@@ -1,0 +1,230 @@
+name: spices leg
+
+# One OS's half of CI: build tur once, then run that OS's shards against it.
+# Called from ci.yml once per OS; see the shape note at the top of ci.yml.
+on:
+  workflow_call:
+    inputs:
+      os:
+        description: "Runner label, e.g. ubuntu-latest"
+        type: string
+        required: true
+      turmeric-sha:
+        description: "turmeric commit to build (pinned once per run in ci.yml)"
+        type: string
+        required: true
+      matrix:
+        description: 'Shard matrix JSON: {"include": [{"shard": "1/4", "spices": "a b"}]}'
+        type: string
+        required: true
+
+jobs:
+  # Build tur once per OS and hand it to the shards as an artifact.
+  #
+  # Workspace paths ARE compiled into tur (the build dir, build/src/generated,
+  # external/mir).  That works because $GITHUB_WORKSPACE is the same path in
+  # every job of this repo on one OS -- so the shards must unpack at exactly
+  # $GITHUB_WORKSPACE/turmeric/build, with turmeric checked out at turmeric/.
+  # Change that layout in one job and not the other and it breaks.  Verified
+  # by probe run 37143548334.
+  build-tur:
+    name: Build tur
+    runs-on: ${{ inputs.os }}
+    steps:
+      - name: Checkout turmeric (compiler)
+        uses: actions/checkout@v4
+        with:
+          repository: turmeric-lang/turmeric
+          ref: ${{ inputs.turmeric-sha }}
+          path: turmeric
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libedit-dev cmake
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libedit cmake || true
+
+      - name: Build the tur compiler
+        working-directory: turmeric
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build build -j
+
+      # The fixture compiler must be the toolchain that built the sanitized
+      # libturi.a, or every spice fails at link time on
+      # ___asan_version_mismatch_check_v8 -- a message that never names the
+      # cause.  Record this job's cc; each shard compares its own against it.
+      - name: Pack the compiler
+        working-directory: turmeric
+        run: |
+          cc --version > build/toolchain.txt
+          cat build/toolchain.txt
+          # tar keeps the executable bit; upload-artifact alone drops it.
+          # libturi_wasm.a (as large as libturi.a) is left out: nothing on the
+          # `tur test` path links it.  A missing file here fails the step,
+          # which is the point.
+          tar -czf "$GITHUB_WORKSPACE/tur-${{ runner.os }}.tgz" \
+            build/tur build/toolchain.txt build/libtur_mir.a \
+            build/src/libturt_runtime.a build/src/libturt_preamble.a \
+            build/src/libturi.a
+          ls -la "$GITHUB_WORKSPACE/tur-${{ runner.os }}.tgz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tur-${{ runner.os }}
+          path: tur-${{ runner.os }}.tgz
+          retention-days: 1
+
+      # Every build.tur must parse cleanly.  Catches the `{` vs `#{`
+      # regression class.  It lives here because it needs a tur and nothing
+      # else; it used to be a job of its own that built one more compiler.
+      - name: Checkout turmeric-spices
+        if: runner.os == 'Linux'
+        uses: actions/checkout@v4
+        with:
+          path: turmeric-spices
+
+      - name: Parse every spice manifest
+        if: runner.os == 'Linux'
+        working-directory: turmeric-spices
+        env:
+          TUR_STDLIB_DIR: ${{ github.workspace }}/turmeric/stdlib
+        run: |
+          set -e
+          n_ok=0; n_fail=0
+          for d in spices/*/; do
+            name=$(basename "$d")
+            pushd "$d" >/dev/null
+            # --dry-run is the cheapest way to exercise the manifest parser:
+            # it parses, plans, and stops, performing no clone and leaving
+            # tur.lock untouched. We do not require the plan to succeed
+            # (optional :spices entries may be unreachable) -- only that no
+            # `:cmake-deps must be a map` or other manifest-parse diagnostic
+            # is emitted, and --dry-run still emits those.
+            #
+            # It used to be a plain `tur fetch`, which was survivable only
+            # because every spice had a committed tur.lock. Those lockfiles
+            # are gone now (see .gitignore for why), so a plain fetch here
+            # genuinely cloned and built every native dep, and the job hung.
+            out=$("$GITHUB_WORKSPACE/turmeric/build/tur" fetch --dry-run 2>&1 || true)
+            if echo "$out" | grep -q 'must be a map\|no (defpackage'; then
+              echo "::error::$name manifest parse error"
+              echo "$out"
+              n_fail=$((n_fail+1))
+            else
+              echo "OK $name"
+              n_ok=$((n_ok+1))
+            fi
+            popd >/dev/null
+          done
+          echo "Summary: $n_ok parse-ok, $n_fail parse-fail"
+          test "$n_fail" -eq 0
+
+  # Each shard runs its spices one after another through scripts/run-shard.sh:
+  # fetch native deps, type-check src/, run tests/, then errors/run.sh and
+  # fixtures/run.sh where present.  A failing spice does not stop the shard;
+  # the step summary has one row per spice, and every annotation title starts
+  # with the spice's name.
+  test-shard:
+    name: spices ${{ matrix.shard }}
+    needs: build-tur
+    runs-on: ${{ inputs.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    env:
+      TUR_STDLIB_DIR: ${{ github.workspace }}/turmeric/stdlib
+
+    steps:
+      - name: Checkout turmeric-spices
+        uses: actions/checkout@v4
+        with:
+          path: turmeric-spices
+
+      # Still needed with a prebuilt tur: the stdlib, and the runtime headers
+      # emitted C includes, come from the source tree.
+      - name: Checkout turmeric (compiler)
+        uses: actions/checkout@v4
+        with:
+          repository: turmeric-lang/turmeric
+          ref: ${{ inputs.turmeric-sha }}
+          path: turmeric
+
+      # The X11 / GL / ALSA headers are for the spices whose :cmake-deps build
+      # a windowing or audio library from source: raylib (and raygui,
+      # sdf-raylib, ecs-raylib, which inherit it) vendor GLFW, opengl builds
+      # GLFW 3.4 directly, and rtaudio needs ALSA. Without them the cmake
+      # configure aborts ("RandR headers not found"), which means NO dep gets
+      # built for that spice -- not just the graphical one -- and every test
+      # in it fails to compile.
+      #
+      # liblo is for osc, and is a system package rather than a source build
+      # on purpose: liblo keeps no CMakeLists.txt at its repo root (its CMake
+      # project lives in cmake/), so FetchContent adds a directory with
+      # nothing to build and produces no library. The osc dep is keyed "lo",
+      # i.e. -llo, which the distro's liblo.so satisfies directly.
+      #
+      # libhiredis-dev is for valkey's HEADERS only -- it builds the library
+      # from source, but its inline-C uses the conventional
+      # <hiredis/hiredis.h> while the fetched tree puts hiredis.h at its root.
+      # libpq-dev is for postgres, whose libpq dep is :prefer-system (there is
+      # no standalone libpq repo to fetch).
+      #
+      # opengl vendors glad's generated output rather than running glad's
+      # Jinja2 generator, so no spice needs Python to build.
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libedit-dev cmake \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+            libgl1-mesa-dev libasound2-dev libxkbcommon-dev \
+            liblo-dev libhiredis-dev libpq-dev \
+            xvfb
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libedit cmake liblo hiredis libpq || true
+          # apt drops its libraries and headers into paths the compiler
+          # already searches; Homebrew does not.  On Apple Silicon the prefix
+          # is /opt/homebrew, and clang searches neither /opt/homebrew/lib nor
+          # /opt/homebrew/include by default -- which is why osc's suites
+          # failed with `ld: library 'lo' not found` even though `brew install
+          # liblo` had just succeeded.  Keg-only formulae (libpq, libedit) are
+          # not symlinked into the prefix at all, so they need their own.
+          brew_prefix="$(brew --prefix)"
+          libs="$brew_prefix/lib"
+          incs="$brew_prefix/include"
+          for formula in libpq libedit; do
+            keg="$(brew --prefix "$formula" 2>/dev/null)" || continue
+            [ -n "$keg" ] || continue
+            libs="$libs:$keg/lib"
+            incs="$incs:$keg/include"
+          done
+          {
+            echo "LIBRARY_PATH=$libs"
+            echo "CPATH=$incs"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tur-${{ runner.os }}
+
+      # Unpack at exactly turmeric/build -- see the build-tur comment.
+      - name: Unpack tur and check the toolchain matches
+        run: |
+          tar -xzf "tur-${{ runner.os }}.tgz" -C turmeric
+          cc --version > /tmp/toolchain-here.txt
+          if ! diff turmeric/build/toolchain.txt /tmp/toolchain-here.txt; then
+            echo "::error title=toolchain mismatch::tur was built with a different cc than this runner has (the runner image changed between jobs?). A sanitized libturi.a will not link. Re-run the workflow."
+            exit 1
+          fi
+          turmeric/build/tur --version
+
+      - name: Test ${{ matrix.spices }}
+        working-directory: turmeric-spices
+        run: scripts/run-shard.sh "$GITHUB_WORKSPACE/turmeric/build/tur" ${{ matrix.spices }}
