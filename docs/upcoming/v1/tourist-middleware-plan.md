@@ -81,6 +81,20 @@ each into a failing test.
 - Unifying the two server stacks. That is a real question (see Open
   questions) but out of scope here.
 
+## Decision: stdlib httpd stays a server users build on (2026-10-04)
+
+The layering follows Node: `stdlib/httpd.tur` is the `http` module plus
+connect-style middleware -- a supported base users build directly on --
+and tourist is the express layer. Consequences for this plan:
+
+- Middleware that belongs at the server level (security headers, request
+  IDs, trust proxy) ships on **both** stacks. T5 is committed, not optional.
+- Framework conveniences (routing-aware middleware, `Ctx` helpers,
+  cookies-on-`Ctx`, multipart on `Ctx`) stay tourist-only.
+- Behavior should match across the stacks: same option struct fields,
+  same defaults, same header output, so moving an app from stdlib httpd
+  to tourist does not change its responses.
+
 ## Design rules for every new API
 
 - **No `:int` stand-ins** (turmeric CLAUDE.md). Middleware factories return
@@ -234,12 +248,24 @@ Separate spice so the zlib native dep stays optional, mirroring the
 - Fixture decodes the gzip body back to the original; a small body and an
   image are passed through untouched; `Vary` is present in both cases.
 
-### T5 -- Optional: stdlib httpd parity (turmeric repo)
+### T5 -- stdlib httpd parity (turmeric repo)
 
-Only if stdlib httpd stays a supported user-facing server (Open question 1).
-Port `secure-headers`, request ID and trust-proxy to `stdlib/httpd.tur`
-as `mw-secure-headers`, `mw-request-id` and a `httpd-req-ip` that respects
-a trust config. Separate turmeric PR with its own fixtures.
+Committed per the decision above. Port the T3 server-level items to
+`stdlib/httpd.tur` in its existing `mw-*` style:
+
+- `mw-secure-headers` + `SecureHeadersOpts` (same fields and defaults as
+  tourist's).
+- `mw-request-id` + `httpd-req-id`, same accept/generate rule.
+- `TrustProxyOpts` + `httpd-req-ip` / `httpd-req-proto`; make
+  `mw-rate-limit` and `mw-log` use `httpd-req-ip` instead of the raw peer
+  address.
+- `mw-etag` for dynamic responses (`mw-static` already does static).
+- Check stdlib httpd for the T1 findings too (body cap exists via
+  `httpd-set-max-body!`; confirm a read timeout exists) and fix any gap
+  there in the same PR.
+
+Separate turmeric PR with its own fixtures; can run in parallel with T2/T3
+once T3's option structs are settled, so both stacks share one shape.
 
 ### T6 -- Multipart for tourist (largest; last)
 
@@ -252,7 +278,7 @@ cap; in-memory only (streaming is a non-goal). Fuzz the boundary parser.
 ```
 T0 (convention) --+--> T2 (ports) --> T3 (new) --> T6 (multipart)
 T1 (hardening) ---+--> T4 (compress, needs binary body)
-                                       T5 (stdlib, independent, optional)
+                                       T5 (stdlib, after T3's option shapes)
 ```
 
 T0 and T1 are independent and can run in parallel. T1 is the most
@@ -261,10 +287,12 @@ denial of service on any tourist app, middleware or not.
 
 ## Risks and open questions
 
-1. **Two server stacks.** Every feature here is either duplicated or
-   missing on one side. Should stdlib httpd stay user-facing, or become the
-   implementation layer under the httpd spice? That decides whether T5
-   is worth doing. Not decided here.
+1. **Two server bases.** Decided: stdlib httpd stays user-facing (see
+   Decision). Still open: in Node, express sits *on* `http`; here tourist
+   sits on `spices/httpd`, a second server, not on stdlib httpd. Long term,
+   should tourist move onto stdlib httpd (or the spice server fold into
+   it) so there is one base, as in Node? Until then, server-level fixes
+   such as T1 land twice. Not decided here.
 2. **Panic recovery may not be expressible** (T0). If a panicking handler
    aborts the process, `recover` becomes a framework-level change
    (catch at the worker boundary), not a middleware.
