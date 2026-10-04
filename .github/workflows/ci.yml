@@ -1,372 +1,70 @@
 name: CI
 
+# Shape (turmeric docs/upcoming/spices-ci-sharding-plan.md):
+#
+#   discover-spices -+-> ubuntu: build-tur -> test-shard x4
+#                    +-> macos:  build-tur -> test-shard x3
+#
+# Each OS is its own chain (.github/workflows/spices-leg.yml), so the Linux
+# shards start as soon as the Linux compiler is built rather than waiting
+# for the macOS build to get out of the macOS runner queue.
+#
+# This used to be one job per spice per OS -- ~98 jobs, each rebuilding the
+# same Debug+ASan tur before doing anything else.  The compiler build was 73%
+# of the run's ~280 runner-minutes, and the 48 macOS jobs queued for up to two
+# hours in the org's shared macOS pool, holding up turmeric's own macOS legs.
+# Now tur is built once per OS and handed to a few shards, each running its
+# spices serially through scripts/run-shard.sh.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  # Re-run a few spices without a whole shard: `spices: "crdt json"`.
+  workflow_dispatch:
+    inputs:
+      spices:
+        description: "Space-separated spices to test (default: all)"
+        required: false
+        default: ""
+
+# A newer push to a PR supersedes the run in flight; pushes to main each keep
+# their own complete run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Shard counts.  macOS is deliberately smaller: the scarce resource is macOS
+  # runners, not wall clock inside a shard.
+  LINUX_SHARDS: 4
+  MACOS_SHARDS: 3
 
 jobs:
-  # Per-spice job: parse build.tur and (if cmake-deps are declared) fetch and
-  # build the C dependencies, then attempt to compile every test file via
-  # `tur test`.  Tests that fail compilation count as a CI failure; tests
-  # that compile but exit non-zero at runtime do too.
-  #
-  # The matrix is expanded by the `discover-spices` job below so adding or
-  # removing a spice does not require touching this file.
-  test-spice:
-    name: ${{ matrix.spice }} (${{ matrix.os }})
-    needs: discover-spices
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        spice: ${{ fromJSON(needs.discover-spices.outputs.spices) }}
-
-    steps:
-      - name: Checkout turmeric-spices
-        uses: actions/checkout@v4
-        with:
-          path: turmeric-spices
-
-      - name: Checkout turmeric (compiler)
-        uses: actions/checkout@v4
-        with:
-          repository: turmeric-lang/turmeric
-          ref: ${{ needs.discover-spices.outputs.turmeric-sha }}
-          path: turmeric
-
-      # The X11 / GL / ALSA headers are for the spices whose :cmake-deps build
-      # a windowing or audio library from source: raylib (and raygui,
-      # sdf-raylib, ecs-raylib, which inherit it) vendor GLFW, opengl builds
-      # GLFW 3.4 directly, and rtaudio needs ALSA. Without them the cmake
-      # configure aborts ("RandR headers not found"), which means NO dep gets
-      # built for that spice -- not just the graphical one -- and every test
-      # in it fails to compile.
-      #
-      # liblo is for osc, and is a system package rather than a source build
-      # on purpose: liblo keeps no CMakeLists.txt at its repo root (its CMake
-      # project lives in cmake/), so FetchContent adds a directory with
-      # nothing to build and produces no library. The osc dep is keyed "lo",
-      # i.e. -llo, which the distro's liblo.so satisfies directly.
-      #
-      # libhiredis-dev is for valkey's HEADERS only -- it builds the library
-      # from source, but its inline-C uses the conventional
-      # <hiredis/hiredis.h> while the fetched tree puts hiredis.h at its root.
-      # libpq-dev is for postgres, whose libpq dep is :prefer-system (there is
-      # no standalone libpq repo to fetch).
-      #
-      # python3-jinja2 used to be here for glad, which is a Python generator
-      # that renders its loader from Jinja2 templates.  opengl now vendors
-      # glad's generated output instead of running the generator (the same
-      # thing raylib does with its own checked-in copy), so no spice needs
-      # Python to build.  Note the macOS leg never installed jinja2 at all --
-      # which is part of why opengl was red there.
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libedit-dev cmake \
-            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
-            libgl1-mesa-dev libasound2-dev libxkbcommon-dev \
-            liblo-dev libhiredis-dev libpq-dev \
-            xvfb
-
-      - name: Install dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install libedit cmake liblo hiredis libpq || true
-          # apt drops its libraries and headers into paths the compiler
-          # already searches; Homebrew does not.  On Apple Silicon the prefix
-          # is /opt/homebrew, and clang searches neither /opt/homebrew/lib nor
-          # /opt/homebrew/include by default -- which is why osc's suites
-          # failed with `ld: library 'lo' not found` even though `brew install
-          # liblo` had just succeeded.  Keg-only formulae (libpq, libedit) are
-          # not symlinked into the prefix at all, so they need their own.
-          brew_prefix="$(brew --prefix)"
-          libs="$brew_prefix/lib"
-          incs="$brew_prefix/include"
-          for formula in libpq libedit; do
-            keg="$(brew --prefix "$formula" 2>/dev/null)" || continue
-            [ -n "$keg" ] || continue
-            libs="$libs:$keg/lib"
-            incs="$incs:$keg/include"
-          done
-          {
-            echo "LIBRARY_PATH=$libs"
-            echo "CPATH=$incs"
-          } >> "$GITHUB_ENV"
-
-      - name: Build the tur compiler
-        working-directory: turmeric
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-          cmake --build build -j
-
-      - name: Show spice manifest
-        working-directory: turmeric-spices/spices/${{ matrix.spice }}
-        run: cat build.tur
-
-      - name: Fetch C dependencies (if any)
-        working-directory: turmeric-spices/spices/${{ matrix.spice }}
-        env:
-          TUR_STDLIB_DIR: ${{ github.workspace }}/turmeric/stdlib
-        run: |
-          # A spice's native libs can be declared directly (:cmake-deps) or
-          # inherited transitively from its dependencies (the compiler walks
-          # declared :spices when collecting :cmake-deps). Several spices
-          # (httpd, plot, ecs-raylib, ws-server) carry no :cmake-deps of their
-          # own but still need their deps' native libs fetched, so trigger
-          # fetch whenever EITHER section is present.
-          #
-          # This used to move the root build.tur aside for the duration: it
-          # lists every spice as a :member, and the compiler once collected
-          # :cmake-deps from every workspace member rather than the spice's
-          # declared :spices closure -- so `tur fetch` in spices/json emitted a
-          # CMakeLists with all 17 native libs instead of yyjson alone, and one
-          # dep that could not configure took the whole job down with it.
-          #
-          # rjungemann/turmeric#791 fixed that upstream: the walk now uses the
-          # declared closure, so there is nothing to hide from. Verified against
-          # that compiler -- `tur fetch` in spices/opengl with the workspace
-          # root in place emits exactly one dep (opengl-deps), not 17.
-          # TUR_CMAKE_DEPS_WORKSPACE_WIDE=1 restores the old behavior if a
-          # spice ever genuinely needs a sibling's native lib without declaring
-          # that sibling in :spices.
-          rc=0
-          if grep -qE ':cmake-deps|:spices' build.tur; then
-            "$GITHUB_WORKSPACE/turmeric/build/tur" fetch --update 2>&1 | tee /tmp/tur-fetch.log
-            rc=${PIPESTATUS[0]}
-          else
-            echo "no :cmake-deps or :spices declared"
-          fi
-          if [ "$rc" -ne 0 ]; then
-            # Non-fatal by design -- an :optional :spices dep is *expected* to
-            # fail here. But a required :cmake-deps native build can fail the
-            # same way, and it then surfaces two steps later as an unrelated
-            # link error ("library 'x' not found") with nothing to tell the two
-            # cases apart. Put the actual `tur fetch` output in the annotation
-            # itself (GitHub escapes %/\r/\n for the ::warning:: message body)
-            # so the failure is findable without digging back through the log.
-            tail=$(tail -n 20 /tmp/tur-fetch.log | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/$/%0A/' | tr -d '\n')
-            echo "::warning title=tur fetch exited ${rc}::${tail}"
-          fi
-          # ...and a native :cmake-deps build that FAILED is not the ambiguous
-          # case. It guarantees a missing archive, so the job is already dead;
-          # the only question is whether it dies here, where the compiler error
-          # is, or 400 lines later pointing at a library nobody touched.
-          #
-          # Run 34448162505 is the argument for dying here. One mbedtls
-          # -Werror abort (clang 21's -Wunterminated-string-initialization vs
-          # mbedtls's own MBEDTLS_FATAL_WARNINGS) took out nine macOS jobs, and
-          # each reported a *different* spice failing to find a *different*
-          # .a -- including `libyyjson.a`, a library with nothing to do with
-          # the actual fault, which was simply next in the same aborted `make`.
-          #
-          # Match on `cmake build failed` specifically, NOT on $rc: the exit
-          # code also covers :optional :spices resolution failures, which must
-          # stay non-fatal. Checked against all 79 passing jobs of that run --
-          # none of them prints this line, so nothing green today goes red.
-          if [ -f /tmp/tur-fetch.log ] && grep -q 'cmake build failed' /tmp/tur-fetch.log; then
-            echo "::error title=native dependency build failed::a :cmake-deps library failed to build; the compiler errors are above, in this step -- do not chase the link error in a later step"
-            grep -n 'cmake build failed' /tmp/tur-fetch.log
-            exit 1
-          fi
-
-      - name: Type-check spice sources
-        working-directory: turmeric-spices/spices/${{ matrix.spice }}
-        env:
-          TUR_STDLIB_DIR: ${{ github.workspace }}/turmeric/stdlib
-        run: |
-          # tur is built here with -DCMAKE_BUILD_TYPE=Debug, so the compiler
-          # itself is ASan-instrumented and its frames are several times
-          # larger than a release build's.  emit_value_dispatch recurses over
-          # the expression tree, and ecs's test corpus is deep enough to
-          # exhaust the default 8 MB stack -- reproducible on Linux by
-          # dropping to `ulimit -s 2048`, on main's own sources.  Give the
-          # process the hard limit; macOS caps it well below `unlimited`.
-          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
-          # SC8: regression matrix.
-          # Before the spice-aware-check work, `tur check src/foo/bar.tur`
-          # could not resolve intra-spice imports like `(import foo/baz)`
-          # because the per-file driver didn't know it was inside a spice;
-          # output was a wall of spurious "module not found" lines.  With
-          # SC4 auto-discovery + SC5 cross-spice dep wiring landed, each
-          # `tur check` is a genuine signal for intra-spice import breakage
-          # and missing-export regressions.
-          #
-          # We must fail the job on any non-zero exit -- the previous
-          # `find -exec` pattern swallowed failures because find returns 0
-          # regardless of what -exec'd commands return.
-          #
-          # Per-spice opt-out: a `requires.typecheck-skip` marker file in
-          # the spice root marks the spice as known-broken; the type-check
-          # step reports it but does not fail the job.  The marker must
-          # contain at least one human-readable line explaining what's
-          # broken and pointing at a tracking issue.  Delete the marker
-          # once the spice type-checks cleanly.
-          if [ -f requires.typecheck-skip ]; then
-            echo "::warning::type-check skipped via requires.typecheck-skip:"
-            sed 's/^/  /' requires.typecheck-skip
-            exit 0
-          fi
-          if [ ! -d src ]; then
-            echo "no src/ directory; skipping check"
-            exit 0
-          fi
-          n_files=0
-          n_fail=0
-          failed=()
-          while IFS= read -r -d '' f; do
-            n_files=$((n_files + 1))
-            if "$GITHUB_WORKSPACE/turmeric/build/tur" check "$f"; then
-              echo "  ok   $f"
-            else
-              echo "::error file=$f::tur check failed"
-              n_fail=$((n_fail + 1))
-              failed+=("$f")
-            fi
-          done < <(find src -name '*.tur' -print0)
-          echo "Summary: checked $n_files file(s), $n_fail failed"
-          if [ "$n_fail" -gt 0 ]; then
-            echo "Failed files:"
-            for f in "${failed[@]}"; do echo "  - $f"; done
-            exit 1
-          fi
-
-      - name: Run spice tests (if any)
-        working-directory: turmeric-spices/spices/${{ matrix.spice }}
-        env:
-          TUR_STDLIB_DIR: ${{ github.workspace }}/turmeric/stdlib
-        run: |
-          # Same stack headroom as the type-check step above: `tur test <dir>`
-          # builds the whole directory in one go, so it is the deepest thing
-          # the ASan-instrumented compiler is asked to emit.
-          ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
-          # `tur test <dir>` DOES recurse into subdirectories.  (This comment
-          # used to claim the opposite; that was wrong, and it is why the ecs
-          # spice's `tests/errors/` compile-FAIL fixtures were being built and
-          # run as ordinary tests and counted as 16 suite failures.  Fixtures
-          # that must NOT compile belong outside tests/ -- see the
-          # "Assert compile-fail diagnostics" step below.)
-          #
-          # Spices store their test suites in one of two layouts:
-          #
-          #   1. flat:    tests/*.tur                      (ansi, notebook, ...)
-          #               (or a flat aggregator that imports nested modules,
-          #                e.g. linalg/tests/linalg.tur, template/tests/smoke.tur)
-          #   2. nested:  tests/<group>/*_test.tur         (frame, plot, ...)
-          #               or tests/<group>/<case>/*.tur    (tourist fixtures)
-          #
-          # If tests/ has any flat .tur file we run `tur test tests` and stop:
-          # that covers the flat spices and the aggregators (descending would
-          # double-run the modules the aggregator already imports, and would
-          # wrongly try to `tur test` non-suite fixtures like template's).
-          # Otherwise we descend and run `tur test` on every directory that
-          # directly contains a .tur file.
-          if [ ! -d tests ]; then
-            echo "no tests/ directory; skipping test run"
-            exit 0
-          fi
-          TUR="$GITHUB_WORKSPACE/turmeric/build/tur"
-          # Run under a virtual X server when one is available.  opengl's
-          # suites check for $DISPLAY and print "# SKIP: no display available"
-          # without asserting anything when it is missing -- so on a headless
-          # runner all 12 of its assertions were being skipped while the job
-          # reported "3 tests, 3 passed".  Under Xvfb they actually run.
-          # Spices that do not touch a display are unaffected.
-          if command -v xvfb-run >/dev/null 2>&1; then
-            TUR="xvfb-run -a $TUR"
-          fi
-          if ls tests/*.tur >/dev/null 2>&1; then
-            $TUR test tests
-          else
-            n_fail=0
-            while IFS= read -r d; do
-              echo "== tur test $d =="
-              if ! $TUR test "$d"; then
-                n_fail=$((n_fail + 1))
-              fi
-            done < <(find tests -name '*.tur' -print0 \
-                       | xargs -0 -n1 dirname \
-                       | sort -u)
-            if [ "$n_fail" -gt 0 ]; then
-              echo "$n_fail test directory/directories failed"
-              exit 1
-            fi
-          fi
-
-      # Compile-FAIL fixtures: a spice may keep an `errors/` directory whose
-      # every file must be REJECTED by the compiler, with a specific
-      # diagnostic.  They cannot live under tests/ (`tur test` recurses and
-      # would count each as a failure), and asserting only "does not compile"
-      # lets a fixture silently drift onto an unrelated diagnostic -- so each
-      # spice's errors/run.sh pins the code AND a witness substring.
-      #
-      # Opt-in per spice: the step is a no-op unless errors/run.sh exists.
-      # Currently: c-dsl, ecs, http, httpd, linalg, opengl, plutovg, postgres,
-      # raylib, rtaudio, secret, sqlite, thread-pool, tls, tourist, valkey.
-      - name: Assert compile-fail diagnostics (if any)
-        working-directory: turmeric-spices/spices/${{ matrix.spice }}
-        env:
-          TUR_STDLIB_DIR: ${{ github.workspace }}/turmeric/stdlib
-        run: |
-          if [ ! -x errors/run.sh ]; then
-            echo "no errors/run.sh; skipping compile-fail assertions"
-            exit 0
-          fi
-          errors/run.sh "$GITHUB_WORKSPACE/turmeric/build/tur"
-
-      # Runnable end-to-end fixtures: a spice may keep a `fixtures/` directory
-      # of whole PROGRAMS (each with its own `main`) rather than test suites.
-      # Like errors/, they cannot live under tests/ -- `tur test` recurses, and
-      # would build each fixture as a suite, find no tests in it, and count it
-      # as a failure. That alone made several jobs red.
-      #
-      # Opt-in per spice: the step is a no-op unless fixtures/run.sh exists.
-      # Currently: template (4 fixtures). tourist, tourist-ws, tls, ws-client
-      # and ws-server keep fixtures/ directories whose per-fixture run.sh
-      # scripts need a live server or a Python helper; those stay manual, and
-      # the absent aggregate runner makes this step skip them.
-      - name: Run end-to-end fixtures (if any)
-        working-directory: turmeric-spices/spices/${{ matrix.spice }}
-        env:
-          TUR_STDLIB_DIR: ${{ github.workspace }}/turmeric/stdlib
-        run: |
-          if [ ! -x fixtures/run.sh ]; then
-            echo "no fixtures/run.sh; skipping end-to-end fixtures"
-            exit 0
-          fi
-          fixtures/run.sh "$GITHUB_WORKSPACE/turmeric/build/tur"
-
-  # Enumerate the spices/ subdirectories that contain a build.tur so the
-  # matrix below stays in sync as spices are added.  Output is a JSON array
-  # of basenames (e.g. ["c-dsl","glsl","plutovg",...]).
+  # Pin turmeric main, list the spices, and deal them into shards.
   discover-spices:
     name: Enumerate spices
     runs-on: ubuntu-latest
     outputs:
-      spices: ${{ steps.list.outputs.spices }}
       turmeric-sha: ${{ steps.turmeric.outputs.sha }}
+      ubuntu-matrix: ${{ steps.shards.outputs.ubuntu-latest }}
+      macos-matrix: ${{ steps.shards.outputs.macos-latest }}
     steps:
       - uses: actions/checkout@v4
       # Resolve turmeric-lang/turmeric's main to ONE commit for this whole run.
       #
       # Every leg used to check out `main` by name, at whatever moment that
-      # leg happened to start.  The matrix is ~90 jobs and the runner pool
-      # staggers them over an hour, so a compiler change landing mid-run gave
-      # different legs *different compilers* -- and the resulting failure
-      # names the spice, not the skew.  That is exactly what reddened
-      # `ecs (ubuntu-latest)` in run 34448162505: it started 07:04Z and got a
-      # compiler that still enforced the TUR-E0712 expression-nesting cap,
-      # while `ecs (macos-latest)` started 07:49Z, after the cap was retired
-      # upstream, and passed the identical source.
+      # leg happened to start.  The runner pool staggers jobs over an hour, so
+      # a compiler change landing mid-run gave different legs *different
+      # compilers* -- and the resulting failure names the spice, not the skew.
+      # That is exactly what reddened `ecs (ubuntu-latest)` in run 34448162505:
+      # it started 07:04Z and got a compiler that still enforced the TUR-E0712
+      # expression-nesting cap, while `ecs (macos-latest)` started 07:49Z,
+      # after the cap was retired upstream, and passed the identical source.
       #
-      # Pinning per-run keeps "spices test against turmeric main" -- the SHA is
-      # still resolved fresh on every run -- while making a single run
-      # internally consistent, so a red leg means a real defect.
+      # Building tur once per OS now makes this structural -- every shard gets
+      # one of two binaries built from this SHA -- but the pin is still what
+      # makes the two OSes agree with each other.
       - id: turmeric
         name: Resolve turmeric main to one SHA for this run
         run: |
@@ -377,79 +75,56 @@ jobs:
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "turmeric main for this run: $sha"
-      - id: list
-        run: |
-          json=$(find spices -mindepth 2 -maxdepth 2 -name build.tur \
-                 | sed 's|spices/||;s|/build.tur||' \
-                 | sort \
-                 | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
-          echo "spices=$json" >> "$GITHUB_OUTPUT"
-          echo "Discovered: $json"
-
-  # Sanity job: every build.tur must parse cleanly.  Catches the
-  # `{` vs `#{` regression class without needing the full per-spice matrix.
-  manifest-parse:
-    name: Parse every build.tur
-    needs: discover-spices
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout turmeric-spices
-        uses: actions/checkout@v4
-        with:
-          path: turmeric-spices
-
-      - name: Checkout turmeric (compiler)
-        uses: actions/checkout@v4
-        with:
-          repository: turmeric-lang/turmeric
-          ref: ${{ needs.discover-spices.outputs.turmeric-sha }}
-          path: turmeric
-
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libedit-dev cmake
-
-      - name: Build the tur compiler
-        working-directory: turmeric
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-          cmake --build build -j
-
-      - name: Parse every spice manifest
-        working-directory: turmeric-spices
+      # Round-robin over the sorted list.  That spreads the alphabetically
+      # adjacent heavy cluster (tourist, tourist-session, tourist-session-valkey,
+      # tourist-ws) across shards with no weights file to maintain.  If one
+      # shard runs much longer than the rest, run-shard.sh's step summary has
+      # the per-spice seconds to build weights from.
+      - id: shards
+        name: Split the spices into shards
         env:
-          TUR_STDLIB_DIR: ${{ github.workspace }}/turmeric/stdlib
+          ONLY: ${{ github.event.inputs.spices }}
         run: |
-          set -e
-          n_ok=0; n_fail=0
-          for d in spices/*/; do
-            name=$(basename "$d")
-            pushd "$d" >/dev/null
-            # --dry-run is the cheapest way to exercise the manifest parser:
-            # it parses, plans, and stops, performing no clone and leaving
-            # tur.lock untouched. We do not require the plan to succeed
-            # (optional :spices entries may be unreachable) -- only that no
-            # `:cmake-deps must be a map` or other manifest-parse diagnostic
-            # is emitted, and --dry-run still emits those.
-            #
-            # It used to be a plain `tur fetch`, which was survivable only
-            # because every spice had a committed tur.lock: fetch without
-            # --update treats the presence of a lock row as "already on disk"
-            # and skips the work. Those lockfiles are gone now (see
-            # .gitignore for why), so a plain fetch here genuinely cloned and
-            # configured every native dep -- and because this loop, unlike the
-            # per-spice job below, does not move the workspace root build.tur
-            # aside, each of the 45 iterations walked every workspace member
-            # and so built all 17 native libraries in the repo. The job hung.
-            out=$("$GITHUB_WORKSPACE/turmeric/build/tur" fetch --dry-run 2>&1 || true)
-            if echo "$out" | grep -q 'must be a map\|no (defpackage'; then
-              echo "::error::$name manifest parse error"
-              echo "$out"
-              n_fail=$((n_fail+1))
-            else
-              echo "OK $name"
-              n_ok=$((n_ok+1))
-            fi
-            popd >/dev/null
-          done
-          echo "Summary: $n_ok parse-ok, $n_fail parse-fail"
-          test "$n_fail" -eq 0
+          find spices -mindepth 2 -maxdepth 2 -name build.tur \
+            | sed 's|spices/||;s|/build.tur||' | sort > all.txt
+          python3 - <<'PY'
+          import json, os, sys
+          spices = open("all.txt").read().split()
+          only = os.environ.get("ONLY", "").split()
+          if only:
+              unknown = [s for s in only if s not in spices]
+              if unknown:
+                  sys.exit(f"unknown spice(s): {' '.join(unknown)}")
+              spices, counts = only, {"ubuntu-latest": 1, "macos-latest": 1}
+          else:
+              counts = {"ubuntu-latest": int(os.environ["LINUX_SHARDS"]),
+                        "macos-latest": int(os.environ["MACOS_SHARDS"])}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              for os_name, n in counts.items():
+                  n = max(1, min(n, len(spices)))
+                  include = [{"shard": f"{i + 1}/{n}", "spices": " ".join(spices[i::n])}
+                             for i in range(n)]
+                  for row in include:
+                      print(f"{os_name:14} {row['shard']:4} {row['spices']}")
+                  out.write(f"{os_name}=" + json.dumps({"include": include}) + "\n")
+          PY
+
+  # One build-then-shard chain per OS.  These are separate callers of one
+  # reusable workflow, not one matrix, on purpose: a job that `needs` a matrix
+  # job waits for EVERY leg of it, so a shared build matrix made the Linux
+  # shards sit behind the macOS build's queue time.
+  ubuntu:
+    needs: discover-spices
+    uses: ./.github/workflows/spices-leg.yml
+    with:
+      os: ubuntu-latest
+      turmeric-sha: ${{ needs.discover-spices.outputs.turmeric-sha }}
+      matrix: ${{ needs.discover-spices.outputs.ubuntu-matrix }}
+
+  macos:
+    needs: discover-spices
+    uses: ./.github/workflows/spices-leg.yml
+    with:
+      os: macos-latest
+      turmeric-sha: ${{ needs.discover-spices.outputs.turmeric-sha }}
+      matrix: ${{ needs.discover-spices.outputs.macos-matrix }}
