@@ -71,7 +71,8 @@ non-recursive) or build your own with `watch-opts-make`. Pass `0` for
 temp file and renaming it over the target. Both backends fire on the
 rename and the watcher's stat-compare reports `watch-kind-rename`. In-place
 writes also fire on Linux; on Darwin the kqueue-on-directory backend does
-not see them (this is documented in `docs/notebook-watch-semantics.md`).
+not see them (this is documented in `docs/upcoming/spices/notebook-watch-semantics.md`
+in the turmeric repo).
 
 ---
 
@@ -222,5 +223,5 @@ is the recommended pattern.
 ## See also
 
 - [tur-watch front page](https://spices.turmeric-lang.com/watch/) -- module map and module-level docs
-- [docs/notebook-watch-semantics.md](https://github.com/turmeric-lang/turmeric-spices/blob/main/docs/notebook-watch-semantics.md) -- the contract tur-watch v0.1.0
+- [docs/upcoming/spices/notebook-watch-semantics.md](https://github.com/turmeric-lang/turmeric/blob/main/docs/upcoming/spices/notebook-watch-semantics.md) -- the contract tur-watch v0.1.0
   preserves from the original notebook watcher

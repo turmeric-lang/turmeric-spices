@@ -528,7 +528,8 @@ because the TAP lines were being read by eye. The fix is `run-all-status`
 ```
 
 Every spice's `test/suite` file now ends this way -- see
-`docs/test-suites-report-success-with-failing-assertions.md`, resolved.
+`docs/upcoming/spices/test-suites-report-success-with-failing-assertions.md` in the
+turmeric repo, resolved.
 
 ## What this does not protect against
 
