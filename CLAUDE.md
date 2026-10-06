@@ -61,7 +61,7 @@ Each cold sandbox doing a CMake build wastes minutes per session.
 
 ```
 spices/        -- one directory per spice package; each has its own build.tur
-docs/          -- shared documentation
+docs/          -- spice guides (rendered to HTML) and generated API docs
 build.tur      -- top-level manifest
 vendor/tur/    -- prebuilt tur binary + stdlib (gitignored; created by install-tur.sh)
 scripts/       -- developer tooling (install-tur.sh, ...)
