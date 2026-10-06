@@ -814,6 +814,7 @@
     printf("  export md|html <file.tur.md> [--out DIR] [--cache] [--watch] [--no-output] [--no-source] [--math=auto|always|never] [--assets=inline|sibling]\n");
     printf("  tui <file.tur.md> [--keybindings FILE] [--no-color]\n");
     printf("  exec <file.tur.md> (--cell <id> | --all)\n");
+    printf("  check <file.tur.md>\n");
     printf("  new <file.tur.md>\n");
     return 0;
     ```)
@@ -882,7 +883,8 @@
               (or (__cli-cstr-eq? tok "export")
                   (or (__cli-cstr-eq? tok "tui")
                       (or (__cli-cstr-eq? tok "exec")
-                          (__cli-cstr-eq? tok "new")))))
+                          (or (__cli-cstr-eq? tok "new")
+                              (__cli-cstr-eq? tok "check"))))))
         (__cli-state-set-command state tok)
         (__cli-state-set-error state "unknown subcommand"))
     (if (__cli-cstr-eq? (__cli-state-command state) "render")
@@ -907,7 +909,11 @@
               (if (__cli-cstr-empty? (__cli-state-path state))
                 (__cli-state-set-path state tok)
                 (__cli-state-set-error state "new accepts exactly one file path"))
-              (__cli-state-set-error state "unknown subcommand"))))))))
+              (if (__cli-cstr-eq? (__cli-state-command state) "check")
+                (if (__cli-cstr-empty? (__cli-state-path state))
+                  (__cli-state-set-path state tok)
+                  (__cli-state-set-error state "check accepts exactly one notebook path"))
+                (__cli-state-set-error state "unknown subcommand")))))))))
 
   (defn __cli-parse-args [tokens : int state : int pending : cstr] #fx{Unsafe} : int
     (if (or (not (__cli-cstr-empty? (__cli-state-error state)))
@@ -1157,6 +1163,67 @@
                 (__cli-eputs "failed to write file")
                 1)))))))
 
+  ;;; __cli-check-outputs -- iterate outputs, print only errors, return error count.
+  (defn __cli-check-outputs [outputs : int] #fx{Unsafe} : int
+    ```c
+    typedef struct { int64_t head; int64_t tail; } __NbCons;
+    typedef struct {
+      char *cell_id; int64_t status; char *stdout_text;
+      char *value_repr; char *error_msg; int64_t elapsed_ms;
+      int64_t image_paths;
+    } __NbOutput;
+    int64_t cur = (int64_t)outputs;
+    int rc = 0;
+    while (cur != 0) {
+      __NbCons *c = (__NbCons*)cur;
+      __NbOutput *out = (__NbOutput*)c->head;
+      if (out->status == 1) {
+        if (out->cell_id) fprintf(stderr, "[%s] ERROR", out->cell_id);
+        else fprintf(stderr, "ERROR");
+        if (out->error_msg) fprintf(stderr, ": %s", out->error_msg);
+        fprintf(stderr, "\n");
+        rc = 1;
+      }
+      cur = c->tail;
+    }
+    return (int64_t)rc;
+    ```)
+
+  ;;; __cli-handle-check -- parse and evaluate a notebook, reporting only errors.
+  (defn __cli-handle-check [state : int] #fx{Unsafe} : int
+    (let [path (__cli-state-path state)]
+      (if (__cli-cstr-empty? path)
+        (do
+          (__cli-eputs "check requires a notebook path")
+          1)
+        (let [parse-result (parse-file path)]
+          (if (not (__cli-result-ok? parse-result))
+            (do
+              (__cli-eputs (__cli-result-err-cstr parse-result))
+              1)
+            (let [nodes (__cli-result-ok-int parse-result)
+                  _box (__cli-box-free parse-result)
+                  cells (__cli-cells-from-nodes nodes)
+                  session (session-open)]
+              (if (= session 0)
+                (do
+                  (__cli-eputs "failed to open eval session")
+                  (__cli-spine-free cells)
+                  (nodes-free nodes)
+                  1)
+                (let [outputs (eval-all session cells 0 0)
+                      code (__cli-check-outputs outputs)]
+                  (do
+                    (session-close session)
+                    (outputs-free outputs)
+                    (__cli-spine-free cells)
+                    (nodes-free nodes)
+                    (if (= code 0)
+                      (do
+                        (__cli-puts "ok")
+                        0)
+                      code))))))))))
+
   ;;; cli-main -- parse notebook CLI args and execute the chosen subcommand.
   (defn cli-main [argv : int] #fx{Unsafe} : int
     (let [args (if (and (not (__cli-list-nil? argv))
@@ -1191,8 +1258,10 @@
                   (__cli-handle-exec state)
                   (if (__cli-cstr-eq? (__cli-state-command state) "new")
                     (__cli-handle-new state)
-                    (do
-                      (__cli-eputs "unknown subcommand")
-                      2))))))))))
+                    (if (__cli-cstr-eq? (__cli-state-command state) "check")
+                      (__cli-handle-check state)
+                      (do
+                        (__cli-eputs "unknown subcommand")
+                        2)))))))))))
 
 ) ;; end defmodule notebook/cli

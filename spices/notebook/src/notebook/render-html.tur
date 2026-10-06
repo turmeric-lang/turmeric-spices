@@ -10,7 +10,8 @@
                                    cell-output-status cell-output-cell-id
                                    cell-output-stdout cell-output-value-repr
                                    cell-output-error-msg cell-output-elapsed-ms
-                                   cell-output-image-paths])
+                                   cell-output-image-paths
+                                   cell-output-type-tag])
   (import notebook/eval :refer [eval-all outputs-free])
   (import notebook/cache :refer [cache-open cache-close])
   (export render-html-string render-html-string-at render-html)
@@ -599,6 +600,10 @@
       ".cell-output-meta.status-ok { color: var(--success); }\n"
       ".cell-output-meta.status-error { color: var(--error); }\n"
       ".cell-output { background: #0f0d0b; }\n"
+      ".frame-table { border-collapse: collapse; width: 100%; margin: 8px 0; }\n"
+      ".frame-table th, .frame-table td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; }\n"
+      ".frame-table th { background: var(--surface); font-weight: 600; }\n"
+      ".frame-table tbody tr:nth-child(even) { background: rgba(255,255,255,0.03); }\n"
       ".cell-images {\n"
       "  display: grid;\n"
       "  gap: 12px;\n"
@@ -697,6 +702,7 @@
       char *error_msg;
       int64_t elapsed_ms;
       int64_t image_paths;
+      char *type_tag;
     } NotebookCellOutput;
     NotebookCellOutput *out = (NotebookCellOutput *)(intptr_t)output;
     if (!out || out->status == 2) return strdup("");
@@ -718,6 +724,7 @@
       char *error_msg;
       int64_t elapsed_ms;
       int64_t image_paths;
+      char *type_tag;
     } NotebookCellOutput;
     NotebookCellOutput *out = (NotebookCellOutput *)(intptr_t)output;
     if (!out || out->status == 2) return strdup("");
@@ -741,6 +748,143 @@
     }
     return buf;
     ```)
+
+;;; __rhtml-is-frame-tag? -- case-insensitive check for "frame" in the type tag.
+  (defn __rhtml-is-frame-tag? [tag : cstr] #fx{Unsafe} : bool
+    ```c
+    const char *s = tag ? (const char *)(intptr_t)tag : "";
+    for (const char *p = s; *p; p++) {
+      if (strncasecmp(p, "frame", 5) == 0) return true;
+    }
+    return false;
+    ```)
+
+;;; __rhtml-frame-text-to-table -- parse pipe-delimited print-frame output
+;;; into an HTML <table>.  Skips the type row and separator dashes.
+;;; All cell values are HTML-escaped.  Returns an owned string.
+  (defn __rhtml-frame-text-to-table [text : cstr] #fx{Unsafe} : cstr
+    ```c
+    const char *src = text ? (const char *)(intptr_t)text : "";
+    /* Pre-scan: count lines that start with '|' to size the buffer. */
+    size_t cap = strlen(src) * 6 + 256;
+    char *out = malloc(cap);
+    size_t len = 0;
+    #define APPEND(str) do { \
+      size_t n = strlen(str); \
+      if (len + n + 1 > cap) { while (len + n + 1 > cap) cap *= 2; \
+        out = realloc(out, cap); } \
+      memcpy(out + len, str, n); len += n; } while(0)
+    #define APPEND_ESC(ch) do { \
+      const char *rep = NULL; \
+      switch (ch) { \
+        case '&': rep = "&amp;"; break; \
+        case '<': rep = "&lt;"; break; \
+        case '>': rep = "&gt;"; break; \
+        case '"': rep = "&quot;"; break; \
+        case '\'': rep = "&#39;"; break; \
+      } \
+      if (rep) APPEND(rep); else { if (len+2>cap){cap*=2;out=realloc(out,cap);} out[len++]=ch; } \
+    } while(0)
+
+    APPEND("<table class=\"frame-table\">");
+
+    const char *line = src;
+    int row_idx = 0;
+    int is_header_done = 0;
+    while (*line) {
+      const char *nl = strchr(line, '\n');
+      size_t line_len = nl ? (size_t)(nl - line) : strlen(line);
+      /* Skip empty lines */
+      if (line_len == 0) { if (!nl) break; line = nl + 1; continue; }
+      /* Skip separator lines (only |, -, whitespace) */
+      int is_sep = 1;
+      for (size_t i = 0; i < line_len; i++) {
+        char c = line[i];
+        if (c != '|' && c != '-' && c != ' ' && c != '\t' && c != '\r') { is_sep = 0; break; }
+      }
+      if (is_sep) { if (!nl) break; line = nl + 1; continue; }
+      /* Only process lines that start with '|' */
+      if (line[0] != '|') { if (!nl) break; line = nl + 1; continue; }
+
+      if (row_idx == 0) {
+        /* Header row */
+        APPEND("<thead><tr>");
+        for (size_t i = 1; i < line_len; i++) {
+          if (line[i] == '|') {
+            /* End of cell -- but only if next char is space or | or end */
+            /* We'll split on | and trim */
+          }
+        }
+        /* Simple split: extract cells between | delimiters */
+        size_t start = 1; /* skip leading | */
+        for (size_t i = 1; i <= line_len; i++) {
+          if (i == line_len || line[i] == '|') {
+            /* Cell from start to i, trim whitespace */
+            while (start < i && (line[start]==' '||line[start]=='\t')) start++;
+            size_t end = i;
+            while (end > start && (line[end-1]==' '||line[end-1]=='\t'||line[end-1]=='\r')) end--;
+            if (end > start) {
+              APPEND("<th>");
+              for (size_t j = start; j < end; j++) APPEND_ESC(line[j]);
+              APPEND("</th>");
+            }
+            start = i + 1;
+          }
+        }
+        APPEND("</tr></thead><tbody>");
+        is_header_done = 1;
+        row_idx++;
+      } else {
+        /* Skip the type row (row_idx == 1) -- it follows the header */
+        if (row_idx == 1) { row_idx++; if (!nl) break; line = nl + 1; continue; }
+        /* Data row */
+        APPEND("<tr>");
+        size_t start = 1;
+        for (size_t i = 1; i <= line_len; i++) {
+          if (i == line_len || line[i] == '|') {
+            while (start < i && (line[start]==' '||line[start]=='\t')) start++;
+            size_t end = i;
+            while (end > start && (line[end-1]==' '||line[end-1]=='\t'||line[end-1]=='\r')) end--;
+            if (end > start) {
+              APPEND("<td>");
+              for (size_t j = start; j < end; j++) APPEND_ESC(line[j]);
+              APPEND("</td>");
+            }
+            start = i + 1;
+          }
+        }
+        APPEND("</tr>");
+        row_idx++;
+      }
+      if (!nl) break;
+      line = nl + 1;
+    }
+    if (is_header_done) APPEND("</tbody>");
+    APPEND("</table>");
+    out[len] = '\0';
+    #undef APPEND
+    #undef APPEND_ESC
+    return out;
+    ```)
+
+  (defn __rhtml-render-output-table [output : int] #fx{Unsafe} : cstr
+    (if (__rhtml-output-skipped? output)
+      (__rhtml-strdup "")
+      (let [status (__rhtml-status-label (cell-output-status output))
+            raw-meta (__rhtml-output-meta output)
+            meta (__rhtml-html-escape raw-meta)
+            raw-body (__rhtml-output-body output)
+            table (__rhtml-frame-text-to-table raw-body)]
+        (let [out (__rhtml-wrap4
+                    "<div class=\"cell-output-block\"><div class=\"cell-output-meta status-"
+                    status "\">" meta "</div>"
+                    table "</div>")]
+          (do
+            (__rhtml-cstr-free raw-meta)
+            (__rhtml-cstr-free raw-body)
+            (__rhtml-cstr-free meta)
+            (__rhtml-cstr-free table)
+            out)))))
 
   (defn __rhtml-render-output-pre [output : int] #fx{Unsafe} : cstr
     (if (__rhtml-output-skipped? output)
@@ -984,6 +1128,7 @@
       char *error_msg;
       int64_t elapsed_ms;
       int64_t image_paths;
+      char *type_tag;
     } NotebookCellOutput;
 
     NotebookCellOutput *out = (NotebookCellOutput *)(intptr_t)output;
@@ -1140,10 +1285,14 @@
                         (__rhtml-render-source-pre cell)
                         (__rhtml-strdup ""))
           math-cell? (= (attr-get-bool (cell-attrs cell) "math" 0) 1)
+          frame-output? (or (__rhtml-is-frame-tag? (cell-output-type-tag output))
+                            (__rhtml-cstr-eq? (attr-get (cell-attrs cell) "html" "") "table"))
           output-part (if (__rhtml-cell-shows-output? cell output opts)
                         (if math-cell?
                           (__rhtml-render-math-output output)
-                          (__rhtml-render-output-pre output))
+                          (if frame-output?
+                            (__rhtml-render-output-table output)
+                            (__rhtml-render-output-pre output)))
                         (__rhtml-strdup ""))
           image-part (if (__rhtml-cell-shows-output? cell output opts)
                        (__rhtml-render-image-block output

@@ -14,12 +14,14 @@
 This guide walks through the workflow:
 
 1. [Writing your first `.tur.md`](#1-your-first-notebook)
-2. [Rendering: markdown vs HTML, watch mode](#2-rendering)
-3. [The TUI: command mode and editing](#3-the-tui)
-4. [Caching expensive cells](#4-caching)
-5. [Embedding plots and images](#5-plots-and-images)
-6. [Reproducibility and CI](#6-reproducibility-and-ci)
-7. [Customizing keybindings](#7-customizing-keybindings)
+2. [Using external spices from cells](#2-using-external-spices-from-cells)
+3. [Rendering: markdown vs HTML, watch mode](#3-rendering)
+4. [The TUI: command mode and editing](#4-the-tui)
+5. [Caching expensive cells](#5-caching)
+6. [Embedding plots and images](#6-plots-and-images)
+7. [Data analysis workflows](#7-data-analysis-workflows)
+8. [Reproducibility and CI](#8-reproducibility-and-ci)
+9. [Customizing keybindings](#9-customizing-keybindings)
 
 ---
 
@@ -93,7 +95,47 @@ about the workflow is identical.
 
 ---
 
-## 2. Rendering
+## 2. Using external spices from cells
+
+All cells in a notebook share one libturi session, so an `(import ...)`
+in one cell makes the module available in every subsequent cell -- exactly
+like a Jupyter kernel. This is what makes cross-spice workflows possible:
+load data with `tur-frame` in one cell, fit a model with `tur-stats` in
+the next, plot the result with `tur-plot` in a third.
+
+The spices most useful in notebooks:
+
+| Spice | Import | What it provides |
+|-------|--------|------------------|
+| `plot`   | `(import plot/core :refer [plot-write-png])`   | 2D visualization, PNG output |
+| `linalg` | `(import linalg/mat :refer [mat-of mat-mul])`  | Dense linear algebra |
+| `stats`  | `(import stats/dist :refer [dnorm pnorm])`    | Distributions, tests, regression |
+| `frame`  | `(import frame/csv :refer [read-csv])`        | Data frames, CSV I/O |
+
+These spices must be declared in your project's `build.tur` (or the
+notebook's own `build.tur` as `:optional true` deps) so `tur fetch` makes
+them available. Without the declaration, the import fails with a clear
+error -- the spice is not installed.
+
+Example -- load a CSV and print its shape:
+
+```turmeric
+(import frame/csv   :refer [read-csv-string])
+(import frame/frame  :refer [frame-nrows frame-ncols])
+(import frame/print  :refer [print-frame])
+
+(def df (read-csv-string "x,y\n1,2\n2,4\n3,6\n" 0 0 1 0 ""))
+(println (str-append "rows: " (int->str (frame-nrows df))))
+(print-frame (frame-head df 3))
+```
+
+See the [frame guide](frame-guide.md) for the full `tur-frame` API, the
+[linalg guide](linalg-guide.md) for linear algebra, and the example
+notebooks in `spices/notebook/examples/` for end-to-end workflows.
+
+---
+
+## 3. Rendering
 
 Render to markdown (the default):
 
@@ -130,7 +172,7 @@ warm-cache exploration, use the TUI instead.
 
 ---
 
-## 3. The TUI
+## 4. The TUI
 
 ```sh
 tur nb tui analysis.tur.md
@@ -168,7 +210,7 @@ fresh session.
 
 ---
 
-## 4. Caching
+## 5. Caching
 
 For cells that are slow to recompute (loading a large CSV, fitting a model),
 opt in to source-hash caching:
@@ -197,7 +239,7 @@ The cache lives in `.turnb-cache/` beside the source file -- add it to
 
 ---
 
-## 5. Plots and images
+## 6. Plots and images
 
 `tur-notebook` does not require any plotting library. To embed an image, a
 cell writes a PNG and announces its path via the image hook:
@@ -232,7 +274,71 @@ the notebook tooling.
 
 ---
 
-## 6. Reproducibility and CI
+## 7. Data analysis workflows
+
+The notebook format shines when a workflow spans multiple spices. Here is
+a condensed end-to-end analysis: load a CSV with `tur-frame`, compute
+summary statistics with `tur-stats`, fit a regression, and plot the data
+and the fitted line with `tur-plot`. The full version lives in
+`spices/notebook/examples/data-analysis.tur.md`.
+
+Load the data:
+
+```turmeric
+(import frame/csv   :refer [read-csv-string])
+(import frame/frame  :refer [frame-nrows frame-head])
+(import frame/print  :refer [print-frame])
+
+(def csv "x,y\n1,2.1\n2,3.9\n3,6.2\n4,8.1\n5,9.8\n")
+(def df (read-csv-string csv 0 0 1 0 ""))
+(print-frame (frame-head df 5))
+```
+
+Summarize and fit:
+
+```turmeric
+(import frame/frame    :refer [frame-column])
+(import stats/summary  :refer [col-mean col-sd])
+(import stats/regress   :refer [ols-frame])
+(import stats/fmt      :refer [print-fit])
+
+(def y-col (frame-column df "y"))
+(println (str-append "mean = " (float->str (col-mean y-col))))
+(println (str-append "sd   = " (float->str (col-sd y-col))))
+
+(def fit (ols-frame df "y" (cons (cast "x" :int) 0) 1))
+(print-fit fit)
+```
+
+Plot the data and the fitted line (see [Plots and images](#6-plots-and-images)
+for the two-call pattern):
+
+```turmeric
+(import plot/core  :refer [plot-write-png])
+(import plot/point :refer [points])
+(import plot/line  :refer [function])
+(import plot/decor :refer [axes tick-grid])
+(import plot/style :refer [default-line-style default-point-style default-plot-opts])
+(import notebook/image :refer [image-hook-record-path])
+
+;; ... build scatter data from the frame, then:
+(plot-write-png
+  (vec-of (tick-grid)
+          (axes)
+          (points scatter-data (default-point-style) "observed")
+          (function fit-line 0.0 10.0 128
+                    (default-line-style) "fitted"))
+  (default-plot-opts)
+  "/tmp/nb-analysis.png")
+(image-hook-record-path "/tmp/nb-analysis.png")
+```
+
+Each step is a cell, the prose explains the analysis, and `tur nb export html`
+produces a shareable report with the plot embedded as a base64 data URL.
+
+---
+
+## 8. Reproducibility and CI
 
 Notebooks that use randomness (any cell calling into `tur-stats`'s `rng-*`
 or any PRNG) should pass an **explicit seed**. The notebook tooling does
@@ -269,7 +375,7 @@ control to catch regressions in numerical behavior.
 
 ---
 
-## 7. Customizing keybindings
+## 9. Customizing keybindings
 
 The TUI's defaults live in `notebook/keys.tur`. Override them with a
 file passed to `--keybindings`:
