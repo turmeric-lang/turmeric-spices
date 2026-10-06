@@ -73,7 +73,7 @@ INDEX_TAB_JS = '''\
 # Spice metadata
 # ---------------------------------------------------------------------------
 
-SpiceMeta = dict  # {name, description, tier, c_dep}
+SpiceMeta = dict  # {name, description, tier, macos, linux, windows, wasm, c_dep}
 
 
 def discover_spices() -> list[Path]:
@@ -91,22 +91,34 @@ def parse_readme_table(readme_text: str) -> dict[str, SpiceMeta]:
     """
     Parse the spices table in the top-level README.md and return a dict keyed
     by spice short-name (e.g. 'json' for 'tur-json').
+
+    The table has eight columns: Spice, Description, Tier, macOS, Linux,
+    Windows, WASM, C dep.
     """
     rows: dict[str, SpiceMeta] = {}
-    # Match table rows like: | [`tur-foo`](spices/foo/) | desc | tier | c dep |
+    # Match table rows like:
+    # | [`tur-foo`](spices/foo/) | desc | tier | macos | linux | windows | wasm | c dep |
     row_re = re.compile(
         r'^\|\s*\[`tur-([\w\-]+)`\]\(spices/[^)]+\)\s*\|'
-        r'\s*([^|]+?)\s*\|'
-        r'\s*([^|]+?)\s*\|'
-        r'\s*([^|]+?)\s*\|',
+        r'\s*([^|]+?)\s*\|'   # description
+        r'\s*([^|]+?)\s*\|'   # tier
+        r'\s*([^|]+?)\s*\|'   # macOS
+        r'\s*([^|]+?)\s*\|'   # Linux
+        r'\s*([^|]+?)\s*\|'   # Windows
+        r'\s*([^|]+?)\s*\|'   # WASM
+        r'\s*([^|]+?)\s*\|',  # C dep
         re.MULTILINE,
     )
     for m in row_re.finditer(readme_text):
-        name, desc, tier, c_dep = m.groups()
+        name, desc, tier, macos, linux, windows, wasm, c_dep = m.groups()
         rows[name] = {
             'name': name,
             'description': desc.strip(),
             'tier': tier.strip(),
+            'macos': macos.strip(),
+            'linux': linux.strip(),
+            'windows': windows.strip(),
+            'wasm': wasm.strip(),
             'c_dep': c_dep.strip(),
         }
     return rows
@@ -235,6 +247,10 @@ def collect_spice_meta(spice_dirs: list[Path],
         if not meta.get('description'):
             meta['description'] = extract_build_description(d / 'build.tur')
         meta.setdefault('tier', '--')
+        meta.setdefault('macos', '--')
+        meta.setdefault('linux', '--')
+        meta.setdefault('windows', '--')
+        meta.setdefault('wasm', '--')
         meta.setdefault('c_dep', '--')
         out.append(meta)
     return out
@@ -397,12 +413,20 @@ def render_top_index(metas: list[SpiceMeta], out_dir: Path,
         name = meta['name']
         desc = meta.get('description', '') or ''
         tier = meta.get('tier', '--')
+        macos = meta.get('macos', '--')
+        linux = meta.get('linux', '--')
+        windows = meta.get('windows', '--')
+        wasm = meta.get('wasm', '--')
         c_dep = meta.get('c_dep', '--')
         rows.append(
             '      <tr>'
             f'<td><a href="{html_module.escape(name)}/"><code>tur-{html_module.escape(name)}</code></a></td>'
             f'<td>{html_module.escape(desc)}</td>'
             f'<td>{html_module.escape(tier)}</td>'
+            f'<td class="platform">{html_module.escape(macos)}</td>'
+            f'<td class="platform">{html_module.escape(linux)}</td>'
+            f'<td class="platform">{html_module.escape(windows)}</td>'
+            f'<td class="platform">{html_module.escape(wasm)}</td>'
             f'<td>{html_module.escape(c_dep)}</td>'
             f'<td><a href="{html_module.escape(name)}/api/">API</a></td>'
             '</tr>'
@@ -410,7 +434,10 @@ def render_top_index(metas: list[SpiceMeta], out_dir: Path,
     table_html = (
         '<table class="spices-table">\n'
         '  <thead><tr>'
-        '<th>Spice</th><th>Description</th><th>Tier</th><th>C dep</th><th>Docs</th>'
+        '<th>Spice</th><th>Description</th><th>Tier</th>'
+        '<th title="macOS">macOS</th><th title="Linux">Linux</th>'
+        '<th title="Windows">Windows</th><th title="WebAssembly">WASM</th>'
+        '<th>C dep</th><th>Docs</th>'
         '</tr></thead>\n'
         '  <tbody>\n'
         + '\n'.join(rows)
@@ -487,6 +514,7 @@ def render_top_index(metas: list[SpiceMeta], out_dir: Path,
 {GUIDE_CSS}
     .spices-table, .guides-table {{ width:100%; margin-top:1rem; }}
     .spices-table td code {{ font-size:0.85rem; }}
+    .spices-table td.platform, .spices-table th[title] {{ text-align:center; white-space:nowrap; }}
     .guides-table th:first-child, .guides-table td:first-child {{ white-space:nowrap; }}
     .index-tabs {{ display:flex; gap:2px; border-bottom:1px solid var(--border); margin-bottom:1.5rem; }}
     .index-tab {{ padding:0.5rem 1.1rem; background:transparent; color:var(--text-sec); border:none; border-bottom:2px solid transparent; cursor:pointer; font-size:0.95rem; font-family:inherit; transition:all 0.14s; }}
