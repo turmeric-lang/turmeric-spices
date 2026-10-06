@@ -124,5 +124,6 @@ place.
 
 ## See also
 
+- [Guide](https://turmeric-lang.com/docs/html/guides/json-guide.html)
 - [API reference](api/)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/json>

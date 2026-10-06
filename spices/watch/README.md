@@ -166,3 +166,9 @@ tur run tests/drain_burst_test.tur          # single-file burst collapse
 tur run tests/tree_test.tur                 # WT6 + WTNF2/3 per-file naming
 tur run tests/tree_burst_test.tur           # WTNF4 multi-file coalesce
 ```
+
+## See also
+
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/watch-guide.html)
+- [tur-watch guide](https://turmeric-lang.com/docs/html/guides/tur-watch-guide.html)
+- Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/watch>

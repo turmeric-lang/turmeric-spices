@@ -71,4 +71,6 @@ column-major storage to match OpenGL conventions.
 
 ## See also
 
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/linalg-guide.html)
+- [API reference](api/)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/linalg>

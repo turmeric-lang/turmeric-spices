@@ -460,3 +460,9 @@ answer: removing the OR-Set merge's context test leaves 400 seeds green
 (removes simply stop propagating), and dropping the clock max in `rga-merge`
 leaves every seed green because each replica corrupts the id tree identically.
 Both are caught by hand-written assertions instead.
+
+## See also
+
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/crdt-guide.html)
+- [API reference](api/)
+- Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/crdt>

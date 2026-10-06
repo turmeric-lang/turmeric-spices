@@ -99,5 +99,6 @@ let [a frame("x" list(1.0 2.0 3.0))
 
 ## See also
 
+- [Guide](https://turmeric-lang.com/docs/html/guides/stats-guide.html)
 - [API reference](api/)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/stats>

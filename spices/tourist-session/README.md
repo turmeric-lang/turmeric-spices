@@ -237,3 +237,8 @@ JSON `serde` codec, both built-in stores through the `Store` vtable,
 `session-rotate!`, the CSRF token + middleware decision, and the full ctx +
 middleware request lifecycle (lazy load, dirty persist, destroy) driven against
 fabricated tourist contexts.
+
+## See also
+
+- [Session guide](https://turmeric-lang.com/docs/html/guides/tourist-session-guide.html)
+- Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/tourist-session>

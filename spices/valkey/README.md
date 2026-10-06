@@ -95,5 +95,6 @@ unchanged. See `errors/` for the rejected cases.
 
 ## See also
 
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/valkey-guide.html)
 - [API reference](api/)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/valkey>

@@ -280,6 +280,7 @@ errors/run.sh           # the three compile-fail linear fixtures
 
 ## See also
 
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/nng-guide.html)
 - [API reference](api/)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/nng>
 - [`tur-msgpack`](../msgpack/) -- the binary codec whose buffer layout this

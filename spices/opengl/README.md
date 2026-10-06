@@ -257,5 +257,6 @@ after linking is a use-after-delete rather than a second link.
 
 ## See also
 
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/opengl-guide.html)
 - [API reference](api/)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/opengl>

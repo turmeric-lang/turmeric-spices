@@ -196,6 +196,7 @@ nor yyjson behind it.
 
 ## See also
 
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/msgpack-guide.html)
 - [tur-json](../json/README.md) -- the text twin; when to pick which is in the
   [developing-spices guide](https://github.com/turmeric-lang/turmeric/blob/main/docs/guides/developing-spices-guide.md)
 - `stdlib/serial.tur` -- `Buf`'s layout peer (`{ int64 len; uint8 data[] }`)
