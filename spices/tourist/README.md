@@ -56,6 +56,7 @@ turmeric repo for the full roadmap.
 
 ## See also
 
+- [Routing guide](https://turmeric-lang.com/docs/html/guides/tourist-routing-guide.html)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/tourist>
 
 ## Tests

@@ -140,5 +140,8 @@ turmeric repo for the full roadmap.
 
 ## See also
 
+- [HTTP server guide](https://turmeric-lang.com/docs/html/guides/httpd-guide.html)
+- [Async guide](https://turmeric-lang.com/docs/html/guides/httpd-async-guide.html)
+- [Middleware guide](https://turmeric-lang.com/docs/html/guides/httpd-middleware-guide.html)
 - [API reference](api/) (generated)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/httpd>

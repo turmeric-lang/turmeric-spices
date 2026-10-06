@@ -242,3 +242,9 @@ tur test tests/signal                                 # all pass
 Modules that call libm (`signal/osc`, `signal/shaper`) carry a
 `__tur_autolink__: -lm` directive so any program importing them links
 against the math library automatically.
+
+## See also
+
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/signal-guide.html)
+- [API reference](api/)
+- Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/signal>

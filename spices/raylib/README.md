@@ -78,5 +78,6 @@ linear cases.
 
 ## See also
 
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/raylib-guide.html)
 - [API reference](api/)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/raylib>

@@ -244,6 +244,13 @@ that writes a component it did not declare now fails to elaborate.
 See the original report at
 [`docs/archive/history/ecs-defsystem-write-caps-not-enforced.md`](https://github.com/turmeric-lang/turmeric/blob/main/docs/archive/history/ecs-defsystem-write-caps-not-enforced.md).
 
+## See also
+
+- [ECS guide](https://turmeric-lang.com/docs/html/guides/ecs-guide.html)
+- [ECS storage guide](https://turmeric-lang.com/docs/html/guides/ecs-storage-guide.html)
+- [ECS cross-world guide](https://spices.turmeric-lang.com/docs/html/guides/ecs-cross-world-guide.html)
+- Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/ecs>
+
 ## License
 
 MIT.

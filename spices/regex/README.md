@@ -57,5 +57,6 @@ let [r regex-compile("(?P<year>\\d{4})-(?P<month>\\d{2})" 0)]
 
 ## See also
 
+- [Guide](https://turmeric-lang.com/docs/html/guides/regex-guide.html)
 - [API reference](api/)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/regex>

@@ -342,5 +342,6 @@ tty, so the key-reading and key-name test suites run safely in CI.
 
 ## See also
 
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/ansi-guide.html)
 - [API reference](api/)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/ansi>

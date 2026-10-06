@@ -62,5 +62,6 @@ let [s ok-val(surface-create(256 256))
 
 ## See also
 
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/plutovg-guide.html)
 - [API reference](api/)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/plutovg>

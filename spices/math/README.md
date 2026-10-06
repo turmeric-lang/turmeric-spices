@@ -44,5 +44,6 @@ let [a vec3(1.0 0.0 0.0)
 
 ## See also
 
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/math-guide.html)
 - [API reference](api/)
 - Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/math>

@@ -80,3 +80,9 @@ Cells that produce images can advertise them to the TUI via:
 
 The TUI renders PNG images inline using the Kitty graphics protocol, iTerm2
 inline images, or a text fallback for other terminals.
+
+## See also
+
+- [Guide](https://spices.turmeric-lang.com/docs/html/guides/notebook-guide.html)
+- [API reference](api/)
+- Source: <https://github.com/turmeric-lang/turmeric-spices/tree/main/spices/notebook>
