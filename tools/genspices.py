@@ -35,6 +35,39 @@ SPICES_REPO = Path('.')
 
 PAGE_HEADER = build_page_header(active='Spices')
 
+INDEX_TAB_JS = '''\
+  <script>
+  (function(){
+    var tabs = document.querySelectorAll('.index-tab');
+    if (!tabs.length) return;
+    var panels = {
+      spices: document.getElementById('panel-spices'),
+      guides: document.getElementById('panel-guides'),
+    };
+    function activate(name){
+      tabs.forEach(function(t){
+        var on = t.dataset.tab === name;
+        t.classList.toggle('active', on);
+        t.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+      Object.keys(panels).forEach(function(k){
+        if (panels[k]) panels[k].hidden = (k !== name);
+      });
+    }
+    tabs.forEach(function(t){
+      t.addEventListener('click', function(){ activate(t.dataset.tab); });
+    });
+    // Sidebar / in-page anchor links to #spices or #guides switch the tab too.
+    document.querySelectorAll('a[href^="#"]').forEach(function(a){
+      a.addEventListener('click', function(){
+        var hash = a.getAttribute('href');
+        if (hash === '#spices') activate('spices');
+        else if (hash === '#guides') activate('guides');
+      });
+    });
+  })();
+  </script>'''
+
 
 # ---------------------------------------------------------------------------
 # Spice metadata
@@ -350,7 +383,7 @@ def render_top_index(metas: list[SpiceMeta], out_dir: Path,
             + '\n  </tbody>\n</table>'
         )
         guides_section = (
-            '<h2 id="guides" style="margin-top:1.5rem">Guides</h2>\n'
+            '<h2 id="guides">Guides</h2>\n'
             '<p>Long-form, task-oriented walkthroughs for individual spices. '
             'See the <a href="guides/">full guide index</a> for sidebar navigation.</p>\n'
             f'{guides_table_html}\n'
@@ -390,13 +423,48 @@ def render_top_index(metas: list[SpiceMeta], out_dir: Path,
         'reference.</p>'
     )
 
+    spices_section = (
+        '<h2 id="spices">Spices</h2>\n'
+        f'{intro}\n'
+        f'{table_html}\n'
+    )
+
+    # ---- Tabbed layout: Spices first (default), Guides second -------------
+    has_guides = bool(guides)
+    if has_guides:
+        tabs_html = (
+            '<div class="index-tabs" role="tablist" aria-label="Spices index">\n'
+            '  <button class="index-tab active" id="tab-spices" role="tab" '
+            'aria-selected="true" aria-controls="panel-spices" '
+            'data-tab="spices">Spices</button>\n'
+            '  <button class="index-tab" id="tab-guides" role="tab" '
+            'aria-selected="false" aria-controls="panel-guides" '
+            'data-tab="guides">Guides</button>\n'
+            '</div>\n'
+        )
+        body_content = (
+            f'{tabs_html}'
+            '<div class="index-panel" id="panel-spices" role="tabpanel" '
+            'aria-labelledby="tab-spices">\n'
+            f'{spices_section}'
+            '</div>\n'
+            '<div class="index-panel" id="panel-guides" role="tabpanel" '
+            'aria-labelledby="tab-guides" hidden>\n'
+            f'{guides_section}'
+            '</div>\n'
+        )
+        tab_js = INDEX_TAB_JS
+    else:
+        body_content = spices_section
+        tab_js = ''
+
     sidebar_links = ''
-    if guides:
+    if has_guides:
         sidebar_links = (
             '      <h3>On this page</h3>\n'
             '      <ul>\n'
-            '        <li><a href="#guides">Guides</a></li>\n'
             '        <li><a href="#spices">Spices</a></li>\n'
+            '        <li><a href="#guides">Guides</a></li>\n'
             '      </ul>\n'
         )
 
@@ -420,6 +488,11 @@ def render_top_index(metas: list[SpiceMeta], out_dir: Path,
     .spices-table, .guides-table {{ width:100%; margin-top:1rem; }}
     .spices-table td code {{ font-size:0.85rem; }}
     .guides-table th:first-child, .guides-table td:first-child {{ white-space:nowrap; }}
+    .index-tabs {{ display:flex; gap:2px; border-bottom:1px solid var(--border); margin-bottom:1.5rem; }}
+    .index-tab {{ padding:0.5rem 1.1rem; background:transparent; color:var(--text-sec); border:none; border-bottom:2px solid transparent; cursor:pointer; font-size:0.95rem; font-family:inherit; transition:all 0.14s; }}
+    .index-tab:hover {{ color:var(--text-primary); }}
+    .index-tab.active {{ color:var(--gold-bright); border-bottom-color:var(--gold); }}
+    .index-panel h2:first-child {{ margin-top:0; }}
   </style>
 </head>
 <body>
@@ -431,10 +504,7 @@ def render_top_index(metas: list[SpiceMeta], out_dir: Path,
     </div>
     <div class="content guide-content">
       <h1>Turmeric Spices</h1>
-      {guides_section}
-      <h2 id="spices" style="margin-top:2rem">Spices</h2>
-      {intro}
-      {table_html}
+      {body_content}
     </div>
   </div>
   <footer class="site-footer">
@@ -442,6 +512,7 @@ def render_top_index(metas: list[SpiceMeta], out_dir: Path,
   </footer>
 {TURMERIC_HIGHLIGHT_JS}
 {SYNTAX_TOGGLE_JS}
+{tab_js}
 </body>
 </html>
 '''
