@@ -1,0 +1,301 @@
+;; prob/cuckoo -- Cuckoo filter: approximate membership with deletion.
+;;
+;; A Cuckoo filter stores fingerprints in a bucket array with cuckoo hashing.
+;; Each item maps to two candidate buckets; each bucket holds up to 4
+;; fingerprints.  Insert tries both buckets; if both are full, it kicks an
+;; existing fingerprint to its alternate bucket (cuckoo relocation), up to a
+;; max-kick count (500).  Lookup checks both buckets for the fingerprint.
+;; Delete finds and removes the fingerprint from either bucket.
+;;
+;; The key advantage over Bloom is deletion: a Cuckoo filter can remove an
+;; item without a counting variant.  The trade-off is a bounded relocation
+;; loop on insert and a load-factor limit (~95% at 4 slots/bucket).
+;;
+;; Partial-key cuckoo hashing (Fan et al. 2014): the second bucket index is
+;; i2 = i1 xor hash(fingerprint), so given a fingerprint in bucket i1, the
+;; alternate bucket i2 can always be computed without the original key.
+;; This is what makes merge possible: iterate B's buckets and re-insert
+;; each fingerprint into a new filter.
+;;
+;; Merge is "insert all of B into A" -- NOT idempotent and NOT commutative
+;; under shared items.  No JoinSemilattice instance (probabilistic-spice-plan
+;; 2.6).  The docstring on cuckoo-merge says so.
+;;
+;; No user inline C (probabilistic-spice-plan 2.8).  All operations are Vec
+;; arithmetic over the flat bucket array.  num-buckets should be a power of
+;; two so that the bit-and mask is a fast mod.
+
+(defmodule prob/cuckoo
+  (import prob/hash :refer [prob-hash-int prob-unsigned-shr])
+  (export Cuckoo cuckoo-new cuckoo-free cuckoo-insert! cuckoo-maybe?
+          cuckoo-delete! cuckoo-merge cuckoo-num-buckets cuckoo-bucket-size
+          cuckoo-count)
+
+;;; Cuckoo -- a Cuckoo filter with num-buckets buckets of bucket-size slots.
+;;;
+;;; The backing array is a flat Vec[int] of length num-buckets * bucket-size.
+;;; Bucket i occupies slots [i*bucket-size, (i+1)*bucket-size).  Each slot
+;;; is 0 (empty) or a non-zero 8-bit fingerprint.
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defstruct Cuckoo [buckets : (Vec int) num-buckets : int bucket-size : int])
+
+;;; cuckoo-num-buckets -- the bucket count.
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn cuckoo-num-buckets [^borrow cf : Cuckoo] : int (.num-buckets cf))
+
+;;; cuckoo-bucket-size -- the slots per bucket.
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn cuckoo-bucket-size [^borrow cf : Cuckoo] : int (.bucket-size cf))
+
+;;; __cuckoo-bucket-size -- constant: 4 slots per bucket.
+(defn __cuckoo-bucket-size [] : int 4)
+
+;;; __cuckoo-max-kicks -- constant: 500 kicks before declaring full.
+(defn __cuckoo-max-kicks [] : int 500)
+
+;;; cuckoo-new -- create a Cuckoo filter with num-buckets buckets.
+;;;
+;;; Parameters:
+;;;   num-buckets -- number of buckets (should be a power of two)
+;;;
+;;; Returns:
+;;;   A new Cuckoo filter with all slots empty.  Each bucket has 4 slots.
+;;;
+;;; Example:
+;;;   (let [cf (cuckoo-new 1024)] ...)
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn cuckoo-new [num-buckets : int] : Cuckoo
+  (let [bsz (__cuckoo-bucket-size)
+        v (vec-new)]
+    (__cuckoo-init v 0 (* num-buckets bsz))
+    (Cuckoo v num-buckets bsz)))
+
+;;; __cuckoo-init -- internal: push n zeros into the bucket Vec.
+(defn __cuckoo-init [v : (Vec int) i : int n : int] : nil
+  (if (>= i n)
+    nil
+    (do (vec-push! v 0)
+        (__cuckoo-init v (+ i 1) n))))
+
+;;; cuckoo-free -- release the bucket array.
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn cuckoo-free [cf : Cuckoo] : void
+  (vec-free (.buckets cf)))
+
+;;; __cuckoo-fingerprint -- compute a non-zero 8-bit fingerprint.
+;;;
+;;; The low 8 bits of prob-hash-int(key), forced non-zero (0 is the empty
+;;; sentinel).  If the hash's low 8 bits are 0, use 1.
+(defn __cuckoo-fingerprint [key : int] : int
+  (let [fp (bit-and (prob-hash-int key) 255)]
+    (if (= fp 0) 1 fp)))
+
+;;; __cuckoo-alt-index -- compute the alternate bucket index.
+;;;
+;;; Partial-key cuckoo hashing: i2 = i1 xor hash(fingerprint).  The hash
+;;; of the fingerprint uses prob-hash-int, and the result is masked to
+;;; [0, num-buckets) via bit-and (power-of-two num-buckets).
+(defn __cuckoo-alt-index [idx : int fp : int num-buckets : int] : int
+  (bit-and (bit-xor idx (prob-hash-int fp)) (- num-buckets 1)))
+
+;;; __cuckoo-bucket-base -- compute the base slot index for bucket idx.
+(defn __cuckoo-bucket-base [idx : int bsz : int] : int
+  (* idx bsz))
+
+;;; __cuckoo-try-insert -- internal: try to place fp in one slot of bucket.
+;;;
+;;; Scans the bucket's slots; if any is 0 (empty), writes fp and returns
+;;; true.  If all slots are occupied, returns false.
+(defn __cuckoo-try-insert [buckets : (Vec int) base : int bsz : int
+                           j : int fp : int] : bool
+  (if (>= j bsz)
+    false
+    (if (= (vec-get buckets (+ base j)) 0)
+      (do (vec-set! buckets (+ base j) fp) true)
+      (__cuckoo-try-insert buckets base bsz (+ j 1) fp))))
+
+;;; __cuckoo-find-fp -- internal: find the slot index of fp in a bucket.
+;;;
+;;; Returns the slot offset (0..bsz-1) if found, or -1 if not found.
+(defn __cuckoo-find-fp [buckets : (Vec int) base : int bsz : int
+                        j : int fp : int] : int
+  (if (>= j bsz)
+    -1
+    (if (= (vec-get buckets (+ base j)) fp)
+      j
+      (__cuckoo-find-fp buckets base bsz (+ j 1) fp))))
+
+;;; __cuckoo-relocate -- internal: cuckoo relocation loop.
+;;;
+;;; Kicks the fingerprint at slot 0 of the current bucket to its alternate
+;;; bucket, then tries to insert the evicted fingerprint there.  Repeats
+;;; up to max-kicks times.  Returns true if all relocations succeeded,
+;;; false if the filter is full.
+(defn __cuckoo-relocate [buckets : (Vec int) fp : int idx : int
+                         num-buckets : int bsz : int kicks : int] : bool
+  (if (>= kicks (__cuckoo-max-kicks))
+    false
+    (let [base  (__cuckoo-bucket-base idx bsz)
+          evicted (vec-get buckets base)]
+      (do (vec-set! buckets base fp)
+          (let [alt (__cuckoo-alt-index idx evicted num-buckets)
+                alt-base (__cuckoo-bucket-base alt bsz)]
+            (if (__cuckoo-try-insert buckets alt-base bsz 0 evicted)
+              true
+              (__cuckoo-relocate buckets evicted alt num-buckets bsz
+                (+ kicks 1))))))))
+
+;;; cuckoo-insert! -- add an element to the filter.
+;;;
+;;; Parameters:
+;;;   cf  -- the filter (mutated in place)
+;;;   key -- the integer key to insert
+;;;
+;;; Returns:
+;;;   true if the element was inserted (or was already present).
+;;;   false if the filter is full (max kicks exceeded).
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn cuckoo-insert! [^borrow cf : Cuckoo key : int] : bool
+  (let [fp  (__cuckoo-fingerprint key)
+        nb  (.num-buckets cf)
+        bsz (.bucket-size cf)
+        i1  (bit-and (prob-hash-int key) (- nb 1))
+        i2  (__cuckoo-alt-index i1 fp nb)
+        buckets (.buckets cf)
+        base1 (__cuckoo-bucket-base i1 bsz)
+        base2 (__cuckoo-bucket-base i2 bsz)]
+    (if (>= (__cuckoo-find-fp buckets base1 bsz 0 fp) 0)
+      true
+      (if (>= (__cuckoo-find-fp buckets base2 bsz 0 fp) 0)
+        true
+        (if (__cuckoo-try-insert buckets base1 bsz 0 fp)
+          true
+          (if (__cuckoo-try-insert buckets base2 bsz 0 fp)
+            true
+            (__cuckoo-relocate buckets fp i1 nb bsz 0)))))))
+
+;;; cuckoo-maybe? -- is the element possibly in the filter?
+;;;
+;;; Parameters:
+;;;   cf  -- the filter
+;;;   key -- the integer key to check
+;;;
+;;; Returns:
+;;;   true if the fingerprint is found in either candidate bucket.
+;;;   false if not found (element is definitely not present).
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn cuckoo-maybe? [^borrow cf : Cuckoo key : int] : bool
+  (let [fp  (__cuckoo-fingerprint key)
+        nb  (.num-buckets cf)
+        bsz (.bucket-size cf)
+        i1  (bit-and (prob-hash-int key) (- nb 1))
+        i2  (__cuckoo-alt-index i1 fp nb)
+        buckets (.buckets cf)]
+    (if (>= (__cuckoo-find-fp buckets (__cuckoo-bucket-base i1 bsz) bsz 0 fp) 0)
+      true
+      (>= (__cuckoo-find-fp buckets (__cuckoo-bucket-base i2 bsz) bsz 0 fp) 0))))
+
+;;; __cuckoo-remove-from -- internal: remove fp from a bucket if found.
+;;;
+;;; Returns true if found and removed (slot set to 0), false if not found.
+(defn __cuckoo-remove-from [buckets : (Vec int) base : int bsz : int
+                            j : int fp : int] : bool
+  (let [slot (__cuckoo-find-fp buckets base bsz j fp)]
+    (if (< slot 0)
+      false
+      (do (vec-set! buckets (+ base slot) 0) true))))
+
+;;; cuckoo-delete! -- remove an element from the filter.
+;;;
+;;; Parameters:
+;;;   cf  -- the filter (mutated in place)
+;;;   key -- the integer key to remove
+;;;
+;;; Returns:
+;;;   true if the fingerprint was found and removed.
+;;;   false if the fingerprint was not found (element not present).
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn cuckoo-delete! [^borrow cf : Cuckoo key : int] : bool
+  (let [fp  (__cuckoo-fingerprint key)
+        nb  (.num-buckets cf)
+        bsz (.bucket-size cf)
+        i1  (bit-and (prob-hash-int key) (- nb 1))
+        i2  (__cuckoo-alt-index i1 fp nb)
+        buckets (.buckets cf)]
+    (if (__cuckoo-remove-from buckets (__cuckoo-bucket-base i1 bsz) bsz 0 fp)
+      true
+      (__cuckoo-remove-from buckets (__cuckoo-bucket-base i2 bsz) bsz 0 fp))))
+
+;;; __cuckoo-count-loop -- internal: count non-zero slots.
+(defn __cuckoo-count-loop [buckets : (Vec int) i : int n : int acc : int] : int
+  (if (>= i n)
+    acc
+    (__cuckoo-count-loop buckets (+ i 1) n
+      (if (= (vec-get buckets i) 0) acc (+ acc 1)))))
+
+;;; cuckoo-count -- the number of occupied slots.
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn cuckoo-count [^borrow cf : Cuckoo] : int
+  (__cuckoo-count-loop (.buckets cf) 0
+    (* (.num-buckets cf) (.bucket-size cf)) 0))
+
+;;; __cuckoo-merge-scan -- internal: scan B's buckets, re-insert each fp.
+;;;
+;;; For each non-zero fingerprint in B, compute its two candidate buckets
+;;; in the result and try to insert.  If both are full, relocate.  Returns
+;;; true if all inserted, false if the result is full.
+(defn __cuckoo-merge-scan [dst-buckets : (Vec int) src-buckets : (Vec int)
+                           i : int n : int bsz : int nb : int] : bool
+  (if (>= i n)
+    true
+    (let [fp (vec-get src-buckets i)]
+      (if (= fp 0)
+        (__cuckoo-merge-scan dst-buckets src-buckets (+ i 1) n bsz nb)
+        (let [bucket-idx (/ i bsz)
+              base (__cuckoo-bucket-base bucket-idx bsz)
+              alt (__cuckoo-alt-index bucket-idx fp nb)
+              alt-base (__cuckoo-bucket-base alt bsz)]
+          (if (__cuckoo-try-insert dst-buckets base bsz 0 fp)
+            (__cuckoo-merge-scan dst-buckets src-buckets (+ i 1) n bsz nb)
+            (if (__cuckoo-try-insert dst-buckets alt-base bsz 0 fp)
+              (__cuckoo-merge-scan dst-buckets src-buckets (+ i 1) n bsz nb)
+              (if (__cuckoo-relocate dst-buckets fp bucket-idx nb bsz 0)
+                (__cuckoo-merge-scan dst-buckets src-buckets (+ i 1) n bsz nb)
+                false))))))))
+
+;;; cuckoo-merge -- "insert all of B into A" into a new filter.
+;;;
+;;; Parameters:
+;;;   a -- first filter
+;;;   b -- second filter (must have the same num-buckets and bucket-size)
+;;;
+;;; Returns:
+;;;   A new Cuckoo filter containing all fingerprints from both a and b.
+;;;   Both inputs remain valid.
+;;;
+;;; Note: this merge is NOT idempotent and NOT commutative under shared
+;;; items.  It is "insert all of B into A", not a lattice join.  No
+;;; JoinSemilattice instance is declared for Cuckoo (probabilistic-spice-plan
+;;; 2.6).  If the result filter is full, some fingerprints from B may be
+;;; dropped; the caller should size num-buckets to accommodate the union.
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn cuckoo-merge [^borrow a : Cuckoo ^borrow b : Cuckoo] : Cuckoo
+  (let [r (cuckoo-new (.num-buckets a))
+        n (* (.num-buckets a) (.bucket-size a))]
+    (__cuckoo-merge-scan (.buckets r) (.buckets a) 0 n (.bucket-size a)
+      (.num-buckets a))
+    (__cuckoo-merge-scan (.buckets r) (.buckets b) 0 n (.bucket-size a)
+      (.num-buckets a))
+    r))
+
+) ;; end defmodule prob/cuckoo

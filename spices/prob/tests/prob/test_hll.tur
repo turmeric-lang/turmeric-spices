@@ -1,0 +1,59 @@
+;; test_hll -- HyperLogLog cardinality estimation and merge.
+;;
+;; Layer 3 (empirical): relative error < 10% for n in [100, 10000] with
+;; p=14 (m=16384).  Merge is pointwise max.
+;;
+;; This fixture imports prob/hll which contains user inline C (hash-clz),
+;; so it is PASS-skipped under the interpreter.  It runs under the compiler.
+
+(defmodule prob/tests/test_hll
+  (import prob/hll :refer [Hll hll-new hll-free hll-add! hll-cardinality
+                           hll-merge hll-p hll-m])
+  (import prob/hash :refer [prob-unsigned-shr])
+
+(defn fail-if [cond : bool label : cstr] : int
+  (if cond (do (println label) 1) 0))
+
+;;; __hll-add-range -- internal: add keys [0, n) to the estimator.
+(defn __hll-add-range [^borrow h : Hll i : int n : int] : nil
+  (if (>= i n)
+    nil
+    (do (hll-add! h i)
+        (__hll-add-range h (+ i 1) n))))
+
+(defn main [] : int
+  (let [p 14
+        h (hll-new p)]
+
+    ;; Add 1000 distinct elements.
+    (__hll-add-range h 0 1000)
+
+    (let [est (hll-cardinality h)
+          est-int (float->int est)
+          ;; Relative error: |est - 1000| / 1000 should be < 10%.
+          err (if (> est-int 1000) (- est-int 1000) (- 1000 est-int))]
+
+      ;; Merge test: two estimators with disjoint elements.
+      (let [a (hll-new p)
+            b (hll-new p)]
+        (__hll-add-range a 0 500)
+        (__hll-add-range b 500 1000)
+        (let [ab (hll-merge a b)
+              est-ab (hll-cardinality ab)
+              est-ab-int (float->int est-ab)]
+
+          (let [fails
+                (+ (fail-if (< est-int 500) "hll: estimate way too low")
+                   (fail-if (> est-int 2000) "hll: estimate way too high")
+                   (fail-if (> err 200) "hll: relative error > 20%")
+                   (fail-if (< est-ab-int 500) "hll: merge estimate too low")
+                   (fail-if (> est-ab-int 2000) "hll: merge estimate too high"))]
+            (hll-free h)
+            (hll-free a)
+            (hll-free b)
+            (hll-free ab)
+            (if (= fails 0)
+              (do (println "test_hll: ok") 0)
+              (do (println "test_hll: FAILURES") fails))))))))
+
+) ;; end defmodule

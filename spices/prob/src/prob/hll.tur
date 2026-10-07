@@ -1,0 +1,233 @@
+;; prob/hll -- HyperLogLog: cardinality estimation in m registers.
+;;
+;; HyperLogLog estimates the number of distinct elements in a stream using
+;; m = 2^p registers (p in [4..16]).  Each element is hashed; the low p bits
+;; select a register, and the position of the leftmost set bit in the
+;; remaining bits updates that register by max.  The estimate is the
+;; harmonic mean of the registers, with bias corrections for small and
+;; large ranges.
+;;
+;; Merge is pointwise max of registers -- associative, commutative,
+;; idempotent -- a join-semilattice.  The all-zero register set is bottom.
+;;
+;; Representation: a by-value struct holding a Vec[int] handle (the register
+;; array), p, and m.  The Vec is shared across copies, so `hll-add!` mutates
+;; in place.
+;;
+;; Inline C: one line, `hash-clz` (probabilistic-spice-plan 1.3, 2.8).
+;; `__builtin_clzll` has no Turmeric spelling, and a Turmeric loop shifting
+;; and testing each bit is O(64) per insert -- acceptable for correctness
+;; but not for a structure whose entire point is speed.  This is the one
+;; inline-C body in C1, and it costs HLL its interpreter coverage.
+;;
+;; math.tur is loaded for `log` (small-range linear counting correction).
+;; This adds stdlib inline C to the program, but HLL tests are already
+;; PASS-skipped under the interpreter due to `hash-clz`.
+
+(load "stdlib/math.tur")
+(load "stdlib/typeclass-lattice.tur")
+
+(defmodule prob/hll
+  (import prob/hash :refer [prob-hash-pair prob-unsigned-shr])
+  (export Hll hll-new hll-free hll-add! hll-cardinality hll-merge hll-p hll-m)
+
+;;; Hll -- a HyperLogLog estimator with m = 2^p registers.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defstruct Hll [regs : (Vec int) p : int m : int])
+
+;;; hll-p -- the precision parameter.
+;;;
+;;; Parameters:
+;;;   h -- the estimator
+;;;
+;;; Returns:
+;;;   p, where m = 2^p is the register count.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn hll-p [^borrow h : Hll] : int (.p h))
+
+;;; hll-m -- the register count.
+;;;
+;;; Parameters:
+;;;   h -- the estimator
+;;;
+;;; Returns:
+;;;   m = 2^p, the number of registers.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn hll-m [^borrow h : Hll] : int (.m h))
+
+;;; hash-clz -- position of the leftmost set bit in the low w bits of h.
+;;;
+;;; 1-indexed (returns 0 if none).  This is the HLL register value.
+;;;
+;;; Parameters:
+;;;   h -- the hash value (already shifted to the high bits)
+;;;   w -- the number of bits to consider (64 - p)
+;;;
+;;; Returns:
+;;;   w - clz(h & mask), i.e. the 1-indexed position of the leftmost set bit.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn hash-clz [h : int w : int] : int
+  ```c
+  uint64_t x = (uint64_t)h & (w >= 64 ? ~0ULL : ((1ULL << w) - 1));
+  if (x == 0) return 0;
+  return w - (int)__builtin_clzll(x);
+  ```)
+
+;;; hll-new -- create a HyperLogLog estimator with m = 2^p registers.
+;;;
+;;; Parameters:
+;;;   p -- precision in [4..16]; m = 2^p registers
+;;;
+;;; Returns:
+;;;   A new estimator with all registers zero.
+;;;
+;;; Example:
+;;;   (let [h (hll-new 14)] ...)
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn hll-new [p : int] : Hll
+  (let [m (bit-shl 1 p)
+        regs (vec-new)]
+    (__hll-init-regs regs 0 m)
+    (Hll regs p m)))
+
+;;; __hll-init-regs -- internal: push m zeros into the register Vec.
+(defn __hll-init-regs [regs : (Vec int) i : int m : int] : nil
+  (if (>= i m)
+    nil
+    (do (vec-push! regs 0)
+        (__hll-init-regs regs (+ i 1) m))))
+
+;;; hll-free -- release the register array.
+;;;
+;;; Parameters:
+;;;   h -- the estimator to free
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn hll-free [h : Hll] : void
+  (vec-free (.regs h)))
+
+;;; __hll-add-update -- internal: update one register by max.
+(defn __hll-add-update [regs : (Vec int) idx : int val : int] : nil
+  (let [cur (vec-get regs idx)]
+    (if (> val cur) (vec-set! regs idx val))))
+
+;;; hll-add! -- add an element to the estimator.
+;;;
+;;; Parameters:
+;;;   h   -- the estimator (mutated in place)
+;;;   key -- the integer key to add
+;;;
+;;; Returns:
+;;;   nil
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn hll-add! [^borrow h : Hll key : int] : nil
+  (let [hp  (prob-hash-pair key)
+        hh  (.h1 hp)
+        p   (.p h)
+        m   (.m h)
+        idx (bit-and hh (- m 1))
+        w   (prob-unsigned-shr hh p)
+        wbits (- 64 p)
+        val (hash-clz w wbits)]
+    (__hll-add-update (.regs h) idx val)))
+
+;;; __hll-zeros-loop -- internal: count zero registers.
+(defn __hll-zeros-loop [regs : (Vec int) i : int m : int acc : int] : int
+  (if (>= i m)
+    acc
+    (let [r (vec-get regs i)]
+      (__hll-zeros-loop regs (+ i 1) m
+        (if (= r 0) (+ acc 1) acc)))))
+
+;;; __hll-raw-sum -- internal: compute the sum of 2^(-r) as a float.
+(defn __hll-raw-sum [regs : (Vec int) i : int m : int acc : float] : float
+  (if (>= i m)
+    acc
+    (let [r (vec-get regs i)]
+      (if (= r 0)
+        (__hll-raw-sum regs (+ i 1) m (+ acc 1.0))
+        (__hll-raw-sum regs (+ i 1) m
+          (+ acc (/ 1.0 (int->float (bit-shl 1 r)))))))))
+
+;;; hll-cardinality -- the estimated number of distinct elements.
+;;;
+;;; Parameters:
+;;;   h -- the estimator
+;;;
+;;; Returns:
+;;;   The estimated cardinality as a float.  Uses the standard HLL raw
+;;;   estimate with small-range (linear counting) bias correction.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn hll-cardinality [^borrow h : Hll] : float
+  (let [m       (.m h)
+        regs    (.regs h)
+        alpha   (/ 0.7213 (+ 1.0 (/ 1.079 (int->float m))))
+        m2      (* (int->float m) (int->float m))
+        raw-sum (__hll-raw-sum regs 0 m 0.0)
+        raw     (* alpha (/ m2 raw-sum))
+        zeros   (__hll-zeros-loop regs 0 m 0)
+        small   (* 2.5 (int->float m))]
+    (if (and (<= raw small) (> zeros 0))
+      (* (int->float m) (log (/ (int->float m) (int->float zeros))))
+      raw)))
+
+;;; __hll-merge-loop -- internal: pointwise max of registers.
+(defn __hll-merge-loop [dst : (Vec int) src : (Vec int) i : int m : int] : nil
+  (if (>= i m)
+    nil
+    (do (let [sv (vec-get src i)]
+          (if (> sv (vec-get dst i)) (vec-set! dst i sv)))
+        (__hll-merge-loop dst src (+ i 1) m))))
+
+;;; hll-merge -- pointwise max of two estimators' registers.
+;;;
+;;; Parameters:
+;;;   a -- first estimator
+;;;   b -- second estimator (must have the same p)
+;;;
+;;; Returns:
+;;;   A new Hll whose registers are max(a[i], b[i]).  Both inputs remain valid.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn hll-merge [^borrow a : Hll ^borrow b : Hll] : Hll
+  (let [r (hll-new (.p a))]
+    (__hll-merge-loop (.regs r) (.regs a) 0 (.m a))
+    (__hll-merge-loop (.regs r) (.regs b) 0 (.m b))
+    r))
+
+;;; __hll-eq-loop -- internal: are all registers equal?
+(defn __hll-eq-loop [a : (Vec int) b : (Vec int) i : int m : int] : bool
+  (if (>= i m)
+    true
+    (if (= (vec-get a i) (vec-get b i))
+      (__hll-eq-loop a b (+ i 1) m)
+      false)))
+
+;;; Eq [Hll] -- same p and all registers equal.
+(definstance Eq [Hll]
+  (eq? [^borrow x ^borrow y]
+    (and (= (.p x) (.p y))
+         (__hll-eq-loop (.regs x) (.regs y) 0 (.m x)))))
+
+;;; default-hll-p -- default precision for bottom.
+(defn default-hll-p [] : int 14)
+
+;;; JoinSemilattice [Hll] -- join is pointwise max.
+;;
+;; max is associative, commutative and idempotent, so this is a genuine
+;; join-semilattice.  The all-zero register set is bottom.
+(definstance JoinSemilattice [Hll]
+  (join [x y] (hll-merge x y)))
+
+;;; BoundedJoin [Hll] -- the all-zero estimator of default precision is bottom.
+(definstance BoundedJoin [Hll]
+  (bottom [] (hll-new (default-hll-p))))
+
+) ;; end defmodule prob/hll

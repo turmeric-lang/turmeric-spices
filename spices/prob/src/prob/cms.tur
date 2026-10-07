@@ -1,0 +1,227 @@
+;; prob/cms -- Count-Min Sketch: frequency estimation with provable bounds.
+;;
+;; A d x w counter matrix backed by a single flat Vec[int] of length d * w.
+;; Each element is hashed to d positions (one per row) via double-hashing;
+;; every add increments all d counters.  The estimate for an element is the
+;; min over the d rows -- the over-counting bound is min, never max.
+;;
+;; Merge is pointwise addition of counters -- associative and commutative,
+;; but NOT idempotent (joining a sketch with itself doubles every count).
+;; The JoinSemilattice instance is correct for merging two DISTINCT streams;
+;; the law harness in test_merge.tur skips law-idempotent? for CMS by name.
+;;
+;; No user inline C (probabilistic-spice-plan 2.8).  All operations are Vec
+;; arithmetic over the flat counter array.  w should be a power of two so
+;; that prob-double-hash-index's bit-and mask is a fast mod.
+
+(load "stdlib/typeclass-lattice.tur")
+
+(defmodule prob/cms
+  (import prob/hash :refer [prob-hash-pair prob-double-hash-index])
+  (export CountMin cms-new cms-free cms-add! cms-estimate cms-merge
+          cms-inner-product cms-d cms-w)
+
+;;; CountMin -- a Count-Min Sketch with d rows and w columns.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defstruct CountMin [counters : (Vec int) d : int w : int])
+
+;;; cms-d -- the depth (number of rows).
+;;;
+;;; Parameters:
+;;;   c -- the sketch
+;;;
+;;; Returns:
+;;;   d, the number of hash functions / rows.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn cms-d [^borrow c : CountMin] : int (.d c))
+
+;;; cms-w -- the width (columns per row).
+;;;
+;;; Parameters:
+;;;   c -- the sketch
+;;;
+;;; Returns:
+;;;   w, the number of columns per row.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn cms-w [^borrow c : CountMin] : int (.w c))
+
+;;; cms-new -- create a Count-Min Sketch with d rows and w columns.
+;;;
+;;; Parameters:
+;;;   d -- depth (number of rows / hash functions)
+;;;   w -- width (columns per row; should be a power of two)
+;;;
+;;; Returns:
+;;;   A new sketch with all counters zero.
+;;;
+;;; Example:
+;;;   (let [c (cms-new 5 1024)] ...)
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn cms-new [d : int w : int] : CountMin
+  (let [counters (vec-new)]
+    (__cms-init counters 0 (* d w))
+    (CountMin counters d w)))
+
+;;; __cms-init -- internal: push n zeros into the counter Vec.
+(defn __cms-init [v : (Vec int) i : int n : int] : nil
+  (if (>= i n)
+    nil
+    (do (vec-push! v 0)
+        (__cms-init v (+ i 1) n))))
+
+;;; cms-free -- release the counter array.
+;;;
+;;; Parameters:
+;;;   c -- the sketch to free
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn cms-free [c : CountMin] : void
+  (vec-free (.counters c)))
+
+;;; cms-add! -- record one occurrence of an element.
+;;;
+;;; Parameters:
+;;;   c   -- the sketch (mutated in place)
+;;;   key -- the integer key to add
+;;;
+;;; Returns:
+;;;   nil
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn cms-add! [^borrow c : CountMin key : int] : nil
+  (let [hp (prob-hash-pair key)]
+    (__cms-add-loop (.counters c) (.h1 hp) (.h2 hp) 0 (.d c) (.w c))))
+
+;;; __cms-add-loop -- internal: increment d counters for this element.
+(defn __cms-add-loop [counters : (Vec int) h1 : int h2 : int i : int d : int w : int] : nil
+  (if (>= i d)
+    nil
+    (let [j   (prob-double-hash-index h1 h2 i w)
+          idx (+ (* i w) j)
+          cur (vec-get counters idx)]
+      (do (vec-set! counters idx (+ cur 1))
+          (__cms-add-loop counters h1 h2 (+ i 1) d w)))))
+
+;;; __cms-est-loop -- internal: min over d rows of the counter for this element.
+(defn __cms-est-loop [counters : (Vec int) h1 : int h2 : int i : int d : int w : int
+                      acc : int] : int
+  (if (>= i d)
+    acc
+    (let [j   (prob-double-hash-index h1 h2 i w)
+          idx (+ (* i w) j)
+          val (vec-get counters idx)]
+      (__cms-est-loop counters h1 h2 (+ i 1) d w
+        (if (= i 0) val (if (< val acc) val acc))))))
+
+;;; cms-estimate -- the estimated frequency of an element.
+;;;
+;;; Parameters:
+;;;   c   -- the sketch
+;;;   key -- the integer key to estimate
+;;;
+;;; Returns:
+;;;   The minimum counter value over all d rows.  Always >= the true
+;;;   frequency; never under-counts.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn cms-estimate [^borrow c : CountMin key : int] : int
+  (let [hp (prob-hash-pair key)]
+    (__cms-est-loop (.counters c) (.h1 hp) (.h2 hp) 0 (.d c) (.w c) 0)))
+
+;;; __cms-merge-loop -- internal: pointwise addition of counters.
+(defn __cms-merge-loop [dst : (Vec int) src : (Vec int) i : int n : int] : nil
+  (if (>= i n)
+    nil
+    (do (vec-set! dst i (+ (vec-get dst i) (vec-get src i)))
+        (__cms-merge-loop dst src (+ i 1) n))))
+
+;;; cms-merge -- pointwise addition of two sketches.
+;;;
+;;; Parameters:
+;;;   a -- first sketch
+;;;   b -- second sketch (must have the same d and w)
+;;;
+;;; Returns:
+;;;   A new CountMin whose counters are a[i] + b[i].  Both inputs remain
+;;;   valid.
+;;;
+;;; Since: probabilistic-spice-plan C1
+;;;
+;;; Note: + is NOT idempotent.  Joining a sketch with itself doubles every
+;;; count.  The JoinSemilattice instance is correct for merging two DISTINCT
+;;; streams; the law harness skips law-idempotent? for this type.
+(defn cms-merge [^borrow a : CountMin ^borrow b : CountMin] : CountMin
+  (let [r (cms-new (.d a) (.w a))]
+    (__cms-merge-loop (.counters r) (.counters a) 0 (* (.d a) (.w a)))
+    (__cms-merge-loop (.counters r) (.counters b) 0 (* (.d a) (.w a)))
+    r))
+
+;;; __cms-dot-loop -- internal: dot product of one row of a and b.
+(defn __cms-dot-loop [ca : (Vec int) cb : (Vec int) off : int j : int w : int acc : int] : int
+  (if (>= j w)
+    acc
+    (let [idx (+ off j)]
+      (__cms-dot-loop ca cb off (+ j 1) w
+        (+ acc (* (vec-get ca idx) (vec-get cb idx)))))))
+
+;;; __cms-ip-loop -- internal: min over d rows of the dot product.
+(defn __cms-ip-loop [ca : (Vec int) cb : (Vec int) i : int d : int w : int acc : int] : int
+  (if (>= i d)
+    acc
+    (let [dot (__cms-dot-loop ca cb (* i w) 0 w 0)]
+      (__cms-ip-loop ca cb (+ i 1) d w
+        (if (= i 0) dot (if (< dot acc) dot acc))))))
+
+;;; cms-inner-product -- estimate the inner product of two streams' frequencies.
+;;;
+;;; Parameters:
+;;;   a -- first sketch
+;;;   b -- second sketch (must have the same d and w)
+;;;
+;;; Returns:
+;;;   The min over d rows of the dot product of corresponding rows.
+;;;   Estimates the size of the join of the two streams.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn cms-inner-product [^borrow a : CountMin ^borrow b : CountMin] : int
+  (__cms-ip-loop (.counters a) (.counters b) 0 (.d a) (.w a) 0))
+
+;;; __cms-eq-loop -- internal: are all counters equal?
+(defn __cms-eq-loop [a : (Vec int) b : (Vec int) i : int n : int] : bool
+  (if (>= i n)
+    true
+    (if (= (vec-get a i) (vec-get b i))
+      (__cms-eq-loop a b (+ i 1) n)
+      false)))
+
+;;; Eq [CountMin] -- same d, w, and all counters equal.
+(definstance Eq [CountMin]
+  (eq? [^borrow x ^borrow y]
+    (and (= (.d x) (.d y))
+         (= (.w x) (.w y))
+         (__cms-eq-loop (.counters x) (.counters y) 0 (* (.d x) (.w x))))))
+
+;;; default-cms-d -- default depth for bottom.
+(defn default-cms-d [] : int 5)
+
+;;; default-cms-w -- default width for bottom.
+(defn default-cms-w [] : int 1024)
+
+;;; JoinSemilattice [CountMin] -- join is pointwise addition.
+;;
+;; + is associative and commutative, so the join is order-independent for
+;; merging distinct streams.  It is NOT idempotent: joining a sketch with
+;; itself doubles every count.  The instance docstring and the law harness
+;; both say this; test_merge.tur skips law-idempotent? for CountMin by name.
+(definstance JoinSemilattice [CountMin]
+  (join [x y] (cms-merge x y)))
+
+;;; BoundedJoin [CountMin] -- the all-zero sketch of default size is bottom.
+(definstance BoundedJoin [CountMin]
+  (bottom [] (cms-new (default-cms-d) (default-cms-w))))
+
+) ;; end defmodule prob/cms

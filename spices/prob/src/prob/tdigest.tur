@@ -1,0 +1,332 @@
+;; prob/tdigest -- t-digest: streaming approximate quantiles.
+;;
+;; A t-digest stores a set of centroids (mean, count) whose scale function
+;; k1(q) = delta / (2*pi) * asin(2*q - 1) controls compression near the tails.
+;; tdigest-add! inserts a value as a singleton centroid, then compresses.
+;; tdigest-quantile returns the approximate value at quantile q by walking
+;; the sorted centroids and returning the mean of the centroid whose rank
+;; range contains the target.  Merge combines two centroid sets, sorts by
+;; mean, and re-clusters to the scale bound.
+;;
+;; The merge is associative and commutative (combine all centroids and
+;; re-compress; the result is order-independent).  It is NOT idempotent in
+;; raw centroid data: merging a t-digest with itself doubles every count.
+;; It IS idempotent in quantile estimates (the same centroid is found at
+;; the same quantile).  The JoinSemilattice instance is declared for the
+;; associativity/commutativity/bottom-identity laws; the law harness skips
+;; law-idempotent? for TDigest, the same way it does for CountMin
+;; (probabilistic-spice-plan 2.7, 7).
+;;
+;; No user inline C (probabilistic-spice-plan 2.8).  The scale function
+;; uses asin from stdlib/math.tur, which has native interpreter overrides,
+;; so t-digest tests run under both the interpreter and the compiler.
+;; The insertion sort (gap 1.4) is plain Turmeric: t-digest centroids are
+;; nearly sorted after each add, so insertion sort is O(n) in the common
+;; case.
+
+(load "stdlib/math.tur")
+(load "stdlib/typeclass-lattice.tur")
+
+(defmodule prob/tdigest
+  (export TDigest tdigest-new tdigest-free tdigest-add! tdigest-quantile
+          tdigest-merge tdigest-count tdigest-num-centroids
+          tdigest-compression)
+
+;;; TDigest -- a t-digest with parallel centroid arrays and compression.
+;;;
+;;; `means` and `counts` are parallel arrays: centroid i has mean
+;;; means[i] and count counts[i].  `compression` is the delta parameter
+;;; that controls centroid size near the tails.
+;;;
+;;; Since: probabilistic-spice-plan C3
+(defstruct TDigest [means : (Vec float) counts : (Vec int) compression : float])
+
+;;; tdigest-compression -- the compression parameter (delta).
+;;;
+;;; Since: probabilistic-spice-plan C3
+(defn tdigest-compression [^borrow td : TDigest] : float (.compression td))
+
+;;; tdigest-num-centroids -- the number of centroids.
+;;;
+;;; Since: probabilistic-spice-plan C3
+(defn tdigest-num-centroids [^borrow td : TDigest] : int (vec-len (.means td)))
+
+;;; __td-sum-counts -- internal: sum the counts array.
+(defn __td-sum-counts [counts : (Vec int) i : int n : int acc : int] : int
+  (if (>= i n)
+    acc
+    (__td-sum-counts counts (+ i 1) n (+ acc (vec-get counts i)))))
+
+;;; tdigest-count -- the total count (sum of all centroid counts).
+;;;
+;;; Since: probabilistic-spice-plan C3
+(defn tdigest-count [^borrow td : TDigest] : int
+  (__td-sum-counts (.counts td) 0 (vec-len (.counts td)) 0))
+
+;;; tdigest-new -- create an empty t-digest.
+;;;
+;;; Parameters:
+;;;   compression -- the delta parameter (higher = more centroids = more accuracy)
+;;;
+;;; Returns:
+;;;   A new empty t-digest.
+;;;
+;;; Example:
+;;;   (let [td (tdigest-new 100.0)] ...)
+;;;
+;;; Since: probabilistic-spice-plan C3
+(defn tdigest-new [compression : float] : TDigest
+  (TDigest (:: (vec-new) (Vec float)) (vec-new) compression))
+
+;;; tdigest-free -- release the centroid arrays.
+;;;
+;;; Since: probabilistic-spice-plan C3
+(defn tdigest-free [td : TDigest] : void
+  (do (vec-free (.means td))
+      (vec-free (.counts td))))
+
+;;; __td-scale -- the k1 scale function.
+;;;
+;;; k1(q) = delta / (2*pi) * asin(2*q - 1), clamped to [1e-15, 1-1e-15]
+;;; to avoid asin domain errors at the boundaries.
+(defn __td-scale [q : float delta : float] : float
+  (* (/ delta (* 2.0 PI))
+     (asin (- (* 2.0
+                 (if (< q 1e-15)
+                   1e-15
+                   (if (> q (- 1.0 1e-15))
+                     (- 1.0 1e-15)
+                     q)))
+               1.0))))
+
+;;; __td-insert -- internal: insert element at position i into sorted [0, i].
+;;;
+;;; Insertion sort step: swap element at i leftward until it's in position.
+;;; Sorts the parallel means/counts arrays by mean value.
+(defn __td-insert [means : (Vec float) counts : (Vec int) i : int] : nil
+  (if (<= i 0)
+    nil
+    (let [mi (:: (vec-get means i) :float)
+          ci (vec-get counts i)
+          mj (:: (vec-get means (- i 1)) :float)]
+      (if (< mi mj)
+        (do (vec-set! means i mj)
+            (vec-set! counts i (vec-get counts (- i 1)))
+            (vec-set! means (- i 1) mi)
+            (vec-set! counts (- i 1) ci)
+            (__td-insert means counts (- i 1)))
+        nil))))
+
+;;; __td-sort-loop -- internal: insertion sort outer loop over [1, n).
+(defn __td-sort-loop [means : (Vec float) counts : (Vec int) i : int n : int] : nil
+  (if (>= i n)
+    nil
+    (do (__td-insert means counts i)
+        (__td-sort-loop means counts (+ i 1) n))))
+
+;;; __td-insertion-sort -- internal: sort parallel arrays by mean.
+(defn __td-insertion-sort [means : (Vec float) counts : (Vec int) n : int] : nil
+  (if (<= n 1)
+    nil
+    (__td-sort-loop means counts 1 n)))
+
+;;; __td-can-merge -- internal: can two adjacent centroids merge?
+;;;
+;;; Checks whether the combined centroid's quantile range fits within
+;;; the scale function bound: k1(q1) - k1(q0) <= 1.
+(defn __td-can-merge [cum : int proposed-count : int total : int
+                      delta : float] : bool
+  (let [total-f (int->float total)
+        q0 (/ (int->float cum) total-f)
+        q1 (/ (int->float (+ cum proposed-count)) total-f)]
+    (<= (- (__td-scale q1 delta) (__td-scale q0 delta)) 1.0)))
+
+;;; __td-merge-absorb -- internal: try to absorb subsequent centroids.
+;;;
+;;; Walks forward from read-idx, merging centroids into the current
+;;; (w-mean, w-count) if the scale function allows.  When no more can
+;;; be absorbed, writes the current centroid at write-idx and advances.
+(defn __td-merge-absorb [means : (Vec float) counts : (Vec int)
+                         delta : float total : int
+                         write-idx : int read-idx : int n : int
+                         w-mean : float w-count : int cum : int] : nil
+  (let [next-idx (+ read-idx 1)]
+    (if (>= next-idx n)
+      (do (vec-set! means write-idx w-mean)
+          (vec-set! counts write-idx w-count)
+          (__td-truncate means counts (+ write-idx 1) n))
+      (let [nc (vec-get counts next-idx)
+            proposed (+ w-count nc)]
+        (if (__td-can-merge cum proposed total delta)
+          (let [nm (:: (vec-get means next-idx) :float)
+                new-mean (/ (+ (* w-mean (int->float w-count))
+                              (* nm (int->float nc)))
+                           (int->float proposed))]
+            (__td-merge-absorb means counts delta total
+              write-idx next-idx n new-mean proposed cum))
+          (do (vec-set! means write-idx w-mean)
+              (vec-set! counts write-idx w-count)
+              (__td-merge-advance means counts delta total
+                (+ write-idx 1) next-idx n (+ cum w-count))))))))
+
+;;; __td-merge-advance -- internal: start a new merged centroid at read-idx.
+(defn __td-merge-advance [means : (Vec float) counts : (Vec int)
+                          delta : float total : int
+                          write-idx : int read-idx : int n : int
+                          cum : int] : nil
+  (if (>= read-idx n)
+    (__td-truncate means counts write-idx n)
+    (let [wm (:: (vec-get means read-idx) :float)
+          wc (vec-get counts read-idx)]
+      (__td-merge-absorb means counts delta total
+        write-idx read-idx n wm wc cum))))
+
+;;; __td-truncate -- internal: remove elements [write-idx, n) from both arrays.
+(defn __td-truncate [means : (Vec float) counts : (Vec int)
+                     write-idx : int n : int] : nil
+  (if (>= write-idx n)
+    nil
+    (do (vec-drop-last! means)
+        (vec-drop-last! counts)
+        (__td-truncate means counts write-idx (- n 1)))))
+
+;;; __td-compress -- internal: sort and merge centroids in place.
+;;;
+;;; Sorts the parallel arrays by mean, then greedily merges adjacent
+;;; centroids whose combined quantile range fits within the scale
+;;; function bound.  After compression, the arrays are sorted and
+;;; no further merging is possible (compress is idempotent).
+(defn __td-compress [means : (Vec float) counts : (Vec int)
+                     delta : float] : nil
+  (let [n (vec-len means)]
+    (if (<= n 1)
+      nil
+      (let [total (__td-sum-counts counts 0 n 0)]
+        (do (__td-insertion-sort means counts n)
+            (__td-merge-advance means counts delta total 0 0 n 0))))))
+
+;;; tdigest-add! -- add a value to the t-digest.
+;;;
+;;; Parameters:
+;;;   td    -- the t-digest (mutated in place)
+;;;   value -- the float value to add
+;;;
+;;; Returns:
+;;;   nil
+;;;
+;;; Since: probabilistic-spice-plan C3
+(defn tdigest-add! [^borrow td : TDigest value : float] : nil
+  (do (vec-push! (.means td) value)
+      (vec-push! (.counts td) 1)
+      (__td-compress (.means td) (.counts td) (.compression td))))
+
+;;; __td-quantile-walk -- internal: find the centroid containing target rank.
+;;;
+;;; Walks through sorted centroids, accumulating count.  Returns the mean
+;;; of the centroid whose rank range [cum, cum+count) contains the target.
+(defn __td-quantile-walk [means : (Vec float) counts : (Vec int)
+                          i : int n : int target : float cum : float] : float
+  (if (>= i n)
+    (:: (vec-get means (- n 1)) :float)
+    (let [c (vec-get counts i)
+          next-cum (+ cum (int->float c))]
+      (if (> next-cum target)
+        (:: (vec-get means i) :float)
+        (__td-quantile-walk means counts (+ i 1) n target next-cum)))))
+
+;;; tdigest-quantile -- approximate value at quantile q.
+;;;
+;;; Parameters:
+;;;   td -- the t-digest
+;;;   q  -- the quantile in [0, 1]
+;;;
+;;; Returns:
+;;;   The approximate value at quantile q.  For q=0.5, the median.
+;;;   Returns 0.0 if the t-digest is empty.
+;;;
+;;; Since: probabilistic-spice-plan C3
+(defn tdigest-quantile [^borrow td : TDigest q : float] : float
+  (let [n (vec-len (.means td))]
+    (if (= n 0)
+      0.0
+      (if (= n 1)
+        (:: (vec-get (.means td) 0) :float)
+        (let [total (tdigest-count td)
+              rank (* q (int->float total))]
+          (__td-quantile-walk (.means td) (.counts td) 0 n rank 0.0))))))
+
+;;; __td-copy-all -- internal: copy all centroids from src to dst.
+(defn __td-copy-all [dst-means : (Vec float) dst-counts : (Vec int)
+                    src-means : (Vec float) src-counts : (Vec int)
+                    i : int n : int] : nil
+  (if (>= i n)
+    nil
+    (do (vec-push! dst-means (:: (vec-get src-means i) :float))
+        (vec-push! dst-counts (vec-get src-counts i))
+        (__td-copy-all dst-means dst-counts src-means src-counts (+ i 1) n))))
+
+;;; tdigest-merge -- merge two t-digests into a new one.
+;;;
+;;; Parameters:
+;;;   a -- first t-digest
+;;;   b -- second t-digest (should have the same compression)
+;;;
+;;; Returns:
+;;;   A new TDigest containing all centroids from both a and b,
+;;;   re-compressed.  Both inputs remain valid.
+;;;
+;;; Since: probabilistic-spice-plan C3
+(defn tdigest-merge [^borrow a : TDigest ^borrow b : TDigest] : TDigest
+  (let [r (tdigest-new (.compression a))]
+    (__td-copy-all (.means r) (.counts r) (.means a) (.counts a)
+      0 (vec-len (.means a)))
+    (__td-copy-all (.means r) (.counts r) (.means b) (.counts b)
+      0 (vec-len (.means b)))
+    (__td-compress (.means r) (.counts r) (.compression a))
+    r))
+
+;;; __td-eq-loop -- internal: are all centroids equal (means within tol)?
+(defn __td-eq-loop [am : (Vec float) ac : (Vec int)
+                    bm : (Vec float) bc : (Vec int)
+                    i : int n : int] : bool
+  (if (>= i n)
+    true
+    (if (and (= (vec-get ac i) (vec-get bc i))
+             (< (fabs (- (:: (vec-get am i) :float)
+                         (:: (vec-get bm i) :float)))
+                1e-6))
+      (__td-eq-loop am ac bm bc (+ i 1) n)
+      false)))
+
+;;; Eq [TDigest] -- same number of centroids, same means and counts.
+;;;
+;;; Means are compared within a 1e-6 tolerance (floating-point arithmetic).
+;;; Counts are compared exactly.  This is structural equality, not
+;;; quantile-estimate equality: merging a t-digest with itself doubles
+;;; counts, so eq? would return false for idempotence.
+(definstance Eq [TDigest]
+  (eq? [^borrow x ^borrow y]
+    (let [nx (vec-len (.means x))
+          ny (vec-len (.means y))]
+      (if (= nx ny)
+        (__td-eq-loop (.means x) (.counts x) (.means y) (.counts y) 0 nx)
+        false))))
+
+;;; default-td-compression -- default compression for bottom.
+(defn default-td-compression [] : float 100.0)
+
+;;; JoinSemilattice [TDigest] -- join is merge.
+;;
+;; The merge is associative and commutative (combine all centroids and
+;; re-compress; the result is order-independent).  It is NOT idempotent
+;; in raw centroid data: merging a t-digest with itself doubles every
+;; count.  It IS idempotent in quantile estimates.  The law harness
+;; skips law-idempotent? for TDigest, the same way it does for CountMin.
+(definstance JoinSemilattice [TDigest]
+  (join [x y] (tdigest-merge x y)))
+
+;;; BoundedJoin [TDigest] -- the empty t-digest is bottom.
+(definstance BoundedJoin [TDigest]
+  (bottom [] (tdigest-new (default-td-compression))))
+
+) ;; end defmodule prob/tdigest
