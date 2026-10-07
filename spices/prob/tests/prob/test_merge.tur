@@ -1,0 +1,117 @@
+;; test_merge -- lattice law harness across mergeable types.
+;;
+;; Layer 2 (laws): for each type with a JoinSemilattice instance, check
+;; associativity, commutativity, idempotence, and bottom-identity.
+;;
+;; Bloom: all three laws hold (bit-OR is a genuine join-semilattice).
+;; CMS: associativity and commutativity hold, but idempotence does NOT
+;; (+ is not idempotent).  The harness skips law-idempotent? for CMS
+;; by name, not by accident -- this is the one place the lattice fit is
+;; imperfect (probabilistic-spice-plan 2.5, 7).
+;; TDigest: associativity and commutativity hold, but idempotence does NOT
+;; (merging with itself doubles counts).  The harness skips
+;; law-idempotent? for TDigest, same as CMS (probabilistic-spice-plan 2.7, 7).
+;;
+;; HLL laws are tested in test_hll.tur, not here, because prob/hll contains
+;; user inline C (hash-clz) which would PASS-skip this fixture under the
+;; interpreter.  Keeping this fixture inline-C-free lets Bloom, CMS, and
+;; TDigest laws run on both back ends.
+;;
+;; The law functions from stdlib/typeclass-lattice.tur take their arguments
+;; by value, which moves move-only types like Bloom and CountMin (defstructs
+;; containing a Vec).  This harness calls bloom-merge / cms-merge /
+;; tdigest-merge directly (which take ^borrow) and eq? (which takes ^borrow)
+;; so the inputs are borrowed, not moved, and can be freed afterward.
+
+(load "stdlib/typeclass-lattice.tur")
+
+(defmodule prob/tests/test_merge
+  (import prob/bloom :refer [Bloom bloom-new bloom-free bloom-insert!
+                             bloom-merge bloom-maybe?])
+  (import prob/cms :refer [CountMin cms-new cms-free cms-add! cms-merge
+                           cms-estimate])
+  (import prob/tdigest :refer [TDigest tdigest-new tdigest-free tdigest-add!
+                               tdigest-merge tdigest-quantile])
+
+(defn fail-if [cond : bool label : cstr] : int
+  (if cond (do (println label) 1) 0))
+
+;;; __td-add3 -- internal: add three float values to a t-digest.
+(defn __td-add3 [^borrow td : TDigest a : int b : int c : int] : nil
+  (do (tdigest-add! td (int->float a))
+      (tdigest-add! td (int->float b))
+      (tdigest-add! td (int->float c))))
+
+(defn main [] : int
+  ;; --- Bloom laws ---
+  (let [bx (bloom-new 256 5)
+        by (bloom-new 256 5)
+        bz (bloom-new 256 5)]
+    (bloom-insert! bx 1)
+    (bloom-insert! by 2)
+    (bloom-insert! bz 3)
+    (let [bf-assoc (eq? (bloom-merge (bloom-merge bx by) bz)
+                        (bloom-merge bx (bloom-merge by bz)))
+          bf-comm  (eq? (bloom-merge bx by) (bloom-merge by bx))
+          bf-idem  (eq? (bloom-merge bx bx) bx)
+          bf-bot   (eq? (bloom-merge bx (bloom-new 256 5)) bx)
+          bf-fails
+          (+ (fail-if (not bf-assoc) "bloom: join not associative")
+             (fail-if (not bf-comm) "bloom: join not commutative")
+             (fail-if (not bf-idem) "bloom: join not idempotent")
+             (fail-if (not bf-bot) "bloom: bottom not identity"))]
+      (bloom-free bx)
+      (bloom-free by)
+      (bloom-free bz)
+
+      ;; --- CMS laws (skip idempotence: + is not idempotent) ---
+      (let [cx (cms-new 3 256)
+            cy (cms-new 3 256)
+            cz (cms-new 3 256)]
+        (cms-add! cx 1)
+        (cms-add! cy 2)
+        (cms-add! cz 3)
+        (let [cm-assoc (eq? (cms-merge (cms-merge cx cy) cz)
+                            (cms-merge cx (cms-merge cy cz)))
+              cm-comm  (eq? (cms-merge cx cy) (cms-merge cy cx))
+              ;; Deliberately NOT testing idempotence for CMS:
+              ;; + is not idempotent, so merge(x, x) != x.  This is the
+              ;; documented caveat (probabilistic-spice-plan 2.5, 7).
+              cm-bot   (eq? (cms-merge cx (cms-new 3 256)) cx)
+              cm-fails
+              (+ (fail-if (not cm-assoc) "cms: join not associative")
+                 (fail-if (not cm-comm) "cms: join not commutative")
+                 (fail-if (not cm-bot) "cms: bottom not identity"))]
+          (cms-free cx)
+          (cms-free cy)
+          (cms-free cz)
+
+          ;; --- TDigest laws (skip idempotence: counts double) ---
+          (let [td-x (tdigest-new 50.0)
+                td-y (tdigest-new 50.0)
+                td-z (tdigest-new 50.0)]
+            (__td-add3 td-x 1 2 3)
+            (__td-add3 td-y 4 5 6)
+            (__td-add3 td-z 7 8 9)
+            (let [td-assoc (eq? (tdigest-merge (tdigest-merge td-x td-y) td-z)
+                                (tdigest-merge td-x (tdigest-merge td-y td-z)))
+                  td-comm  (eq? (tdigest-merge td-x td-y)
+                                (tdigest-merge td-y td-x))
+                  ;; Deliberately NOT testing idempotence for TDigest:
+                  ;; merging with itself doubles counts, so merge(x, x) != x.
+                  ;; This is the documented caveat (probabilistic-spice-plan 2.7, 7).
+                  td-bot   (eq? (tdigest-merge td-x (tdigest-new 50.0)) td-x)
+                  td-fails
+                  (+ (fail-if (not td-assoc) "tdigest: join not associative")
+                     (fail-if (not td-comm) "tdigest: join not commutative")
+                     (fail-if (not td-bot) "tdigest: bottom not identity"))]
+              (tdigest-free td-x)
+              (tdigest-free td-y)
+              (tdigest-free td-z)
+
+              (let [fails (+ bf-fails cm-fails td-fails)]
+                (if (= fails 0)
+                  (do (println "test_merge: ok") 0)
+                  (do (println "test_merge: FAILURES") fails))))))))))
+
+) ;; end defmodule

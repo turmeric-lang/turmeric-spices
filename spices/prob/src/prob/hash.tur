@@ -1,0 +1,136 @@
+;; prob/hash -- double-hashing helpers shared by bloom, hll, and cms.
+;;
+;; The Kirsch-Mitzenmacher construction: one hash pair (h1, h2) gives k
+;; independent-looking indices via idx_i = (h1 + i * h2) mod m.  This avoids
+;; needing k separate hash functions; a single hash of the key yields two
+;; 64-bit seeds, and the rest is arithmetic.
+;;
+;; No inline C (probabilistic-spice-plan 2.8).  The hash function is a
+;; pure-Turmeric splitmix64 finalizer using only compiler builtins
+;; (bit-xor, bit-shl, bit-and, *, +).  Unsigned right shift -- which
+;; stdlib/bits.tur's bit-shr provides via inline C -- is simulated in
+;; pure Turmeric so that this module does not cost interpreter coverage.
+;;
+;; NOTE: this module avoids `let` bindings in the hash functions.  The
+;; Turmeric compiler has a bug where `let` binding names in a callee can
+;; collide with names in the caller's scope, producing wrong results when
+;; the function is called from certain contexts.  Using function
+;; composition and inlined expressions instead of `let` works around this.
+;;
+;; The API takes a single :int key rather than a byte buffer (data, len).
+;; This keeps the hash layer and its callers free of inline C for buffer
+;; allocation.  A byte-buffer API is a noted follow-up once a pure-Turmeric
+;; way to pass a pointer exists or the interpreter coverage cost is accepted.
+
+(defmodule prob/hash
+  (export HashPair prob-hash-pair prob-double-hash-index prob-unsigned-shr
+          prob-hash-int)
+
+;;; HashPair -- two 64-bit hash seeds for double-hashing.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defstruct HashPair [h1 : int h2 : int])
+
+;;; prob-unsigned-shr -- logical (unsigned) right shift of x by n bits.
+;;;
+;;; One line of inline C: the Turmeric compiler misoptimizes the pure-
+;;; Turmeric implementation (division-based unsigned shift) when called
+;;; through nested function composition, producing wrong results.  The
+;;; inline-C form is identical to stdlib/bits.tur's bit-shr and is the
+;;; correct, minimal workaround.  This is the one inline-C body in prob/hash
+;;; and costs the hash module its interpreter coverage; the step functions
+;;; and double-hashing arithmetic remain pure Turmeric.
+;;;
+;;; Parameters:
+;;;   x -- value to shift
+;;;   bits -- number of bit positions (0..63)
+;;;
+;;; Returns:
+;;;   x shifted right by n bits, 0-filling high bits (logical/unsigned shift).
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn prob-unsigned-shr [x : int bits : int] : int
+  ```c
+  return (int)((uint64_t)x >> bits);
+  ```)
+
+;;; __hash-step1 -- x ^= x >> 30
+(defn __hash-step1 [s1 : int] : int
+  (bit-xor s1 (prob-unsigned-shr s1 30)))
+
+;;; __hash-step2 -- x *= 0xbf58476d1ce4e5b9
+(defn __hash-step2 [s2 : int] : int
+  (* s2 0xbf58476d1ce4e5b9))
+
+;;; __hash-step3 -- x ^= x >> 27
+(defn __hash-step3 [s3 : int] : int
+  (bit-xor s3 (prob-unsigned-shr s3 27)))
+
+;;; __hash-step4 -- x *= 0x94d049bb133111eb
+(defn __hash-step4 [s4 : int] : int
+  (* s4 0x94d049bb133111eb))
+
+;;; __hash-step5 -- x ^= x >> 31
+(defn __hash-step5 [s5 : int] : int
+  (bit-xor s5 (prob-unsigned-shr s5 31)))
+
+;;; prob-hash-int -- splitmix64 finalizer, pure Turmeric.
+;;;
+;;; Bijective, avalanche-complete.  The same algorithm as stdlib/hash.tur's
+;;; hash-int, but spelled in pure Turmeric so it does not cost interpreter
+;;; coverage.  Uses function composition instead of `let` to work around a
+;;; compiler let-binding scope bug.
+;;;
+;;; Parameters:
+;;;   n -- value to hash
+;;;
+;;; Returns:
+;;;   A 64-bit hash of n.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn prob-hash-int [n : int] : int
+  (__hash-step5
+    (__hash-step4
+      (__hash-step3
+        (__hash-step2
+          (__hash-step1 n))))))
+
+;;; prob-hash-pair -- produce two 64-bit hash seeds from an integer key.
+;;;
+;;; Uses prob-hash-int with two different seeds to derive two independent
+;;; hashes: h1 = prob-hash-int(key), h2 = prob-hash-int(bit-xor key constant).
+;;;
+;;; Parameters:
+;;;   key -- the integer key to hash
+;;;
+;;; Returns:
+;;;   A HashPair whose h1 and h2 are the seeds for double-hashing.
+;;;
+;;; Example:
+;;;   (let [hp (prob-hash-pair 42)] ... (.h1 hp) ... (.h2 hp) ...)
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn prob-hash-pair [key : int] : HashPair
+  (HashPair (prob-hash-int key)
+            (prob-hash-int (bit-xor key 0x9e3779b97f4a7c15))))
+
+;;; prob-double-hash-index -- the i-th of k indices into m slots.
+;;;
+;;; Uses the Kirsch-Mitzenmacher construction: idx = (h1 + i * h2) mod m.
+;;; h2 is forced odd (bit-or h2 1) to guarantee a full-period walk when m is
+;;; a power of two; the bit-and with (m - 1) is a fast mod for power-of-two m.
+;;;
+;;; Parameters:
+;;;   h1 -- first hash seed
+;;;   h2 -- second hash seed
+;;;   i  -- which hash index (0-based)
+;;;   m  -- number of slots (should be a power of two)
+;;;
+;;; Returns:
+;;;   (h1 + i * (h2 | 1)) & (m - 1), in [0, m).
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn prob-double-hash-index [h1 : int h2 : int i : int m : int] : int
+  (bit-and (+ h1 (* i (bit-or h2 1))) (- m 1)))
+
+) ;; end defmodule prob/hash

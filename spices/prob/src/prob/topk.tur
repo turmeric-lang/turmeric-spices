@@ -1,0 +1,210 @@
+;; prob/topk -- Top-K: track the K most frequent elements in a stream.
+;;
+;; An exact, Vec-backed Top-K tracker.  Two parallel Vec[int]s hold keys and
+;; their counts.  topk-add! increments the count if the key is present, else
+;; appends.  topk-list returns the top K (count, key) pairs sorted by count
+;; descending via selection sort.  topk-merge creates a new TopK and adds all
+;; entries from both inputs.
+;;
+;; This is the exact Map-backed variant the plan prefers for C2
+;; (probabilistic-spice-plan 2.6): simpler, correct, no approximation.  The
+;; counts are exact for all tracked items.  Memory is O(n) where n is the
+;; number of distinct items seen -- unbounded, unlike the sketch-backed
+;; variant.  The plan notes the sketch-backed (CMS + heap) variant as a
+;; memory-bounded option for a later phase.
+;;
+;; Merge is "add all of B's items into A" -- NOT idempotent and NOT
+;; commutative under shared items (joining a TopK with itself doubles
+;; counts).  No JoinSemilattice instance (probabilistic-spice-plan 2.6).
+;;
+;; No user inline C (probabilistic-spice-plan 2.8).  All operations are Vec
+;; arithmetic.  The module and its tests run under both the interpreter and
+;; the compiler.
+
+(defmodule prob/topk
+  (export TopK topk-new topk-free topk-add! topk-list topk-merge
+          topk-len topk-count)
+
+;;; TopK -- an exact Top-K tracker with parallel key/count Vecs.
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defstruct TopK [keys : (Vec int) counts : (Vec int) k : int])
+
+;;; topk-len -- the number of distinct items tracked.
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn topk-len [^borrow tk : TopK] : int (vec-len (.keys tk)))
+
+;;; topk-count -- the count for a key, or 0 if not tracked.
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn topk-count [^borrow tk : TopK key : int] : int
+  (__topk-find-count (.counts tk) (.keys tk) 0 (vec-len (.keys tk)) key))
+
+;;; __topk-find-count -- internal: linear scan for key, return its count.
+(defn __topk-find-count [counts : (Vec int) keys : (Vec int)
+                         i : int n : int key : int] : int
+  (if (>= i n)
+    0
+    (if (= (vec-get keys i) key)
+      (vec-get counts i)
+      (__topk-find-count counts keys (+ i 1) n key))))
+
+;;; __topk-init -- internal: push n zeros into a Vec.
+(defn __topk-init [v : (Vec int) i : int n : int] : nil
+  (if (>= i n)
+    nil
+    (do (vec-push! v 0)
+        (__topk-init v (+ i 1) n))))
+
+;;; topk-new -- create a TopK tracker with capacity K.
+;;;
+;;; Parameters:
+;;;   k -- the maximum number of items to return from topk-list
+;;;
+;;; Returns:
+;;;   A new empty TopK tracker.
+;;;
+;;; Example:
+;;;   (let [tk (topk-new 10)] ...)
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn topk-new [k : int] : TopK
+  (let [keys (vec-new)
+        counts (vec-new)]
+    (TopK keys counts k)))
+
+;;; topk-free -- release the key and count arrays.
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn topk-free [tk : TopK] : void
+  (do (vec-free (.keys tk))
+      (vec-free (.counts tk))))
+
+;;; __topk-find-slot -- internal: find the slot index for key, or -1.
+(defn __topk-find-slot [keys : (Vec int) i : int n : int key : int] : int
+  (if (>= i n)
+    -1
+    (if (= (vec-get keys i) key)
+      i
+      (__topk-find-slot keys (+ i 1) n key))))
+
+;;; topk-add! -- record one occurrence of an element.
+;;;
+;;; Parameters:
+;;;   tk  -- the tracker (mutated in place)
+;;;   key -- the integer key to add
+;;;
+;;; Returns:
+;;;   nil
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn topk-add! [^borrow tk : TopK key : int] : nil
+  (let [slot (__topk-find-slot (.keys tk) 0 (vec-len (.keys tk)) key)]
+    (if (>= slot 0)
+      (vec-set! (.counts tk) slot (+ (vec-get (.counts tk) slot) 1))
+      (do (vec-push! (.keys tk) key)
+          (vec-push! (.counts tk) 1)))))
+
+;;; __topk-find-max -- internal: find the index of the maximum count
+;;; in [start, n), skipping indices already used (marked by swapping
+;;; to the front).
+(defn __topk-find-max [counts : (Vec int) keys : (Vec int)
+                       i : int n : int best-i : int best-count : int] : int
+  (if (>= i n)
+    best-i
+    (let [c (vec-get counts i)]
+      (if (> c best-count)
+        (__topk-find-max counts keys (+ i 1) n i c)
+        (__topk-find-max counts keys (+ i 1) n best-i best-count)))))
+
+;;; __topk-swap -- internal: swap entries at indices i and j.
+(defn __topk-swap [keys : (Vec int) counts : (Vec int) i : int j : int] : nil
+  (let [tk (vec-get keys i)
+        tc (vec-get counts i)]
+    (do (vec-set! keys i (vec-get keys j))
+        (vec-set! counts i (vec-get counts j))
+        (vec-set! keys j tk)
+        (vec-set! counts j tc))))
+
+;;; __topk-select -- internal: selection sort the top K entries to the front.
+;;;
+;;; Selects the K largest entries by count and places them at indices
+;;; [0, K) in descending order.  Does not sort the rest.
+(defn __topk-select [keys : (Vec int) counts : (Vec int)
+                     i : int k : int n : int] : nil
+  (if (>= i k)
+    nil
+    (if (>= i n)
+      nil
+      (let [max-i (__topk-find-max counts keys i n i (vec-get counts i))]
+        (do (if (not (= max-i i)) (__topk-swap keys counts i max-i))
+            (__topk-select keys counts (+ i 1) k n))))))
+
+;;; __topk-copy-front -- internal: copy the first K (count, key) pairs
+;;; into a flat result Vec as [count1, key1, count2, key2, ...].
+(defn __topk-copy-front [keys : (Vec int) counts : (Vec int)
+                         result : (Vec int) i : int k : int] : nil
+  (if (>= i k)
+    nil
+    (do (vec-push! result (vec-get counts i))
+        (vec-push! result (vec-get keys i))
+        (__topk-copy-front keys counts result (+ i 1) k))))
+
+;;; topk-list -- return the top K (count, key) pairs sorted by count descending.
+;;;
+;;; Parameters:
+;;;   tk -- the tracker
+;;;
+;;; Returns:
+;;;   A new flat Vec[int] of [count1, key1, count2, key2, ...] sorted by
+;;;   count descending.  If fewer than K items have been tracked, returns
+;;;   all of them.  The caller owns the returned Vec and must free it.
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn topk-list [^borrow tk : TopK] : (Vec int)
+  (let [n (vec-len (.keys tk))
+        k (if (< (.k tk) n) (.k tk) n)
+        result (vec-new)]
+    (__topk-select (.keys tk) (.counts tk) 0 k n)
+    (__topk-copy-front (.keys tk) (.counts tk) result 0 k)
+    result))
+
+;;; __topk-merge-scan -- internal: add all entries from src into dst.
+(defn __topk-merge-scan [^borrow dst : TopK src-keys : (Vec int) src-counts : (Vec int)
+                         i : int n : int] : nil
+  (if (>= i n)
+    nil
+    (let [key (vec-get src-keys i)
+          cnt (vec-get src-counts i)
+          slot (__topk-find-slot (.keys dst) 0 (vec-len (.keys dst)) key)]
+      (do (if (>= slot 0)
+            (vec-set! (.counts dst) slot (+ (vec-get (.counts dst) slot) cnt))
+            (do (vec-push! (.keys dst) key)
+                (vec-push! (.counts dst) cnt)))
+          (__topk-merge-scan dst src-keys src-counts (+ i 1) n)))))
+
+;;; topk-merge -- "add all of B's items into A" into a new tracker.
+;;;
+;;; Parameters:
+;;;   a -- first tracker
+;;;   b -- second tracker
+;;;
+;;; Returns:
+;;;   A new TopK containing all entries from both a and b, with counts
+;;;   summed for shared keys.  Both inputs remain valid.  The result's
+;;;   K is taken from a.
+;;;
+;;; Note: this merge is NOT idempotent and NOT commutative under shared
+;;; items.  Joining a TopK with itself doubles every count.  No
+;;; JoinSemilattice instance is declared for TopK (probabilistic-spice-plan
+;;; 2.6).
+;;;
+;;; Since: probabilistic-spice-plan C2
+(defn topk-merge [^borrow a : TopK ^borrow b : TopK] : TopK
+  (let [r (topk-new (.k a))]
+    (__topk-merge-scan r (.keys a) (.counts a) 0 (vec-len (.keys a)))
+    (__topk-merge-scan r (.keys b) (.counts b) 0 (vec-len (.keys b)))
+    r))
+
+) ;; end defmodule prob/topk

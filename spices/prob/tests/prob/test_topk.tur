@@ -1,0 +1,96 @@
+;; test_topk -- Top-K correctness, eviction, and merge.
+;;
+;; Layer 3 (empirical): the K reported are the K true most-frequent.
+;; Exact for the Vec-backed variant.  Tests eviction (K+1-th distinct
+;; item replaces the min) and merge (counts summed for shared keys).
+;;
+;; No user inline C in this fixture or in prob/topk, so it runs under
+;; both the interpreter and the compiler.
+;;
+;; NOTE: let-binding names in main are prefixed (tk-) to avoid the
+;; compiler let-binding name collision with function parameters in
+;; topk.tur.
+
+(defmodule prob/tests/test_topk
+  (import prob/topk :refer [TopK topk-new topk-free topk-add! topk-list
+                            topk-merge topk-count topk-len])
+
+(defn fail-if [cond : bool label : cstr] : int
+  (if cond (do (println label) 1) 0))
+
+;;; __topk-add-n -- internal: add key n times.
+(defn __topk-add-n [^borrow tk : TopK key : int cnt : int tot : int] : nil
+  (if (>= cnt tot)
+    nil
+    (do (topk-add! tk key)
+        (__topk-add-n tk key (+ cnt 1) tot))))
+
+(defn main [] : int
+  (let [tk-k 3
+        tk (topk-new tk-k)]
+
+    ;; Add: key 1 x5, key 2 x3, key 3 x1, key 4 x4
+    (__topk-add-n tk 1 0 5)
+    (__topk-add-n tk 2 0 3)
+    (topk-add! tk 3)
+    (__topk-add-n tk 4 0 4)
+
+    (let [result (topk-list tk)
+          ;; result is [count, key, count, key, ...] sorted by count desc
+          ;; Expected: [5, 1, 4, 4, 3, 2] -- key 3 (count 1) evicted
+          r0 (vec-get result 0)
+          r1 (vec-get result 1)
+          r2 (vec-get result 2)
+          r3 (vec-get result 3)
+          r4 (vec-get result 4)
+          r5 (vec-get result 5)]
+
+      ;; --- Eviction test (K+1-th distinct item replaces the min) ---
+      ;; K=2: add key 100 x5, key 200 x3, key 300 x1, key 400 x4.
+      ;; Key 300 (count 1) is the min and must be evicted by key 400.
+      (let [tk-ev (topk-new 2)]
+        (__topk-add-n tk-ev 100 0 5)
+        (__topk-add-n tk-ev 200 0 3)
+        (topk-add! tk-ev 300)
+        (__topk-add-n tk-ev 400 0 4)
+        (let [ev-result (topk-list tk-ev)
+              ev-r0 (vec-get ev-result 0)
+              ev-r1 (vec-get ev-result 1)
+              ev-r2 (vec-get ev-result 2)
+              ev-r3 (vec-get ev-result 3)]
+
+          ;; --- Merge test ---
+          (let [tk-a (topk-new tk-k)
+                tk-b (topk-new tk-k)]
+            (__topk-add-n tk-a 10 0 3)
+            (__topk-add-n tk-b 10 0 2)
+            (let [tk-ab (topk-merge tk-a tk-b)
+                  merged-count (topk-count tk-ab 10)]
+
+              (let [fails
+                    (+ (fail-if (not (= r0 5)) "topk: top count wrong")
+                       (fail-if (not (= r1 1)) "topk: top key wrong")
+                       (fail-if (not (= r2 4)) "topk: 2nd count wrong")
+                       (fail-if (not (= r3 4)) "topk: 2nd key wrong")
+                       (fail-if (not (= r4 3)) "topk: 3rd count wrong")
+                       (fail-if (not (= r5 2)) "topk: 3rd key wrong")
+                       (fail-if (not (= ev-r0 5)) "topk: evict top count wrong")
+                       (fail-if (not (= ev-r1 100)) "topk: evict top key wrong")
+                       (fail-if (not (= ev-r2 4)) "topk: evict 2nd count wrong")
+                       (fail-if (not (= ev-r3 400)) "topk: evict 2nd key wrong")
+                       (fail-if (not (= merged-count 5)) "topk: merge summed count wrong")
+                       (fail-if (not (= (topk-count tk 1) 5)) "topk: count(1) wrong")
+                       (fail-if (not (= (topk-count tk 3) 1)) "topk: count(3) wrong")
+                       (fail-if (not (= (topk-count tk 99) 0)) "topk: absent key count not 0"))]
+                (vec-free result)
+                (vec-free ev-result)
+                (topk-free tk)
+                (topk-free tk-ev)
+                (topk-free tk-a)
+                (topk-free tk-b)
+                (topk-free tk-ab)
+                (if (= fails 0)
+                  (do (println "test_topk: ok") 0)
+                  (do (println "test_topk: FAILURES") fails))))))))))
+
+) ;; end defmodule

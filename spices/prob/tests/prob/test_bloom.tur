@@ -1,0 +1,81 @@
+;; test_bloom -- Bloom filter correctness and empirical false-positive rate.
+;;
+;; Layer 3 (empirical): no false negatives, false-positive rate within 2x of
+;; target.  The FP-rate test is the one that catches a subtle bug the law
+;; harness cannot: if k is wrong for m/n, the filter still joins correctly
+;; (laws pass) but the FP rate is off by a factor.
+;;
+;; Parameters chosen so the FP rate is sensitive to k: m=256, k=2, n=100.
+;; The filter is moderately loaded (fill ratio ~54%), so the FP rate is high
+;; enough (~29%) that 5000 absent keys give ~1470 fps for k=2, vs ~1955 for
+;; k=1 and ~1640 for k=3 -- both mutations are >5 sigma from the correct
+;; value, easily distinguishable.
+;;
+;; No user inline C in this fixture.  prob/bloom has no inline C either,
+;; so this runs under both the interpreter and the compiler.
+
+(defmodule prob/tests/test_bloom
+  (import prob/bloom :refer [Bloom bloom-new bloom-free bloom-insert!
+                             bloom-maybe? bloom-count bloom-merge
+                             bloom-m bloom-k])
+
+(defn fail-if [cond : bool label : cstr] : int
+  (if cond (do (println label) 1) 0))
+
+;;; __bloom-no-fn -- internal: insert n elements, verify all are present.
+(defn __bloom-no-fn [^borrow bf : Bloom i : int n : int fails : int] : int
+  (if (>= i n)
+    fails
+    (do (bloom-insert! bf i)
+        (__bloom-no-fn bf (+ i 1) n
+          (if (bloom-maybe? bf i) fails (+ fails 1))))))
+
+;;; __bloom-fp-rate -- internal: count false positives over absent keys.
+;;;
+;;; Queries keys [start, start+total) -- none were inserted.
+;;; Returns the false-positive count.
+(defn __bloom-fp-rate [^borrow bf : Bloom key : int end : int fps : int] : int
+  (if (>= key end)
+    fps
+    (__bloom-fp-rate bf (+ key 1) end
+      (if (bloom-maybe? bf key) (+ fps 1) fps))))
+
+(defn main [] : int
+  (let [m 256
+        k 2
+        n 100
+        bf (bloom-new m k)
+
+        ;; Insert n elements and verify no false negatives.
+        fn-fails (__bloom-no-fn bf 0 n 0)
+
+        ;; Measure false-positive rate over 5000 absent keys.
+        ;; Expected fps for k=2: ~1470 (29.4%).  Tolerance +/- 100
+        ;; catches k=1 (~1955) and k=3 (~1640).
+        fps  (__bloom-fp-rate bf 100 5100 0)
+
+        ;; Merge test: two filters with disjoint elements.
+        sk-a (bloom-new m k)
+        sk-b (bloom-new m k)]
+    (bloom-insert! sk-a 1)
+    (bloom-insert! sk-a 2)
+    (bloom-insert! sk-b 3)
+    (bloom-insert! sk-b 4)
+    (let [ab (bloom-merge sk-a sk-b)
+          fails
+          (+ (fail-if (> fn-fails 0) "bloom: false negative")
+             (fail-if (< fps 1370) "bloom: FP rate too low (k wrong?)")
+             (fail-if (> fps 1570) "bloom: FP rate too high (k wrong?)")
+             (fail-if (not (bloom-maybe? ab 1)) "bloom: merge lost key 1")
+             (fail-if (not (bloom-maybe? ab 2)) "bloom: merge lost key 2")
+             (fail-if (not (bloom-maybe? ab 3)) "bloom: merge lost key 3")
+             (fail-if (not (bloom-maybe? ab 4)) "bloom: merge lost key 4"))]
+      (bloom-free bf)
+      (bloom-free sk-a)
+      (bloom-free sk-b)
+      (bloom-free ab)
+      (if (= fails 0)
+        (do (println "test_bloom: ok") 0)
+        (do (println "test_bloom: FAILURES") fails)))))
+
+) ;; end defmodule

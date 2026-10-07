@@ -1,0 +1,99 @@
+;; test_cuckoo -- Cuckoo filter correctness, deletion, and filter-full.
+;;
+;; Layer 3 (empirical): no false negatives, false-positive rate check,
+;; delete-then-lookup, and the filter-full case (max kicks exceeded).
+;;
+;; No user inline C in this fixture or in prob/cuckoo, so it runs under
+;; both the interpreter and the compiler.
+;;
+;; NOTE: let-binding names in main are prefixed (cf-, ck-) to avoid the
+;; compiler let-binding name collision with function parameters in
+;; cuckoo.tur.
+
+(defmodule prob/tests/test_cuckoo
+  (import prob/cuckoo :refer [Cuckoo cuckoo-new cuckoo-free cuckoo-insert!
+                              cuckoo-maybe? cuckoo-delete! cuckoo-merge
+                              cuckoo-count])
+
+(defn fail-if [cond : bool label : cstr] : int
+  (if cond (do (println label) 1) 0))
+
+;;; __cuckoo-insert-range -- internal: insert keys [0, n).
+(defn __cuckoo-insert-range [^borrow cf : Cuckoo key : int n : int] : nil
+  (if (>= key n)
+    nil
+    (do (cuckoo-insert! cf key)
+        (__cuckoo-insert-range cf (+ key 1) n))))
+
+;;; __cuckoo-no-fn -- internal: verify all inserted keys are present.
+(defn __cuckoo-no-fn [^borrow cf : Cuckoo key : int n : int fails : int] : int
+  (if (>= key n)
+    fails
+    (__cuckoo-no-fn cf (+ key 1) n
+      (if (cuckoo-maybe? cf key) fails (+ fails 1)))))
+
+;;; __cuckoo-fp-rate -- internal: count false positives over absent keys.
+(defn __cuckoo-fp-rate [^borrow cf : Cuckoo key : int end : int fps : int] : int
+  (if (>= key end)
+    fps
+    (__cuckoo-fp-rate cf (+ key 1) end
+      (if (cuckoo-maybe? cf key) (+ fps 1) fps))))
+
+;;; __cuckoo-fill-until-full -- internal: insert keys [start, ...) until full.
+;;; Returns true if at least one insert returned false (filter full).
+(defn __cuckoo-fill-until-full [^borrow cf : Cuckoo key : int] : bool
+  (if (>= key 100000)
+    false
+    (if (cuckoo-insert! cf key)
+      (__cuckoo-fill-until-full cf (+ key 1))
+      true)))
+
+(defn main [] : int
+  ;; --- Basic insert and lookup ---
+  (let [cf-n 4096
+        cf (cuckoo-new cf-n)]
+    (__cuckoo-insert-range cf 0 100)
+
+    (let [fn-fails (__cuckoo-no-fn cf 0 100 0)
+          fps (__cuckoo-fp-rate cf 100 5100 0)]
+
+      ;; --- Delete-then-lookup ---
+      (cuckoo-delete! cf 42)
+      (let [after-delete (cuckoo-maybe? cf 42)
+            still-there (cuckoo-maybe? cf 43)]
+
+        ;; --- Filter-full case (max kicks exceeded) ---
+        ;; A tiny filter (16 buckets x 4 slots = 64 slots) filled with
+        ;; many distinct keys must eventually report full (insert returns
+        ;; false).  This is the C2 acceptance criterion from the plan.
+        (let [cf-full (cuckoo-new 16)
+              full? (__cuckoo-fill-until-full cf-full 1000)]
+          (cuckoo-free cf-full)
+
+          ;; --- Merge test ---
+          (let [ck-a (cuckoo-new cf-n)
+                ck-b (cuckoo-new cf-n)]
+            (cuckoo-insert! ck-a 1)
+            (cuckoo-insert! ck-a 2)
+            (cuckoo-insert! ck-b 3)
+            (cuckoo-insert! ck-b 4)
+            (let [ck-ab (cuckoo-merge ck-a ck-b)]
+              (let [fails
+                    (+ (fail-if (> fn-fails 0) "cuckoo: false negative")
+                       (fail-if (> fps 1500) "cuckoo: FP rate too high (> 30%)")
+                       (fail-if after-delete "cuckoo: deleted key still found")
+                       (fail-if (not still-there) "cuckoo: delete removed wrong key")
+                       (fail-if (not full?) "cuckoo: filter never reported full")
+                       (fail-if (not (cuckoo-maybe? ck-ab 1)) "cuckoo: merge lost key 1")
+                       (fail-if (not (cuckoo-maybe? ck-ab 2)) "cuckoo: merge lost key 2")
+                       (fail-if (not (cuckoo-maybe? ck-ab 3)) "cuckoo: merge lost key 3")
+                       (fail-if (not (cuckoo-maybe? ck-ab 4)) "cuckoo: merge lost key 4"))]
+                (cuckoo-free cf)
+                (cuckoo-free ck-a)
+                (cuckoo-free ck-b)
+                (cuckoo-free ck-ab)
+                (if (= fails 0)
+                  (do (println "test_cuckoo: ok") 0)
+                  (do (println "test_cuckoo: FAILURES") fails))))))))))
+
+) ;; end defmodule

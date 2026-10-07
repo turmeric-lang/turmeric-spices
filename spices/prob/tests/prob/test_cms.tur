@@ -1,0 +1,67 @@
+;; test_cms -- Count-Min Sketch frequency estimation and merge.
+;;
+;; Layer 3 (empirical): estimate >= true always (never under-counts);
+;; estimate <= true + eps * N with eps = e/w over N total.  Merge is
+;; pointwise addition.
+;;
+;; No user inline C in this fixture or in prob/cms, so it runs under both
+;; the interpreter and the compiler.
+;;
+;; NOTE: let-binding names in main are prefixed (sk-, cms-) to avoid a
+;; compiler let-binding name collision with function parameters in cms.tur
+;; (e.g. cms-merge's parameters a/b, cms-new's parameters d/w).
+
+(defmodule prob/tests/test_cms
+  (import prob/cms :refer [CountMin cms-new cms-free cms-add! cms-estimate
+                           cms-merge cms-inner-product cms-d cms-w])
+
+(defn fail-if [cond : bool label : cstr] : int
+  (if cond (do (println label) 1) 0))
+
+;;; __cms-add-n -- internal: add key n times.
+(defn __cms-add-n [^borrow self : CountMin k : int cnt : int tot : int] : nil
+  (if (>= cnt tot)
+    nil
+    (do (cms-add! self k)
+        (__cms-add-n self k (+ cnt 1) tot))))
+
+(defn main [] : int
+  (let [cms-d 5
+        cms-w 1024
+        sk (cms-new cms-d cms-w)]
+
+    ;; Add key 42 ten times, key 7 three times, key 100 once.
+    (__cms-add-n sk 42 0 10)
+    (__cms-add-n sk 7 0 3)
+    (cms-add! sk 100)
+
+    (let [est42  (cms-estimate sk 42)
+          est7   (cms-estimate sk 7)
+          est100 (cms-estimate sk 100)
+          est999 (cms-estimate sk 999)]
+
+      ;; Merge test: two sketches with overlapping keys.
+      (let [sk-a (cms-new cms-d cms-w)
+            sk-b (cms-new cms-d cms-w)]
+        (__cms-add-n sk-a 1 0 5)
+        (__cms-add-n sk-b 1 0 3)
+        (let [sk-ab (cms-merge sk-a sk-b)
+              est1-ab (cms-estimate sk-ab 1)]
+
+          (let [fails
+                (+ (fail-if (< est42 10) "cms: under-counted key 42")
+                   (fail-if (< est7 3) "cms: under-counted key 7")
+                   (fail-if (< est100 1) "cms: under-counted key 100")
+                   (fail-if (> est42 20) "cms: over-counted key 42 (> 2x)")
+                   (fail-if (> est999 10) "cms: absent key over-counted too much")
+                   (fail-if (< est1-ab 8) "cms: merge under-counted key 1")
+                   (fail-if (> est1-ab 16) "cms: merge over-counted key 1 (> 2x)"))]
+            (cms-free sk)
+            (cms-free sk-a)
+            (cms-free sk-b)
+            (cms-free sk-ab)
+            (if (= fails 0)
+              (do (println "test_cms: ok") 0)
+              (do (println "test_cms: FAILURES") fails))))))))
+
+) ;; end defmodule

@@ -1,0 +1,214 @@
+;; prob/bloom -- Bloom filter: approximate membership with no false negatives.
+;;
+;; A bit array of m bits and k hash functions.  Insert sets k bits at positions
+;; derived from double-hashing (prob/hash).  Membership is approximate: false
+;; positives are possible, false negatives are not.  Merge is bit-OR, which is
+;; associative, commutative and idempotent -- a join-semilattice.
+;;
+;; Representation: a by-value struct holding a Vec[int] handle (the bit array,
+;; where each element is 0 or 1), plus m and k.  The Vec is shared across
+;; copies of the struct, so `bloom-insert!` mutates the bits in place and the
+;; change is visible to all holders.  `bloom-merge` allocates a NEW Vec and
+;; leaves both inputs valid.
+;;
+;; No user inline C (probabilistic-spice-plan 2.8).  All operations go
+;; through stdlib/vec.tur, which is auto-loaded and has native interpreter
+;; overrides, so Bloom tests run under both the interpreter and the compiler.
+;; The plan names SizedBitVec as the ideal backing (1 bit per bit vs 8 bytes
+;; per bit here); the switch to Vec[int] is a C1 pragmatic choice to avoid
+;; the sized-bits.tur dependency, which has inline C without native overrides.
+;; Promoting to SizedBitVec is a noted follow-up once the stdlib is stable.
+
+(load "stdlib/typeclass-lattice.tur")
+
+(defmodule prob/bloom
+  (import prob/hash :refer [HashPair prob-hash-pair prob-double-hash-index])
+  (export Bloom bloom-new bloom-free bloom-insert! bloom-maybe?
+          bloom-count bloom-merge bloom-m bloom-k)
+
+;;; Bloom -- a Bloom filter: bit array of m bits, k hash functions.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defstruct Bloom [bits : (Vec int) m : int k : int])
+
+;;; bloom-m -- the bit count.
+;;;
+;;; Parameters:
+;;;   bf -- the filter
+;;;
+;;; Returns:
+;;;   m, the number of bits in the bit array.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn bloom-m [^borrow bf : Bloom] : int (.m bf))
+
+;;; bloom-k -- the hash function count.
+;;;
+;;; Parameters:
+;;;   bf -- the filter
+;;;
+;;; Returns:
+;;;   k, the number of hash functions.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn bloom-k [^borrow bf : Bloom] : int (.k bf))
+
+;;; bloom-new -- create a Bloom filter with m bits and k hash functions.
+;;;
+;;; Parameters:
+;;;   m -- number of bits (should be a power of two for fast mod)
+;;;   k -- number of hash functions
+;;;
+;;; Returns:
+;;;   A new Bloom filter with all bits clear.
+;;;
+;;; Example:
+;;;   (let [bf (bloom-new 1024 7)] ...)
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn bloom-new [m : int k : int] : Bloom
+  (let [v (vec-new)]
+    (__bloom-init v 0 m)
+    (Bloom v m k)))
+
+;;; __bloom-init -- internal: push m zeros into the bit Vec.
+(defn __bloom-init [v : (Vec int) i : int m : int] : nil
+  (if (>= i m)
+    nil
+    (do (vec-push! v 0)
+        (__bloom-init v (+ i 1) m))))
+
+;;; bloom-free -- release the bit array.
+;;;
+;;; Parameters:
+;;;   bf -- the filter to free
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn bloom-free [bf : Bloom] : void
+  (vec-free (.bits bf)))
+
+;;; __bloom-set-loop -- internal: set k bits at the double-hash positions.
+(defn __bloom-set-loop [bits : (Vec int) h1 : int h2 : int i : int k : int m : int] : nil
+  (if (>= i k)
+    nil
+    (do (vec-set! bits (prob-double-hash-index h1 h2 i m) 1)
+        (__bloom-set-loop bits h1 h2 (+ i 1) k m))))
+
+;;; bloom-insert! -- add an element to the filter.
+;;;
+;;; Parameters:
+;;;   bf  -- the filter (mutated in place via the shared bit array)
+;;;   key -- the integer key to insert
+;;;
+;;; Returns:
+;;;   nil
+;;;
+;;; Example:
+;;;   (bloom-insert! bf 42)
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn bloom-insert! [^borrow bf : Bloom key : int] : nil
+  (let [hp (prob-hash-pair key)]
+    (__bloom-set-loop (.bits bf) (.h1 hp) (.h2 hp) 0 (.k bf) (.m bf))))
+
+;;; __bloom-check-loop -- internal: are all k bits set?
+(defn __bloom-check-loop [bits : (Vec int) h1 : int h2 : int i : int k : int m : int] : bool
+  (if (>= i k)
+    true
+    (if (= (vec-get bits (prob-double-hash-index h1 h2 i m)) 0)
+      false
+      (__bloom-check-loop bits h1 h2 (+ i 1) k m))))
+
+;;; bloom-maybe? -- is the element possibly in the filter?
+;;;
+;;; Parameters:
+;;;   bf  -- the filter
+;;;   key -- the integer key to check
+;;;
+;;; Returns:
+;;;   true if all k bits are set (element may be present, or a false positive).
+;;;   false if any bit is clear (element is definitely not present).
+;;;
+;;; Example:
+;;;   (bloom-maybe? bf 42)
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn bloom-maybe? [^borrow bf : Bloom key : int] : bool
+  (let [hp (prob-hash-pair key)]
+    (__bloom-check-loop (.bits bf) (.h1 hp) (.h2 hp) 0 (.k bf) (.m bf))))
+
+;;; __bloom-count-loop -- internal: count set bits.
+(defn __bloom-count-loop [bits : (Vec int) i : int m : int acc : int] : int
+  (if (>= i m)
+    acc
+    (__bloom-count-loop bits (+ i 1) m (+ acc (vec-get bits i)))))
+
+;;; bloom-count -- the number of set bits (popcount).
+;;;
+;;; Parameters:
+;;;   bf -- the filter
+;;;
+;;; Returns:
+;;;   The popcount of the bit array.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn bloom-count [^borrow bf : Bloom] : int
+  (__bloom-count-loop (.bits bf) 0 (.m bf) 0))
+
+;;; __bloom-or-loop -- internal: OR src bits into dst.
+(defn __bloom-or-loop [dst : (Vec int) src : (Vec int) i : int m : int] : nil
+  (if (>= i m)
+    nil
+    (do (if (= (vec-get src i) 1) (vec-set! dst i 1))
+        (__bloom-or-loop dst src (+ i 1) m))))
+
+;;; bloom-merge -- bit-OR two filters into a new one.
+;;;
+;;; Parameters:
+;;;   a -- first filter
+;;;   b -- second filter (must have the same m and k)
+;;;
+;;; Returns:
+;;;   A new Bloom filter whose bits are the OR of a's and b's.  Both inputs
+;;;   remain valid.
+;;;
+;;; Since: probabilistic-spice-plan C1
+(defn bloom-merge [^borrow a : Bloom ^borrow b : Bloom] : Bloom
+  (let [r (bloom-new (.m a) (.k a))]
+    (__bloom-or-loop (.bits r) (.bits a) 0 (.m a))
+    (__bloom-or-loop (.bits r) (.bits b) 0 (.m b))
+    r))
+
+;;; __bloom-eq-loop -- internal: are all bits equal?
+(defn __bloom-eq-loop [a : (Vec int) b : (Vec int) i : int m : int] : bool
+  (if (>= i m)
+    true
+    (if (= (vec-get a i) (vec-get b i))
+      (__bloom-eq-loop a b (+ i 1) m)
+      false)))
+
+;;; Eq [Bloom] -- same m, k, and all bits equal.
+(definstance Eq [Bloom]
+  (eq? [^borrow x ^borrow y]
+    (and (= (.m x) (.m y))
+         (= (.k x) (.k y))
+         (__bloom-eq-loop (.bits x) (.bits y) 0 (.m x)))))
+
+;;; default-bloom-m -- default bit count for bottom.
+(defn default-bloom-m [] : int 1024)
+
+;;; default-bloom-k -- default hash count for bottom.
+(defn default-bloom-k [] : int 7)
+
+;;; JoinSemilattice [Bloom] -- join is bit-OR.
+;;
+;; bit-OR is associative, commutative and idempotent, so this is a genuine
+;; join-semilattice.  The law harness in test_merge.tur checks all three laws.
+(definstance JoinSemilattice [Bloom]
+  (join [x y] (bloom-merge x y)))
+
+;;; BoundedJoin [Bloom] -- the all-zero filter of default size is bottom.
+(definstance BoundedJoin [Bloom]
+  (bottom [] (bloom-new (default-bloom-m) (default-bloom-k))))
+
+) ;; end defmodule prob/bloom

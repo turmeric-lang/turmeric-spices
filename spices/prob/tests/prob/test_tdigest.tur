@@ -1,0 +1,97 @@
+;; test_tdigest -- t-digest empirical quantile error and merge.
+;;
+;; Layer 3 (empirical): quantile error against a known uniform distribution
+;; at several quantiles including the tails (q near 0 and 1).  Also tests
+;; merge: two t-digests covering disjoint ranges merge into one whose
+;; quantiles match the full range.
+;;
+;; No user inline C in this fixture or in prob/tdigest.  stdlib/math.tur
+;; (loaded by tdigest for asin) has native interpreter overrides, so this
+;; test runs under both the interpreter and the compiler.
+;;
+;; NOTE: let-binding names in main are prefixed (td-) to avoid the
+;; compiler let-binding name collision with function parameters in
+;; tdigest.tur.
+
+(defmodule prob/tests/test_tdigest
+  (import prob/tdigest :refer [TDigest tdigest-new tdigest-free tdigest-add!
+                               tdigest-quantile tdigest-merge tdigest-count
+                               tdigest-num-centroids])
+
+(defn fail-if [cond : bool label : cstr] : int
+  (if cond (do (println label) 1) 0))
+
+;;; __td-add-range -- internal: add values [start, end) as floats.
+(defn __td-add-range [^borrow td : TDigest val : int end : int] : nil
+  (if (>= val end)
+    nil
+    (do (tdigest-add! td (int->float val))
+        (__td-add-range td (+ val 1) end))))
+
+;;; __td-check-quantile -- internal: check one quantile against the true value.
+;;; Returns 1 if the error exceeds the bound, 0 otherwise.
+(defn __td-check-quantile [^borrow td : TDigest q : float true-val : float
+                           bound : float label : cstr] : int
+  (let [approx (tdigest-quantile td q)
+        err (fabs (- approx true-val))]
+    (fail-if (> err bound) label)))
+
+(defn main [] : int
+  ;; --- Uniform distribution: insert 0..999, check quantiles ---
+  ;; compression=50 gives ~50 centroids over 1000 values.
+  ;; Each centroid covers ~20 values, so error should be < 20.
+  ;; We use a generous bound of 50 (5% of the 1000 range).
+  (let [td-comp 50.0
+        td (tdigest-new td-comp)]
+    (__td-add-range td 0 1000)
+
+    (let [td-bound 50.0
+          td-fails
+          (+ (__td-check-quantile td 0.01 10.0 td-bound "tdigest: q=0.01 error too large")
+             (__td-check-quantile td 0.05 50.0 td-bound "tdigest: q=0.05 error too large")
+             (__td-check-quantile td 0.10 100.0 td-bound "tdigest: q=0.10 error too large")
+             (__td-check-quantile td 0.25 250.0 td-bound "tdigest: q=0.25 error too large")
+             (__td-check-quantile td 0.50 500.0 td-bound "tdigest: q=0.50 error too large")
+             (__td-check-quantile td 0.75 750.0 td-bound "tdigest: q=0.75 error too large")
+             (__td-check-quantile td 0.90 900.0 td-bound "tdigest: q=0.90 error too large")
+             (__td-check-quantile td 0.95 950.0 td-bound "tdigest: q=0.95 error too large")
+             (__td-check-quantile td 0.99 990.0 td-bound "tdigest: q=0.99 error too large"))]
+
+      ;; --- Merge test: two disjoint halves ---
+      (let [td-a (tdigest-new td-comp)
+            td-b (tdigest-new td-comp)]
+        (__td-add-range td-a 0 500)
+        (__td-add-range td-b 500 1000)
+        (let [td-ab (tdigest-merge td-a td-b)
+              merge-fails
+              (+ (__td-check-quantile td-ab 0.25 250.0 td-bound "tdigest: merge q=0.25 error")
+                 (__td-check-quantile td-ab 0.50 500.0 td-bound "tdigest: merge q=0.50 error")
+                 (__td-check-quantile td-ab 0.75 750.0 td-bound "tdigest: merge q=0.75 error"))]
+
+          ;; --- Edge cases ---
+          (let [td-empty (tdigest-new td-comp)
+                empty-q (tdigest-quantile td-empty 0.5)
+                td-single (tdigest-new td-comp)]
+            (tdigest-add! td-single 42.0)
+            (let [single-q (tdigest-quantile td-single 0.5)
+                  td-count (tdigest-count td)
+                  td-nc (tdigest-num-centroids td)
+                  edge-fails
+                  (+ (fail-if (not (= empty-q 0.0)) "tdigest: empty quantile not 0.0")
+                     (fail-if (not (= single-q 42.0)) "tdigest: single centroid quantile wrong")
+                     (fail-if (not (= td-count 1000)) "tdigest: count wrong")
+                     (fail-if (>= td-nc 100) "tdigest: too many centroids (compression not working)")
+                     (fail-if (< td-nc 10) "tdigest: too few centroids"))]
+
+              (let [fails (+ td-fails merge-fails edge-fails)]
+                (tdigest-free td)
+                (tdigest-free td-a)
+                (tdigest-free td-b)
+                (tdigest-free td-ab)
+                (tdigest-free td-empty)
+                (tdigest-free td-single)
+                (if (= fails 0)
+                  (do (println "test_tdigest: ok") 0)
+                  (do (println "test_tdigest: FAILURES") fails))))))))))
+
+) ;; end defmodule
