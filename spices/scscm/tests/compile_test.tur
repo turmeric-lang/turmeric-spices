@@ -1,0 +1,170 @@
+;; tests/compile_test.tur -- compile-text on small programs, one rule each.
+;;
+;; Every expected string here (errors aside) was checked to parse with stock
+;; sclang 3.13, inside a function declaring its free variables; the corpus has
+;; the same guarantee through tests/corpus/check-sclang.sh. Errors come back
+;; as positioned messages.
+
+(defmodule scscm/tests/compile
+  (import scscm/compile :refer [compile-text])
+  (import scscm/lexer   :refer [lex-ok? lex-ok-val lex-err-val scscm-int-as-cstr])
+  (import test/assert   :refer [assert-true])
+  (import test/suite    :refer [describe it])
+  (import test/runner   :refer [run-all-status])
+
+  ;; Compiled text, or "error: <message>".
+  (defn sc [src : cstr] #fx{Unsafe} : cstr
+    (let [r (compile-text src)]
+      (if (lex-ok? r)
+        (scscm-int-as-cstr (lex-ok-val r))
+        (cat "error: " (scscm-int-as-cstr (lex-err-val r))))))
+
+  (defn cat [a : cstr b : cstr] #fx{Unsafe} : cstr
+    ```c
+    size_t la = strlen((const char*)a), lb = strlen((const char*)b);
+    char *o = malloc(la + lb + 1);
+    memcpy(o, a, la); memcpy(o + la, b, lb); o[la + lb] = '\0';
+    return o;
+    ```)
+
+  ;; Equal, or print both so the failure shows the difference.
+  (defn is [expected : cstr actual : cstr] #fx{Unsafe IO} : bool
+    ```c
+    if (strcmp((const char*)expected, (const char*)actual) == 0) return true;
+    fprintf(stderr, "expected: %s\n  actual: %s\n", (const char*)expected, (const char*)actual);
+    return false;
+    ```)
+
+  (defn __all-tests [] #fx{Unsafe IO} : void
+    (do
+      (describe "functions"
+        (it "parameter defaults are |name=value|"
+          (assert-true (is "{ |freq=440, amp=0.1| freq * amp };\n"
+                           (sc "(fn (freq 440 amp 0.1) (* freq amp))"))))
+        (it "a rest parameter follows without a comma"
+          (assert-true (is "{ |a ...more| more };\n" (sc "(fn (a . more) more)"))))
+        (it "no parameters is a bare block"
+          (assert-true (is "{ 1 };\n" (sc "(fn () 1)"))))
+        (it "bracket parameters are accepted"
+          (assert-true (is "{ |a, b| a + b };\n" (sc "(fn [a b] (+ a b))"))))
+        (it "a defn is declared and called with .()"
+          (assert-true (is "var sq = { |x| x * x };\nsq.(3);\n"
+                           (sc "(defn sq (x) (* x x)) (sq 3)"))))
+        (it "a call to an unknown name is a message to its first argument"
+          (assert-true (is "postln(1);\n" (sc "(postln 1)"))))
+        (it "a fn value is applied with .()"
+          (assert-true (is "{ |x| x }.(5);\n" (sc "((fn (x) x) 5)"))))
+        (it "#(...) is a function of %1..%N"
+          (assert-true (is "{ |scscm_p1, scscm_p2| scscm_p1 + scscm_p2 };\n"
+                           (sc "#(+ % %2)")))))
+
+      (describe "declarations"
+        (it "leading vars stay declarations"
+          (assert-true (is "var x = 1;\nvar y = x + 1;\ny;\n"
+                           (sc "(var x 1) (var y (+ x 1)) y"))))
+        (it "a var after a statement is hoisted"
+          (assert-true (is "var y;\nvar x = 1;\nx.postln;\ny = 2;\n"
+                           (sc "(var x 1) (. x postln) (var y 2)"))))
+        (it "a fn body hoists the same way"
+          (assert-true (is "{ var b; var a = 1; a.postln; b = 2 };\n"
+                           (sc "(fn () (var a 1) (. a postln) (var b 2))"))))
+        (it "a repeated var is an assignment"
+          (assert-true (is "var x = 1;\nx = 2;\nx;\n" (sc "(var x 1) (var x 2) x"))))
+        (it "names declared in a do block stay inside it"
+          (assert-true (is "[{ var f = 1; f }.value, f(2)];\n"
+                           (sc "(list (do (var f 1) f) (f 2))"))))
+        (it "def is var"
+          (assert-true (is "var my_value = 42;\n" (sc "(def my-value 42)"))))
+        (it "let binds through a block"
+          (assert-true (is "{ |a, b| a + b }.value(1, 2);\n"
+                           (sc "(let ((a 1) (b 2)) (+ a b))"))))
+        (it "bracket let bindings are accepted"
+          (assert-true (is "{ |a| a }.value(1);\n" (sc "(let [a 1] a)")))))
+
+      (describe "data"
+        (it "list is an array literal"
+          (assert-true (is "[60, 62, 64];\n" (sc "(list 60 62 64)"))))
+        (it "a standalone dict is an Event"
+          (assert-true (is "(freq: 440, amp: 0.1);\n" (sc "(dict :freq 440 :amp 0.1)"))))
+        (it "a trailing dict is keyword arguments"
+          (assert-true (is "EnvGen.kr(env, gate, doneAction: 2);\n"
+                           (sc "(EnvGen.kr env gate (dict :doneAction 2))"))))
+        (it "a dict for Synth is a control array"
+          (assert-true (is "Synth(\"s\", [\\freq, 440]);\n"
+                           (sc "(Synth \"s\" (dict :freq 440))"))))
+        (it "a dict for node.set is a control array"
+          (assert-true (is "n.set([\\freq, 220]);\n" (sc "(. n set (dict :freq 220))"))))
+        (it "keyword hyphens become underscores"
+          (assert-true (is "\\some_key;\n" (sc ":some-key"))))
+        (it "a quoted symbol is a symbol literal"
+          (assert-true (is "\\foo;\n" (sc "'foo"))))
+        (it "a quoted list is a literal array"
+          (assert-true (is "#['+', 1, [2, 3]];\n" (sc "'(+ 1 (2 3))"))))
+        (it "unary plus is dropped from a number"
+          (assert-true (is "5;\n" (sc "+5"))))
+        (it "strings keep their escapes"
+          (assert-true (is "\"a\\\"b\";\n" (sc "\"a\\\"b\"")))))
+
+      (describe "operators"
+        (it "n-ary arithmetic folds left"
+          (assert-true (is "a * b * c;\n" (sc "(* a b c)"))))
+        (it "a nested operator is parenthesised (sclang has no precedence)"
+          (assert-true (is "a * (b + c);\n" (sc "(* a (+ b c))"))))
+        (it "unary minus is neg"
+          (assert-true (is "x.neg;\n" (sc "(- x)"))))
+        (it "= is ==, and/or are &&/||"
+          (assert-true (is "(a == b) && c;\n" (sc "(and (= a b) c)"))))
+        (it "an operator receiver is parenthesised"
+          (assert-true (is "(1 + 1).postln;\n" (sc "(. (+ 1 1) postln)")))))
+
+      (describe "control flow"
+        (it "if takes two blocks"
+          (assert-true (is "if (c) { 1 } { 2 };\n" (sc "(if c 1 2)"))))
+        (it "if without else is nil"
+          (assert-true (is "if (c) { 1 } { nil };\n" (sc "(if c 1)"))))
+        (it "cond clauses nest ifs"
+          (assert-true (is "if (x < 0) { \\neg } { if (x > 0) { \\pos } { \\zero } };\n"
+                           (sc "(cond ((< x 0) :neg) ((> x 0) :pos) (else :zero))"))))
+        (it "do in an expression is a parenthesised sequence"
+          (assert-true (is "[(a.postln; b)];\n" (sc "(list (do (. a postln) b))"))))
+        (it "do at the top level is spliced"
+          (assert-true (is "1;\n2;\n" (sc "(do 1 2)"))))
+        (it "when is if with a nil else"
+          (assert-true (is "if (c) { a.postln } { nil };\n" (sc "(when c (. a postln))")))))
+
+      (describe "macros"
+        (it "-> sends a symbol step and threads a list step first"
+          (assert-true (is "f(x.abs, 2);\n" (sc "(-> x abs (f 2))"))))
+        (it "->> threads last"
+          (assert-true (is "g(1, f(x));\n" (sc "(->> x f (g 1))"))))
+        (it "defsynth adds the SynthDef"
+          (assert-true (is "SynthDef(\"beep\", { |freq=440| Out.ar(0, SinOsc.ar(freq)) }).add;\n"
+                           (sc "(defsynth beep (freq 440) (Out.ar 0 (SinOsc.ar freq)))"))))
+        (it "metronome is a TempoClock"
+          (assert-true (is "TempoClock.new(140 / 60);\n" (sc "(metronome 140)"))))
+        (it "adsr wraps an EnvGen with doneAction 2"
+          (assert-true (is "EnvGen.kr(Env.adsr(0.01, 0.1, 0.8, 0.3), gate, doneAction: 2);\n"
+                           (sc "(adsr gate 0.01 0.1 0.8 0.3)"))))
+        (it "pbind is Pbind of its pairs"
+          (assert-true (is "Pbind(\\dur, 0.25).play;\n" (sc "(. (pbind :dur 0.25) play)"))))
+        (it "in schedules on the default clock"
+          (assert-true (is "TempoClock.default.sched(2, { n.free });\n" (sc "(in 2 (kill n))"))))
+        (it "a user defmacro substitutes and unquotes"
+          (assert-true (is "5 + 1;\n" (sc "(defmacro my-inc [x] `(+ ~x 1)) (my-inc 5)"))))
+        (it "~@ splices a rest parameter"
+          (assert-true (is "[1, 2, 3];\n" (sc "(defmacro lst (. xs) `(list ~@xs)) (lst 1 2 3)")))))
+
+      (describe "errors"
+        (it "an unclosed list names where it opened"
+          (assert-true (is "error: unclosed '(' opened at line 2 col 3" (sc "1\n  (foo (bar 1)"))))
+        (it "a stray close paren names its position"
+          (assert-true (is "error: unexpected ')' at line 1 col 6" (sc "(foo))"))))
+        (it "an unterminated string names where it starts"
+          (assert-true (is "error: unterminated string literal at line 1 col 4" (sc "(a \"abc"))))
+        (it "an unexpected character names its position"
+          (assert-true (is "error: unexpected char '@' at line 2 col 3" (sc "(a\n  @b)")))))))
+
+  (defn main [] #fx{Unsafe IO} : int
+    (do
+      (__all-tests)
+      (run-all-status))))

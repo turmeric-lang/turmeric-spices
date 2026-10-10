@@ -27,7 +27,8 @@
   (import scscm/lexer :refer [cons head tail nil-value list-nil?
                                scscm-list-rev scscm-cstr-eq?
                                lex-ok lex-err lex-ok? lex-err? lex-ok-val
-                               token-type token-value])
+                               token-type token-value token-line token-col
+                               scscm-cstr-as-int])
 
 ;; ---- AST node allocators (inline-C) ----
 
@@ -267,14 +268,33 @@
 
 ;; ---- string helpers ----
 
+;; ---- error messages ----
+
+;; "<what> at line L col C" as a fresh string, cast to :int for lex-err.
+(defn scscm-err-at [what : cstr tok : int] #fx{Unsafe} : int
+  (scscm-cstr-as-int (scscm-err-fmt what (token-value tok) (token-line tok) (token-col tok))))
+
+(defn scscm-err-fmt [what : cstr text : cstr line : int col : int] #fx{Unsafe} : cstr
+  ```c
+  const char *w = (const char*)(intptr_t)what;
+  const char *t = (const char*)(intptr_t)text;
+  size_t n = strlen(w) + strlen(t) + 64;
+  char *out = malloc(n);
+  snprintf(out, n, w, t, (int)line, (int)col);
+  return out;
+  ```)
+
+(defn scscm-err [what : cstr] #fx{Unsafe} : int
+  (scscm-cstr-as-int what))
+
 ;; ---- recursive descent parser ----
 
 ;; Parse items into node until closing token type close-ttyp is seen.
 ;; Returns lex-ok(cons(node remaining)) or lex-err.
 ;; scscm-parse-form is a forward reference here (1 int arg -> ptr<void>).
-(defn scscm-parse-list-body [tokens : int node : int close-ttyp : cstr] #fx{Unsafe} : ptr<void>
+(defn scscm-parse-list-body [tokens : int node : int close-ttyp : cstr open-tok : int] #fx{Unsafe} : ptr<void>
   (if (list-nil? tokens)
-    (lex-err 2)
+    (lex-err (scscm-err-at "unclosed '%s' opened at line %d col %d" open-tok))
     (let [tok   (head tokens)
           ttyp  (token-type tok)]
       (if (scscm-cstr-eq? ttyp close-ttyp)
@@ -286,14 +306,14 @@
                   child     (head pair)
                   remaining (tail pair)]
               (scscm-ast-add-child node child)
-              (scscm-parse-list-body remaining node close-ttyp))))))))
+              (scscm-parse-list-body remaining node close-ttyp open-tok))))))))
 
 ;; Parse a wrapper node (quote / quasiquote / unquote / unquote-splice).
 ;; kind is the AST node kind; wraps the next parsed form.
 ;; scscm-parse-form is a forward reference here (1 int arg -> ptr<void>).
-(defn scscm-parse-wrapper [kind : int tokens : int] #fx{Unsafe} : ptr<void>
+(defn scscm-parse-wrapper [kind : int tokens : int quote-tok : int] #fx{Unsafe} : ptr<void>
   (if (list-nil? tokens)
-    (lex-err 3)
+    (lex-err (scscm-err-at "nothing after '%s' at line %d col %d" quote-tok))
     (let [res (scscm-parse-form tokens)]
       (if (lex-err? res)
         res
@@ -322,7 +342,7 @@
 ;; scscm-parse-list-body and scscm-parse-wrapper are defined above.
 (defn scscm-parse-form [tokens : int] #fx{Unsafe} : ptr<void>
   (if (list-nil? tokens)
-    (lex-err 0)
+    (lex-err (scscm-err "unexpected end of input"))
     (let [tok  (head tokens)
           ttyp (token-type tok)
           rest (tail tokens)]
@@ -337,20 +357,20 @@
               (if (scscm-cstr-eq? ttyp ":string")
                 (lex-ok (cons (scscm-ast-leaf 4 (token-value tok)) rest))
                 (if (scscm-cstr-eq? ttyp ":lparen")
-                  (scscm-parse-list-body rest (scscm-ast-list-node 5) ":rparen")
+                  (scscm-parse-list-body rest (scscm-ast-list-node 5) ":rparen" tok)
                   (if (scscm-cstr-eq? ttyp ":lbracket")
-                    (scscm-parse-list-body rest (scscm-ast-list-node 6) ":rbracket")
+                    (scscm-parse-list-body rest (scscm-ast-list-node 6) ":rbracket" tok)
                     (if (scscm-cstr-eq? ttyp ":hash-paren")
-                      (scscm-parse-list-body rest (scscm-ast-list-node 11) ":rparen")
+                      (scscm-parse-list-body rest (scscm-ast-list-node 11) ":rparen" tok)
                       (if (scscm-cstr-eq? ttyp ":quote")
-                        (scscm-parse-wrapper 7 rest)
+                        (scscm-parse-wrapper 7 rest tok)
                         (if (scscm-cstr-eq? ttyp ":quasiquote")
-                          (scscm-parse-wrapper 8 rest)
+                          (scscm-parse-wrapper 8 rest tok)
                           (if (scscm-cstr-eq? ttyp ":unquote")
-                            (scscm-parse-wrapper 9 rest)
+                            (scscm-parse-wrapper 9 rest tok)
                             (if (scscm-cstr-eq? ttyp ":unquote-splice")
-                              (scscm-parse-wrapper 10 rest)
-                              (lex-err 1))))))))))))))))
+                              (scscm-parse-wrapper 10 rest tok)
+                              (lex-err (scscm-err-at "unexpected '%s' at line %d col %d" tok)))))))))))))))))
 
 
 ;;; parse -- parse a token cons list into a cons list of top-level AST nodes.
@@ -360,7 +380,8 @@
 ;;;
 ;;; Returns:
 ;;;   lex-ok(nodes :int) where nodes is a cons list of AST node handles.
-;;;   lex-err(msg-int :int) on parse error (msg-int is a :cstr cast to :int).
+;;;   lex-err(msg :int) on a parse error: a :cstr cast to :int naming the
+;;;   token and its line and column, e.g. "unexpected ')' at line 3 col 5".
 ;;;
 ;;; Example:
 ;;;   (let [r (tokenize "(+ 1 2)")]
