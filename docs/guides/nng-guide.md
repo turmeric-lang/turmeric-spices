@@ -1,7 +1,7 @@
 ---
 title: Scalability Protocols with nng
 category: Networking
-description: Request/reply, pub/sub, pipeline, pair, bus, and survey messaging over inproc, ipc, and tcp -- blocking calls over a linear socket handle
+description: Request/reply, pub/sub, pipeline, pair, bus, and survey messaging over inproc, ipc, and tcp -- blocking calls over a linear socket handle, plus poll fds for event loops
 audience: developers building distributed or inter-process messaging in Turmeric
 since: nng v0.1.0
 ---
@@ -14,7 +14,7 @@ one worker, a subscriber sees every message whose topic it matches. nng
 (nanomsg-next-generation) implements those patterns; this spice wraps them
 in a thin surface of blocking calls over one linear `Socket` handle.
 
-This guide walks the six things you will do most often:
+This guide walks the seven things you will do most often:
 
 1. [Request/reply: the RPC round trip](#1-requestreply)
 2. [Pipeline: a load-balanced job queue](#2-pipeline)
@@ -22,6 +22,7 @@ This guide walks the six things you will do most often:
 4. [Binary payloads and msgpack interop](#4-binary-payloads)
 5. [Timeouts: not hanging forever](#5-timeouts)
 6. [Concurrency: blocking calls on threads](#6-concurrency)
+7. [Event loops: poll fds and try-*](#7-event-loops)
 
 Each section is a self-contained snippet you can drop into a `defmodule`.
 
@@ -396,8 +397,65 @@ ordinary receive loop. Use `stdlib/thread.tur`:
 ```
 
 That is the v0 concurrency answer, and it is the same one `tur-valkey`
-gives. Async (`nng_aio`) and reactor integration are documented seams, not
-built.
+gives. To multiplex many sockets on one thread instead, use an event loop
+(next section). `nng_aio` async is planned, not built.
+
+---
+
+## 7. Event loops
+
+`stdlib/reactor.tur` runs one thread's worth of sockets. Each socket hands
+the reactor a poll fd, and the callback moves messages with calls that never
+block:
+
+```turmeric no-check
+(import nng/socket :refer [Socket sub-open dial close
+                           recv-poll-fd poll-fd->int])
+(import nng/msg    :refer [sub-subscribe try-recv-str])
+(import reactor)
+
+;; drain -- every waiting message, never a blocking receive.
+(defn drain [^borrow s : Socket n : int] : int
+  (let [r (try-recv-str s)]
+    (if (ok? r)
+      (match (ok-val r)
+        (Some m) (do (println m) (drain s (+ n 1)))
+        (None)   n)
+      n)))
+
+(let [sub (ok-val (sub-open))
+      _   (dial sub "inproc://feed")
+      _   (sub-subscribe sub "")
+      r   (reactor-new)
+      fd  (ok-val (recv-poll-fd sub))]
+  (reactor-add-fd r (poll-fd->int fd) READ
+    (fn [id events user] : nil (drain sub 0))
+    (:: 0 :ptr<void>))
+  (reactor-run r)
+  (reactor-free r)
+  (close sub))
+```
+
+The pieces:
+
+- **`recv-poll-fd` / `send-poll-fd`** return a `PollFd`, the read end of a
+  pipe nng raises while the socket is ready. It is poll-only: never read,
+  write or close it. **Both** fds signal by becoming readable, so register
+  both for `READ`.
+- **`try-recv-str` / `try-recv-payload`** return `(Result (Option T) int)`.
+  `(ok (none))` means nothing is waiting; an `err` is a real failure, never
+  "nothing yet".
+- **`try-send-str` / `try-send-payload`** return `(Result bool int)`.
+  `(ok false)` means the send would block and nothing was sent.
+
+**Drain to empty.** On macOS the reactor reports the fd once per
+empty-to-ready transition (kqueue `EV_CLEAR`). A callback that takes one
+message per wakeup stalls with the rest still queued. Draining is harmless on
+Linux, so always drain.
+
+PUB and PUSH have no receive fd, and SUB and PULL have no send fd. Asking for
+one is an `err` carrying `NNG_ENOTSUP`. Do not use poll fds on a socket that
+also uses nng contexts.
 
 ---
 
@@ -412,9 +470,9 @@ read out, and the type says so.
 
 ## When not to use this
 
-- **You need async or non-blocking I/O.** v0 is blocking calls on OS
-  threads. `nng_aio` and pollable file descriptors are documented seams, not
-  built.
+- **You need completion-based async (`nng_aio`) or concurrent contexts
+  (`nng_ctx`).** Both are planned, not built. For non-blocking I/O on an
+  event loop, see section 7.
 - **You need TLS, WebSocket, or ZeroTier transports.** TLS is off in the
   build (`NNG_ENABLE_TLS=OFF`); the other transports are not compiled in.
 - **You want per-protocol socket types.** Ten opaques would turn "receive on
@@ -428,7 +486,7 @@ read out, and the type says so.
 
 ```sh
 tur fetch --update      # clone + build nng (once)
-tur test tests/nng      # 52 assertions, all over inproc:// -- no network
+tur test tests/nng      # 61 assertions in 6 suites, all over inproc:// -- no network
 errors/run.sh           # the three compile-fail linear fixtures
 ```
 

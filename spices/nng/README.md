@@ -215,7 +215,69 @@ receive loop. Use `stdlib/thread.tur`:
 ```
 
 That is the v0 concurrency answer, and it is the same one the
-[`tur-valkey`](../valkey/) spice gives.
+[`tur-valkey`](../valkey/) spice gives. For many sockets on one thread, see
+the next section.
+
+## Event loops: poll fds and `try-*`
+
+One thread can multiplex many sockets through `stdlib/reactor.tur`.
+
+- **The fd.** `recv-poll-fd` / `send-poll-fd` (nng/socket) hand back a
+  `PollFd`: the read end of a pipe nng raises while the socket is ready and
+  clears once it drains. It is poll-only: never read, write or close it.
+  `poll-fd->int` is the step to the plain fd the reactor takes.
+- **Moving messages.** `try-recv-str` / `try-recv-payload` / `try-send-str` /
+  `try-send-payload` (nng/msg) never block. "Nothing ready" is an ok result,
+  `(ok (none))` or `(ok false)`. Every real failure is still an `err`.
+
+```turmeric
+;; drain -- every waiting message; never a blocking receive in a callback.
+(defn drain [^borrow s : Socket n : int] : int
+  (let [r (try-recv-str s)]
+    (if (ok? r)
+      (match (ok-val r)
+        (Some m) (do (handle m) (drain s (+ n 1)))
+        (None)   n)
+      n)))
+
+(let [fd (ok-val (recv-poll-fd sub))]
+  (reactor-add-fd r (poll-fd->int fd) READ
+    (fn [id events user] : nil (drain sub 0))
+    (:: 0 :ptr<void>))
+  (reactor-run r))
+```
+
+```sweet-exp
+;; drain -- every waiting message; never a blocking receive in a callback.
+defn drain [^borrow s : Socket n : int] : int
+  let [r try-recv-str(s)]
+    if ok?(r)
+      (match (ok-val r)
+        (Some m) (do (handle m) (drain s {n + 1}))
+        (None)   n)
+      n
+
+let [fd ok-val(recv-poll-fd(sub))]
+  reactor-add-fd r poll-fd->int(fd) READ
+    (fn [id events user] : nil (drain sub 0))
+    (:: 0 :ptr<void>)
+  reactor-run r
+```
+
+Three rules, each learned the hard way:
+
+- **Drain to empty.** The reactor's macOS backend (kqueue, `EV_CLEAR`)
+  reports the fd once per empty-to-ready transition. A callback that takes one
+  message per wakeup stalls with the rest still queued. On Linux (epoll) it
+  happens to work either way.
+- **Never block in the callback.** Use `try-*`. If another consumer drained
+  the socket first, a blocking receive would park the whole loop.
+- **The send fd is READABLE when a send would not block.** Register both fds
+  for `READ`.
+
+Some protocols have no fd in a direction: PUB and PUSH have no receive fd,
+and SUB and PULL have no send fd. Asking for one is an `err` carrying
+`NNG_ENOTSUP`. Poll fds and nng contexts must not be mixed on one socket.
 
 ## Linear `Socket`
 
@@ -253,11 +315,10 @@ prevent.
 
 Deliberate omissions, each with a known seam:
 
-- **`nng_aio` async and `nng_ctx` contexts.** The concurrent-server story is
-  blocking calls on OS threads, as above.
-- **Reactor integration.** nng exposes pollable receive/send file descriptors
-  via socket options, which would plug into `stdlib/reactor.tur`. Documented,
-  not built.
+- **`nng_aio` async and `nng_ctx` contexts.** These are planned as NG-B and
+  NG-C of turmeric's `docs/upcoming/spices/nng-async-plan.md`. Until then, a
+  concurrent server uses blocking calls on OS threads, as above. Event loops
+  have poll fds and `try-*` (see above).
 - **TLS, WebSocket, and ZeroTier transports.** `NNG_ENABLE_TLS=OFF` keeps
   mbedTLS out of the build entirely.
 - **Per-protocol socket types.** Ten opaques would turn "receive on a PUB
@@ -274,7 +335,7 @@ Deliberate omissions, each with a known seam:
 
 ```sh
 tur fetch --update      # clone + build nng (once)
-tur test tests/nng      # 52 assertions, all over inproc:// -- no network
+tur test tests/nng      # 61 assertions in 6 suites, all over inproc:// -- no network
 errors/run.sh           # the three compile-fail linear fixtures
 ```
 
