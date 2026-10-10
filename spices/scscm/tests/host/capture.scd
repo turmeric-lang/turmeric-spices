@@ -18,6 +18,9 @@ fake = (
 	sendBundle: { |self, time ...msgs|
 		msgs.do { |m| log.add([Main.elapsedTime - t0 + (time ? 0), clean.(m)]) } },
 	sendRaw: { |self ...a| },
+	// Server:sync waits on its address. Nothing is asynchronous in the score
+	// (scsynth -N applies each message in order), so return at once.
+	sync: { |self ...a| nil },
 	sendClumpedBundles: { |self, time ...msgs|
 		msgs.do { |m| log.add([Main.elapsedTime - t0 + (time ? 0), clean.(m)]) } }
 );

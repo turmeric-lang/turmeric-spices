@@ -29,7 +29,7 @@ scscm --[tur-scscm]--> sclang --[sclang | hclang]--> OSC, SynthDefs --> scsynth 
 
 Every command below was run on Ubuntu 24.04 with tur v0.63.9, SuperCollider
 3.13.0 and hypercollider built from source; where a step was *not* run, the
-section says so.
+text says so.
 
 ---
 
@@ -172,9 +172,9 @@ printf '"hi".postln;\n0.exit;\n' > hi.scd
 QT_QPA_PLATFORM=offscreen sclang hi.scd     # ... prints hi
 ```
 
-### Live
+### Live (verified with JACK's dummy driver)
 
-The compiled program assumes a booted server, so boot one and then run it:
+Boot a server, then run the compiled program:
 
 ```supercollider
 // play.scd
@@ -185,8 +185,31 @@ s.waitForBoot { thisProcess.interpreter.executeFile("beep.scd".resolveRelative) 
 sclang play.scd
 ```
 
-*Not verified here*: the test machine has no audio device. This is ordinary
-SuperCollider usage.
+Run this way, `beep.scd`'s first note fails: `*** ERROR: SynthDef beep not
+found`. `SynthDef(...).add` is asynchronous, so the `Synth` sent right
+behind it reaches the server before the definition has loaded. (The offline
+renders below never show this, because they apply every message in order.)
+Wait for the server between adding and playing. In scscm that is `(. s
+sync)` inside a `(routine ...)`; `s` is sclang's default server. That is
+`examples/beep-live.scscm`:
+
+```scheme
+(routine
+  (. s sync)          ; wait until the server has beep
+  (play-beep 440)
+  (wait 0.5)
+  (play-beep 660))
+```
+
+which compiles to
+
+```supercollider
+Routine({ s.sync; play_beep.(440); 0.5.wait; play_beep.(660) }).play;
+```
+
+and plays both notes live. The machine these were run on has no audio
+device: `jackd -d dummy -r 48000` stood in for one, and `s.record` captured
+what the server played.
 
 ### Offline, to a WAV (verified)
 
@@ -260,7 +283,9 @@ node cli/hcsynth.js --commands beep.json --output beep.wav --duration 2 --block-
 [OK] Rendered 2 packets to beep.wav
 ```
 
-Two packets: the SynthDef and the first beep. **The capture has no clock**:
+Two packets: the SynthDef and the first beep. **The capture has no clock**
+(`beep-live.scscm` captures only its SynthDef, since everything it plays is
+inside a routine):
 `hclang` exits after evaluating the script, so nothing scheduled -- the
 second beep, a `Pbind`'s events, `(in ...)`, `(at ...)` -- is ever sent. Use
 it for programs that make their sound immediately; render the rest on
@@ -273,12 +298,14 @@ sets its control rate: `EnvGen.kr` then steps at 94 Hz instead of scsynth's
 ### Forwarding to a server
 
 `hclang --scsynth-host 127.0.0.1 --scsynth-port 57110` sends the OSC to a
-running server instead. *Not verified with a live server.* Expect it not to
-work with stock SuperCollider 3.13: hypercollider's sclang writes version-3
-SynthDefs (`SynthDef.writeDef` defaults to `version=3`), and scsynth 3.13 did
-not load them -- rendering hclang's capture with `scsynth -N` gives
-`SynthDef not found` for every `Synth`. hcsynth's own server mode (`node
-cli/hcsynth.js --server`) is the matching server; also not verified.
+running server instead. Before hypercollider #2 it sent nothing: hclang
+closed its socket while the packets were still queued. With #2 they arrive.
+Against stock SuperCollider 3.13 that still does not play anything (verified
+with a live scsynth): hypercollider's sclang writes version-3 SynthDefs
+(`SynthDef.writeDef` defaults to `version=3`), and scsynth 3.13 accepts the
+`/d_recv` but does not load the definition, so every `/s_new` fails with
+`SynthDef not found`, even a second later. hcsynth's own server mode (`node
+cli/hcsynth.js --server`) is the matching server; *not verified*.
 
 ### scscm files directly
 
@@ -350,9 +377,11 @@ freed synth is silence.
 **sclang: `Variable 'foo' not defined`.** The program uses a name nothing
 defines; sclang has no free variables. (`a` to `z` are predefined.)
 
-**scsynth: `SynthDef not found`.** The program never adds the SynthDef --
-`(SynthDef "x" ...)` builds one; `(. (SynthDef "x" ...) add)` or `defsynth`
-sends it -- or the SynthDef is version 3 (from hclang) on a 3.13 scsynth.
+**scsynth: `SynthDef not found`.** Either the program never adds the
+SynthDef (`(SynthDef "x" ...)` builds one; `(. (SynthDef "x" ...) add)` or
+`defsynth` sends it), or it plays one before the asynchronous add has
+finished -- live only; wait with `(. s sync)` in a routine (section 4) --
+or the SynthDef is version 3 (from hclang) on a 3.13 scsynth.
 
 **No sound from a `pbind`.** A Pbind is a description; `(. (pbind ...) play)`
 plays it.
