@@ -238,7 +238,12 @@ without reaching tourist, the client address in the log, a 429.
 ETag / 304 / binary / dotfile behaviour. Run them with `tur test tests`.
 
 `errors/run.sh` asserts the compile-fail fixtures: that Captures, Ctx, Pattern
-and Item are not interchangeable even though all four are `:int` underneath.
+and Item are not interchangeable even though all four are `:int` underneath,
+and that a `(Result cstr cstr)` from `param` is not a `cstr`.
+
+`fixtures/run.sh` runs the end-to-end fixtures -- whole apps, one per
+directory (routing, cascades, middleware, attrs, static files, templates) --
+each on a kernel-assigned port; CI runs it after the suites.
 
 Everything under `fixtures/` is a whole app needing a live listener, so those
 stay manual -- see the per-fixture files.

@@ -5,12 +5,21 @@
   (import tourist/dsl     :refer [get!])
   (import tourist/helpers :refer [text])
   (import tourist/param   :refer [param])
-  (import httpd/server    :refer [server-stop])
-  (import http/client     :refer [http-get])
+  (import httpd/server    :refer [server-port server-stop])
+  (import http/client     :refer [http-get http-result-free])
   (import http/response   :refer [response-status response-body])
   (import test/suite      :refer [describe it])
   (import test/assert     :refer [assert-eq assert-true])
-  (import test/runner     :refer [run-all])
+  (import test/runner     :refer [run-all-status])
+
+  ;; url-for -- the test server's URL for `path` (the port is kernel-assigned).
+  (defn url-for [port : int path : cstr] : cstr
+    ```c
+    #include <stdio.h>
+    static __thread char u[256];
+    snprintf(u, sizeof u, "http://127.0.0.1:%d%s", (int)port, path);
+    return u;
+    ```)
 
   (defn __cr-ok? [r : ptr<void>] : bool
     ```c
@@ -28,56 +37,53 @@
     return strcmp((const char *)a, (const char *)b) == 0;
     ```)
 
+  ;; "<prefix><value>" in a per-thread buffer (text copies it).
   (defn __join-prefix [prefix : cstr val : cstr] : cstr
     ```c
-    #include <stdlib.h>
-    #include <string.h>
-    const char *p = (const char *)prefix;
-    const char *v = (const char *)val;
-    size_t pl = strlen(p), vl = strlen(v);
-    char *out = (char *)malloc(pl + vl + 1);
-    memcpy(out, p, pl);
-    memcpy(out + pl, v, vl + 1);
+    #include <stdio.h>
+    static __thread char out[512];
+    snprintf(out, sizeof out, "%s%s", (const char *)prefix, (const char *)val);
     return out;
     ```)
 
-  (defn sleep-ms [ms : int] #fx{Unsafe} : void
-    ```c
-    #include <unistd.h>
-    if (ms > 0) usleep((useconds_t)ms * 1000u);
-    ```)
-
   (defn main [] : int
-    (let [srv (tourist 18102
+    (let [srv (tourist 0
                 (get! "/search"
                   (fn [req]
                     (let [r (param req "q")]
                       (if (ok? r)
                         (text (__join-prefix "q:" (ok-val r)))
-                        (text "missing"))))))]
+                        (text "missing"))))))
+          port (server-port srv)]
       (do
-        (unsafe (sleep-ms 50))
         (describe "tourist query-param"
           (it "GET /search?q=foo status is 200"
-            (let [r (http-get "http://127.0.0.1:18102/search?q=foo")]
-              (if (__cr-ok? r)
-                (assert-eq 200 (response-status (__cr-val r)))
-                (assert-true false))))
+            (let [r    (http-get (url-for port "/search?q=foo"))
+                  __ok (if (__cr-ok? r)
+                         (assert-eq 200 (response-status (__cr-val r)))
+                         (assert-true false))]
+              (http-result-free r)
+              __ok))
           (it "GET /search?q=foo body is q:foo"
-            (let [r (http-get "http://127.0.0.1:18102/search?q=foo")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "q:foo" (response-body (__cr-val r))))
-                (assert-true false))))
+            (let [r    (http-get (url-for port "/search?q=foo"))
+                  __ok (if (__cr-ok? r)
+                         (assert-true (cstr-eq? "q:foo" (response-body (__cr-val r))))
+                         (assert-true false))]
+              (http-result-free r)
+              __ok))
           (it "GET /search?q=hello body is q:hello"
-            (let [r (http-get "http://127.0.0.1:18102/search?q=hello")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "q:hello" (response-body (__cr-val r))))
-                (assert-true false))))
+            (let [r    (http-get (url-for port "/search?q=hello"))
+                  __ok (if (__cr-ok? r)
+                         (assert-true (cstr-eq? "q:hello" (response-body (__cr-val r))))
+                         (assert-true false))]
+              (http-result-free r)
+              __ok))
           (it "GET /search (no q param) body is missing"
-            (let [r (http-get "http://127.0.0.1:18102/search")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "missing" (response-body (__cr-val r))))
-                (assert-true false)))))
+            (let [r    (http-get (url-for port "/search"))
+                  __ok (if (__cr-ok? r)
+                         (assert-true (cstr-eq? "missing" (response-body (__cr-val r))))
+                         (assert-true false))]
+              (http-result-free r)
+              __ok)))
         (server-stop srv)
-        (run-all)))
-    0))
+        (run-all-status)))))
