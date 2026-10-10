@@ -194,8 +194,10 @@
       (__json-null-frag))))
 
 ;; Runtime helper: join a cons-list of element fragments into `[e1,e2,...]`.
-;; Each list node's head is a malloc'd cstr fragment (from `encode-json`); they are
-;; freed as they are consumed, mirroring __json-obj-build.
+;; Each list node's head is a malloc'd cstr fragment (from `encode-json`); the
+;; fragments AND the cells are freed as they are consumed, mirroring
+;; __json-obj-build -- the list is always one __json-arr-frags built for this
+;; call.
 (defn __json-arr-build [lst : int] #fx{Unsafe} : cstr
   ```c
   typedef struct __c { int64_t head; int64_t tail; } cons_t;
@@ -217,7 +219,9 @@
     if (v) { size_t vn = strlen(v); memcpy(out + w, v, vn); w += vn; free((void *)v); }
     else   { memcpy(out + w, "null", 4); w += 4; }
     written++;
+    cons_t *done = q;
     q = (cons_t *)(intptr_t)q->tail;
+    free(done);   /* the list was built for this call; its cells die here */
   }
   out[w++] = ']';
   out[w] = '\0';
@@ -262,8 +266,11 @@
 ;; Runtime helper: walk a cons-list of alternating (key, fragment) cstrs and
 ;; emit `{"k1":v1,"k2":v2,...}` into a fresh malloc'd cstr. Frees every
 ;; fragment buffer it consumes -- each `(encode-json ...)` call returns malloc'd
-;; memory the caller is expected to free. Keys must be static string literals
-;; (the macro guarantees this from `symbol-name`), so they are NOT freed.
+;; memory the caller is expected to free -- and every cell of the list, which
+;; is always one __json-chain / __sum-vchain built for this call (the cells
+;; used to leak, two per field per encode). Keys must be static string
+;; literals (the macro guarantees this from `symbol-name`), so they are NOT
+;; freed.
 (defn __json-obj-build [lst : int] #fx{Unsafe} : cstr
   ```c
   typedef struct __c { int64_t head; int64_t tail; } cons_t;
@@ -286,10 +293,14 @@
   int written = 0;
   while (q) {
     const char *k = (const char *)(intptr_t)q->head;
+    cons_t *kc = q;
     q = (cons_t *)(intptr_t)q->tail;
+    free(kc);   /* the list was built for this call; its cells die here */
     if (!q) break;
     const char *v = (const char *)(intptr_t)q->head;
+    cons_t *vc = q;
     q = (cons_t *)(intptr_t)q->tail;
+    free(vc);
     if (written > 0) out[w++] = ',';
     out[w++] = '"';
     if (k) { size_t kn = strlen(k); memcpy(out + w, k, kn); w += kn; }
