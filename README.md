@@ -40,6 +40,7 @@ turmeric's [Emscripten spice audit](https://github.com/turmeric-lang/turmeric/bl
 | [`tur-tourist-session`](spices/tourist-session/) | Swappable-store session middleware for tur-tourist (memory + file stores) | 2 | ✅ | ✅ | ❌ | ❌ | tur-tourist, tur-httpd |
 | [`tur-ecs`](spices/ecs/) | Entity-Component-System for Turmeric. E1 surface: dense + sparse + tag storages, variadic-looking for-each (up to 8 components) over the row-typed Query value, with/without tag filters, defquery + run-query! functional surface | 2 | ✅ | ✅ | ✅ | ✅ | -- |
 | [`tur-ecs-raylib`](spices/ecs-raylib/) | Raylib companion to tur-ecs: standard 2D components, systems, and a with-game-loop macro for ECS-driven games | 2 | ✅ | ✅ | ✅ | ✅ | tur-raylib |
+| [`tur-raygui`](spices/raygui/) | Immediate-mode GUI controls for Turmeric, layered on tur-raylib | 2 | ✅ | ✅ | ✅ | ✅ | raygui 4.0 (vendored), tur-raylib |
 | [`tur-httpd`](spices/httpd/) | Minimal threaded HTTP/1.1 server (POSIX sockets) | 2 | ✅ | ✅ | ❌ | ❌ | tur-json, tur-http (optional), tur-tls (optional) |
 | [`tur-msgpack`](spices/msgpack/) | MessagePack binary serialization for Turmeric -- the binary twin of tur-json | 2 | ✅ | ✅ | ✅ | ✅ | -- |
 | [`tur-secret`](spices/secret/) | Linear key material and crypto hygiene primitives for Turmeric | 2 | ✅ | ✅ | ✅ | ❌ | -- |
@@ -67,7 +68,6 @@ turmeric's [Emscripten spice audit](https://github.com/turmeric-lang/turmeric/bl
 | [`tur-valkey`](spices/valkey/) | Valkey/Redis client via hiredis | 3 | ✅ | ✅ | ✅ | ❌ | hiredis 1.2.0 |
 | [`tur-nng`](spices/nng/) | nanomsg-next-generation scalability protocols (req/rep, pub/sub, pipeline, pair, bus, survey) | 3 | ✅ | ✅ | ✅ | ❌ | nng 1.12.4 |
 | [`tur-wav`](spices/wav/) | WAV and PCM audio file read/write via libsndfile | 3 | ✅ | ✅ | ✅ | ✅ | libsndfile 1.2.2 |
-| [`tur-raygui`](spices/raygui/) | Immediate-mode GUI controls for Turmeric, layered on tur-raylib | 3 | ✅ | ✅ | ✅ | ✅ | raygui 4.0 |
 | [`tur-tls`](spices/tls/) | TLS termination for tur/httpd via mbedTLS | 3 | ✅ | ✅ | ❌ | ❌ | mbedTLS 3.6.2 |
 | [`tur-ws-client`](spices/ws-client/) | RFC 6455 WebSocket client (ws:// and wss://) for Turmeric | 3 | ✅ | ✅ | ❌ | ❌ | mbedTLS 3.6.2 (wss:// only) |
 | [`tur-zlib`](spices/zlib/) | zlib + gzip encode/decode for Turmeric | 3 | ✅ | ✅ | ✅ | ✅ | zlib 1.3.1 |

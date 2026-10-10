@@ -174,28 +174,39 @@ Related shapes worth knowing, each found the hard way:
 
 Without `:targets`, `tur fetch` guesses a dep's include dir
 (`${SOURCE_DIR}/include`, else `${SOURCE_DIR}`) and its `-l` name (the dep or
-target basename). Several real libraries defeat both guesses: a
-header-only library with its header in `src/`; a target whose `OUTPUT_NAME`
-differs from its name (glfw builds `libglfw3.a`); a find_package import whose
-target is `PostgreSQL::PostgreSQL` while the library is `libpq`; a "library"
-that is really a code generator (glad).
+target basename). Declare `:targets` whenever the library has a CMake target:
+tur then reads include dirs from `INTERFACE_INCLUDE_DIRECTORIES`, links the
+target's real artifact (`$<TARGET_FILE:...>`) and its
+`INTERFACE_LINK_LIBRARIES` (`-framework Cocoa` and the like). That covers a
+target whose `OUTPUT_NAME` differs from its name (glfw builds `libglfw3.a`)
+and a find_package import whose target is `PostgreSQL::PostgreSQL` while the
+library is `libpq`, with no shim.
 
-The fix is a small CMake project under `spices/<spice>/cmake-deps/<name>/`
-that produces a target whose name **is** the `-l` name, declared as a `:path`
-cmake-dep with `:targets`:
+What is left, and where each goes:
 
-```turmeric
-:cmake-deps #map{
-  "raygui" #map{:path    "../cmake-deps/raygui"
-                :targets ["raygui"]}}
-```
+- **A library only the system provides** (libpq): `:prefer-system true` with
+  `:cmake-name` and `:targets`, and no `:url`. A missing library then stops
+  `tur fetch` with a message naming it. Find-module hints (`PostgreSQL_ROOT`
+  for keg-only Homebrew) go in `:options`, which reach `find_package`. See
+  `postgres`.
+- **A single header with an implementation TU** (raygui): vendor it under
+  `c/` and list it in `:build-opts` `:c-includes` / `:c-sources` -- no fetch,
+  no CMake. Make sure exactly one TU defines the implementation macro: a
+  `:c-sources` file is always linked, unlike a static archive's member. See
+  `raygui`.
+- **Anything that needs real CMake work** (glad is a code generator, not a
+  library): a small CMake project under `spices/<spice>/cmake-deps/<name>/`,
+  declared as a `:path` cmake-dep with `:targets`:
 
-With `:targets`, tur reads include dirs from the target's
-`INTERFACE_INCLUDE_DIRECTORIES` and link dirs from `$<TARGET_FILE_DIR:...>`
-instead of guessing. Note the leading `../`: `:path` is spliced in as
-`add_subdirectory("./<path>")` inside `cmake/`, so the path is relative to
-that directory, not to the spice root. See `raygui`, `opengl` and `postgres`
-for worked examples.
+  ```turmeric
+  :cmake-deps #map{
+    "opengl-deps" #map{:path    "../cmake-deps/opengl"
+                       :targets ["glfw" "glad"]}}
+  ```
+
+  Note the leading `../`: `:path` is spliced in as
+  `add_subdirectory("./<path>")` inside `cmake/`, so the path is relative to
+  that directory, not to the spice root. See `opengl`.
 
 A missing header does **not** fail the build: hoisted includes are emitted as
 `#if __has_include(<x.h>) ... #endif`, so a wrong include dir degrades

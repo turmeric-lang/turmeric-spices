@@ -6,8 +6,10 @@ theme system -- the full raygui control set.
 
 ## Overview
 
-`tur-raygui` is a Tier 3 spice (`cmake-dep` -- pulls in `raygui 4.0` via
-`tur fetch`). It depends on `tur-raylib` for window, drawing, and input.
+`tur-raygui` is a Tier 2 spice: `raygui 4.0` is a single header, vendored
+under `c/raygui/` (zlib license) and compiled into your program, so there is
+nothing of its own to fetch. It depends on `tur-raylib` for window, drawing,
+and input -- that spice's raylib is what `tur fetch` builds.
 The control surface mirrors raylib's `raygui.h` one-to-one: every
 `Gui*` function is a `gui-*` export, grouped by module (`raygui/controls`,
 `raygui/layout`, `raygui/core`, `raygui/style`, `raygui/themes`,
