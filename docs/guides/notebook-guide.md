@@ -134,16 +134,17 @@ spice takes a few seconds longer; set `TUR_BIN` if `tur` is not on `PATH`.
 What runs compiled:
 
 - `stats` (distributions, tests, summaries), `frame` (CSV, filtering,
-  group-by, printing) and `plot` (scatter, histograms, densities), whose
-  APIs pass numbers, strings, handles and cons lists.
+  group-by, printing), `plot` (scatter, histograms, densities) and `linalg`
+  (matrices, solvers, formatting), whose APIs pass numbers, strings,
+  handles, cons lists and by-value records.
 - Turmeric wrappers in those spices over private C helpers.
+
+A function that takes or returns a record (linalg's `mat`) is callable once
+its module is imported in the session -- the import is where its layout
+comes from -- which a cell does anyway to use the name.
 
 What still cannot:
 
-- An export that takes or returns a struct by value -- most of `linalg`,
-  whose matrices are a `defstruct` -- reports `inline-C not supported in
-  interpreter mode`. Pure-Turmeric code (`linalg/mat`'s constructors and
-  accessors, your own `defn`s) runs.
 - A cell's `defn` passed as a C callback, such as plot's `function`
   renderer: the interpreter's closure has no C address to hand over.
 - An inline-C `defn` written in a cell itself, beyond the interpreter's

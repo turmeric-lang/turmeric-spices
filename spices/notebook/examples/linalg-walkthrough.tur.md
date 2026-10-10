@@ -118,5 +118,5 @@ Here we fit a line y = a + b*x to four data points.
 (def Xty (mat-mul-vec Xt y))
 
 (vec-print (mat-solve XtX Xty 1))
-;; => intercept ~ 0.05, slope ~ 2.00
+;; => intercept ~ 0.00, slope ~ 2.03
 ```
