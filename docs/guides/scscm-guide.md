@@ -224,8 +224,10 @@ No hypercollider release boots today: v0.1.5 and v0.1.6 stop with `class
 library compilation FAILED`, and their `--classlib-dir` does not get around
 it (the embedded pack still shadows the files). The fixes are on the
 `claude/scscm-host-testing-plan-8s8b5c` branch of rjungemann/hypercollider
-(the commit in `spices/scscm/tests/host/HOSTS`). Built with emsdk 5.0.5, the
-version hypercollider's CI uses:
+(hypercollider PRs [#1](https://github.com/rjungemann/hypercollider/pull/1)
+and [#2](https://github.com/rjungemann/hypercollider/pull/2); the commit is
+in `spices/scscm/tests/host/HOSTS`). Built with emsdk 5.0.5, the version
+hypercollider's native CI uses:
 
 ```sh
 git clone https://github.com/emscripten-core/emsdk.git && cd emsdk
