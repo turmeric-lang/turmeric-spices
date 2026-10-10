@@ -261,6 +261,20 @@ cmake --preset wasm_release
 cmake --build build/wasm --target hclang hcsynth -j"$(nproc)"
 ```
 
+The same branch also builds `hclang_native`, a single native binary that
+runs the WASI build of hclang under WAMR, with no Node:
+
+```sh
+cmake --preset wasi_release
+cmake --build build/wasi --target hclang hcsynth -j"$(nproc)"
+cmake -B build/native -S native -DCMAKE_BUILD_TYPE=Release -DHC_EMBED_WASM=ON
+cmake --build build/native --target hclang_native -j"$(nproc)"
+build/native/hclang_host/hclang_native --script hello.scd
+```
+
+The host tests below use the Node `hclang`, whose `--output` capture
+`hcsynth` renders.
+
 Run `hclang` from the checkout's root (it finds `build/wasm/` from the
 working directory), and pass `--verbose` to see what the program posts:
 
@@ -359,6 +373,12 @@ hcsynth layer runs by hand until a hypercollider release boots.
 failed (-1)`.** The release's class library does not compile; build from the
 branch in section 5. The errors come from `HC/Scscm*.sc`,
 `HCNetAddrZeroconf.sc`, `Quarks.sc` and `String.sc`.
+
+**hclang_native: `filesystem_error was thrown in -fno-exceptions mode`, or
+`out of bounds memory access` after `compile done`.** Both are fixed on the
+branch: the first was the WASI directory walk, the second a host import that
+shifted its arguments (it failed for some environments and not others, e.g.
+under `env -i`).
 
 **hclang: `Wrote 0 OSC packets`, and `Primitive '_NetAddr_SendMsg' failed`
 with `--verbose`.** The CLI installed its OSC bridge under a name the WASM side
