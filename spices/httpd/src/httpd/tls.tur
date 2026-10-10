@@ -1,435 +1,54 @@
 ;;; httpd/tls -- TLS-terminating listener for upgrade-aware handlers (HTTPS / wss).
 ;;;
-;;; This is the TLS counterpart of httpd/server's `server-start-conn`. It binds a
-;;; listening socket, and for every accepted connection it wraps the fd in a
-;;; tur-tls server context (`tls-wrap-fd` + `tls-handshake`), reads the HTTP
-;;; request over the encrypted stream, and dispatches a two-arg
-;;; `(fn [Conn Request] Response)` handler -- exactly the shape ws-server's
-;;; `ws-upgrade` consumes. The `Conn` carries the per-connection `tls_conn_t*`
-;;; in its tls slot (see httpd/conn `conn-new-tls` / `conn-tls`), so an upgrade
-;;; handler can lift the connection to `wss://` and keep talking TLS.
+;;; This is the TLS counterpart of httpd/server's `server-start-conn`: the same
+;;; two-arg `(fn [Conn Request] Response)` handler shape ws-server's
+;;; `ws-upgrade` consumes, served over HTTPS.  The `Conn` carries the
+;;; per-connection `tls_conn_t*` in its tls slot (see httpd/conn `conn-tls`), so
+;;; an upgrade handler can lift the connection to `wss://` and keep talking TLS.
 ;;;
-;;; Design notes:
+;;; Since tourist-on-stdlib-httpd H2 the listener is stdlib httpd's
+;;; `httpd-new-tls`: the tls spice's `tls-httpd-init` registers its wrap /
+;;; handshake / read / write / shutdown / free functions in stdlib's TLS hook
+;;; table, and the stdlib workers drive the handshake and every read and write
+;;; through them.  The TLS context (cert + key) is the tls spice's `tls/ctx`.
+;;; The pool has 8 workers, like server-start-conn; an upgraded session holds
+;;; its worker while it runs.
 ;;;
-;;;   * Reuse, not reinvention: the TLS context lifecycle (cert/key load, fd
-;;;     wrap, handshake, close_notify, free) is the tur-tls spice's `tls/ctx` +
-;;;     `tls/conn`. Only the request-read and response-write hot paths are
-;;;     inline here, calling mbedtls on the same `tls_conn_t` the spice handed
-;;;     us -- the layout is duplicated verbatim, the documented tur-tls pattern.
+;;; Upgrade ownership: when the handler calls `conn-mark-upgraded!`, the
+;;; `tls_conn_t` and the fd belong to the upgrade handler -- stdlib httpd does
+;;; not shut down, free or close them; ws-server's `wss-free` does.
 ;;;
-;;;   * Thread-per-connection: mirrors httpd/server's `server-start-spawn`
-;;;     dispatch (a listener thread that spawns one detached worker per accept).
-;;;     The pool path is intentionally not duplicated for v0; one TLS context is
-;;;     shared across workers exactly as the tur-tls httpd guide prescribes.
-;;;
-;;;   * Upgrade ownership: when the handler calls `conn-mark-upgraded!`, the
-;;;     worker hands the `tls_conn_t` and the fd to the upgrade handler and does
-;;;     NOT shut down / free / close them -- ws-server's `wss-free` does. This
-;;;     mirrors the plaintext worker's upgraded-path skip in httpd/server.
-;;;
-;;; Since: WS4
+;;; Since: WS4 (on stdlib httpd since tourist-on-stdlib-httpd H2)
+
+(load "stdlib/httpd.tur")
 
 (defmodule httpd/tls
   (import tls/ctx       :refer [TlsCtx tls-ctx-null?
                                 tls-ctx-new tls-ctx-free
                                 tls-ctx-load-cert-pem tls-ctx-load-key-pem])
-  (import tls/conn      :refer [TlsConn tls-conn-null?
-                                tls-wrap-fd tls-handshake tls-shutdown tls-free])
+  (import tls/httpd     :refer [tls-httpd-init])
   (import tls/autolink  :refer [tls-autolink-hint])
-  (import httpd/parse   :refer [parse-request free-request])
-  (import httpd/response :refer [free-response])
-  (import httpd/write   :refer [serialize-response wbuf-bytes wbuf-len free-wbuf])
-  (import httpd/conn    :refer [conn-new-tls conn-upgraded? conn-free])
-  (import httpd/types   :refer [Request Response Conn])
+  (import httpd/server  :refer [serve-httpd-request-conn server-launch server-stop
+                                server-tls-ctx server-set-tls-ctx!])
   (export server-start-tls-conn server-stop-tls)
-
-;; file-scope-c-block: POSIX + mbedTLS headers (which carry top-level static
-;; inline definitions illegal inside a function body) and the shared struct
-;; layouts + pthread trampolines, all hoisted to TU scope -- the same shape
-;; httpd/server uses for its plaintext listener.
-```c
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <errno.h>
-#include <pthread.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include "mbedtls/ssl.h"
-#include "mbedtls/net_sockets.h"
-
-/* tls_conn_t: must match tur-tls's tls/conn.tur byte-for-byte. */
-typedef struct {
-  mbedtls_ssl_context ssl;
-  mbedtls_net_context net;
-} httpd_tls_conn_t;
-
-struct __httpd_tls_rawreq { char *bytes; int len; };
-
-struct __httpd_tls_warg { int client_fd; void *ctx; void *handler; };
-
-struct __httpd_tls_server {
-  int           listen_fd;
-  void         *ctx;             /* TlsCtx (tls_ctx_t *) shared across workers  */
-  void         *handler;         /* int64_t (*)(int64_t, int64_t)               */
-  volatile int  stop_flag;
-  void         *listener_thread; /* pthread_t * (malloc'd)                      */
-};
-
-/* Forward-declare the Turmeric-generated worker/listener statics so the
-   trampolines below can hand them to pthread_create. */
-static void * httpd__tls__tls_hyworker_hyloop(void *);
-static void * httpd__tls__tls_hylistener_hyloop(void *);
-void * httpd__tls__tls_worker_loop_trampoline(void *arg) {
-  return httpd__tls__tls_hyworker_hyloop(arg);
-}
-void * httpd__tls__tls_listener_loop_trampoline(void *arg) {
-  return httpd__tls__tls_hylistener_hyloop(arg);
-}
-```
-
-;; =============================================================================
-;; Low-level POSIX socket primitives (local to this module, mirroring
-;; httpd/server -- kept here so the core plaintext listener stays mbedTLS-free).
-;; =============================================================================
-
-(defn htls-make-listener [port : int] : int
-  ```c
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return -1;
-  int yes = 1;
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-  struct sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port   = htons((uint16_t)(int)port);
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
-  if (listen(fd, 128) < 0) { close(fd); return -1; }
-  return (int64_t)fd;
-  ```)
-
-(defn htls-accept-one [listen-fd : int] : int
-  ```c
-  int lf = (int)listen_fd;
-  if (lf < 0) return -1;
-  for (;;) {
-    int c = accept(lf, NULL, NULL);
-    if (c >= 0) return (int64_t)c;
-    if (errno == EINTR) continue;
-    return -1;
-  }
-  ```)
-
-(defn htls-close-fd [fd : int] : void
-  ```c
-  int f = (int)fd;
-  if (f >= 0) close(f);
-  ```)
 
 (defn htls-null-ptr [] : ptr<void>
   ```c return NULL; ```)
 
-;; =============================================================================
-;; TLS request read + response write (inline mbedTLS on the wrapped conn).
-;; =============================================================================
+(defn htls-null? [p : ptr<void>] : bool
+  ```c return p == NULL; ```)
 
-;; Read a full HTTP request off a TLS connection into a malloc'd buffer, using
-;; the same CRLF-CRLF + Content-Length framing as httpd/server's plaintext
-;; srv-recv-request. `tls` is a tls_conn_t* handle (from tls-wrap-fd). Returns a
-;; handle to { char *bytes; int len; }, or 0 on read/handshake error.
-(defn htls-recv-request [^borrow tls : TlsConn] : int
-  ```c
-  httpd_tls_conn_t *cn = (httpd_tls_conn_t *)(intptr_t)tls;
-  if (cn == 0) return 0;
-
-  size_t cap = 4096;
-  size_t len = 0;
-  char  *buf = malloc(cap);
-  if (!buf) return 0;
-  int    hdr_end = -1;
-  long   content_length = -1;
-  int    need_body = 0;
-
-  for (;;) {
-    if (len + 1 >= cap) {
-      cap *= 2;
-      char *nb = realloc(buf, cap);
-      if (!nb) { free(buf); return 0; }
-      buf = nb;
-    }
-    int n = mbedtls_ssl_read(&cn->ssl, (unsigned char *)(buf + len), cap - len);
-    if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
-    if (n <= 0) break;        /* close_notify, peer reset, or error */
-    len += (size_t)n;
-
-    if (hdr_end < 0) {
-      size_t start = (len > (size_t)(n + 3)) ? (len - (size_t)n - 3) : 0;
-      for (size_t i = start; i + 3 < len; i++) {
-        if (buf[i] == '\r' && buf[i+1] == '\n' &&
-            buf[i+2] == '\r' && buf[i+3] == '\n') {
-          hdr_end = (int)(i + 3);
-          break;
-        }
-      }
-      if (hdr_end >= 0) {
-        const char *p = buf;
-        const char *end = buf + hdr_end - 3;
-        while (p < end && !(p[0] == '\r' && p[1] == '\n')) p++;
-        if (p < end) p += 2;
-        while (p < end) {
-          const char *nl = p;
-          while (nl < end && !(nl[0] == '\r' && nl[1] == '\n')) nl++;
-          if (nl - p >= 16 && strncasecmp(p, "Content-Length:", 15) == 0) {
-            const char *vp = p + 15;
-            while (vp < nl && (*vp == ' ' || *vp == '\t')) vp++;
-            content_length = strtol(vp, NULL, 10);
-            if (content_length < 0) content_length = 0;
-            break;
-          }
-          if (nl >= end) break;
-          p = nl + 2;
-        }
-        need_body = (content_length > 0) ? 1 : 0;
-      }
-    }
-
-    if (hdr_end >= 0) {
-      size_t body_have = len - (size_t)(hdr_end + 1);
-      if (!need_body || body_have >= (size_t)content_length) break;
-    }
-  }
-
-  if (hdr_end < 0 && len == 0) { free(buf); return 0; }
-
-  struct __httpd_tls_rawreq *r = malloc(sizeof(*r));
-  if (!r) { free(buf); return 0; }
-  r->bytes = buf;
-  r->len   = (int)len;
-  return (int64_t)(intptr_t)r;
-  ```)
-
-(defn htls-raw-bytes [raw : int] : cstr
-  ```c return ((struct __httpd_tls_rawreq *)(intptr_t)raw)->bytes; ```)
-
-(defn htls-raw-len [raw : int] : int
-  ```c return (int64_t)((struct __httpd_tls_rawreq *)(intptr_t)raw)->len; ```)
-
-(defn htls-raw-free [raw : int] : void
-  ```c
-  if (raw == 0) return;
-  struct __httpd_tls_rawreq *r = (struct __httpd_tls_rawreq *)(intptr_t)raw;
-  free(r->bytes);
-  free(r);
-  ```)
-
-;; Encrypt and send all `len` bytes from `buf` over the TLS stream. Returns 0 on
-;; success, -1 on error. `tls` is a tls_conn_t* handle.
-(defn htls-write-all [^borrow tls : TlsConn buf : cstr len : int] : int
-  ```c
-  httpd_tls_conn_t *cn = (httpd_tls_conn_t *)(intptr_t)tls;
-  if (cn == 0) return -1;
-  const unsigned char *p = (const unsigned char *)buf;
-  size_t remaining = (size_t)(int)len;
-  while (remaining > 0) {
-    int n = mbedtls_ssl_write(&cn->ssl, p, remaining);
-    if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
-    if (n <= 0) return -1;
-    p += (size_t)n;
-    remaining -= (size_t)n;
-  }
-  return 0;
-  ```)
-
-;; =============================================================================
-;; Worker arg + dispatch.
-;; =============================================================================
-
-(defn htls-warg->int [arg : ptr<void>] : int
-  ```c return (int64_t)(intptr_t)arg; ```)
-
-(defn htls-warg-fd [arg : int] : int
-  ```c return (int64_t)((struct __httpd_tls_warg *)(intptr_t)arg)->client_fd; ```)
-
-(defn htls-warg-ctx [arg : int] : int
-  ```c return (int64_t)(intptr_t)((struct __httpd_tls_warg *)(intptr_t)arg)->ctx; ```)
-
-(defn htls-warg-handler [arg : int] : ptr<void>
-  ```c return ((struct __httpd_tls_warg *)(intptr_t)arg)->handler; ```)
-
-(defn htls-warg-free [arg : int] : void
-  ```c free((void *)(intptr_t)arg); ```)
-
-;; Invoke a two-arg handler function pointer: handler(conn, req) -> resp.
-(defn htls-call-handler-conn [handler : ptr<void> conn : int req : int] : int
-  ```c
-  typedef int64_t (*handler_fn)(int64_t, int64_t);
-  return ((handler_fn)handler)((int64_t)conn, (int64_t)req);
-  ```)
-
-;; Spawn a detached TLS worker thread for one accepted connection. The worker
-;; owns the fd + ctx pointer it is handed (ctx is shared and not freed here).
-(defn htls-spawn-worker [ctx : int handler : ptr<void> client-fd : int] : void
-  ```c
-  extern void *httpd__tls__tls_worker_loop_trampoline(void *);
-  struct __httpd_tls_warg *wa = malloc(sizeof(*wa));
-  if (!wa) { close((int)client_fd); return; }
-  wa->client_fd = (int)client_fd;
-  wa->ctx       = (void *)(intptr_t)ctx;
-  wa->handler   = (void *)handler;
-  pthread_t tid;
-  if (pthread_create(&tid, NULL, httpd__tls__tls_worker_loop_trampoline, wa) != 0) {
-    free(wa);
-    close((int)client_fd);
-    return;
-  }
-  pthread_detach(tid);
-  ```)
-
-;; The per-connection worker: TLS handshake, serve one request/response (or hand
-;; off to an upgrade handler), then tear the TLS session down.
-(defn tls-worker-loop [arg : ptr<void>] : ptr<void>
-  (let [a       (htls-warg->int arg)
-        fd      (htls-warg-fd a)
-        ctx     (htls-warg-ctx a)
-        handler (htls-warg-handler a)]
-    (htls-warg-free a)
-    (let [tc (tls-wrap-fd (:: ctx TlsCtx) fd)]
-      (if (tls-conn-null? tc)
-        (do (tls-free tc) (htls-close-fd fd))
-        (if (not (= (tls-handshake tc) 0))
-          (do (tls-shutdown tc) (tls-free tc) (htls-close-fd fd))
-          (let [raw (htls-recv-request tc)]
-            (if (= raw 0)
-              (do (tls-shutdown tc) (tls-free tc) (htls-close-fd fd))
-              (let [req (parse-request (htls-raw-bytes raw) (htls-raw-len raw))]
-                (if (= req 0)
-                  (do (htls-raw-free raw)
-                      (tls-shutdown tc) (tls-free tc) (htls-close-fd fd))
-                  (let [conn (conn-new-tls fd tc)
-                        resp (:: (htls-call-handler-conn handler (:: conn :int) req) :Response)]
-                    (if (conn-upgraded? conn)
-                      ;; The upgrade handler now owns the tls_conn_t and the fd;
-                      ;; do not shut down / free / close them here.  Consume the
-                      ;; linear `tc` binding (discarded via `let _`) so the
-                      ;; linear-check sees a consume on both branches; the conn
-                      ;; struct retains the aliased pointer, which the upgrade
-                      ;; handler reads back via `conn-tls`.
-                      (let [_ (unsafe (:: tc :int))]
-                        (free-response resp)
-                        (free-request (:: req :Request))
-                        (htls-raw-free raw)
-                        (conn-free conn))
-                      (let [wbuf (serialize-response resp)]
-                        (htls-write-all tc (wbuf-bytes wbuf) (wbuf-len wbuf))
-                        (free-wbuf wbuf)
-                        (free-response resp)
-                        (free-request (:: req :Request))
-                        (htls-raw-free raw)
-                        (conn-free conn)
-                        (tls-shutdown tc)
-                        (tls-free tc)
-                        (htls-close-fd fd))))))))))))
-  (htls-null-ptr))
-
-;; =============================================================================
-;; Server state + listener thread.
-;; =============================================================================
-
-(defn htls-state-new [listen-fd : int ctx : int handler : (c-fn [int int] int)] : ptr<void>
-  ```c
-  struct __httpd_tls_server *s = malloc(sizeof(*s));
-  if (!s) return NULL;
-  s->listen_fd       = (int)listen_fd;
-  s->ctx             = (void *)(intptr_t)ctx;
-  s->handler         = (void *)handler;
-  s->stop_flag       = 0;
-  s->listener_thread = NULL;
-  return (void *)s;
-  ```)
-
-(defn htls-state->int [s : ptr<void>] : int
-  ```c return (int64_t)(intptr_t)s; ```)
-
-(defn htls-state-listen-fd [s : int] : int
-  ```c return (int64_t)((struct __httpd_tls_server *)(intptr_t)s)->listen_fd; ```)
-
-(defn htls-state-ctx [s : int] : int
-  ```c return (int64_t)(intptr_t)((struct __httpd_tls_server *)(intptr_t)s)->ctx; ```)
-
-(defn htls-state-handler-ptr [s : int] : ptr<void>
-  ```c return ((struct __httpd_tls_server *)(intptr_t)s)->handler; ```)
-
-(defn htls-state-stopping? [s : int] : int
-  ```c
-  __sync_synchronize();
-  return ((struct __httpd_tls_server *)(intptr_t)s)->stop_flag ? 1 : 0;
-  ```)
-
-(defn htls-state-mark-stopping [s : ptr<void>] : void
-  ```c
-  struct __httpd_tls_server *sv = (struct __httpd_tls_server *)s;
-  sv->stop_flag = 1;
-  __sync_synchronize();
-  ```)
-
-(defn htls-state-close-listen [s : ptr<void>] : void
-  ```c
-  struct __httpd_tls_server *sv = (struct __httpd_tls_server *)s;
-  if (sv->listen_fd >= 0) {
-    shutdown(sv->listen_fd, SHUT_RDWR);
-    close(sv->listen_fd);
-    sv->listen_fd = -1;
-  }
-  ```)
-
-(defn htls-state-set-thread [s : ptr<void> tid : ptr<void>] : void
-  ```c ((struct __httpd_tls_server *)s)->listener_thread = tid; ```)
-
-(defn htls-state-get-thread [s : ptr<void>] : ptr<void>
-  ```c return ((struct __httpd_tls_server *)s)->listener_thread; ```)
-
-(defn htls-state-free [s : ptr<void>] : void
-  ```c free(s); ```)
-
-;; The listener-loop entry: arg = struct __httpd_tls_server *.
-(defn tls-listener-loop [arg : ptr<void>] : ptr<void>
-  (let [s-int   (htls-state->int arg)
-        listen-fd (htls-state-listen-fd s-int)
-        ctx     (htls-state-ctx s-int)
-        handler (htls-state-handler-ptr s-int)]
-    (while (= (htls-state-stopping? s-int) 0)
-      (let [client-fd (htls-accept-one listen-fd)]
-        (when (>= client-fd 0)
-          (htls-spawn-worker ctx handler client-fd)))))
-  (htls-null-ptr))
-
-(defn htls-spawn-listener [s : ptr<void>] : ptr<void>
-  ```c
-  extern void *httpd__tls__tls_listener_loop_trampoline(void *);
-  pthread_t *tid = malloc(sizeof(*tid));
-  if (!tid) return NULL;
-  if (pthread_create(tid, NULL, httpd__tls__tls_listener_loop_trampoline, s) != 0) {
-    free(tid);
-    return NULL;
-  }
-  return (void *)tid;
-  ```)
-
-(defn htls-join-listener [tid : ptr<void>] : void
-  ```c
-  if (!tid) return;
-  pthread_t *t = (pthread_t *)tid;
-  pthread_join(*t, NULL);
-  free(t);
-  ```)
-
-;; =============================================================================
-;; Public API
-;; =============================================================================
+;; Start the stdlib TLS server for a loaded context; the context is recorded
+;; on the handle so server-stop-tls can free it.  NULL (context freed) on
+;; failure.
+(defn htls-start [port : int ctx : TlsCtx handler : (c-fn [int int] int)] : ptr<void>
+  (let [s (server-launch
+            (httpd-new-tls port 8
+              (fn [c : ptr<void>] : nil (serve-httpd-request-conn c handler))
+              (:: ctx :int)))]
+    (if (htls-null? s)
+      (do (tls-ctx-free ctx) (htls-null-ptr))
+      (do (server-set-tls-ctx! s (:: ctx :int)) s))))
 
 ;;; server-start-tls-conn -- bind a TLS listener and dispatch to a two-arg
 ;;; (Conn, Request) -> Response handler over HTTPS.
@@ -440,7 +59,8 @@ void * httpd__tls__tls_listener_loop_trampoline(void *arg) {
 ;;; the per-connection TLS state so an upgrade handler can lift it to `wss://`.
 ;;;
 ;;; Parameters:
-;;;   port      -- TCP port to bind on (IPv4, INADDR_ANY).
+;;;   port      -- TCP port to bind on (127.0.0.1 unless the program called
+;;;                httpd-set-bind-any! / httpd-set-bind-addr!).
 ;;;   cert-path -- filesystem path to a PEM server cert (+ optional chain).
 ;;;   key-path  -- filesystem path to the matching PEM private key (unencrypted).
 ;;;   handler   -- captureless `(c-fn [int int] int)`. Define it as a top-level
@@ -458,51 +78,37 @@ void * httpd__tls__tls_listener_loop_trampoline(void *arg) {
 ;;; Since: WS4
 (defn server-start-tls-conn [port : int cert-path : cstr key-path : cstr
                              handler : (c-fn [int int] int)] : ptr<void>
-  (do
-    ;; Force the tur-tls autolink hint into the build so the final binary links
-    ;; -lmbedtls / -lmbedx509 / -lmbedcrypto.
-    (let [_ (tls-autolink-hint)]
-      (let [ctx (tls-ctx-new)]
-        (if (tls-ctx-null? ctx)
-          (htls-null-ptr)
-          (if (not (= (tls-ctx-load-cert-pem ctx cert-path) 0))
-            (do (tls-ctx-free ctx) (htls-null-ptr))
-            (if (not (= (tls-ctx-load-key-pem ctx key-path) 0))
-              (do (tls-ctx-free ctx) (htls-null-ptr))
-              (let [fd (htls-make-listener port)]
-                (if (< fd 0)
-                  (do (tls-ctx-free ctx) (htls-null-ptr))
-                  (let [s (htls-state-new fd (:: ctx :int) handler)]
-                    (if (= (htls-state->int s) 0)
-                      (do (htls-close-fd fd) (tls-ctx-free ctx) (htls-null-ptr))
-                      (let [tid (htls-spawn-listener s)]
-                        (if (= (htls-state->int tid) 0)
-                          (do (htls-close-fd fd)
-                              (tls-ctx-free ctx)
-                              (htls-state-free s)
-                              (htls-null-ptr))
-                          (do (htls-state-set-thread s tid)
-                              s))))))))))))))
+  ;; Force the tur-tls autolink hint into the build so the final binary links
+  ;; -lmbedtls / -lmbedx509 / -lmbedcrypto, and wire the tls spice's functions
+  ;; into stdlib httpd's TLS hook table (idempotent).
+  (let [_ (tls-autolink-hint)
+        _ (tls-httpd-init)
+        ctx (tls-ctx-new)]
+    (cond
+      (tls-ctx-null? ctx)
+        (htls-null-ptr)
+      (not (= (tls-ctx-load-cert-pem ctx cert-path) 0))
+        (do (tls-ctx-free ctx) (htls-null-ptr))
+      (not (= (tls-ctx-load-key-pem ctx key-path) 0))
+        (do (tls-ctx-free ctx) (htls-null-ptr))
+      :else
+        (htls-start port ctx handler))))
 
 ;;; server-stop-tls -- shut down a TLS server started by server-start-tls-conn.
 ;;;
-;;; Marks the listener stopping, closes the listening socket, joins the listener
-;;; thread, frees the shared TLS context, and frees the server handle. In-flight
-;;; detached workers are not joined (they exit when their connection closes),
-;;; mirroring httpd/server's spawn-mode shutdown.
+;;; Stops accepting, lets the workers finish the connections already queued,
+;;; joins every thread, frees the server and then the shared TLS context.
+;;; Connections a handler upgraded belong to it and are left alone.
 ;;;
 ;;; Parameters:
 ;;;   srv -- handle from server-start-tls-conn (NULL is a safe no-op).
 ;;;
 ;;; Since: WS4
 (defn server-stop-tls [srv : ptr<void>] : void
-  (when (not (= (htls-state->int srv) 0))
-    (let [s-int (htls-state->int srv)
-          ctx   (htls-state-ctx s-int)]
-      (htls-state-mark-stopping srv)
-      (htls-state-close-listen srv)
-      (htls-join-listener (htls-state-get-thread srv))
-      (tls-ctx-free (:: ctx TlsCtx))
-      (htls-state-free srv))))
+  (when (not (htls-null? srv))
+    (let [ctx (server-tls-ctx srv)]
+      (server-stop srv)
+      (when (not (= ctx 0))
+        (tls-ctx-free (:: ctx TlsCtx))))))
 
 ) ;; end defmodule httpd/tls

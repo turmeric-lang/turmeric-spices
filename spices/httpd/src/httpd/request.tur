@@ -1,24 +1,51 @@
-;;; httpd/request -- read-only accessors for parsed HTTP requests.
+;;; httpd/request -- read-only accessors for HTTP requests.
 ;;;
-;;; A Request handle is produced by httpd/parse and consumed by the user's
-;;; request handler.  Every accessor takes the bare :int handle.
+;;; A Request is a borrowed view of the request stdlib httpd parsed for the
+;;; current worker: the server builds it before calling the handler and frees
+;;; it after the response is written.  Handlers borrow it and must not free it
+;;; or keep it past their return.
 ;;;
 ;;; Public API:
 ;;;
-;;;   req-method  -- HTTP method as :cstr ("GET", "POST", ...).
-;;;   req-path    -- target path as :cstr (no query string).
-;;;   req-query   -- raw query string after '?' (or "").
-;;;   req-body    -- request body bytes as :cstr (or "").
-;;;   req-header  -- look up a header by name (case-insensitive); returns
-;;;                  result<:cstr>.
+;;;   req-method      -- HTTP method as :cstr ("GET", "POST", ...).
+;;;   req-path        -- target path as :cstr (no query string).
+;;;   req-query       -- raw query string after '?' (or "").
+;;;   req-body        -- request body bytes as :cstr (or "").
+;;;   req-body-len    -- body length in bytes (the body may hold NULs).
+;;;   req-header      -- look up a header by name (case-insensitive); returns
+;;;                      result<:cstr>.
+;;;   req-remote-addr -- the peer's IP address.
 ;;;
-;;; Since: H3
-;; See parse.tur for the struct layout (duplicated verbatim in every
-;; inline-C block here, matching the http/ spice convention).
+;;; Since: H3 (a view over stdlib httpd since tourist-on-stdlib-httpd H2)
+;;
+;; Layout (duplicated verbatim in every inline-C block here):
+;;
+;;   struct __httpd_req {
+;;     char  *method;     /* the stdlib conn's method                       */
+;;     char  *path;       /* path up to '?'      (owned by the view)        */
+;;     char  *query;      /* raw query after '?' (owned by the view), or "" */
+;;     char  *body;       /* the stdlib conn's body, or ""                  */
+;;     char **hdr_keys;   /* (array owned by the view; strings borrowed     */
+;;     char **hdr_vals;   /*  from the stdlib conn's header list)           */
+;;     int    hdr_count;
+;;     int    body_len;
+;;     int64_t magic;     /* HTTPD_REQ_MAGIC: this is a server-built view   */
+;;     void  *hconn;      /* the stdlib HttpdConn                           */
+;;   };
+;;
+;; The first eight fields are the layout this spice has always had, and other
+;; spices rely on it: tourist's Ctx starts with the same eight fields, so the
+;; accessors below work on a Ctx cast to Request.  Anything that needs the
+;; stdlib conn (req-remote-addr, request-conn) checks `magic` first, because a
+;; Ctx has different fields past the eighth.
+
+(load "stdlib/httpd.tur")
 
 (defmodule httpd/request
   (import httpd/types :refer [Request])
-  (export req-method req-path req-query req-body req-header)
+  (export req-method req-path req-query req-body req-body-len req-header
+          req-remote-addr request-conn
+          request-view-new request-view-free)
 
 ;; file-scope-c-block: system headers contain static inline function
 ;; definitions illegal inside function bodies on macOS 14+ / Xcode 15+.
@@ -27,16 +54,84 @@
 #include <string.h>
 #include <strings.h>
 
+#define HTTPD_REQ_MAGIC 0x7475722d68747470LL   /* "tur-http" */
+
 struct __httpd_req {
   char  *method; char *path; char *query; char *body;
   char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
+  int64_t magic; void *hconn;
 };
 ```
+
+;;; request-view-new -- internal: build the Request view of a stdlib conn.
+;;;
+;;; Called by httpd/server before the handler runs; the view borrows the
+;;; conn's method, body and header strings and owns only the path / query
+;;; split and the header arrays.  Free with request-view-free.
+;;;
+;;; Parameters:
+;;;   hconn -- the stdlib httpd conn of the current request
+;;;
+;;; Returns:
+;;;   Request -- the view, or the null handle on allocation failure.
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn request-view-new [hconn : ptr<void>] : Request
+  ```c
+  HttpdConn *c = (HttpdConn *)hconn;
+  if (!c) return 0;
+  struct __httpd_req *r = (struct __httpd_req *)calloc(1, sizeof *r);
+  if (!r) return 0;
+  r->magic  = HTTPD_REQ_MAGIC;
+  r->hconn  = hconn;
+  r->method = c->method;
+  const char *target = c->path;
+  const char *q = strchr(target, '?');
+  size_t pl = q ? (size_t)(q - target) : strlen(target);
+  r->path = (char *)malloc(pl + 1);
+  r->query = strdup(q ? q + 1 : "");
+  if (!r->path || !r->query) { free(r->path); free(r->query); free(r); return 0; }
+  memcpy(r->path, target, pl);
+  r->path[pl] = '\0';
+  r->body = c->body ? c->body : (char *)"";
+  r->body_len = c->body ? c->body_len : 0;
+  int n = 0;
+  for (HttpdHeader *h = (HttpdHeader *)c->req_headers; h; h = h->next) n++;
+  r->hdr_keys = (char **)malloc(sizeof(char *) * (size_t)(n ? n : 1));
+  r->hdr_vals = (char **)malloc(sizeof(char *) * (size_t)(n ? n : 1));
+  if (!r->hdr_keys || !r->hdr_vals) {
+    free(r->hdr_keys); free(r->hdr_vals); free(r->path); free(r->query); free(r);
+    return 0;
+  }
+  for (HttpdHeader *h = (HttpdHeader *)c->req_headers; h; h = h->next) {
+    r->hdr_keys[r->hdr_count] = h->name;
+    r->hdr_vals[r->hdr_count] = h->value ? h->value : (char *)"";
+    r->hdr_count++;
+  }
+  return (int64_t)(intptr_t)r;
+  ```)
+
+;;; request-view-free -- internal: release a view from request-view-new.
+;;;
+;;; Frees only what the view owns; the stdlib conn's strings are left alone.
+;;; Safe on the null handle.
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn request-view-free [req : Request] : void
+  ```c
+  if (req == 0) return;
+  struct __httpd_req *r = (struct __httpd_req *)(intptr_t)req;
+  free(r->path);
+  free(r->query);
+  free(r->hdr_keys);
+  free(r->hdr_vals);
+  free(r);
+  ```)
 
 ;;; req-method -- HTTP method of a parsed request.
 ;;;
 ;;; Parameters:
-;;;   req -- :int Request handle
+;;;   req -- Request handle
 ;;;
 ;;; Returns:
 ;;;   :cstr -- uppercase method string, e.g. "GET", "POST"
@@ -53,7 +148,7 @@ struct __httpd_req {
 ;;; req-path -- request-target path component (no query string).
 ;;;
 ;;; Parameters:
-;;;   req -- :int Request handle
+;;;   req -- Request handle
 ;;;
 ;;; Returns:
 ;;;   :cstr -- path beginning with '/', e.g. "/foo/bar"
@@ -70,7 +165,7 @@ struct __httpd_req {
 ;;; req-query -- raw query string after '?', or "" if absent.
 ;;;
 ;;; Parameters:
-;;;   req -- :int Request handle
+;;;   req -- Request handle
 ;;;
 ;;; Returns:
 ;;;   :cstr -- e.g. "name=world&id=1", or "" if the target had no '?'
@@ -86,8 +181,11 @@ struct __httpd_req {
 
 ;;; req-body -- request body bytes (NUL-terminated; length = Content-Length).
 ;;;
+;;; A body that holds NUL bytes reads short as a cstr; use req-body-len for
+;;; its real length.
+;;;
 ;;; Parameters:
-;;;   req -- :int Request handle
+;;;   req -- Request handle
 ;;;
 ;;; Returns:
 ;;;   :cstr -- body content, or "" if the request had no body
@@ -99,6 +197,26 @@ struct __httpd_req {
 (defn req-body [req : Request] : cstr
   ```c
   return ((struct __httpd_req *)(intptr_t)req)->body;
+  ```)
+
+;;; req-body-len -- length of the request body in bytes.
+;;;
+;;; The body is binary-safe: it may contain NUL bytes, which a cstr view of
+;;; it (req-body) stops at.
+;;;
+;;; Parameters:
+;;;   req -- Request handle
+;;;
+;;; Returns:
+;;;   :int -- the byte count (0 when there was no body)
+;;;
+;;; Example:
+;;;   (req-body-len req)  ; => 11
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn req-body-len [req : Request] : int
+  ```c
+  return (int64_t)((struct __httpd_req *)(intptr_t)req)->body_len;
   ```)
 
 ;;; req-header -- look up a request header by name (case-insensitive).
@@ -125,6 +243,59 @@ struct __httpd_req {
     }
   }
   return tur_box_err((int64_t)(intptr_t)"not found");
+  ```)
+
+;;; request-conn -- the stdlib httpd conn behind a Request.
+;;;
+;;; For code that wants a stdlib httpd accessor the typed API does not wrap
+;;; (cookies, forms, multipart, ...).  The conn is valid only while the
+;;; handler runs.  A Request the server did not build -- a tourist Ctx cast
+;;; to Request, say -- has none.
+;;;
+;;; Parameters:
+;;;   req -- Request handle
+;;;
+;;; Returns:
+;;;   (Option ptr<void>) -- some(conn) for a server-built Request, none otherwise.
+;;;
+;;; Example:
+;;;   (let [c (request-conn req)]
+;;;     (when (some? c) (httpd-req-cookie (unwrap c) "session")))
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn request-conn [req : Request] : (Option ptr<void>)
+  ```c
+  struct __httpd_req *r = (struct __httpd_req *)(intptr_t)req;
+  if (!r || r->magic != HTTPD_REQ_MAGIC || !r->hconn) return tur_none();
+  return tur_some_ptr(r->hconn);
+  ```)
+
+;;; req-remote-addr -- the IP address of the client that sent the request.
+;;;
+;;; The peer of the connection (getpeername), in dotted-quad or IPv6 form.
+;;; Behind a reverse proxy this is the proxy; stdlib httpd's trust-proxy
+;;; support reads X-Forwarded-For when you configure it.
+;;;
+;;; Parameters:
+;;;   req -- Request handle
+;;;
+;;; Returns:
+;;;   (Option cstr) -- some(address), or none when the Request was not built
+;;;   by the server or the address could not be read.  The string lives as
+;;;   long as the request.
+;;;
+;;; Example:
+;;;   (let [a (req-remote-addr req)]
+;;;     (when (some? a) (println (unwrap a))))   ; prints 127.0.0.1
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn req-remote-addr [req : Request] : (Option cstr)
+  ```c
+  struct __httpd_req *r = (struct __httpd_req *)(intptr_t)req;
+  if (!r || r->magic != HTTPD_REQ_MAGIC || !r->hconn) return tur_none();
+  const char *ip = httpd_hyreq_hyremote_hyip(r->hconn);
+  if (!ip || !*ip) return tur_none();
+  return tur_some_ptr((void *)ip);
   ```)
 
 ) ;; end defmodule httpd/request

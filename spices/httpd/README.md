@@ -1,24 +1,30 @@
 # tur-httpd
 
-Minimal threaded HTTP/1.1 server for Turmeric, built on POSIX sockets and
-`pthreads`. Server-side counterpart to [`tur-http`](../http/).
+A typed HTTP/1.1 server layer for Turmeric, over stdlib `httpd`.
+Server-side counterpart to [`tur-http`](../http/).
 
 ## Overview
 
-`tur-httpd` is a Tier 1 spice (no external `cmake-dep`). It exposes a small
-synchronous request/response API: start a server with a handler function,
-inspect the request, build a response, return.
+`tur-httpd` exposes a small synchronous request/response API: start a server
+with a handler function, inspect the request, build a response, return. The
+server underneath -- listener, worker pool, HTTP/1.1 keep-alive, read timeout,
+body cap, TLS hook, connection upgrade -- is stdlib `httpd`
+(`stdlib/httpd.tur`); this spice is the typed layer over it, the way Node's
+`req`/`res` objects sit over its socket: `Request` is a view of the request
+stdlib parsed, `Response` is a value the layer writes back, and the
+`Handler` typeclass and JSON codecs build on those.
 
-It is one of three spices that together form a composable web stack for
+It is one of the spices that together form a composable web stack for
 Turmeric:
 
 | Spice          | Analogue            | Depends on                       |
 |----------------|---------------------|----------------------------------|
 | `tur-template` | ERB / EJS           | (none -- pure Turmeric)          |
-| `tur-httpd`    | Mongoose / Civetweb | (none -- POSIX sockets/pthreads) |
-| `tur-turist`   | Haskell's scotty    | `tur-httpd`, `tur-template`      |
+| `tur-httpd`    | Node's `http` req/res | stdlib `httpd`                 |
+| `tur-tourist`  | Express / scotty    | `tur-httpd`, `tur-template`      |
 
-The three are deliberately separate so any layer can be used independently.
+The layers are deliberately separate so any one can be used independently --
+and stdlib `httpd` itself is a supported base, with its own middleware set.
 
 ## Install
 
@@ -42,6 +48,60 @@ The three are deliberately separate so any layer can be used independently.
 ;; ... application code ...
 
 (server-stop srv)
+```
+
+```sweet-exp
+import httpd/server   :refer [server-start server-stop]
+import httpd/response :refer [resp-ok]
+
+def srv server-start(8080 (fn [req] (resp-ok "text/plain" "Hello, world!")))
+
+;; ... application code ...
+
+server-stop(srv)
+```
+
+## Server behaviour and options
+
+These come from stdlib `httpd` (since tur-httpd 0.3.0; the spice's own server
+before that had none of the limits):
+
+- **Keep-alive.** HTTP/1.1 connections stay open for the next request. A
+  client that reads to EOF to find the end of a response must send
+  `Connection: close` (or use `Content-Length`). A `Connection: close` header
+  on a `Response` closes the connection after it.
+- **Loopback by default.** Servers bind `127.0.0.1` unless the program calls
+  stdlib's `httpd-set-bind-any!` / `httpd-set-bind-addr!` (or sets
+  `TUR_HTTPD_BIND_ANY=1`) before starting them.
+- **Limits.** A request head must arrive within the read timeout (5 s; 408
+  past it, 431 for a head over 256 KiB), and a body over the cap (8 MiB) is
+  refused 413 before it is read. `server-start-opts` sets both per server
+  (example below).
+- **Binary bodies and the peer.** `req-body-len` gives the real length of a
+  body that holds NULs, `with-body-bytes` sends one, and `req-remote-addr`
+  returns the client's address as `(Option cstr)`. `with-header-set` replaces
+  a header case-insensitively and `resp-header` reads one back.
+- **stdlib accessors.** `(request-conn req)` is the stdlib conn behind a
+  `Request`, for the stdlib accessors this layer does not wrap (cookies,
+  forms, multipart).
+
+`ServerOpts` holds the pool size (`server-start` uses 8), the body cap in
+bytes (-1 keeps stdlib's) and the read timeout in ms (0 keeps stdlib's):
+
+```turmeric
+(import httpd/server :refer [ServerOpts server-start-opts server-port server-stop])
+
+(let [srv (server-start-opts 0 my-handler (make-struct ServerOpts 8 1048576 2000))]
+  (println (server-port srv))     ; kernel-assigned port
+  (server-stop srv))
+```
+
+```sweet-exp
+import httpd/server :refer [ServerOpts server-start-opts server-port server-stop]
+
+let [srv server-start-opts(0 my-handler make-struct(ServerOpts 8 1048576 2000))]
+  println $ server-port srv
+  server-stop srv
 ```
 
 ## Typed handlers (`Handler` typeclass)
@@ -129,12 +189,23 @@ state -- which is exactly what `ws-server`'s `ws-upgrade` consumes to serve
   (server-stop-tls srv))
 ```
 
-TLS is opt-in: only programs that import `httpd/tls` link mbedTLS. The plaintext
-`server-start*` path stays dependency-free.
+TLS is opt-in: only programs that import `httpd/tls` link mbedTLS. The listener
+is stdlib `httpd-new-tls`; `httpd/tls` registers the tls spice's functions in
+stdlib's TLS hook table (`tls-httpd-init`) for you.
+
+## Connection upgrade
+
+A two-arg handler's `conn-mark-upgraded!` is stdlib's `httpd-conn-detach!`:
+from that call the connection -- fd and TLS state -- belongs to the handler,
+the server writes nothing after it returns and closes nothing. ws-server's
+`ws-upgrade` is built on it. An upgraded session holds its worker for as long
+as it runs, so size the pool for the sessions you expect.
 
 ## Status
 
-Early in development. See
+Requires turmeric with stdlib httpd's connection upgrade and per-server
+limits (tourist-on-stdlib-httpd-plan H1) -- the first release after v0.64.0,
+or main. See
 [`docs/archive/history/tur-httpd-plan.md`](https://github.com/turmeric-lang/turmeric/blob/main/docs/archive/history/tur-httpd-plan.md) in the
 turmeric repo for the full roadmap.
 

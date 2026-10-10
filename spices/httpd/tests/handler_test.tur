@@ -12,7 +12,7 @@
   (import httpd/response :refer [resp-ok not-found])
   (import httpd/server   :refer [server-stop])
   (import httpd/types    :refer [Request Response])
-  (import http/client    :refer [http-get])
+  (import http/client    :refer [http-get http-result-free])
   (import http/response  :refer [response-status response-body response-header])
   (import test/suite     :refer [describe it])
   (import test/assert    :refer [assert-eq assert-true])
@@ -38,6 +38,26 @@
     return strcmp((const char *)a, (const char *)b) == 0;
     ```)
 
+  ;; ---------------------------------------------------------------------
+  ;; Client result readers: read one thing, then free the result (the http
+  ;; spice's http-result-free also frees the strings read from it).
+  ;; ---------------------------------------------------------------------
+
+  (defn status-of [r : ptr<void>] : int
+    (let [s (if (__cr-ok? r) (response-status (__cr-val r)) -1)]
+      (http-result-free r)
+      s))
+
+  (defn body-is? [r : ptr<void> want : cstr] : bool
+    (let [ok (if (__cr-ok? r) (cstr-eq? want (response-body (__cr-val r))) false)]
+      (http-result-free r)
+      ok))
+
+  (defn header-is? [r : ptr<void> name : cstr want : cstr] : bool
+    (let [ok (if (__cr-ok? r) (cstr-eq? want (response-header (__cr-val r) name)) false)]
+      (http-result-free r)
+      ok))
+
   ;; Local "<method> <path>" join -- stdlib/str-concat trips the elaborator
   ;; when reached transitively through several spices, so inline a tiny
   ;; purpose-built helper (mirrors echo_test).
@@ -55,6 +75,9 @@
     out[ml + 1 + pl] = '\0';
     return out;
     ```)
+
+  (defn cstr-free [s : cstr] : void
+    ```c free((void *)s); ```)
 
   (defn sleep-ms [ms : int] #fx{Unsafe} : void
     ```c
@@ -78,7 +101,10 @@
       (let [r (:: req :Request)]
         (if (cstr-eq? "/health" (req-path r))
           (resp-ok "text/plain" "ok")
-          (not-found (echo-join (req-method r) (req-path r)))))))
+          (let [body (echo-join (req-method r) (req-path r))
+                resp (not-found body)]
+            (cstr-free body)
+            resp)))))
 
   ;; ---------------------------------------------------------------------
   ;; Test driver -- `serve` generates the trampoline + starts the server.
@@ -92,35 +118,19 @@
         (describe "httpd Handler typeclass -- serve bridge"
 
           (it "GET /health returns 200"
-            (let [r (http-get "http://127.0.0.1:18083/health")]
-              (if (__cr-ok? r)
-                (assert-eq 200 (response-status (__cr-val r)))
-                (assert-true false))))
+            (assert-eq 200 (status-of (http-get "http://127.0.0.1:18083/health"))))
 
           (it "GET /health body is 'ok'"
-            (let [r (http-get "http://127.0.0.1:18083/health")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "ok" (response-body (__cr-val r))))
-                (assert-true false))))
+            (assert-true (body-is? (http-get "http://127.0.0.1:18083/health") "ok")))
 
           (it "GET /missing returns 404"
-            (let [r (http-get "http://127.0.0.1:18083/missing")]
-              (if (__cr-ok? r)
-                (assert-eq 404 (response-status (__cr-val r)))
-                (assert-true false))))
+            (assert-eq 404 (status-of (http-get "http://127.0.0.1:18083/missing"))))
 
           (it "GET /missing echoes 'GET /missing'"
-            (let [r (http-get "http://127.0.0.1:18083/missing")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "GET /missing" (response-body (__cr-val r))))
-                (assert-true false))))
+            (assert-true (body-is? (http-get "http://127.0.0.1:18083/missing") "GET /missing")))
 
           (it "Content-Type is text/plain"
-            (let [r (http-get "http://127.0.0.1:18083/health")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "text/plain"
-                                       (response-header (__cr-val r) "Content-Type")))
-                (assert-true false)))))
+            (assert-true (header-is? (http-get "http://127.0.0.1:18083/health") "Content-Type" "text/plain"))))
 
         (server-stop srv)
         ))

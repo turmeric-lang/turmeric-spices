@@ -11,7 +11,7 @@
   (import httpd/request  :refer [req-method req-body])
   (import httpd/response :refer [resp-ok])
   (import httpd/types    :refer [Request])
-  (import http/client    :refer [http-post http-get])
+  (import http/client    :refer [http-post http-get http-result-free])
   (import http/response  :refer [response-status response-body])
   (import test/suite     :refer [describe it])
   (import test/assert    :refer [assert-eq assert-true])
@@ -36,6 +36,26 @@
     #include <string.h>
     return strcmp((const char *)a, (const char *)b) == 0;
     ```)
+
+  ;; ---------------------------------------------------------------------
+  ;; Client result readers: read one thing, then free the result (the http
+  ;; spice's http-result-free also frees the strings read from it).
+  ;; ---------------------------------------------------------------------
+
+  (defn status-of [r : ptr<void>] : int
+    (let [s (if (__cr-ok? r) (response-status (__cr-val r)) -1)]
+      (http-result-free r)
+      s))
+
+  (defn body-is? [r : ptr<void> want : cstr] : bool
+    (let [ok (if (__cr-ok? r) (cstr-eq? want (response-body (__cr-val r))) false)]
+      (http-result-free r)
+      ok))
+
+  (defn header-is? [r : ptr<void> name : cstr want : cstr] : bool
+    (let [ok (if (__cr-ok? r) (cstr-eq? want (response-header (__cr-val r) name)) false)]
+      (http-result-free r)
+      ok))
 
   ;; ---------------------------------------------------------------------
   ;; Handler: 200 OK; body = request body (or "<empty>" if there was none).
@@ -71,30 +91,17 @@
         (describe "httpd post-body -- request body round-trip"
 
           (it "POST short body echoes verbatim"
-            (let [r (http-post "http://127.0.0.1:18083/echo" "hello, world")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "hello, world" (response-body (__cr-val r))))
-                (assert-true false))))
+            (assert-true (body-is? (http-post "http://127.0.0.1:18083/echo" "hello, world") "hello, world")))
 
           (it "POST short body returns 200"
-            (let [r (http-post "http://127.0.0.1:18083/echo" "x")]
-              (if (__cr-ok? r)
-                (assert-eq 200 (response-status (__cr-val r)))
-                (assert-true false))))
+            (assert-eq 200 (status-of (http-post "http://127.0.0.1:18083/echo" "x"))))
 
           (it "POST JSON-shaped body echoes verbatim"
-            (let [r (http-post "http://127.0.0.1:18083/echo"
-                               "{\"key\":\"value\",\"n\":42}")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "{\"key\":\"value\",\"n\":42}"
-                                       (response-body (__cr-val r))))
-                (assert-true false))))
+            (assert-true (body-is? (http-post "http://127.0.0.1:18083/echo"
+                               "{\"key\":\"value\",\"n\":42}") "{\"key\":\"value\",\"n\":42}")))
 
           (it "GET with no body returns '<empty>'"
-            (let [r (http-get "http://127.0.0.1:18083/no-body")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "<empty>" (response-body (__cr-val r))))
-                (assert-true false)))))
+            (assert-true (body-is? (http-get "http://127.0.0.1:18083/no-body") "<empty>"))))
 
         (server-stop srv)
         ))

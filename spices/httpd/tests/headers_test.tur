@@ -9,7 +9,7 @@
   (import httpd/request  :refer [req-header])
   (import httpd/response :refer [resp-ok with-header])
   (import httpd/types    :refer [Request])
-  (import http/client    :refer [http-request])
+  (import http/client    :refer [http-request http-result-free])
   (import http/request   :refer [request])
   (import http/response  :refer [response-status response-header])
   (import test/suite     :refer [describe it])
@@ -35,6 +35,26 @@
     #include <string.h>
     return strcmp((const char *)a, (const char *)b) == 0;
     ```)
+
+  ;; ---------------------------------------------------------------------
+  ;; Client result readers: read one thing, then free the result (the http
+  ;; spice's http-result-free also frees the strings read from it).
+  ;; ---------------------------------------------------------------------
+
+  (defn status-of [r : ptr<void>] : int
+    (let [s (if (__cr-ok? r) (response-status (__cr-val r)) -1)]
+      (http-result-free r)
+      s))
+
+  (defn body-is? [r : ptr<void> want : cstr] : bool
+    (let [ok (if (__cr-ok? r) (cstr-eq? want (response-body (__cr-val r))) false)]
+      (http-result-free r)
+      ok))
+
+  (defn header-is? [r : ptr<void> name : cstr want : cstr] : bool
+    (let [ok (if (__cr-ok? r) (cstr-eq? want (response-header (__cr-val r) name)) false)]
+      (http-result-free r)
+      ok))
 
   ;; ok? / ok-val on the result<:cstr> that req-header returns.  We can't
   ;; rely on stdlib/result here because the type elaborator gets confused
@@ -68,6 +88,32 @@
     return (int64_t)(intptr_t)kc;
     ```)
 
+  ;; Free the two cells cons-pair allocated (the strings are literals).
+  (defn cons-pair-free [cell : int] : void
+    ```c
+    #include <stdlib.h>
+    struct __cons { int64_t value; int64_t next; };
+    struct __cons *kc = (struct __cons *)(intptr_t)cell;
+    if (!kc) return;
+    free((void *)(intptr_t)kc->next);
+    free(kc);
+    ```)
+
+  ;; GET / with the given header list; frees the request record before
+  ;; returning the client result (the caller frees that).
+  (defn fetch [hdrs : int] : ptr<void>
+    (let [req (request "GET" "http://127.0.0.1:18082/" "" hdrs)
+          r   (http-request req)]
+      (request-free req)
+      r))
+
+  ;; GET / carrying `X-Echo: v`, freeing the header cells.
+  (defn fetch-echo [v : cstr] : ptr<void>
+    (let [hdrs (cons-pair "X-Echo" v (nil-cons))
+          r    (fetch hdrs)]
+      (cons-pair-free hdrs)
+      r))
+
   ;; ---------------------------------------------------------------------
   ;; Handler: copy X-Echo from request -> X-Echo-Reply on response.
   ;; ---------------------------------------------------------------------
@@ -99,29 +145,13 @@
         (describe "httpd headers -- request/response round-trip"
 
           (it "echoes X-Echo back as X-Echo-Reply"
-            (let [hdrs (cons-pair "X-Echo" "ping-pong" (nil-cons))
-                  req  (request "GET" "http://127.0.0.1:18082/" "" hdrs)
-                  r    (http-request req)]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "ping-pong"
-                                       (response-header (__cr-val r) "X-Echo-Reply")))
-                (assert-true false))))
+            (assert-true (header-is? (fetch-echo "ping-pong") "X-Echo-Reply" "ping-pong")))
 
           (it "request without X-Echo gets 'absent'"
-            (let [req (request "GET" "http://127.0.0.1:18082/" "" (nil-cons))
-                  r   (http-request req)]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "absent"
-                                       (response-header (__cr-val r) "X-Echo-Reply")))
-                (assert-true false))))
+            (assert-true (header-is? (fetch (nil-cons)) "X-Echo-Reply" "absent")))
 
           (it "round-trip returns 200"
-            (let [hdrs (cons-pair "X-Echo" "x" (nil-cons))
-                  req  (request "GET" "http://127.0.0.1:18082/" "" hdrs)
-                  r    (http-request req)]
-              (if (__cr-ok? r)
-                (assert-eq 200 (response-status (__cr-val r)))
-                (assert-true false)))))
+            (assert-eq 200 (status-of (fetch-echo "x")))))
 
         (server-stop srv)
         ))

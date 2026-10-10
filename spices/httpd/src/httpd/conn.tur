@@ -1,37 +1,44 @@
 ;;; httpd/conn -- live-connection handle for upgrade-aware handlers.
 ;;;
-;;; The low-level worker loop normally owns the client socket for the whole
-;;; request/response lifetime: it reads the request, calls the handler, writes
-;;; the Response, and closes the fd. Protocol upgrades (WebSocket, SSE, ...)
-;;; need to break out of that lifecycle -- the handler must take over the raw
-;;; fd and the worker must NOT write a second response or close the socket.
+;;; The server normally owns the client socket for the whole request/response
+;;; lifetime: it reads the request, calls the handler, writes the Response, and
+;;; keeps the connection for the next keep-alive request or closes it.
+;;; Protocol upgrades (WebSocket, SSE, ...) need to break out of that -- the
+;;; handler must take over the raw transport and the server must NOT write a
+;;; second response or close the socket.
 ;;;
 ;;; A `Conn` is the handle that makes that possible. Handlers registered via
 ;;; `server-start-conn` / `serve-conn` receive a `Conn` alongside the
-;;; `Request`; an upgrade helper reads the fd with `conn-fd`, writes its own
-;;; "101 Switching Protocols" response directly to it, then calls
-;;; `conn-mark-upgraded!`. After the handler returns the worker checks
-;;; `conn-upgraded?` and, when set, skips its serialize / write / close step --
-;;; ownership of the fd has transferred to the upgrade handler.
+;;; `Request`; an upgrade helper reads the fd with `conn-fd` (and the TLS state
+;;; with `conn-tls`), writes its own "101 Switching Protocols" response, then
+;;; calls `conn-mark-upgraded!`. That hands the connection over at once -- it is
+;;; stdlib httpd's `httpd-conn-detach!` -- so when the handler returns the
+;;; server writes nothing and closes nothing: the upgrade handler owns the fd
+;;; and the TLS state and must release them.
 ;;;
-;;; The `tls` slot carries the per-connection TLS state for the `wss://` path
-;;; (websocket-server-plan WS4). On a plaintext listener it stays NULL and the
-;;; `conn-fd` raw-socket path is used; on a TLS listener (`server-start-tls-conn`
-;;; in httpd/tls) it holds the `tls_conn_t*` produced by tur-tls's `tls-wrap-fd`,
-;;; and `conn-tls` hands it to the upgrade helper so the WebSocket handshake +
-;;; frame I/O run over the encrypted stream instead of the bare fd.
+;;; The `tls` slot carries the per-connection TLS state for the `wss://` path:
+;;; NULL on a plaintext listener; on a TLS listener (`server-start-tls-conn` in
+;;; httpd/tls) the `tls_conn_t*` tur-tls's `tls-wrap-fd` produced, so the
+;;; WebSocket handshake + frame I/O run over the encrypted stream.
 ;;;
 ;;; Internal layout (duplicated verbatim in every inline-C block):
 ;;;
-;;;   struct __httpd_conn { int fd; int upgraded; void *tls; };
+;;;   struct __httpd_conn { int fd; int upgraded; void *tls; void *hconn; };
 ;;;
-;;; Since: WS0 (tls slot wired in WS4)
+;;; `hconn` is the stdlib httpd conn of the request (NULL for a Conn made with
+;;; conn-new / conn-new-tls outside the server).
+;;;
+;;; Since: WS0 (tls slot wired in WS4; over stdlib httpd since
+;;; tourist-on-stdlib-httpd H2)
+
+(load "stdlib/httpd.tur")
 
 (defmodule httpd/conn
   (import httpd/types :refer [Conn])
   (import tls/conn    :refer [TlsConn])
   (export conn-new conn-new-tls conn-fd conn-tls
-          conn-mark-upgraded! conn-upgraded? conn-free)
+          conn-mark-upgraded! conn-upgraded? conn-free
+          conn-of-httpd)
 
 ;; file-scope-c-block: keep the struct layout and headers out of function
 ;; bodies (system headers carry static inline defs illegal inside functions
@@ -39,13 +46,14 @@
 ```c
 #include <stdlib.h>
 
-struct __httpd_conn { int fd; int upgraded; void *tls; };
+struct __httpd_conn { int fd; int upgraded; void *tls; void *hconn; };
 ```
 
-;;; conn-new -- allocate a Conn wrapping a worker's client fd.
+;;; conn-new -- allocate a Conn wrapping a client fd.
 ;;;
-;;; The connection starts un-upgraded with a NULL TLS slot. The framework
-;;; constructs this in the worker loop; user code never calls it directly.
+;;; The connection starts un-upgraded with a NULL TLS slot and no stdlib conn,
+;;; so conn-mark-upgraded! only sets the flag. The server builds its Conns with
+;;; conn-of-httpd; this is for code driving a socket of its own.
 ;;;
 ;;; Parameters:
 ;;;   fd -- connected client socket.
@@ -61,17 +69,17 @@ struct __httpd_conn { int fd; int upgraded; void *tls; };
   c->fd       = (int)fd;
   c->upgraded = 0;
   c->tls      = NULL;
+  c->hconn    = NULL;
   return (int64_t)(intptr_t)c;
   ```)
 
 ;;; conn-new-tls -- allocate a Conn wrapping a worker's client fd plus its
 ;;; per-connection TLS state.
 ;;;
-;;; Used by httpd/tls's TLS worker loop: `tls` is the `tls_conn_t*` handle
-;;; returned by tur-tls's `tls-wrap-fd` (post-handshake). `conn-tls` later hands
-;;; it to ws-upgrade so the WebSocket handshake + frames run over TLS. The fd is
-;;; still recorded (it backs `SO_RCVTIMEO` and the final `close`), but byte I/O
-;;; goes through the TLS state, not the raw fd.
+;;; `tls` is a `tls_conn_t*` handle from tur-tls's `tls-wrap-fd`
+;;; (post-handshake). `conn-tls` hands it to ws-upgrade so the WebSocket
+;;; handshake + frames run over TLS. Like conn-new, this Conn has no stdlib
+;;; conn behind it.
 ;;;
 ;;; Parameters:
 ;;;   fd  -- connected client socket.
@@ -88,6 +96,30 @@ struct __httpd_conn { int fd; int upgraded; void *tls; };
   c->fd       = (int)fd;
   c->upgraded = 0;
   c->tls      = (void *)(intptr_t)tls;
+  c->hconn    = NULL;
+  return (int64_t)(intptr_t)c;
+  ```)
+
+;;; conn-of-httpd -- internal: the Conn for the stdlib conn of a request.
+;;;
+;;; httpd/server builds one per request for a two-arg handler; the fd and TLS
+;;; state are the stdlib conn's. Free with conn-free.
+;;;
+;;; Parameters:
+;;;   hconn -- the stdlib httpd conn of the current request
+;;;
+;;; Returns:
+;;;   :Conn -- a fresh handle, or 0 on allocation failure.
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn conn-of-httpd [hconn : ptr<void>] : Conn
+  ```c
+  struct __httpd_conn *c = (struct __httpd_conn *)malloc(sizeof(*c));
+  if (!c) return 0;
+  c->fd       = (int)httpd_hyconn_hyfd(hconn);
+  c->upgraded = 0;
+  c->tls      = httpd_hyconn_hytls(hconn);
+  c->hconn    = hconn;
   return (int64_t)(intptr_t)c;
   ```)
 
@@ -129,11 +161,12 @@ struct __httpd_conn { int fd; int upgraded; void *tls; };
   return (int64_t)(intptr_t)((struct __httpd_conn *)(intptr_t)conn)->tls;
   ```)
 
-;;; conn-mark-upgraded! -- flag the connection as protocol-upgraded.
+;;; conn-mark-upgraded! -- hand the connection to the upgrade handler.
 ;;;
-;;; After this is set, the worker loop skips its serialize / write / close
-;;; step: ownership of the fd has transferred to the upgrade handler, which is
-;;; now responsible for closing it.
+;;; Effective at once: the server will write no response (the handler's
+;;; returned Response is discarded) and will not close the fd or release the
+;;; TLS state -- the upgrade handler now owns both and must close them.
+;;; Call it once the switch-protocols response is on the wire.
 ;;;
 ;;; Parameters:
 ;;;   conn -- Conn handle.
@@ -142,12 +175,17 @@ struct __httpd_conn { int fd; int upgraded; void *tls; };
 (defn conn-mark-upgraded! [conn : Conn] : void
   ```c
   if (conn == 0) return;
-  ((struct __httpd_conn *)(intptr_t)conn)->upgraded = 1;
+  struct __httpd_conn *c = (struct __httpd_conn *)(intptr_t)conn;
+  if (c->upgraded) return;
+  c->upgraded = 1;
+  /* Hand the connection over now (it also drops the server's read timeout,
+   * which an upgraded session must not inherit). */
+  if (c->hconn) (void)__TUR_CNAME_httpd-conn-detach!__(c->hconn);
   ```)
 
 ;;; conn-upgraded? -- true once conn-mark-upgraded! has been called.
 ;;;
-;;; The worker loop consults this after the handler returns.
+;;; The server consults this after the handler returns.
 ;;;
 ;;; Parameters:
 ;;;   conn -- Conn handle.

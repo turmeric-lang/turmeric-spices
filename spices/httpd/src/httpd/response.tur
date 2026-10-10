@@ -13,7 +13,11 @@
 ;;;   bad-request    -- 400 Bad Request shortcut.
 ;;;   with-header    -- append a header (mutates in place; returns the
 ;;;                     same handle for chaining).
+;;;   with-header-set -- set a header, replacing any of the same name
+;;;                     (case-insensitive).
+;;;   resp-header    -- read a header back: (Option cstr).
 ;;;   with-body      -- replace the body.
+;;;   with-body-bytes -- replace the body with raw bytes (may contain NUL).
 ;;;   with-status    -- replace the status code.
 ;;;   free-response  -- release the handle and all owned storage.
 ;;;
@@ -37,7 +41,8 @@
 (defmodule httpd/response
   (import httpd/types :refer [Response])
   (export response resp-ok not-found bad-request
-          with-header with-body with-status
+          with-header with-header-set resp-header
+          with-body with-body-bytes with-status
           free-response)
 
 ;; file-scope-c-block: system headers contain static inline function
@@ -45,6 +50,7 @@
 ```c
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 struct __httpd_resp {
   int    status; char  *body; int body_len;
@@ -107,6 +113,74 @@ struct __httpd_resp {
   return resp;
   ```)
 
+;;; with-header-set -- set a header on a Response, replacing any existing
+;;; header of the same name (case-insensitive); appends when there is none.
+;;;
+;;; Use for single-valued headers (`Content-Type`, `Cache-Control`, ...);
+;;; with-header appends, which is what `Set-Cookie` and `Vary` want.
+;;;
+;;; Parameters:
+;;;   resp -- Response handle
+;;;   key  -- header name
+;;;   val  -- header value
+;;;
+;;; Returns:
+;;;   Response -- the same handle (for chaining)
+;;;
+;;; Example:
+;;;   (with-header-set (resp-ok "text/plain" "{}") "Content-Type" "application/json")
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn with-header-set [resp : Response key : cstr val : cstr] : Response
+  ```c
+  struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
+  const char *k = (const char *)key;
+  const char *v = (const char *)val;
+  int kept = -1, out = 0;
+  for (int i = 0; i < r->hdr_count; i++) {
+    if (strcasecmp(r->hdr_keys[i], k) == 0) {
+      if (kept >= 0) { free(r->hdr_keys[i]); free(r->hdr_vals[i]); continue; }
+      kept = out;
+      free(r->hdr_vals[i]);
+      size_t vl = strlen(v);
+      r->hdr_vals[i] = malloc(vl + 1);
+      memcpy(r->hdr_vals[i], v, vl + 1);
+    }
+    r->hdr_keys[out] = r->hdr_keys[i];
+    r->hdr_vals[out] = r->hdr_vals[i];
+    out++;
+  }
+  r->hdr_count = out;
+  if (kept >= 0) return resp;
+  return httpd__response__with_hyheader(resp, key, val);
+  ```)
+
+;;; resp-header -- read a header of a Response by name (case-insensitive).
+;;;
+;;; Middleware that decorates a response uses this to see what the route
+;;; already set.  Returns the first match.
+;;;
+;;; Parameters:
+;;;   resp -- Response handle
+;;;   name -- header name
+;;;
+;;; Returns:
+;;;   (Option cstr) -- some(value), or none when the header is absent.  The
+;;;   value belongs to the Response.
+;;;
+;;; Example:
+;;;   (resp-header (resp-ok "text/plain" "hi") "Content-Type")  ; => some("text/plain")
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn resp-header [resp : Response name : cstr] : (Option cstr)
+  ```c
+  struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
+  for (int i = 0; i < r->hdr_count; i++)
+    if (strcasecmp(r->hdr_keys[i], (const char *)name) == 0)
+      return tur_some_ptr(r->hdr_vals[i]);
+  return tur_none();
+  ```)
+
 ;;; with-body -- replace the body of a Response (mutates in place).
 ;;;
 ;;; Parameters:
@@ -129,6 +203,37 @@ struct __httpd_resp {
   r->body = malloc(bl + 1);
   if (bl > 0) memcpy(r->body, b, bl);
   r->body[bl] = '\0';
+  r->body_len = (int)bl;
+  return resp;
+  ```)
+
+;;; with-body-bytes -- replace the body of a Response with raw bytes.
+;;;
+;;; Binary-safe: copies exactly `len` bytes, NULs included (an image, gzip
+;;; output, ...), where with-body stops at the first NUL.
+;;;
+;;; Parameters:
+;;;   resp  -- Response handle
+;;;   bytes -- source buffer
+;;;   len   -- byte count
+;;;
+;;; Returns:
+;;;   Response -- the same handle
+;;;
+;;; Example:
+;;;   (with-body-bytes (resp-ok "image/png" "") png-data png-len)
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn with-body-bytes [resp : Response bytes : ptr<void> len : int] : Response
+  ```c
+  struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
+  size_t bl = (bytes && len > 0) ? (size_t)len : 0;
+  char *nb = malloc(bl + 1);
+  if (!nb) return resp;
+  if (bl > 0) memcpy(nb, bytes, bl);
+  nb[bl] = '\0';
+  free(r->body);
+  r->body = nb;
   r->body_len = (int)bl;
   return resp;
   ```)

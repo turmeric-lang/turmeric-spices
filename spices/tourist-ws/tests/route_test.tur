@@ -17,7 +17,7 @@
 
 (defmodule tourist-ws/tests/route
   (import tourist-ws/route :refer [ws-route!])
-  (import tourist/dsl      :refer [route-method route-pattern])
+  (import tourist/dsl      :refer [route-method route-pattern route-free])
   (import tourist/router   :refer [router-match captures-get captures-free])
   (import tourist/types    :refer [Captures Pattern])
   (import ws-core/conn     :refer [WsConn])
@@ -39,42 +39,60 @@
   (defn noop-handler [ws : WsConn] : void
     (let [_ ws] 0))
 
-  ;;; route-for -- the route Item ws-route! builds for `path`.
+  ;;; route-for -- the route Item ws-route! builds for `path`.  Each caller
+  ;;; frees it with route-free when done.
   (defn route-for [path : cstr] : int
     (ws-route! path noop-handler))
 
-  ;;; pattern-of -- the compiled Pattern the route carries.
-  (defn pattern-of [path : cstr] : Pattern
-    (:: (route-pattern (route-for path)) :Pattern))
+  ;;; built? -- does ws-route! build a route at all?
+  (defn built? [path : cstr] : bool
+    (let [r  (route-for path)
+          ok (not (= 0 r))]
+      (route-free r)
+      ok))
+
+  ;;; method-is? -- is the route built for `path` declared on `want`?
+  (defn method-is? [path : cstr want : cstr] : bool
+    (let [r  (route-for path)
+          ok (cstr-eq? want (route-method r))]
+      (route-free r)
+      ok))
 
   ;;; routes? -- does the route built for `path` match `req-path`?
   (defn routes? [path : cstr req-path : cstr] : bool
-    (let [caps (router-match (pattern-of path) req-path)
+    (let [r    (route-for path)
+          caps (router-match (:: (route-pattern r) :Pattern) req-path)
           hit  (not (= (:: caps :int) 0))]
-      (do (when hit (captures-free caps)) hit)))
+      (when hit (captures-free caps))
+      (route-free r)
+      hit))
 
   ;;; captures-as? -- does routing `req-path` bind `want` under `key`?
   ;;;
   ;;; Compared before captures-free, deliberately: captures-get returns a
   ;;; pointer into the caps struct that captures-free then frees.
   (defn captures-as? [path : cstr req-path : cstr key : cstr want : cstr] : bool
-    (let [caps (router-match (pattern-of path) req-path)]
-      (if (= (:: caps :int) 0)
-        false
-        (let [r   (captures-get caps key)
-              hit (if (ok? r) (cstr-eq? want (ok-val r)) false)]
-          (do (captures-free caps) hit)))))
+    (let [r    (route-for path)
+          caps (router-match (:: (route-pattern r) :Pattern) req-path)
+          hit  (if (= (:: caps :int) 0)
+                 false
+                 (let [v  (captures-get caps key)
+                       ok (if (ok? v) (cstr-eq? want (ok-val v)) false)]
+                   (captures-free caps)
+                   ok))]
+      (route-free r)
+      hit))
 
   (defn main [] : int
     (describe "tourist-ws/route -- ws-route! wiring"
 
       (it "builds a route"
-        (assert-true (not (= 0 (route-for "/ws")))))
+        (assert-true (built? "/ws")))
 
       ;; A WebSocket handshake is a GET, so the route ws-route! declares must
       ;; be a GET route -- nothing else would ever be reached by an upgrade.
       (it "declares the route on GET"
-        (assert-true (cstr-eq? "GET" (route-method (route-for "/ws")))))
+        (assert-true (method-is? "/ws" "GET")))
 
       (it "compiles the path it was given"
         (assert-true (routes? "/ws" "/ws")))
