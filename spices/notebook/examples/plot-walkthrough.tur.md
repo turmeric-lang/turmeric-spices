@@ -13,7 +13,12 @@ Plot y = x^2 over [-2, 2]. The `function` renderer takes a typed callback
 (`defn` with `:float` argument and return), a domain, a sample count, a
 line style, and a label.
 
-```turmeric
+> This cell is not evaluated (`eval=false`): `function` takes its callback
+> as an untyped parameter, so a cell's `defn` -- an interpreter closure --
+> reaches plot's compiled code as an `:int` with no C function behind it.
+> The cell runs as written in a compiled program.
+
+```turmeric {eval=false}
 (import plot/core  :refer [plot-write-png])
 (import plot/line  :refer [function])
 (import plot/decor :refer [axes tick-grid])
@@ -30,7 +35,7 @@ line style, and a label.
   (default-plot-opts)
   "/tmp/nb-plot-quadratic.png")
 
-(image-hook-record-path "/tmp/nb-plot-quadratic.png")
+(unsafe (image-hook-record-path "/tmp/nb-plot-quadratic.png"))
 ```
 
 ---
@@ -48,22 +53,11 @@ The list itself is a cons list of those pair cells.
 (import plot/style :refer [default-point-style default-plot-opts])
 (import notebook/image :refer [image-hook-record-path])
 
-(defn xy [x :float y :float] : int
-  ```c
-  typedef struct { int64_t head; int64_t tail; } Cons;
-  Cons *p = malloc(sizeof(*p));
-  union { double d; int64_t i; } ux, uy; ux.d = x; uy.d = y;
-  p->head = ux.i; p->tail = uy.i;
-  return (int64_t)(intptr_t)p;
-  ```)
+(load "stdlib/bits.tur")
 
-(defn lst [v : int n : int] : int
-  ```c
-  typedef struct { int64_t head; int64_t tail; } Cons;
-  Cons *c = malloc(sizeof(*c));
-  c->head = v; c->tail = n;
-  return (int64_t)(intptr_t)c;
-  ```)
+;; One (x, y) point: a cons cell of the two floats' bits.
+(defn xy [x :float y :float] : int (cons (float->bits x) (float->bits y)))
+(defn lst [v : int n : int] : int (cons v n))
 
 (def data
   (lst (xy 0.0 0.1)
@@ -79,7 +73,7 @@ The list itself is a cons list of those pair cells.
   (default-plot-opts)
   "/tmp/nb-plot-scatter.png")
 
-(image-hook-record-path "/tmp/nb-plot-scatter.png")
+(unsafe (image-hook-record-path "/tmp/nb-plot-scatter.png"))
 ```
 
 ---
@@ -96,22 +90,12 @@ cell whose head is the category label (cstr) and tail is the height (float).
 (import plot/style :refer [default-fill-style default-plot-opts])
 (import notebook/image :refer [image-hook-record-path])
 
-(defn cat [label : cstr height : float] : int
-  ```c
-  typedef struct { int64_t head; int64_t tail; } Cons;
-  Cons *c = malloc(sizeof(*c));
-  union { double d; int64_t i; } u; u.d = height;
-  c->head = (int64_t)(intptr_t)label; c->tail = u.i;
-  return (int64_t)(intptr_t)c;
-  ```)
+(load "stdlib/bits.tur")
 
-(defn lst [v : int n : int] : int
-  ```c
-  typedef struct { int64_t head; int64_t tail; } Cons;
-  Cons *c = malloc(sizeof(*c));
-  c->head = v; c->tail = n;
-  return (int64_t)(intptr_t)c;
-  ```)
+;; One bar: a cons cell of the label and the height's bits.
+(defn cat [label : cstr height : float] : int
+  (cons (:: label :int) (float->bits height)))
+(defn lst [v : int n : int] : int (cons v n))
 
 (def bars
   (lst (cat "A" 3.0)
@@ -125,16 +109,17 @@ cell whose head is the category label (cstr) and tail is the height (float).
   (default-plot-opts)
   "/tmp/nb-plot-histogram.png")
 
-(image-hook-record-path "/tmp/nb-plot-histogram.png")
+(unsafe (image-hook-record-path "/tmp/nb-plot-histogram.png"))
 ```
 
 ---
 
 ## Density estimate
 
-The `density` renderer takes a list of float samples and draws a kernel
-density estimate. Here we generate 200 samples from N(0, 1) using
-`tur-stats` and pass them directly.
+The `density` renderer takes a list of float samples -- a cons list whose
+heads are the floats' bits -- and draws a kernel density estimate. Here we
+generate 200 samples from N(0, 1) using `tur-stats`; `rnorm` returns a
+column, so the cell walks it into that list first.
 
 ```turmeric
 (import plot/core  :refer [plot-write-png])
@@ -143,20 +128,28 @@ density estimate. Here we generate 200 samples from N(0, 1) using
 (import plot/style :refer [default-line-style default-plot-opts])
 (import stats/rng  :refer [rng-make])
 (import stats/dist :refer [rnorm])
+(import frame/column :refer [column-length column-float64-at])
 (import notebook/image :refer [image-hook-record-path])
+(load "stdlib/bits.tur")
 
 (def rng (rng-make 42 0))
 (def samples (rnorm rng 200 0.0 1.0))
 
+;; Column -> cons list of float bits, last element first.
+(defn col->float-list [c : int i : int acc : int] : int
+  (if (< i 0)
+    acc
+    (col->float-list c (- i 1) (cons (float->bits (column-float64-at c i)) acc))))
+
 (plot-write-png
   (vec-of (tick-grid)
           (axes)
-          (density samples 0.0 128
-                   (default-line-style) "density"))
+          (density (col->float-list samples (- (column-length samples) 1) 0)
+                   0.0 128 (default-line-style) "density"))
   (default-plot-opts)
   "/tmp/nb-plot-density.png")
 
-(image-hook-record-path "/tmp/nb-plot-density.png")
+(unsafe (image-hook-record-path "/tmp/nb-plot-density.png"))
 ```
 
 ---

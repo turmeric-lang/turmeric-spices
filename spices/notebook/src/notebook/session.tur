@@ -25,6 +25,61 @@
     return 0;
     ```)
 
+```c
+/* Module-level, so emitted into every unit that imports this module -- some
+ * of which (the notebook's own cell/format tests) never get the libturi
+ * include path the autolink hint adds.  The defn bodies that call into this
+ * block only reach units that do. */
+#if __has_include("turi/eval.h")
+#include "turi/eval.h"
+#include "turi/value.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* notebook/image's image-hook-record-path, for cells.  A cell that imports
+ * notebook/image has the interpreter evaluate that module's source, whose
+ * body here is inline C the interpreter does not run -- and the module is
+ * this process's own code, so there is no spice image to attach for it.  A
+ * native registered under the name stands in: the interpreter keeps a native
+ * over a defn whose body is inline C.  The marker is image-marker's. */
+static TuriValue nb_native_image_hook_record_path(TuriEnv *env, TuriValue *args,
+                                                  uint32_t n, void *ud) {
+  (void)env; (void)ud;
+  const char *p = (n > 0 && args[0].tag == TURI_CSTR && args[0].as_cstr)
+                ? args[0].as_cstr : "";
+  printf("__NB_IMG__: %s\n", p);
+  fflush(stdout);
+  return turi_int(0);
+}
+
+/* What session-open-for gives a fresh env, and session-reset its
+ * replacement: the stdlib a program gets, top-level imports, the search
+ * path a program at source_path would have, and the notebook's natives. */
+static void nb_session_configure(TuriEnv *env, const char *source_path) {
+#ifdef TURI_HAS_SEARCH_PATH_FOR
+#ifndef TUR_NB_STDLIB
+#define TUR_NB_STDLIB ""   /* the stdlib the building tur used; "" = $TUR_STDLIB_DIR */
+#endif
+  turi_env_preload_stdlib(env, TUR_NB_STDLIB);
+  turi_env_set_toplevel_imports(env, true);
+  if (source_path) turi_env_set_search_path_for(env, source_path);
+#else
+  if (source_path) {
+    char *dir = strdup(source_path);
+    char *slash = dir ? strrchr(dir, '/') : NULL;
+    if (slash) { *slash = '\0'; turi_env_set_module_base_dir(env, dir); }
+    free(dir);
+  }
+#endif
+  turi_env_register_native(env, "image-hook-record-path",
+                           nb_native_image_hook_record_path, NULL);
+  turi_env_register_native(env, "notebook/image/image-hook-record-path",
+                           nb_native_image_hook_record_path, NULL);
+}
+#endif
+```
+
   (defn output-status-ok [] : int 0)
   (defn output-status-error [] : int 1)
   (defn output-status-skipped [] : int 2)
@@ -284,23 +339,7 @@
     const char *p = path ? (const char *)(intptr_t)path : "";
     session->source_path = *p ? strdup(p) : NULL;
     session->env = turi_env_new();
-    /* The same configuration session-reset applies to its fresh env. */
-#ifdef TURI_HAS_SEARCH_PATH_FOR
-#ifndef TUR_NB_STDLIB
-#define TUR_NB_STDLIB ""   /* the stdlib the building tur used; "" = $TUR_STDLIB_DIR */
-#endif
-    turi_env_preload_stdlib(session->env, TUR_NB_STDLIB);
-    turi_env_set_toplevel_imports(session->env, true);
-    if (session->source_path)
-      turi_env_set_search_path_for(session->env, session->source_path);
-#else
-    if (session->source_path) {
-      char *dir = strdup(session->source_path);
-      char *slash = dir ? strrchr(dir, '/') : NULL;
-      if (slash) { *slash = '\0'; turi_env_set_module_base_dir(session->env, dir); }
-      free(dir);
-    }
-#endif
+    nb_session_configure(session->env, session->source_path);
     return (int64_t)(intptr_t)session;
     ```)
 
@@ -334,22 +373,7 @@
     if (!s) return;
     if (s->env) turi_env_free(s->env);
     s->env = turi_env_new();
-    /* The configuration session-open-for gave the env it replaces. */
-#ifdef TURI_HAS_SEARCH_PATH_FOR
-#ifndef TUR_NB_STDLIB
-#define TUR_NB_STDLIB ""   /* the stdlib the building tur used; "" = $TUR_STDLIB_DIR */
-#endif
-    turi_env_preload_stdlib(s->env, TUR_NB_STDLIB);
-    turi_env_set_toplevel_imports(s->env, true);
-    if (s->source_path) turi_env_set_search_path_for(s->env, s->source_path);
-#else
-    if (s->source_path) {
-      char *dir = strdup(s->source_path);
-      char *slash = dir ? strrchr(dir, '/') : NULL;
-      if (slash) { *slash = '\0'; turi_env_set_module_base_dir(s->env, dir); }
-      free(dir);
-    }
-#endif
+    nb_session_configure(s->env, s->source_path);
     ```)
 
   ;;; session-eval -- evaluate one cell source string in the current session.

@@ -70,16 +70,16 @@ coefficient estimates, standard errors, and R-squared.
 
 ## 4. Plot the data and the fit
 
-Plot the observed data as points and the fitted line as a function.
+Plot the observed data as points and the fitted line through two points.
 The two-call pattern (write PNG, then record path) makes the image
 visible in the TUI and in HTML export.
 
 ```turmeric
 (import frame/frame  :refer [frame-column])
-(import frame/column :refer [column-length column-float64-at])
+(import frame/column :refer [column-length column-int64-at column-float64-at])
 (import plot/core    :refer [plot-write-png])
 (import plot/point   :refer [points])
-(import plot/line    :refer [function])
+(import plot/line    :refer [lines])
 (import plot/decor   :refer [axes tick-grid])
 (import plot/style   :refer [default-line-style default-point-style default-plot-opts])
 (import notebook/image :refer [image-hook-record-path])
@@ -90,47 +90,38 @@ visible in the TUI and in HTML export.
 (def n (column-length x-col))
 
 ;; Build a list of (x, y) pairs for the scatter plot
-(defn xy [x :float y :float] : int
-  ```c
-  typedef struct { int64_t head; int64_t tail; } Cons;
-  Cons *p = malloc(sizeof(*p));
-  union { double d; int64_t i; } ux, uy; ux.d = x; uy.d = y;
-  p->head = ux.i; p->tail = uy.i;
-  return (int64_t)(intptr_t)p;
-  ```)
+(load "stdlib/bits.tur")
+(load "stdlib/math.tur")
 
-(defn lst [v : int n : int] : int
-  ```c
-  typedef struct { int64_t head; int64_t tail; } Cons;
-  Cons *c = malloc(sizeof(*c));
-  c->head = v; c->tail = n;
-  return (int64_t)(intptr_t)c;
-  ```)
+;; One (x, y) point: a cons cell of the two floats' bits.
+(defn xy [x :float y :float] : int (cons (float->bits x) (float->bits y)))
+(defn lst [v : int n : int] : int (cons v n))
 
 (defn build-pairs [i : int acc : int] : int
   (if (>= i n)
     acc
     (build-pairs (+ i 1)
-      (lst (xy (column-float64-at x-col i)
+      ;; x was read as int64 (the CSV writes 1, 2, ...), y as float64
+      (lst (xy (int->float (column-int64-at x-col i))
                (column-float64-at y-col i)) acc))))
 
 (def scatter-data (build-pairs 0 0))
 
-;; Fitted line: y = intercept + slope * x
-;; From the regression above, intercept ~ 0.05, slope ~ 2.00
+;; Fitted line: y = intercept + slope * x, intercept ~ 0.05, slope ~ 2.00.
+;; A straight line needs only its two end points.
 (defn fit-line [x :float] :float
   (+ 0.05 (* 2.00 x)))
+(def fit-data (lst (xy 0.0 (fit-line 0.0)) (lst (xy 10.0 (fit-line 10.0)) 0)))
 
 (plot-write-png
   (vec-of (tick-grid)
           (axes)
           (points scatter-data (default-point-style) "observed")
-          (function fit-line 0.0 10.0 128
-                    (default-line-style) "fitted"))
+          (lines fit-data (default-line-style) "fitted"))
   (default-plot-opts)
   "/tmp/nb-data-analysis.png")
 
-(image-hook-record-path "/tmp/nb-data-analysis.png")
+(unsafe (image-hook-record-path "/tmp/nb-data-analysis.png"))
 ```
 
 ---

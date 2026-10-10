@@ -21,6 +21,11 @@
 
 ### Fixed
 
+- x-axis tick labels showed y values. The label buffers were local to the
+  blocks that filled them; `x_labels` outlived its block and the y block
+  reused the storage, so every x tick but the last read a y label.
+- A discrete or stacked histogram's category labels were garbage: the tick
+  loop printed each bar's address as its label instead of the bar's head.
 - `__plot-sample-adaptive` is now pinned to the stable C symbol
   `plot_sample_adaptive` via `export-as`. turmeric's injective identifier
   mangler encodes the `__`-prefixed, kebab-cased name differently from the

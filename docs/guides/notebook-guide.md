@@ -133,18 +133,22 @@ rebuilt when a source changes -- and calls its exports there, the way
 spice takes a few seconds longer; set `TUR_BIN` if `tur` is not on `PATH`.
 What runs compiled:
 
-- `stats` (distributions, tests, summaries) and `frame` (CSV, filtering,
-  printing), whose APIs pass numbers, strings and handles.
+- `stats` (distributions, tests, summaries), `frame` (CSV, filtering,
+  group-by, printing) and `plot` (scatter, histograms, densities), whose
+  APIs pass numbers, strings, handles and cons lists.
 - Turmeric wrappers in those spices over private C helpers.
 
-What still cannot, and reports `inline-C not supported in interpreter mode`:
+What still cannot:
 
 - An export that takes or returns a struct by value -- most of `linalg`,
-  whose matrices are a `defstruct`. Pure-Turmeric code (`linalg/mat`'s
-  constructors and accessors, your own `defn`s) runs.
-- `plot`: its image does not link yet (the `plutovg` static library is not
-  built position-independent).
-- An inline-C `defn` written in a cell itself.
+  whose matrices are a `defstruct` -- reports `inline-C not supported in
+  interpreter mode`. Pure-Turmeric code (`linalg/mat`'s constructors and
+  accessors, your own `defn`s) runs.
+- A cell's `defn` passed as a C callback, such as plot's `function`
+  renderer: the interpreter's closure has no C address to hand over.
+- An inline-C `defn` written in a cell itself, beyond the interpreter's
+  few simple shapes. Build such values with `cons` and `float->bits`
+  (`(load "stdlib/bits.tur")`) instead -- the example notebooks do.
 
 Tracked as turmeric's
 `docs/reported/notebook-cells-cannot-call-inline-c-spices.md`.
