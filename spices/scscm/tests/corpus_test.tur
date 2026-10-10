@@ -1,0 +1,127 @@
+;; tests/corpus_test.tur -- compile-parity corpus (scscm-host-testing-plan T1).
+;;
+;; Every program in tests/corpus/SOURCES (copied from hypercollider, see
+;; tests/corpus/README.md) must compile, and its sclang must equal
+;; <name>.expected.scd byte for byte. Regenerate with tests/corpus/regen.sh;
+;; tests/corpus/check-sclang.sh checks that the expected files parse.
+
+(defmodule scscm/tests/corpus
+  (import scscm/compile :refer [compile-file])
+  (import scscm/lexer   :refer [lex-ok? lex-ok-val lex-err-val scscm-int-as-cstr])
+  (import test/assert   :refer [assert-true assert-false])
+  (import test/suite    :refer [describe it])
+  (import test/runner   :refer [run-all-status])
+
+  ;; The corpus directory: `tur test tests` runs from the spice root; also
+  ;; accept the repo root and tests/ itself.
+  (defn corpus-dir [] #fx{Unsafe} : cstr
+    ```c
+    static const char *dirs[] = { "tests/corpus", "spices/scscm/tests/corpus", "corpus", NULL };
+    for (int i = 0; dirs[i]; i++) {
+      char p[512];
+      snprintf(p, sizeof p, "%s/SOURCES", dirs[i]);
+      FILE *f = fopen(p, "r");
+      if (f) { fclose(f); return dirs[i]; }
+    }
+    return "";
+    ```)
+
+  ;; The program names in SOURCES, one per line, as a "\n"-joined string.
+  (defn corpus-names [dir : cstr] #fx{Unsafe} : cstr
+    ```c
+    char p[512];
+    snprintf(p, sizeof p, "%s/SOURCES", (const char*)dir);
+    FILE *f = fopen(p, "r");
+    if (!f) return "";
+    size_t cap = 4096, len = 0;
+    char *out = malloc(cap);
+    out[0] = '\0';
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+      if (line[0] == '#' || line[0] == '\n') continue;
+      size_t n = strcspn(line, " \t\n");
+      if (n == 0) continue;
+      if (len + n + 2 > cap) { cap *= 2; out = realloc(out, cap); }
+      memcpy(out + len, line, n); len += n;
+      out[len++] = '\n'; out[len] = '\0';
+    }
+    fclose(f);
+    return out;
+    ```)
+
+  ;; The n-th name (0-based) of a "\n"-joined list, or "".
+  (defn nth-name [names : cstr n : int] #fx{Unsafe} : cstr
+    ```c
+    const char *s = (const char*)names;
+    for (int64_t i = 0; i < n && *s; i++) {
+      s = strchr(s, '\n');
+      if (!s) return "";
+      s++;
+    }
+    size_t len = strcspn(s, "\n");
+    char *out = malloc(len + 1);
+    memcpy(out, s, len); out[len] = '\0';
+    return out;
+    ```)
+
+  (defn path-of [dir : cstr name : cstr ext : cstr] #fx{Unsafe} : cstr
+    ```c
+    size_t n = strlen((const char*)dir) + strlen((const char*)name) + strlen((const char*)ext) + 3;
+    char *out = malloc(n);
+    snprintf(out, n, "%s/%s%s", (const char*)dir, (const char*)name, (const char*)ext);
+    return out;
+    ```)
+
+  (defn read-file [path : cstr] #fx{Unsafe} : cstr
+    ```c
+    FILE *f = fopen((const char*)path, "rb");
+    if (!f) return "";
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    char *buf = malloc(sz + 1);
+    size_t got = fread(buf, 1, sz, f);
+    buf[got] = '\0';
+    fclose(f);
+    return buf;
+    ```)
+
+  ;; Equal, or print both texts so a failure shows what moved.
+  (defn same-or-report [name : cstr expected : cstr actual : cstr] #fx{Unsafe IO} : bool
+    ```c
+    if (strcmp((const char*)expected, (const char*)actual) == 0) return true;
+    fprintf(stderr, "--- %s.expected.scd\n%s--- tur-scscm\n%s---\n",
+            (const char*)name, (const char*)expected, (const char*)actual);
+    return false;
+    ```)
+
+  (defn check-one [dir : cstr name : cstr] #fx{Unsafe IO} : bool
+    (let [r (compile-file (path-of dir name ".scscm"))]
+      (if (lex-ok? r)
+        (same-or-report name (read-file (path-of dir name ".expected.scd"))
+                        (scscm-int-as-cstr (lex-ok-val r)))
+        (same-or-report name "(compiles)" (scscm-int-as-cstr (lex-err-val r))))))
+
+  (defn check-from [dir : cstr names : cstr i : int] #fx{Unsafe IO} : int
+    (let [name (nth-name names i)]
+      (if (= (scscm-cstr-len name) 0)
+        i
+        (do
+          (it name (assert-true (check-one dir name)))
+          (check-from dir names (+ i 1))))))
+
+  (defn scscm-cstr-len [s : cstr] #fx{Unsafe} : int
+    ```c return (int64_t)strlen((const char*)s); ```)
+
+  (defn __all-tests [] #fx{Unsafe IO} : void
+    (let [dir (corpus-dir)]
+      (describe "corpus (tests/corpus/SOURCES)"
+        (it "the corpus directory is found" (assert-false (= (scscm-cstr-len dir) 0)))
+        ;; 21 programs: a shrinking SOURCES is a failure, not a smaller pass.
+        (it "all 21 programs are checked"
+          (assert-true (>= (check-from dir (corpus-names dir) 0) 21))))))
+
+  (defn main [] #fx{Unsafe IO} : int
+    (do
+      (__all-tests)
+      (run-all-status))))

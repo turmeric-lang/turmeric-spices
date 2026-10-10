@@ -1,0 +1,5 @@
+var double = { |x| x * 2 };
+var x = 5;
+var y = x + 10;
+Post.put("x = ");
+Post.put(x);

@@ -33,7 +33,7 @@ turmeric's [Emscripten spice audit](https://github.com/turmeric-lang/turmeric/bl
 | [`tur-crdt`](spices/crdt/) | Conflict-free replicated data types: counters, sets, registers, maps and a replicated sequence, over a join-semilattice, with delta-state mutators | 1 | ✅ | ✅ | ✅ | ✅ | -- |
 | [`tur-tourist-ws`](spices/tourist-ws/) | WebSocket routes for the tur-tourist framework (ws-route!) | 1 | ✅ | ✅ | ❌ | ❌ | tur-tourist, tur-ws-server, tur-httpd, tur-json |
 | [`tur-linalg`](spices/linalg/) | Dense float linear algebra: matrices, vectors, Cholesky/LU/QR solvers, mat4 graphics helpers | 2 | ✅ | ✅ | ✅ | ✅ | -- |
-| [`tur-scscm`](spices/scscm/) | scscm s-expression -> sclang compiler + scsynth/hcsynth OSC client | 2 | ✅ | ✅ | ⚠️ | ⚠️ | tur-osc (optional, server module only) |
+| [`tur-scscm`](spices/scscm/) | scscm s-expression -> sclang compiler, tested against scsynth and hcsynth ([guide](docs/guides/scscm-guide.md)) | 2 | ✅ | ✅ | ⚠️ | ⚠️ | -- |
 | [`tur-tidal`](spices/tidal/) | Tidal-like mini-notation -> Pbind/event text | 2 | ✅ | ✅ | ✅ | ✅ | -- |
 | [`tur-stats`](spices/stats/) | Statistical analysis on dataframes (summary, distributions, hypothesis tests, OLS, resampling) | 2 | ✅ | ✅ | ✅ | ✅ | -- |
 | [`tur-ansi`](spices/ansi/) | ANSI terminal control, raw-mode key input, color, style, inline images (Kitty/iTerm2/sixel) | 2 | ✅ | ✅ | ⚠️ | ⚠️ | -- |
@@ -82,9 +82,9 @@ turmeric's [Emscripten spice audit](https://github.com/turmeric-lang/turmeric/bl
 - **`tur-ansi`** is portable except for `ansi/term`, which is `termios` +
   `sys/ioctl` + `sys/select` for raw mode, terminal size and resize signals.
   Windows needs a Console-API port of that one module; a browser has no tty.
-- **`tur-scscm`**'s s-expression -> sclang compiler is pure text
-  transformation and portable; only its OSC client module inherits the
-  `tur-osc` limits below.
+- **`tur-scscm`** is pure text transformation (scscm in, sclang out) and
+  portable. It has no OSC client; the sclang it emits runs under `sclang` or
+  hypercollider's `hclang`.
 - **`tur-opengl`** reaches the browser through Emscripten's GLFW port
   (`-sUSE_GLFW=3`) restricted to the GLES 3.0 / WebGL2 subset. Nothing in the
   manifest wires that up yet.

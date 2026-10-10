@@ -2,7 +2,9 @@
 ;;
 ;; Pipeline: source -> tokenize -> parse -> expand-all -> generate-all -> sclang
 ;;
-;; compile-text returns result<:cstr> (lex-ok = sclang text, lex-err = error message).
+;; compile-text returns the lexer's ok/err box: lex-ok holds the sclang text,
+;; lex-err an error message (both :cstr cast to :int; read with
+;; scscm-int-as-cstr).
 ;; compile-file reads the file and delegates to compile-text.
 
 (defmodule scscm/compile
@@ -11,7 +13,7 @@
                                 lex-ok lex-err lex-ok? lex-err? lex-ok-val
                                 scscm-cstr-as-int])
   (import scscm/parser :refer [parse ast-free-all])
-  (import scscm/expander :refer [expand-all])
+  (import scscm/expander :refer [expand-all scscm-macros-reset])
   (import scscm/codegen  :refer [generate-all])
 
 ;; ---- file I/O helper ----
@@ -26,10 +28,21 @@
   rewind(f);
   char *buf = malloc(sz + 1);
   if (!buf) { fclose(f); return 0; }
-  fread(buf, 1, sz, f);
-  buf[sz] = '\0';
+  size_t got = fread(buf, 1, sz, f);
+  buf[got] = '\0';
   fclose(f);
   return (int64_t)(intptr_t)buf;
+  ```)
+
+;; "cannot read <path>: <strerror>"
+(defn scscm-read-error [path : cstr] #fx{Unsafe} : cstr
+  ```c
+  const char *p = (const char*)(intptr_t)path;
+  const char *e = strerror(errno);
+  size_t n = strlen(p) + strlen(e) + 32;
+  char *out = malloc(n);
+  snprintf(out, n, "cannot read %s: %s", p, e);
+  return out;
   ```)
 
 ;; Cast :int (cstr pointer) to :cstr.
@@ -45,7 +58,8 @@
 ;;;
 ;;; Returns:
 ;;;   lex-ok(sclang-text :cstr) on success.
-;;;   lex-err(message-int :int) on lexer/parser error (cast :int to :cstr for message).
+;;;   lex-err(message :int) on a lexer or parser error; the message names
+;;;   the line and column (cast :int to :cstr with scscm-int-as-cstr).
 ;;;
 ;;; Example:
 ;;;   (let [r (compile-text "(+ 1 2)")]
@@ -62,8 +76,11 @@
         (if (lex-err? parse-res)
           parse-res
           (let [ast-list  (lex-ok-val parse-res)
+                _         (scscm-macros-reset)
                 expanded  (expand-all ast-list)
                 sclang    (generate-all expanded)]
+            ;; The macro table points into ast-list, freed next.
+            (scscm-macros-reset)
             (ast-free-all ast-list)
             (lex-ok (scscm-cstr-as-int sclang))))))))
 
@@ -74,7 +91,7 @@
 ;;;
 ;;; Returns:
 ;;;   lex-ok(sclang-text :cstr) on success.
-;;;   lex-err(message-int :int) on I/O or compile error.
+;;;   lex-err(message :int) on a read or compile error.
 ;;;
 ;;; Example:
 ;;;   (let [r (compile-file "my-synth.scscm")]
@@ -84,7 +101,7 @@
 (defn compile-file [path : cstr] #fx{Unsafe} : ptr<void>
   (let [buf (scscm-read-file path)]
     (if (= buf 0)
-      (lex-err 0)
+      (lex-err (scscm-cstr-as-int (scscm-read-error path)))
       (let [src (scscm-int-as-cstr buf)]
         (compile-text src)))))
 

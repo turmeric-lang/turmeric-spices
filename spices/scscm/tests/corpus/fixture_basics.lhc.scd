@@ -1,0 +1,15 @@
+42;
+3.14159;
+-10;
++5;
+"hello world";
+"escaped \" quote";
+true;
+false;
+nil;
+foo;
+bar;
+some_symbol;
+\freq;
+\amp;
+\some_keyword;
