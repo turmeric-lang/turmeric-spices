@@ -34,7 +34,7 @@ samples from a normal distribution and returns a frame column handle.
 (import stats/rng  :refer [rng-make])
 (import stats/dist :refer [rnorm])
 
-(def rng (rng-make 42))
+(def rng (rng-make 42 0))
 (def samples (rnorm rng 1000 0.0 1.0))
 ```
 
@@ -69,8 +69,8 @@ confidence level. It returns a test result you can print with `print-test`.
 (import stats/test :refer [t-test-2samp alt-two-sided])
 (import stats/fmt  :refer [print-test])
 
-(def rng1 (rng-make 1))
-(def rng2 (rng-make 2))
+(def rng1 (rng-make 1 0))
+(def rng2 (rng-make 2 0))
 (def group-a (rnorm rng1 50 10.0 2.0))
 (def group-b (rnorm rng2 50 12.0 2.0))
 

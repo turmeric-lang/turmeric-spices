@@ -1,7 +1,8 @@
 ;; tests/session_test.tur -- NB4 tests for notebook/session.
 
 (defmodule notebook/tests/session
-  (import notebook/session :refer [session-open session-close session-reset session-eval
+  (import notebook/session :refer [session-open session-open-for session-close session-reset
+                                   session-eval
                                    output-status-ok output-status-error
                                    cell-output-status cell-output-stdout
                                    cell-output-value-repr cell-output-error-msg
@@ -85,12 +86,37 @@
         (session-close s)
         ok)))
 
+  ;; One cell imports at the top level and a later cell calls what it
+  ;; referred -- the Jupyter model.  Every import used to fail: the session
+  ;; searched only the process cwd, and an import outside a defmodule was an
+  ;; error.  session-open-for searches the way `tur run` does for a file in
+  ;; this spice, so linalg (a :path dep in build.tur) resolves, and the
+  ;; search path outlives a session-reset.
+  (defn test-import-across-cells [] #fx{Unsafe} : bool
+    (let [s   (session-open-for "tests/session_test.tur")
+          imp (session-eval s "(import linalg/mat :refer [mat-identity mat-rows])" 0)
+          out (session-eval s "(mat-rows (mat-identity 3))" 0)
+          ok1 (and (= (cell-output-status imp) (output-status-ok))
+                   (and (= (cell-output-status out) (output-status-ok))
+                        (cstr-eq? (cell-output-value-repr out) "3")))]
+      (do
+        (cell-output-free imp)
+        (cell-output-free out)
+        (session-reset s)
+        (let [again (session-eval s "(import linalg/mat :as m) (m/mat-cols (m/mat-identity 2))" 0)
+              ok2   (and (= (cell-output-status again) (output-status-ok))
+                         (cstr-eq? (cell-output-value-repr again) "2"))]
+          (cell-output-free again)
+          (session-close s)
+          (and ok1 ok2)))))
+
   (defn main [] #fx{Unsafe} : int
     (let [f1 (run-case 1 "persists definitions across eval calls" (test-persistent-env))
           f2 (run-case 2 "resets the embedded session" (test-reset))
           f3 (run-case 3 "captures stdout and value repr" (test-stdout-capture))
-          f4 (run-case 4 "evaluates sweet-exp cells" (test-sweet-exp))]
-      (tap-plan 4 (+ f1 (+ f2 (+ f3 f4))))
-      (if (= (+ f1 (+ f2 (+ f3 f4))) 0) 0 1)))
+          f4 (run-case 4 "evaluates sweet-exp cells" (test-sweet-exp))
+          f5 (run-case 5 "imports in one cell, calls in the next" (test-import-across-cells))]
+      (tap-plan 5 (+ f1 (+ f2 (+ f3 (+ f4 f5)))))
+      (if (= (+ f1 (+ f2 (+ f3 (+ f4 f5)))) 0) 0 1)))
 
 ) ;; end defmodule notebook/tests/session

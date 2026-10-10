@@ -117,6 +117,20 @@ notebook's own `build.tur` as `:optional true` deps) so `tur fetch` makes
 them available. Without the declaration, the import fails with a clear
 error -- the spice is not installed.
 
+Imports resolve the way `tur run <notebook>` would for a program at the
+notebook's path: first the notebook's own directory (a `helpers.tur` next to
+it is `(import helpers ...)`), then the enclosing spice's `src/`, each
+`:spices` dep's `src/`, and the other members of the workspace -- whatever
+directory you render from. The session starts from the same stdlib
+`tur --interpret` gives a program.
+
+**Current limit:** cells run in the interpreter, which does not run inline-C
+bodies. A spice whose functions are written in C -- most of `plot`, `stats`,
+`frame` and `linalg`'s solvers and formatter -- imports fine, but the first
+call into such a function reports `inline-C not supported in interpreter
+mode`. Pure-Turmeric code (your own `defn`s, `linalg/mat`) runs. Tracked as
+turmeric's `docs/reported/notebook-cells-cannot-call-inline-c-spices.md`.
+
 Example -- load a CSV and print its shape:
 
 ```turmeric

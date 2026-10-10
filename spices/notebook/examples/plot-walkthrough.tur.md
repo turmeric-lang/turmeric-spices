@@ -145,7 +145,7 @@ density estimate. Here we generate 200 samples from N(0, 1) using
 (import stats/dist :refer [rnorm])
 (import notebook/image :refer [image-hook-record-path])
 
-(def rng (rng-make 42))
+(def rng (rng-make 42 0))
 (def samples (rnorm rng 200 0.0 1.0))
 
 (plot-write-png

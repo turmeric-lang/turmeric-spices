@@ -3,7 +3,7 @@
 (defmodule notebook/session
   (export notebook-session-autolink-hint
           output-status-ok output-status-error output-status-skipped
-          session-open session-close session-reset session-eval
+          session-open session-open-for session-close session-reset session-eval
           cell-output-make cell-output-free
           cell-output-cell-id cell-output-status cell-output-stdout
           cell-output-value-repr cell-output-error-msg
@@ -13,7 +13,7 @@
   ;;; notebook-session-autolink-hint -- inject libturi linker and header hints.
   (defn notebook-session-autolink-hint [] : int
     ```c
-    /* __tur_autolink__: -Lbuild/src -lturi -Isrc -Isrc/compiler -Isrc/runtime */
+    /* __tur_autolink__: -Lbuild/src -lturi -Isrc -Isrc/compiler -Isrc/runtime -DTUR_NB_STDLIB=@TUR_STDLIB_ROOT@ */
     /* __tur_include__: #include "turi/eval.h" */
     /* __tur_include__: #include "turi/env.h" */
     /* __tur_include__: #include "turi/value.h" */
@@ -245,11 +245,33 @@
     return out && out->type_tag ? out->type_tag : "";
     ```)
 
-  ;;; session-open -- create a fresh libturi-backed notebook session.
-  (defn session-open [] #fx{Unsafe} : int
+  ;;; session-open-for -- create a session whose imports resolve for a notebook.
+  ;;;
+  ;;; The session starts from the stdlib `tur repl` preloads (collections,
+  ;;; core macros, Show), cells may `(import ...)` at the top level the way a
+  ;;; REPL turn may, and the module search is the one `tur run <path>` would
+  ;;; use for a program at `path`: the notebook's own directory, then the
+  ;;; enclosing spice's src/, its `:spices` deps and its workspace siblings.
+  ;;; An empty `path` (a notebook rendered from a string) searches the cwd and
+  ;;; the stdlib only.  Against a libturi that predates
+  ;;; turi_env_set_search_path_for, none of that: only the notebook's
+  ;;; directory is searched, and only a defmodule may import.
+  ;;;
+  ;;; Parameters:
+  ;;;   path -- the .tur.md file the cells come from, or ""
+  ;;;
+  ;;; Returns:
+  ;;;   A session handle (0 on allocation failure); free with session-close.
+  ;;;
+  ;;; Example:
+  ;;;   (session-open-for "examples/plot-walkthrough.tur.md")
+  ;;;
+  ;;; Since: notebook-v0.3.1
+  (defn session-open-for [path : cstr] #fx{Unsafe} : int
     ```c
     typedef struct {
       TuriEnv *env;
+      char *source_path;
     } NotebookSession;
     static bool inited = false;
     if (!inited) {
@@ -257,19 +279,46 @@
       inited = true;
     }
     NotebookSession *session = malloc(sizeof(*session));
+    if (!session) return 0;
+    const char *p = path ? (const char *)(intptr_t)path : "";
+    session->source_path = *p ? strdup(p) : NULL;
     session->env = turi_env_new();
+    /* The same configuration session-reset applies to its fresh env. */
+#ifdef TURI_HAS_SEARCH_PATH_FOR
+#ifndef TUR_NB_STDLIB
+#define TUR_NB_STDLIB ""   /* the stdlib the building tur used; "" = $TUR_STDLIB_DIR */
+#endif
+    turi_env_preload_stdlib(session->env, TUR_NB_STDLIB);
+    turi_env_set_toplevel_imports(session->env, true);
+    if (session->source_path)
+      turi_env_set_search_path_for(session->env, session->source_path);
+#else
+    if (session->source_path) {
+      char *dir = strdup(session->source_path);
+      char *slash = dir ? strrchr(dir, '/') : NULL;
+      if (slash) { *slash = '\0'; turi_env_set_module_base_dir(session->env, dir); }
+      free(dir);
+    }
+#endif
     return (int64_t)(intptr_t)session;
     ```)
+
+  ;;; session-open -- create a fresh libturi-backed notebook session.
+  ;;; A session for no particular file: see session-open-for.
+  (defn session-open [] #fx{Unsafe} : int
+    (session-open-for ""))
 
   ;;; session-close -- free a notebook session and its embedded environment.
   (defn session-close [session : int] #fx{Unsafe} : void
     ```c
     typedef struct {
       TuriEnv *env;
+      char *source_path;
     } NotebookSession;
     NotebookSession *s = (NotebookSession *)(intptr_t)session;
     if (!s) return;
     if (s->env) turi_env_free(s->env);
+    free(s->source_path);
     free(s);
     ```)
 
@@ -278,11 +327,28 @@
     ```c
     typedef struct {
       TuriEnv *env;
+      char *source_path;
     } NotebookSession;
     NotebookSession *s = (NotebookSession *)(intptr_t)session;
     if (!s) return;
     if (s->env) turi_env_free(s->env);
     s->env = turi_env_new();
+    /* The configuration session-open-for gave the env it replaces. */
+#ifdef TURI_HAS_SEARCH_PATH_FOR
+#ifndef TUR_NB_STDLIB
+#define TUR_NB_STDLIB ""   /* the stdlib the building tur used; "" = $TUR_STDLIB_DIR */
+#endif
+    turi_env_preload_stdlib(s->env, TUR_NB_STDLIB);
+    turi_env_set_toplevel_imports(s->env, true);
+    if (s->source_path) turi_env_set_search_path_for(s->env, s->source_path);
+#else
+    if (s->source_path) {
+      char *dir = strdup(s->source_path);
+      char *slash = dir ? strrchr(dir, '/') : NULL;
+      if (slash) { *slash = '\0'; turi_env_set_module_base_dir(s->env, dir); }
+      free(dir);
+    }
+#endif
     ```)
 
   ;;; session-eval -- evaluate one cell source string in the current session.
@@ -290,6 +356,7 @@
     ```c
     typedef struct {
       TuriEnv *env;
+      char *source_path;
     } NotebookSession;
     typedef struct {
       char *cell_id;
