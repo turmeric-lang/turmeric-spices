@@ -279,6 +279,63 @@ Some protocols have no fd in a direction: PUB and PUSH have no receive fd,
 and SUB and PULL have no send fd. Asking for one is an `err` carrying
 `NNG_ENOTSUP`. Poll fds and nng contexts must not be mixed on one socket.
 
+## Async: `nng/aio`
+
+`nng/aio` is completion-based: submit an operation now and collect it
+later. An `Aio` is one operation slot, `:linear` and consumed by `aio-free`.
+Submit on it with `send-payload-aio`, `send-str-aio` or `recv-aio`. Each
+returns at once, `(ok nil)` when the operation was submitted. Then collect
+the outcome:
+
+| Collector | Behaviour |
+| --- | --- |
+| `aio-wait` | blocks this thread, returns `(Result nil int)` |
+| `aio-try-result` | never blocks: `(none)` while in flight, else `(some outcome)` |
+| `aio-poll-fd` | a `PollFd` that is readable once it finishes; register it with `reactor-add-fd` or park a fiber on it with `local-park-fd` |
+
+After a receive, `aio-take-payload` / `aio-take-str` hand back the message.
+N slots in flight on one thread are the fan-out.
+
+```turmeric
+(let [a (ok-val (aio-alloc))
+      r (recv-aio pull a)
+      w (aio-wait a)]
+  (when (ok? w)
+    (let [t (aio-take-str a)]
+      (when (ok? t) (println (ok-val t)))))
+  (aio-free a))
+```
+
+```sweet-exp
+let [a ok-val(aio-alloc())
+     r recv-aio(pull a)
+     w aio-wait(a)]
+  when ok?(w)
+    let [t aio-take-str(a)]
+      when ok?(t) println(ok-val(t))
+  aio-free(a)
+```
+
+What the slot guarantees, which nng's own `nng_aio` does not:
+
+- **No nng message reaches your code or leaks.** A send copies the payload
+  in, so the caller still owns the `Payload`. A failed send's message is
+  freed for you. An untaken receive is freed by the next submit or by
+  `aio-free`.
+- **One operation at a time.** A submit while one is in flight is
+  `(err NNG_EBUSY)` and nothing is submitted. nng itself asserts here.
+- **Free is safe in flight.** `aio-free` cancels and waits first.
+- **The completion fd is readable until you collect.** Any collector that
+  sees the result clears it, and so does the next submit. A reactor callback
+  that collects therefore neither spins nor stalls. Remove the reactor source
+  before `aio-free` closes the fd.
+
+nng's completion callback runs on one of its worker threads. The spice's C
+callback handles the message and the fd there and never calls a Turmeric
+closure, because closures must not run off their own thread. By default an
+operation takes the socket's timeout as it stands when the operation is
+submitted; `aio-set-timeout` overrides that for the slot.
+
 ## Linear `Socket`
 
 `Socket` is a `:linear` opaque. A socket extracted with `ok-val` must be
@@ -291,6 +348,8 @@ makes three mistakes compile-time errors rather than runtime faults:
 | closing the same socket twice | `TUR-E0101` linear value used after being consumed |
 | operating on a closed socket | `TUR-E0101` linear value used after being consumed |
 | opening a socket and never closing it | `TUR-E0100` linear value dropped without being consumed |
+
+`Aio` (nng/aio) follows the same discipline with `aio-free` as its consumer.
 
 The discipline is inert in ordinary builds, so call sites compile unchanged.
 `errors/` holds one rejected fixture per row, and `errors/run.sh` asserts each
@@ -315,10 +374,9 @@ prevent.
 
 Deliberate omissions, each with a known seam:
 
-- **`nng_aio` async and `nng_ctx` contexts.** These are planned as NG-B and
-  NG-C of turmeric's `docs/upcoming/spices/nng-async-plan.md`. Until then, a
-  concurrent server uses blocking calls on OS threads, as above. Event loops
-  have poll fds and `try-*` (see above).
+- **`nng_ctx` contexts.** These are planned as NG-C of turmeric's
+  `docs/upcoming/spices/nng-async-plan.md`. Until then, a REQ socket has one
+  request in flight at a time, and a REP socket serves one request at a time.
 - **TLS, WebSocket, and ZeroTier transports.** `NNG_ENABLE_TLS=OFF` keeps
   mbedTLS out of the build entirely.
 - **Per-protocol socket types.** Ten opaques would turn "receive on a PUB
@@ -335,8 +393,8 @@ Deliberate omissions, each with a known seam:
 
 ```sh
 tur fetch --update      # clone + build nng (once)
-tur test tests/nng      # 61 assertions in 6 suites, all over inproc:// -- no network
-errors/run.sh           # the three compile-fail linear fixtures
+tur test tests/nng      # 72 assertions in 7 suites, all over inproc:// -- no network
+errors/run.sh           # the six compile-fail linear fixtures (Socket, Aio)
 ```
 
 ## See also

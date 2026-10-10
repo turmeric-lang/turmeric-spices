@@ -1,7 +1,7 @@
 ---
 title: Scalability Protocols with nng
 category: Networking
-description: Request/reply, pub/sub, pipeline, pair, bus, and survey messaging over inproc, ipc, and tcp -- blocking calls over a linear socket handle, plus poll fds for event loops
+description: Request/reply, pub/sub, pipeline, pair, bus, and survey messaging over inproc, ipc, and tcp -- blocking calls over a linear socket handle, poll fds for event loops, and completion-based async (nng/aio)
 audience: developers building distributed or inter-process messaging in Turmeric
 since: nng v0.1.0
 ---
@@ -14,7 +14,7 @@ one worker, a subscriber sees every message whose topic it matches. nng
 (nanomsg-next-generation) implements those patterns; this spice wraps them
 in a thin surface of blocking calls over one linear `Socket` handle.
 
-This guide walks the seven things you will do most often:
+This guide walks the eight things you will do most often:
 
 1. [Request/reply: the RPC round trip](#1-requestreply)
 2. [Pipeline: a load-balanced job queue](#2-pipeline)
@@ -23,6 +23,7 @@ This guide walks the seven things you will do most often:
 5. [Timeouts: not hanging forever](#5-timeouts)
 6. [Concurrency: blocking calls on threads](#6-concurrency)
 7. [Event loops: poll fds and try-*](#7-event-loops)
+8. [Async: submit now, collect later](#8-async-nngaio)
 
 Each section is a self-contained snippet you can drop into a `defmodule`.
 
@@ -375,8 +376,8 @@ set-recv-timeout-ms(s 100)
 let [r recv-str(s)]
   if ok?(r)
     handle $ ok-val r
-    if timed-out?(err-val r)
-      nothing-yet                      ;; not a failure -- just nothing to read
+    if timed-out?(err-val(r))
+      nothing-yet()                    ;; not a failure -- just nothing to read
       println $ err-str $ err-val r
 ```
 
@@ -398,7 +399,7 @@ ordinary receive loop. Use `stdlib/thread.tur`:
 
 That is the v0 concurrency answer, and it is the same one `tur-valkey`
 gives. To multiplex many sockets on one thread instead, use an event loop
-(next section). `nng_aio` async is planned, not built.
+(next section), or completion-based async (section 8).
 
 ---
 
@@ -459,6 +460,81 @@ also uses nng contexts.
 
 ---
 
+## 8. Async (`nng/aio`)
+
+Section 7 asks "is the socket ready?" and then moves a message itself.
+`nng/aio` asks nng to move it and says when it is done: submit an operation
+now and collect the outcome later. One `Aio` is one operation slot, and N
+slots in flight on one thread are the fan-out.
+
+```turmeric no-check
+(import nng/aio :refer [Aio aio-alloc aio-free recv-aio send-str-aio
+                        aio-wait aio-try-result aio-take-str aio-poll-fd])
+
+(let [a (ok-val (aio-alloc))
+      r (recv-aio pull a)          ;; returns at once: (ok nil) = submitted
+      w (aio-wait a)]              ;; blocks this thread until it finishes
+  (when (ok? w)
+    (let [t (aio-take-str a)]      ;; the received text, now yours
+      (when (ok? t) (println (ok-val t)))))
+  (aio-free a))
+```
+
+`Aio` is `:linear`: it must reach `aio-free` exactly once, and every other
+call borrows it. Submit with `send-payload-aio`, `send-str-aio` or
+`recv-aio`; then collect in whichever way suits the caller:
+
+| Collector | Behaviour |
+| --- | --- |
+| `aio-wait` | blocks this thread, returns `(Result nil int)` |
+| `aio-try-result` | never blocks: `(none)` while in flight, else `(some outcome)` |
+| `aio-poll-fd` | a `PollFd` readable once it finishes |
+
+The poll fd plugs into both event-loop shapes from section 7. With a reactor,
+the callback collects:
+
+```turmeric no-check
+(let [a  (ok-val (aio-alloc))
+      rs (recv-aio pull a)
+      fd (ok-val (aio-poll-fd a))
+      r  (reactor-new)]
+  (reactor-add-fd r (poll-fd->int fd) READ
+    (fn [id events user] : nil
+      (let [t (aio-take-str a)]            ;; collecting clears the fd
+        (when (ok? t) (println (ok-val t)))
+        (reactor-stop r)))
+    (:: 0 :ptr<void>))
+  (reactor-run r)
+  (reactor-free r)                         ;; the source goes before the fd
+  (aio-free a))
+```
+
+In direct style, a `LocalFiberGroup` fiber parks on it:
+`(local-park-fd g (poll-fd->int fd) READ timeout-ms)`, then takes the message
+when it resumes.
+
+What the slot does for you, on top of nng's own `nng_aio`:
+
+- **No `nng_msg` reaches your code or leaks.** A send copies the payload in,
+  so you still own the `Payload`. A failed send's message is freed for you,
+  and so is an untaken receive, by the next submit or by `aio-free`.
+- **One operation at a time.** A submit while one is in flight is
+  `(err NNG_EBUSY)` and nothing is submitted. nng itself asserts here.
+- **`aio-free` is safe in flight.** It cancels and waits first.
+- **The fd stays readable until you collect.** Any collector that sees the
+  result clears it, and so does the next submit, so a reactor callback that
+  collects neither spins (epoll) nor stalls (kqueue).
+- **Timeouts follow the socket.** By default each operation takes the
+  socket's `set-recv-timeout-ms` / `set-send-timeout-ms` as they stand when
+  it is submitted. `aio-set-timeout` overrides that for the slot.
+
+`aio-cancel` asks an operation to stop; it then completes with
+`NNG_ECANCELED`. An `Aio` belongs to one thread at a time. nng's completion
+callback runs on one of nng's own threads, and the spice's C callback never
+calls a Turmeric closure from there.
+
+---
+
 ## Operations with no result value
 
 `dial`, `listen`, `sub-subscribe`, and the timeout setters return
@@ -470,9 +546,9 @@ read out, and the type says so.
 
 ## When not to use this
 
-- **You need completion-based async (`nng_aio`) or concurrent contexts
-  (`nng_ctx`).** Both are planned, not built. For non-blocking I/O on an
-  event loop, see section 7.
+- **You need concurrent contexts (`nng_ctx`)** -- several requests in
+  flight on one REQ socket, or one REP socket serving several at once. They
+  are planned, not built. Section 8's `Aio` slots work on the socket itself.
 - **You need TLS, WebSocket, or ZeroTier transports.** TLS is off in the
   build (`NNG_ENABLE_TLS=OFF`); the other transports are not compiled in.
 - **You want per-protocol socket types.** Ten opaques would turn "receive on
@@ -486,8 +562,8 @@ read out, and the type says so.
 
 ```sh
 tur fetch --update      # clone + build nng (once)
-tur test tests/nng      # 61 assertions in 6 suites, all over inproc:// -- no network
-errors/run.sh           # the three compile-fail linear fixtures
+tur test tests/nng      # 72 assertions in 7 suites, all over inproc:// -- no network
+errors/run.sh           # the six compile-fail linear fixtures (Socket, Aio)
 ```
 
 ---

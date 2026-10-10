@@ -1,0 +1,334 @@
+;; NG-B: nng/aio -- submit now, collect later.
+;;
+;; Everything runs over `inproc://`, one name per case. Every Result is bound
+;; and inspected rather than dropped in statement position: a dropped Result
+;; leaks its box today (turmeric's carrier-sum-option-boxes-have-no-owner), and
+;; spices CI runs the suite under a sanitized tur whose LeakSanitizer fails it.
+;; The reactor and fiber cases arm a guard so a regression fails rather than
+;; hangs.
+
+(defmodule nng/tests/aio (export)
+
+(import nng/socket  :refer [Socket pair-open push-open pull-open sub-open
+                            dial listen close poll-fd->int set-recv-timeout-ms])
+(import nng/msg     :refer [send-str])
+(import nng/payload :refer [Payload payload-of-cstr payload->cstr payload-free])
+(import nng/aio     :refer [Aio aio-alloc aio-free aio-set-timeout aio-cancel
+                            send-payload-aio send-str-aio recv-aio
+                            aio-wait aio-try-result aio-take-payload aio-take-str
+                            aio-poll-fd])
+(import reactor)
+(import test/suite  :refer [describe it])
+(import test/assert :refer [assert-true])
+(import test/runner :refer [run-all-status])
+
+;; nng error codes the cases expect.
+(def etimedout 5)
+(def ebusy 4)
+(def enotsup 9)
+(def estate 11)
+(def ecanceled 20)
+
+(def guard-ms 2000)
+
+(defn cstr-eq? [a : cstr b : cstr] : bool
+  ```c
+  #include <string.h>
+  return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+
+(defn cstr-free [p : cstr] : nil
+  ```c
+  free((void *)(intptr_t)p);
+  ```)
+
+(defn sleep-ms [ms : int] : nil
+  ```c
+  #include <time.h>
+  struct timespec ts;
+  ts.tv_sec  = ms / 1000;
+  ts.tv_nsec = (ms % 1000) * 1000000L;
+  nanosleep(&ts, NULL);
+  ```)
+
+(defn no-user-data [] : ptr<void> (:: 0 :ptr<void>))
+
+;; code -- 0 for ok, the nng code for err.
+(defn code [r : (Result nil int)] : int
+  (if (ok? r) 0 (err-val r)))
+
+;; take-is? -- take the received text and compare it, freeing it either way.
+(defn take-is? [^borrow a : Aio expect : cstr] : bool
+  (let [r (aio-take-str a)]
+    (if (ok? r)
+      (let [got (ok-val r)
+            eq  (cstr-eq? got expect)]
+        (cstr-free got)
+        eq)
+      false)))
+
+;; take-code -- the err code of a take, or 0 if it succeeded (freeing it).
+(defn take-code [^borrow a : Aio] : int
+  (let [r (aio-take-payload a)]
+    (if (ok? r)
+      (do (payload-free (ok-val r)) 0)
+      (err-val r))))
+
+(defn in-flight? [^borrow a : Aio] : bool
+  (none? (aio-try-result a)))
+
+(defn finished-with? [^borrow a : Aio expect : int] : bool
+  (match (aio-try-result a)
+    (Some r) (= (code r) expect)
+    (None)   false))
+
+;; ---- round trips ----
+
+(defn round-trip? [] : bool
+  (let [x  (ok-val (pair-open))
+        y  (ok-val (pair-open))
+        _  (listen x "inproc://ngb-rt")
+        _  (dial y "inproc://ngb-rt")
+        ra (ok-val (aio-alloc))
+        sa (ok-val (aio-alloc))
+        b  (payload-of-cstr "hello")
+        r1 (recv-aio x ra)
+        r2 (send-payload-aio y sa b)
+        w2 (aio-wait sa)
+        w1 (aio-wait ra)
+        r  (aio-take-payload ra)
+        ok (if (ok? r)
+             (let [txt (payload->cstr (ok-val r))
+                   eq  (cstr-eq? txt "hello")]
+               (cstr-free txt)
+               (payload-free (ok-val r))
+               eq)
+             false)
+        again (take-code ra)]
+    (payload-free b)
+    (aio-free ra)
+    (aio-free sa)
+    (close y)
+    (close x)
+    (and (ok? r1) (ok? r2) (ok? w1) (ok? w2) ok (= again estate))))
+
+(defn str-round-trip? [] : bool
+  (let [x  (ok-val (pair-open))
+        y  (ok-val (pair-open))
+        _  (listen x "inproc://ngb-str")
+        _  (dial y "inproc://ngb-str")
+        ra (ok-val (aio-alloc))
+        sa (ok-val (aio-alloc))
+        r1 (recv-aio x ra)
+        r2 (send-str-aio y sa "text")
+        w2 (aio-wait sa)
+        w1 (aio-wait ra)
+        ok (take-is? ra "text")]
+    (aio-free ra)
+    (aio-free sa)
+    (close y)
+    (close x)
+    (and (ok? r1) (ok? r2) (ok? w1) (ok? w2) ok)))
+
+;; ---- outcomes ----
+
+(defn try-result-and-timeout? [] : bool
+  (let [p  (ok-val (pull-open))
+        _  (listen p "inproc://ngb-quiet")
+        a  (ok-val (aio-alloc))
+        _  (do (aio-set-timeout a 50) 0)
+        r1 (recv-aio p a)
+        fl (in-flight? a)
+        w  (aio-wait a)
+        fin (finished-with? a etimedout)]
+    (aio-free a)
+    (close p)
+    (and (ok? r1) fl (= (code w) etimedout) fin)))
+
+(defn busy-and-cancel? [] : bool
+  (let [p  (ok-val (pull-open))
+        _  (listen p "inproc://ngb-busy")
+        a  (ok-val (aio-alloc))
+        r1 (recv-aio p a)
+        r2 (recv-aio p a)
+        _  (do (aio-cancel a) 0)
+        w  (aio-wait a)]
+    (aio-free a)
+    (close p)
+    (and (ok? r1) (= (code r2) ebusy) (= (code w) ecanceled))))
+
+;; SUB cannot send: the send completes with NNG_ENOTSUP, and the message nng
+;; handed back is freed by the spice (a leak would fail the sanitized run).
+(defn failed-send? [] : bool
+  (let [s (ok-val (sub-open))
+        a (ok-val (aio-alloc))
+        b (payload-of-cstr "x")
+        r (send-payload-aio s a b)
+        w (aio-wait a)]
+    (payload-free b)
+    (aio-free a)
+    (close s)
+    (and (ok? r) (= (code w) enotsup))))
+
+;; Free with a receive still in flight: cancelled and waited for, not a hang.
+(defn free-in-flight? [] : bool
+  (let [p (ok-val (pull-open))
+        _ (listen p "inproc://ngb-inflight")
+        a (ok-val (aio-alloc))
+        r (recv-aio p a)]
+    (aio-free a)
+    (close p)
+    (ok? r)))
+
+;; An untaken message is the spice's to free: by aio-free, and by the next
+;; submit on the slot. Under a sanitized tur, a leak in either fails the run.
+(defn untaken-freed-by-free? [] : bool
+  (let [x  (ok-val (pair-open))
+        y  (ok-val (pair-open))
+        _  (listen x "inproc://ngb-untaken-free")
+        _  (dial y "inproc://ngb-untaken-free")
+        a  (ok-val (aio-alloc))
+        r  (recv-aio x a)
+        s  (send-str y "never taken")
+        w  (aio-wait a)]
+    (aio-free a)
+    (close y)
+    (close x)
+    (and (ok? r) (ok? s) (ok? w))))
+
+(defn untaken-freed-by-resubmit? [] : bool
+  (let [x  (ok-val (pair-open))
+        y  (ok-val (pair-open))
+        _  (listen x "inproc://ngb-untaken-resubmit")
+        _  (dial y "inproc://ngb-untaken-resubmit")
+        a  (ok-val (aio-alloc))
+        r1 (recv-aio x a)
+        s1 (send-str y "dropped")
+        w1 (aio-wait a)
+        r2 (recv-aio x a)
+        s2 (send-str y "kept")
+        w2 (aio-wait a)
+        ok (take-is? a "kept")]
+    (aio-free a)
+    (close y)
+    (close x)
+    (and (ok? r1) (ok? s1) (ok? w1) (ok? r2) (ok? s2) (ok? w2) ok)))
+
+;; The default timeout is the socket's as it stands at each submit, not as it
+;; stood at the slot's first one. The first receive goes out while the socket
+;; waits forever; the second, after a 50 ms socket timeout, must time out. It
+;; is polled rather than waited for, so a regression fails instead of hanging.
+(defn default-timeout-follows-socket? [] : bool
+  (let [p  (ok-val (pull-open))
+        _  (listen p "inproc://ngb-inherit")
+        a  (ok-val (aio-alloc))
+        r1 (recv-aio p a)
+        _  (do (aio-cancel a) 0)
+        w1 (aio-wait a)
+        st (set-recv-timeout-ms p 50)
+        r2 (recv-aio p a)
+        _  (do (sleep-ms 400) 0)
+        fin (finished-with? a etimedout)]
+    (aio-free a)
+    (close p)
+    (and (ok? r1) (= (code w1) ecanceled) (ok? st) (ok? r2) fin)))
+
+;; ---- completion fd ----
+
+(def ^mut fired 0)
+
+;; The completion fd drives a reactor callback; collecting it inside the
+;; callback clears it, so a following 0 ms poll dispatches nothing.
+(defn reactor-completion? [] : bool
+  (let [push (ok-val (push-open))
+        pull (ok-val (pull-open))
+        _    (listen pull "inproc://ngb-reactor")
+        _    (dial push "inproc://ngb-reactor")
+        a    (ok-val (aio-alloc))
+        rs   (recv-aio pull a)
+        fd   (ok-val (aio-poll-fd a))
+        r    (reactor-new)]
+    (set! fired 0)
+    (reactor-add-fd r (poll-fd->int fd) READ
+      (fn [id events user] : nil
+        (do (set! fired (+ fired 1))
+            (when (take-is? a "job") (reactor-stop r))))
+      (no-user-data))
+    (reactor-add-timer r guard-ms
+      (fn [id user] : nil (reactor-stop r))
+      (no-user-data))
+    (let [sent  (send-str push "job")
+          _     (do (reactor-run r) 0)
+          again (reactor-poll r 0)]
+      (reactor-free r)
+      (aio-free a)
+      (close push)
+      (close pull)
+      (and (ok? rs) (ok? sent) (= fired 1) (= again 0)))))
+
+(def ^mut parked-ok 0)
+
+;; Direct style: a LocalFiberGroup fiber parks on the completion fd.
+(defn fiber-park? [] : bool
+  (let [push (ok-val (push-open))
+        pull (ok-val (pull-open))
+        _    (listen pull "inproc://ngb-fiber")
+        _    (dial push "inproc://ngb-fiber")
+        a    (ok-val (aio-alloc))
+        r    (reactor-new)
+        g    (local-fiber-group-new r)]
+    (set! parked-ok 0)
+    (local-spawn g
+      (fn [u] : nil
+        (let [rs (recv-aio pull a)
+              ev (local-park-fd g (poll-fd->int (ok-val (aio-poll-fd a))) READ guard-ms)]
+          (when (and (ok? rs) (= ev READ) (take-is? a "direct"))
+            (set! parked-ok 1))))
+      (no-user-data))
+    (local-spawn g
+      (fn [u] : nil
+        (let [s (send-str push "direct")]
+          (when (err? s) (set! parked-ok -1))))
+      (no-user-data))
+    (reactor-run-fibers g)
+    (local-fiber-group-free g)
+    (reactor-free r)
+    (aio-free a)
+    (close push)
+    (close pull)
+    (= parked-ok 1)))
+
+(defn __all-tests [] : void
+  (describe "nng/aio -- round trips"
+    (it "a payload round-trips, and a second take is NNG_ESTATE"
+      (assert-true (round-trip?)))
+    (it "a string round-trips through send-str-aio / aio-take-str"
+      (assert-true (str-round-trip?))))
+
+  (describe "nng/aio -- outcomes"
+    (it "aio-try-result is (none) in flight; a timeout ends NNG_ETIMEDOUT"
+      (assert-true (try-result-and-timeout?)))
+    (it "a resubmit in flight is NNG_EBUSY; cancel ends NNG_ECANCELED"
+      (assert-true (busy-and-cancel?)))
+    (it "the default timeout follows the socket's, submit by submit"
+      (assert-true (default-timeout-follows-socket?)))
+    (it "a send on SUB completes with NNG_ENOTSUP"
+      (assert-true (failed-send?)))
+    (it "aio-free with a receive in flight returns"
+      (assert-true (free-in-flight?)))
+    (it "an untaken message is freed by aio-free"
+      (assert-true (untaken-freed-by-free?)))
+    (it "an untaken message is freed by the next submit"
+      (assert-true (untaken-freed-by-resubmit?))))
+
+  (describe "nng/aio -- completion fd"
+    (it "drives a reactor callback once, and collecting clears it"
+      (assert-true (reactor-completion?)))
+    (it "parks and resumes a LocalFiberGroup fiber"
+      (assert-true (fiber-park?)))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule nng/tests/aio

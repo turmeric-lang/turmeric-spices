@@ -83,6 +83,15 @@ expect_reject nng-use-after-close.tur TUR-E0101 \
 expect_reject nng-leak-no-close.tur TUR-E0100 \
   'linear value '\''s'\'' dropped without being consumed' \
   'a socket that is never closed is a leak'
+expect_reject nng-aio-double-free.tur TUR-E0101 \
+  'linear value '\''a'\'' used after being consumed' \
+  'freeing an Aio twice is a use-after-consume'
+expect_reject nng-aio-use-after-free.tur TUR-E0101 \
+  'linear value '\''a'\'' used after being consumed' \
+  'submitting on a freed Aio is a use-after-consume'
+expect_reject nng-aio-leak-no-free.tur TUR-E0100 \
+  'linear value '\''a'\'' dropped without being consumed' \
+  'an Aio that is never freed is a leak'
 
 echo "1..$n"
 if [ "$fail" -ne 0 ]; then
