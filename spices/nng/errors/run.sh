@@ -92,6 +92,15 @@ expect_reject nng-aio-use-after-free.tur TUR-E0101 \
 expect_reject nng-aio-leak-no-free.tur TUR-E0100 \
   'linear value '\''a'\'' dropped without being consumed' \
   'an Aio that is never freed is a leak'
+expect_reject nng-ctx-double-close.tur TUR-E0101 \
+  'linear value '\''c'\'' used after being consumed' \
+  'closing a context twice is a use-after-consume'
+expect_reject nng-ctx-use-after-close.tur TUR-E0101 \
+  'linear value '\''c'\'' used after being consumed' \
+  'receiving on a closed context is a use-after-consume'
+expect_reject nng-ctx-leak-no-close.tur TUR-E0100 \
+  'linear value '\''c'\'' dropped without being consumed' \
+  'a context that is never closed is a leak'
 
 echo "1..$n"
 if [ "$fail" -ne 0 ]; then

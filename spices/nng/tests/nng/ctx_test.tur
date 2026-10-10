@@ -1,0 +1,423 @@
+;; NG-C: nng/ctx -- independent protocol state on one shared socket.
+;;
+;; Everything runs over `inproc://`, one name per case. Every Result is bound
+;; and inspected rather than dropped in statement position (see aio_test.tur
+;; for why). Each context that could wait gets a receive timeout, so a
+;; regression fails the case instead of hanging the suite.
+;;
+;; The threaded server moves each context into its worker thread through the
+;; thread's ptr<void> argument: the main thread opens it, the worker serves on
+;; it and closes it. That is an ownership hand-off, so ctx->thread-arg
+;; consumes the context and thread-arg->ctx gives the worker a fresh linear
+;; one -- the substructural check sees one open and one close on each side.
+;;
+;; stdlib/thread.tur is not auto-loaded, and a load goes outside the module.
+
+(load "stdlib/thread.tur")
+
+(defmodule nng/tests/ctx (export)
+
+(import nng/socket  :refer [Socket req-open rep-open pub-open push-open sub-open
+                            dial listen close set-recv-timeout-ms])
+(import nng/msg     :refer [send-str])
+(import nng/payload :refer [Payload payload-of-cstr payload->cstr payload-free])
+(import nng/aio     :refer [Aio aio-alloc aio-free recv-aio
+                            aio-wait aio-take-str])
+(import nng/ctx     :refer [NngCtx ctx-open ctx-close
+                            ctx-send-payload ctx-recv-payload ctx-send-str ctx-recv-str
+                            ctx-send-str-aio ctx-recv-aio
+                            ctx-set-recv-timeout-ms ctx-set-send-timeout-ms
+                            ctx-subscribe ctx-unsubscribe])
+(import test/suite  :refer [describe it])
+(import test/assert :refer [assert-true])
+(import test/runner :refer [run-all-status])
+
+;; nng error codes the cases expect.
+(def etimedout 5)
+(def eclosed 7)
+(def enotsup 9)
+(def estate 11)
+
+(def guard-ms 2000)
+
+(defn cstr-eq? [a : cstr b : cstr] : bool
+  ```c
+  #include <string.h>
+  return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+
+(defn cstr-free [p : cstr] : nil
+  ```c
+  free((void *)(intptr_t)p);
+  ```)
+
+;; reply-to -- "re:" followed by the request, malloc'd; the caller frees it.
+(defn reply-to [req : cstr] : cstr
+  ```c
+  #include <stdio.h>
+  const char *q = (const char *)req;
+  size_t n = strlen(q) + 4;
+  char *out = (char *)malloc(n);
+  if (out != NULL) snprintf(out, n, "re:%s", q);
+  return out;
+  ```)
+
+(defn sleep-ms [ms : int] : nil
+  ```c
+  #include <time.h>
+  struct timespec ts;
+  ts.tv_sec  = ms / 1000;
+  ts.tv_nsec = (ms % 1000) * 1000000L;
+  nanosleep(&ts, NULL);
+  ```)
+
+(defn code [r : (Result nil int)] : int
+  (if (ok? r) 0 (err-val r)))
+
+;; recv-is? -- a blocking context receive that compares, freeing either way.
+(defn recv-is? [^borrow c : NngCtx expect : cstr] : bool
+  (let [r (ctx-recv-str c)]
+    (if (ok? r)
+      (let [got (ok-val r)
+            eq  (cstr-eq? got expect)]
+        (cstr-free got)
+        eq)
+      false)))
+
+(defn recv-err-is? [^borrow c : NngCtx expect : int] : bool
+  (let [r (ctx-recv-str c)]
+    (if (ok? r)
+      (do (cstr-free (ok-val r)) false)
+      (= (err-val r) expect))))
+
+;; take-is? -- take an Aio's received text and compare it, freeing it.
+(defn take-is? [^borrow a : Aio expect : cstr] : bool
+  (let [r (aio-take-str a)]
+    (if (ok? r)
+      (let [got (ok-val r)
+            eq  (cstr-eq? got expect)]
+        (cstr-free got)
+        eq)
+      false)))
+
+;; answer -- take the request an Aio received on a REP context and reply to it
+;; with (reply-to request), blocking. True when both steps worked.
+(defn answer [^borrow c : NngCtx ^borrow a : Aio] : bool
+  (let [r (aio-take-str a)]
+    (if (ok? r)
+      (let [req (ok-val r)
+            rep (reply-to req)
+            s   (ctx-send-str c rep)]
+        (cstr-free rep)
+        (cstr-free req)
+        (ok? s))
+      false)))
+
+;; ---- opening and closing ----
+
+(defn open-unsupported? [] : bool
+  (let [pub  (ok-val (pub-open))
+        push (ok-val (push-open))
+        a    (ctx-open pub)
+        b    (ctx-open push)
+        res  (and (err? a) (= (err-val a) enotsup)
+                  (err? b) (= (err-val b) enotsup))]
+    (close push)
+    (close pub)
+    res))
+
+;; Closing the socket first reaps the context: calls on it are NNG_ECLOSED,
+;; and the late ctx-close returns rather than hanging.
+(defn close-after-socket? [] : bool
+  (let [rep (ok-val (rep-open))
+        c   (ok-val (ctx-open rep))]
+    (close rep)
+    (let [res (recv-err-is? c eclosed)]
+      (ctx-close c)
+      res)))
+
+;; ---- blocking operations ----
+
+(defn blocking-round-trip? [] : bool
+  (let [req (ok-val (req-open))
+        rep (ok-val (rep-open))
+        _   (listen rep "inproc://ngc-rt")
+        _   (dial req "inproc://ngc-rt")
+        q   (ok-val (ctx-open req))
+        p   (ok-val (ctx-open rep))
+        t1  (ctx-set-recv-timeout-ms q guard-ms)
+        t2  (ctx-set-recv-timeout-ms p guard-ms)
+        t3  (ctx-set-send-timeout-ms q guard-ms)
+        s1  (ctx-send-str q "ping")
+        rx1 (recv-is? p "ping")
+        s2  (ctx-send-str p "pong")
+        rx2 (recv-is? q "pong")]
+    (ctx-close p)
+    (ctx-close q)
+    (close req)
+    (close rep)
+    (and (ok? t1) (ok? t2) (ok? t3) (ok? s1) rx1 (ok? s2) rx2)))
+
+(defn payload-round-trip? [] : bool
+  (let [req (ok-val (req-open))
+        rep (ok-val (rep-open))
+        _   (listen rep "inproc://ngc-payload")
+        _   (dial req "inproc://ngc-payload")
+        q   (ok-val (ctx-open req))
+        p   (ok-val (ctx-open rep))
+        _   (ctx-set-recv-timeout-ms p guard-ms)
+        b   (payload-of-cstr "bytes")
+        s   (ctx-send-payload q b)
+        r   (ctx-recv-payload p)
+        ok  (if (ok? r)
+              (let [txt (payload->cstr (ok-val r))
+                    eq  (cstr-eq? txt "bytes")]
+                (cstr-free txt)
+                (payload-free (ok-val r))
+                eq)
+              false)]
+    (payload-free b)
+    (ctx-close p)
+    (ctx-close q)
+    (close req)
+    (close rep)
+    (and (ok? s) ok)))
+
+;; A context copies its socket's receive timeout when it is opened, and an Aio
+;; with the default timeout takes the context's.
+(defn timeouts-follow-context? [] : bool
+  (let [rep (ok-val (rep-open))
+        _   (set-recv-timeout-ms rep 30)
+        c1  (ok-val (ctx-open rep))
+        c2  (ok-val (ctx-open rep))
+        _   (ctx-set-recv-timeout-ms c2 40)
+        a   (ok-val (aio-alloc))
+        r1  (recv-err-is? c1 etimedout)
+        s   (ctx-recv-aio c2 a)
+        w   (aio-wait a)]
+    (aio-free a)
+    (ctx-close c2)
+    (ctx-close c1)
+    (close rep)
+    (and r1 (ok? s) (= (code w) etimedout))))
+
+;; ---- many conversations on one socket ----
+
+;; Without contexts, a REP socket has one receive state: a second pending
+;; receive fails with NNG_ESTATE. This is the shape contexts exist to fix.
+(defn rep-socket-one-receive? [] : bool
+  (let [rep (ok-val (rep-open))
+        _   (set-recv-timeout-ms rep 50)
+        a1  (ok-val (aio-alloc))
+        a2  (ok-val (aio-alloc))
+        r1  (recv-aio rep a1)
+        r2  (recv-aio rep a2)
+        w2  (aio-wait a2)
+        w1  (aio-wait a1)]
+    (aio-free a2)
+    (aio-free a1)
+    (close rep)
+    (and (ok? r1) (ok? r2) (= (code w2) estate) (= (code w1) etimedout))))
+
+;; Two requests in flight on ONE REQ socket, one thread. Two REP contexts take
+;; them and reply in reverse order; each REQ context still gets the reply to
+;; its own request.
+(defn two-requests-in-flight? [] : bool
+  (let [req (ok-val (req-open))
+        rep (ok-val (rep-open))
+        _   (listen rep "inproc://ngc-inflight")
+        _   (dial req "inproc://ngc-inflight")
+        q1  (ok-val (ctx-open req))
+        q2  (ok-val (ctx-open req))
+        p1  (ok-val (ctx-open rep))
+        p2  (ok-val (ctx-open rep))
+        a1  (ok-val (aio-alloc))
+        a2  (ok-val (aio-alloc))
+        b1  (ok-val (aio-alloc))
+        b2  (ok-val (aio-alloc))
+        _   (ctx-set-recv-timeout-ms p1 guard-ms)
+        _   (ctx-set-recv-timeout-ms p2 guard-ms)
+        _   (ctx-set-recv-timeout-ms q1 guard-ms)
+        _   (ctx-set-recv-timeout-ms q2 guard-ms)
+        rb1 (ctx-recv-aio p1 b1)
+        rb2 (ctx-recv-aio p2 b2)
+        sa1 (ctx-send-str-aio q1 a1 "q1")
+        sa2 (ctx-send-str-aio q2 a2 "q2")
+        wa1 (aio-wait a1)
+        wa2 (aio-wait a2)
+        wb1 (aio-wait b1)
+        wb2 (aio-wait b2)
+        ;; reverse order: the second REP context answers first
+        an2 (answer p2 b2)
+        an1 (answer p1 b1)
+        ra1 (ctx-recv-aio q1 a1)
+        ra2 (ctx-recv-aio q2 a2)
+        wr1 (aio-wait a1)
+        wr2 (aio-wait a2)
+        ok1 (take-is? a1 "re:q1")
+        ok2 (take-is? a2 "re:q2")]
+    (aio-free b2)
+    (aio-free b1)
+    (aio-free a2)
+    (aio-free a1)
+    (ctx-close p2)
+    (ctx-close p1)
+    (ctx-close q2)
+    (ctx-close q1)
+    (close req)
+    (close rep)
+    (and (ok? rb1) (ok? rb2) (ok? sa1) (ok? sa2)
+         (ok? wa1) (ok? wa2) (ok? wb1) (ok? wb2)
+         an2 an1
+         (ok? ra1) (ok? ra2) (ok? wr1) (ok? wr2)
+         ok1 ok2)))
+
+;; ---- the threaded server ----
+
+;; ctx->thread-arg / thread-arg->ctx -- move a context across the thread
+;; boundary. The first consumes it; the second hands the worker its own.
+(defn ctx->thread-arg [c : NngCtx] : ptr<void>
+  ```c
+  return (void *)(intptr_t)c;
+  ```)
+
+(defn thread-arg->ctx [p : ptr<void>] : NngCtx
+  ```c
+  return (int64_t)(intptr_t)p;
+  ```)
+
+;; serve-one -- one blocking receive-then-reply cycle on a REP context.
+(defn serve-one [^borrow c : NngCtx] : nil
+  (let [r (ctx-recv-str c)]
+    (when (ok? r)
+      (let [req (ok-val r)
+            rep (reply-to req)
+            s   (ctx-send-str c rep)]
+        (cstr-free rep)
+        (cstr-free req)
+        (when (err? s) (println "serve-one: reply failed"))))))
+
+;; worker -- a pthread entry: own the context it was handed, serve one
+;; request on it, close it.
+(defn worker [arg : ptr<void>] : ptr<void>
+  (let [c (thread-arg->ctx arg)]
+    (serve-one c)
+    (ctx-close c))
+  (:: 0 :ptr<void>))
+
+;; open-worker-ctx -- a REP context with the guard timeout, as a thread arg.
+(defn open-worker-ctx [^borrow rep : Socket] : ptr<void>
+  (let [c (ok-val (ctx-open rep))
+        _ (ctx-set-recv-timeout-ms c guard-ms)]
+    (ctx->thread-arg c)))
+
+;; Two worker threads, each blocked in ctx-recv-str on its own context of ONE
+;; REP socket. The main thread puts two requests in flight from one REQ socket
+;; (two contexts again) and both are answered -- one by each worker, since
+;; each serves exactly one request and then exits.
+(defn threaded-server? [] : bool
+  (let [rep  (ok-val (rep-open))
+        req  (ok-val (req-open))
+        _    (listen rep "inproc://ngc-threads")
+        _    (dial req "inproc://ngc-threads")
+        arg1 (open-worker-ctx rep)
+        arg2 (open-worker-ctx rep)]
+    (unsafe
+      (let [t1 (thread-spawn-fn worker arg1)
+            t2 (thread-spawn-fn worker arg2)
+            q1 (ok-val (ctx-open req))
+            q2 (ok-val (ctx-open req))
+            a1 (ok-val (aio-alloc))
+            a2 (ok-val (aio-alloc))
+            _  (ctx-set-recv-timeout-ms q1 guard-ms)
+            _  (ctx-set-recv-timeout-ms q2 guard-ms)
+            s1 (ctx-send-str-aio q1 a1 "c1")
+            s2 (ctx-send-str-aio q2 a2 "c2")
+            w1 (aio-wait a1)
+            w2 (aio-wait a2)
+            r1 (ctx-recv-aio q1 a1)
+            r2 (ctx-recv-aio q2 a2)
+            v1 (aio-wait a1)
+            v2 (aio-wait a2)
+            ok1 (take-is? a1 "re:c1")
+            ok2 (take-is? a2 "re:c2")]
+        (thread-join t1)
+        (thread-join t2)
+        (aio-free a2)
+        (aio-free a1)
+        (ctx-close q2)
+        (ctx-close q1)
+        (close req)
+        (close rep)
+        (and (ok? s1) (ok? s2) (ok? w1) (ok? w2)
+             (ok? r1) (ok? r2) (ok? v1) (ok? v2) ok1 ok2)))))
+
+;; ---- SUB contexts ----
+
+;; Each SUB context filters on its own: the subscribed one receives, the
+;; unsubscribed one times out, though both sit on the same socket.
+(defn sub-contexts-filter? [] : bool
+  (let [pub (ok-val (pub-open))
+        sub (ok-val (sub-open))
+        _   (listen pub "inproc://ngc-sub")
+        _   (dial sub "inproc://ngc-sub")
+        c1  (ok-val (ctx-open sub))
+        c2  (ok-val (ctx-open sub))
+        s1  (ctx-subscribe c1 "")
+        _   (ctx-set-recv-timeout-ms c1 guard-ms)
+        _   (ctx-set-recv-timeout-ms c2 50)]
+    (sleep-ms 100)
+    (let [sent (send-str pub "news")
+          got  (recv-is? c1 "news")
+          none (recv-err-is? c2 etimedout)
+          un   (ctx-unsubscribe c1 "")
+          un2  (ctx-unsubscribe c1 "")]
+      (ctx-close c2)
+      (ctx-close c1)
+      (close sub)
+      (close pub)
+      (and (ok? s1) (ok? sent) got none (ok? un) (err? un2)))))
+
+(defn subscribe-not-sub? [] : bool
+  (let [rep (ok-val (rep-open))
+        c   (ok-val (ctx-open rep))
+        r   (ctx-subscribe c "x")
+        res (and (err? r) (= (err-val r) enotsup))]
+    (ctx-close c)
+    (close rep)
+    res))
+
+(defn __all-tests [] : void
+  (describe "nng/ctx -- open and close"
+    (it "ctx-open on PUB and PUSH is NNG_ENOTSUP"
+      (assert-true (open-unsupported?)))
+    (it "after the socket closes, calls are NNG_ECLOSED and ctx-close returns"
+      (assert-true (close-after-socket?))))
+
+  (describe "nng/ctx -- blocking operations"
+    (it "a REQ context and a REP context round-trip text"
+      (assert-true (blocking-round-trip?)))
+    (it "ctx-send-payload / ctx-recv-payload round-trip"
+      (assert-true (payload-round-trip?)))
+    (it "a context copies its socket's timeout; an Aio on it takes the context's"
+      (assert-true (timeouts-follow-context?))))
+
+  (describe "nng/ctx -- many conversations on one socket"
+    (it "without contexts, a second receive on a REP socket is NNG_ESTATE"
+      (assert-true (rep-socket-one-receive?)))
+    (it "two requests in flight on one REQ socket, answered out of order"
+      (assert-true (two-requests-in-flight?)))
+    (it "two worker threads serve one REP socket, a context each"
+      (assert-true (threaded-server?))))
+
+  (describe "nng/ctx -- SUB contexts"
+    (it "each SUB context filters on its own"
+      (assert-true (sub-contexts-filter?)))
+    (it "ctx-subscribe on a REP context is NNG_ENOTSUP"
+      (assert-true (subscribe-not-sub?)))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule nng/tests/ctx

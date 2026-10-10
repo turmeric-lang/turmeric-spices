@@ -11,7 +11,9 @@ and `tcp://`.
 TLS and the test/tool targets off. The surface is intentionally thin: nng runs
 its own worker threads and poller, so this spice is a set of blocking calls over
 one linear `Socket` handle, plus a length-prefixed `Payload` for binary
-messages.
+messages. On top of that sit three opt-in layers: poll fds and non-blocking
+`try-*` calls for event loops, completion-based async (`nng/aio`), and
+per-conversation contexts (`nng/ctx`).
 
 What you get over raw sockets is a **messaging pattern** rather than a byte
 stream: nng frames messages, reconnects dropped peers in the background,
@@ -206,17 +208,13 @@ Topic matching is a raw byte **prefix**, not a namespace: subscribing to
 ## Concurrency
 
 nng's blocking calls park only the CALLING thread -- nng's internal workers keep
-running -- so a concurrent server is an ordinary thread running an ordinary
-receive loop. Use `stdlib/thread.tur`:
+running -- so a concurrent server is ordinary `stdlib/thread.tur` threads
+running ordinary receive loops, as in the [`tur-valkey`](../valkey/) spice.
 
-```turmeric
-;; one thread per REP worker; each runs a blocking recv/send loop
-(thread-spawn (fn [] (serve-forever rep)))
-```
-
-That is the v0 concurrency answer, and it is the same one the
-[`tur-valkey`](../valkey/) spice gives. For many sockets on one thread, see
-the next section.
+One worker per socket needs nothing more. Several workers on ONE REP socket
+need a context each (see "Contexts" below): the socket itself has one receive
+state, so a second worker's receive fails with `NNG_ESTATE`. For many sockets
+on one thread, see the next section.
 
 ## Event loops: poll fds and `try-*`
 
@@ -336,6 +334,73 @@ closure, because closures must not run off their own thread. By default an
 operation takes the socket's timeout as it stands when the operation is
 submitted; `aio-set-timeout` overrides that for the slot.
 
+## Contexts: `nng/ctx`
+
+On a REQ or REP socket, the socket's own calls share one protocol state
+machine. On REQ a second request cancels the first; on REP a second pending
+receive fails with `NNG_ESTATE`. An `NngCtx` is an independent copy of that
+state on the socket, so N contexts are N conversations. Each serves its own
+receive-then-reply cycle:
+
+```turmeric
+(let [c (ok-val (ctx-open rep))
+      r (ctx-recv-str c)]
+  (when (ok? r)
+    (println (ok-val r))
+    (let [s (ctx-send-str c "pong")]
+      (when (err? s) (println "reply failed"))))
+  (ctx-close c))
+```
+
+```sweet-exp
+let [c ok-val(ctx-open(rep))
+     r ctx-recv-str(c)]
+  when ok?(r)
+    println(ok-val(r))
+    let [s ctx-send-str(c "pong")]
+      when err?(s) println("reply failed")
+  ctx-close(c)
+```
+
+Contexts come in two flavours:
+
+- **Blocking** (`ctx-send-str`, `ctx-recv-str`, `ctx-send-payload`,
+  `ctx-recv-payload`): one thread per context. N worker threads, each with
+  its own context, share one REP socket. A context is `:linear` and belongs
+  to one thread at a time. The threaded server in `tests/nng/ctx_test.tur`
+  opens each context on the main thread and moves it into its worker, which
+  serves on it and closes it.
+- **Async** (`ctx-send-str-aio`, `ctx-send-payload-aio`, `ctx-recv-aio`):
+  the `nng/aio` contract on a context. One thread keeps many conversations in
+  flight. Here two requests are out at once on ONE REQ socket, and each
+  context gets the reply to its own request, whatever order REP answers in:
+
+```turmeric
+(let [s1 (ctx-send-str-aio q1 a1 "q1")
+      s2 (ctx-send-str-aio q2 a2 "q2")
+      w1 (aio-wait a1)
+      w2 (aio-wait a2)
+      r1 (ctx-recv-aio q1 a1)
+      r2 (ctx-recv-aio q2 a2)
+      v1 (aio-wait a1)
+      v2 (aio-wait a2)]
+  (aio-take-str a1))
+```
+
+The rules:
+
+- Contexts exist on REQ, REP, SUB, SURVEYOR and RESPONDENT. `ctx-open` on
+  PUB, PUSH, PULL, PAIR or BUS is `(err NNG_ENOTSUP)`.
+- Each SUB context filters on its own, with `ctx-subscribe` /
+  `ctx-unsubscribe`. A context with no subscription receives nothing.
+- A context copies its socket's timeouts at `ctx-open`. The
+  `ctx-set-recv-timeout-ms` / `ctx-set-send-timeout-ms` calls change the
+  context's own. An `Aio` on a context takes the context's timeout.
+- A socket uses poll fds or contexts, never both.
+- Close each context before its socket. The other order is harmless, since
+  closing the socket reaps its contexts. Every call on a context in between
+  is `(err NNG_ECLOSED)`.
+
 ## Linear `Socket`
 
 `Socket` is a `:linear` opaque. A socket extracted with `ok-val` must be
@@ -349,7 +414,8 @@ makes three mistakes compile-time errors rather than runtime faults:
 | operating on a closed socket | `TUR-E0101` linear value used after being consumed |
 | opening a socket and never closing it | `TUR-E0100` linear value dropped without being consumed |
 
-`Aio` (nng/aio) follows the same discipline with `aio-free` as its consumer.
+`Aio` (nng/aio) follows the same discipline with `aio-free` as its consumer,
+and `NngCtx` (nng/ctx) with `ctx-close`.
 
 The discipline is inert in ordinary builds, so call sites compile unchanged.
 `errors/` holds one rejected fixture per row, and `errors/run.sh` asserts each
@@ -374,9 +440,6 @@ prevent.
 
 Deliberate omissions, each with a known seam:
 
-- **`nng_ctx` contexts.** These are planned as NG-C of turmeric's
-  `docs/upcoming/spices/nng-async-plan.md`. Until then, a REQ socket has one
-  request in flight at a time, and a REP socket serves one request at a time.
 - **TLS, WebSocket, and ZeroTier transports.** `NNG_ENABLE_TLS=OFF` keeps
   mbedTLS out of the build entirely.
 - **Per-protocol socket types.** Ten opaques would turn "receive on a PUB
@@ -393,8 +456,8 @@ Deliberate omissions, each with a known seam:
 
 ```sh
 tur fetch --update      # clone + build nng (once)
-tur test tests/nng      # 72 assertions in 7 suites, all over inproc:// -- no network
-errors/run.sh           # the six compile-fail linear fixtures (Socket, Aio)
+tur test tests/nng      # 82 assertions in 8 suites, all over inproc:// -- no network
+errors/run.sh           # the nine compile-fail linear fixtures (Socket, Aio, NngCtx)
 ```
 
 ## See also
