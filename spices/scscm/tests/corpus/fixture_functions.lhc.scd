@@ -1,0 +1,16 @@
+square = { |x| x * x };
+add = { |a, b| a + b };
+get_pi = { || 3.14159 };
+square(5);
+add(3, 4);
+get-pi();
+add(square(2), square(3));
+{ |x| x * x };
+{ |a, b| a + b };
+{ |x| x * x }(5);
+{ |x| x * x }.value(10);
+{ |a, b| a + b }.value(5, 3);
+{ |x| { |y| x + y }.value(5) }.value(10);
+var counter = 0;
+counter = counter + 1;
+def(my_value, 42);

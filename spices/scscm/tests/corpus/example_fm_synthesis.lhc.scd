@@ -1,0 +1,2 @@
+SynthDef("fm-synth", { |carrier_freq=440, mod_freq=100, mod_amount=50, amp=0.1, gate=1| var modulator = SinOsc.ar(mod_freq, 0); var modulated_freq = carrier_freq + modulator * mod_amount; var osc = SinOsc.ar(modulated_freq, 0); var envelope = EnvGen.kr(Env.adsr(0.01, 0.1, 0.8, 0.1), gate, (doneAction: 2)); Out.ar(0, *(osc, envelope, amp)) });
+Synth("fm-synth", (carrier_freq: 440, mod_freq: 100, mod_amount: 50, amp: 0.1));

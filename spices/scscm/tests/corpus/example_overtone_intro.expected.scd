@@ -1,0 +1,10 @@
+var sine_wave, pluck, root, third, fifth;
+SynthDef("sine-wave", { |freq=440, amp=0.3, gate=1| Out.ar(0, (SinOsc.ar(freq, 0) * EnvGen.kr(Env.adsr(0.01, 0.1, 0.8, 0.3), gate, doneAction: 2)).dup(2)) }).add;
+sine_wave = { |...scscm_args| Synth("sine-wave", scscm_args) };
+SynthDef("pluck", { |freq=440, amp=0.5, decay=2.0| Out.ar(0, (Pluck.ar(WhiteNoise.ar(), Impulse.kr(0), 0.2, 1.0 / freq, decay, 0.1) * amp).dup(2)) }).add;
+pluck = { |...scscm_args| Synth("pluck", scscm_args) };
+root = sine_wave.(\freq, 60.midicps, \amp, 0.2);
+third = sine_wave.(\freq, 64.midicps, \amp, 0.2);
+fifth = sine_wave.(\freq, 67.midicps, \amp, 0.2);
+TempoClock.default.sched(2.0, { third.set(\freq, 63.midicps) });
+TempoClock.default.sched(4.0, { root.free; third.free; fifth.free });
