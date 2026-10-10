@@ -1,0 +1,443 @@
+;;; nng/ctx -- independent protocol state on one shared socket.
+;;;
+;;; A stateful protocol's socket-level calls share ONE state machine. On REQ a
+;;; second request cancels the first (NNG_ECANCELED); on REP a second pending
+;;; receive fails with NNG_ESTATE. So several workers cannot share one REP
+;;; socket, and one REQ socket cannot have two requests out.
+;;;
+;;; An NngCtx is a private copy of that state machine on the socket. Each
+;;; context runs its own receive-then-reply (REP) or request-then-reply (REQ)
+;;; cycle, so N contexts on one socket are N independent conversations. The
+;;; blocking calls give the threaded form -- one worker thread per context --
+;;; and the *-aio calls (nng/aio) the single-threaded one: many conversations
+;;; in flight, driven by one thread.
+;;;
+;;; Contexts exist on REQ, REP, SUB, SURVEYOR and RESPONDENT. ctx-open on PUB,
+;;; PUSH, PULL, PAIR or BUS is an err carrying NNG_ENOTSUP.
+;;;
+;;; Rules the types cannot carry:
+;;;
+;;; * A socket uses poll fds (nng/socket recv-poll-fd / send-poll-fd) or
+;;;   contexts, never both (nng_ctx.5).
+;;; * ctx-close each context before close-ing its socket. The other order is
+;;;   harmless -- closing the socket reaps its contexts, and the later
+;;;   ctx-close does nothing -- but every call on the context in between is
+;;;   an err carrying NNG_ECLOSED.
+;;;
+;;; Timeouts. A context copies its socket's receive and send timeouts when it
+;;; is opened; ctx-set-recv-timeout-ms / ctx-set-send-timeout-ms change them
+;;; for that context only. An Aio submitted on a context takes the context's
+;;; timeout unless aio-set-timeout overrides it.
+;;;
+;;; Since: Phase NG-C
+;; Per-conversation protocol state over an nng socket (NG-C of the nng async plan).
+
+(defmodule nng/ctx
+  (import nng/socket  :refer [Socket])
+  (import nng/payload :refer [Payload])
+  (import nng/aio     :refer [Aio])
+  (export NngCtx ctx-open ctx-close
+          ctx-send-payload ctx-recv-payload ctx-send-str ctx-recv-str
+          ctx-send-payload-aio ctx-send-str-aio ctx-recv-aio
+          ctx-set-recv-timeout-ms ctx-set-send-timeout-ms
+          ctx-subscribe ctx-unsubscribe)
+
+;;; NngCtx -- a linear handle to one context on a socket.
+;;;
+;;; `nng_ctx` is a by-value struct wrapping a `uint32_t` id, so the opaque
+;;; packs that id the same way Socket does. Named NngCtx rather than Ctx
+;;; because opaque names resolve globally and tur-tourist already owns `Ctx`.
+;;; :linear, consumed only by ctx-close.
+;;;
+;;; Since: Phase NG-C
+(defopaque NngCtx :int :linear)
+
+;;; ctx-open -- open a context on a socket.
+;;;
+;;; The socket is only borrowed: the context does not keep it open. Close the
+;;; context first (see the module notes).
+;;;
+;;; Parameters:
+;;;   s -- the socket (borrowed)
+;;;
+;;; Returns:
+;;;   (Result NngCtx int) -- err carries the nng error code: NNG_ENOTSUP on
+;;;   a protocol without contexts (PUB, PUSH, PULL, PAIR, BUS).
+;;;
+;;; Example:
+;;;   (let [c (ok-val (ctx-open rep))]
+;;;     (serve c)
+;;;     (ctx-close c))
+;;;
+;;; Since: Phase NG-C
+(defn ctx-open [^borrow s : Socket] : (Result NngCtx int)
+  ```c
+  #include <nng/nng.h>
+  nng_socket sk;
+  sk.id = (uint32_t)s;
+  nng_ctx c;
+  int rv = nng_ctx_open(&c, sk);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int((int64_t)c.id);
+  ```)
+
+;;; ctx-close -- close a context. The single linear consumer.
+;;;
+;;; Aborts any operation in flight on the context: a blocked call returns, and
+;;; a submitted Aio completes, with NNG_ECLOSED. Closing a context whose
+;;; socket is already closed does nothing -- the socket's close reaped it.
+;;;
+;;; Parameters:
+;;;   c -- the context, consumed
+;;;
+;;; Example:
+;;;   (ctx-close c)
+;;;
+;;; Since: Phase NG-C
+(defn ctx-close [c : NngCtx] : nil
+  ```c
+  #include <nng/nng.h>
+  nng_ctx cx;
+  cx.id = (uint32_t)c;
+  /* NNG_ECLOSED -- the socket closed first -- is the only error, and it means
+   * there is nothing left to close. */
+  (void)nng_ctx_close(cx);
+  ```)
+
+;; -------------------------------------------------------------------------
+;; Blocking operations -- one per thread, like the socket-level calls.
+;; -------------------------------------------------------------------------
+
+;;; ctx-send-payload -- send a byte buffer on the context; blocks.
+;;;
+;;; BORROWS the payload: its bytes are copied into the message, so `b` is the
+;;; caller's to free afterwards.
+;;;
+;;; Parameters:
+;;;   c -- the context (borrowed)
+;;;   b -- the payload (borrowed)
+;;;
+;;; Returns:
+;;;   (Result nil int) -- err carries the nng error code.
+;;;
+;;; Example:
+;;;   (ctx-send-payload c reply)
+;;;
+;;; Since: Phase NG-C
+(defn ctx-send-payload [^borrow c : NngCtx b : Payload] #fx{Net} : (Result nil int)
+  ```c
+  #include <nng/nng.h>
+  extern int64_t turnng_payload_len(const void *);
+  extern void   *turnng_payload_data(void *);
+  nng_ctx cx;
+  cx.id = (uint32_t)c;
+  void   *data = turnng_payload_data((void *)(intptr_t)b);
+  size_t  len  = (size_t)turnng_payload_len((const void *)(intptr_t)b);
+  nng_msg *m = NULL;
+  int rv = nng_msg_alloc(&m, 0);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  if (data != NULL && len > 0 && (rv = nng_msg_append(m, data, len)) != 0) {
+    nng_msg_free(m);
+    return tur_err_int((int64_t)rv);
+  }
+  /* nng takes the message only on success (nng_ctx_sendmsg.3). */
+  rv = nng_ctx_sendmsg(cx, m, 0);
+  if (rv != 0) { nng_msg_free(m); return tur_err_int((int64_t)rv); }
+  return tur_ok_int(0);
+  ```)
+
+;;; ctx-recv-payload -- receive one message on the context; blocks.
+;;;
+;;; Parameters:
+;;;   c -- the context (borrowed)
+;;;
+;;; Returns:
+;;;   (Result Payload int) -- ok carries a fresh Payload the caller frees with
+;;;   payload-free; err carries the nng error code (NNG_ETIMEDOUT after the
+;;;   context's receive timeout).
+;;;
+;;; Example:
+;;;   (let [r (ctx-recv-payload c)]
+;;;     (when (ok? r) (payload-free (ok-val r))))
+;;;
+;;; Since: Phase NG-C
+(defn ctx-recv-payload [^borrow c : NngCtx] #fx{Net} : (Result Payload int)
+  ```c
+  #include <nng/nng.h>
+  extern void *turnng_payload_of_bytes(const void *, int64_t);
+  nng_ctx cx;
+  cx.id = (uint32_t)c;
+  nng_msg *m = NULL;
+  int rv = nng_ctx_recvmsg(cx, &m, 0);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  size_t len = nng_msg_len(m);
+  void *out = turnng_payload_of_bytes(len ? nng_msg_body(m) : "", (int64_t)len);
+  nng_msg_free(m);
+  if (out == NULL) return tur_err_int((int64_t)NNG_ENOMEM);
+  return tur_ok_ptr(out);
+  ```)
+
+;;; ctx-send-str -- send a NUL-terminated string on the context; blocks.
+;;;
+;;; The terminator is not sent. BORROWS msg.
+;;;
+;;; Parameters:
+;;;   c   -- the context (borrowed)
+;;;   msg -- the payload (borrowed)
+;;;
+;;; Returns:
+;;;   (Result nil int) -- err carries the nng error code.
+;;;
+;;; Example:
+;;;   (ctx-send-str c "pong")
+;;;
+;;; Since: Phase NG-C
+(defn ctx-send-str [^borrow c : NngCtx msg : cstr] #fx{Net} : (Result nil int)
+  ```c
+  #include <nng/nng.h>
+  nng_ctx cx;
+  cx.id = (uint32_t)c;
+  const char *p = (const char *)msg;
+  if (p == NULL) p = "";
+  size_t len = strlen(p);
+  nng_msg *m = NULL;
+  int rv = nng_msg_alloc(&m, 0);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  if (len > 0 && (rv = nng_msg_append(m, p, len)) != 0) {
+    nng_msg_free(m);
+    return tur_err_int((int64_t)rv);
+  }
+  rv = nng_ctx_sendmsg(cx, m, 0);
+  if (rv != 0) { nng_msg_free(m); return tur_err_int((int64_t)rv); }
+  return tur_ok_int(0);
+  ```)
+
+;;; ctx-recv-str -- receive one message on the context as a malloc'd cstr.
+;;;
+;;; Blocks. The caller frees the string. As with recv-str, a payload with an
+;;; interior NUL reads back truncated; use ctx-recv-payload for binary data.
+;;;
+;;; Parameters:
+;;;   c -- the context (borrowed)
+;;;
+;;; Returns:
+;;;   (Result cstr int) -- err carries the nng error code.
+;;;
+;;; Example:
+;;;   (let [r (ctx-recv-str c)]
+;;;     (when (ok? r) (println (ok-val r))))
+;;;
+;;; Since: Phase NG-C
+(defn ctx-recv-str [^borrow c : NngCtx] #fx{Net} : (Result cstr int)
+  ```c
+  #include <nng/nng.h>
+  nng_ctx cx;
+  cx.id = (uint32_t)c;
+  nng_msg *m = NULL;
+  int rv = nng_ctx_recvmsg(cx, &m, 0);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  size_t len = nng_msg_len(m);
+  char *out = (char *)malloc(len + 1);
+  if (out == NULL) { nng_msg_free(m); return tur_err_int((int64_t)NNG_ENOMEM); }
+  if (len > 0) memcpy(out, nng_msg_body(m), len);
+  out[len] = '\0';
+  nng_msg_free(m);
+  return tur_ok_ptr(out);
+  ```)
+
+;; -------------------------------------------------------------------------
+;; Asynchronous operations -- the nng/aio submit/collect contract, on the
+;; context. Collect with aio-wait / aio-try-result / aio-poll-fd, and take a
+;; receive with aio-take-payload / aio-take-str, exactly as on a socket.
+;; -------------------------------------------------------------------------
+
+;;; ctx-send-payload-aio -- submit a send of a byte buffer on the context.
+;;;
+;;; BORROWS the payload: its bytes are copied before this returns.
+;;;
+;;; Parameters:
+;;;   c -- the context (borrowed)
+;;;   a -- the slot (borrowed)
+;;;   b -- the payload (borrowed)
+;;;
+;;; Returns:
+;;;   (Result nil int) -- ok: submitted; err: nothing submitted (NNG_EBUSY
+;;;   while the slot has an operation in flight).
+;;;
+;;; Example:
+;;;   (ctx-send-payload-aio c a b)
+;;;
+;;; Since: Phase NG-C
+(defn ctx-send-payload-aio [^borrow c : NngCtx ^borrow a : Aio b : Payload]
+  #fx{Net}
+  : (Result nil int)
+  ```c
+  extern int turnng_aio_send_bytes(void *, uint32_t, uint32_t, int, const void *, size_t);
+  extern int64_t turnng_payload_len(const void *);
+  extern void   *turnng_payload_data(void *);
+  void   *data = turnng_payload_data((void *)(intptr_t)b);
+  size_t  len  = (size_t)turnng_payload_len((const void *)(intptr_t)b);
+  if (data == NULL) { data = (void *)""; len = 0; }
+  int rv = turnng_aio_send_bytes((void *)(intptr_t)a, 0, (uint32_t)c, 1, data, len);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int(0);
+  ```)
+
+;;; ctx-send-str-aio -- submit a send of a NUL-terminated string on the context.
+;;;
+;;; The terminator is not sent. BORROWS msg.
+;;;
+;;; Parameters:
+;;;   c   -- the context (borrowed)
+;;;   a   -- the slot (borrowed)
+;;;   msg -- the payload (borrowed)
+;;;
+;;; Returns:
+;;;   (Result nil int) -- ok: submitted; err: nothing submitted.
+;;;
+;;; Example:
+;;;   (ctx-send-str-aio c a "q1")
+;;;
+;;; Since: Phase NG-C
+(defn ctx-send-str-aio [^borrow c : NngCtx ^borrow a : Aio msg : cstr]
+  #fx{Net}
+  : (Result nil int)
+  ```c
+  extern int turnng_aio_send_bytes(void *, uint32_t, uint32_t, int, const void *, size_t);
+  const char *p = (const char *)msg;
+  if (p == NULL) p = "";
+  int rv = turnng_aio_send_bytes((void *)(intptr_t)a, 0, (uint32_t)c, 1, p, strlen(p));
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int(0);
+  ```)
+
+;;; ctx-recv-aio -- submit a receive on the context.
+;;;
+;;; After it completes, take the message with aio-take-payload / aio-take-str.
+;;;
+;;; Parameters:
+;;;   c -- the context (borrowed)
+;;;   a -- the slot (borrowed)
+;;;
+;;; Returns:
+;;;   (Result nil int) -- ok: submitted; err: nothing submitted.
+;;;
+;;; Example:
+;;;   (ctx-recv-aio c a)
+;;;
+;;; Since: Phase NG-C
+(defn ctx-recv-aio [^borrow c : NngCtx ^borrow a : Aio] #fx{Net} : (Result nil int)
+  ```c
+  extern int turnng_aio_recv(void *, uint32_t, uint32_t, int);
+  int rv = turnng_aio_recv((void *)(intptr_t)a, 0, (uint32_t)c, 1);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int(0);
+  ```)
+
+;; -------------------------------------------------------------------------
+;; Options
+;; -------------------------------------------------------------------------
+
+;;; ctx-set-recv-timeout-ms -- this context's receive timeout.
+;;;
+;;; Parameters:
+;;;   c  -- the context (borrowed)
+;;;   ms -- milliseconds; -1 waits forever
+;;;
+;;; Returns:
+;;;   (Result nil int) -- err carries the nng error code.
+;;;
+;;; Example:
+;;;   (ctx-set-recv-timeout-ms c 2000)
+;;;
+;;; Since: Phase NG-C
+(defn ctx-set-recv-timeout-ms [^borrow c : NngCtx ms : int] : (Result nil int)
+  ```c
+  #include <nng/nng.h>
+  nng_ctx cx;
+  cx.id = (uint32_t)c;
+  int rv = nng_ctx_set_ms(cx, NNG_OPT_RECVTIMEO, (nng_duration)ms);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int(0);
+  ```)
+
+;;; ctx-set-send-timeout-ms -- this context's send timeout.
+;;;
+;;; Parameters:
+;;;   c  -- the context (borrowed)
+;;;   ms -- milliseconds; -1 waits forever
+;;;
+;;; Returns:
+;;;   (Result nil int) -- err carries the nng error code.
+;;;
+;;; Example:
+;;;   (ctx-set-send-timeout-ms c 2000)
+;;;
+;;; Since: Phase NG-C
+(defn ctx-set-send-timeout-ms [^borrow c : NngCtx ms : int] : (Result nil int)
+  ```c
+  #include <nng/nng.h>
+  nng_ctx cx;
+  cx.id = (uint32_t)c;
+  int rv = nng_ctx_set_ms(cx, NNG_OPT_SENDTIMEO, (nng_duration)ms);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int(0);
+  ```)
+
+;;; ctx-subscribe -- add a topic prefix filter to a SUB context.
+;;;
+;;; Each SUB context filters on its own: a context with no subscription
+;;; receives nothing, whatever the socket or its other contexts subscribe to.
+;;;
+;;; Parameters:
+;;;   c     -- the context (borrowed); on anything but SUB, err NNG_ENOTSUP
+;;;   topic -- the byte prefix to accept; "" accepts every message
+;;;
+;;; Returns:
+;;;   (Result nil int) -- err carries the nng error code.
+;;;
+;;; Example:
+;;;   (ctx-subscribe c "temp:")
+;;;
+;;; Since: Phase NG-C
+(defn ctx-subscribe [^borrow c : NngCtx topic : cstr] : (Result nil int)
+  ```c
+  #include <nng/nng.h>
+  #include <nng/protocol/pubsub0/sub.h>
+  nng_ctx cx;
+  cx.id = (uint32_t)c;
+  const char *p = (const char *)topic;
+  if (p == NULL) p = "";
+  int rv = nng_sub0_ctx_subscribe(cx, p, strlen(p));
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int(0);
+  ```)
+
+;;; ctx-unsubscribe -- drop a topic prefix filter from a SUB context.
+;;;
+;;; Parameters:
+;;;   c     -- the context (borrowed)
+;;;   topic -- the exact prefix passed to ctx-subscribe; anything else is
+;;;            err NNG_ENOENT
+;;;
+;;; Returns:
+;;;   (Result nil int) -- err carries the nng error code.
+;;;
+;;; Example:
+;;;   (ctx-unsubscribe c "temp:")
+;;;
+;;; Since: Phase NG-C
+(defn ctx-unsubscribe [^borrow c : NngCtx topic : cstr] : (Result nil int)
+  ```c
+  #include <nng/nng.h>
+  #include <nng/protocol/pubsub0/sub.h>
+  nng_ctx cx;
+  cx.id = (uint32_t)c;
+  const char *p = (const char *)topic;
+  if (p == NULL) p = "";
+  int rv = nng_sub0_ctx_unsubscribe(cx, p, strlen(p));
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int(0);
+  ```)
+
+) ;; end defmodule nng/ctx

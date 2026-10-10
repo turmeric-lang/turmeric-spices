@@ -30,7 +30,8 @@
           surveyor-open respondent-open
           dial listen close
           set-recv-timeout-ms set-send-timeout-ms
-          err-str timed-out?)
+          err-str timed-out?
+          PollFd poll-fd->int recv-poll-fd send-poll-fd)
 
 ;;; Socket -- a linear handle to an open nng socket.
 ;;;
@@ -479,6 +480,102 @@
   ```c
   #include <nng/nng.h>
   return ((int)code == NNG_ETIMEDOUT) ? true : false;
+  ```)
+
+;; -------------------------------------------------------------------------
+;; Poll fds (event-loop integration)
+;;
+;; nng hands out the read end of a pipe it raises when the socket becomes
+;; ready and clears when it drains. Register it with a reactor or a fiber
+;; park for READ -- both the receive fd and the send fd signal by becoming
+;; READABLE -- and then move messages with the non-blocking try-* calls in
+;; nng/msg. See docs/upcoming/spices/nng-async-plan.md (turmeric repo), NG-A.
+;; -------------------------------------------------------------------------
+
+;;; PollFd -- a file descriptor that may only be polled.
+;;;
+;;; Owned by nng and alive as long as the socket that produced it. Reading,
+;;; writing or closing it corrupts nng's readiness state, which is why it is
+;;; its own type rather than an :int or a stdlib Fd: nothing here offers a
+;;; read or a close. `poll-fd->int` is the one explicit step to the plain fd a
+;;; reactor or fiber-park call takes.
+;;;
+;;; Since: Phase NG-A
+(defopaque PollFd :int)
+
+;;; poll-fd->int -- the raw descriptor, for reactor-add-fd / local-park-fd.
+;;;
+;;; Parameters:
+;;;   fd -- the poll fd
+;;;
+;;; Returns:
+;;;   int -- the descriptor number. Poll it; never read, write or close it.
+;;;
+;;; Example:
+;;;   (reactor-add-fd r (poll-fd->int (ok-val (recv-poll-fd s))) READ cb ud)
+;;;
+;;; Since: Phase NG-A
+(defn poll-fd->int [fd : PollFd] : int (:: fd :int))
+
+;;; recv-poll-fd -- an fd that is readable while a message is waiting.
+;;;
+;;; Becomes readable when the socket has a message to receive and stops being
+;;; readable once the queue drains. On macOS the reactor reports it edge-style
+;;; (kqueue EV_CLEAR), so a callback must drain with try-recv-* until it
+;;; returns (ok (none)) -- reading one message per wakeup stalls there.
+;;;
+;;; Not compatible with nng contexts on the same socket (nng_ctx.5).
+;;;
+;;; Parameters:
+;;;   s -- the socket (borrowed)
+;;;
+;;; Returns:
+;;;   (Result PollFd int) -- err carries NNG_ENOTSUP on a protocol that cannot
+;;;   receive (PUB, PUSH), or another nng error code.
+;;;
+;;; Example:
+;;;   (let [fd (ok-val (recv-poll-fd sub))]
+;;;     (reactor-add-fd r (poll-fd->int fd) READ drain-cb ud))
+;;;
+;;; Since: Phase NG-A
+(defn recv-poll-fd [^borrow s : Socket] : (Result PollFd int)
+  ```c
+  #include <nng/nng.h>
+  nng_socket sk;
+  sk.id = (uint32_t)s;
+  int fd = -1;
+  int rv = nng_socket_get_int(sk, NNG_OPT_RECVFD, &fd);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int((int64_t)fd);
+  ```)
+
+;;; send-poll-fd -- an fd that is READABLE while a send would not block.
+;;;
+;;; Readable, not writable: nng signals both directions through the read end
+;;; of its pipe, so register it for READ. The same drain rule as recv-poll-fd
+;;; applies on macOS -- send with try-send-* until it returns (ok false).
+;;;
+;;; Parameters:
+;;;   s -- the socket (borrowed)
+;;;
+;;; Returns:
+;;;   (Result PollFd int) -- err carries NNG_ENOTSUP on a protocol that cannot
+;;;   send (SUB, PULL), or another nng error code.
+;;;
+;;; Example:
+;;;   (let [fd (ok-val (send-poll-fd push))]
+;;;     (reactor-add-fd r (poll-fd->int fd) READ flush-cb ud))
+;;;
+;;; Since: Phase NG-A
+(defn send-poll-fd [^borrow s : Socket] : (Result PollFd int)
+  ```c
+  #include <nng/nng.h>
+  nng_socket sk;
+  sk.id = (uint32_t)s;
+  int fd = -1;
+  int rv = nng_socket_get_int(sk, NNG_OPT_SENDFD, &fd);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int((int64_t)fd);
   ```)
 
 ) ;; end defmodule nng/socket

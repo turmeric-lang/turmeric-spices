@@ -11,7 +11,9 @@ and `tcp://`.
 TLS and the test/tool targets off. The surface is intentionally thin: nng runs
 its own worker threads and poller, so this spice is a set of blocking calls over
 one linear `Socket` handle, plus a length-prefixed `Payload` for binary
-messages.
+messages. On top of that sit three opt-in layers: poll fds and non-blocking
+`try-*` calls for event loops, completion-based async (`nng/aio`), and
+per-conversation contexts (`nng/ctx`).
 
 What you get over raw sockets is a **messaging pattern** rather than a byte
 stream: nng frames messages, reconnects dropped peers in the background,
@@ -206,16 +208,198 @@ Topic matching is a raw byte **prefix**, not a namespace: subscribing to
 ## Concurrency
 
 nng's blocking calls park only the CALLING thread -- nng's internal workers keep
-running -- so a concurrent server is an ordinary thread running an ordinary
-receive loop. Use `stdlib/thread.tur`:
+running -- so a concurrent server is ordinary `stdlib/thread.tur` threads
+running ordinary receive loops, as in the [`tur-valkey`](../valkey/) spice.
+
+One worker per socket needs nothing more. Several workers on ONE REP socket
+need a context each (see "Contexts" below): the socket itself has one receive
+state, so a second worker's receive fails with `NNG_ESTATE`. For many sockets
+on one thread, see the next section.
+
+## Event loops: poll fds and `try-*`
+
+One thread can multiplex many sockets through `stdlib/reactor.tur`.
+
+- **The fd.** `recv-poll-fd` / `send-poll-fd` (nng/socket) hand back a
+  `PollFd`: the read end of a pipe nng raises while the socket is ready and
+  clears once it drains. It is poll-only: never read, write or close it.
+  `poll-fd->int` is the step to the plain fd the reactor takes.
+- **Moving messages.** `try-recv-str` / `try-recv-payload` / `try-send-str` /
+  `try-send-payload` (nng/msg) never block. "Nothing ready" is an ok result,
+  `(ok (none))` or `(ok false)`. Every real failure is still an `err`.
 
 ```turmeric
-;; one thread per REP worker; each runs a blocking recv/send loop
-(thread-spawn (fn [] (serve-forever rep)))
+;; drain -- every waiting message; never a blocking receive in a callback.
+(defn drain [^borrow s : Socket n : int] : int
+  (let [r (try-recv-str s)]
+    (if (ok? r)
+      (match (ok-val r)
+        (Some m) (do (handle m) (drain s (+ n 1)))
+        (None)   n)
+      n)))
+
+(let [fd (ok-val (recv-poll-fd sub))]
+  (reactor-add-fd r (poll-fd->int fd) READ
+    (fn [id events user] : nil (drain sub 0))
+    (:: 0 :ptr<void>))
+  (reactor-run r))
 ```
 
-That is the v0 concurrency answer, and it is the same one the
-[`tur-valkey`](../valkey/) spice gives.
+```sweet-exp
+;; drain -- every waiting message; never a blocking receive in a callback.
+defn drain [^borrow s : Socket n : int] : int
+  let [r try-recv-str(s)]
+    if ok?(r)
+      (match (ok-val r)
+        (Some m) (do (handle m) (drain s {n + 1}))
+        (None)   n)
+      n
+
+let [fd ok-val(recv-poll-fd(sub))]
+  reactor-add-fd r poll-fd->int(fd) READ
+    (fn [id events user] : nil (drain sub 0))
+    (:: 0 :ptr<void>)
+  reactor-run r
+```
+
+Three rules, each learned the hard way:
+
+- **Drain to empty.** The reactor's macOS backend (kqueue, `EV_CLEAR`)
+  reports the fd once per empty-to-ready transition. A callback that takes one
+  message per wakeup stalls with the rest still queued. On Linux (epoll) it
+  happens to work either way.
+- **Never block in the callback.** Use `try-*`. If another consumer drained
+  the socket first, a blocking receive would park the whole loop.
+- **The send fd is READABLE when a send would not block.** Register both fds
+  for `READ`.
+
+Some protocols have no fd in a direction: PUB and PUSH have no receive fd,
+and SUB and PULL have no send fd. Asking for one is an `err` carrying
+`NNG_ENOTSUP`. Poll fds and nng contexts must not be mixed on one socket.
+
+## Async: `nng/aio`
+
+`nng/aio` is completion-based: submit an operation now and collect it
+later. An `Aio` is one operation slot, `:linear` and consumed by `aio-free`.
+Submit on it with `send-payload-aio`, `send-str-aio` or `recv-aio`. Each
+returns at once, `(ok nil)` when the operation was submitted. Then collect
+the outcome:
+
+| Collector | Behaviour |
+| --- | --- |
+| `aio-wait` | blocks this thread, returns `(Result nil int)` |
+| `aio-try-result` | never blocks: `(none)` while in flight, else `(some outcome)` |
+| `aio-poll-fd` | a `PollFd` that is readable once it finishes; register it with `reactor-add-fd` or park a fiber on it with `local-park-fd` |
+
+After a receive, `aio-take-payload` / `aio-take-str` hand back the message.
+N slots in flight on one thread are the fan-out.
+
+```turmeric
+(let [a (ok-val (aio-alloc))
+      r (recv-aio pull a)
+      w (aio-wait a)]
+  (when (ok? w)
+    (let [t (aio-take-str a)]
+      (when (ok? t) (println (ok-val t)))))
+  (aio-free a))
+```
+
+```sweet-exp
+let [a ok-val(aio-alloc())
+     r recv-aio(pull a)
+     w aio-wait(a)]
+  when ok?(w)
+    let [t aio-take-str(a)]
+      when ok?(t) println(ok-val(t))
+  aio-free(a)
+```
+
+What the slot guarantees, which nng's own `nng_aio` does not:
+
+- **No nng message reaches your code or leaks.** A send copies the payload
+  in, so the caller still owns the `Payload`. A failed send's message is
+  freed for you. An untaken receive is freed by the next submit or by
+  `aio-free`.
+- **One operation at a time.** A submit while one is in flight is
+  `(err NNG_EBUSY)` and nothing is submitted. nng itself asserts here.
+- **Free is safe in flight.** `aio-free` cancels and waits first.
+- **The completion fd is readable until you collect.** Any collector that
+  sees the result clears it, and so does the next submit. A reactor callback
+  that collects therefore neither spins nor stalls. Remove the reactor source
+  before `aio-free` closes the fd.
+
+nng's completion callback runs on one of its worker threads. The spice's C
+callback handles the message and the fd there and never calls a Turmeric
+closure, because closures must not run off their own thread. By default an
+operation takes the socket's timeout as it stands when the operation is
+submitted; `aio-set-timeout` overrides that for the slot.
+
+## Contexts: `nng/ctx`
+
+On a REQ or REP socket, the socket's own calls share one protocol state
+machine. On REQ a second request cancels the first; on REP a second pending
+receive fails with `NNG_ESTATE`. An `NngCtx` is an independent copy of that
+state on the socket, so N contexts are N conversations. Each serves its own
+receive-then-reply cycle:
+
+```turmeric
+(let [c (ok-val (ctx-open rep))
+      r (ctx-recv-str c)]
+  (when (ok? r)
+    (println (ok-val r))
+    (let [s (ctx-send-str c "pong")]
+      (when (err? s) (println "reply failed"))))
+  (ctx-close c))
+```
+
+```sweet-exp
+let [c ok-val(ctx-open(rep))
+     r ctx-recv-str(c)]
+  when ok?(r)
+    println(ok-val(r))
+    let [s ctx-send-str(c "pong")]
+      when err?(s) println("reply failed")
+  ctx-close(c)
+```
+
+Contexts come in two flavours:
+
+- **Blocking** (`ctx-send-str`, `ctx-recv-str`, `ctx-send-payload`,
+  `ctx-recv-payload`): one thread per context. N worker threads, each with
+  its own context, share one REP socket. A context is `:linear` and belongs
+  to one thread at a time. The threaded server in `tests/nng/ctx_test.tur`
+  opens each context on the main thread and moves it into its worker, which
+  serves on it and closes it.
+- **Async** (`ctx-send-str-aio`, `ctx-send-payload-aio`, `ctx-recv-aio`):
+  the `nng/aio` contract on a context. One thread keeps many conversations in
+  flight. Here two requests are out at once on ONE REQ socket, and each
+  context gets the reply to its own request, whatever order REP answers in:
+
+```turmeric
+(let [s1 (ctx-send-str-aio q1 a1 "q1")
+      s2 (ctx-send-str-aio q2 a2 "q2")
+      w1 (aio-wait a1)
+      w2 (aio-wait a2)
+      r1 (ctx-recv-aio q1 a1)
+      r2 (ctx-recv-aio q2 a2)
+      v1 (aio-wait a1)
+      v2 (aio-wait a2)]
+  (aio-take-str a1))
+```
+
+The rules:
+
+- Contexts exist on REQ, REP, SUB, SURVEYOR and RESPONDENT. `ctx-open` on
+  PUB, PUSH, PULL, PAIR or BUS is `(err NNG_ENOTSUP)`.
+- Each SUB context filters on its own, with `ctx-subscribe` /
+  `ctx-unsubscribe`. A context with no subscription receives nothing.
+- A context copies its socket's timeouts at `ctx-open`. The
+  `ctx-set-recv-timeout-ms` / `ctx-set-send-timeout-ms` calls change the
+  context's own. An `Aio` on a context takes the context's timeout.
+- A socket uses poll fds or contexts, never both.
+- Close each context before its socket. The other order is harmless, since
+  closing the socket reaps its contexts. Every call on a context in between
+  is `(err NNG_ECLOSED)`.
 
 ## Linear `Socket`
 
@@ -229,6 +413,9 @@ makes three mistakes compile-time errors rather than runtime faults:
 | closing the same socket twice | `TUR-E0101` linear value used after being consumed |
 | operating on a closed socket | `TUR-E0101` linear value used after being consumed |
 | opening a socket and never closing it | `TUR-E0100` linear value dropped without being consumed |
+
+`Aio` (nng/aio) follows the same discipline with `aio-free` as its consumer,
+and `NngCtx` (nng/ctx) with `ctx-close`.
 
 The discipline is inert in ordinary builds, so call sites compile unchanged.
 `errors/` holds one rejected fixture per row, and `errors/run.sh` asserts each
@@ -253,11 +440,6 @@ prevent.
 
 Deliberate omissions, each with a known seam:
 
-- **`nng_aio` async and `nng_ctx` contexts.** The concurrent-server story is
-  blocking calls on OS threads, as above.
-- **Reactor integration.** nng exposes pollable receive/send file descriptors
-  via socket options, which would plug into `stdlib/reactor.tur`. Documented,
-  not built.
 - **TLS, WebSocket, and ZeroTier transports.** `NNG_ENABLE_TLS=OFF` keeps
   mbedTLS out of the build entirely.
 - **Per-protocol socket types.** Ten opaques would turn "receive on a PUB
@@ -274,8 +456,8 @@ Deliberate omissions, each with a known seam:
 
 ```sh
 tur fetch --update      # clone + build nng (once)
-tur test tests/nng      # 52 assertions, all over inproc:// -- no network
-errors/run.sh           # the three compile-fail linear fixtures
+tur test tests/nng      # 82 assertions in 8 suites, all over inproc:// -- no network
+errors/run.sh           # the nine compile-fail linear fixtures (Socket, Aio, NngCtx)
 ```
 
 ## See also

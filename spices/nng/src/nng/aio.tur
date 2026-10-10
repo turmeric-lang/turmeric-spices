@@ -1,0 +1,351 @@
+;;; nng/aio -- asynchronous send and receive: submit now, collect later.
+;;;
+;;; An `Aio` is one operation slot. Submit a send or receive on it and the
+;;; call returns at once; the operation runs on nng's own worker threads. Then
+;;; collect the outcome in whichever way suits the caller:
+;;;
+;;;   aio-wait        block this thread until it finishes
+;;;   aio-try-result  ask without blocking: (none) while it is in flight
+;;;   aio-poll-fd     an fd that turns readable when it finishes, for
+;;;                   reactor-add-fd or local-park-fd
+;;;
+;;; and, after a receive, take the message with aio-take-payload /
+;;; aio-take-str. N slots in flight on one thread are the fan-out.
+;;;
+;;; Ownership. Payloads are copied in and out, as in nng/msg: a send borrows
+;;; its Payload, and a take hands back a fresh one the caller frees. No nng
+;;; message ever reaches Turmeric code -- a failed send's message is freed for
+;;; you, and an untaken receive is freed by the next submit or by aio-free.
+;;;
+;;; Rules the types cannot carry:
+;;;
+;;; * One operation at a time per Aio. A submit while one is in flight is an
+;;;   err carrying NNG_EBUSY; nothing is submitted.
+;;; * An Aio belongs to one thread at a time.
+;;; * Remove a reactor source watching aio-poll-fd before aio-free closes it.
+;;;
+;;; Timeouts. By default each operation takes the socket's
+;;; set-recv-timeout-ms / set-send-timeout-ms as they stand when it is
+;;; submitted. aio-set-timeout overrides that for every later operation on
+;;; the slot.
+;;;
+;;; Since: Phase NG-B
+;; Asynchronous send/receive over an nng_aio (NG-B of the nng async plan).
+
+(defmodule nng/aio
+  (import nng/socket  :refer [Socket PollFd])
+  (import nng/payload :refer [Payload])
+  (export Aio
+          aio-alloc aio-free aio-set-timeout aio-cancel
+          send-payload-aio send-str-aio recv-aio
+          aio-wait aio-try-result aio-take-payload aio-take-str
+          aio-poll-fd)
+
+;;; Aio -- a linear handle to one asynchronous operation slot.
+;;;
+;;; Points at the spice's own box (c/nng/turnng_aio.c), not at a bare
+;;; nng_aio: the box is what frees failed sends, refuses a busy resubmit and
+;;; owns the completion fd. :linear, consumed only by aio-free.
+;;;
+;;; Since: Phase NG-B
+(defopaque Aio :ptr<void> :linear)
+
+;;; aio-alloc -- allocate an operation slot.
+;;;
+;;; Returns:
+;;;   (Result Aio int) -- err carries the nng error code (NNG_ENOMEM).
+;;;
+;;; Example:
+;;;   (let [a (ok-val (aio-alloc))]
+;;;     (recv-aio s a)
+;;;     (aio-wait a)
+;;;     (aio-free a))
+;;;
+;;; Since: Phase NG-B
+(defn aio-alloc [] : (Result Aio int)
+  ```c
+  extern void *turnng_aio_new(int *);
+  int rv = 0;
+  void *a = turnng_aio_new(&rv);
+  if (a == NULL) return tur_err_int((int64_t)rv);
+  return tur_ok_ptr(a);
+  ```)
+
+;;; aio-free -- release the slot. The single linear consumer.
+;;;
+;;; Safe with an operation still in flight: it is cancelled and waited for
+;;; first. Frees an untaken received message and closes the completion fd --
+;;; so remove any reactor source on aio-poll-fd before calling this.
+;;;
+;;; Parameters:
+;;;   a -- the slot, consumed
+;;;
+;;; Example:
+;;;   (aio-free a)
+;;;
+;;; Since: Phase NG-B
+(defn aio-free [a : Aio] : nil
+  ```c
+  extern void turnng_aio_free(void *);
+  turnng_aio_free((void *)(intptr_t)a);
+  ```)
+
+;;; aio-set-timeout -- the deadline for this slot's later operations.
+;;;
+;;; Persists across reuse. -2 restores the default (inherit the socket's
+;;; timeout), -1 waits forever, 0 polls, a positive value fails the operation
+;;; with NNG_ETIMEDOUT after that many milliseconds.
+;;;
+;;; Parameters:
+;;;   a  -- the slot (borrowed)
+;;;   ms -- milliseconds, or -2 / -1 / 0 as above
+;;;
+;;; Example:
+;;;   (aio-set-timeout a 100)
+;;;
+;;; Since: Phase NG-B
+(defn aio-set-timeout [^borrow a : Aio ms : int] : nil
+  ```c
+  extern void turnng_aio_set_timeout(void *, int64_t);
+  turnng_aio_set_timeout((void *)(intptr_t)a, ms);
+  ```)
+
+;;; aio-cancel -- ask an in-flight operation to stop.
+;;;
+;;; The operation then completes with NNG_ECANCELED (unless it finished
+;;; first); collect it as usual. The slot stays usable.
+;;;
+;;; Parameters:
+;;;   a -- the slot (borrowed)
+;;;
+;;; Example:
+;;;   (aio-cancel a)
+;;;   (aio-wait a)  ; => (err NNG_ECANCELED)
+;;;
+;;; Since: Phase NG-B
+(defn aio-cancel [^borrow a : Aio] : nil
+  ```c
+  extern void turnng_aio_cancel(void *);
+  turnng_aio_cancel((void *)(intptr_t)a);
+  ```)
+
+;; -------------------------------------------------------------------------
+;; Submits. An err means nothing was submitted (NNG_EBUSY: the slot is in
+;; flight; NNG_ENOMEM). An ok means the outcome arrives through a collector.
+;; -------------------------------------------------------------------------
+
+;;; send-payload-aio -- submit a send of a byte buffer.
+;;;
+;;; BORROWS the payload: its bytes are copied into the message before this
+;;; returns, so `b` is the caller's to free straight away.
+;;;
+;;; Parameters:
+;;;   s -- the socket (borrowed)
+;;;   a -- the slot (borrowed)
+;;;   b -- the payload (borrowed)
+;;;
+;;; Returns:
+;;;   (Result nil int) -- ok: submitted, collect with aio-wait / aio-try-result
+;;;   / aio-poll-fd; err: nothing submitted.
+;;;
+;;; Example:
+;;;   (send-payload-aio s a b)
+;;;
+;;; Since: Phase NG-B
+(defn send-payload-aio [^borrow s : Socket ^borrow a : Aio b : Payload]
+  #fx{Net}
+  : (Result nil int)
+  ```c
+  extern int turnng_aio_send_bytes(void *, uint32_t, uint32_t, int, const void *, size_t);
+  extern int64_t turnng_payload_len(const void *);
+  extern void   *turnng_payload_data(void *);
+  void   *data = turnng_payload_data((void *)(intptr_t)b);
+  size_t  len  = (size_t)turnng_payload_len((const void *)(intptr_t)b);
+  if (data == NULL) { data = (void *)""; len = 0; }
+  int rv = turnng_aio_send_bytes((void *)(intptr_t)a, (uint32_t)s, 0, 0, data, len);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int(0);
+  ```)
+
+;;; send-str-aio -- submit a send of a NUL-terminated string.
+;;;
+;;; The terminator is not sent. BORROWS msg.
+;;;
+;;; Parameters:
+;;;   s   -- the socket (borrowed)
+;;;   a   -- the slot (borrowed)
+;;;   msg -- the payload (borrowed)
+;;;
+;;; Returns:
+;;;   (Result nil int) -- ok: submitted; err: nothing submitted.
+;;;
+;;; Example:
+;;;   (send-str-aio s a "job:42")
+;;;
+;;; Since: Phase NG-B
+(defn send-str-aio [^borrow s : Socket ^borrow a : Aio msg : cstr]
+  #fx{Net}
+  : (Result nil int)
+  ```c
+  extern int turnng_aio_send_bytes(void *, uint32_t, uint32_t, int, const void *, size_t);
+  const char *p = (const char *)msg;
+  if (p == NULL) p = "";
+  int rv = turnng_aio_send_bytes((void *)(intptr_t)a, (uint32_t)s, 0, 0, p, strlen(p));
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int(0);
+  ```)
+
+;;; recv-aio -- submit a receive.
+;;;
+;;; After it completes successfully, take the message with aio-take-payload
+;;; or aio-take-str. An untaken message is freed by the next submit or by
+;;; aio-free.
+;;;
+;;; Parameters:
+;;;   s -- the socket (borrowed)
+;;;   a -- the slot (borrowed)
+;;;
+;;; Returns:
+;;;   (Result nil int) -- ok: submitted; err: nothing submitted.
+;;;
+;;; Example:
+;;;   (recv-aio s a)
+;;;
+;;; Since: Phase NG-B
+(defn recv-aio [^borrow s : Socket ^borrow a : Aio] #fx{Net} : (Result nil int)
+  ```c
+  extern int turnng_aio_recv(void *, uint32_t, uint32_t, int);
+  int rv = turnng_aio_recv((void *)(intptr_t)a, (uint32_t)s, 0, 0);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int(0);
+  ```)
+
+;; -------------------------------------------------------------------------
+;; Collectors. Each one that sees the operation finished also clears
+;; aio-poll-fd, so a reactor watching it does not fire again.
+;; -------------------------------------------------------------------------
+
+;;; aio-wait -- block until the operation finishes; its outcome.
+;;;
+;;; Returns at once if nothing was submitted or it already finished.
+;;;
+;;; Parameters:
+;;;   a -- the slot (borrowed)
+;;;
+;;; Returns:
+;;;   (Result nil int) -- ok, or err carrying the operation's nng error
+;;;   (NNG_ETIMEDOUT, NNG_ECANCELED, NNG_ECLOSED, NNG_ENOTSUP, ...).
+;;;
+;;; Example:
+;;;   (when (ok? (aio-wait a)) (aio-take-payload a))
+;;;
+;;; Since: Phase NG-B
+(defn aio-wait [^borrow a : Aio] : (Result nil int)
+  ```c
+  extern int turnng_aio_wait(void *);
+  int rv = turnng_aio_wait((void *)(intptr_t)a);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int(0);
+  ```)
+
+;;; aio-try-result -- the outcome if the operation has finished; never blocks.
+;;;
+;;; Parameters:
+;;;   a -- the slot (borrowed)
+;;;
+;;; Returns:
+;;;   (Option (Result nil int)) -- (none) while in flight; (some outcome)
+;;;   once finished.
+;;;
+;;; Example:
+;;;   (match (aio-try-result a)
+;;;     (Some r) (finish r)
+;;;     (None)   (do-other-work))
+;;;
+;;; Since: Phase NG-B
+(defn aio-try-result [^borrow a : Aio] : (Option (Result nil int))
+  ```c
+  extern int turnng_aio_try_result(void *);
+  int rv = turnng_aio_try_result((void *)(intptr_t)a);
+  if (rv < 0) return tur_none();
+  if (rv != 0) return tur_some_int(tur_err_int((int64_t)rv));
+  return tur_some_int(tur_ok_int(0));
+  ```)
+
+;;; aio-take-payload -- the received message, as an owned Payload.
+;;;
+;;; Detaches the message from the slot: a second take is NNG_ESTATE.
+;;;
+;;; Parameters:
+;;;   a -- the slot (borrowed)
+;;;
+;;; Returns:
+;;;   (Result Payload int) -- ok: a fresh Payload the caller releases with
+;;;   payload-free; err: the receive's own error, or NNG_ESTATE when there is
+;;;   nothing to take (not a receive, still in flight, already taken).
+;;;
+;;; Example:
+;;;   (let [r (aio-take-payload a)]
+;;;     (when (ok? r) (do (use (ok-val r)) (payload-free (ok-val r)))))
+;;;
+;;; Since: Phase NG-B
+(defn aio-take-payload [^borrow a : Aio] : (Result Payload int)
+  ```c
+  extern int turnng_aio_take_payload(void *, void **);
+  void *out = NULL;
+  int rv = turnng_aio_take_payload((void *)(intptr_t)a, &out);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_ptr(out);
+  ```)
+
+;;; aio-take-str -- the received message, as a malloc'd cstr.
+;;;
+;;; As aio-take-payload, for text; an interior NUL truncates, as in recv-str.
+;;;
+;;; Parameters:
+;;;   a -- the slot (borrowed)
+;;;
+;;; Returns:
+;;;   (Result cstr int) -- ok: a fresh string the caller frees; err as for
+;;;   aio-take-payload.
+;;;
+;;; Example:
+;;;   (println (ok-val (aio-take-str a)))
+;;;
+;;; Since: Phase NG-B
+(defn aio-take-str [^borrow a : Aio] : (Result cstr int)
+  ```c
+  extern int turnng_aio_take_str(void *, char **);
+  char *out = NULL;
+  int rv = turnng_aio_take_str((void *)(intptr_t)a, &out);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_ptr(out);
+  ```)
+
+;;; aio-poll-fd -- an fd that is readable while a finished operation awaits collection.
+;;;
+;;; Readable from completion until a collector sees the result, or until the
+;;; next submit. Register it for READ with reactor-add-fd, or park a fiber
+;;; on it with local-park-fd. Owned by the slot: aio-free closes it.
+;;;
+;;; Parameters:
+;;;   a -- the slot (borrowed)
+;;;
+;;; Returns:
+;;;   (Result PollFd int) -- err carries NNG_ENOMEM if the pipe could not be
+;;;   made.
+;;;
+;;; Example:
+;;;   (local-park-fd g (poll-fd->int (ok-val (aio-poll-fd a))) READ 2000)
+;;;
+;;; Since: Phase NG-B
+(defn aio-poll-fd [^borrow a : Aio] : (Result PollFd int)
+  ```c
+  extern int turnng_aio_fd(void *, int *);
+  int fd = -1;
+  int rv = turnng_aio_fd((void *)(intptr_t)a, &fd);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  return tur_ok_int((int64_t)fd);
+  ```)
+
+) ;; end defmodule nng/aio

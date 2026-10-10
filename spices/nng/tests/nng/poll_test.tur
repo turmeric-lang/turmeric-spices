@@ -1,0 +1,285 @@
+;; NG-A: poll fds and the non-blocking try-* calls -- the event-loop surface.
+;;
+;; Everything runs over `inproc://`, one name per case, as the other suites do.
+;;
+;; Two shapes recur and both are deliberate:
+;;
+;; * Every reactor case arms a guard timer that stops the loop. A regression
+;;   then FAILS the case instead of hanging the whole suite.
+;; * Messages are queued with PUB/SUB, not PUSH/PULL. Three blocking sends on
+;;   a PUSH whose PULL peer is not receiving yet park the only thread on the
+;;   third send (PULL buffers almost nothing), so a single-threaded test that
+;;   wants a backlog cannot build one that way. PUB never blocks; SUB needs a
+;;   short settle after subscribing (the slow-joiner rule pubsub_test.tur
+;;   documents).
+;;
+;; The drain case is the one the macOS (kqueue) leg exists for: kqueue reports
+;; the poll fd edge-style, so a callback that took one message per wakeup
+;; would stall with two still queued. On Linux (epoll, level-triggered) it
+;; passes either way.
+
+(defmodule nng/tests/poll (export)
+
+(import nng/socket  :refer [Socket
+                            pub-open sub-open push-open pull-open pair-open
+                            dial listen close set-recv-timeout-ms
+                            PollFd poll-fd->int recv-poll-fd send-poll-fd])
+(import nng/msg     :refer [send-str recv-str sub-subscribe
+                            try-send-str try-recv-str
+                            try-send-payload try-recv-payload])
+(import nng/payload :refer [Payload payload-of-cstr payload->cstr payload-free])
+(import reactor)
+(import test/suite  :refer [describe it])
+(import test/assert :refer [assert-true])
+(import test/runner :refer [run-all-status])
+
+;; NNG_ENOTSUP: the code a protocol gives for an operation it does not have.
+(def enotsup 9)
+
+;; How long a reactor case may run before its guard timer stops it.
+(def guard-ms 2000)
+
+(defn cstr-eq? [a : cstr b : cstr] : bool
+  ```c
+  #include <string.h>
+  return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+
+(defn cstr-free [p : cstr] : nil
+  ```c
+  free((void *)(intptr_t)p);
+  ```)
+
+(defn sleep-ms [ms : int] : nil
+  ```c
+  #include <time.h>
+  struct timespec ts;
+  ts.tv_sec  = ms / 1000;
+  ts.tv_nsec = (ms % 1000) * 1000000L;
+  nanosleep(&ts, NULL);
+  ```)
+
+;; The null user-data pointer.  Spelled out rather than `nil`: a `nil`
+;; argument for a ptr<void> parameter did not compile before turmeric's fix
+;; (nil-argument-to-ptr-param-emits-void-expression), and this suite has to
+;; build against the released compiler as well as main.
+(defn no-user-data [] : ptr<void> (:: 0 :ptr<void>))
+
+;; ok-none? / err-code? -- read a try-recv result without unwrapping it twice.
+(defn ok-none-str? [r : (Result (Option cstr) int)] : bool
+  (if (ok? r) (none? (ok-val r)) false))
+
+(defn ok-none-payload? [r : (Result (Option Payload) int)] : bool
+  (if (ok? r) (none? (ok-val r)) false))
+
+(defn err-is? [r : (Result (Option cstr) int) code : int] : bool
+  (if (err? r) (= (err-val r) code) false))
+
+;; drain -- take every message waiting on s with try-recv-str; return how many.
+;; The reactor recipe: never a blocking receive inside a callback.
+(defn drain [^borrow s : Socket n : int] : int
+  (let [r (try-recv-str s)]
+    (if (ok? r)
+      (match (ok-val r)
+        (Some m) (do (cstr-free m) (drain s (+ n 1)))
+        (None)   n)
+      n)))
+
+;; send-until-sent? -- retry try-send-str until the peer's pipe is up.
+(defn send-until-sent? [^borrow s : Socket msg : cstr tries : int] : bool
+  (if (<= tries 0)
+    false
+    (let [r (try-send-str s msg)]
+      (if (and (ok? r) (ok-val r))
+        true
+        (do (sleep-ms 5) (send-until-sent? s msg (- tries 1)))))))
+
+;; recv-is? -- a blocking receive (with the socket's timeout) that compares.
+(defn recv-is? [^borrow s : Socket expect : cstr] : bool
+  (let [r (recv-str s)]
+    (if (ok? r)
+      (let [got (ok-val r)
+            eq  (cstr-eq? got expect)]
+        (cstr-free got)
+        eq)
+      false)))
+
+;; ---- try-recv / try-send ----
+
+(defn empty-recv-is-none? [] : bool
+  (let [p (ok-val (pull-open))
+        _ (listen p "inproc://nga-empty")
+        a (ok-none-str? (try-recv-str p))
+        b (ok-none-payload? (try-recv-payload p))]
+    (close p)
+    (and a b)))
+
+;; A PUB cannot receive: that is an err, never mistaken for "nothing yet".
+(defn recv-on-pub-is-err? [] : bool
+  (let [p   (ok-val (pub-open))
+        res (err-is? (try-recv-str p) enotsup)]
+    (close p)
+    res))
+
+;; No peer at all: the send would block, so it is (ok false), not an err.
+(defn send-without-peer-is-false? [] : bool
+  (let [p   (ok-val (push-open))
+        _   (listen p "inproc://nga-nopeer")
+        r   (try-send-str p "nobody")
+        res (if (ok? r) (not (ok-val r)) false)]
+    (close p)
+    res))
+
+(defn try-send-round-trip? [] : bool
+  (let [a  (ok-val (pair-open))
+        b  (ok-val (pair-open))
+        _  (listen a "inproc://nga-pair")
+        _  (dial b "inproc://nga-pair")
+        _  (set-recv-timeout-ms a 2000)
+        ok (send-until-sent? b "hello" 200)
+        rx (recv-is? a "hello")]
+    (close b)
+    (close a)
+    (and ok rx)))
+
+(defn try-payload-round-trip? [] : bool
+  (let [a  (ok-val (pair-open))
+        b  (ok-val (pair-open))
+        _  (listen a "inproc://nga-payload")
+        _  (dial b "inproc://nga-payload")
+        p  (payload-of-cstr "bytes")
+        s  (try-send-payload b p)]
+    (sleep-ms 50)
+    (let [r   (try-recv-payload a)
+          res (if (and (ok? s) (ok? r))
+                (match (ok-val r)
+                  (Some got) (let [txt (payload->cstr got)
+                                   eq  (cstr-eq? txt "bytes")]
+                               (cstr-free txt)
+                               (payload-free got)
+                               eq)
+                  (None)     false)
+                false)]
+      (payload-free p)
+      (close b)
+      (close a)
+      res)))
+
+;; ---- poll fds ----
+
+(defn poll-fd-unsupported? [] : bool
+  (let [pub (ok-val (pub-open))
+        sub (ok-val (sub-open))
+        a   (recv-poll-fd pub)
+        b   (send-poll-fd sub)
+        res (and (err? a) (= (err-val a) enotsup)
+                 (err? b) (= (err-val b) enotsup))]
+    (close sub)
+    (close pub)
+    res))
+
+(defn poll-fd-supported? [] : bool
+  (let [sub (ok-val (sub-open))
+        r   (recv-poll-fd sub)
+        res (if (ok? r) (>= (poll-fd->int (ok-val r)) 0) false)]
+    (close sub)
+    res))
+
+;; ---- reactor integration ----
+
+(def ^mut drained 0)
+
+;; Three messages are queued before the loop runs; ONE readable callback must
+;; take all three.
+(defn reactor-drains-backlog? [] : bool
+  (let [pub (ok-val (pub-open))
+        sub (ok-val (sub-open))
+        _   (listen pub "inproc://nga-drain")
+        _   (dial sub "inproc://nga-drain")
+        _   (sub-subscribe sub "")]
+    (sleep-ms 100)
+    (set! drained 0)
+    ;; Bind each send's result rather than discarding it: a Result dropped in
+    ;; statement position leaks its box today (turmeric's open
+    ;; carrier-sum-option-boxes-have-no-owner), which a sanitized tur's
+    ;; LeakSanitizer turns into a failed suite.
+    (let [s1 (send-str pub "a")
+          s2 (send-str pub "b")
+          s3 (send-str pub "c")
+          _  (do (sleep-ms 50) 0)
+          sent (and (ok? s1) (ok? s2) (ok? s3))
+          fd (ok-val (recv-poll-fd sub))
+          r  (reactor-new)]
+      (reactor-add-fd r (poll-fd->int fd) READ
+        (fn [id events user] : nil
+          (do (set! drained (drain sub drained))
+              (when (>= drained 3) (reactor-stop r))))
+        (no-user-data))
+      (reactor-add-timer r guard-ms
+        (fn [id user] : nil (reactor-stop r))
+        (no-user-data))
+      (reactor-run r)
+      (reactor-free r)
+      (close sub)
+      (close pub)
+      (and sent (= drained 3)))))
+
+(def ^mut flushed 0)
+
+;; The send fd is READABLE when a send would not block: a READ callback on it
+;; flushes with try-send-str, and the peer receives what it sent.
+(defn reactor-send-fd-flushes? [] : bool
+  (let [push (ok-val (push-open))
+        pull (ok-val (pull-open))
+        _    (listen pull "inproc://nga-sendfd")
+        _    (dial push "inproc://nga-sendfd")
+        _    (set-recv-timeout-ms pull 2000)]
+    (set! flushed 0)
+    (let [fd (ok-val (send-poll-fd push))
+          r  (reactor-new)]
+      (reactor-add-fd r (poll-fd->int fd) READ
+        (fn [id events user] : nil
+          (let [s (try-send-str push "flushed")]
+            (when (and (ok? s) (ok-val s))
+              (do (set! flushed 1) (reactor-stop r)))))
+        (no-user-data))
+      (reactor-add-timer r guard-ms
+        (fn [id user] : nil (reactor-stop r))
+        (no-user-data))
+      (reactor-run r)
+      (reactor-free r)
+      (let [rx (recv-is? pull "flushed")]
+        (close push)
+        (close pull)
+        (and (= flushed 1) rx)))))
+
+(defn __all-tests [] : void
+  (describe "nng/msg -- non-blocking receive and send"
+    (it "try-recv on an empty queue is (ok (none)), immediately"
+      (assert-true (empty-recv-is-none?)))
+    (it "try-recv on a PUB socket is an err (NNG_ENOTSUP), not (none)"
+      (assert-true (recv-on-pub-is-err?)))
+    (it "try-send with no peer is (ok false)"
+      (assert-true (send-without-peer-is-false?)))
+    (it "try-send-str reaches the peer"
+      (assert-true (try-send-round-trip?)))
+    (it "try-send-payload / try-recv-payload round-trip"
+      (assert-true (try-payload-round-trip?))))
+
+  (describe "nng/socket -- poll fds"
+    (it "recv-poll-fd on PUB and send-poll-fd on SUB are NNG_ENOTSUP"
+      (assert-true (poll-fd-unsupported?)))
+    (it "recv-poll-fd on SUB is a valid descriptor"
+      (assert-true (poll-fd-supported?))))
+
+  (describe "nng + tur/reactor"
+    (it "one readable callback drains a three-message backlog"
+      (assert-true (reactor-drains-backlog?)))
+    (it "the send fd's READ callback flushes with try-send"
+      (assert-true (reactor-send-fd-flushes?)))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule nng/tests/poll
