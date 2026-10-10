@@ -1,0 +1,299 @@
+;; conformance.tur -- James Clark's xmltest from the W3C XML Conformance Test
+;; Suite (xmlts20130923), run by fixtures/run.sh after it fetches the suite.
+;;
+;; The suite is NOT vendored: xmltest's licence permits redistributing only
+;; the unmodified archive ("permission to distribute the collection in any
+;; other form is not granted"), so fixtures/run.sh downloads the official
+;; W3C tarball, checks its SHA-256, and unpacks it under fixtures/.xmlconf/
+;; (gitignored). This program reads it from there:
+;;
+;;   valid/sa  -- every document must parse, and its event stream, written out
+;;                as James Clark's canonical XML, must match valid/sa/out/
+;;                byte for byte. That checks entity expansion, attribute
+;;                defaulting from the internal subset, character references,
+;;                line-end normalization, CDATA, PIs and UTF-16 input, not just
+;;                "did it parse".
+;;   not-wf/sa -- every document must be rejected.
+;;
+;; xmltest predates XML Namespaces (valid/sa/012 has an attribute named ":"),
+;; so the suite runs with namespace processing off.
+
+(defmodule conformance_fixture (export)
+
+(import dom/ownstr :refer [String to-cstr])
+(import dom/event  :refer [SaxEvent SaxControl Attr StartElement EndElement
+                           Chars Comment Pi StartCdata EndCdata Doctype
+                           Continue Stop])
+(import xml/sax    :refer [ParseOpts default-parse-opts sax-parse-file-opts])
+(import test/suite  :refer [describe it])
+(import test/assert :refer [assert-true assert-eq])
+(import test/runner :refer [run-all-status])
+
+;; ---------------------------------------------------------------------------
+;; A canonical-XML writer over a C buffer.
+;; ---------------------------------------------------------------------------
+
+;;; __cb-reset -- clear the output buffer and pending attributes.
+(defn __cb-reset [] : nil
+  ```c
+  /* __tur_include__: #include <stddef.h> */
+  /* __tur_include__: static char *g_cb = 0; */
+  /* __tur_include__: static size_t g_cb_len = 0, g_cb_cap = 0; */
+  /* __tur_include__: static char **g_ca = 0; */
+  /* __tur_include__: static size_t g_ca_len = 0, g_ca_cap = 0; */
+  g_cb_len = 0;
+  if (g_cb) g_cb[0] = '\0';
+  for (size_t i = 0; i < g_ca_len; i++) free(g_ca[i]);
+  g_ca_len = 0;
+  ```)
+
+;;; __cb-put -- append raw bytes.
+(defn __cb-put [s : cstr] : nil
+  ```c
+  size_t n = strlen((const char *)s);
+  if (g_cb_len + n + 1 > g_cb_cap) {
+    size_t cap = g_cb_cap ? g_cb_cap : 1024;
+    while (cap < g_cb_len + n + 1) cap *= 2;
+    g_cb = (char *)realloc(g_cb, cap);
+    g_cb_cap = cap;
+  }
+  memcpy(g_cb + g_cb_len, s, n);
+  g_cb_len += n;
+  g_cb[g_cb_len] = '\0';
+  ```)
+
+;;; __cb-esc -- append s escaped.
+(defn __cb-esc [s : cstr] : nil
+  ```c
+  const unsigned char *p = (const unsigned char *)s;
+  size_t n = strlen((const char *)s);
+  for (size_t i = 0; i < n; i++) {
+    char one[2] = { (char)p[i], 0 };
+    const char *r = one;
+    switch (p[i]) {
+      case '&': r = "&amp;"; break;
+      case '<': r = "&lt;"; break;
+      case '>': r = "&gt;"; break;
+      case '"': r = "&quot;"; break;
+      case 9: r = "&#9;"; break;
+      case 10: r = "&#10;"; break;
+      case 13: r = "&#13;"; break;
+      default: break;
+    }
+    size_t k = strlen(r);
+    if (g_cb_len + k + 1 > g_cb_cap) {
+      size_t cap = g_cb_cap ? g_cb_cap : 1024;
+      while (cap < g_cb_len + k + 1) cap *= 2;
+      g_cb = (char *)realloc(g_cb, cap);
+      g_cb_cap = cap;
+    }
+    memcpy(g_cb + g_cb_len, r, k);
+    g_cb_len += k;
+    g_cb[g_cb_len] = '\0';
+  }
+  ```)
+
+;;; __cb-attr -- stage one attribute as ` name="escaped value"`.
+(defn __cb-attr [name : cstr value : cstr] : nil
+  ```c
+  const unsigned char *p = (const unsigned char *)value;
+  size_t n = strlen((const char *)value), nl = strlen((const char *)name);
+  char *a = (char *)malloc(nl + n * 6 + 5);
+  size_t o = 0;
+  a[o++] = ' ';
+  memcpy(a + o, name, nl); o += nl;
+  a[o++] = '='; a[o++] = '"';
+  for (size_t i = 0; i < n; i++) {
+    const char *r = 0;
+    switch (p[i]) {
+      case '&': r = "&amp;"; break;
+      case '<': r = "&lt;"; break;
+      case '>': r = "&gt;"; break;
+      case '"': r = "&quot;"; break;
+      case 9: r = "&#9;"; break;
+      case 10: r = "&#10;"; break;
+      case 13: r = "&#13;"; break;
+      default: break;
+    }
+    if (r) { size_t k = strlen(r); memcpy(a + o, r, k); o += k; }
+    else a[o++] = (char)p[i];
+  }
+  a[o++] = '"';
+  a[o] = '\0';
+  if (g_ca_len == g_ca_cap) {
+    g_ca_cap = g_ca_cap ? g_ca_cap * 2 : 8;
+    g_ca = (char **)realloc(g_ca, g_ca_cap * sizeof(char *));
+  }
+  g_ca[g_ca_len++] = a;
+  ```)
+
+;;; __cb-attrs-flush -- append the staged attributes in name order.
+(defn __cb-attrs-flush [] : nil
+  ```c
+  /* " name=..." -- comparing whole strings orders by name, since '=' sorts
+     below every name character. */
+  for (size_t i = 1; i < g_ca_len; i++)
+    for (size_t j = i; j > 0 && strcmp(g_ca[j - 1], g_ca[j]) > 0; j--) {
+      char *t = g_ca[j]; g_ca[j] = g_ca[j - 1]; g_ca[j - 1] = t;
+    }
+  for (size_t i = 0; i < g_ca_len; i++) {
+    size_t k = strlen(g_ca[i]);
+    if (g_cb_len + k + 1 > g_cb_cap) {
+      size_t cap = g_cb_cap ? g_cb_cap : 1024;
+      while (cap < g_cb_len + k + 1) cap *= 2;
+      g_cb = (char *)realloc(g_cb, cap);
+      g_cb_cap = cap;
+    }
+    memcpy(g_cb + g_cb_len, g_ca[i], k);
+    g_cb_len += k;
+    g_cb[g_cb_len] = '\0';
+    free(g_ca[i]);
+  }
+  g_ca_len = 0;
+  ```)
+
+;;; __cb-equals-file? -- does the buffer hold exactly the file's bytes?
+(defn __cb-equals-file? [path : cstr] : bool
+  ```c
+  #include <stdio.h>
+  FILE *f = fopen((const char *)path, "rb");
+  if (!f) return false;
+  char *buf = (char *)malloc(1 << 16);
+  size_t n = fread(buf, 1, 1 << 16, f);
+  fclose(f);
+  bool eq = n == g_cb_len && memcmp(buf, g_cb ? g_cb : "", n) == 0;
+  free(buf);
+  return eq;
+  ```)
+
+;;; __stage-attrs -- stage a StartElement's attributes.
+(defn __stage-attrs [xs : (Cons Attr)] : nil
+  (if (tnil? xs)
+    nil
+    (do (__cb-attr (to-cstr (.name (thead xs))) (to-cstr (.value (thead xs))))
+        (__stage-attrs (ttail xs)))))
+
+;;; canon -- the handler: one event's canonical form into the buffer.
+(defn canon [e : SaxEvent] : SaxControl
+  (match e
+    (StartElement n as) (do (__cb-put "<") (__cb-put (to-cstr n))
+                            (__stage-attrs as) (__cb-attrs-flush)
+                            (__cb-put ">") (Continue))
+    (EndElement n)      (do (__cb-put "</") (__cb-put (to-cstr n)) (__cb-put ">")
+                            (Continue))
+    (Chars t)           (do (__cb-esc (to-cstr t)) (Continue))
+    (Pi t d)            (do (__cb-put "<?") (__cb-put (to-cstr t)) (__cb-put " ")
+                            (__cb-put (to-cstr d)) (__cb-put "?>") (Continue))
+    (Comment _)         (Continue)
+    (StartCdata)        (Continue)
+    (EndCdata)          (Continue)
+    (Doctype _ _ _)     (Continue)))
+
+;; ---------------------------------------------------------------------------
+;; Directory walking.
+;; ---------------------------------------------------------------------------
+
+;;; __dir-count -- how many *.xml files are in dir (sorted listing is cached).
+(defn __dir-load [dir : cstr] : int
+  ```c
+  #include <dirent.h>
+  /* __tur_include__: static char **g_dir = 0; */
+  /* __tur_include__: static size_t g_dir_len = 0; */
+  for (size_t i = 0; i < g_dir_len; i++) free(g_dir[i]);
+  free(g_dir); g_dir = 0; g_dir_len = 0;
+  DIR *d = opendir((const char *)dir);
+  if (!d) return 0;
+  size_t cap = 0;
+  struct dirent *de;
+  while ((de = readdir(d))) {
+    size_t n = strlen(de->d_name);
+    if (n < 5 || strcmp(de->d_name + n - 4, ".xml") != 0) continue;
+    if (g_dir_len == cap) { cap = cap ? cap * 2 : 64; g_dir = (char **)realloc(g_dir, cap * sizeof(char *)); }
+    g_dir[g_dir_len++] = strdup(de->d_name);
+  }
+  closedir(d);
+  for (size_t i = 1; i < g_dir_len; i++)
+    for (size_t j = i; j > 0 && strcmp(g_dir[j - 1], g_dir[j]) > 0; j--) {
+      char *t = g_dir[j]; g_dir[j] = g_dir[j - 1]; g_dir[j - 1] = t;
+    }
+  return (int64_t)g_dir_len;
+  ```)
+
+;;; __dir-path -- dir + "/" + the i-th file name (malloc'd).
+(defn __dir-path [dir : cstr i : int] : cstr
+  ```c
+  size_t a = strlen((const char *)dir), b = strlen(g_dir[i]);
+  char *p = (char *)malloc(a + b + 2);
+  memcpy(p, dir, a); p[a] = '/'; memcpy(p + a + 1, g_dir[i], b + 1);
+  return p;
+  ```)
+
+;;; __report -- print a failing file name to stderr.
+(defn __report [what : cstr path : cstr] : nil
+  ```c
+  #include <stdio.h>
+  fprintf(stderr, "# %s: %s\n", what, path);
+  ```)
+
+;;; opts -- XML 1.0 without Namespaces, as xmltest expects.
+(defn opts [] : ParseOpts
+  (with (default-parse-opts) [namespaces false]))
+
+;;; __second-form? -- does the i-th valid/sa document's expected output use
+;;; the SECOND canonical form (notation declarations in a DOCTYPE)? The event
+;;; API deliberately does not report notations, so those four are out of
+;;; scope; they still have to parse.
+(defn __second-form? [i : int] : bool
+  ```c
+  const char *n = g_dir[i];
+  return strcmp(n, "069.xml") == 0 || strcmp(n, "076.xml") == 0 ||
+         strcmp(n, "090.xml") == 0 || strcmp(n, "091.xml") == 0;
+  ```)
+
+;;; valid-loop -- count valid/sa documents whose canonical form matches.
+(defn valid-loop [dir : cstr outdir : cstr i : int n : int ok : int] : int
+  (if (>= i n)
+    ok
+    (let [path (__dir-path dir i)
+          want (__dir-path outdir i)
+          skip (__second-form? i)]
+      (__cb-reset)
+      (match (sax-parse-file-opts path (opts) canon)
+        (Ok _)  (if (or skip (__cb-equals-file? want))
+                  (valid-loop dir outdir (+ i 1) n (+ ok 1))
+                  (do (__report "canonical mismatch" path)
+                      (valid-loop dir outdir (+ i 1) n ok)))
+        (Err _) (do (__report "rejected a valid document" path)
+                    (valid-loop dir outdir (+ i 1) n ok))))))
+
+;;; ignore -- a handler that accepts every event.
+(defn ignore [e : SaxEvent] : SaxControl (Continue))
+
+;;; notwf-loop -- count not-wf/sa documents that are rejected.
+(defn notwf-loop [dir : cstr i : int n : int ok : int] : int
+  (if (>= i n)
+    ok
+    (let [path (__dir-path dir i)]
+      (match (sax-parse-file-opts path (opts) ignore)
+        (Ok _)  (do (__report "accepted a not-well-formed document" path)
+                    (notwf-loop dir (+ i 1) n ok))
+        (Err _) (notwf-loop dir (+ i 1) n (+ ok 1))))))
+
+(defn __all-tests [] : void
+  (describe "xmltest valid/sa -- canonical output matches"
+    (let [n (__dir-load "fixtures/.xmlconf/xmlconf/xmltest/valid/sa")]
+      (it "finds the suite's documents" (= n 120))
+      (it "every document parses to its canonical form"
+        (assert-eq n (valid-loop "fixtures/.xmlconf/xmlconf/xmltest/valid/sa"
+                                 "fixtures/.xmlconf/xmlconf/xmltest/valid/sa/out" 0 n 0)))))
+  (describe "xmltest not-wf/sa -- every document is rejected"
+    (let [n (__dir-load "fixtures/.xmlconf/xmlconf/xmltest/not-wf/sa")]
+      (it "finds the suite's documents" (= n 186))
+      (it "every document is rejected"
+        (assert-eq n (notwf-loop "fixtures/.xmlconf/xmlconf/xmltest/not-wf/sa" 0 n 0))))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule conformance_test

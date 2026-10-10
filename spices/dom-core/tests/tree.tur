@@ -1,0 +1,213 @@
+;; tree.tur -- dom-core on its own: trees built by hand through the C builder
+;; (the same entry points tur-xml and tur-html use), so the node API, the
+;; serializer's two flavors and the iterative walks are tested without either
+;; parser.
+
+(defmodule dom_core_tree_test (export)
+
+(import dom/ownstr :refer [String from-cstr to-cstr release str-len string=?
+                           retain])
+(import dom/core   :refer [Document Node dom-root dom-node dom-free
+                           dom-serialize dom-equal? dom-node-count
+                           dom-live-bytes node-text node-name node-attr
+                           node-depth find-all find-first node-children
+                           node-matches?])
+(import dom/event  :refer [SaxEvent SaxControl Attr StartElement Chars
+                           Continue Stop sax-event-release sax-dispatch
+                           attrs-get])
+(import test/suite  :refer [describe it])
+(import test/assert :refer [assert-true assert-eq])
+(import test/runner :refer [run-all-status])
+
+;; ---- building trees through the C API --------------------------------------
+
+;;; __html-doc -- an HTML-flavored tree exercising the serializer's rules.
+(defn __html-doc [] : ptr<void>
+  ```c
+  extern void *turdom_doc_new(int);
+  extern void *turdom_doc_node(void *);
+  extern void *turdom_append_element(void *, void *, const char *, const char *,
+                                     const char *, int64_t, int64_t);
+  extern void turdom_add_attr(void *, void *, const char *, const char *,
+                              const char *, const char *, size_t);
+  extern void *turdom_append_chars(void *, void *, int, const char *, size_t,
+                                   int64_t, int64_t);
+  extern void *turdom_append_doctype(void *, void *, const char *, const char *,
+                                     const char *, int64_t, int64_t);
+  const char *H = "http://www.w3.org/1999/xhtml";
+  void *d = turdom_doc_new(1);
+  void *top = turdom_doc_node(d);
+  turdom_append_doctype(d, top, "html", NULL, NULL, 0, 0);
+  void *html = turdom_append_element(d, top, "html", H, "html", 0, 0);
+  void *body = turdom_append_element(d, html, "body", H, "body", 0, 0);
+  void *p = turdom_append_element(d, body, "p", H, "p", 0, 0);
+  turdom_add_attr(d, p, "title", NULL, "title", "a\"b&c\xC2\xA0<d>", strlen("a\"b&c\xC2\xA0<d>"));
+  turdom_append_chars(d, p, 2, "1 < 2 & 3\xC2\xA0x", strlen("1 < 2 & 3\xC2\xA0x"), 0, 0);
+  turdom_append_element(d, body, "br", H, "br", 0, 0);
+  void *s = turdom_append_element(d, body, "script", H, "script", 0, 0);
+  turdom_append_chars(d, s, 2, "if (a < b && c) {}", 18, 0, 0);
+  void *svg = turdom_append_element(d, body, "svg", "http://www.w3.org/2000/svg", "svg", 0, 0);
+  turdom_append_element(d, svg, "circle", "http://www.w3.org/2000/svg", "circle", 0, 0);
+  turdom_append_chars(d, body, 3, " note ", 6, 0, 0);
+  return (void *)d;
+  ```)
+
+;;; __deep-doc -- an XML-flavored chain `depth` elements deep.
+(defn __deep-doc [depth : int] : ptr<void>
+  ```c
+  extern void *turdom_doc_new(int);
+  extern void *turdom_doc_node(void *);
+  extern void *turdom_append_element(void *, void *, const char *, const char *,
+                                     const char *, int64_t, int64_t);
+  extern void *turdom_append_chars(void *, void *, int, const char *, size_t,
+                                   int64_t, int64_t);
+  void *d = turdom_doc_new(0);
+  void *at = turdom_doc_node(d);
+  for (int64_t i = 0; i < depth; i++)
+    at = turdom_append_element(d, at, "d", NULL, NULL, 0, 0);
+  turdom_append_chars(d, at, 2, "bottom", 6, 0, 0);
+  return (void *)d;
+  ```)
+
+;;; __ns-doc -- an XML tree with a namespaced element and attribute.
+(defn __ns-doc [] : ptr<void>
+  ```c
+  extern void *turdom_doc_new(int);
+  extern void *turdom_doc_node(void *);
+  extern void *turdom_append_element(void *, void *, const char *, const char *,
+                                     const char *, int64_t, int64_t);
+  extern void turdom_add_attr(void *, void *, const char *, const char *,
+                              const char *, const char *, size_t);
+  void *d = turdom_doc_new(0);
+  void *r = turdom_append_element(d, turdom_doc_node(d), "a:r", "urn:a", "r", 1, 1);
+  turdom_add_attr(d, r, "xmlns:a", NULL, NULL, "urn:a", 5);
+  turdom_add_attr(d, r, "a:k", "urn:a", "k", "v", 1);
+  turdom_append_element(d, r, "a:item", "urn:a", "item", 1, 20);
+  turdom_append_element(d, r, "item", NULL, NULL, 1, 30);
+  return (void *)d;
+  ```)
+
+;;; as-doc -- a raw tree pointer as a Document.
+(defn as-doc [p : ptr<void>] : Document (:: p Document))
+
+;;; __eq? -- byte equality, printing both on a mismatch.
+(defn __eq? [got : cstr want : cstr] : bool
+  ```c
+  #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+
+;;; ser-is? -- does dom-serialize give exactly `want`?
+(defn ser-is? [n : Node want : cstr] : bool
+  (let [s  (dom-serialize n)
+        ok (__eq? (to-cstr s) want)]
+    (release s)
+    ok))
+
+;;; __html-want -- the expected HTML serialization (built in C: non-ASCII).
+(defn __html-want [] : cstr
+  ```c
+  return "<!DOCTYPE html><html><body>"
+         "<p title=\"a&quot;b&amp;c&nbsp;&lt;d&gt;\">1 &lt; 2 &amp; 3&nbsp;x</p>"
+         "<br><script>if (a < b && c) {}</script>"
+         "<svg><circle></circle></svg><!-- note --></body></html>";
+  ```)
+
+;;; deepest -- follow first children to the bottom.
+(defn deepest [n : Node] : Node
+  (match (find-first n "d")
+    (Some c) (deepest c)
+    (None)   n))
+
+(defn __all-tests [] : void
+  (describe "dom/core -- HTML serialization"
+    (let [d (as-doc (__html-doc))]
+      (it "follows the fragment serialization algorithm"
+        (ser-is? (dom-node d) (__html-want)))
+      (it "matches element names ignoring ASCII case in an HTML document"
+        (match (dom-root d)
+          (Some r) (and (node-matches? r "HTML") (assert-eq 1 (tlength (find-all r "BR"))))
+          (None) false))
+      (it "matches attributes ignoring ASCII case in an HTML document"
+        (match (find-first (dom-node d) "p")
+          (Some p) (match (node-attr p "TITLE") (Some _) true (None) false)
+          (None) false))
+      (dom-free d)))
+
+  (describe "dom/core -- namespaces"
+    (let [d (as-doc (__ns-doc))]
+      (it "find-all by Clark name skips the unnamespaced twin"
+        (assert-eq 1 (tlength (find-all (dom-node d) "{urn:a}item"))))
+      (it "find-all by qualified name as written"
+        (and (assert-eq 1 (tlength (find-all (dom-node d) "a:item")))
+             (assert-eq 1 (tlength (find-all (dom-node d) "item")))))
+      (it "node-attr by Clark name"
+        (match (dom-root d)
+          (Some r) (match (node-attr r "{urn:a}k") (Some v) (__eq? v "v") (None) false)
+          (None) false))
+      (it "XML serialization keeps prefixes and self-closes empty elements"
+        (ser-is? (dom-node d) "<a:r xmlns:a=\"urn:a\" a:k=\"v\"><a:item/><item/></a:r>"))
+      (dom-free d)))
+
+  (describe "dom/core -- walks never recurse on depth"
+    (let [d (as-doc (__deep-doc 200000))]
+      (it "builds a 200000-deep tree"
+        (assert-eq 200001 (dom-node-count d)))
+      (it "node-text reaches the bottom"
+        (let [t (node-text (dom-node d))
+              ok (string=? t "bottom")]
+          (release t)
+          ok))
+      (it "serializes it (and the serialization has the right length)"
+        (let [s (dom-serialize (dom-node d))
+              n (str-len s)]
+          (release s)
+          ;; 200000 x "<d>" + "bottom" + 200000 x "</d>"
+          (assert-eq (+ (* 200000 7) 6) n)))
+      (it "find-all visits every element"
+        (assert-eq 200000 (tlength (find-all (dom-node d) "d"))))
+      (it "compares equal to itself"
+        (dom-equal? (dom-node d) (dom-node d)))
+      (it "node-depth of the text at the bottom"
+        (match (find-first (dom-node d) "d")
+          (Some _) true
+          (None) false))
+      (dom-free d)))
+
+  (describe "dom/core -- arena accounting"
+    (it "dom-free returns every arena byte"
+      (let [before (dom-live-bytes)
+            d      (as-doc (__deep-doc 1000))
+            during (dom-live-bytes)]
+        (dom-free d)
+        (and (> during before) (= before (dom-live-bytes))))))
+
+  (describe "dom/event and dom/ownstr"
+    (it "attrs-get finds by name, none when absent"
+      (let [xs (tcons-of (Attr (from-cstr "a") (from-cstr "1"))
+                         (tcons-of (Attr (from-cstr "b") (from-cstr "2")) (tnil)))]
+        (and (match (attrs-get xs "b") (Some v) (string=? v "2") (None) false)
+             (match (attrs-get xs "c") (Some _) false (None) true))))
+    (it "sax-dispatch calls the handler"
+      (match (sax-dispatch (fn [e : SaxEvent] : SaxControl (Stop)) (Chars (from-cstr "x")))
+        (Stop) true
+        (Continue) false))
+    (it "string=? compares bytes, not prefixes"
+      (let [s (from-cstr "item")]
+        (and (string=? s "item")
+             (and (not (string=? s "ite")) (not (string=? s "items"))))))
+    (it "retain keeps a String alive across a release"
+      (let [s (from-cstr "kept")
+            t (retain s)]
+        (release s)
+        (let [ok (string=? t "kept")]
+          (release t)
+          ok)))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule dom_core_tree_test
