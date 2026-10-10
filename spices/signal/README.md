@@ -8,7 +8,7 @@ oscillators, filters, shapers, ADSR envelopes, and SF-pipeline composition.
 ## Status
 
 The Tier 1 surface ships and runs end-to-end against turmeric `main`.
-All six modules `tur check` clean, all five examples run and print the
+All seven modules `tur check` clean, all six examples run and print the
 values in their comments, and the full `tests/signal/` suite passes:
 
 ```
@@ -17,10 +17,11 @@ PASS test_compose
 PASS test_core
 PASS test_envelope
 PASS test_filter
+PASS test_hf_osc
 PASS test_osc
 PASS test_shaper
-......
-6 tests, 6 passed, 0 failed
+.......
+7 tests, 7 passed, 0 failed
 ```
 
 This is the surface area an honest version of the previous spice would
@@ -84,6 +85,7 @@ A few constructors need a specific call shape:
 |-------------------|------------------------------------------------------------------------------------------|
 | `signal/core`     | `constant`, `time-signal`, `sample`, `map-signal`, `pair-signals`                        |
 | `signal/osc`      | `sine`, `square`, `sawtooth`, `triangle`                                                 |
+| `signal/hf-osc`   | `hf-sawtooth`, `hf-square`, `hf-triangle` -- band-limited, for hearing-range pitches     |
 | `signal/filter`   | `low-pass`, `high-pass`                                                                  |
 | `signal/shaper`   | `gain`, `offset`, `invert`, `abs-sf`, `scale`, `saturate-tanh`, `hard-clip`, `clip`, `mix`, `add`, `multiply` |
 | `signal/envelope` | `ADSRParams`, `adsr-fixed`, `adsr-gen`                                                   |
@@ -109,6 +111,22 @@ Each oscillator is an `SF () Sample` -- it ignores its input signal.
 | `square freq duty` | `+1` for the on-portion of each cycle, `-1` otherwise |
 | `sawtooth freq` | rising ramp in `[0, 1)` |
 | `triangle freq` | rises `-1 -> 1` then falls `1 -> -1` each cycle |
+
+These are the *naive* shapes: right for control signals (LFOs), but they alias
+at audio rate. For hearing-range pitches use `signal/hf-osc`.
+
+### `signal/hf-osc`
+
+Band-limited oscillators (PolyBLEP / PolyBLAMP) for hearing-range pitches. Each
+takes the **sample rate** the signal will be sampled at, so it can size the edge
+correction to one sample period. See the guide's section 2b for the measured
+aliasing reduction.
+
+| Symbol | Produces |
+|---|---|
+| `hf-sawtooth freq sample-rate` | rising ramp in `[-1, 1)` (bipolar), step smoothed |
+| `hf-square freq duty sample-rate` | `+1` / `-1`, both edges smoothed |
+| `hf-triangle freq sample-rate` | rises `-1 -> 1` then falls, corners smoothed |
 
 ### `signal/filter`
 
@@ -215,7 +233,7 @@ Then `tur fetch`.
 
 ## Examples
 
-Five runnable, per-phase examples live under `examples/`:
+Six runnable, per-phase examples live under `examples/`:
 
 ```sh
 cd spices/signal
@@ -224,6 +242,7 @@ tur run examples/02_oscillators.tur           # sine/square/sawtooth/triangle
 tur run examples/03_filters_and_shapers.tur   # filters + scalar shapers
 tur run examples/04_envelopes.tur             # ADSR
 tur run examples/05_simple_voice.tur          # capstone: every module wired together
+tur run examples/06_hf_oscillators.tur        # naive vs band-limited sawtooth at 7.9 kHz
 ```
 
 Each prints sample values that match the hand-computed references in its

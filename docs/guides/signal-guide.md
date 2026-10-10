@@ -1,7 +1,7 @@
 ---
 title: Signal Processing with Typed Signal Functions
 category: Audio
-description: Oscillators, filters, shapers, ADSR envelopes, and SF-pipeline composition -- a typed Signal/SF abstraction for building audio DSP graphs
+description: Oscillators (LFO and band-limited audio-rate), filters, shapers, ADSR envelopes, and SF-pipeline composition -- a typed Signal/SF abstraction for building audio DSP graphs
 audience: developers building audio synthesis, DSP pipelines, or signal-driven applications in Turmeric
 since: signal v0.1.0
 ---
@@ -14,10 +14,11 @@ sculpts its loudness over time. This spice models that pipeline as typed
 Signal Functions -- closures you compose left-to-right, sample at a time
 you choose, and test without a sound card.
 
-This guide walks the five things you will do most often:
+This guide walks the six things you will do most often:
 
 1. [Signals and sampling](#1-signals)
 2. [Oscillators: sine, square, sawtooth, triangle](#2-oscillators)
+   and [band-limited oscillators for audio rate](#2b-band-limited-oscillators-hf-osc)
 3. [Filters: low-pass and high-pass](#3-filters)
 4. [Shapers and mixers](#4-shapers)
 5. [ADSR envelopes and a complete voice](#5-envelopes)
@@ -152,6 +153,91 @@ defmodule demo
 | `square` | freq, dutycycle | +1 for the on-portion, -1 otherwise |
 | `sawtooth` | freq | rising ramp in [0, 1) |
 | `triangle` | freq | rises -1 to 1, falls 1 to -1 each cycle |
+
+---
+
+## 2b. Band-limited oscillators (`hf-osc`)
+
+The oscillators above are the *naive* shapes, and that is the right thing for
+a control signal: a 2 Hz sawtooth modulating a filter has nothing near the
+Nyquist frequency to alias. At **audio rate** it is the wrong thing. A bare
+ramp or comparison has sharp edges, so its harmonics run past half the sample
+rate and fold back down as inharmonic partials -- the harsh, metallic "digital"
+sound -- that no later filter can remove, because by then they sit at the same
+frequencies as the real harmonics' neighbours.
+
+`signal/hf-osc` is the same three shapes for hearing-range pitches. It adds a
+small polynomial correction around each edge (PolyBLEP for the square and
+sawtooth, PolyBLAMP for the triangle's corners) so the edge is rounded the way
+a band-limited signal's would be. A sine needs none -- it has a single partial
+-- so `signal/osc`'s `sine` is already fine at any pitch.
+
+```turmeric
+(defmodule demo
+  (import signal/core   :refer [constant sample])
+  (import signal/osc    :refer [sawtooth])
+  (import signal/hf-osc :refer [hf-sawtooth hf-square hf-triangle])
+
+  (defn main [] : int
+    ;; An LFO: the naive ramp is fine at 2 Hz.
+    (let [lfo ((sawtooth 2.0) (constant 0.0))]
+      (println (sample lfo 0.25)))               ;; 0.5
+    ;; A 440 Hz voice, to be sampled at 48 kHz: band-limit it.
+    (let [voice ((hf-sawtooth 440.0 48000.0) (constant 0.0))]
+      (println (sample voice 0.0005681818181818182)))   ;; ~ -0.5 (a quarter cycle)
+    (let [pulse ((hf-square 220.0 0.25 48000.0) (constant 0.0))]
+      (println (sample pulse 0.0005)))            ;; 1.0 (inside the 25% on-portion)
+    0))
+```
+
+```sweet-exp
+defmodule demo
+  import signal/core   :refer [constant sample]
+  import signal/osc    :refer [sawtooth]
+  import signal/hf-osc :refer [hf-sawtooth hf-square hf-triangle]
+
+  defn main [] : int
+    let [z     constant(0.0)
+         lfo   (sawtooth(2.0) z)
+         voice (hf-sawtooth(440.0 48000.0) z)
+         pulse (hf-square(220.0 0.25 48000.0) z)]
+      println $ sample lfo 0.25
+      println $ sample voice 0.0005681818181818182
+      println $ sample pulse 0.0005
+    0
+```
+
+| Oscillator | Parameters | Produces |
+|-----------|-----------|----------|
+| `hf-sawtooth` | freq, sample-rate | rising ramp in **[-1, 1)**, step smoothed |
+| `hf-square` | freq, dutycycle, sample-rate | +1 / -1, both edges smoothed |
+| `hf-triangle` | freq, sample-rate | rises -1 to 1, falls back, corners smoothed |
+
+Three things differ from `signal/osc`:
+
+- **Pass the sample rate**, and sample on that grid (`t = n / sample-rate`).
+  The correction is sized to one sample period, so it needs to know it. Sampled
+  at a different rate than you declared, the signal is still a signal but
+  aliases like a naive shape. A rate of `0` (or less) disables the correction
+  and gives the naive shape rather than dividing by zero.
+- **`hf-sawtooth` is bipolar**, `[-1, 1)`. `sawtooth` is a unipolar `[0, 1)`
+  control ramp; an audio oscillator must not carry a DC offset.
+- **Values can overshoot ±1 slightly** around an edge, as any band-limited
+  square or sawtooth does.
+
+How much it helps, measured as aliased energy relative to the true harmonics
+(FFT, 48 kHz; lower is better):
+
+| | 3.0 kHz naive | 3.0 kHz `hf-` | 7.9 kHz naive | 7.9 kHz `hf-` |
+|---|---|---|---|---|
+| sawtooth | -13 dB | -27 dB | -7 dB | -27 dB |
+| square | -16 dB | -36 dB | -10 dB | -38 dB |
+| triangle | -40 dB | -48 dB | -26 dB | -45 dB |
+
+That is a cheap two-sample correction, not a brick-wall filter. It removes
+most of the audible aliasing for a few multiplies per sample, and pitches above
+roughly a quarter of the sample rate get increasingly impure. For
+reference-quality oscillators use wavetables or additive synthesis (Tier 2).
 
 ---
 
@@ -341,8 +427,9 @@ sampling.
 
 ## When not to use this
 
-- **You need wavetable, FM, Karplus-Strong, or granular oscillators.** Tier
-  2 -- explicitly out of scope until each lands behind a real consumer and
+- **You need wavetable, FM, Karplus-Strong, or granular oscillators** -- or
+  a reference-quality band-limited one. `hf-osc` is a cheap correction, not a
+  brick-wall filter. Tier 2 -- explicitly out of scope until each lands behind a real consumer and
   a dedicated plan.
 - **You need a poly-synth, step-sequencer, or voice manager.** Those are
   Tier 2 composition layers.
@@ -353,7 +440,7 @@ sampling.
 
 ## Examples
 
-Five runnable examples live under `examples/`:
+Six runnable examples live under `examples/`:
 
 ```sh
 cd spices/signal
@@ -362,6 +449,7 @@ tur run examples/02_oscillators.tur           # sine/square/sawtooth/triangle
 tur run examples/03_filters_and_shapers.tur   # filters + scalar shapers
 tur run examples/04_envelopes.tur             # ADSR
 tur run examples/05_simple_voice.tur          # capstone: every module wired together
+tur run examples/06_hf_oscillators.tur        # naive vs band-limited sawtooth at 7.9 kHz
 ```
 
 Each prints sample values that match the hand-computed references in its
@@ -373,7 +461,7 @@ comments.
 
 ```sh
 cd spices/signal
-tur test tests/signal    # 6 tests, all pass
+tur test tests/signal    # 7 tests, all pass
 ```
 
 ---

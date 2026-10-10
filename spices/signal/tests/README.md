@@ -5,6 +5,7 @@ One test module per source module, covering the Tier 1 surface:
 | Test | Covers |
 |---|---|
 | `test_core.tur` | `constant`, `time-signal`, `sample` |
+| `test_hf_osc.tur` | `hf-sawtooth`, `hf-square`, `hf-triangle`: naive away from edges, rounded at edges, range, sample-rate 0 |
 | `test_osc.tur` | `sine`, `square`, `sawtooth`, `triangle` (zero crossings + peaks) |
 | `test_filter.tur` | `low-pass`, `high-pass` step response; per-instance state |
 | `test_shaper.tur` | every shaper + the Pair mixers (`mix`, `add`, `multiply`) |
@@ -20,7 +21,7 @@ not just a printed message.
 ```sh
 cd spices/signal
 tur test tests/signal
-# expected: 6 tests, 6 passed, 0 failed
+# expected: 7 tests, 7 passed, 0 failed
 ```
 
 Or run a single module directly:
