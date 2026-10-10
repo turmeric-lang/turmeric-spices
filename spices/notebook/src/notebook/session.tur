@@ -13,7 +13,7 @@
   ;;; notebook-session-autolink-hint -- inject libturi linker and header hints.
   (defn notebook-session-autolink-hint [] : int
     ```c
-    /* __tur_autolink__: -Lbuild/src -lturi -Isrc -Isrc/compiler -Isrc/runtime -DTUR_NB_STDLIB=@TUR_STDLIB_ROOT@ */
+    /* __tur_autolink__: -Lbuild/src -lturi -Isrc -Isrc/compiler -Isrc/runtime -DTUR_NB_STDLIB=@TUR_STDLIB_ROOT@ -rdynamic */
     /* __tur_include__: #include "turi/eval.h" */
     /* __tur_include__: #include "turi/env.h" */
     /* __tur_include__: #include "turi/value.h" */
@@ -21,6 +21,7 @@
     /* __tur_include__: #include <fcntl.h> */
     /* __tur_include__: #include <sys/time.h> */
     /* __tur_include__: #include <dirent.h> */
+    /* __tur_include__: #include <ctype.h> */
     return 0;
     ```)
 
@@ -409,6 +410,38 @@
       dup2(capture_fd, STDOUT_FILENO);
       dup2(capture_fd, STDERR_FILENO);
     }
+
+#ifdef TURI_HAS_ATTACH_SPICE
+    /* A spice whose functions are inline C runs compiled: before the cell
+     * evaluates, attach the compiled image of each spice it imports (built
+     * once by `tur build --shared`, cached under that spice's
+     * .tur-repl-cache/; $TUR_BIN names the tur, else the one on PATH).  The
+     * build's output, if it fails, is the cell's.  notebook/ modules are this
+     * process's own code already. */
+    for (const char *ip = src; (ip = strstr(ip, "import")) != NULL; ip += 6) {
+      int at_form = ip > src && ip[-1] == '(';
+      int at_line = 0;
+      if (!at_form) {
+        const char *b = ip;
+        while (b > src && (b[-1] == ' ' || b[-1] == '\t')) b--;
+        at_line = b == src || b[-1] == '\n';
+      }
+      if (!at_form && !at_line) continue;
+      const char *mp = ip + 6;
+      if (*mp != ' ' && *mp != '\t' && *mp != '\n') continue;
+      while (*mp == ' ' || *mp == '\t' || *mp == '\n') mp++;
+      char mod[256];
+      size_t mk = 0;
+      while (mp[mk] && !isspace((unsigned char)mp[mk]) && mp[mk] != ')'
+             && mp[mk] != '(' && mk + 1 < sizeof mod) {
+        mod[mk] = mp[mk];
+        mk++;
+      }
+      mod[mk] = '\0';
+      if (mk == 0 || strncmp(mod, "notebook/", 9) == 0) continue;
+      turi_env_attach_spice_for_module(s->env, mod, NULL);
+    }
+#endif
 
     char type_tag[128] = {0};
     TuriValue result = turi_eval_typed(s->env, src, type_tag, sizeof(type_tag));

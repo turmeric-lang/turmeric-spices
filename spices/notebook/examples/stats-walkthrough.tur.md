@@ -48,11 +48,11 @@ The `rnorm` result above is a column, so we can pass it directly.
 ```turmeric
 (import stats/summary :refer [col-mean col-sd col-median col-min col-max])
 
-(println (str-append "mean   = " (float->str (col-mean samples))))
-(println (str-append "sd     = " (float->str (col-sd samples))))
-(println (str-append "median = " (float->str (col-median samples))))
-(println (str-append "min    = " (float->str (col-min samples))))
-(println (str-append "max    = " (float->str (col-max samples))))
+(println (col-mean samples))    ;; mean
+(println (col-sd samples))      ;; sd
+(println (col-median samples))  ;; median
+(println (col-min samples))     ;; min
+(println (col-max samples))     ;; max
 ```
 
 ---
@@ -86,7 +86,11 @@ confidence level. It returns a test result you can print with `print-test`.
 the frame, the response column name, a list of predictor column names,
 and an intercept flag. `print-fit` prints the coefficients and diagnostics.
 
-```turmeric
+> This cell is not evaluated (`eval=false`): stats' `ols-frame` reads frame
+> handles with a layout frame no longer uses and crashes, compiled or not --
+> turmeric's `docs/reported/stats-frame-interop-reads-a-stale-frame-layout.md`.
+
+```turmeric {eval=false}
 (import frame/csv   :refer [read-csv-string])
 (import frame/frame  :refer [frame-column])
 (import stats/regress :refer [ols-frame])
@@ -97,7 +101,7 @@ and an intercept flag. `print-fit` prints the coefficients and diagnostics.
 (def df (read-csv-string csv 0 0 1 0 ""))
 
 ;; Fit y ~ x with intercept
-(def fit (ols-frame df "y" (cons (cast "x" :int) 0) 1))
+(def fit (ols-frame df "y" (cons (:: "x" :int) 0) 1))
 (print-fit fit)
 ```
 

@@ -23,8 +23,8 @@ notebook, use `read-csv` with a file path.
 (def csv "x,y\n1,2.1\n2,3.9\n3,6.2\n4,8.1\n5,9.8\n6,11.7\n7,14.2\n8,15.9\n9,18.1\n10,20.2\n")
 (def df (read-csv-string csv 0 0 1 0 ""))
 
-(println (str-append "rows: " (int->str (frame-nrows df))))
-(println (str-append "cols: " (int->str (frame-ncols df))))
+(println (frame-nrows df))   ;; rows
+(println (frame-ncols df))   ;; columns
 (print-frame (frame-head df 5))
 ```
 
@@ -40,11 +40,11 @@ Extract the y column and compute summary statistics.
 
 (def y-col (frame-column df "y"))
 
-(println (str-append "mean   = " (float->str (col-mean y-col))))
-(println (str-append "sd     = " (float->str (col-sd y-col))))
-(println (str-append "median = " (float->str (col-median y-col))))
-(println (str-append "min    = " (float->str (col-min y-col))))
-(println (str-append "max    = " (float->str (col-max y-col))))
+(println (col-mean y-col))    ;; mean
+(println (col-sd y-col))      ;; sd
+(println (col-median y-col))  ;; median
+(println (col-min y-col))     ;; min
+(println (col-max y-col))     ;; max
 ```
 
 ---
@@ -54,11 +54,15 @@ Extract the y column and compute summary statistics.
 Fit y ~ x with an intercept using `ols-frame`. The result includes
 coefficient estimates, standard errors, and R-squared.
 
-```turmeric
+> This cell is not evaluated (`eval=false`): stats' `ols-frame` reads frame
+> handles with a layout frame no longer uses and crashes, compiled or not --
+> turmeric's `docs/reported/stats-frame-interop-reads-a-stale-frame-layout.md`.
+
+```turmeric {eval=false}
 (import stats/regress :refer [ols-frame])
 (import stats/fmt    :refer [print-fit])
 
-(def fit (ols-frame df "y" (cons (cast "x" :int) 0) 1))
+(def fit (ols-frame df "y" (cons (:: "x" :int) 0) 1))
 (print-fit fit)
 ```
 

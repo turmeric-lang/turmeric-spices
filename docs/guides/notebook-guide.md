@@ -124,12 +124,30 @@ it is `(import helpers ...)`), then the enclosing spice's `src/`, each
 directory you render from. The session starts from the same stdlib
 `tur --interpret` gives a program.
 
-**Current limit:** cells run in the interpreter, which does not run inline-C
-bodies. A spice whose functions are written in C -- most of `plot`, `stats`,
-`frame` and `linalg`'s solvers and formatter -- imports fine, but the first
-call into such a function reports `inline-C not supported in interpreter
-mode`. Pure-Turmeric code (your own `defn`s, `linalg/mat`) runs. Tracked as
-turmeric's `docs/reported/notebook-cells-cannot-call-inline-c-spices.md`.
+**Spices written in C run compiled.** Cells run in the interpreter, which
+does not run inline-C bodies. So before a cell evaluates, the notebook
+builds each spice the cell imports as a shared library -- once, with
+`tur build --shared`, cached under that spice's `.tur-repl-cache/` and
+rebuilt when a source changes -- and calls its exports there, the way
+`tur repl` does for the spice it starts in. The first cell that imports a
+spice takes a few seconds longer; set `TUR_BIN` if `tur` is not on `PATH`.
+What runs compiled:
+
+- `stats` (distributions, tests, summaries) and `frame` (CSV, filtering,
+  printing), whose APIs pass numbers, strings and handles.
+- Turmeric wrappers in those spices over private C helpers.
+
+What still cannot, and reports `inline-C not supported in interpreter mode`:
+
+- An export that takes or returns a struct by value -- most of `linalg`,
+  whose matrices are a `defstruct`. Pure-Turmeric code (`linalg/mat`'s
+  constructors and accessors, your own `defn`s) runs.
+- `plot`: its image does not link yet (the `plutovg` static library is not
+  built position-independent).
+- An inline-C `defn` written in a cell itself.
+
+Tracked as turmeric's
+`docs/reported/notebook-cells-cannot-call-inline-c-spices.md`.
 
 Example -- load a CSV and print its shape:
 
