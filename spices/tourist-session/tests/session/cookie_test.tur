@@ -1,9 +1,42 @@
-;; tests/session/cookie_test.tur -- Cookie parsing + Set-Cookie construction.
+;; tests/session/cookie_test.tur -- the session cookie, read and written
+;; through tourist's req-cookie / set-cookie! (tourist-on-stdlib-httpd H5).
+;;
+;; The session spice no longer parses Cookie headers or builds Set-Cookie
+;; values itself.  These cases pin what it gets from tourist (and so from
+;; stdlib httpd's parser and formatter) on fabricated requests:
+;;
+;;   * req-cookie finds the session cookie among several, first, or not at
+;;     all, and an empty header has none;
+;;   * a persisted session queues `tur_session=<id>; Path=/; Max-Age=86400;
+;;     Secure; HttpOnly; SameSite=Lax` under the production config;
+;;   * a destroyed one queues `tur_session=; Path=/; Max-Age=0`.
 (defmodule session/tests/cookie
   (import test/suite  :refer [describe it])
   (import test/assert :refer [assert-true])
   (import test/runner :refer [run-all-status])
-  (import session/cookie :refer [cookie-find cookie-build cookie-build-expired])
+  (import session/memory-store :refer [memory-store-new])
+  (import session/config       :refer [default-session-config])
+  (import session/mw           :refer [session-mw session-flush])
+  (import session/ctx          :refer [session-set! session-id session-destroy!])
+  (import tourist/param        :refer [tourist-ctx-new tourist-ctx-free
+                                       tourist-ctx-resp-headers])
+  (import tourist/request      :refer [req-cookie])
+  (import tourist/types        :refer [Ctx])
+  (import tourist/helpers      :refer [text])
+  (import httpd/types          :refer [Response])
+  (import httpd/response       :refer [free-response])
+
+```c
+/* session-mw installs a process-wide store and config, and the memory store
+   keeps what it saves until exit; nothing in this suite frees either, by
+   design.  Everything the test itself allocates is freed. */
+const char *__lsan_default_suppressions(void);
+const char *__lsan_default_suppressions(void) {
+  return "leak:session__mw__session_hymw\n"
+         "leak:session__memory_hystore__\n"
+         "leak:session__data__sessmap_hyclone\n";
+}
+```
 
 (defn seq? [a : cstr b : cstr] : bool
   ```c
@@ -11,33 +44,110 @@
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
 
-(defn found-is? [header : cstr name : cstr want : cstr] : bool
-  (let [r (cookie-find header name)]
-    (if (ok? r) (seq? (ok-val r) want) false)))
+(defn fake-req [cookie : cstr] : int
+  ```c
+  #include <stdlib.h>
+  #include <string.h>
+  struct __httpd_req {
+    char *method; char *path; char *query; char *body;
+    char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
+  };
+  struct __httpd_req *r = malloc(sizeof(*r));
+  r->method = "GET"; r->path = "/"; r->query = ""; r->body = "";
+  r->hdr_keys = malloc(sizeof(char *)); r->hdr_vals = malloc(sizeof(char *));
+  r->hdr_keys[0] = "Cookie"; r->hdr_vals[0] = strdup(cookie);
+  r->hdr_count = 1;
+  r->body_len = 0;
+  return (int64_t)(intptr_t)r;
+  ```)
 
-(defn not-found? [header : cstr name : cstr] : bool
-  (let [r (cookie-find header name)] (if (ok? r) false true)))
+(defn fake-req-free [req : int] : void
+  ```c
+  #include <stdlib.h>
+  struct __httpd_req {
+    char *method; char *path; char *query; char *body;
+    char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
+  };
+  struct __httpd_req *r = (struct __httpd_req *)(intptr_t)req;
+  free(r->hdr_vals[0]); free(r->hdr_keys); free(r->hdr_vals); free(r);
+  ```)
+
+;; The value of the session cookie a request carrying `header` presents.
+(defn cookie-in [header : cstr] : cstr
+  (let [req (fake-req header)
+        ctx (:: (tourist-ctx-new req 0) :Ctx)
+        c   (req-cookie ctx "tur_session")
+        out (if (some? c) (__keep (unwrap c)) "(none)")]
+    (tourist-ctx-free ctx)
+    (fake-req-free req)
+    out))
+
+;; Copy into a static buffer (the cookie belongs to the ctx, freed above).
+(defn __keep [s : cstr] : cstr
+  ```c
+  #include <string.h>
+  static char buf[256];
+  strncpy(buf, s, sizeof buf - 1);
+  buf[sizeof buf - 1] = '\0';
+  return buf;
+  ```)
+
+;; The Set-Cookie value queued on a ctx starts with `prefix` and ends with
+;; `suffix`.
+(defn queued-cookie? [ctx : Ctx prefix : cstr suffix : cstr] : bool
+  ```c
+  #include <string.h>
+  #include <strings.h>
+  struct __tourist_hdr { char *name; char *value; struct __tourist_hdr *next; };
+  struct __tourist_hdr *h = (struct __tourist_hdr *)(intptr_t)
+                            tourist__param__tourist_hyctx_hyresp_hyheaders(ctx);
+  for (; h; h = h->next) {
+    if (strcasecmp(h->name, "Set-Cookie") != 0) continue;
+    size_t vl = strlen(h->value), pl = strlen(prefix), sl = strlen(suffix);
+    if (vl >= pl + sl && strncmp(h->value, prefix, pl) == 0 &&
+        strcmp(h->value + vl - sl, suffix) == 0) return true;
+  }
+  return false;
+  ```)
 
 (defn main [] : int
  (do
-  (describe "session/cookie"
-    (it "finds a cookie among several"
-      (assert-true (found-is? "a=1; tur_session=deadbeef; b=2" "tur_session" "deadbeef")))
-    (it "finds the first cookie"
-      (assert-true (found-is? "sid=xyz; other=1" "sid" "xyz")))
-    (it "returns missing when absent"
-      (assert-true (not-found? "a=1; b=2" "tur_session")))
-    (it "handles an empty header"
-      (assert-true (not-found? "" "tur_session")))
-    (it "builds a production Set-Cookie"
-      (assert-true (seq? (cookie-build "tur_session" "ID" "/" "" 86400 1 1 "Lax")
-                         "tur_session=ID; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax")))
-    (it "builds with Domain and Secure off"
-      (assert-true (seq? (cookie-build "sid" "ID" "/app" "ex.com" 60 0 1 "Strict")
-                         "sid=ID; Path=/app; Max-Age=60; Domain=ex.com; HttpOnly; SameSite=Strict")))
-    (it "builds an expiring Set-Cookie"
-      (assert-true (seq? (cookie-build-expired "tur_session" "/" "")
-                         "tur_session=; Path=/; Max-Age=0"))))
+  (describe "session cookie via tourist's req-cookie"
+    (it "finds the session cookie among several"
+      (assert-true (seq? (cookie-in "a=1; tur_session=deadbeef; b=2") "deadbeef")))
+    (it "finds it first"
+      (assert-true (seq? (cookie-in "tur_session=xyz; other=1") "xyz")))
+    (it "is none when absent"
+      (assert-true (seq? (cookie-in "a=1; b=2") "(none)")))
+    (it "is none for an empty header"
+      (assert-true (seq? (cookie-in "") "(none)"))))
+  (describe "session cookie via tourist's set-cookie!"
+    (it "a persisted session queues the production Set-Cookie"
+      (let [s   (memory-store-new)
+            _   (session-mw s (default-session-config))
+            req (fake-req "")
+            c   (:: (tourist-ctx-new req 0) :Ctx)]
+        (session-set! c "k" "v")
+        (let [resp (session-flush c (:: (text "ok") :Response))
+              ok   (queued-cookie? c "tur_session="
+                                   "; Path=/; Max-Age=86400; Secure; HttpOnly; SameSite=Lax")]
+          (free-response resp)
+          (tourist-ctx-free c)
+          (fake-req-free req)
+          (assert-true ok))))
+    (it "a destroyed session queues an expiring Set-Cookie"
+      (let [s   (memory-store-new)
+            _   (session-mw s (default-session-config))
+            req (fake-req "")
+            c   (:: (tourist-ctx-new req 0) :Ctx)]
+        (session-set! c "k" "v")
+        (session-destroy! c)
+        (let [resp (session-flush c (:: (text "ok") :Response))
+              ok   (queued-cookie? c "tur_session=; Path=/; Max-Age=0" "")]
+          (free-response resp)
+          (tourist-ctx-free c)
+          (fake-req-free req)
+          (assert-true ok)))))
   (run-all-status)))
 
 ) ;; end module

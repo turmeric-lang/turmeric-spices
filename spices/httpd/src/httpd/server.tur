@@ -60,6 +60,7 @@
           server-start server-start-pool server-start-spawn server-start-opts
           server-start-conn server-start-pool-conn server-start-conn-opts
           ServerWrap server-wrap server-start-wrapped server-start-conn-wrapped
+          take-conn-response
           server-port server-stop
           serve-httpd-request serve-httpd-request-conn
           server-launch server-tls-ctx server-set-tls-ctx!)
@@ -159,6 +160,66 @@ struct __httpd_resp {
 
 (defn srv-null? [p : ptr<void>] : bool
   ```c return p == NULL; ```)
+
+;;; take-conn-response -- move what a stdlib helper wrote on the conn into a
+;;; Response.
+;;;
+;;; For a typed handler that lets a stdlib function answer -- stdlib's
+;;; httpd-static-serve!, say -- and must hand the server a Response: the
+;;; conn's status (200 when unset), headers and body (binary-safe) move into a
+;;; new Response, and the conn's pending response is cleared, so the server
+;;; writes them once, from the Response.
+;;;
+;;; Parameters:
+;;;   hc -- the stdlib httpd conn of the current request (request-conn)
+;;;
+;;; Returns:
+;;;   Response -- owned by the caller, like any handler's Response.
+;;;
+;;; Example:
+;;;   (if (httpd-static-serve! hc "./public" path)
+;;;     (take-conn-response hc)
+;;;     (not-found))
+;;;
+;;; Since: tourist-on-stdlib-httpd H5
+(defn take-conn-response [hc : ptr<void>] : Response
+  ```c
+  HttpdConn *c = (HttpdConn *)hc;
+  struct __httpd_resp *r = (struct __httpd_resp *)calloc(1, sizeof *r);
+  if (!r) return 0;
+  int n = 0;
+  for (HttpdHeader *h = c ? (HttpdHeader *)c->resp_headers : NULL; h; h = h->next) n++;
+  r->hdr_cap = n > 4 ? n : 4;
+  r->hdr_keys = (char **)malloc(sizeof(char *) * (size_t)r->hdr_cap);
+  r->hdr_vals = (char **)malloc(sizeof(char *) * (size_t)r->hdr_cap);
+  if (!r->hdr_keys || !r->hdr_vals) {
+    free(r->hdr_keys); free(r->hdr_vals); free(r);
+    return 0;
+  }
+  r->status = (c && c->resp_status) ? c->resp_status : 200;
+  if (c && c->resp_body) {
+    r->body = c->resp_body;
+    r->body_len = c->resp_body_len;
+    c->resp_body = NULL;
+    c->resp_body_len = 0;
+  } else {
+    r->body = (char *)calloc(1, 1);
+  }
+  if (c) {
+    HttpdHeader *h = (HttpdHeader *)c->resp_headers;
+    while (h) {
+      HttpdHeader *nx = h->next;
+      r->hdr_keys[r->hdr_count] = h->name ? h->name : strdup("");
+      r->hdr_vals[r->hdr_count] = h->value ? h->value : strdup("");
+      r->hdr_count++;
+      free(h);
+      h = nx;
+    }
+    c->resp_headers = NULL;
+    c->resp_status = 0;
+  }
+  return (int64_t)(intptr_t)r;
+  ```)
 
 ;;; serve-httpd-request -- internal: serve one stdlib httpd request with a
 ;;; one-arg (Request -> Response) handler.  The body of the stdlib handler

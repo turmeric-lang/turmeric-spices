@@ -1,0 +1,402 @@
+;; tests/request_test.tur -- the Ctx request helpers (tourist-on-stdlib-httpd
+;; H5), against a live app under tourist-with:
+;;
+;;   req-cookie / set-cookie!   -- read a cookie (present, empty, absent);
+;;                                 queue two Set-Cookie headers
+;;   form-param                 -- decoded field, missing field, wrong type
+;;   req-file + part-*          -- a multipart upload, NUL bytes included
+;;   req-ip / req-proto / req-id-- through mw-trust-proxy and mw-request-id
+;;   basic-auth + guarded       -- 401 + challenge, wrong password, auth-user
+;;   body-limit + guarded       -- 413 past the limit on one route only
+;;   serve-static!              -- ETag, 304, a binary file, a refused dotfile
+;;
+;; LeakSanitizer runs with the suite, so every helper's strings must be freed
+;; with the request.
+
+(defmodule tourist/tests/request
+  (import tourist/app        :refer [tourist-with tourist-opts])
+  (import tourist/dsl        :refer [get! post!])
+  (import tourist/helpers    :refer [text status])
+  (import tourist/static     :refer [serve-static!])
+  (import tourist/request    :refer [req-cookie set-cookie! form-param req-file
+                                     part-name part-filename part-content-type
+                                     part-data part-data-len
+                                     req-ip req-proto req-id
+                                     basic-auth auth-user body-limit guarded])
+  (import tourist/types      :refer [Ctx])
+  (import httpd/types        :refer [Response])
+  (import httpd/server       :refer [server-port server-stop])
+  (import test/suite         :refer [describe it])
+  (import test/assert        :refer [assert-eq assert-true])
+  (import test/runner        :refer [run-all-status])
+
+```c
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+/* Send a raw request (it carries Connection: close); return the raw
+   response and its length (caller frees). */
+static char *rqt__send(int port, const char *req, size_t reqlen, size_t *outlen) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return NULL;
+  struct sockaddr_in a; memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return NULL; }
+  struct timeval tv = { 5, 0 };
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  size_t sent = 0;
+  while (sent < reqlen) {
+    ssize_t w = send(fd, req + sent, reqlen - sent, MSG_NOSIGNAL);
+    if (w <= 0) break;
+    sent += (size_t)w;
+  }
+  size_t cap = 4096, len = 0;
+  char *buf = (char *)malloc(cap);
+  for (;;) {
+    if (len + 1 >= cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
+    ssize_t r = recv(fd, buf + len, cap - len - 1, 0);
+    if (r <= 0) break;
+    len += (size_t)r;
+  }
+  buf[len] = '\0';
+  close(fd);
+  if (outlen) *outlen = len;
+  return buf;
+}
+
+static char *rqt__get(int port, const char *path, const char *extra) {
+  char req[1024];
+  int n = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: x\r\n%sConnection: close\r\n\r\n",
+                   path, extra);
+  return rqt__send(port, req, (size_t)n, NULL);
+}
+
+static char *rqt__post(int port, const char *path, const char *ctype, const char *body, size_t blen) {
+  size_t cap = blen + 512;
+  char *req = (char *)malloc(cap);
+  int n = snprintf(req, cap, "POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: %s\r\n"
+                   "Content-Length: %zu\r\nConnection: close\r\n\r\n", path, ctype, blen);
+  memcpy(req + n, body, blen);
+  char *r = rqt__send(port, req, (size_t)n + blen, NULL);
+  free(req);
+  return r;
+}
+
+/* The body after the head. */
+static const char *rqt__body(const char *r) {
+  const char *b = r ? strstr(r, "\r\n\r\n") : NULL;
+  return b ? b + 4 : "";
+}
+
+static char rqt__dir[256];
+static char rqt__etag[128];
+```
+
+  ;; ---------------------------------------------------------------------
+  ;; Probes
+  ;; ---------------------------------------------------------------------
+
+  (defn body-of [port : int path : cstr extra : cstr want : cstr] : bool
+    ```c
+    char *r = rqt__get((int)port, path, extra);
+    int ok = r && strcmp(rqt__body(r), want) == 0;
+    if (!ok && r) fprintf(stderr, "# body of %s: [%s]\n", path, rqt__body(r));
+    free(r);
+    return ok;
+    ```)
+
+  (defn has? [port : int path : cstr extra : cstr needle : cstr] : bool
+    ```c
+    char *r = rqt__get((int)port, path, extra);
+    int ok = r && strstr(r, needle) != NULL;
+    free(r);
+    return ok;
+    ```)
+
+  (defn status-of [port : int path : cstr extra : cstr] : int
+    ```c
+    char *r = rqt__get((int)port, path, extra);
+    int st = 0;
+    if (r) sscanf(r, "HTTP/1.1 %d", &st);
+    free(r);
+    return st;
+    ```)
+
+  (defn post-body-of [port : int path : cstr ctype : cstr body : cstr want : cstr] : bool
+    ```c
+    char *r = rqt__post((int)port, path, ctype, body, strlen(body));
+    int ok = r && strcmp(rqt__body(r), want) == 0;
+    if (!ok && r) fprintf(stderr, "# body of POST %s: [%s]\n", path, rqt__body(r));
+    free(r);
+    return ok;
+    ```)
+
+  (defn post-status-of [port : int path : cstr body-len : int] : int
+    ```c
+    char *body = (char *)malloc((size_t)body_len + 1);
+    memset(body, 'x', (size_t)body_len);
+    char *r = rqt__post((int)port, path, "text/plain", body, (size_t)body_len);
+    free(body);
+    int st = 0;
+    if (r) sscanf(r, "HTTP/1.1 %d", &st);
+    free(r);
+    return st;
+    ```)
+
+  ;; A multipart upload of a 5-byte file holding a NUL; the route answers
+  ;; with what it saw.
+  (defn upload-body-of [port : int want : cstr] : bool
+    ```c
+    static const char part[] =
+      "--XB\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhello\r\n"
+      "--XB\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"me.png\"\r\n"
+      "Content-Type: image/png\r\n\r\nab\0cd\r\n--XB--\r\n";
+    char *r = rqt__post((int)port, "/upload", "multipart/form-data; boundary=XB",
+                        part, sizeof part - 1);
+    int ok = r && strcmp(rqt__body(r), want) == 0;
+    if (!ok && r) fprintf(stderr, "# upload body: [%s]\n", rqt__body(r));
+    free(r);
+    return ok;
+    ```)
+
+  ;; Fetch a static file, remember its ETag; true when there was one.
+  (defn grab-etag! [port : int path : cstr] : bool
+    ```c
+    char *r = rqt__get((int)port, path, "");
+    rqt__etag[0] = '\0';
+    const char *e = r ? strstr(r, "\r\nETag: ") : NULL;
+    if (e) {
+      e += 8;
+      const char *eol = strstr(e, "\r\n");
+      snprintf(rqt__etag, sizeof rqt__etag, "%.*s", (int)(eol ? eol - e : 0), e);
+    }
+    free(r);
+    return rqt__etag[0] != '\0';
+    ```)
+
+  ;; The status of a conditional GET with the remembered ETag, and that it
+  ;; carries no body.
+  (defn conditional-304-empty? [port : int path : cstr] : bool
+    ```c
+    char hdr[200];
+    snprintf(hdr, sizeof hdr, "If-None-Match: %s\r\n", rqt__etag);
+    char *r = rqt__get((int)port, path, hdr);
+    int ok = r && strncmp(r, "HTTP/1.1 304", 12) == 0 && rqt__body(r)[0] == '\0';
+    free(r);
+    return ok;
+    ```)
+
+  ;; The length of a static binary file's body.
+  (defn static-body-len [port : int path : cstr] : int
+    ```c
+    char req[512];
+    int n = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", path);
+    size_t len = 0;
+    char *r = rqt__send((int)port, req, (size_t)n, &len);
+    const char *b = r ? strstr(r, "\r\n\r\n") : NULL;
+    int64_t bl = b ? (int64_t)(len - (size_t)(b + 4 - r)) : -1;
+    free(r);
+    return bl;
+    ```)
+
+  ;; A temporary directory with index.txt, bin.dat (NUL bytes) and .env.
+  (defn make-static-dir [] : cstr
+    ```c
+    snprintf(rqt__dir, sizeof rqt__dir, "/tmp/tourist-static-XXXXXX");
+    if (!mkdtemp(rqt__dir)) return "";
+    char p[512];
+    FILE *f;
+    snprintf(p, sizeof p, "%s/index.txt", rqt__dir);
+    if ((f = fopen(p, "wb"))) { fputs("static hello", f); fclose(f); }
+    snprintf(p, sizeof p, "%s/bin.dat", rqt__dir);
+    if ((f = fopen(p, "wb"))) { fwrite("a\0b\0c\0d", 1, 7, f); fclose(f); }
+    snprintf(p, sizeof p, "%s/.env", rqt__dir);
+    if ((f = fopen(p, "wb"))) { fputs("SECRET=1", f); fclose(f); }
+    return rqt__dir;
+    ```)
+
+  (defn remove-static-dir [] : void
+    ```c
+    char p[512];
+    const char *names[3] = { "index.txt", "bin.dat", ".env" };
+    for (int i = 0; i < 3; i++) { snprintf(p, sizeof p, "%s/%s", rqt__dir, names[i]); unlink(p); }
+    rmdir(rqt__dir);
+    ```)
+
+  (defn b64-header [user-pass : cstr] : cstr
+    ```c
+    static __thread char h[256];
+    static const char tb[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const unsigned char *s = (const unsigned char *)user_pass;
+    size_t n = strlen(user_pass), o = 0;
+    o += (size_t)snprintf(h, sizeof h, "Authorization: Basic ");
+    for (size_t i = 0; i < n; i += 3) {
+      uint32_t v = (uint32_t)s[i] << 16 | (i + 1 < n ? (uint32_t)s[i+1] << 8 : 0) | (i + 2 < n ? s[i+2] : 0);
+      h[o++] = tb[(v >> 18) & 63]; h[o++] = tb[(v >> 12) & 63];
+      h[o++] = i + 1 < n ? tb[(v >> 6) & 63] : '=';
+      h[o++] = i + 2 < n ? tb[v & 63] : '=';
+    }
+    memcpy(h + o, "\r\n", 3);
+    return h;
+    ```)
+
+  ;; ---------------------------------------------------------------------
+  ;; Routes
+  ;; ---------------------------------------------------------------------
+
+  ;; "a|b" formatting for the routes' answers.
+  (defn fmt2 [a : cstr b : cstr] : cstr
+    ```c
+    static __thread char out[512];
+    snprintf(out, sizeof out, "%s|%s", a, b);
+    return out;
+    ```)
+
+  (defn fmt3 [a : cstr b : cstr c : cstr] : cstr
+    ```c
+    static __thread char out[512];
+    snprintf(out, sizeof out, "%s|%s|%s", a, b, c);
+    return out;
+    ```)
+
+  (defn fmt-part [name : cstr filename : cstr ctype : cstr len : int first : int] : cstr
+    ```c
+    static __thread char out[512];
+    snprintf(out, sizeof out, "%s|%s|%s|%lld|%lld", name, filename, ctype,
+             (long long)len, (long long)first);
+    return out;
+    ```)
+
+  (defn byte-at [p : ptr<void> i : int] : int
+    ```c return p ? (int64_t)((const unsigned char *)p)[i] : -1; ```)
+
+  (defn opt-or [o : (Option cstr) dflt : cstr] : cstr
+    (if (some? o) (unwrap o) dflt))
+
+  (defn cookie-route [ctx : Ctx] : Response
+    (let [t (req-cookie ctx "theme")]
+      (text (if (some? t) (fmt2 "some" (unwrap t)) "none"))))
+
+  (defn set-route [ctx : Ctx] : Response
+    (do
+      (set-cookie! ctx (cookie "theme" "dark"))
+      (set-cookie! ctx (cookie-full "sid" "abc" "/app" "" 3600 1 1 "Strict"))
+      (text "set")))
+
+  (defn form-route [ctx : Ctx] : Response
+    (let [r (form-param ctx "email")]
+      (if (ok? r)
+        (text (fmt2 "ok" (ok-val r)))
+        (status 400 (text (fmt2 "err" (err-val r)))))))
+
+  (defn upload-route [ctx : Ctx] : Response
+    (let [f (req-file ctx "avatar")]
+      (if (some? f)
+        (let [p (unwrap f)]
+          (text (fmt-part (part-name p) (opt-or (part-filename p) "-") (part-content-type p)
+                          (part-data-len p) (byte-at (part-data p) 2))))
+        (text "no file"))))
+
+  (defn who-route [ctx : Ctx] : Response
+    (text (fmt3 (opt-or (req-ip ctx) "-") (req-proto ctx) (opt-or (req-id ctx) "-"))))
+
+  (defn admin-route [ctx : Ctx] : Response
+    (text (fmt2 "admin" (opt-or (auth-user ctx) "-"))))
+
+  (defn admin-verify [u : cstr p : cstr] : bool
+    (if (= 1 (cstr-eq-const-time u "alice"))
+      (= 1 (cstr-eq-const-time p "s3cret"))
+      false))
+
+  (defn app-stack [inner : ptr<void>] : ptr<void>
+    (compose-middleware inner
+                        (mw-trust-proxy (ok-val (trust-proxy-opts "loopback")))
+                        mw-request-id))
+
+  ;; ---------------------------------------------------------------------
+  ;; Driver
+  ;; ---------------------------------------------------------------------
+
+  (defn __all-tests [] : void
+    (let [dir  (make-static-dir)
+          srv  (tourist-with 0
+                 (tourist-opts (fn [inner : ptr<void>] : ptr<void> (app-stack inner)))
+                 (get! "/cookie" cookie-route)
+                 (get! "/set" set-route)
+                 (post! "/form" form-route)
+                 (post! "/upload" upload-route)
+                 (get! "/who" who-route)
+                 (get! "/admin" (guarded (basic-auth "staff" admin-verify) admin-route))
+                 (post! "/small" (guarded (body-limit 16) (fn [_] (text "taken"))))
+                 (post! "/big" (fn [_] (text "taken")))
+                 (serve-static! "/static" dir))
+          port (server-port srv)]
+      (describe "tourist/request -- cookies"
+        (it "req-cookie reads a sent cookie"
+          (assert-true (body-of port "/cookie" "Cookie: a=1; theme=dark\r\n" "some|dark")))
+        (it "a cookie sent empty is some \"\""
+          (assert-true (body-of port "/cookie" "Cookie: theme=\r\n" "some|")))
+        (it "an absent cookie is none"
+          (assert-true (body-of port "/cookie" "Cookie: a=1\r\n" "none")))
+        (it "set-cookie! queues a Set-Cookie with the defaults"
+          (assert-true (has? port "/set" "" "Set-Cookie: theme=dark; Path=/; HttpOnly; SameSite=Lax\r\n")))
+        (it "a second set-cookie! queues a second header"
+          (assert-true (has? port "/set" ""
+                             "Set-Cookie: sid=abc; Path=/app; Max-Age=3600; Secure; HttpOnly; SameSite=Strict\r\n"))))
+      (describe "tourist/request -- forms and uploads"
+        (it "form-param decodes a field"
+          (assert-true (post-body-of port "/form" "application/x-www-form-urlencoded"
+                                     "x=1&email=a%40b.example+c" "ok|a@b.example c")))
+        (it "a missing field is an err"
+          (assert-true (post-body-of port "/form" "application/x-www-form-urlencoded"
+                                     "x=1" "err|no such form field")))
+        (it "a body that is not a form is an err"
+          (assert-true (post-body-of port "/form" "text/plain" "email=a"
+                                     "err|request body is not application/x-www-form-urlencoded")))
+        (it "req-file finds the upload and its name, filename, type, length and bytes"
+          (assert-true (upload-body-of port "avatar|me.png|image/png|5|0"))))
+      (describe "tourist/request -- client, protocol, request id"
+        (it "req-ip honours mw-trust-proxy; req-proto; req-id keeps a good X-Request-Id"
+          (assert-true (body-of port "/who" "X-Forwarded-For: 203.0.113.9\r\nX-Request-Id: rq-1\r\n"
+                                "203.0.113.9|http|rq-1"))))
+      (describe "tourist/request -- per-route checks"
+        (it "basic-auth answers 401 without credentials"
+          (assert-eq 401 (status-of port "/admin" "")))
+        (it "the 401 carries the challenge"
+          (assert-true (has? port "/admin" "" "WWW-Authenticate: Basic realm=\"staff\"")))
+        (it "a wrong password is refused"
+          (assert-eq 401 (status-of port "/admin" (b64-header "alice:nope"))))
+        (it "the right one reaches the route, which sees auth-user"
+          (assert-true (body-of port "/admin" (b64-header "alice:s3cret") "admin|alice")))
+        (it "body-limit lets a small body through"
+          (assert-eq 200 (post-status-of port "/small" 10)))
+        (it "body-limit answers 413 past its limit"
+          (assert-eq 413 (post-status-of port "/small" 100)))
+        (it "routes without the guard take the same body"
+          (assert-eq 200 (post-status-of port "/big" 100))))
+      (describe "tourist/static -- through stdlib's static serving"
+        (it "a file is served"
+          (assert-true (body-of port "/static/index.txt" "" "static hello")))
+        (it "with an ETag"
+          (assert-true (grab-etag! port "/static/index.txt")))
+        (it "a matching If-None-Match gets 304 and no body"
+          (assert-true (conditional-304-empty? port "/static/index.txt")))
+        (it "a binary file keeps its NUL bytes"
+          (assert-eq 7 (static-body-len port "/static/bin.dat")))
+        (it "a dotfile is refused"
+          (assert-eq 404 (status-of port "/static/.env" ""))))
+      (server-stop srv)
+      (remove-static-dir)))
+
+  (defn main [] : int
+    (__all-tests)
+    (run-all-status)))

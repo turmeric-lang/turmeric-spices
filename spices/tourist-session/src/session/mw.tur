@@ -30,33 +30,23 @@
                                  cfg-secure? cfg-http-only? cfg-same-site
                                  cfg-rolling? cfg-signing-key])
   (import session/config :refer [SessionConfig])
-  (import session/cookie :refer [cookie-build cookie-build-expired cookie-sign])
+  (import session/cookie :refer [cookie-sign])
   (import session/ownstr :refer [to-cstr release])
   (import session/ctx    :refer [session-existing sess-id sess-map sess-dirty?
                                  sess-destroy? sess-new? sess-rotate-from
                                  sess-free])
-  (import tourist/param      :refer [ctx-add-header!])
+  (import tourist/request    :refer [set-cookie!])
   (import tourist/middleware :refer [use-after!])
   (import tourist/types      :refer [Ctx])
   (import httpd/types        :refer [Response])
   (export session-mw session-flush)
-
-(defn __cstr-free [s : cstr] : void
-  ```c
-  #include <stdlib.h>
-  free((void *)(intptr_t)s);
-  ```)
 
 (defn __cstr-null? [s : cstr] : bool
   ```c
   return ((const char *)s) == 0;
   ```)
 
-;;; __add-cookie! -- queue a Set-Cookie header, freeing the built value.
-(defn __add-cookie! [ctx : Ctx value : cstr] : void
-  (do
-    (ctx-add-header! ctx "Set-Cookie" value)
-    (__cstr-free value)))
+
 
 ;;; __should-persist? -- whether a non-destroyed session needs saving.
 ;;;
@@ -79,11 +69,13 @@
     (if (= (sess-destroy? p) 1)
       (do
         (store-delete store id)
-        (__add-cookie! ctx (cookie-build-expired name path dom)))
+        ;; An empty value with Max-Age=0: the browser drops the cookie. Path
+        ;; and Domain must match the original for that to work.
+        (set-cookie! ctx (cookie-full name "" path dom 0 0 0 "")))
       (when (__should-persist? p cfgp)
         ;; cookie-sign returns an owned String; borrow its bytes for
-        ;; cookie-build (which copies into its own Set-Cookie buffer) and
-        ;; release the String afterwards.
+        ;; set-cookie! (which formats and queues its own copy) and release
+        ;; the String afterwards.
         (let [val (cookie-sign (cfg-signing-key cfgp) id)]
           (do
             (store-save store id (sess-map p) (cfg-max-age cfgp))
@@ -92,10 +84,9 @@
             ;; failure cannot fail the request; the worst case is an orphan
             ;; record that expires on its own TTL.
             (__flush-rotate-delete store p)
-            (__add-cookie! ctx (cookie-build name (to-cstr val) path dom
-                                             (cfg-max-age cfgp) (cfg-secure? cfgp)
-                                             (cfg-http-only? cfgp)
-                                             (cfg-same-site cfgp)))
+            (set-cookie! ctx (cookie-full name (to-cstr val) path dom
+                                          (cfg-max-age cfgp) (cfg-secure? cfgp)
+                                          (cfg-http-only? cfgp) (cfg-same-site cfgp)))
             (release val)))))))
 
 ;;; __flush-rotate-delete -- delete the pre-rotate store entry, if any.

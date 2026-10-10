@@ -100,6 +100,44 @@ tourist 3000
   get! "/" (fn [_] (text "ok"))
 ```
 
+### Request helpers -- `tourist/request`
+
+Typed forwards to stdlib httpd, so a route never reaches the connection.
+Strings they return belong to the request (valid until the response is sent):
+
+| Helper | Returns |
+|---|---|
+| `(req-cookie ctx name)` | `(Option cstr)` -- a cookie sent empty is `some ""` |
+| `(set-cookie! ctx opts)` | queues `Set-Cookie` from stdlib's `CookieOpts` (`cookie`, `cookie-full`) |
+| `(form-param ctx key)` | `(Result cstr cstr)` -- decoded; `err` if the body is not a URL-encoded form or lacks the field |
+| `(req-file ctx field)` | `(Option Part)`; `part-name`, `part-filename : (Option cstr)`, `part-content-type`, `part-data`, `part-data-len` |
+| `(req-ip ctx)` / `(req-proto ctx)` / `(req-id ctx)` | client address, `"http"`/`"https"`, request id -- honouring `mw-trust-proxy` / `mw-request-id` in `tourist-with`'s stack |
+| `(basic-auth realm verify)` | a `use!`-shaped check: 401 + challenge unless `verify` accepts; the route reads `(auth-user ctx)` |
+| `(body-limit n)` | a `use!`-shaped check: 413 past `n` bytes |
+| `(guarded check handler)` | runs such a check in front of one route |
+
+```turmeric
+(tourist 3000
+  (get! "/" (fn [ctx : Ctx] : Response
+              (let [t (req-cookie ctx "theme")]
+                (text (if (some? t) (unwrap t) "light")))))
+  (get! "/admin" (guarded (basic-auth "staff" check-password) admin-page))
+  (post! "/upload" (guarded (body-limit 1048576) upload)))
+```
+
+```sweet-exp
+tourist 3000
+  get! "/" (fn [ctx : Ctx] : Response
+             (let [t req-cookie(ctx "theme")]
+               text(if(some?(t) unwrap(t) "light"))))
+  get! "/admin" guarded(basic-auth("staff" check-password) admin-page)
+  post! "/upload" guarded(body-limit(1048576) upload)
+```
+
+`serve-static!` serves files through stdlib's static serving: an `ETag` on
+every file, `304 Not Modified` for a matching `If-None-Match`, binary-safe
+bodies, and dotfiles (`.env`, `..`) refused.
+
 ### Server-level middleware -- stdlib httpd's set, via `tourist-with`
 
 Express apps get most cross-cutting behaviour from connect middleware
@@ -160,9 +198,13 @@ nothing.
 | `etag` (dynamic responses) | `mw-etag` |
 | `connect-timeout` | `mw-timeout` (the handler still runs to completion) |
 | `compression` | `mw-compress` (`stdlib/httpd-compress.tur`, needs the zlib spice) |
-| basic auth | `mw-basic-auth` |
-| body-parser `limit` | `mw-body-size`, or `ServerOpts`' body cap |
-| `serve-static` | `serve-static!` |
+| basic auth | `mw-basic-auth` app-wide, or `basic-auth` + `guarded` per route |
+| body-parser `limit` | `mw-body-size`, `ServerOpts`' body cap, or `body-limit` per route |
+| body-parser `urlencoded` | `form-param` |
+| `cookie-parser` / `res.cookie` | `req-cookie` / `set-cookie!` |
+| `multer` | `req-file` |
+| `req.ip` / `req.protocol` | `req-ip` / `req-proto` |
+| `serve-static` | `serve-static!` (ETag + 304) |
 | `app.use(fn)` | `use!` / `use-around!` / `use-after!` (above) |
 
 The stdlib middleware are documented in the turmeric repo's
@@ -191,8 +233,9 @@ queued headers on a short-circuit. `tests/wrap_test.tur` runs an app under
 `tourist-with` with trust-proxy, log, recover, CORS and rate-limit layers: a
 panicking route answered 500 (and logged, and leak-free), a preflight answered
 without reaching tourist, the client address in the log, a 429.
-`tests/opts_test.tur` checks `ServerOpts` without a stack. Run them with
-`tur test tests`.
+`tests/opts_test.tur` checks `ServerOpts` without a stack.
+`tests/request_test.tur` covers every request helper and `serve-static!`'s
+ETag / 304 / binary / dotfile behaviour. Run them with `tur test tests`.
 
 `errors/run.sh` asserts the compile-fail fixtures: that Captures, Ctx, Pattern
 and Item are not interchangeable even though all four are `:int` underneath.

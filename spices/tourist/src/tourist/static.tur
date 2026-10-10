@@ -1,10 +1,16 @@
 ;;; tourist/static -- static file serving with path-traversal guard.
 ;;;
 ;;; serve-static! matches GET <url-prefix>/* and serves files from fs-root.
-;;; Rejects any resolved path that escapes fs-root (.. segments and symlink
-;;; escapes via realpath). Content-Type is inferred from a built-in extension/
-;;; mime table. A 404 falls through to the next route; dynamic routes can
-;;; shadow static paths.
+;;; A miss falls through to the next route; dynamic routes can shadow static
+;;; paths.
+;;;
+;;; Since tourist-on-stdlib-httpd H5 the file is served by stdlib httpd's
+;;; httpd-static-serve! (mw-static's file serving): an ETag of
+;;; "<size>-<mtime>" on every file and 304 Not Modified for a matching
+;;; If-None-Match; the resolved path must stay inside fs-root, symlinks
+;;; included; no segment may start with '.' (dotfiles such as .env, and "..",
+;;; are refused -- .well-known excepted).  static-serve, the pre-H5 server
+;;; without validators, remains for a Ctx with no server behind it.
 ;;;
 ;;; Since: v0.1.0
 ;;
@@ -21,11 +27,15 @@
 
 (defmodule tourist/static
   (import tourist/router :refer [router-compile])
-  (import tourist/types  :refer [Item Pattern])
+  (import tourist/types  :refer [Ctx Item Pattern])
+  (import tourist/param  :refer [tourist-ctx-req])
+  (import httpd/request  :refer [request-conn])
+  (import httpd/server   :refer [take-conn-response])
   (export serve-static!
           static-item?
           static-route-fs-root
-          static-serve)
+          static-serve
+          static-serve-ctx)
 
 ;; -- Internal: build pattern string "<prefix>/*" ----------------------------
 
@@ -92,7 +102,12 @@
 (defn serve-static! [url-prefix : cstr fs-root : cstr] : int
   (let [pat-str (__static-pat-join url-prefix)
         pat     (router-compile pat-str)]
+    ;; router-compile copies what it keeps.
+    (__static-cstr-free pat-str)
     (__static-route-alloc url-prefix fs-root pat)))
+
+(defn __static-cstr-free [s : cstr] : void
+  ```c free((void *)s); ```)
 
 ;;; static-item? -- true if an item handle is a static-file route.
 ;;;
@@ -238,5 +253,32 @@
 
   return (int64_t)(intptr_t)r;
   ```)
+
+;;; static-serve-ctx -- serve `rel` from fs-root for this request.
+;;;
+;;; Through stdlib httpd's httpd-static-serve! (ETag, 304, path guards; see
+;;; the module docstring) when the Ctx has a server-built request behind it,
+;;; else through static-serve.
+;;;
+;;; Parameters:
+;;;   ctx     -- the request's Ctx
+;;;   fs-root -- filesystem root directory
+;;;   rel-raw -- relative path as char* cast to int64_t (the wildcard
+;;;              capture); 0 is a miss
+;;;
+;;; Returns:
+;;;   :int -- Response handle (200 or 304) on a hit, 0 on a miss
+;;;
+;;; Since: tourist-on-stdlib-httpd H5
+(defn static-serve-ctx [ctx : Ctx fs-root : cstr rel-raw : int] : int
+  (if (= rel-raw 0)
+    0
+    (let [c (request-conn (tourist-ctx-req ctx))]
+      (if (some? c)
+        (let [hc (unwrap c)]
+          (if (httpd-static-serve! hc fs-root (:: rel-raw :cstr))
+            (:: (take-conn-response hc) :int)
+            0))
+        (static-serve fs-root rel-raw)))))
 
 ) ;; end defmodule tourist/static

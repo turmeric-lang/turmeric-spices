@@ -132,6 +132,11 @@ sees the Response already on the conn. A handler that panics under
 `mw-recover` is answered 500, and its Request view is still freed. tourist's
 `tourist-with` is built on this.
 
+A typed handler can also let one stdlib function answer and hand the result
+back as its Response: `take-conn-response` moves what the stdlib conn holds
+(status, headers, body) into a new Response. tourist's `serve-static!` serves
+files that way, through stdlib's `httpd-static-serve!`.
+
 ## Typed handlers (`Handler` typeclass)
 
 `server-start` takes a bare `(c-fn [int] int)` whose `int`s are really a

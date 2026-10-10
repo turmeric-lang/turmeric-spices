@@ -65,11 +65,14 @@ like tourist's own dispatch state) and returns a tourist **after-middleware**
 item. There is no separate "before" middleware — the session is loaded
 **lazily** the first time a handler calls a `session-*` helper:
 
-1. the configured cookie is read from the request;
+1. the configured cookie is read from the request (tourist's `req-cookie`);
 2. if it names a session the store knows, that ID + map are adopted;
 3. otherwise a fresh 256-bit ID and an empty map are minted.
 
-On the way out, the after-middleware inspects the per-request session state:
+On the way out, the after-middleware inspects the per-request session state
+and writes the cookie with tourist's `set-cookie!` -- both are stdlib httpd's
+cookie parser and formatter, so the session spice no longer has its own
+(`session/cookie` is down to signing since v0.4.0):
 
 | Situation | Action |
 |-----------|--------|

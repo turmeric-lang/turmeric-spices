@@ -24,13 +24,14 @@
   (import session/data   :refer [SessMap sessmap-new sessmap-get sessmap-set!
                                  sessmap-del!])
   (import session/id     :refer [session-id-new])
-  (import session/cookie :refer [cookie-find cookie-unsign])
+  (import session/cookie :refer [cookie-unsign])
   (import session/store  :refer [store-load])
   (import session/ownstr :refer [String to-cstr release])
   (import session/state  :refer [session-get-store session-config-ptr
                                  cfg-cookie-name cfg-signing-key])
   (import tourist/param  :refer [ctx-attr-set!])
   (import tourist/types  :refer [Ctx])
+  (import tourist/request :refer [req-cookie])
   (export session-get session-set! session-del! session-destroy! session-id
           session-rotate!
           ;; internal surface consumed by session/mw:
@@ -192,24 +193,6 @@
   return 0;
   ```)
 
-;;; __ctx-header -- look up a request header value case-insensitively (NULL if
-;;; absent). Reads the borrowed httpd header arrays carried by the ctx.
-(defn __ctx-header [ctx : Ctx name : cstr] : cstr
-  ```c
-  #include <strings.h>
-  struct __tourist_ctx_h {
-    char  *method; char *path; char *query; char *body;
-    char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
-  };
-  struct __tourist_ctx_h *c = (struct __tourist_ctx_h *)(intptr_t)ctx;
-  const char *nm = (const char *)name;
-  for (int i = 0; i < c->hdr_count; i++) {
-    if (strcasecmp(c->hdr_keys[i], nm) == 0)
-      return (const char *)c->hdr_vals[i];
-  }
-  return (const char *)0;
-  ```)
-
 (defn __cstr-null? [s : cstr] : bool
   ```c
   return ((const char *)s) == 0;
@@ -220,12 +203,6 @@
   #include <stdlib.h>
   #include <string.h>
   return (const char *)strdup((const char *)s);
-  ```)
-
-(defn __cstr-free [s : cstr] : void
-  ```c
-  #include <stdlib.h>
-  free((void *)(intptr_t)s);
   ```)
 
 ;; -- lazy initialisation ---------------------------------------------------
@@ -251,28 +228,22 @@
       (__session-init ctx))))
 
 (defn __session-init [ctx : Ctx] : int
-  (let [cfgp   (session-config-ptr)
-        name   (cfg-cookie-name cfgp)
-        header (__ctx-header ctx "Cookie")
-        found  (if (__cstr-null? header)
-                 (:: (err "missing") (Result cstr cstr))
-                 (cookie-find header name))]
-    (if (ok? found)
-      (__session-init-from-cookie ctx (ok-val found))
+  (let [found (req-cookie ctx (cfg-cookie-name (session-config-ptr)))]
+    (if (some? found)
+      (__session-init-from-cookie ctx (unwrap found))
       (__session-attach ctx (session-id-new) (sessmap-new) 1))))
 
 (defn __session-init-from-cookie [ctx : Ctx cookie-val : cstr] : int
-  ;; cookie-val is the raw (possibly signed) value owned by cookie-find. Verify
-  ;; the signature first: with a key set, a tampered/forged MAC fails here and
-  ;; is indistinguishable from an unknown ID (a fresh session is minted); with
-  ;; signing off, the value is the ID verbatim.
+  ;; cookie-val is the raw (possibly signed) value, owned by the request
+  ;; (tourist's req-cookie). Verify the signature first: with a key set, a
+  ;; tampered/forged MAC fails here and is indistinguishable from an unknown
+  ;; ID (a fresh session is minted); with signing off, the value is the ID
+  ;; verbatim.
   (let [skey (cfg-signing-key (session-config-ptr))
         un   (cookie-unsign skey cookie-val)]
-    (do
-      (__cstr-free cookie-val)
-      (if (ok? un)
-        (__session-init-with-id ctx (ok-val un))
-        (__session-attach ctx (session-id-new) (sessmap-new) 1)))))
+    (if (ok? un)
+      (__session-init-with-id ctx (ok-val un))
+      (__session-attach ctx (session-id-new) (sessmap-new) 1))))
 
 ;;; __session-init-with-id -- load a verified session ID from the store.
 ;;;
