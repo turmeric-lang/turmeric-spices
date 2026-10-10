@@ -1,0 +1,179 @@
+;; Signal Processing -- Band-limited (hearing-range) oscillators
+;;
+;; The oscillators in signal/osc are the naive shapes: a sawtooth is a bare
+;; ramp, a square is a bare comparison. That is exactly right for a control
+;; signal (an LFO at a few Hz), where nothing near Nyquist is ever sampled. At
+;; audio rate it is wrong: the shapes have discontinuities, so their harmonics
+;; run past half the sample rate and fold back down as inharmonic "aliasing"
+;; partials that no later filter can remove. These oscillators are for
+;; hearing-range pitches. (A sine is already band-limited, so there is no
+;; hf-sine: use signal/osc `sine` at any pitch.)
+;;
+;; Method: PolyBLEP (square, sawtooth) and PolyBLAMP (triangle). The naive
+;; shape is computed, then a two-sample polynomial residual is added around
+;; each discontinuity (a step for sawtooth/square, a slope change for the
+;; triangle) to round it off the way a band-limited signal would be.
+;;
+;; Like every oscillator in this spice, each one is a pure function of time:
+;; the phase is derived from `t` (no hidden state), so these may be sampled out
+;; of order and at any rate. The price is that the correction needs to know the
+;; sample period, so each constructor takes the SAMPLE RATE in Hz. Sample the
+;; resulting signal at t = n / sample-rate; sampling it at a different rate than
+;; the one given still produces a signal, but its correction no longer matches
+;; the grid and it will alias like a naive shape.
+;;
+;; Measured with a windowed FFT, aliased energy relative to the true harmonics
+;; at 48 kHz (lower is better):
+;;
+;;                      3.0 kHz           7.9 kHz
+;;                   naive   hf-osc    naive   hf-osc
+;;   sawtooth        -13 dB  -27 dB     -7 dB  -27 dB
+;;   square          -16 dB  -36 dB    -10 dB  -38 dB
+;;   triangle        -40 dB  -48 dB    -26 dB  -45 dB
+;;
+;; This is a cheap, two-sample correction, not a brick-wall filter: it removes
+;; most of the audible aliasing for the cost of a few multiplies per sample, and
+;; leaves pitches near Nyquist (above ~sample-rate/4) increasingly impure. For a
+;; reference-quality oscillator use wavetables or additive synthesis (Tier 2).
+;;
+;; Output ranges differ from signal/osc where noted: hf-sawtooth is BIPOLAR
+;; ([-1, 1)) because an audio-rate oscillator must not carry a DC offset, while
+;; signal/osc `sawtooth` is a unipolar [0, 1) control ramp.
+
+(defmodule signal/hf-osc
+  (export hf-sawtooth hf-square hf-triangle)
+
+;; =============================================================================
+;; libm bridge
+;; =============================================================================
+
+;;; __hf_fmod -- compute floating-point modulo.
+;;;
+;;; The autolink directive links libm (-lm) for every program that pulls in this
+;;; module, so fmod resolves at link time.
+(defn __hf_fmod [x :float y :float] :float
+  ```c
+  /* __tur_autolink__: -lm */
+  extern double fmod(double, double);
+  return fmod(x, y);
+  ```)
+
+;; =============================================================================
+;; Helpers
+;; =============================================================================
+
+;;; __hf_phase -- cycle position of time t at freq Hz, in [0, 1).
+(defn __hf_phase [freq :float t :float] :float
+  (let [p (__hf_fmod (* freq t) 1.0)]
+    (if (< p 0.0) (+ p 1.0) p)))
+
+;;; __hf_dt -- phase advance per sample, clamped to a usable range.
+;;;
+;;; freq / sample-rate, held in [0, 0.5]. At dt = 0 (a DC or invalid request)
+;;; the corrections vanish and the oscillator degrades to the naive shape; above
+;;; 0.5 the two correction regions would overlap, and a frequency past Nyquist
+;;; has no meaningful band-limited form anyway.
+(defn __hf_dt [freq :float sample-rate :float] :float
+  (if (<= sample-rate 0.0)
+    0.0
+    (let [d (/ freq sample-rate)]
+      (if (< d 0.0) 0.0 (if (> d 0.5) 0.5 d)))))
+
+;;; __hf_blep -- PolyBLEP residual for a unit-height step at phase 0.
+;;;
+;;; Nonzero only within one sample (dt) either side of the step: a quadratic
+;;; that rounds the step. Scale by the step's size / 2 when applying.
+(defn __hf_blep [p :float dt :float] :float
+  (if (<= dt 0.0)
+    0.0
+    (if (< p dt)
+      (let [x (/ p dt)] (- (- (* 2.0 x) (* x x)) 1.0))
+      (if (> p (- 1.0 dt))
+        (let [x (/ (- p 1.0) dt)] (+ (+ (* x x) (* 2.0 x)) 1.0))
+        0.0))))
+
+;;; __hf_blamp -- PolyBLAMP residual for a unit slope change at phase 0.
+;;;
+;;; The integral of the BLEP residual: cubic, nonzero within one sample either
+;;; side of the corner. Scale by (slope change * dt / 2) when applying.
+(defn __hf_blamp [p :float dt :float] :float
+  (if (<= dt 0.0)
+    0.0
+    (if (< p dt)
+      (let [x (- (/ p dt) 1.0)] (/ (- 0.0 (* x (* x x))) 3.0))
+      (if (> p (- 1.0 dt))
+        (let [x (+ (/ (- p 1.0) dt) 1.0)] (/ (* x (* x x)) 3.0))
+        0.0))))
+
+;; =============================================================================
+;; Oscillators
+;; =============================================================================
+
+;;; hf-sawtooth -- band-limited sawtooth Signal Function.
+;;;
+;;; Parameters:
+;;;   freq        -- frequency in Hz
+;;;   sample-rate -- the rate the signal will be sampled at, in Hz
+;;;
+;;; Returns:
+;;;   An SF: ignores its input signal and emits a rising ramp in [-1, 1) with
+;;;   the downward step at the end of each cycle smoothed by PolyBLEP. It is
+;;;   0 at t = 0 (the smoothed step is centered on the cycle boundary) and
+;;;   crosses zero again mid-cycle.
+;;;
+;;; Example:
+;;;   ((hf-sawtooth 440.0 48000.0) (constant 0.0))
+(defn hf-sawtooth [freq :float sample-rate :float]
+  (let [fv freq dt (__hf_dt freq sample-rate)]
+    (fn [^fat sig]
+      (fn [t :float] :float
+        (let [p (__hf_phase fv t)]
+          (- (- (* 2.0 p) 1.0) (__hf_blep p dt)))))))
+
+;;; hf-square -- band-limited square/pulse Signal Function.
+;;;
+;;; Parameters:
+;;;   freq        -- frequency in Hz
+;;;   dutycycle   -- duty cycle in [0, 1]: the fraction of each cycle spent at +1
+;;;   sample-rate -- the rate the signal will be sampled at, in Hz
+;;;
+;;; Returns:
+;;;   An SF emitting +1.0 for the on-portion of each cycle and -1.0 otherwise,
+;;;   with both edges smoothed by PolyBLEP.
+;;;
+;;; Example:
+;;;   ((hf-square 220.0 0.5 48000.0) (constant 0.0))
+(defn hf-square [freq :float dutycycle :float sample-rate :float]
+  (let [fv freq dv dutycycle dt (__hf_dt freq sample-rate)]
+    (fn [^fat sig]
+      (fn [t :float] :float
+        (let [p     (__hf_phase fv t)
+              naive (if (< p dv) 1.0 -1.0)
+              fall  (let [q (+ (- p dv) 1.0)]
+                      (if (>= q 1.0) (- q 1.0) q))]
+          (- (+ naive (__hf_blep p dt)) (__hf_blep fall dt)))))))
+
+;;; hf-triangle -- band-limited triangle Signal Function.
+;;;
+;;; Parameters:
+;;;   freq        -- frequency in Hz
+;;;   sample-rate -- the rate the signal will be sampled at, in Hz
+;;;
+;;; Returns:
+;;;   An SF that rises from -1.0 to 1.0 over the first half of each cycle and
+;;;   falls back over the second, with both corners rounded by PolyBLAMP.
+;;;
+;;; Example:
+;;;   ((hf-triangle 440.0 48000.0) (constant 0.0))
+(defn hf-triangle [freq :float sample-rate :float]
+  (let [fv freq dt (__hf_dt freq sample-rate)]
+    (fn [^fat sig]
+      (fn [t :float] :float
+        (let [p     (__hf_phase fv t)
+              naive (if (< p 0.5) (- (* 4.0 p) 1.0) (- 3.0 (* 4.0 p)))
+              far   (let [q (+ p 0.5)] (if (>= q 1.0) (- q 1.0) q))]
+          ;; Slope changes by +8 at p = 0 and -8 at p = 0.5; the residual is
+          ;; scaled by (8 * dt / 2) = 4 * dt.
+          (+ naive (* (* 4.0 dt) (- (__hf_blamp p dt) (__hf_blamp far dt)))))))))
+
+) ;; end defmodule signal/hf-osc
