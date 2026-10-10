@@ -1,0 +1,344 @@
+;; html5lib.tur -- a slice of the html5lib tree-construction tests.
+;;
+;; tests/data/html5lib/*.dat come from html5lib-tests (MIT; LICENSE and the
+;; upstream commit are recorded beside them). Each test is markup plus the
+;; tree a conforming parser builds, dumped in html5lib's indented format; this
+;; file parses every test with html-parse (or html-parse-fragment for a
+;; `#document-fragment` test), dumps the dom-core tree in the same format and
+;; compares the text. So it checks lexbor's tree construction AND the copy
+;; into dom-core: element and attribute namespaces, foreign-content case
+;; adjustment, template contents, doctype identifiers, text coalescing.
+;;
+;; Skipped, and counted as such: `#script-on` tests (we parse with scripting
+;; off), fragments whose context is an SVG or MathML element (the API takes
+;; an HTML tag name), and tests whose data contains a NUL byte (not a cstr).
+;;
+;; Five tests are known failures (see `__known?` and the data README): newer
+;; than lexbor 3.0.1, they describe tree-builder behaviour that release does
+;; not have. A known failure that starts to pass FAILS this suite, so the
+;; list is removed as soon as it is wrong.
+
+(defmodule html5lib_test (export)
+
+(import dom/core   :refer [Document dom-node dom-free])
+(import html/dom   :refer [html-parse html-parse-fragment])
+(import test/suite  :refer [describe it])
+(import test/assert :refer [assert-true assert-eq])
+(import test/runner :refer [run-all-status])
+
+;; ---- the .dat reader --------------------------------------------------------
+
+;;; __dat-load -- read a .dat file into the test table; the number of tests.
+(defn __dat-load [path : cstr] : int
+  ```c
+  /* __tur_include__: #include <stddef.h> */
+  /* __tur_include__: #include <stdio.h> */
+  /* __tur_include__: typedef struct { char *data; char *ctx; char *want; int skip; } h5_test; */
+  /* __tur_include__: static h5_test *g_h5 = 0; */
+  /* __tur_include__: static size_t g_h5_len = 0; */
+  for (size_t i = 0; i < g_h5_len; i++) {
+    free(g_h5[i].data); free(g_h5[i].ctx); free(g_h5[i].want);
+  }
+  free(g_h5); g_h5 = 0; g_h5_len = 0;
+  FILE *f = fopen((const char *)path, "rb");
+  if (!f) return 0;
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  char *buf = (char *)malloc((size_t)sz + 2);
+  size_t got = fread(buf, 1, (size_t)sz, f);
+  fclose(f);
+  buf[got] = '\0';
+  /* Split into lines (keeping embedded NULs out of the picture by length). */
+  size_t cap = 0;
+  char *p = buf, *end = buf + got;
+  enum { NONE, DATA, ERRS, FRAG, DOC } sec = NONE;
+  h5_test *t = 0;
+  char *data_start = 0, *doc_start = 0;
+  int data_has_nul = 0;
+  while (p < end) {
+    char *nl = (char *)memchr(p, '\n', (size_t)(end - p));
+    char *le = nl ? nl : end;
+    size_t ll = (size_t)(le - p);
+    int is_hdr = ll > 1 && p[0] == '#';
+    if (is_hdr && ll == 5 && memcmp(p, "#data", 5) == 0) {
+      if (t && sec == DOC && doc_start) {
+        size_t n = (size_t)(p - doc_start);
+        while (n > 0 && doc_start[n - 1] == '\n') n--;
+        t->want = (char *)malloc(n + 1); memcpy(t->want, doc_start, n); t->want[n] = '\0';
+      }
+      if (g_h5_len == cap) { cap = cap ? cap * 2 : 64; g_h5 = (h5_test *)realloc(g_h5, cap * sizeof(h5_test)); }
+      t = &g_h5[g_h5_len++];
+      memset(t, 0, sizeof *t);
+      sec = DATA; data_start = le + (nl ? 1 : 0); data_has_nul = 0; doc_start = 0;
+    } else if (is_hdr && t && sec == DATA &&
+               ((ll == 7 && memcmp(p, "#errors", 7) == 0) ||
+                (ll == 11 && memcmp(p, "#new-errors", 11) == 0))) {
+      size_t n = (size_t)(p - data_start);
+      if (n > 0 && data_start[n - 1] == '\n') n--;
+      for (size_t i = 0; i < n; i++) if (data_start[i] == '\0') data_has_nul = 1;
+      t->data = (char *)malloc(n + 1); memcpy(t->data, data_start, n); t->data[n] = '\0';
+      if (data_has_nul) t->skip = 1;
+      sec = ERRS;
+    } else if (is_hdr && t && sec != DOC && ll >= 18 && memcmp(p, "#document-fragment", 18) == 0) {
+      /* the context is on the next line */
+      char *cs = le + 1;
+      char *ce = (char *)memchr(cs, '\n', (size_t)(end - cs));
+      if (!ce) ce = end;
+      t->ctx = (char *)malloc((size_t)(ce - cs) + 1);
+      memcpy(t->ctx, cs, (size_t)(ce - cs)); t->ctx[ce - cs] = '\0';
+      if (strchr(t->ctx, ' ')) t->skip = 1;       /* svg / math context */
+      p = ce < end ? ce + 1 : end;
+      continue;
+    } else if (is_hdr && t && sec != DOC && ll == 10 && memcmp(p, "#script-on", 10) == 0) {
+      t->skip = 1;
+    } else if (is_hdr && t && sec != DOC && ll == 9 && memcmp(p, "#document", 9) == 0) {
+      sec = DOC; doc_start = le + (nl ? 1 : 0);
+    }
+    p = nl ? nl + 1 : end;
+  }
+  if (t && sec == DOC && doc_start) {
+    size_t n = (size_t)(end - doc_start);
+    while (n > 0 && doc_start[n - 1] == '\n') n--;
+    t->want = (char *)malloc(n + 1); memcpy(t->want, doc_start, n); t->want[n] = '\0';
+  }
+  free(buf);
+  for (size_t i = 0; i < g_h5_len; i++)
+    if (!g_h5[i].data || !g_h5[i].want) g_h5[i].skip = 1;
+  return (int64_t)g_h5_len;
+  ```)
+
+;;; __dat-skip? -- is test i out of scope?
+(defn __dat-skip? [i : int] : bool
+  ```c
+  return g_h5[i].skip != 0;
+  ```)
+
+;;; __dat-fragment? -- is test i a fragment test?
+(defn __dat-fragment? [i : int] : bool
+  ```c
+  return g_h5[i].ctx != NULL;
+  ```)
+
+;;; __dat-data -- test i's markup.
+(defn __dat-data [i : int] : cstr
+  ```c
+  return g_h5[i].data ? g_h5[i].data : "";
+  ```)
+
+;;; __dat-context -- test i's fragment context.
+(defn __dat-context [i : int] : cstr
+  ```c
+  return g_h5[i].ctx ? g_h5[i].ctx : "";
+  ```)
+
+;; ---- the html5lib tree dump ---------------------------------------------------
+
+;;; __dump-matches? -- dump the tree under `top` and compare with test i;
+;;; prints the test on a mismatch.
+(defn __dump-matches? [top : ptr<void> i : int file : cstr quiet : bool] : bool
+  ```c
+  extern int turdom_kind(void *);
+  extern const char *turdom_name(void *);
+  extern const char *turdom_local_name(void *);
+  extern const char *turdom_ns_uri(void *);
+  extern const char *turdom_value(void *);
+  extern const char *turdom_public_id(void *);
+  extern const char *turdom_system_id(void *);
+  extern void *turdom_first_child(void *);
+  extern void *turdom_next_sibling(void *);
+  extern void *turdom_parent(void *);
+  extern int64_t turdom_attr_count(void *);
+  extern const char *turdom_attr_value_at(void *, int64_t);
+  extern const char *turdom_attr_ns_uri_at(void *, int64_t);
+  extern const char *turdom_attr_local_at(void *, int64_t);
+  extern const char *turdom_attr_name_at(void *, int64_t);
+  size_t cap = 4096, len = 0;
+  char *out = (char *)malloc(cap);
+  #define H5_PUT(s, n) do { size_t _n = (n); \
+    if (len + _n + 1 > cap) { while (len + _n + 1 > cap) cap *= 2; out = (char *)realloc(out, cap); } \
+    memcpy(out + len, (s), _n); len += _n; out[len] = '\0'; } while (0)
+  #define H5_PUTS(s) H5_PUT((s), strlen(s))
+  #define H5_LINE(d) do { if (len) H5_PUTS("\n"); H5_PUTS("| "); \
+    for (int64_t _d = 0; _d < (d); _d++) H5_PUTS("  "); } while (0)
+  /* Iterative pre-order walk; depth tracked through parent links.  A
+     <template>'s children are its content: print "content" one level down
+     and the children one level below that. */
+  void *n = turdom_first_child(top);
+  int64_t depth = 0;
+  const char *HTML = "http://www.w3.org/1999/xhtml";
+  while (n) {
+    int k = turdom_kind(n);
+    void *par = turdom_parent(n);
+    int64_t extra = 0;
+    if (par && par != top && turdom_kind(par) == 1 && turdom_ns_uri(par) &&
+        strcmp(turdom_ns_uri(par), HTML) == 0 && strcmp(turdom_local_name(par), "template") == 0)
+      extra = 0;  /* handled when the template line was written */
+    H5_LINE(depth);
+    if (k == 1) {
+      const char *ns = turdom_ns_uri(n);
+      H5_PUTS("<");
+      if (ns && strcmp(ns, "http://www.w3.org/2000/svg") == 0) { H5_PUTS("svg "); H5_PUTS(turdom_local_name(n)); }
+      else if (ns && strcmp(ns, "http://www.w3.org/1998/Math/MathML") == 0) { H5_PUTS("math "); H5_PUTS(turdom_local_name(n)); }
+      else H5_PUTS(turdom_local_name(n));
+      H5_PUTS(">");
+      /* attributes, sorted by their printed name */
+      int64_t na = turdom_attr_count(n);
+      char **lines = (char **)calloc((size_t)(na ? na : 1), sizeof(char *));
+      for (int64_t a = 0; a < na; a++) {
+        const char *ans = turdom_attr_ns_uri_at(n, a);
+        const char *pre = "";
+        if (ans && strcmp(ans, "http://www.w3.org/1999/xlink") == 0) pre = "xlink ";
+        else if (ans && strcmp(ans, "http://www.w3.org/XML/1998/namespace") == 0) pre = "xml ";
+        else if (ans && strcmp(ans, "http://www.w3.org/2000/xmlns/") == 0) pre = "xmlns ";
+        const char *nm = ans ? turdom_attr_local_at(n, a) : turdom_attr_name_at(n, a);
+        const char *v = turdom_attr_value_at(n, a);
+        size_t l = strlen(pre) + strlen(nm) + strlen(v) + 4;
+        lines[a] = (char *)malloc(l);
+        snprintf(lines[a], l, "%s%s=\"%s\"", pre, nm, v);
+      }
+      for (int64_t a = 1; a < na; a++)
+        for (int64_t b = a; b > 0 && strcmp(lines[b - 1], lines[b]) > 0; b--) {
+          char *tmp = lines[b]; lines[b] = lines[b - 1]; lines[b - 1] = tmp;
+        }
+      for (int64_t a = 0; a < na; a++) { H5_LINE(depth + 1); H5_PUTS(lines[a]); free(lines[a]); }
+      free(lines);
+      int is_tpl = ns && strcmp(ns, HTML) == 0 && strcmp(turdom_local_name(n), "template") == 0;
+      if (is_tpl) { H5_LINE(depth + 1); H5_PUTS("content"); }
+      (void)extra;
+      void *c = turdom_first_child(n);
+      if (c) { n = c; depth += is_tpl ? 2 : 1; continue; }
+    } else if (k == 2) {
+      H5_PUTS("\""); H5_PUTS(turdom_value(n)); H5_PUTS("\"");
+    } else if (k == 3) {
+      H5_PUTS("<!-- "); H5_PUTS(turdom_value(n)); H5_PUTS(" -->");
+    } else if (k == 6) {
+      H5_PUTS("<!DOCTYPE "); H5_PUTS(turdom_name(n));
+      const char *pub = turdom_public_id(n), *sys = turdom_system_id(n);
+      if (pub || sys) {
+        H5_PUTS(" \""); H5_PUTS(pub ? pub : ""); H5_PUTS("\" \""); H5_PUTS(sys ? sys : ""); H5_PUTS("\"");
+      }
+      H5_PUTS(">");
+    } else if (k == 5) {
+      H5_PUTS("<?"); H5_PUTS(turdom_name(n)); H5_PUTS(" "); H5_PUTS(turdom_value(n)); H5_PUTS(">");
+    }
+    /* advance: next sibling, else climb */
+    while (n) {
+      void *nx = turdom_next_sibling(n);
+      if (nx) { n = nx; break; }
+      n = turdom_parent(n);
+      if (!n || n == top) { n = NULL; break; }
+      int tpl = turdom_kind(n) == 1 && turdom_ns_uri(n) && strcmp(turdom_ns_uri(n), HTML) == 0 &&
+                strcmp(turdom_local_name(n), "template") == 0;
+      depth -= tpl ? 2 : 1;
+    }
+  }
+  int ok = strcmp(out, g_h5[i].want) == 0;
+  if (!ok && !quiet) {
+    fprintf(stderr, "# %s test %lld differs\n# data: %s\n# want:\n%s\n# got:\n%s\n",
+            (const char *)file, (long long)i, g_h5[i].data, g_h5[i].want, out);
+  }
+  free(out);
+  return ok;
+  #undef H5_PUT
+  #undef H5_PUTS
+  #undef H5_LINE
+  ```)
+
+;;; __node-ptr -- the document node as a bare pointer.
+(defn __node-ptr [d : Document] : ptr<void>
+  ```c
+  extern void *turdom_doc_node(void *);
+  return turdom_doc_node((void *)(intptr_t)d);
+  ```)
+
+;;; __known? -- is test i of `file` a known failure (lexbor 3.0.1)?
+(defn __known? [file : cstr i : int] : bool
+  ```c
+  const char *f = strrchr((const char *)file, '/');
+  f = f ? f + 1 : (const char *)file;
+  if (strcmp(f, "adoption02.dat") == 0) return i == 2;
+  if (strcmp(f, "webkit02.dat") == 0) return i >= 44 && i <= 47;
+  return false;
+  ```)
+
+;;; __say -- print a note to stderr.
+(defn __say [what : cstr file : cstr i : int] : nil
+  ```c
+  fprintf(stderr, "# %s: %s test %lld\n", (const char *)what, (const char *)file,
+          (long long)i);
+  ```)
+
+;;; run-one -- run test i; true when it behaved as expected.
+(defn run-one [i : int file : cstr] : bool
+  (if (__dat-skip? i)
+    true
+    (let [known (__known? file i)
+          d     (if (__dat-fragment? i)
+                  (html-parse-fragment (__dat-context i) (__dat-data i))
+                  (html-parse (__dat-data i)))
+          ok    (__dump-matches? (__node-ptr d) i file known)]
+      (dom-free d)
+      (if known
+        (if ok
+          (do (__say "known failure now passes; remove it from __known?" file i) false)
+          true)
+        ok))))
+
+;;; run-file -- how many of a .dat file's tests misbehave.
+(defn run-file [path : cstr] : int
+  (let [n          (__dat-load path)
+        ^mut i     0
+        ^mut fails 0]
+    (while (< i n)
+      (if (run-one i path) nil (set! fails (+ fails 1)))
+      (set! i (+ i 1)))
+    fails))
+
+;;; __nfiles -- list tests/data/html5lib/*.dat (sorted); how many.
+(defn __nfiles [] : int
+  ```c
+  /* __tur_include__: #include <dirent.h> */
+  /* __tur_include__: static char **g_files = 0; */
+  /* __tur_include__: static size_t g_nfiles = 0; */
+  if (!g_files) {
+    DIR *d = opendir("tests/data/html5lib");
+    struct dirent *de;
+    size_t cap = 0;
+    while (d && (de = readdir(d))) {
+      size_t n = strlen(de->d_name);
+      if (n < 5 || strcmp(de->d_name + n - 4, ".dat")) continue;
+      if (g_nfiles == cap) { cap = cap ? cap * 2 : 64; g_files = (char **)realloc(g_files, cap * sizeof(char *)); }
+      char *p = (char *)malloc(n + 32);
+      snprintf(p, n + 32, "tests/data/html5lib/%s", de->d_name);
+      g_files[g_nfiles++] = p;
+    }
+    if (d) closedir(d);
+    for (size_t i = 1; i < g_nfiles; i++)
+      for (size_t j = i; j > 0 && strcmp(g_files[j-1], g_files[j]) > 0; j--) {
+        char *t = g_files[j]; g_files[j] = g_files[j-1]; g_files[j-1] = t;
+      }
+  }
+  return (int64_t)g_nfiles;
+  ```)
+
+;;; __file -- the i-th file.
+(defn __file [i : int] : cstr
+  ```c
+  return g_files[i];
+  ```)
+
+(defn __all-tests [] : void
+  (describe "html5lib tree construction (tests/data/html5lib)"
+    (let [n (__nfiles)]
+      (it "finds the vendored .dat files" (= n 54))
+      (let [^mut i 0]
+        (while (< i n)
+          (it (__file i) (= 0 (run-file (__file i))))
+          (set! i (+ i 1)))))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule html5lib_test

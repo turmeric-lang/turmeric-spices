@@ -1,0 +1,389 @@
+;;; html/sax -- tokenizer-level HTML events, via lexbor's tokenizer.
+;;;
+;;; The same `(fn [SaxEvent] SaxControl)` handlers that read tur-xml's SAX
+;;; stream read this one: StartElement, EndElement, Chars, Comment and
+;;; Doctype. It is a TOKENIZER-level stream -- tags exactly as written, with
+;;; no tree construction behind them:
+;;;
+;;;   - no implied tags: "<p>a<p>b" is two StartElement p and no EndElement;
+;;;   - a void element (<br>, <img>) has no EndElement; an explicitly
+;;;     self-closed tag (<br/>, <path .../>) reports StartElement then
+;;;     EndElement;
+;;;   - mismatched end tags are reported as they appear;
+;;;   - the contents of <script>, <style>, <title>, <textarea>, <xmp>,
+;;;     <iframe>, <noembed>, <noframes> and <plaintext> are text, as in the
+;;;     HTML tokenizer's RAWTEXT / RCDATA / script states (decided by tag
+;;;     name, so an SVG <style> is treated the same way);
+;;;   - names are lower-case; character references are decoded in text and
+;;;     attribute values; NUL becomes U+FFFD.
+;;;
+;;; Use html/dom for the tree a browser would build. Tokenizing never fails,
+;;; so the only errors are the byte cap and running out of memory.
+;;;
+;;; Since: 0.1.0
+;; SAX driver over the token queue in c/html/turhtml.c.
+
+(defmodule html/sax
+  (export HtmlSaxParser html-sax-parse-string html-sax-parse-string-opts
+          html-sax-parser-new html-sax-parser-new-opts html-sax-feed!
+          html-sax-finish! html-sax-parser-free)
+
+(import dom/ownstr :refer [String from-cstr])
+(import dom/core   :refer [ParseError ParseErrorKind Syntax Limit Refused Io])
+(import dom/event  :refer [SaxEvent SaxControl Attr sax-event-release
+                           sax-dispatch StartElement EndElement Chars Comment
+                           Pi StartCdata EndCdata Doctype Continue Stop])
+(import html/dom   :refer [HtmlOpts default-html-opts])
+
+;;; HtmlSaxRaw -- internal: the C tokenizer state (c/html/turhtml.c).
+(defopaque HtmlSaxRaw :ptr<void>)
+
+;;; HtmlSaxParser -- a push tokenizer plus the handler it feeds.
+;;; Release with `html-sax-parser-free`.
+(defstruct HtmlSaxParser :copy [raw : HtmlSaxRaw
+                                handler : (fn [SaxEvent] SaxControl)])
+
+;; ---------------------------------------------------------------------------
+;; C bridge
+;; ---------------------------------------------------------------------------
+
+;;; __new-raw -- internal: a tokenizer (NULL on OOM).
+(defn __new-raw [nbytes : int] : ptr<void>
+  ```c
+  extern void *turhtml_sax_new(int64_t);
+  return turhtml_sax_new(nbytes);
+  ```)
+
+;;; __null? -- internal.
+(defn __null? [p : ptr<void>] : bool
+  ```c
+  return p == NULL;
+  ```)
+
+;;; __free -- internal.
+(defn __free [x : HtmlSaxRaw] : nil
+  ```c
+  extern void turhtml_sax_free(void *);
+  turhtml_sax_free((void *)(intptr_t)x);
+  ```)
+
+;;; __set-string -- internal: tokenize `src` (borrowed for the parse).
+(defn __set-string [x : HtmlSaxRaw src : cstr] : nil
+  ```c
+  extern void turhtml_sax_set_string(void *, const char *);
+  turhtml_sax_set_string((void *)(intptr_t)x, (const char *)src);
+  ```)
+
+;;; __pump -- internal: 1 more, 0 done, -1 failed.
+(defn __pump [x : HtmlSaxRaw] : int
+  ```c
+  extern int turhtml_sax_pump(void *);
+  return turhtml_sax_pump((void *)(intptr_t)x);
+  ```)
+
+;;; __feed -- internal: 0 ok, -1 failed.
+(defn __feed [x : HtmlSaxRaw chunk : cstr final : bool] : int
+  ```c
+  #include <string.h>
+  extern int turhtml_sax_feed(void *, const char *, int64_t, int);
+  const char *c = (const char *)chunk;
+  return turhtml_sax_feed((void *)(intptr_t)x, c, c ? (int64_t)strlen(c) : 0,
+                          final ? 1 : 0);
+  ```)
+
+;;; __next -- internal: the next queued event's kind, or 0.
+(defn __next [x : HtmlSaxRaw] : int
+  ```c
+  extern int turhtml_sax_next(void *);
+  return turhtml_sax_next((void *)(intptr_t)x);
+  ```)
+
+;;; __stop -- internal.
+(defn __stop [x : HtmlSaxRaw] : nil
+  ```c
+  extern void turhtml_sax_stop(void *);
+  turhtml_sax_stop((void *)(intptr_t)x);
+  ```)
+
+;;; __ev-name -- internal.
+(defn __ev-name [x : HtmlSaxRaw] : cstr
+  ```c
+  extern const char *turhtml_ev_name(void *);
+  return turhtml_ev_name((void *)(intptr_t)x);
+  ```)
+
+;;; __ev-text -- internal.
+(defn __ev-text [x : HtmlSaxRaw] : cstr
+  ```c
+  extern const char *turhtml_ev_text(void *);
+  return turhtml_ev_text((void *)(intptr_t)x);
+  ```)
+
+;;; __ev-pubid -- internal.
+(defn __ev-pubid [x : HtmlSaxRaw] : cstr
+  ```c
+  extern const char *turhtml_ev_pubid(void *);
+  return turhtml_ev_pubid((void *)(intptr_t)x);
+  ```)
+
+;;; __ev-sysid -- internal.
+(defn __ev-sysid [x : HtmlSaxRaw] : cstr
+  ```c
+  extern const char *turhtml_ev_sysid(void *);
+  return turhtml_ev_sysid((void *)(intptr_t)x);
+  ```)
+
+;;; __ev-nattrs -- internal.
+(defn __ev-nattrs [x : HtmlSaxRaw] : int
+  ```c
+  extern int64_t turhtml_ev_nattrs(void *);
+  return turhtml_ev_nattrs((void *)(intptr_t)x);
+  ```)
+
+;;; __ev-attr-name -- internal.
+(defn __ev-attr-name [x : HtmlSaxRaw i : int] : cstr
+  ```c
+  extern const char *turhtml_ev_attr_name(void *, int64_t);
+  return turhtml_ev_attr_name((void *)(intptr_t)x, i);
+  ```)
+
+;;; __ev-attr-value -- internal.
+(defn __ev-attr-value [x : HtmlSaxRaw i : int] : cstr
+  ```c
+  extern const char *turhtml_ev_attr_value(void *, int64_t);
+  return turhtml_ev_attr_value((void *)(intptr_t)x, i);
+  ```)
+
+;;; __err-kind -- internal.
+(defn __err-kind [x : HtmlSaxRaw] : int
+  ```c
+  extern int turhtml_sax_err_kind(void *);
+  return (int64_t)turhtml_sax_err_kind((void *)(intptr_t)x);
+  ```)
+
+;;; __err-msg -- internal.
+(defn __err-msg [x : HtmlSaxRaw] : cstr
+  ```c
+  extern const char *turhtml_sax_err_msg(void *);
+  return turhtml_sax_err_msg((void *)(intptr_t)x);
+  ```)
+
+;; ---------------------------------------------------------------------------
+;; Events
+;; ---------------------------------------------------------------------------
+
+;;; __error -- internal: the recorded error (msg copied).
+(defn __error [x : HtmlSaxRaw] : ParseError
+  (ParseError (if (= (__err-kind x) 3) (Io) (Limit)) (from-cstr (__err-msg x)) 0 0))
+
+;;; __oom -- internal.
+(defn __oom [] : ParseError
+  (ParseError (Limit) (from-cstr "out of memory") 0 0))
+
+;;; __attrs-acc -- internal: attributes, built back to front.
+(defn __attrs-acc [x : HtmlSaxRaw i : int acc : (Cons Attr)] : (Cons Attr)
+  (if (< i 0)
+    acc
+    (__attrs-acc x (- i 1)
+                 (tcons-of (Attr (from-cstr (__ev-attr-name x i))
+                                 (from-cstr (__ev-attr-value x i)))
+                           acc))))
+
+;;; __event -- internal: the current token as a SaxEvent.
+(defn __event [x : HtmlSaxRaw k : int] : SaxEvent
+  (cond
+    (= k 1) (StartElement (from-cstr (__ev-name x))
+                          (__attrs-acc x (- (__ev-nattrs x) 1) (tnil)))
+    (= k 2) (EndElement (from-cstr (__ev-name x)))
+    (= k 3) (Chars (from-cstr (__ev-text x)))
+    (= k 4) (Comment (from-cstr (__ev-text x)))
+    :else   (Doctype (from-cstr (__ev-name x))
+                     (from-cstr (__ev-pubid x))
+                     (from-cstr (__ev-sysid x)))))
+
+;;; __deliver -- internal: hand every queued event to the handler; true when
+;;; the handler stopped. A loop, as in xml/sax.
+(defn __deliver [x : HtmlSaxRaw h : (fn [SaxEvent] SaxControl)] : bool
+  (let [^mut stopped false
+        ^mut k       (__next x)]
+    (while (> k 0)
+      (let [ev  (__event x k)
+            ctl (sax-dispatch h ev)]
+        (sax-event-release ev)
+        (match ctl
+          (Continue) (set! k (__next x))
+          (Stop)     (do (__stop x)
+                         (set! stopped true)
+                         (set! k 0)))))
+    stopped))
+
+;;; __deliver-chunk -- internal: one chunk's events inside a region, so the
+;;; :heap events and attribute cells are rewound when it is done.
+(defn __deliver-chunk [x : HtmlSaxRaw h : (fn [SaxEvent] SaxControl)] : bool
+  (let [deliver (fn [] : bool (__deliver x h))]
+    (with-region deliver)))
+
+;;; __run -- internal: pump the configured string to the end.
+(defn __run [x : HtmlSaxRaw h : (fn [SaxEvent] SaxControl)]
+  : (Result nil ParseError)
+  (let [^mut rc      1
+        ^mut stopped false]
+    (while (and (> rc 0) (not stopped))
+      (set! rc (__pump x))
+      (set! stopped (__deliver-chunk x h)))
+    (if stopped
+      (Ok nil)
+      (if (< rc 0)
+        (Err (__error x))
+        (Ok nil)))))
+
+;;; __make -- internal: a tokenizer, or none on OOM.
+(defn __make [opts : HtmlOpts] : (Option HtmlSaxRaw)
+  (let [p (__new-raw (.max-bytes opts))]
+    (if (__null? p) (None) (Some (:: p HtmlSaxRaw)))))
+
+;; ---------------------------------------------------------------------------
+;; Entry points
+;; ---------------------------------------------------------------------------
+
+;;; html-sax-parse-string-opts -- tokenize HTML with explicit caps.
+;;;
+;;; Parameters:
+;;;   src  -- the markup
+;;;   opts -- only max-bytes applies (there is no tree to cap the depth of)
+;;;   h    -- called once per event; return (Continue) or (Stop)
+;;;
+;;; Returns:
+;;;   (Result nil ParseError) -- err (Limit) only past max-bytes or on OOM.
+;;;
+;;; Example:
+;;;   (html-sax-parse-string-opts src (with (default-html-opts) [max-bytes 0]) h)
+;;;
+;;; Since: 0.1.0
+(defn html-sax-parse-string-opts [src : cstr opts : HtmlOpts
+                                  h : (fn [SaxEvent] SaxControl)]
+  : (Result nil ParseError)
+  (match (__make opts)
+    (None)   (Err (__oom))
+    (Some x) (do (__set-string x src)
+                 (let [r (__run x h)]
+                   (__free x)
+                   r))))
+
+;;; html-sax-parse-string -- tokenize HTML with the default caps.
+;;;
+;;; Parameters:
+;;;   src -- the markup
+;;;   h   -- called once per event
+;;;
+;;; Returns:
+;;;   (Result nil ParseError)
+;;;
+;;; Example:
+;;;   (html-sax-parse-string "<a href=x>link</a>"
+;;;     (fn [e : SaxEvent] : SaxControl
+;;;       (match e
+;;;         (StartElement n as) (do (println (to-cstr n)) (Continue))
+;;;         _ (Continue))))
+;;;
+;;; Since: 0.1.0
+(defn html-sax-parse-string [src : cstr h : (fn [SaxEvent] SaxControl)]
+  : (Result nil ParseError)
+  (html-sax-parse-string-opts src (default-html-opts) h))
+
+;;; html-sax-parser-new-opts -- a push tokenizer with explicit caps.
+;;;
+;;; Parameters:
+;;;   opts -- only max-bytes applies
+;;;   h    -- called once per event as chunks are fed
+;;;
+;;; Returns:
+;;;   (Result HtmlSaxParser ParseError) -- err only when out of memory.
+;;;
+;;; Example:
+;;;   (html-sax-parser-new-opts (default-html-opts) h)
+;;;
+;;; Since: 0.1.0
+(defn html-sax-parser-new-opts [opts : HtmlOpts h : (fn [SaxEvent] SaxControl)]
+  : (Result HtmlSaxParser ParseError)
+  (match (__make opts)
+    (None)   (Err (__oom))
+    (Some x) (Ok (HtmlSaxParser x h))))
+
+;;; html-sax-parser-new -- a push tokenizer with the default caps.
+;;;
+;;; Parameters:
+;;;   h -- called once per event as chunks are fed
+;;;
+;;; Returns:
+;;;   (Result HtmlSaxParser ParseError)
+;;;
+;;; Example:
+;;;   (match (html-sax-parser-new h)
+;;;     (Ok p) (do (html-sax-feed! p "<p>he") (html-sax-feed! p "llo")
+;;;                (html-sax-finish! p) (html-sax-parser-free p))
+;;;     (Err e) ...)
+;;;
+;;; Since: 0.1.0
+(defn html-sax-parser-new [h : (fn [SaxEvent] SaxControl)]
+  : (Result HtmlSaxParser ParseError)
+  (html-sax-parser-new-opts (default-html-opts) h))
+
+;;; __push -- internal: feed a chunk (or the end) and deliver its events.
+(defn __push [p : HtmlSaxParser chunk : cstr final : bool]
+  : (Result nil ParseError)
+  (let [x       (.raw p)
+        rc      (__feed x chunk final)
+        stopped (__deliver-chunk x (.handler p))]
+    (if (and (< rc 0) (not stopped))
+      (Err (__error x))
+      (Ok nil))))
+
+;;; html-sax-feed! -- feed the next chunk and deliver its events.
+;;;
+;;; Chunks may split the input anywhere; text that may continue in the next
+;;; chunk is held back, so the events do not depend on where chunks fall.
+;;;
+;;; Parameters:
+;;;   p     -- the push tokenizer
+;;;   chunk -- the next bytes
+;;;
+;;; Returns:
+;;;   (Result nil ParseError)
+;;;
+;;; Example:
+;;;   (html-sax-feed! p "<div cla")
+;;;   (html-sax-feed! p "ss=x>")
+;;;
+;;; Since: 0.1.0
+(defn html-sax-feed! [p : HtmlSaxParser chunk : cstr] : (Result nil ParseError)
+  (__push p chunk false))
+
+;;; html-sax-finish! -- signal the end of input and deliver the last events.
+;;;
+;;; Parameters:
+;;;   p -- the push tokenizer
+;;;
+;;; Returns:
+;;;   (Result nil ParseError)
+;;;
+;;; Example:
+;;;   (html-sax-finish! p)
+;;;
+;;; Since: 0.1.0
+(defn html-sax-finish! [p : HtmlSaxParser] : (Result nil ParseError)
+  (__push p "" true))
+
+;;; html-sax-parser-free -- release a push tokenizer.
+;;;
+;;; Parameters:
+;;;   p -- the tokenizer, not used afterwards
+;;;
+;;; Example:
+;;;   (html-sax-parser-free p)
+;;;
+;;; Since: 0.1.0
+(defn html-sax-parser-free [p : HtmlSaxParser] : nil
+  (__free (.raw p)))
+
+) ;; end defmodule html/sax
