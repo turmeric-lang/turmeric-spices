@@ -6,7 +6,9 @@ One test module per source module, covering the Tier 1 surface:
 |---|---|
 | `test_core.tur` | `constant`, `time-signal`, `sample` |
 | `test_hf_osc.tur` | `hf-sawtooth`, `hf-square`, `hf-triangle`: naive away from edges, rounded at edges, range, sample-rate 0 |
+| `test_noise.tur` | white/pink/brown/blue/violet: determinism, range, spectral tilt order, the `-from` injected forms, effect-row purity |
 | `test_osc.tur` | `sine`, `square`, `sawtooth`, `triangle` (zero crossings + peaks) |
+| `test_delay.tur` | `delay-n`, `comb-ff-n`, `comb-n`, `allpass-n` impulse responses; the seconds layer; clamping; allpass energy preservation |
 | `test_filter.tur` | `low-pass`, `high-pass` step response; per-instance state |
 | `test_shaper.tur` | every shaper + the Pair mixers (`mix`, `add`, `multiply`) |
 | `test_envelope.tur` | `adsr-fixed` / `adsr-gen` across all ADSR segments |
@@ -21,7 +23,7 @@ not just a printed message.
 ```sh
 cd spices/signal
 tur test tests/signal
-# expected: 7 tests, 7 passed, 0 failed
+# expected: 9 tests, 9 passed, 0 failed
 ```
 
 Or run a single module directly:

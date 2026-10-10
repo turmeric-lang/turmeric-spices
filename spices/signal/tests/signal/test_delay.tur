@@ -1,0 +1,124 @@
+;; test_delay -- correctness tests for signal/delay.
+;;
+;; Every effect here is stateful and pull-order dependent, so the tests feed a
+;; unit impulse (1.0 at k = 0, else 0.0) and sample k = 0, 1, 2, ... in order.
+;; With a delay of D samples and gain g the impulse responses are:
+;;   delay-n    D=3         : 0 0 0 1 0 0
+;;   comb-ff-n  D=2 g=0.5   : 1 0 .5 0 0
+;;   comb-n     D=2 g=0.5   : 1 0 .5 0 .25 0 .125
+;;   allpass-n  D=2 g=0.5   : -.5 0 .75 0 .375 0 .1875
+;; An allpass has unit gain at every frequency, so its impulse response must
+;; carry the energy of the impulse: sum of squares -> 1.
+;;
+;; main returns the failure count for `tur test`.
+
+(defmodule signal/tests/test_delay
+  (import signal/core  :refer [sample])
+  (import signal/delay :refer [delay-n delay comb-ff-n comb-ff comb-n comb
+                               allpass-n allpass])
+
+(defn near? [a :float b :float] :bool
+  (let [d (- a b)]
+    (if (< d 0.0) (< (- 0.0 d) 0.0001) (< d 0.0001))))
+
+(defn fail-unless [cond :bool label :cstr] :int
+  (if cond 0 (do (println label) 1)))
+
+;; Unit impulse: 1.0 at k = 0, else 0.0 (k is passed as t).
+(defn impulse [t :float] :float
+  (if (< t 0.5) 1.0 0.0))
+
+;; Sum of squares of the first n outputs of `s`, sampled at t = k.
+(defn energy [^fat s : (fn [float] float) k :int n :int acc :float] :float
+  (if (>= k n)
+    acc
+    (let [y (sample s (as float k))]
+      (energy s (+ k 1) n (+ acc (* y y))))))
+
+(defn main [] : int
+  (let [d ((delay-n 3) impulse)
+        d0 (sample d 0.0) d1 (sample d 1.0) d2 (sample d 2.0)
+        d3 (sample d 3.0) d4 (sample d 4.0)
+
+        ff ((comb-ff-n 2 0.5) impulse)
+        f0 (sample ff 0.0) f1 (sample ff 1.0) f2 (sample ff 2.0)
+        f3 (sample ff 3.0) f4 (sample ff 4.0)
+
+        cb ((comb-n 2 0.5) impulse)
+        c0 (sample cb 0.0) c1 (sample cb 1.0) c2 (sample cb 2.0)
+        c3 (sample cb 3.0) c4 (sample cb 4.0) c6 (+ (sample cb 5.0) (sample cb 6.0))
+
+        ap ((allpass-n 2 0.5) impulse)
+        a0 (sample ap 0.0) a1 (sample ap 1.0) a2 (sample ap 2.0)
+        a3 (sample ap 3.0) a4 (sample ap 4.0)
+
+        ;; Seconds layer: 10 Hz * 0.3 s = 3 samples, so it matches delay-n 3.
+        ds ((delay 10.0 0.3) impulse)
+        s0 (sample ds 0.0) s1 (sample ds 1.0) s2 (sample ds 2.0) s3 (sample ds 3.0)
+        ;; 100 Hz * 0.02 s = 2 samples: same as comb-n 2.
+        cs ((comb 100.0 0.02 0.5) impulse)
+        cs0 (sample cs 0.0) cs1 (sample cs 1.0) cs2 (sample cs 2.0)
+        fs ((comb-ff 100.0 0.02 0.5) impulse)
+        fs0 (sample fs 0.0) fs1 (sample fs 1.0) fs2 (sample fs 2.0)
+        as ((allpass 100.0 0.02 0.5) impulse)
+        as0 (sample as 0.0) as1 (sample as 1.0) as2 (sample as 2.0)
+
+        ;; Clamping: a zero / negative delay and a bad sample rate degrade to
+        ;; one sample instead of failing.
+        z ((delay-n 0) impulse)
+        z0 (sample z 0.0) z1 (sample z 1.0)
+        bad ((delay -5.0 0.3) impulse)
+        b0 (sample bad 0.0) b1 (sample bad 1.0)
+
+        ;; Energy preservation of the allpass over a long tail.
+        e (energy ((allpass-n 7 0.6) impulse) 0 400 0.0)
+
+        f (+ (fail-unless (near? d0 0.0) "FAIL: delay-n[0]")
+             (fail-unless (near? d2 0.0) "FAIL: delay-n[2]")
+             (fail-unless (near? d3 1.0) "FAIL: delay-n[3] (impulse at D)")
+             (fail-unless (near? (+ d1 d4) 0.0) "FAIL: delay-n tail")
+
+             (fail-unless (near? f0 1.0) "FAIL: comb-ff-n[0]")
+             (fail-unless (near? f1 0.0) "FAIL: comb-ff-n[1]")
+             (fail-unless (near? f2 0.5) "FAIL: comb-ff-n[2]")
+             (fail-unless (near? (+ f3 f4) 0.0) "FAIL: comb-ff-n finite response")
+
+             (fail-unless (near? c0 1.0)  "FAIL: comb-n[0]")
+             (fail-unless (near? c1 0.0)  "FAIL: comb-n[1]")
+             (fail-unless (near? c2 0.5)  "FAIL: comb-n[2]")
+             (fail-unless (near? c3 0.0)  "FAIL: comb-n[3]")
+             (fail-unless (near? c4 0.25) "FAIL: comb-n[4] (echo decays by g)")
+             (fail-unless (near? c6 0.125) "FAIL: comb-n[6]")
+
+             (fail-unless (near? a0 -0.5)  "FAIL: allpass-n[0]")
+             (fail-unless (near? a1 0.0)   "FAIL: allpass-n[1]")
+             (fail-unless (near? a2 0.75)  "FAIL: allpass-n[2]")
+             (fail-unless (near? a3 0.0)   "FAIL: allpass-n[3]")
+             (fail-unless (near? a4 0.375) "FAIL: allpass-n[4]")
+
+             (fail-unless (and (near? s0 0.0) (near? s1 0.0) (near? s2 0.0)
+                               (near? s3 1.0))
+                          "FAIL: delay seconds layer")
+             (fail-unless (and (near? cs0 1.0) (near? cs1 0.0) (near? cs2 0.5))
+                          "FAIL: comb seconds layer")
+             (fail-unless (and (near? fs0 1.0) (near? fs1 0.0) (near? fs2 0.5))
+                          "FAIL: comb-ff seconds layer")
+             (fail-unless (and (near? as0 -0.5) (near? as1 0.0) (near? as2 0.75))
+                          "FAIL: allpass seconds layer")
+
+             (fail-unless (and (near? z0 0.0) (near? z1 1.0))
+                          "FAIL: delay-n 0 should clamp to 1 sample")
+             (fail-unless (and (near? b0 0.0) (near? b1 1.0))
+                          "FAIL: delay with negative sample-rate should clamp to 1 sample")
+
+             (fail-unless (near? e 1.0) "FAIL: allpass-n does not preserve energy")
+
+             ;; Two independent instances must not share a buffer.
+             (fail-unless (near? (sample ((delay-n 1) impulse) 0.0) 0.0)
+                          "FAIL: delay-n first output not silent on a fresh instance"))]
+    (if (= f 0)
+      (println "PASS test_delay")
+      (println "test_delay: failures above"))
+    f))
+
+) ;; end defmodule signal/tests/test_delay

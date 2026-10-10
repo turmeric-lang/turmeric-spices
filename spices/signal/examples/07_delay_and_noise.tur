@@ -1,0 +1,64 @@
+;; 07_delay_and_noise -- delay lines, comb/allpass filters, and colored noise.
+;;
+;; Delay effects and noise are STATEFUL: each instance advances once per
+;; `sample` call and ignores the time argument, so sample every instance once
+;; per sample, in order. Expected outputs are in comments.
+
+(defmodule signal/examples/07_delay_and_noise
+  (import signal/core  :refer [constant sample])
+  (import signal/delay :refer [delay-n comb allpass-n])
+  (import signal/noise :refer [rng white pink white-from])
+
+;; A unit impulse: 1.0 for t < 0.5, else 0.0 (sampled at t = 0, 1, 2, ...).
+(defn impulse [t :float] :float
+  (if (< t 0.5) 1.0 0.0))
+
+;; A noise source that is NOT pure: it declares #fx{IO}, so the signal built
+;; from it is #fx{IO} too and the compiler will not let a #fx{} caller use it.
+(defn noisy-source [] #fx{IO} : float
+  (println "(drew a sample)")
+  0.5)
+
+(defn main [] #fx{IO} : int
+  ;; Delay by 3 samples: the impulse reappears at k = 3.
+  (let [d ((delay-n 3) impulse)]
+    (println (sample d 0.0))    ;; 0
+    (println (sample d 1.0))    ;; 0
+    (println (sample d 2.0))    ;; 0
+    (println (sample d 3.0)))   ;; 1
+
+  ;; Feedback comb, delay given in seconds at an explicit sample rate:
+  ;; 100 Hz * 0.02 s = 2 samples, feedback 0.5 -> echoes 1, .5, .25, ...
+  (let [c ((comb 100.0 0.02 0.5) impulse)]
+    (println (sample c 0.0))    ;; 1
+    (println (sample c 1.0))    ;; 0
+    (println (sample c 2.0))    ;; 0.5
+    (println (sample c 3.0))    ;; 0
+    (println (sample c 4.0)))   ;; 0.25
+
+  ;; Schroeder allpass: unit gain at every frequency, so it changes the phase
+  ;; of the impulse but preserves its energy.
+  (let [a ((allpass-n 2 0.5) impulse)]
+    (println (sample a 0.0))    ;; -0.5
+    (println (sample a 1.0))    ;; 0
+    (println (sample a 2.0)))   ;; 0.75
+
+  ;; Seeded noise is repeatable: the same seed gives the same stream.
+  (let [w1 ((white 42) (constant 0.0))
+        w2 ((white 42) (constant 0.0))]
+    (println (sample w1 0.0))   ;; 0.48313
+    (println (sample w2 0.0)))  ;; 0.48313 (same seed, same sample)
+
+  ;; (pink 42) colors the stream of (rng 42); white-from the same source
+  ;; passes it through unchanged, so the first sample matches `white`.
+  (let [p1 ((pink 42) (constant 0.0))
+        p2 ((white-from (rng 42)) (constant 0.0))]
+    (println (sample p1 0.0))  ;; 0.0875385 (colored)
+    (println (sample p2 0.0)))  ;; 0.48313 (white-from is uncolored)
+
+  ;; Injecting an impure source: allowed here because main declares #fx{IO}.
+  (let [n ((white-from noisy-source) (constant 0.0))]
+    (println (sample n 0.0)))   ;; (drew a sample), then 0.5
+  0)
+
+) ;; end defmodule signal/examples/07_delay_and_noise
