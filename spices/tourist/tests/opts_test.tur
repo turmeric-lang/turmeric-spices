@@ -1,0 +1,79 @@
+;; tests/opts_test.tur -- tourist-with without a middleware stack
+;; (tourist-on-stdlib-httpd-plan H4).
+;;
+;; A TouristOpts whose wrap is none runs the app on the plain server, with
+;; its ServerOpts applied: here a 16-byte body cap, so a larger POST is
+;; answered 413 by the server before tourist sees it.
+
+(defmodule tourist/tests/opts
+  (import tourist/app     :refer [TouristOpts tourist-with])
+  (import tourist/dsl     :refer [get! post!])
+  (import tourist/helpers :refer [text])
+  (import httpd/server    :refer [ServerOpts server-port server-stop])
+  (import test/suite      :refer [describe it])
+  (import test/assert     :refer [assert-eq])
+  (import test/runner     :refer [run-all-status])
+
+```c
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+static int opt__status(int port, const char *req) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+  struct sockaddr_in a; memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return -1; }
+  struct timeval tv = { 5, 0 };
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  send(fd, req, strlen(req), MSG_NOSIGNAL);
+  char buf[512];
+  ssize_t n = recv(fd, buf, sizeof buf - 1, 0);
+  close(fd);
+  if (n <= 0) return -1;
+  buf[n] = '\0';
+  int st = 0;
+  sscanf(buf, "HTTP/1.1 %d", &st);
+  return st;
+}
+```
+
+  (defn get-status [port : int] : int
+    ```c return opt__status((int)port, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"); ```)
+
+  (defn post-status [port : int body-len : int] : int
+    ```c
+    char req[512];
+    char body[200];
+    memset(body, 'x', (size_t)body_len);
+    body[body_len] = '\0';
+    snprintf(req, sizeof req, "POST /in HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+             (int)body_len, body);
+    return opt__status((int)port, req);
+    ```)
+
+  (defn __all-tests [] : void
+    (let [srv  (tourist-with 0 (make-struct TouristOpts (make-struct ServerOpts 2 16 0) (none))
+                 (get! "/" (fn [_] (text "ok")))
+                 (post! "/in" (fn [_] (text "taken"))))
+          port (server-port srv)]
+      (describe "tourist-with -- ServerOpts, no middleware stack"
+        (it "a route is served"
+          (assert-eq 200 (get-status port)))
+        (it "a body within the cap reaches the route"
+          (assert-eq 200 (post-status port 10)))
+        (it "a body over the ServerOpts cap is answered 413"
+          (assert-eq 413 (post-status port 100))))
+      (server-stop srv)))
+
+  (defn main [] : int
+    (__all-tests)
+    (run-all-status)))

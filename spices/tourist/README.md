@@ -100,6 +100,74 @@ tourist 3000
   get! "/" (fn [_] (text "ok"))
 ```
 
+### Server-level middleware -- stdlib httpd's set, via `tourist-with`
+
+Express apps get most cross-cutting behaviour from connect middleware
+(`app.use(cors())`). tourist's equivalent is stdlib httpd's middleware set,
+run around the whole app: give `tourist-with` a `TouristOpts` whose wrap puts
+a `compose-middleware` stack around tourist's dispatch. It sees every request
+-- also the ones no route matches and the ones it answers itself (a CORS
+preflight, a 429) -- and runs after tourist's response is written, so it can
+decorate it.
+
+```turmeric
+(defn app-stack [inner : ptr<void>] : ptr<void>
+  (compose-middleware inner
+                      (mw-trust-proxy (ok-val (trust-proxy-opts "loopback")))
+                      mw-log
+                      mw-recover
+                      (mw-cors-opts cors)
+                      (mw-rate-limit (make-struct RateLimitOpts 100 60))))
+
+(tourist-with 3000
+  (tourist-opts (fn [inner : ptr<void>] : ptr<void> (app-stack inner)))
+  (get! "/" (fn [_] (text "ok"))))
+```
+
+```sweet-exp
+defn app-stack [inner : ptr<void>] : ptr<void>
+  compose-middleware inner
+                     mw-trust-proxy(ok-val(trust-proxy-opts("loopback")))
+                     mw-log
+                     mw-recover
+                     mw-cors-opts(cors)
+                     mw-rate-limit(make-struct(RateLimitOpts 100 60))
+
+tourist-with 3000
+  tourist-opts (fn [inner : ptr<void>] : ptr<void> (app-stack inner))
+  get! "/" (fn [_] (text "ok"))
+```
+
+The leftmost layer is outermost. Put `mw-trust-proxy` outside what reads the
+client address, and `mw-log` outside `mw-recover` so the 500 it makes is
+logged (a panic skips the post-processing of every layer it unwinds through).
+`TouristOpts` also carries httpd's `ServerOpts` (workers, body cap, read
+timeout); `(default-tourist-opts)` is `tourist`'s own settings with no stack.
+The wrap is called once when the server starts: build a fresh `TouristOpts`
+for each server. `tourist-conn-with` is the same for apps with WebSocket
+routes. A route that panics under `mw-recover` is answered 500 and leaks
+nothing.
+
+| Express | tourist |
+|---|---|
+| `cors` | `mw-cors-opts` (origin allow-list, credentials) |
+| `morgan` | `mw-log`, or `mw-log-to` for your own sink |
+| error-handling middleware | `mw-recover` (real panic recovery) |
+| `express-rate-limit` | `mw-rate-limit` |
+| `helmet` | `mw-secure-headers` / `mw-secure-headers-opts` |
+| `express-request-id` | `mw-request-id`, read with `httpd-req-id` |
+| `app.set('trust proxy', ...)` | `mw-trust-proxy`; `httpd-req-ip` / `httpd-req-proto` |
+| `etag` (dynamic responses) | `mw-etag` |
+| `connect-timeout` | `mw-timeout` (the handler still runs to completion) |
+| `compression` | `mw-compress` (`stdlib/httpd-compress.tur`, needs the zlib spice) |
+| basic auth | `mw-basic-auth` |
+| body-parser `limit` | `mw-body-size`, or `ServerOpts`' body cap |
+| `serve-static` | `serve-static!` |
+| `app.use(fn)` | `use!` / `use-around!` / `use-after!` (above) |
+
+The stdlib middleware are documented in the turmeric repo's
+[httpd middleware guide](https://turmeric-lang.com/docs/html/guides/httpd-middleware-guide.html).
+
 ## Status
 
 Early in development. See
@@ -119,7 +187,12 @@ literal segments, named captures (single, multiple, and the empty-segment and
 extra-segment misses), the greedy `*` wildcard, and trailing-slash tolerance.
 `tests/middleware_test.tur` runs a live app: capturing `use!` / `use-around!` /
 `use-after!` closures under eight concurrent clients, nesting order, and
-queued headers on a short-circuit. Run them with `tur test tests`.
+queued headers on a short-circuit. `tests/wrap_test.tur` runs an app under
+`tourist-with` with trust-proxy, log, recover, CORS and rate-limit layers: a
+panicking route answered 500 (and logged, and leak-free), a preflight answered
+without reaching tourist, the client address in the log, a 429.
+`tests/opts_test.tur` checks `ServerOpts` without a stack. Run them with
+`tur test tests`.
 
 `errors/run.sh` asserts the compile-fail fixtures: that Captures, Ctx, Pattern
 and Item are not interchangeable even though all four are `:int` underneath.

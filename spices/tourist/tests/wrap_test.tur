@@ -1,0 +1,213 @@
+;; tests/wrap_test.tur -- stdlib httpd middleware around a tourist app
+;; (tourist-on-stdlib-httpd-plan H4 acceptance).
+;;
+;; tourist-with runs the app inside a stdlib middleware stack given as
+;; TouristOpts' `wrap`:
+;;
+;;   mw-trust-proxy        -- loopback is trusted, so X-Forwarded-For names
+;;                            the client (each probe below is its own client);
+;;   mw-log-to             -- one line per request, to a sink this test reads;
+;;   mw-recover            -- a route that panics is answered 500, the server
+;;                            keeps serving, and nothing leaks (LSan is on);
+;;   mw-cors-opts          -- a preflight is answered without reaching
+;;                            tourist, and a simple request is decorated;
+;;   mw-rate-limit         -- 3 requests per client per minute, then 429.
+;;
+;; The use! item counts the requests that reached tourist, so the test can
+;; tell that the preflight and the 429 never did.
+
+(defmodule tourist/tests/wrap
+  (import tourist/app        :refer [tourist-with tourist-opts])
+  (import tourist/dsl        :refer [get!])
+  (import tourist/helpers    :refer [text])
+  (import tourist/middleware :refer [use!])
+  (import tourist/types      :refer [Ctx])
+  (import httpd/types        :refer [Response])
+  (import httpd/server       :refer [server-port server-stop])
+  (import test/suite         :refer [describe it])
+  (import test/assert        :refer [assert-eq assert-true])
+  (import test/runner        :refer [run-all-status])
+
+```c
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+/* Send METHOD path with the extra header lines and Connection: close; return
+   the raw response (caller frees). */
+static char *wrt__req(int port, const char *method, const char *path, const char *extra) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return NULL;
+  struct sockaddr_in a; memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return NULL; }
+  struct timeval tv = { 5, 0 };
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  char req[1024];
+  int n = snprintf(req, sizeof req, "%s %s HTTP/1.1\r\nHost: x\r\n%sConnection: close\r\n\r\n",
+                   method, path, extra);
+  send(fd, req, (size_t)n, MSG_NOSIGNAL);
+  size_t cap = 4096, len = 0;
+  char *buf = (char *)malloc(cap);
+  for (;;) {
+    if (len + 1 >= cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
+    ssize_t r = recv(fd, buf + len, cap - len - 1, 0);
+    if (r <= 0) break;
+    len += (size_t)r;
+  }
+  buf[len] = '\0';
+  close(fd);
+  return buf;
+}
+
+/* The log sink's buffer. */
+static char wrt__log[8192];
+static size_t wrt__log_len = 0;
+static pthread_mutex_t wrt__log_mtx = PTHREAD_MUTEX_INITIALIZER;
+```
+
+  ;; ---------------------------------------------------------------------
+  ;; Probes: each request carries its own X-Forwarded-For client
+  ;; ---------------------------------------------------------------------
+
+  ;; The status of METHOD path, sent as client `ip` with the extra headers.
+  (defn status-of [port : int method : cstr path : cstr ip : cstr extra : cstr] : int
+    ```c
+    char hdr[512];
+    snprintf(hdr, sizeof hdr, "X-Forwarded-For: %s\r\n%s", ip, extra);
+    char *r = wrt__req((int)port, method, path, hdr);
+    int st = 0;
+    if (r) sscanf(r, "HTTP/1.1 %d", &st);
+    free(r);
+    return st;
+    ```)
+
+  ;; The raw response to METHOD path contains `needle`.
+  (defn has? [port : int method : cstr path : cstr ip : cstr extra : cstr needle : cstr] : bool
+    ```c
+    char hdr[512];
+    snprintf(hdr, sizeof hdr, "X-Forwarded-For: %s\r\n%s", ip, extra);
+    char *r = wrt__req((int)port, method, path, hdr);
+    int ok = r && strstr(r, needle) != NULL;
+    free(r);
+    return ok;
+    ```)
+
+  ;; ---------------------------------------------------------------------
+  ;; The log sink and a counter of requests that reached tourist
+  ;; ---------------------------------------------------------------------
+
+  (defn log-line! [line : cstr] : nil
+    ```c
+    pthread_mutex_lock(&wrt__log_mtx);
+    wrt__log_len += (size_t)snprintf(wrt__log + wrt__log_len, sizeof wrt__log - wrt__log_len,
+                                     "%s\n", line);
+    pthread_mutex_unlock(&wrt__log_mtx);
+    ```)
+
+  (defn log-has? [needle : cstr] : bool
+    ```c
+    pthread_mutex_lock(&wrt__log_mtx);
+    int ok = strstr(wrt__log, needle) != NULL;
+    pthread_mutex_unlock(&wrt__log_mtx);
+    return ok;
+    ```)
+
+  (defn reached-cell [] : ptr<void>
+    ```c
+    static int64_t n = 0;
+    return &n;
+    ```)
+
+  (defn reached-inc! [] : int
+    ```c return __atomic_add_fetch((int64_t *)tourist__tests__wrap__reached_hycell(), 1, __ATOMIC_SEQ_CST); ```)
+
+  (defn reached [] : int
+    ```c return __atomic_load_n((int64_t *)tourist__tests__wrap__reached_hycell(), __ATOMIC_SEQ_CST); ```)
+
+  (defn count-reached [ctx : Ctx] : (Option Response)
+    (do
+      (reached-inc!)
+      (none)))
+
+  (defn boom [ctx : Ctx] : Response
+    (panic "route exploded"))
+
+  ;; ---------------------------------------------------------------------
+  ;; The middleware stack: compose-middleware's leftmost layer is outermost
+  ;; ---------------------------------------------------------------------
+
+  (defn app-wrap [inner : ptr<void>] : ptr<void>
+    (let [cors (make-struct CorsOpts "https://app.example" "GET, POST" "Content-Type" ""
+                            false 600)
+          tp   (trust-proxy-opts "loopback")
+          sink (fn [line : cstr] : nil (log-line! line))]
+      ;; mw-log-to sits outside mw-recover so the recovered 500 is logged
+      ;; (a panic skips the post-processing of every layer it unwinds
+      ;; through), and inside mw-trust-proxy so the line has the client.
+      (compose-middleware inner
+                          (mw-trust-proxy (ok-val tp))
+                          (mw-log-to sink)
+                          mw-recover
+                          (mw-cors-opts cors)
+                          (mw-rate-limit (make-struct RateLimitOpts 3 60)))))
+
+  ;; ---------------------------------------------------------------------
+  ;; Driver
+  ;; ---------------------------------------------------------------------
+
+  (defn __all-tests [] : void
+    (let [srv  (tourist-with 0
+                 (tourist-opts (fn [inner : ptr<void>] : ptr<void> (app-wrap inner)))
+                 (use! count-reached)
+                 (get! "/" (fn [_] (text "ok")))
+                 (get! "/boom" boom))
+          port (server-port srv)]
+      (describe "tourist-with -- stdlib middleware around the app"
+        (it "a plain route is served through the stack"
+          (assert-eq 200 (status-of port "GET" "/" "203.0.113.1" "")))
+        (it "a panicking route is answered 500 by mw-recover"
+          (assert-eq 500 (status-of port "GET" "/boom" "203.0.113.2" "")))
+        (it "the server keeps serving after the panic"
+          (assert-eq 200 (status-of port "GET" "/" "203.0.113.3" "")))
+        (it "a CORS preflight is answered by the stack"
+          (assert-eq 204 (status-of port "OPTIONS" "/" "203.0.113.4"
+                                    "Origin: https://app.example\r\nAccess-Control-Request-Method: POST\r\n")))
+        (it "the preflight carries the allowed origin"
+          (assert-true (has? port "OPTIONS" "/" "203.0.113.5"
+                             "Origin: https://app.example\r\nAccess-Control-Request-Method: POST\r\n"
+                             "Access-Control-Allow-Origin: https://app.example")))
+        (it "a simple cross-origin GET is decorated"
+          (assert-true (has? port "GET" "/" "203.0.113.6" "Origin: https://app.example\r\n"
+                             "Access-Control-Allow-Origin: https://app.example")))
+        (it "the log sink got a line per request, with the client address"
+          (assert-true (log-has? "GET / -> 200 2 ")))
+        (it "the log line names the X-Forwarded-For client"
+          (assert-true (log-has? "ip=203.0.113.1")))
+        (it "the panic's 500 is logged too"
+          (assert-true (log-has? "GET /boom -> 500")))
+        (it "a client's 4th request in the window is answered 429"
+          (do
+            (status-of port "GET" "/" "198.51.100.7" "")
+            (status-of port "GET" "/" "198.51.100.7" "")
+            (status-of port "GET" "/" "198.51.100.7" "")
+            (assert-eq 429 (status-of port "GET" "/" "198.51.100.7" ""))))
+        (it "another client is not limited"
+          (assert-eq 200 (status-of port "GET" "/" "198.51.100.8" "")))
+        (it "the preflights and the 429 never reached tourist"
+          ;; /, /boom, /, the decorated GET, three 198.51.100.7 requests and
+          ;; 198.51.100.8: eight.
+          (assert-eq 8 (reached))))
+      (server-stop srv)))
+
+  (defn main [] : int
+    (__all-tests)
+    (run-all-status)))

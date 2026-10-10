@@ -31,11 +31,16 @@
   (import httpd/response    :refer [not-found with-header])
   (import tourist/static    :refer [static-item? static-route-fs-root static-serve])
   (import tourist/routing   :refer [subapp-item? subapp-call])
-  (import httpd/server      :refer [server-start server-start-conn])
+  (import httpd/server      :refer [server-start server-start-conn
+                                     ServerOpts default-server-opts server-start-opts
+                                     server-start-conn-opts
+                                     ServerWrap server-wrap
+                                     server-start-wrapped server-start-conn-wrapped])
   (import httpd/request     :refer [req-method req-path])
   (import httpd/types       :refer [Request Response Conn])
   (import tourist/types     :refer [Ctx Captures Item ItemList Pattern])
-  (export tourist tourist-conn tourist-request-conn)
+  (export tourist tourist-conn tourist-request-conn
+          TouristOpts default-tourist-opts tourist-opts tourist-with tourist-conn-with)
 
 ;; -- Cons list helpers ------------------------------------------------------
 
@@ -384,14 +389,38 @@
 ;;; ownership of any captures left in the caps slot (route dispatch always
 ;;; swaps the original 0-caps value back into place via
 ;;; __tourist-ctx-swap-caps) and freeing the attrs / resp_headers lists.
+;;; A route that panics -- answered 500 by an mw-recover in tourist-with's
+;;; wrap -- leaks nothing either: __tourist-run-guarded frees the ctx (the
+;;; captures it was dispatched with are still in its caps slot then).
 (defn __tourist-handler [req : int] : int
   (let [ctx       (tourist-ctx-new req 0)
-        raw       (:: (__tourist-run ctx) :int)
+        raw       (__tourist-run-guarded ctx)
         decorated (mwafter-chain-run (__tourist-state-after-mws) ctx raw)
         resp      (__apply-resp-headers (tourist-ctx-resp-headers ctx) decorated)]
-    (tourist-ctx-clear-resp-headers ctx)
     (tourist-ctx-free ctx)
     resp))
+
+;;; __tourist-run-guarded -- __tourist-run, freeing the ctx when the request
+;;; panicked.
+;;;
+;;; A panic returns through every caller at once, so __tourist-handler never
+;;; reaches its own free.  Not a `defer`: __tourist-handler is CPS-converted,
+;;; and a defer there does not run on the panic path (see turmeric
+;;; docs/reported/defer-skipped-on-panic-in-cps-function.md).  The panic flag
+;;; is lowered while the ctx is freed, since tourist-ctx-free is Turmeric code
+;;; that would otherwise return at its first call.
+(defn __tourist-run-guarded [ctx : Ctx] : int
+  ```c
+  int64_t r = (int64_t)tourist__app___un_untourist_hyrun(ctx);
+  if (tur_panicking) {
+      int p = tur_panicking;
+      tur_panicking = 0;
+      tourist__param__tourist_hyctx_hyfree(ctx);
+      tur_panicking = p;
+      return 0;
+  }
+  return r;
+  ```)
 
 ;;; __tourist-run -- run the request through every use-around! (outermost
 ;;; first) and the core inside them.
@@ -467,8 +496,14 @@
 ;;;
 ;;; Since: v0.1.0
 (defn tourist [port : int & items : int] : ptr<void>
+  (do
+    (__tourist-install (:: items :ItemList))
+    (server-start port (__tourist-handler-ptr))))
+
+;;; __tourist-install -- sort the items into the dispatch state and free the
+;;; variadic list's spine (the items themselves now belong to the state).
+(defn __tourist-install [items-l : ItemList] : void
   (let [empty     (:: 0 :ItemList)
-        items-l   (:: items :ItemList)
         mws       (__tourist-list-rev (__tourist-collect-mws       items-l empty) empty)
         ;; After-mws are intentionally NOT reversed: head-first walk
         ;; matches the reverse-declaration-order semantics use-after!
@@ -477,8 +512,7 @@
         routes    (__tourist-list-rev (__tourist-collect-routes    items-l empty) empty)
         arounds   (__tourist-list-rev (__tourist-collect-arounds   items-l empty) empty)]
     (__tourist-state-set mws after-mws routes arounds)
-    (__tourist-spine-free items-l)
-    (server-start port (__tourist-handler-ptr))))
+    (__tourist-spine-free items-l)))
 
 ;; -- Conn-aware entry point (TOUR-V0) --------------------------------------
 ;;
@@ -549,14 +583,122 @@
 ;;;
 ;;; Since: TOUR-V0
 (defn tourist-conn [port : int & items : int] : ptr<void>
-  (let [empty     (:: 0 :ItemList)
-        items-l   (:: items :ItemList)
-        mws       (__tourist-list-rev (__tourist-collect-mws       items-l empty) empty)
-        after-mws (__tourist-collect-after-mws items-l empty)
-        routes    (__tourist-list-rev (__tourist-collect-routes    items-l empty) empty)
-        arounds   (__tourist-list-rev (__tourist-collect-arounds   items-l empty) empty)]
-    (__tourist-state-set mws after-mws routes arounds)
-    (__tourist-spine-free items-l)
+  (do
+    (__tourist-install (:: items :ItemList))
     (server-start-conn port (__tourist-handler-conn-ptr))))
+
+;; -- Options: server settings and a stdlib middleware stack (H4) -----------
+;;
+;; Express apps get most of their cross-cutting behaviour from connect
+;; middleware (`app.use(cors())`).  tourist's equivalent is stdlib httpd's
+;; middleware set, applied around tourist's whole dispatch through the `wrap`
+;; field: it runs before tourist builds the Ctx, so it sees every request,
+;; including the ones no route matches and the ones it answers itself (a
+;; CORS preflight, a 429), and after tourist's response is written, so it can
+;; decorate or replace it.  See the README's Middleware section for the
+;; Express package -> stdlib name table.
+
+;;; TouristOpts -- how tourist-with runs the server.
+;;;
+;;; Fields:
+;;;   server -- httpd's ServerOpts: worker count, body cap, read timeout
+;;;   wrap   -- (Option ServerWrap): a stdlib middleware stack around the
+;;;             app (see tourist-opts), or none
+;;;
+;;; A TouristOpts with a wrap starts one server: the wrap is called once and
+;;; released then, so build a fresh TouristOpts for each server.
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defstruct TouristOpts
+  [server : ServerOpts
+   wrap   : (Option ServerWrap)])
+
+;;; default-tourist-opts -- `tourist`'s own settings: 8 workers, stdlib's
+;;; body cap and read timeout, and no middleware stack.
+;;;
+;;; Returns:
+;;;   TouristOpts
+;;;
+;;; Example:
+;;;   (tourist-with 8080 (default-tourist-opts) (get! "/" home))
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defn default-tourist-opts [] : TouristOpts
+  (make-struct TouristOpts (default-server-opts) (none)))
+
+;;; tourist-opts -- the default settings with a stdlib middleware stack.
+;;;
+;;; `wrap` receives tourist's dispatch as a stdlib httpd handler -- the
+;;; `ptr<void>` every stdlib mw-* takes and returns -- and returns the
+;;; handler to serve, usually it inside compose-middleware (whose leftmost
+;;; layer is outermost).
+;;;
+;;; Parameters:
+;;;   wrap -- (fn [ptr<void>] ptr<void>), called once when the server starts
+;;;
+;;; Returns:
+;;;   TouristOpts
+;;;
+;;; Example:
+;;;   (tourist-with 8080
+;;;     (tourist-opts (fn [inner : ptr<void>] : ptr<void>
+;;;                     (compose-middleware inner mw-log mw-recover
+;;;                                         (mw-cors-opts cors))))
+;;;     (get! "/" home))
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defn tourist-opts [^fat wrap : (fn [ptr<void>] ptr<void>)] : TouristOpts
+  (make-struct TouristOpts (default-server-opts) (some (server-wrap wrap))))
+
+;;; tourist-with -- like `tourist`, configured by a TouristOpts.
+;;;
+;;; The routes and use! / use-around! / use-after! items behave exactly as
+;;; under `tourist`; the opts add the server settings and the stdlib
+;;; middleware stack around all of it (see TouristOpts).
+;;;
+;;; Parameters:
+;;;   port  -- TCP port to bind on (0 = kernel-assigned; see server-port)
+;;;   opts  -- TouristOpts
+;;;   items -- mix of Route and Middleware handles from the DSL constructors
+;;;
+;;; Returns:
+;;;   :ptr<void> -- server handle for server-stop, or NULL on failure
+;;;
+;;; Example:
+;;;   (let [srv (tourist-with 8080
+;;;               (tourist-opts (fn [inner : ptr<void>] : ptr<void>
+;;;                               (compose-middleware inner mw-log mw-recover)))
+;;;               (get! "/" (fn [_] (text "hi"))))]
+;;;     (server-stop srv))
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defn tourist-with [port : int opts : TouristOpts & items : int] : ptr<void>
+  (let [wrap (.wrap opts)]
+    (__tourist-install (:: items :ItemList))
+    (if (some? wrap)
+      (server-start-wrapped port (__tourist-handler-ptr) (.server opts) (unwrap wrap))
+      (server-start-opts port (__tourist-handler-ptr) (.server opts)))))
+
+;;; tourist-conn-with -- like `tourist-conn`, configured by a TouristOpts.
+;;;
+;;; For apps with WebSocket routes (tourist-ws) that also want the stdlib
+;;; middleware stack.  An upgraded request leaves the middleware nothing to
+;;; decorate.
+;;;
+;;; Parameters:
+;;;   port  -- TCP port to bind on
+;;;   opts  -- TouristOpts
+;;;   items -- mix of Route and Middleware handles (including ws-route!)
+;;;
+;;; Returns:
+;;;   :ptr<void> -- server handle for server-stop, or NULL on failure
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defn tourist-conn-with [port : int opts : TouristOpts & items : int] : ptr<void>
+  (let [wrap (.wrap opts)]
+    (__tourist-install (:: items :ItemList))
+    (if (some? wrap)
+      (server-start-conn-wrapped port (__tourist-handler-conn-ptr) (.server opts) (unwrap wrap))
+      (server-start-conn-opts port (__tourist-handler-conn-ptr) (.server opts)))))
 
 ) ;; end defmodule tourist/app

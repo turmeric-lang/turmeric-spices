@@ -59,6 +59,7 @@
   (export ServerOpts default-server-opts
           server-start server-start-pool server-start-spawn server-start-opts
           server-start-conn server-start-pool-conn server-start-conn-opts
+          ServerWrap server-wrap server-start-wrapped server-start-conn-wrapped
           server-port server-stop
           serve-httpd-request serve-httpd-request-conn
           server-launch server-tls-ctx server-set-tls-ctx!)
@@ -168,10 +169,15 @@ struct __httpd_resp {
   (let [req (request-view-new hc)]
     (if (= (:: req :int) 0)
       (httpd-resp-status! hc 500)
-      (let [resp (:: (srv-call-handler handler (:: req :int)) :Response)]
-        (srv-send-response hc resp)
-        (free-response resp)
-        (request-view-free req)))))
+      (srv-serve-view hc req handler))))
+
+;; The view is released by a defer, so a handler that panics (under a
+;; server-start-wrapped mw-recover) does not leak it.
+(defn srv-serve-view [hc : ptr<void> req : Request handler : (c-fn [int] int)] : nil
+  (defer (request-view-free req))
+  (let [resp (:: (srv-call-handler handler (:: req :int)) :Response)]
+    (srv-send-response hc resp)
+    (free-response resp)))
 
 ;;; serve-httpd-request-conn -- internal: serve one stdlib httpd request with a
 ;;; two-arg (Conn, Request -> Response) handler.  When the handler took the
@@ -186,12 +192,16 @@ struct __httpd_resp {
         (request-view-free req)
         (conn-free conn)
         (httpd-resp-status! hc 500))
-      (let [resp (:: (srv-call-handler-conn handler (:: conn :int) (:: req :int)) :Response)]
-        (when (not (conn-upgraded? conn))
-          (srv-send-response hc resp))
-        (free-response resp)
-        (conn-free conn)
-        (request-view-free req)))))
+      (srv-serve-view-conn hc conn req handler))))
+
+;; As srv-serve-view, for the two-arg handler.
+(defn srv-serve-view-conn [hc : ptr<void> conn : Conn req : Request
+                           handler : (c-fn [int int] int)] : nil
+  (defer (do (conn-free conn) (request-view-free req)))
+  (let [resp (:: (srv-call-handler-conn handler (:: conn :int) (:: req :int)) :Response)]
+    (when (not (conn-upgraded? conn))
+      (srv-send-response hc resp))
+    (free-response resp)))
 
 ;; =============================================================================
 ;; Server state + the thread that runs httpd-run
@@ -406,6 +416,114 @@ struct __httpd_resp {
     (srv-apply-opts
       (httpd-new-pool port (srv-clamp-pool (.pool-size opts))
         (fn [c : ptr<void>] : nil (serve-httpd-request-conn c handler)))
+      opts)))
+
+;; =============================================================================
+;; Stdlib middleware around the handler (tourist-on-stdlib-httpd H4)
+;; =============================================================================
+
+;;; ServerWrap -- a function that puts stdlib middleware around a server's
+;;; handler.
+;;;
+;;; Built by server-wrap; consumed by server-start-wrapped /
+;;; server-start-conn-wrapped, which call it once and release it.
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defopaque ServerWrap :int)
+
+;;; server-wrap -- package a wrap function for server-start-wrapped.
+;;;
+;;; `f` receives the stdlib httpd handler this spice builds (it makes the
+;;; Request view, calls the typed handler, and writes the Response onto the
+;;; conn) and returns the handler the server runs -- typically that one with
+;;; a stack of stdlib middleware around it, so mw-recover, mw-cors-opts,
+;;; mw-log, mw-rate-limit, mw-secure-headers, ... apply to every request.
+;;; Both handlers are stdlib httpd's own representation, the `ptr<void>`
+;;; every stdlib mw-* takes and returns.
+;;;
+;;; Middleware that answers by itself (a CORS preflight, a 429) never reaches
+;;; the typed handler; middleware that runs after `next` sees the Response
+;;; already written onto the conn and may adjust it.
+;;;
+;;; Parameters:
+;;;   f -- (fn [ptr<void>] ptr<void>), called once when the server starts
+;;;
+;;; Returns:
+;;;   ServerWrap -- pass to exactly one server-start-wrapped call
+;;;
+;;; Example:
+;;;   (server-wrap (fn [inner : ptr<void>] : ptr<void>
+;;;                  (compose-middleware inner mw-recover mw-log)))
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defn server-wrap [^fat f : (fn [ptr<void>] ptr<void>)] : ServerWrap
+  (:: (:: f :int) :ServerWrap))
+
+;; Call a ServerWrap on the base handler and release it.  The wrap arrived
+;; through a ^fat parameter: a { thunk, env } closure whose slot 0 takes
+;; (env, arg).
+(defn srv-wrap-apply [wrap : ServerWrap base : ptr<void>] : ptr<void>
+  ```c
+  if (!wrap) return base;
+  typedef void *(*fn1_t)(void *, int64_t);
+  void *h = ((fn1_t)(intptr_t)((int64_t *)(intptr_t)wrap)[0])((void *)(intptr_t)wrap,
+                                                            (int64_t)(intptr_t)base);
+  TUR_CLOSURE_DROP(wrap);
+  return h;
+  ```)
+
+;;; server-start-wrapped -- server-start-opts with stdlib middleware around
+;;; the handler.
+;;;
+;;; Parameters:
+;;;   port    -- TCP port to bind on
+;;;   handler -- (c-fn [int] int) request handler (see server-start)
+;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
+;;;   wrap    -- ServerWrap from server-wrap; called once and released, so
+;;;              build one per server
+;;;
+;;; Returns:
+;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+;;;
+;;; Example:
+;;;   (server-start-wrapped 8080 my-handler (default-server-opts)
+;;;     (server-wrap (fn [inner : ptr<void>] : ptr<void>
+;;;                    (compose-middleware inner mw-recover mw-log))))
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defn server-start-wrapped [port : int handler : (c-fn [int] int) opts : ServerOpts
+                            wrap : ServerWrap] : ptr<void>
+  (server-launch
+    (srv-apply-opts
+      (httpd-new-pool port (srv-clamp-pool (.pool-size opts))
+        (srv-wrap-apply wrap
+          (:: (fn [c : ptr<void>] : nil (serve-httpd-request c handler)) :ptr<void>)))
+      opts)))
+
+;;; server-start-conn-wrapped -- server-start-conn-opts with stdlib middleware
+;;; around the handler (see server-start-wrapped).
+;;;
+;;; A handler that upgrades the connection leaves the middleware nothing to
+;;; write: post-processing that sets headers on an upgraded request is
+;;; ignored.
+;;;
+;;; Parameters:
+;;;   port    -- TCP port to bind on
+;;;   handler -- (c-fn [int int] int) (Conn, Request) -> Response handler
+;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
+;;;   wrap    -- ServerWrap from server-wrap; called once and released
+;;;
+;;; Returns:
+;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defn server-start-conn-wrapped [port : int handler : (c-fn [int int] int) opts : ServerOpts
+                                 wrap : ServerWrap] : ptr<void>
+  (server-launch
+    (srv-apply-opts
+      (httpd-new-pool port (srv-clamp-pool (.pool-size opts))
+        (srv-wrap-apply wrap
+          (:: (fn [c : ptr<void>] : nil (serve-httpd-request-conn c handler)) :ptr<void>)))
       opts)))
 
 ;;; server-start-spawn -- compatibility entry point: a pool of 64 workers.

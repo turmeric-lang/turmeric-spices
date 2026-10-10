@@ -104,6 +104,34 @@ let [srv server-start-opts(0 my-handler make-struct(ServerOpts 8 1048576 2000))]
   server-stop srv
 ```
 
+## Stdlib middleware around a typed handler
+
+`server-start-wrapped` (and `server-start-conn-wrapped` for two-arg
+handlers) runs the handler inside a stack of stdlib httpd middleware --
+`mw-recover`, `mw-cors-opts`, `mw-log`, `mw-rate-limit`, `mw-secure-headers`,
+`mw-request-id`, `mw-trust-proxy`, `mw-etag`, ... -- given as a `server-wrap`
+function from the stdlib handler this spice builds to the one to serve:
+
+```turmeric
+(server-start-wrapped 8080 my-handler (default-server-opts)
+  (server-wrap (fn [inner : ptr<void>] : ptr<void>
+                 (compose-middleware inner mw-log mw-recover mw-secure-headers))))
+```
+
+```sweet-exp
+server-start-wrapped 8080 my-handler default-server-opts()
+  server-wrap (fn [inner : ptr<void>] : ptr<void>
+                (compose-middleware inner mw-log mw-recover mw-secure-headers))
+```
+
+The handlers are stdlib's own representation, the `ptr<void>` every `mw-*`
+takes and returns. A `ServerWrap` is called once when the server starts and
+released then, so build one per server. Middleware that answers by itself (a
+preflight, a 429) never reaches the typed handler; middleware after `next`
+sees the Response already on the conn. A handler that panics under
+`mw-recover` is answered 500, and its Request view is still freed. tourist's
+`tourist-with` is built on this.
+
 ## Typed handlers (`Handler` typeclass)
 
 `server-start` takes a bare `(c-fn [int] int)` whose `int`s are really a
