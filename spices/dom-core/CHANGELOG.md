@@ -13,7 +13,9 @@ tur-xml and tur-html (turmeric `docs/upcoming/spices/xml-html-parsers-plan.md`).
   XML and HTML serialization, structural `dom-equal?`, and `dom-live-bytes`
   for leak checks. Every walk is iterative.
 - `ParseError` / `ParseErrorKind` (`Syntax`, `Limit`, `Refused`, `Io`), the
-  error both parsers return.
+  error both parsers return. `syntax-kind`, `limit-kind`, `refused-kind` and
+  `io-kind` return one shared node per kind, so building an error does not
+  allocate (and leak) a `:heap` node for its kind.
 - `dom/event`: `SaxEvent`, `SaxControl`, `Attr`, `attrs-get`,
   `sax-event-release`, `sax-dispatch`. Events are `:heap` nodes so the SAX
   drivers reclaim them per chunk with a region.
