@@ -179,11 +179,13 @@ is constant-time. Safe methods (GET/HEAD/OPTIONS) always pass.
 
 ## Writing a custom store
 
-The store is a small vtable, not a typeclass — tourist registers middleware as
-a bare C-ABI function pointer with no captured environment, so the middleware
-reads its store from a process-global, and a global cannot hold a value of an
-erased typeclass-instance type. A backend therefore provides three functions
-and an opaque state pointer and calls `store-new`:
+The store is a small vtable, not a typeclass. The middleware reads its store
+from a process-global -- because the `session-*` helpers your routes call
+read it too, not because tourist middleware cannot capture: tourist's `use!`,
+`use-around!` and `use-after!` all accept capturing closures (tourist v0.3.0
+pins it with a concurrent test). A global cannot hold a value of an erased
+typeclass-instance type, so a backend provides three functions and an opaque
+state pointer and calls `store-new`:
 
 ```turmeric
 ;; load   : (c-fn [state:int id:cstr] int)            -> SessMap handle, 0 = miss
@@ -195,7 +197,7 @@ and an opaque state pointer and calls `store-new`:
 Session data is a `SessMap` (see `session/data`) — a compact owned
 string→string map. Stores clone on the way in and out so a request's working
 copy never aliases the master copy. This is the same open-set extensibility a
-typeclass would give, expressed in tourist's established fn-pointer idiom.
+typeclass would give, expressed as a plain function-pointer vtable.
 
 ## Security notes
 

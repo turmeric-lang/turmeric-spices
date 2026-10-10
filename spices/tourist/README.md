@@ -16,10 +16,11 @@ Turmeric:
 | Spice | Analogue | Depends on |
 |---|---|---|
 | `tur-template` | ERB / EJS | (none -- pure Turmeric) |
-| `tur-httpd` | Mongoose / Civetweb | (none -- POSIX sockets + pthreads) |
-| `tur-tourist` | Haskell's scotty | `tur-httpd`, `tur-template` |
+| `tur-httpd` | Node's `http` req/res | stdlib `httpd` |
+| `tur-tourist` | Express / Haskell's scotty | `tur-httpd`, `tur-template` |
 
-The three are deliberately separate so any layer can be used independently.
+The layers are deliberately separate so any one can be used independently.
+Underneath it all is stdlib `httpd` -- the server, as `http` is under Express.
 
 ## Install
 
@@ -48,6 +49,57 @@ The three are deliberately separate so any layer can be used independently.
       (text (req-body req)))))
 ```
 
+```sweet-exp
+import tourist/app    :refer [tourist]
+import tourist/dsl    :refer [get! post!]
+import tourist/param  :refer [capture]
+import tourist/helpers :refer [text]
+
+tourist 3000
+  get! "/hello/:name"
+    (fn [req]
+      (text (str-concat "Hello, " (ok-val (capture req "name")) "!")))
+  post! "/echo"
+    (fn [req]
+      (text (req-body req)))
+```
+
+## Middleware
+
+Three kinds, all of which may capture (the closure's environment survives the
+dispatch boundary, under concurrent requests):
+
+| Form | Shape | Runs |
+|---|---|---|
+| `use!` | `(fn [Ctx] (Option Response))` | before the route, in declaration order; `(some resp)` short-circuits |
+| `use-around!` | `(fn [Ctx (fn [Ctx] Response)] Response)` | around everything inside it -- the Express/Koa `next` shape; the first declared is outermost |
+| `use-after!` | `(fn [Ctx Response] Response)` | after the route and every `use-around!`, in reverse declaration order |
+
+Headers queued with `ctx-add-header!` land on whatever response goes out, a
+`use!` short-circuit included.
+
+```turmeric
+(defn timing [label : cstr] : (fn [Ctx (fn [Ctx] Response)] Response)
+  (fn [ctx : Ctx next : (fn [Ctx] Response)] : Response
+    (let [resp (next ctx)]
+      (with-header resp "X-Served-By" label))))
+
+(tourist 3000
+  (use-around! (timing "app-1"))
+  (get! "/" (fn [_] (text "ok"))))
+```
+
+```sweet-exp
+defn timing [label : cstr] : (fn [Ctx (fn [Ctx] Response)] Response)
+  (fn [ctx : Ctx next : (fn [Ctx] Response)] : Response
+    (let [resp (next ctx)]
+      (with-header resp "X-Served-By" label)))
+
+tourist 3000
+  use-around! timing("app-1")
+  get! "/" (fn [_] (text "ok"))
+```
+
 ## Status
 
 Early in development. See
@@ -65,7 +117,9 @@ turmeric repo for the full roadmap.
 matching -- which is the part of this spice that runs without a socket:
 literal segments, named captures (single, multiple, and the empty-segment and
 extra-segment misses), the greedy `*` wildcard, and trailing-slash tolerance.
-Run it with `tur test tests`.
+`tests/middleware_test.tur` runs a live app: capturing `use!` / `use-around!` /
+`use-after!` closures under eight concurrent clients, nesting order, and
+queued headers on a short-circuit. Run them with `tur test tests`.
 
 `errors/run.sh` asserts the compile-fail fixtures: that Captures, Ctx, Pattern
 and Item are not interchangeable even though all four are `:int` underneath.
