@@ -11,9 +11,9 @@ arithmetic, solving linear systems, and LU decomposition.
 row-major float literals.
 
 ```turmeric
-(import linalg/mat :refer [mat-of mat-print mat-transpose mat-mul])
-(import linalg/vec :refer [la-vec-of vec-print])
-(import linalg/fmt :refer [linalg-str-free])
+(import linalg/mat :refer [mat-of mat-transpose mat-mul])
+(import linalg/vec :refer [la-vec-of])
+(import linalg/fmt :refer [mat-print vec-print linalg-str-free])
 
 (def A (mat-of 2 2  1.0 2.0  3.0 4.0))
 (def b (la-vec-of 5.0 6.0))
@@ -27,7 +27,7 @@ row-major float literals.
 ## Matrix arithmetic
 
 ```turmeric
-(import linalg/mat :refer [mat-of mat-print mat-mul mat-transpose mat-scale])
+(import linalg/mat :refer [mat-of mat-mul mat-transpose mat-scale])
 
 (def A (mat-of 2 2  1.0 2.0  3.0 4.0))
 (def B (mat-of 2 2  5.0 6.0  7.0 8.0))
@@ -52,7 +52,7 @@ solution vector.
 
 ```turmeric
 (import linalg/mat  :refer [mat-of])
-(import linalg/vec  :refer [la-vec-of vec-print])
+(import linalg/vec  :refer [la-vec-of])
 (import linalg/solve :refer [mat-solve])
 
 ;; Solve A x = b for the 2x2 system:
@@ -75,7 +75,7 @@ to solve multiple systems with the same matrix.
 
 ```turmeric
 (import linalg/mat   :refer [mat-of])
-(import linalg/vec   :refer [la-vec-of vec-print])
+(import linalg/vec   :refer [la-vec-of])
 (import linalg/decomp :refer [lu lu-free])
 (import linalg/solve  :refer [lu-solve])
 
@@ -103,7 +103,7 @@ Here we fit a line y = a + b*x to four data points.
 
 ```turmeric
 (import linalg/mat  :refer [mat-of mat-transpose mat-mul])
-(import linalg/vec  :refer [la-vec-of vec-print])
+(import linalg/vec  :refer [la-vec-of])
 (import linalg/solve :refer [qr-solve])
 (import linalg/decomp :refer [qr qr-free])
 
@@ -118,5 +118,5 @@ Here we fit a line y = a + b*x to four data points.
 (def Xty (mat-mul-vec Xt y))
 
 (vec-print (mat-solve XtX Xty 1))
-;; => intercept ~ 0.05, slope ~ 2.00
+;; => intercept ~ 0.00, slope ~ 2.03
 ```
