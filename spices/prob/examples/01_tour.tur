@@ -1,0 +1,150 @@
+;; 01_tour -- one stream, six questions.
+;;
+;; A stream of 12,000 events is summarised six ways, each in a fixed amount of
+;; memory regardless of how long the stream runs. The numbers in the comments are
+;; what this program prints; they are the figures quoted in the prob guide.
+;;
+;; Build note: compile with -fwrapv until the compiler adds it to its default
+;; flags (see the guide, "Compiling"):
+;;
+;;   TUR_CC_FLAGS="-O2 -std=c99 -Wall -fno-strict-aliasing -fwrapv" \
+;;     tur run examples/01_tour.tur
+;;
+;; Style note: a function that takes a sketch borrows it (`^borrow`), and must be
+;; DEFINED BEFORE the function that calls it -- called ahead of its definition,
+;; the sketch is treated as moved and the compiler reports TUR-E0005.
+
+(load "stdlib/str-build.tur")
+
+(defmodule prob/examples/01_tour
+  (import prob/bloom   :refer [Bloom bloom-new bloom-free bloom-insert! bloom-maybe? bloom-count])
+  (import prob/cuckoo  :refer [Cuckoo cuckoo-new cuckoo-free cuckoo-insert! cuckoo-maybe? cuckoo-delete! cuckoo-count])
+  (import prob/hll     :refer [Hll hll-new hll-free hll-add! hll-cardinality hll-merge])
+  (import prob/cms     :refer [CountMin cms-new cms-free cms-add! cms-estimate])
+  (import prob/topk    :refer [TopK topk-new topk-free topk-add! topk-list])
+  (import prob/tdigest :refer [TDigest tdigest-new tdigest-free tdigest-add! tdigest-quantile tdigest-count tdigest-num-centroids])
+
+;;; to-float -- cast an int to float (int64_t -> double).
+(defn to-float [n : int] : float
+  ```c
+  return (double)n;
+  ```)
+
+;;; say -- print "label: value".
+(defn say [label : cstr v : int] : nil
+  (println (str-concat label (int->str v))))
+
+;; ---- Bloom: have we seen this id? ------------------------------------------
+
+(defn bloom-add-range [^borrow bf : Bloom i : int n : int] : nil
+  (if (>= i n) nil (do (bloom-insert! bf i) (bloom-add-range bf (+ i 1) n))))
+
+(defn bloom-count-maybe [^borrow bf : Bloom i : int n : int acc : int] : int
+  (if (>= i n) acc (bloom-count-maybe bf (+ i 1) n (if (bloom-maybe? bf i) (+ acc 1) acc))))
+
+(defn bloom-demo [] : nil
+  ;; 65,536 bits, 7 hash functions, 5,000 members.
+  (let [bf (bloom-new 65536 7)]
+    (bloom-add-range bf 0 5000)
+    (say "bloom: members found, of 5000:       " (bloom-count-maybe bf 0 5000 0))      ;; 5000
+    (say "bloom: false positives, of 10000:    " (bloom-count-maybe bf 100000 110000 0)) ;; 23
+    (say "bloom: bits set, of 65536:           " (bloom-count bf))                     ;; 27083
+    (bloom-free bf)))
+
+;; ---- Cuckoo: have we seen it -- and can we forget it? ----------------------
+
+(defn cuckoo-add-range [^borrow cf : Cuckoo i : int n : int ok : int] : int
+  (if (>= i n) ok (cuckoo-add-range cf (+ i 1) n (if (cuckoo-insert! cf i) (+ ok 1) ok))))
+
+(defn cuckoo-count-maybe [^borrow cf : Cuckoo i : int n : int acc : int] : int
+  (if (>= i n) acc (cuckoo-count-maybe cf (+ i 1) n (if (cuckoo-maybe? cf i) (+ acc 1) acc))))
+
+(defn cuckoo-demo [] : nil
+  ;; 4,096 buckets x 4 slots = 16,384 slots; 12,000 keys is a 73% load.
+  (let [cf (cuckoo-new 4096)]
+    (say "cuckoo: inserts that succeeded:      " (cuckoo-add-range cf 0 12000 0))         ;; 12000
+    (say "cuckoo: fingerprints stored:         " (cuckoo-count cf))                       ;; 11704
+    (say "cuckoo: false positives, of 10000:   " (cuckoo-count-maybe cf 100000 110000 0)) ;; 443
+    (say "cuckoo: delete 5 (1 = removed):      " (if (cuckoo-delete! cf 5) 1 0))          ;; 1
+    (say "cuckoo: 5 still present (1 = yes):   " (if (cuckoo-maybe? cf 5) 1 0))          ;; 0
+    (cuckoo-free cf)))
+
+;; ---- HyperLogLog: how many distinct? ---------------------------------------
+
+(defn hll-add-range [^borrow h : Hll i : int n : int] : nil
+  (if (>= i n) nil (do (hll-add! h i) (hll-add-range h (+ i 1) n))))
+
+(defn hll-demo [] : nil
+  ;; p = 14: 16,384 registers.
+  (let [ha (hll-new 14)
+        hb (hll-new 14)]
+    (hll-add-range ha 0 6000)
+    (hll-add-range hb 4000 10000)           ;; overlaps ha on [4000, 6000)
+    (say "hll: distinct in A (true 6000):      " (float->int (hll-cardinality ha)))
+    (say "hll: distinct in B (true 6000):      " (float->int (hll-cardinality hb)))
+    (let [hm (hll-merge ha hb)]
+      (say "hll: distinct in A or B (true 10000): " (float->int (hll-cardinality hm)))  ;; 9965
+      (hll-free hm))
+    (hll-free ha)
+    (hll-free hb)))
+
+;; ---- Count-Min + Top-K: how often? which are the heaviest? -----------------
+
+(defn skew-reps [^borrow cm : CountMin ^borrow tk : TopK key : int i : int n : int] : nil
+  (if (>= i n)
+    nil
+    (do (cms-add! cm key)
+        (topk-add! tk key)
+        (skew-reps cm tk key (+ i 1) n))))
+
+;; Key k occurs 20000/k times, k = 1..200: a heavy-tailed stream.
+(defn skew-fill [^borrow cm : CountMin ^borrow tk : TopK key : int kmax : int] : nil
+  (if (> key kmax)
+    nil
+    (do (skew-reps cm tk key 0 (/ 20000 key))
+        (skew-fill cm tk (+ key 1) kmax))))
+
+(defn freq-demo [] : nil
+  (let [cm (cms-new 5 1024)     ;; 5 rows x 1024 columns
+        tk (topk-new 3)]
+    (skew-fill cm tk 1 200)
+    (say "cms: key 1 (true 20000):             " (cms-estimate cm 1))      ;; 20000
+    (say "cms: key 7 (true 2857):              " (cms-estimate cm 7))      ;; 2857
+    (say "cms: key 150 (true 133):             " (cms-estimate cm 150))    ;; 133
+    (say "cms: never-seen key:                 " (cms-estimate cm 99999))  ;; 0
+    ;; topk-list is a flat [count, key, count, key, ...] the caller owns.
+    (let [top (topk-list tk)]
+      (say "topk: #1 key:                        " (vec-get top 1))          ;; 1
+      (say "topk: #1 count:                      " (vec-get top 0))          ;; 20000
+      (say "topk: #2 key:                        " (vec-get top 3))          ;; 2
+      (say "topk: #3 key:                        " (vec-get top 5))          ;; 3
+      (vec-free top))
+    (cms-free cm)
+    (topk-free tk)))
+
+;; ---- t-digest: what is the p99? --------------------------------------------
+
+(defn td-add-range [^borrow td : TDigest i : int n : int] : nil
+  (if (>= i n) nil (do (tdigest-add! td (to-float i)) (td-add-range td (+ i 1) n))))
+
+(defn tdigest-demo [] : nil
+  ;; compression 100; the values 0..9999.
+  (let [td (tdigest-new 100.0)]
+    (td-add-range td 0 10000)
+    (say "tdigest: values seen:                " (tdigest-count td))                    ;; 10000
+    (say "tdigest: centroids kept:             " (tdigest-num-centroids td))            ;; 74
+    (say "tdigest: p1   (true 100):            " (float->int (tdigest-quantile td 0.01)))  ;; 111
+    (say "tdigest: p50  (true 4999):           " (float->int (tdigest-quantile td 0.5)))   ;; 4936
+    (say "tdigest: p99  (true 9899):           " (float->int (tdigest-quantile td 0.99)))  ;; 9885
+    (say "tdigest: p99.9 (true 9989):          " (float->int (tdigest-quantile td 0.999))) ;; 9988
+    (tdigest-free td)))
+
+(defn main [] : int
+  (bloom-demo)
+  (cuckoo-demo)
+  (hll-demo)
+  (freq-demo)
+  (tdigest-demo)
+  0)
+
+) ;; end defmodule prob/examples/01_tour
