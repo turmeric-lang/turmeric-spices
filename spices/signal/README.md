@@ -8,20 +8,22 @@ oscillators, filters, shapers, ADSR envelopes, and SF-pipeline composition.
 ## Status
 
 The Tier 1 surface ships and runs end-to-end against turmeric `main`.
-All seven modules `tur check` clean, all six examples run and print the
+All nine modules `tur check` clean, all seven examples run and print the
 values in their comments, and the full `tests/signal/` suite passes:
 
 ```
 $ tur test tests/signal
 PASS test_compose
 PASS test_core
+PASS test_delay
 PASS test_envelope
 PASS test_filter
 PASS test_hf_osc
+PASS test_noise
 PASS test_osc
 PASS test_shaper
-.......
-7 tests, 7 passed, 0 failed
+.........
+9 tests, 9 passed, 0 failed
 ```
 
 This is the surface area an honest version of the previous spice would
@@ -87,6 +89,8 @@ A few constructors need a specific call shape:
 | `signal/osc`      | `sine`, `square`, `sawtooth`, `triangle`                                                 |
 | `signal/hf-osc`   | `hf-sawtooth`, `hf-square`, `hf-triangle` -- band-limited, for hearing-range pitches     |
 | `signal/filter`   | `low-pass`, `high-pass`                                                                  |
+| `signal/delay`    | `delay`, `comb-ff`, `comb`, `allpass` (+ sample-counted `*-n` forms) -- ring-buffer effects |
+| `signal/noise`    | `white`, `pink`, `brown`, `blue`, `violet` (+ injected-source `*-from`, and `rng`)       |
 | `signal/shaper`   | `gain`, `offset`, `invert`, `abs-sf`, `scale`, `saturate-tanh`, `hard-clip`, `clip`, `mix`, `add`, `multiply` |
 | `signal/envelope` | `ADSRParams`, `adsr-fixed`, `adsr-gen`                                                   |
 | `signal/compose`  | `effects-chain`                                                                          |
@@ -136,6 +140,58 @@ First-order IIR filters; each application owns its own state cell.
 |---|---|
 | `low-pass alpha` | EMA: `y = alpha*x + (1-alpha)*prev` |
 | `high-pass alpha` | `x - low_pass(x)` |
+
+### `signal/delay`
+
+Ring-buffer effects. Two layers: the `*-n` constructors take the delay in
+**whole samples** and need no sample rate; the bare ones take
+`(sample-rate seconds ...)` -- `sample-rate` in Hz, like `signal/hf-osc` -- and
+round `seconds * sample-rate` to the nearest sample. Delays clamp to
+`[1, 16777216]` samples.
+
+| Symbol | Produces |
+|---|---|
+| `delay-n n` / `delay sr secs` | the input, `n` samples late (first `n` outputs are 0) |
+| `comb-ff-n n g` / `comb-ff sr secs g` | feedforward comb: `y = x + g*x[n-D]` (always stable) |
+| `comb-n n g` / `comb sr secs g` | feedback comb: `y = x + g*y[n-D]`; needs `|g| < 1` |
+| `allpass-n n g` / `allpass sr secs g` | Schroeder allpass: `v = x + g*v[n-D]`, `y = v[n-D] - g*v`; needs `|g| < 1` |
+
+Feedback gains are not clamped: `|g| >= 1` grows without bound.
+
+### `signal/noise`
+
+Generators: apply the SF to any signal (it is ignored), e.g.
+`((pink 1) (constant 0.0))`. Output is always within `[-1, 1]`.
+
+| Symbol | Spectrum | Method |
+|---|---|---|
+| `white seed` | flat | SplitMix64, uniform in `[-1, 1)` |
+| `pink seed` | -3 dB/oct (1/f) | Kellet's 7-pole filter on white |
+| `brown seed` | -6 dB/oct | leaky integral of white |
+| `blue seed` | +3 dB/oct | first difference of pink |
+| `violet seed` | +6 dB/oct | first difference of white |
+
+Grey noise is a psychoacoustic equal-loudness curve rather than a slope and is
+not provided.
+
+**Purity.** `(white seed)` keeps its PRNG state in a private cell: its effect
+row is `#fx{}` and a seed always yields the same samples. The `*-from`
+constructors (`white-from`, `pink-from`, ...) instead take a source
+`src : (fn [] #fx{e} float)` of raw white samples and return a signal whose row
+is `#fx{e}`. Pass `(rng seed)` and it stays pure; pass an entropy read or a
+live input and it is honestly `#fx{IO}`, and the compiler rejects using it
+from a function declared `#fx{}` (`TUR-E0009`). Row checking needs a recent
+compiler: turmeric v0.55 does not enforce it, v0.64 does.
+
+### Stateful signals are pull-order dependent
+
+`low-pass`, `high-pass`, every delay effect and every noise generator advance
+their internal state once per `sample` call and ignore `t`. Sample each
+instance exactly once per sample period, in order. Feeding one instance to two
+consumers (for example both halves of `pair-signals`) advances it twice, so
+each consumer sees only part of the stream and a delay's effective length
+changes. Build one instance per consumer. The oscillators and shapers are pure
+functions of `t` and have no such restriction.
 
 ### `signal/shaper`
 
@@ -233,7 +289,7 @@ Then `tur fetch`.
 
 ## Examples
 
-Six runnable, per-phase examples live under `examples/`:
+Seven runnable, per-phase examples live under `examples/`:
 
 ```sh
 cd spices/signal
@@ -243,6 +299,7 @@ tur run examples/03_filters_and_shapers.tur   # filters + scalar shapers
 tur run examples/04_envelopes.tur             # ADSR
 tur run examples/05_simple_voice.tur          # capstone: every module wired together
 tur run examples/06_hf_oscillators.tur        # naive vs band-limited sawtooth at 7.9 kHz
+tur run examples/07_delay_and_noise.tur      # delay, comb, allpass, colored noise
 ```
 
 Each prints sample values that match the hand-computed references in its
