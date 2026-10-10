@@ -3,7 +3,8 @@
 (defmodule notebook/session
   (export notebook-session-autolink-hint
           output-status-ok output-status-error output-status-skipped
-          session-open session-close session-reset session-eval
+          session-open session-open-for session-close session-reset session-eval
+          session-cell-imports?
           cell-output-make cell-output-free
           cell-output-cell-id cell-output-status cell-output-stdout
           cell-output-value-repr cell-output-error-msg
@@ -13,7 +14,7 @@
   ;;; notebook-session-autolink-hint -- inject libturi linker and header hints.
   (defn notebook-session-autolink-hint [] : int
     ```c
-    /* __tur_autolink__: -Lbuild/src -lturi -Isrc -Isrc/compiler -Isrc/runtime */
+    /* __tur_autolink__: -Lbuild/src -lturi -Isrc -Isrc/compiler -Isrc/runtime -DTUR_NB_STDLIB=@TUR_STDLIB_ROOT@ -rdynamic */
     /* __tur_include__: #include "turi/eval.h" */
     /* __tur_include__: #include "turi/env.h" */
     /* __tur_include__: #include "turi/value.h" */
@@ -21,8 +22,64 @@
     /* __tur_include__: #include <fcntl.h> */
     /* __tur_include__: #include <sys/time.h> */
     /* __tur_include__: #include <dirent.h> */
+    /* __tur_include__: #include <ctype.h> */
     return 0;
     ```)
+
+```c
+/* Module-level, so emitted into every unit that imports this module -- some
+ * of which (the notebook's own cell/format tests) never get the libturi
+ * include path the autolink hint adds.  The defn bodies that call into this
+ * block only reach units that do. */
+#if __has_include("turi/eval.h")
+#include "turi/eval.h"
+#include "turi/value.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* notebook/image's image-hook-record-path, for cells.  A cell that imports
+ * notebook/image has the interpreter evaluate that module's source, whose
+ * body here is inline C the interpreter does not run -- and the module is
+ * this process's own code, so there is no spice image to attach for it.  A
+ * native registered under the name stands in: the interpreter keeps a native
+ * over a defn whose body is inline C.  The marker is image-marker's. */
+static TuriValue nb_native_image_hook_record_path(TuriEnv *env, TuriValue *args,
+                                                  uint32_t n, void *ud) {
+  (void)env; (void)ud;
+  const char *p = (n > 0 && args[0].tag == TURI_CSTR && args[0].as_cstr)
+                ? args[0].as_cstr : "";
+  printf("__NB_IMG__: %s\n", p);
+  fflush(stdout);
+  return turi_int(0);
+}
+
+/* What session-open-for gives a fresh env, and session-reset its
+ * replacement: the stdlib a program gets, top-level imports, the search
+ * path a program at source_path would have, and the notebook's natives. */
+static void nb_session_configure(TuriEnv *env, const char *source_path) {
+#ifdef TURI_HAS_SEARCH_PATH_FOR
+#ifndef TUR_NB_STDLIB
+#define TUR_NB_STDLIB ""   /* the stdlib the building tur used; "" = $TUR_STDLIB_DIR */
+#endif
+  turi_env_preload_stdlib(env, TUR_NB_STDLIB);
+  turi_env_set_toplevel_imports(env, true);
+  if (source_path) turi_env_set_search_path_for(env, source_path);
+#else
+  if (source_path) {
+    char *dir = strdup(source_path);
+    char *slash = dir ? strrchr(dir, '/') : NULL;
+    if (slash) { *slash = '\0'; turi_env_set_module_base_dir(env, dir); }
+    free(dir);
+  }
+#endif
+  turi_env_register_native(env, "image-hook-record-path",
+                           nb_native_image_hook_record_path, NULL);
+  turi_env_register_native(env, "notebook/image/image-hook-record-path",
+                           nb_native_image_hook_record_path, NULL);
+}
+#endif
+```
 
   (defn output-status-ok [] : int 0)
   (defn output-status-error [] : int 1)
@@ -245,11 +302,33 @@
     return out && out->type_tag ? out->type_tag : "";
     ```)
 
-  ;;; session-open -- create a fresh libturi-backed notebook session.
-  (defn session-open [] #fx{Unsafe} : int
+  ;;; session-open-for -- create a session whose imports resolve for a notebook.
+  ;;;
+  ;;; The session starts from the stdlib `tur repl` preloads (collections,
+  ;;; core macros, Show), cells may `(import ...)` at the top level the way a
+  ;;; REPL turn may, and the module search is the one `tur run <path>` would
+  ;;; use for a program at `path`: the notebook's own directory, then the
+  ;;; enclosing spice's src/, its `:spices` deps and its workspace siblings.
+  ;;; An empty `path` (a notebook rendered from a string) searches the cwd and
+  ;;; the stdlib only.  Against a libturi that predates
+  ;;; turi_env_set_search_path_for, none of that: only the notebook's
+  ;;; directory is searched, and only a defmodule may import.
+  ;;;
+  ;;; Parameters:
+  ;;;   path -- the .tur.md file the cells come from, or ""
+  ;;;
+  ;;; Returns:
+  ;;;   A session handle (0 on allocation failure); free with session-close.
+  ;;;
+  ;;; Example:
+  ;;;   (session-open-for "examples/plot-walkthrough.tur.md")
+  ;;;
+  ;;; Since: notebook-v0.3.1
+  (defn session-open-for [path : cstr] #fx{Unsafe} : int
     ```c
     typedef struct {
       TuriEnv *env;
+      char *source_path;
     } NotebookSession;
     static bool inited = false;
     if (!inited) {
@@ -257,19 +336,53 @@
       inited = true;
     }
     NotebookSession *session = malloc(sizeof(*session));
+    if (!session) return 0;
+    const char *p = path ? (const char *)(intptr_t)path : "";
+    session->source_path = *p ? strdup(p) : NULL;
     session->env = turi_env_new();
+    nb_session_configure(session->env, session->source_path);
     return (int64_t)(intptr_t)session;
     ```)
+
+  ;;; session-cell-imports? -- whether a cell may `(import ...)` at the top level.
+  ;;;
+  ;;; True when the libturi this was built against has
+  ;;; turi_env_set_search_path_for (TURI_HAS_SEARCH_PATH_FOR), so a session
+  ;;; resolves a cell's imports the way session-open-for describes.  False
+  ;;; against an older one, where only a defmodule may import.
+  ;;;
+  ;;; Returns:
+  ;;;   true when cells can import modules.
+  ;;;
+  ;;; Example:
+  ;;;   (session-cell-imports?)  ; => true
+  ;;;
+  ;;; Since: notebook-v0.3.1
+  (defn session-cell-imports? [] : bool
+    ```c
+    #ifdef TURI_HAS_SEARCH_PATH_FOR
+    return true;
+    #else
+    return false;
+    #endif
+    ```)
+
+  ;;; session-open -- create a fresh libturi-backed notebook session.
+  ;;; A session for no particular file: see session-open-for.
+  (defn session-open [] #fx{Unsafe} : int
+    (session-open-for ""))
 
   ;;; session-close -- free a notebook session and its embedded environment.
   (defn session-close [session : int] #fx{Unsafe} : void
     ```c
     typedef struct {
       TuriEnv *env;
+      char *source_path;
     } NotebookSession;
     NotebookSession *s = (NotebookSession *)(intptr_t)session;
     if (!s) return;
     if (s->env) turi_env_free(s->env);
+    free(s->source_path);
     free(s);
     ```)
 
@@ -278,11 +391,13 @@
     ```c
     typedef struct {
       TuriEnv *env;
+      char *source_path;
     } NotebookSession;
     NotebookSession *s = (NotebookSession *)(intptr_t)session;
     if (!s) return;
     if (s->env) turi_env_free(s->env);
     s->env = turi_env_new();
+    nb_session_configure(s->env, s->source_path);
     ```)
 
   ;;; session-eval -- evaluate one cell source string in the current session.
@@ -290,6 +405,7 @@
     ```c
     typedef struct {
       TuriEnv *env;
+      char *source_path;
     } NotebookSession;
     typedef struct {
       char *cell_id;
@@ -342,6 +458,38 @@
       dup2(capture_fd, STDOUT_FILENO);
       dup2(capture_fd, STDERR_FILENO);
     }
+
+#ifdef TURI_HAS_ATTACH_SPICE
+    /* A spice whose functions are inline C runs compiled: before the cell
+     * evaluates, attach the compiled image of each spice it imports (built
+     * once by `tur build --shared`, cached under that spice's
+     * .tur-repl-cache/; $TUR_BIN names the tur, else the one on PATH).  The
+     * build's output, if it fails, is the cell's.  notebook/ modules are this
+     * process's own code already. */
+    for (const char *ip = src; (ip = strstr(ip, "import")) != NULL; ip += 6) {
+      int at_form = ip > src && ip[-1] == '(';
+      int at_line = 0;
+      if (!at_form) {
+        const char *b = ip;
+        while (b > src && (b[-1] == ' ' || b[-1] == '\t')) b--;
+        at_line = b == src || b[-1] == '\n';
+      }
+      if (!at_form && !at_line) continue;
+      const char *mp = ip + 6;
+      if (*mp != ' ' && *mp != '\t' && *mp != '\n') continue;
+      while (*mp == ' ' || *mp == '\t' || *mp == '\n') mp++;
+      char mod[256];
+      size_t mk = 0;
+      while (mp[mk] && !isspace((unsigned char)mp[mk]) && mp[mk] != ')'
+             && mp[mk] != '(' && mk + 1 < sizeof mod) {
+        mod[mk] = mp[mk];
+        mk++;
+      }
+      mod[mk] = '\0';
+      if (mk == 0 || strncmp(mod, "notebook/", 9) == 0) continue;
+      turi_env_attach_spice_for_module(s->env, mod, NULL);
+    }
+#endif
 
     char type_tag[128] = {0};
     TuriValue result = turi_eval_typed(s->env, src, type_tag, sizeof(type_tag));

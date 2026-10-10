@@ -19,8 +19,8 @@ character (0 = double-quote), has-header flag (1 = yes), infer-rows
 (def csv "name,age,city\nAlice,30,NYC\nBob,25,SF\nCarol,35,NYC\nDave,28,LA\n")
 (def df (read-csv-string csv 0 0 1 0 ""))
 
-(println (str-append "rows: " (int->str (frame-nrows df))))
-(println (str-append "cols: " (int->str (frame-ncols df))))
+(println (frame-nrows df))   ;; rows
+(println (frame-ncols df))   ;; columns
 (print-frame (frame-head df 3))
 ```
 
@@ -49,9 +49,10 @@ with `column-bool` from a list of 0/1 values.
 
 ## Group-by and aggregation
 
-`group-by` takes a frame and a list of column names. `agg` takes the
-grouped object, three parallel lists (output names, input names,
-aggregation tags), and returns a result frame.
+`group-by` takes a frame and a vector of key column names. `agg` takes
+the grouped object, three parallel lists (output names, input names,
+aggregation tags), and returns a result frame. frame's handles are `:int`,
+so a column name goes in as `(:: "name" :int)`.
 
 ```turmeric
 (import frame/csv   :refer [read-csv-string])
@@ -62,13 +63,13 @@ aggregation tags), and returns a result frame.
 (def csv "city,age\nNYC,30\nSF,25\nNYC,35\nLA,28\nNYC,22\nSF,40\n")
 (def df (read-csv-string csv 0 0 1 0 ""))
 
-(def g (group-by df (cons (cast "city" :int) 0)))
+(def g (group-by df (vec-of (:: "city" :int))))
 
 ;; Two aggregations: count and mean age, per city
-(def outs (cons (cast "n"   :int)
-          (cons (cast "avg" :int) 0)))
-(def ins  (cons (cast "age" :int)
-          (cons (cast "age" :int) 0)))
+(def outs (cons (:: "n"   :int)
+          (cons (:: "avg" :int) 0)))
+(def ins  (cons (:: "age" :int)
+          (cons (:: "age" :int) 0)))
 (def tags (cons (agg-count)
           (cons (agg-mean) 0)))
 

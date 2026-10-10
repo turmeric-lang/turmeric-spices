@@ -1,0 +1,143 @@
+;; tests/stats/frame_interop_test.tur -- stats against frames frame builds.
+;;
+;; Every other stats test builds its columns by hand, which is how stats'
+;; private copy of frame's layout drifted from frame's own without a test
+;; noticing: ols-frame on a read-csv-string frame segfaulted, and a frame stats
+;; built could not be freed by frame (turmeric
+;; docs/reported/stats-frame-interop-reads-a-stale-frame-layout.md).  Each case
+;; here reads a frame frame made, and frees through frame what stats made.
+
+(defmodule stats/tests/frame-interop
+  (import frame/csv     :refer [read-csv-string])
+  (import frame/frame   :refer [frame-nrows frame-ncols frame-free frame-column])
+  (import frame/column  :refer [column-length column-float64-at column-int64-at
+                                column-utf8-at])
+  (import stats/regress :refer [ols-frame predict-frame])
+  (import stats/fmt     :refer [fit-coefs-frame])
+  (import stats/summary :refer [frame-mean frame-max])
+  (import stats/cov     :refer [frame-cor])
+  (import stats/sample  :refer [train-test-split])
+  (import stats/rng     :refer [rng-make])
+  (import test/assert   :refer [assert-true assert-eq])
+  (import test/suite    :refer [describe it])
+  (import test/runner   :refer [run-all-status])
+
+  (defn approx= [x : float y : float tol : float] : bool
+    ```c
+    #include <math.h>
+    return fabs(x - y) <= tol;
+    ```)
+
+  ;; stats results are cons-shaped: (0 . (value . nil)) for ok.
+  (defn result-ok? [r : int] : bool
+    ```c
+    #include <stdint.h>
+    struct __ir_cons { int64_t value; int64_t next; };
+    struct __ir_cons *c = (struct __ir_cons *)(intptr_t)r;
+    return c && c->value == 0;
+    ```)
+
+  (defn result-unwrap [r : int] : int
+    ```c
+    #include <stdint.h>
+    struct __ir_cons { int64_t value; int64_t next; };
+    struct __ir_cons *outer = (struct __ir_cons *)(intptr_t)r;
+    return ((struct __ir_cons *)(intptr_t)outer->next)->value;
+    ```)
+
+  (defn split-train [p : int] : int
+    ```c
+    #include <stdint.h>
+    struct __ir_cons { int64_t value; int64_t next; };
+    return ((struct __ir_cons *)(intptr_t)p)->value;
+    ```)
+
+  (defn split-test [p : int] : int
+    ```c
+    #include <stdint.h>
+    struct __ir_cons { int64_t value; int64_t next; };
+    return ((struct __ir_cons *)(intptr_t)p)->next;
+    ```)
+
+  (defn csv [] : cstr "x,y,g\n1,2.1,a\n2,3.9,b\n3,6.2,a\n4,8.1,b\n")
+
+  (defn __all-tests [] : void
+    (describe "frame interop"
+      (it "ols-frame fits a frame read-csv-string made"
+        (let [df  (read-csv-string (csv) 0 0 1 0 "")
+              r   (ols-frame df "y" (cons (:: "x" :int) 0) 1)]
+          (assert-true (result-ok? r))))
+      (it "fit-coefs-frame's frame reads and frees through frame"
+        (let [df   (read-csv-string (csv) 0 0 1 0 "")
+              fit  (result-unwrap (ols-frame df "y" (cons (:: "x" :int) 0) 1))
+              cf   (fit-coefs-frame fit)
+              est  (frame-column cf "estimate")
+              nm   (frame-column cf "name")]
+          (assert-eq 2 (frame-nrows cf))
+          (assert-eq 5 (frame-ncols cf))
+          (assert-eq 0 (strcmp-int (column-utf8-at nm 1) "x"))
+          (let [slope (column-float64-at est 1)]
+            (frame-free cf)
+            (frame-free df)
+            (assert-true (approx= slope 2.03 0.000001)))))
+      (it "predict-frame reads a new frame's predictors"
+        (let [df  (read-csv-string (csv) 0 0 1 0 "")
+              fit (result-unwrap (ols-frame df "y" (cons (:: "x" :int) 0) 1))
+              nd  (read-csv-string "x\n10\n" 0 0 1 0 "")
+              p   (result-unwrap (predict-frame fit nd))]
+          (frame-free nd)
+          (frame-free df)
+          (assert-true (approx= (column-float64-at p 0) 20.3 0.000001))))
+      (it "a summary reads a frame's column by name"
+        (let [df (read-csv-string (csv) 0 0 1 0 "")
+              m  (frame-mean df "y")
+              mx (frame-max df "y")]
+          (frame-free df)
+          (assert-true (approx= mx 8.1 0.000001))
+          (assert-true (approx= m 5.075 0.000001))))
+      (it "describe's frame reads and frees through frame"
+        (let [df (read-csv-string (csv) 0 0 1 0 "")
+              d  (stats/summary/describe df)
+              nr (frame-nrows d)]
+          (frame-free d)
+          (frame-free df)
+          (assert-eq 8 nr)))
+      (it "frame-cor's frame reads and frees through frame"
+        (let [df (read-csv-string (csv) 0 0 1 0 "")
+              c  (frame-cor df (cons (:: "x" :int) (cons (:: "y" :int) 0)))]
+          (assert-eq 2 (frame-nrows c))
+          (let [r11 (column-float64-at (frame-column c "x") 0)]
+            (frame-free c)
+            (frame-free df)
+            (assert-true (approx= r11 1.0 0.000001)))))
+      (it "train-test-split copies int64, float64 and utf8 columns"
+        (let [df  (read-csv-string (csv) 0 0 1 0 "")
+              r   (train-test-split df 0.5 0 (rng-make 7 1))
+              tr  (split-train (result-unwrap r))
+              te  (split-test (result-unwrap r))]
+          (assert-eq 2 (frame-nrows tr))
+          (assert-eq 2 (frame-nrows te))
+          (assert-eq 3 (frame-ncols tr))
+          (let [x0 (column-int64-at (frame-column tr "x") 0)
+                y0 (column-float64-at (frame-column tr "y") 0)]
+            (frame-free tr)
+            (frame-free te)
+            (frame-free df)
+            (assert-true (approx= y0 (row-y x0) 0.000001)))))))
+
+  ;; y for the csv's x (1..4): the split keeps rows whole.
+  (defn row-y [x : int] : float
+    ```c
+    static const double ys[] = { 0.0, 2.1, 3.9, 6.2, 8.1 };
+    return (x >= 1 && x <= 4) ? ys[x] : -1.0;
+    ```)
+
+  (defn strcmp-int [a : cstr b : cstr] : int
+    ```c
+    #include <string.h>
+    return strcmp(a, b);
+    ```)
+
+  (defn main [] : int
+    (__all-tests)
+    (run-all-status)))

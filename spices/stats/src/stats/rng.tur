@@ -51,6 +51,28 @@ struct __frame_col {
   void *validity; void *values; void *offsets;
 };
 #endif
+#ifndef __STATS_FRAME_BUF_DEFINED
+#define __STATS_FRAME_BUF_DEFINED
+/* frame's buffer protocol (spices/frame/src/frame/column.tur): the data is
+   64-byte aligned behind a 16-byte header -- the raw malloc base at data-16,
+   the rounded size at data-8 -- which frame's column-free and frame-free read
+   back.  Every column buffer stats builds goes through it, so a stats column
+   or frame is frame's to free. */
+static inline void *__stats_frame_buf(int64_t bytes) {
+  int64_t rounded = (bytes + 63) & ~((int64_t)63);
+  if (rounded == 0) rounded = 64;
+  void *raw = calloc(1, (size_t)(rounded + 64 + 8));
+  if (!raw) return NULL;
+  uintptr_t base = (uintptr_t)raw;
+  uintptr_t data = (base + 16 + 63) & ~((uintptr_t)63);
+  *((int64_t *)(data - 8)) = rounded;
+  *((uintptr_t *)(data - 16)) = base;
+  return (void *)data;
+}
+static inline void __stats_frame_buf_free(void *data) {
+  if (data) free((void *)(*((uintptr_t *)((uintptr_t)data - 16))));
+}
+#endif
 #ifndef __STATS_CONS_DEFINED
 #define __STATS_CONS_DEFINED
 struct __cons { int64_t value; int64_t next; };
@@ -433,16 +455,14 @@ struct __cons { int64_t value; int64_t next; };
   int64_t bytes = k * (int64_t)sizeof(double);
   int64_t rounded = (bytes + 63) & ~((int64_t)63);
 
-  int64_t total = (int64_t)sizeof(int64_t) + rounded;
-  void *buf = malloc((size_t)total);
+  void *buf = __stats_frame_buf(rounded);
   if (!buf) { free(indices); return 0; }
-  *(int64_t *)buf = rounded;
-  double *out_vals = (double *)((char *)buf + sizeof(int64_t));
+  double *out_vals = (double *)buf;
   for (int64_t i = 0; i < k; i++) out_vals[i] = src_vals[indices[i]];
   free(indices);
 
   struct __frame_col *out = (struct __frame_col *)calloc(1, sizeof(struct __frame_col));
-  if (!out) { free(buf); return 0; }
+  if (!out) { __stats_frame_buf_free(buf); return 0; }
   out->type_tag = 4; /* float64 */
   out->length   = k;
   out->refcount = 1;

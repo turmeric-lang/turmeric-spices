@@ -34,7 +34,7 @@ samples from a normal distribution and returns a frame column handle.
 (import stats/rng  :refer [rng-make])
 (import stats/dist :refer [rnorm])
 
-(def rng (rng-make 42))
+(def rng (rng-make 42 0))
 (def samples (rnorm rng 1000 0.0 1.0))
 ```
 
@@ -48,11 +48,11 @@ The `rnorm` result above is a column, so we can pass it directly.
 ```turmeric
 (import stats/summary :refer [col-mean col-sd col-median col-min col-max])
 
-(println (str-append "mean   = " (float->str (col-mean samples))))
-(println (str-append "sd     = " (float->str (col-sd samples))))
-(println (str-append "median = " (float->str (col-median samples))))
-(println (str-append "min    = " (float->str (col-min samples))))
-(println (str-append "max    = " (float->str (col-max samples))))
+(println (col-mean samples))    ;; mean
+(println (col-sd samples))      ;; sd
+(println (col-median samples))  ;; median
+(println (col-min samples))     ;; min
+(println (col-max samples))     ;; max
 ```
 
 ---
@@ -69,8 +69,8 @@ confidence level. It returns a test result you can print with `print-test`.
 (import stats/test :refer [t-test-2samp alt-two-sided])
 (import stats/fmt  :refer [print-test])
 
-(def rng1 (rng-make 1))
-(def rng2 (rng-make 2))
+(def rng1 (rng-make 1 0))
+(def rng2 (rng-make 2 0))
 (def group-a (rnorm rng1 50 10.0 2.0))
 (def group-b (rnorm rng2 50 12.0 2.0))
 
@@ -97,7 +97,8 @@ and an intercept flag. `print-fit` prints the coefficients and diagnostics.
 (def df (read-csv-string csv 0 0 1 0 ""))
 
 ;; Fit y ~ x with intercept
-(def fit (ols-frame df "y" (cons (cast "x" :int) 0) 1))
+;; ols-frame returns a result -- (0 . (fit)) on success; head/tail unwrap it.
+(def fit (head (tail (ols-frame df "y" (cons (:: "x" :int) 0) 1))))
 (print-fit fit)
 ```
 

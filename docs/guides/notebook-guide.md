@@ -117,15 +117,52 @@ notebook's own `build.tur` as `:optional true` deps) so `tur fetch` makes
 them available. Without the declaration, the import fails with a clear
 error -- the spice is not installed.
 
+Imports resolve the way `tur run <notebook>` would for a program at the
+notebook's path: first the notebook's own directory (a `helpers.tur` next to
+it is `(import helpers ...)`), then the enclosing spice's `src/`, each
+`:spices` dep's `src/`, and the other members of the workspace -- whatever
+directory you render from. The session starts from the same stdlib
+`tur --interpret` gives a program.
+
+**Spices written in C run compiled.** Cells run in the interpreter, which
+does not run inline-C bodies. So before a cell evaluates, the notebook
+builds each spice the cell imports as a shared library -- once, with
+`tur build --shared`, cached under that spice's `.tur-repl-cache/` and
+rebuilt when a source changes -- and calls its exports there, the way
+`tur repl` does for the spice it starts in. The first cell that imports a
+spice takes a few seconds longer; set `TUR_BIN` if `tur` is not on `PATH`.
+What runs compiled:
+
+- `stats` (distributions, tests, summaries), `frame` (CSV, filtering,
+  group-by, printing), `plot` (scatter, histograms, densities) and `linalg`
+  (matrices, solvers, formatting), whose APIs pass numbers, strings,
+  handles, cons lists and by-value records.
+- Turmeric wrappers in those spices over private C helpers.
+
+A function that takes or returns a record (linalg's `mat`) is callable once
+its module is imported in the session -- the import is where its layout
+comes from -- which a cell does anyway to use the name.
+
+What still cannot:
+
+- A cell's `defn` passed as a C callback, such as plot's `function`
+  renderer: the interpreter's closure has no C address to hand over.
+- An inline-C `defn` written in a cell itself, beyond the interpreter's
+  few simple shapes. Build such values with `cons` and `float->bits`
+  (`(load "stdlib/bits.tur")`) instead -- the example notebooks do.
+
+Tracked as turmeric's
+`docs/reported/notebook-cells-cannot-call-inline-c-spices.md`.
+
 Example -- load a CSV and print its shape:
 
 ```turmeric
 (import frame/csv   :refer [read-csv-string])
-(import frame/frame  :refer [frame-nrows frame-ncols])
+(import frame/frame  :refer [frame-nrows frame-ncols frame-head])
 (import frame/print  :refer [print-frame])
 
 (def df (read-csv-string "x,y\n1,2\n2,4\n3,6\n" 0 0 1 0 ""))
-(println (str-append "rows: " (int->str (frame-nrows df))))
+(println (frame-nrows df))   ;; rows
 (print-frame (frame-head df 3))
 ```
 
@@ -303,10 +340,11 @@ Summarize and fit:
 (import stats/fmt      :refer [print-fit])
 
 (def y-col (frame-column df "y"))
-(println (str-append "mean = " (float->str (col-mean y-col))))
-(println (str-append "sd   = " (float->str (col-sd y-col))))
+(println (col-mean y-col))   ;; mean
+(println (col-sd y-col))     ;; sd
 
-(def fit (ols-frame df "y" (cons (cast "x" :int) 0) 1))
+;; ols-frame returns a result -- (0 . (fit)) on success; head/tail unwrap it.
+(def fit (head (tail (ols-frame df "y" (cons (:: "x" :int) 0) 1))))
 (print-fit fit)
 ```
 

@@ -60,7 +60,7 @@ $$
 The cell below computes the golden ratio $\varphi = \frac{1 + \sqrt{5}}{2}$:
 
 ```turmeric
-(import stdlib/math :refer [sqrt])
+(load "stdlib/math.tur")
 
 (defn golden-ratio [] :float
   (* 0.5 (+ 1.0 (sqrt 5.0))))
