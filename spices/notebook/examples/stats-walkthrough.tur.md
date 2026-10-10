@@ -86,11 +86,7 @@ confidence level. It returns a test result you can print with `print-test`.
 the frame, the response column name, a list of predictor column names,
 and an intercept flag. `print-fit` prints the coefficients and diagnostics.
 
-> This cell is not evaluated (`eval=false`): stats' `ols-frame` reads frame
-> handles with a layout frame no longer uses and crashes, compiled or not --
-> turmeric's `docs/reported/stats-frame-interop-reads-a-stale-frame-layout.md`.
-
-```turmeric {eval=false}
+```turmeric
 (import frame/csv   :refer [read-csv-string])
 (import frame/frame  :refer [frame-column])
 (import stats/regress :refer [ols-frame])
@@ -101,7 +97,8 @@ and an intercept flag. `print-fit` prints the coefficients and diagnostics.
 (def df (read-csv-string csv 0 0 1 0 ""))
 
 ;; Fit y ~ x with intercept
-(def fit (ols-frame df "y" (cons (:: "x" :int) 0) 1))
+;; ols-frame returns a result -- (0 . (fit)) on success; head/tail unwrap it.
+(def fit (head (tail (ols-frame df "y" (cons (:: "x" :int) 0) 1))))
 (print-fit fit)
 ```
 

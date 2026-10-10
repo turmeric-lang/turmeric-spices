@@ -54,15 +54,12 @@ Extract the y column and compute summary statistics.
 Fit y ~ x with an intercept using `ols-frame`. The result includes
 coefficient estimates, standard errors, and R-squared.
 
-> This cell is not evaluated (`eval=false`): stats' `ols-frame` reads frame
-> handles with a layout frame no longer uses and crashes, compiled or not --
-> turmeric's `docs/reported/stats-frame-interop-reads-a-stale-frame-layout.md`.
-
-```turmeric {eval=false}
+```turmeric
 (import stats/regress :refer [ols-frame])
 (import stats/fmt    :refer [print-fit])
 
-(def fit (ols-frame df "y" (cons (:: "x" :int) 0) 1))
+;; ols-frame returns a result -- (0 . (fit)) on success; head/tail unwrap it.
+(def fit (head (tail (ols-frame df "y" (cons (:: "x" :int) 0) 1))))
 (print-fit fit)
 ```
 

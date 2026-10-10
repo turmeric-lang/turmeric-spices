@@ -21,6 +21,11 @@
 
 ### Fixed
 
+- `plot/core`'s hand-written `<plutovg.h>` stand-ins (prototypes, typedefs,
+  `PLUTOVG_TEXT_ENCODING_UTF8`) are guarded by the header's own `PLUTOVG_H`.
+  A project build (`tur build --shared --bundle-deps`, the image `tur repl`
+  and notebooks load) puts the real header on the include path and hoists
+  it, and the stand-ins then conflicted with its prototypes.
 - x-axis tick labels showed y values. The label buffers were local to the
   blocks that filled them; `x_labels` outlived its block and the y block
   reused the storage, so every x tick but the last read a y label.

@@ -158,11 +158,11 @@ Example -- load a CSV and print its shape:
 
 ```turmeric
 (import frame/csv   :refer [read-csv-string])
-(import frame/frame  :refer [frame-nrows frame-ncols])
+(import frame/frame  :refer [frame-nrows frame-ncols frame-head])
 (import frame/print  :refer [print-frame])
 
 (def df (read-csv-string "x,y\n1,2\n2,4\n3,6\n" 0 0 1 0 ""))
-(println (str-append "rows: " (int->str (frame-nrows df))))
+(println (frame-nrows df))   ;; rows
 (print-frame (frame-head df 3))
 ```
 
@@ -340,10 +340,11 @@ Summarize and fit:
 (import stats/fmt      :refer [print-fit])
 
 (def y-col (frame-column df "y"))
-(println (str-append "mean = " (float->str (col-mean y-col))))
-(println (str-append "sd   = " (float->str (col-sd y-col))))
+(println (col-mean y-col))   ;; mean
+(println (col-sd y-col))     ;; sd
 
-(def fit (ols-frame df "y" (cons (cast "x" :int) 0) 1))
+;; ols-frame returns a result -- (0 . (fit)) on success; head/tail unwrap it.
+(def fit (head (tail (ols-frame df "y" (cons (:: "x" :int) 0) 1))))
 (print-fit fit)
 ```
 
