@@ -4,12 +4,22 @@
 ;; ignore their input) and sample at characteristic time points. Values are
 ;; compared with a tolerance because sine goes through libm.
 ;;
+;; The modulation oscillators are checked against identities that do not
+;; depend on how they are built:
+;;   pm-sine with a zero modulator      == sine
+;;   pm-sine with a constant pi/2       == a cosine
+;;   fm-sine with a zero modulator      == sine, sampled on its grid
+;;   fm-sine at a negative frequency    == the sine run backwards
+;;   FM by D*cos(2*pi*fm*t)             == PM by (D/fm)*sin(2*pi*fm*t)
+;; The last is why "FM" synthesizers can be built from phase modulation.
+;;
 ;; main returns the failure count, so `tur test` reports a non-zero exit as a
 ;; failing test.
 
 (defmodule signal/tests/test_osc
   (import signal/core :refer [constant sample])
-  (import signal/osc  :refer [sine square sawtooth triangle])
+  (import signal/osc  :refer [sine square sawtooth triangle pm-sine fm-sine])
+  (import signal/shaper :refer [gain])
 
 ;;; near? -- absolute-tolerance float comparison (no libm dependency).
 (defn near? [a :float b :float] :bool
@@ -19,6 +29,46 @@
 ;;; fail-unless -- print label and count 1 when the assertion is false.
 (defn fail-unless [cond :bool label :cstr] :int
   (if cond 0 (do (println label) 1)))
+
+;;; maxdiff -- max |a - b| over n samples at 48 kHz, both sampled in order.
+(defn maxdiff [^fat a : (fn [float] float) ^fat b : (fn [float] float) n :int] :float
+  (let [^mut k 0
+        ^mut m 0.0]
+    (while (< k n)
+      (let [t  (/ (as float k) 48000.0)
+            d  (- (sample a t) (sample b t))
+            ad (if (< d 0.0) (- 0.0 d) d)]
+        (if (> ad m) (set! m ad) (set! m m)))
+      (set! k (+ k 1)))
+    m))
+
+;;; modulation-failures -- pm-sine and fm-sine identities.
+(defn modulation-failures [] :int
+  (let [z    (constant 0.0)
+        half 1.5707963267948966]
+    (+ (fail-unless (< (maxdiff ((pm-sine 440.0) z) ((sine 440.0 0.0) z) 4800) 0.000000001)
+                    "FAIL: pm-sine with no modulation is not sine")
+       (fail-unless (< (maxdiff ((pm-sine 440.0) (constant half)) ((sine 440.0 half) z) 4800)
+                       0.000000001)
+                    "FAIL: pm-sine with a constant phase is not a shifted sine")
+       (fail-unless (< (maxdiff ((fm-sine 48000.0 440.0) z) ((sine 440.0 0.0) z) 48000) 0.000001)
+                    "FAIL: fm-sine with no modulation drifts from sine over 1 s")
+       (fail-unless (near? (sample ((fm-sine 48000.0 440.0) z) 0.0) 0.0)
+                    "FAIL: fm-sine does not start at sin(0)")
+       ;; 100 Hz carrier pushed to -100 Hz: the same sine, mirrored.
+       (fail-unless (< (maxdiff ((fm-sine 48000.0 100.0) (constant -200.0))
+                                ((sine 100.0 3.141592653589793) z) 4800)
+                       0.000001)
+                    "FAIL: fm-sine through zero is not the mirrored sine")
+       ;; D = 220 Hz at fm = 110 Hz is index 2.
+       (fail-unless (< (maxdiff ((fm-sine 48000.0 440.0) ((gain 220.0) ((sine 110.0 half) z)))
+                                ((pm-sine 440.0) ((gain 2.0) ((sine 110.0 0.0) z)))
+                                48000)
+                       0.0001)
+                    "FAIL: FM by D*cos is not PM by (D/fm)*sin")
+       ;; A non-positive sample rate freezes the phase instead of dividing by 0.
+       (fail-unless (near? (maxdiff ((fm-sine 0.0 440.0) z) z 480) 0.0)
+                    "FAIL: fm-sine with sample rate 0 is not silent"))))
 
 (defn main [] : int
   (let [unused (constant 0.0)
@@ -41,7 +91,8 @@
              (fail-unless (near? (sample tri 0.0) -1.0) "FAIL: triangle @ 0.0")
              (fail-unless (near? (sample tri 0.25) 0.0) "FAIL: triangle @ 0.25")
              (fail-unless (near? (sample tri 0.5) 1.0)  "FAIL: triangle @ 0.5 (peak)")
-             (fail-unless (near? (sample tri 0.75) 0.0) "FAIL: triangle @ 0.75"))]
+             (fail-unless (near? (sample tri 0.75) 0.0) "FAIL: triangle @ 0.75")
+             (modulation-failures))]
     (if (= f 0)
       (println "PASS test_osc")
       (println "test_osc: failures above"))

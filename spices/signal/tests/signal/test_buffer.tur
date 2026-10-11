@@ -1,0 +1,92 @@
+;; test_buffer -- correctness tests for signal/buffer.
+;;
+;; Indexing and storage first (wrap-around, clamping, interpolation between
+;; known samples), then the two things the module is for: rendering a signal
+;; on a sample grid, and scanning a buffer with a position signal. A one-cycle
+;; buffer of a 1 Hz sine scanned by a 220 Hz ramp is a 220 Hz sine, to within
+;; the linear-interpolation error of a 2048-point table (about 1.2e-6).
+;;
+;; main returns the failure count for `tur test`.
+
+(defmodule signal/tests/test_buffer
+  (import signal/core   :refer [constant sample])
+  (import signal/osc    :refer [sine sawtooth])
+  (import signal/noise  :refer [white])
+  (import signal/buffer :refer [Buffer buffer-new buffer-render buffer-len
+                                buffer-get buffer-set! buffer-read scan])
+
+(defn near? [a :float b :float] :bool
+  (let [d (- a b)]
+    (if (< d 0.0) (< (- 0.0 d) 0.0001) (< d 0.0001))))
+
+(defn fail-unless [cond :bool label :cstr] :int
+  (if cond 0 (do (println label) 1)))
+
+;;; maxdiff -- max |a - b| over n samples at 48 kHz, both sampled in order.
+(defn maxdiff [^fat a : (fn [float] float) ^fat b : (fn [float] float) n :int] :float
+  (let [^mut k 0
+        ^mut m 0.0]
+    (while (< k n)
+      (let [t  (/ (as float k) 48000.0)
+            d  (- (sample a t) (sample b t))
+            ad (if (< d 0.0) (- 0.0 d) d)]
+        (if (> ad m) (set! m ad) (set! m m)))
+      (set! k (+ k 1)))
+    m))
+
+;;; diamond -- a 4-sample buffer holding 0, 1, 0, -1.
+(defn diamond [] : Buffer
+  (let [b (buffer-new 4)]
+    (buffer-set! b 1 1.0)
+    (buffer-set! b 3 -1.0)
+    b))
+
+(defn main [] : int
+  (let [d     (diamond)
+        z     (constant 0.0)
+        table (buffer-render 2048.0 2048 ((sine 1.0 0.0) z))
+        ;; Two renders of one seed are equal; the buffer freezes the stream.
+        n1    (buffer-render 48000.0 64 ((white 9) z))
+        n2    (buffer-render 48000.0 64 ((white 9) z))
+        f (+ (fail-unless (= (buffer-len (buffer-new 64)) 64) "FAIL: buffer-new length")
+             (fail-unless (= (buffer-len (buffer-new 0)) 1) "FAIL: buffer-new 0 should clamp to 1")
+             (fail-unless (near? (buffer-get (buffer-new 8) 5) 0.0) "FAIL: buffer-new is not silent")
+             (fail-unless (near? (buffer-get d 1) 1.0)  "FAIL: buffer-set!/get")
+             (fail-unless (near? (buffer-get d -1) -1.0) "FAIL: buffer-get -1 should wrap to the end")
+             (fail-unless (near? (buffer-get d 5) 1.0)  "FAIL: buffer-get past the end should wrap")
+             ;; positions are in buffer lengths; 4 samples, so 0.125 is index 0.5
+             (fail-unless (near? (buffer-read d 0.0) 0.0)    "FAIL: buffer-read 0")
+             (fail-unless (near? (buffer-read d 0.25) 1.0)   "FAIL: buffer-read on a sample")
+             (fail-unless (near? (buffer-read d 0.125) 0.5)  "FAIL: buffer-read interpolation")
+             (fail-unless (near? (buffer-read d 0.875) -0.5) "FAIL: buffer-read should interpolate last -> first")
+             (fail-unless (near? (buffer-read d 1.25) 1.0)   "FAIL: buffer-read should wrap above 1")
+             (fail-unless (near? (buffer-read d -0.25) -1.0) "FAIL: buffer-read should wrap below 0")
+             (fail-unless (near? (buffer-read d (/ 0.0 0.0)) 0.0) "FAIL: buffer-read NaN should read sample 0")
+             ;; render: sample k is sig(k / sample-rate)
+             (fail-unless (= (buffer-len table) 2048) "FAIL: buffer-render length")
+             (fail-unless (near? (buffer-get table 512) 1.0)   "FAIL: buffer-render quarter cycle")
+             (fail-unless (near? (buffer-get table 1536) -1.0) "FAIL: buffer-render three-quarter cycle")
+             (fail-unless (near? (maxdiff ((scan n1) ((sawtooth 1.0) z)) ((scan n2) ((sawtooth 1.0) z)) 480) 0.0)
+                          "FAIL: buffer-render of one seed differs")
+             ;; scan: a wavetable oscillator
+             (fail-unless (< (maxdiff ((scan table) ((sawtooth 220.0) z)) ((sine 220.0 0.0) z) 48000)
+                             0.00001)
+                          "FAIL: scanning a one-cycle table at 220 Hz is not a 220 Hz sine")
+             ;; scan is stateless: sampled out of order, it still reads the table
+             (let [s  ((scan table) ((sawtooth 3.0) z))
+                   late  (sample s 0.3)
+                   early (sample s 0.1)]
+               (fail-unless (and (near? early (sample ((sine 3.0 0.0) z) 0.1))
+                                 (near? late (sample ((sine 3.0 0.0) z) 0.3)))
+                            "FAIL: scan depends on sampling order"))
+             ;; writes are visible through an existing scan
+             (let [b (buffer-new 2)
+                   s ((scan b) z)]
+               (buffer-set! b 0 0.75)
+               (fail-unless (near? (sample s 0.0) 0.75) "FAIL: scan does not see buffer-set!")))]
+    (if (= f 0)
+      (println "PASS test_buffer")
+      (println "test_buffer: failures above"))
+    f))
+
+) ;; end defmodule signal/tests/test_buffer

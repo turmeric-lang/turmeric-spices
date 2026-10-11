@@ -1,15 +1,17 @@
 ;; Signal Processing -- Oscillators
 ;;
 ;; Each oscillator returns an SF (Signal Function): apply it to any
-;; signal to receive a Time -> Sample closure. Periodic shapes only --
-;; wavetable, FM, additive, and granular oscillators are Tier 2.
+;; signal to receive a Time -> Sample closure. The four plain shapes ignore
+;; that input signal. The two modulation oscillators, `pm-sine` and `fm-sine`,
+;; READ it: it is the modulator. (For a wavetable oscillator, scan a buffer:
+;; signal/buffer `scan`.)
 ;;
 ;; These are the NAIVE shapes: right for control signals (LFOs), but a sawtooth or
 ;; square sampled at a hearing-range pitch aliases. For audio-rate pitches use
 ;; signal/hf-osc, which band-limits the same shapes.
 
 (defmodule signal/osc
-  (export sine square sawtooth triangle)
+  (export sine square sawtooth triangle pm-sine fm-sine)
 
 ;; =============================================================================
 ;; libm bridges
@@ -108,5 +110,92 @@
           (if (< phase 0.5)
             (- (* 4.0 phase) 1.0)
             (- 3.0 (* 4.0 phase))))))))
+
+;; =============================================================================
+;; Modulation oscillators
+;; =============================================================================
+
+;;; __fm_alloc -- allocate an FM phase cell: [phase, previous freq, started].
+(defn __fm_alloc [] :int
+  ```c
+  double *p = (double *)calloc(3, sizeof(double));
+  if (!p) { fprintf(stderr, "osc: fm state alloc failed\n"); abort(); }
+  return (int64_t)(intptr_t)p;
+  ```)
+
+;;; __fm_step -- advance the FM phase by one sample and return its sine.
+;;;
+;;; The phase is the integral of the instantaneous frequency f[n], taken with
+;;; the trapezoidal rule: phase[n] = phase[n-1] + pi*(f[n-1] + f[n])/sr. The
+;;; first call emits sin(0) = 0, matching `sine` at t = 0. The phase is kept
+;;; in [-pi, pi) so a long run does not lose precision. A non-positive sample
+;;; rate freezes the phase.
+(defn __fm_step [state :int sample-rate :float f :float] :float
+  ```c
+  extern double sin(double);
+  extern double fmod(double, double);
+  const double two_pi = 2.0 * 3.14159265358979323846;
+  double *s = (double *)(intptr_t)state;
+  if (s[2] == 0.0) {
+    s[2] = 1.0;
+    s[1] = f;
+    return sin(s[0]);
+  }
+  if (sample_rate > 0.0)
+    s[0] += 3.14159265358979323846 * (s[1] + f) / sample_rate;
+  s[1] = f;
+  if (s[0] >= 3.14159265358979323846 || s[0] < -3.14159265358979323846) {
+    s[0] = fmod(s[0] + 3.14159265358979323846, two_pi);
+    if (s[0] < 0.0) s[0] += two_pi;
+    s[0] -= 3.14159265358979323846;
+  }
+  return sin(s[0]);
+  ```)
+
+;;; pm-sine -- phase-modulated sine: sin(2*pi*freq*t + m(t)).
+;;;
+;;; The SF's input signal m is the modulator, in RADIANS of phase offset. This
+;;; is the "FM" of most digital FM synthesizers (the DX7 included): the peak
+;;; of m is the modulation index. A pure function of t, like `sine`, so it can
+;;; be sampled in any order.
+;;;
+;;; Parameters:
+;;;   freq -- carrier frequency in Hz
+;;;
+;;; Returns:
+;;;   SF Sample Sample: modulator (radians) -> modulated carrier.
+;;;
+;;; Example:
+;;;   ((pm-sine 440.0) ((gain 2.0) ((sine 110.0 0.0) (constant 0.0))))
+(defn pm-sine [freq :float]
+  (let [fv freq]
+    (fn [^fat sig : (fn [float] float)]
+      (fn [t :float] :float
+        (__dsp_sin (+ (* (* 2.0 3.14159265358979323846) fv t) (sig t)))))))
+
+;;; fm-sine -- frequency-modulated sine: instantaneous frequency freq + m(t).
+;;;
+;;; The SF's input signal m is the modulator, in HZ of frequency deviation:
+;;; the phase is the running integral of freq + m, so a modulator of peak D Hz
+;;; swings the pitch D Hz either way. A negative instantaneous frequency runs
+;;; the phase backwards (through-zero FM). Because the phase is integrated,
+;;; this oscillator is STATEFUL like the filters: sample it once per sample, in
+;;; order, at t = n / sample-rate.
+;;;
+;;; Parameters:
+;;;   sample-rate -- the rate the result will be sampled at, in Hz
+;;;   freq        -- carrier frequency in Hz
+;;;
+;;; Returns:
+;;;   SF Sample Sample: modulator (Hz) -> modulated carrier.
+;;;
+;;; Example:
+;;;   ((fm-sine 48000.0 440.0) ((gain 220.0) ((sine 110.0 0.0) (constant 0.0))))
+(defn fm-sine [sample-rate :float freq :float]
+  (let [sv sample-rate fv freq]
+    (fn [^fat sig : (fn [float] float)]
+      (let [state (__fm_alloc)]
+        (fn [t :float] :float
+          (__fm_step state sv (+ fv (sig t))))))))
 
 ) ;; end defmodule signal/osc
