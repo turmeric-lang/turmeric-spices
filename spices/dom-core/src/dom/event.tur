@@ -1,0 +1,136 @@
+;;; dom/event -- the SAX event vocabulary shared by tur-xml and tur-html.
+;;;
+;;; Both spices' event APIs hand a handler of type `(fn [SaxEvent]
+;;; SaxControl)` one event at a time, so a consumer written against this
+;;; module reads XML and tokenized HTML alike. HTML adds nothing but the
+;;; `Doctype` event, which XML also reports for a `<!DOCTYPE ...>`.
+;;;
+;;; Ownership: every String in an event is a copy out of the parser's buffer,
+;;; and the event BORROWS it to the handler -- the driver releases them when
+;;; the handler returns. A handler that keeps a name or a text past its own
+;;; return takes a reference with `retain` (dom/ownstr) and later `release`s
+;;; it. That keeps a SAX pass over a multi-gigabyte document at constant
+;;; memory, which is what SAX is for.
+;;;
+;;; Since: 0.1.0
+;; Event types for the SAX front doors of tur-xml and tur-html.
+
+(defmodule dom/event
+  (export SaxEvent SaxControl Attr sax-event-release sax-dispatch attrs-get
+          StartElement EndElement Chars Comment Pi StartCdata EndCdata Doctype
+          Continue Stop)
+
+(import dom/ownstr :refer [String release string=?])
+
+;;; Attr -- one attribute of a StartElement event: name and value.
+(defstruct Attr :heap :copy [name : String value : String])
+
+;;; SaxEvent -- one parse event.
+;;;
+;;;   (StartElement name attrs)  -- an opening tag; attrs in document order
+;;;   (EndElement name)          -- the matching close (also for <x/>)
+;;;   (Chars text)               -- character data; adjacent runs are
+;;;                                 coalesced, so chunk boundaries never split
+;;;                                 one text node into two events
+;;;   (Comment text)             -- <!--text-->
+;;;   (Pi target data)           -- <?target data?>
+;;;   (StartCdata) / (EndCdata)  -- bracket the Chars of a CDATA section
+;;;   (Doctype name public system) -- <!DOCTYPE ...>; an absent public or
+;;;                                 system identifier is the empty String
+;;;
+;;; In XML with namespace processing on (the default), element and attribute
+;;; names are in Clark form `{uri}local` when they are in a namespace, plain
+;;; `local` when they are not, and `xmlns` declarations are not reported as
+;;; attributes.
+(defdata SaxEvent :heap :copy
+  (StartElement String (Cons Attr))
+  (EndElement String)
+  (Chars String)
+  (Comment String)
+  (Pi String String)
+  (StartCdata)
+  (EndCdata)
+  (Doctype String String String))
+
+;;; SaxControl -- what a handler tells the parser after an event.
+;;;   (Continue) -- deliver the next event
+;;;   (Stop)     -- end the parse now; the parse still returns ok
+(defdata SaxControl :copy (Continue) (Stop))
+
+;;; __release-attrs -- internal: release every String of an attribute list.
+(defn __release-attrs [xs : (Cons Attr)] : nil
+  (if (tnil? xs)
+    nil
+    (let [a (thead xs)]
+      (release (.name a))
+      (release (.value a))
+      (__release-attrs (ttail xs)))))
+
+;;; sax-event-release -- release every String an event owns.
+;;;
+;;; The SAX drivers call this after the handler returns; a caller that builds
+;;; events by hand (a test, a replay buffer) uses it too.
+;;;
+;;; Parameters:
+;;;   ev -- the event, not used afterwards
+;;;
+;;; Example:
+;;;   (sax-event-release ev)
+;;;
+;;; Since: 0.1.0
+(defn sax-event-release [ev : SaxEvent] : nil
+  (match ev
+    (StartElement n as) (do (release n) (__release-attrs as))
+    (EndElement n)      (release n)
+    (Chars t)           (release t)
+    (Comment t)         (release t)
+    (Pi t d)            (do (release t) (release d))
+    (StartCdata)        nil
+    (EndCdata)          nil
+    (Doctype n p s)     (do (release n) (release p) (release s))))
+
+;;; sax-dispatch -- call a handler with an event.
+;;;
+;;; The SAX drivers in tur-xml and tur-html call handlers through this
+;;; rather than directly: a :heap value of a type from another module passed
+;;; to a closure is emitted without the cast to the closure's word-sized
+;;; parameter, which clang rejects (-Wint-conversion; turmeric
+;;; docs/reported/heap-adt-arg-to-closure-cross-module-missing-cast.md).
+;;; Calling from the module that defines SaxEvent sidesteps it.
+;;;
+;;; Parameters:
+;;;   h  -- the handler
+;;;   ev -- the event (borrowed by the handler)
+;;;
+;;; Returns:
+;;;   SaxControl -- whatever the handler returned.
+;;;
+;;; Example:
+;;;   (sax-dispatch h (StartCdata))   ; => (Continue)
+;;;
+;;; Since: 0.1.0
+(defn sax-dispatch [h : (fn [SaxEvent] SaxControl) ev : SaxEvent] : SaxControl
+  (h ev))
+
+;;; attrs-get -- the value of the attribute named `name`, if present.
+;;;
+;;; Parameters:
+;;;   xs   -- the attribute list of a StartElement event
+;;;   name -- the attribute name (Clark form for a namespaced attribute)
+;;;
+;;; Returns:
+;;;   (Option String) -- borrowed from the event, like the list itself.
+;;;
+;;; Example:
+;;;   (StartElement n as) (match (attrs-get as "href") (Some h) ... (None) ...)
+;;;
+;;; Since: 0.1.0
+(defn attrs-get [xs : (Cons Attr) name : cstr] : (Option String)
+  (if (tnil? xs)
+    (None)
+    (let [a (thead xs)]
+      (if (string=? (.name a) name)
+        (Some (.value a))
+        (attrs-get (ttail xs) name)))))
+
+) ;; end defmodule dom/event

@@ -1,0 +1,212 @@
+;;; xml/dom -- parse XML into a dom-core Document.
+;;;
+;;; The tree is built in C straight off the SAX layer's event queue (the same
+;;; expat callbacks, the same coalesced text, the same limits), so a document
+;;; that `sax-parse-string` accepts is exactly the document `dom-parse-string`
+;;; builds. Read it with the dom/core node API; release it with `dom-free`.
+;;;
+;;; What the tree keeps: elements with their qualified names, namespace URIs
+;;; and attributes (namespace declarations included, as `xmlns` / `xmlns:p`
+;;; attributes, so serializing reproduces them); text, CDATA sections,
+;;; comments and processing instructions, each with its source position; and
+;;; the doctype's name and identifiers. What it drops: the XML declaration and
+;;; the internal DTD subset (entity declarations are applied, not kept).
+;;;
+;;; Since: 0.1.0
+;; DOM front door over turxml_dom_run in c/xml/turxml.c.
+
+(defmodule xml/dom
+  (export dom-parse-string dom-parse-string-opts dom-parse-file
+          dom-parse-file-opts)
+
+(import dom/ownstr :refer [from-cstr])
+(import dom/core   :refer [Document ParseError ParseErrorKind
+                           syntax-kind limit-kind refused-kind io-kind])
+(import xml/sax    :refer [ParseOpts default-parse-opts])
+
+;;; XmlDomRaw -- internal: the C parser state.
+(defopaque XmlDomRaw :ptr<void>)
+
+;;; __new-raw -- internal: allocate the C parser (NULL on OOM).
+(defn __new-raw [ns : bool depth : int nbytes : int ratio : float
+                 ext : bool] : ptr<void>
+  ```c
+  extern void *turxml_new(int, int64_t, int64_t, double, int);
+  return turxml_new(ns ? 1 : 0, depth, nbytes, ratio, ext ? 1 : 0);
+  ```)
+
+;;; __null? -- internal.
+(defn __null? [p : ptr<void>] : bool
+  ```c
+  return p == NULL;
+  ```)
+
+;;; __free -- internal.
+(defn __free [x : XmlDomRaw] : nil
+  ```c
+  extern void turxml_free(void *);
+  turxml_free((void *)(intptr_t)x);
+  ```)
+
+;;; __set-string -- internal.
+(defn __set-string [x : XmlDomRaw src : cstr] : nil
+  ```c
+  extern void turxml_set_string(void *, const char *, int64_t);
+  turxml_set_string((void *)(intptr_t)x, (const char *)src, -1);
+  ```)
+
+;;; __set-file -- internal: 0, or -1 with an Io error recorded.
+(defn __set-file [x : XmlDomRaw path : cstr] : int
+  ```c
+  extern int turxml_set_file(void *, const char *);
+  return turxml_set_file((void *)(intptr_t)x, (const char *)path);
+  ```)
+
+;;; __run -- internal: build the tree; the turdom_doc or NULL.
+(defn __run [x : XmlDomRaw] : ptr<void>
+  ```c
+  extern void *turxml_dom_run(void *);
+  return turxml_dom_run((void *)(intptr_t)x);
+  ```)
+
+;;; __err-kind -- internal.
+(defn __err-kind [x : XmlDomRaw] : int
+  ```c
+  extern int turxml_err_kind(void *);
+  return (int64_t)turxml_err_kind((void *)(intptr_t)x);
+  ```)
+
+;;; __err-msg -- internal.
+(defn __err-msg [x : XmlDomRaw] : cstr
+  ```c
+  extern const char *turxml_err_msg(void *);
+  return turxml_err_msg((void *)(intptr_t)x);
+  ```)
+
+;;; __err-line -- internal.
+(defn __err-line [x : XmlDomRaw] : int
+  ```c
+  extern int64_t turxml_err_line(void *);
+  return turxml_err_line((void *)(intptr_t)x);
+  ```)
+
+;;; __err-col -- internal.
+(defn __err-col [x : XmlDomRaw] : int
+  ```c
+  extern int64_t turxml_err_col(void *);
+  return turxml_err_col((void *)(intptr_t)x);
+  ```)
+
+;;; __kind-of -- internal: ParseErrorKind from its ordinal.
+(defn __kind-of [k : int] : ParseErrorKind
+  (if (= k 1)
+    (limit-kind)
+    (if (= k 2)
+      (refused-kind)
+      (if (= k 3) (io-kind) (syntax-kind)))))
+
+;;; __error -- internal: the recorded error (msg copied).
+(defn __error [x : XmlDomRaw] : ParseError
+  (ParseError (__kind-of (__err-kind x))
+              (from-cstr (__err-msg x))
+              (__err-line x)
+              (__err-col x)))
+
+;;; __build -- internal: run a configured parser and wrap the outcome.
+(defn __build [x : XmlDomRaw] : (Result Document ParseError)
+  (let [d (__run x)]
+    (if (__null? d)
+      (Err (__error x))
+      (Ok (:: d Document)))))
+
+;;; __make -- internal: a C parser for these options, or none on OOM.
+(defn __make [opts : ParseOpts] : (Option XmlDomRaw)
+  (let [p (__new-raw (.namespaces opts) (.max-depth opts) (.max-bytes opts)
+                     (.max-expansion-ratio opts)
+                     (.allow-external-entities opts))]
+    (if (__null? p) (None) (Some (:: p XmlDomRaw)))))
+
+;;; __oom -- internal.
+(defn __oom [] : ParseError
+  (ParseError (limit-kind) (from-cstr "out of memory") 0 0))
+
+;;; dom-parse-string-opts -- parse an in-memory document into a tree.
+;;;
+;;; Parameters:
+;;;   src  -- the document
+;;;   opts -- limits and switches (see xml/sax ParseOpts)
+;;;
+;;; Returns:
+;;;   (Result Document ParseError) -- release the Document with `dom-free`.
+;;;
+;;; Example:
+;;;   (dom-parse-string-opts src (with (default-parse-opts) [namespaces false]))
+;;;
+;;; Since: 0.1.0
+(defn dom-parse-string-opts [src : cstr opts : ParseOpts]
+  : (Result Document ParseError)
+  (match (__make opts)
+    (None)   (Err (__oom))
+    (Some x) (do (__set-string x src)
+                 (let [r (__build x)]
+                   (__free x)
+                   r))))
+
+;;; dom-parse-string -- parse an in-memory document with the safe defaults.
+;;;
+;;; Parameters:
+;;;   src -- the document
+;;;
+;;; Returns:
+;;;   (Result Document ParseError)
+;;;
+;;; Example:
+;;;   (match (dom-parse-string "<a><b>hi</b></a>")
+;;;     (Ok d)  (do (println (to-cstr (dom-serialize (dom-node d))))
+;;;                 (dom-free d))
+;;;     (Err e) (println (parse-error-message e)))
+;;;
+;;; Since: 0.1.0
+(defn dom-parse-string [src : cstr] : (Result Document ParseError)
+  (dom-parse-string-opts src (default-parse-opts)))
+
+;;; dom-parse-file-opts -- parse a file into a tree, reading 64 KiB at a time.
+;;;
+;;; Parameters:
+;;;   path -- the file
+;;;   opts -- limits and switches
+;;;
+;;; Returns:
+;;;   (Result Document ParseError) -- an Io error when the file cannot be
+;;;   opened.
+;;;
+;;; Example:
+;;;   (dom-parse-file-opts "sitemap.xml" (default-parse-opts))
+;;;
+;;; Since: 0.1.0
+(defn dom-parse-file-opts [path : cstr opts : ParseOpts]
+  : (Result Document ParseError)
+  (match (__make opts)
+    (None)   (Err (__oom))
+    (Some x) (let [r (if (< (__set-file x path) 0)
+                       (Err (__error x))
+                       (__build x))]
+               (__free x)
+               r)))
+
+;;; dom-parse-file -- parse a file into a tree with the safe defaults.
+;;;
+;;; Parameters:
+;;;   path -- the file
+;;;
+;;; Returns:
+;;;   (Result Document ParseError)
+;;;
+;;; Example:
+;;;   (dom-parse-file "feed.xml")
+;;;
+;;; Since: 0.1.0
+(defn dom-parse-file [path : cstr] : (Result Document ParseError)
+  (dom-parse-file-opts path (default-parse-opts)))
+
+) ;; end defmodule xml/dom

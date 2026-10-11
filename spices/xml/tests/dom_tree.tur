@@ -1,0 +1,309 @@
+;; dom_tree.tur -- xml/dom over the dom-core node API: navigation, queries,
+;; text, attributes, positions, serialization, the round-trip gate (parse ->
+;; serialize -> parse is structurally equal) and the dom-free leak check.
+
+(defmodule dom_tree_test (export)
+
+(import dom/ownstr :refer [String to-cstr release string=?])
+(import dom/core   :refer [Document Node NodeKind DocumentNode ElementNode
+                           TextNode CommentNode CdataNode PiNode DoctypeNode
+                           ParseError ParseErrorKind Syntax Limit Refused Io
+                           SourcePos dom-root dom-node dom-free dom-serialize
+                           dom-equal? dom-node-count dom-live-bytes
+                           node-kind node-element? node-name node-local-name
+                           node-ns-uri node-value node-text node-attr
+                           node-attr-count node-attr-name-at node-attr-value-at
+                           node-children node-child-count node-first-child
+                           node-last-child node-next-sibling node-prev-sibling
+                           node-parent node-document node-pos node-depth
+                           node-matches? find-all find-first
+                           parse-error-message])
+(import xml/sax    :refer [ParseOpts default-parse-opts])
+(import xml/dom    :refer [dom-parse-string dom-parse-string-opts dom-parse-file])
+(import test/suite  :refer [describe it])
+(import test/assert :refer [assert-true assert-eq])
+(import test/runner :refer [run-all-status])
+
+;;; __eq? -- byte equality of two cstrs, printing both when they differ.
+(defn __eq? [got : cstr want : cstr] : bool
+  ```c
+  #include <stdio.h>
+  if (got && strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got ? got : "(null)");
+  return false;
+  ```)
+
+;;; opt-is? -- is an (Option cstr) Some with exactly `want`?
+(defn opt-is? [o : (Option cstr) want : cstr] : bool
+  (match o (Some s) (__eq? s want) (None) (do (println "# got none") false)))
+
+;;; none? -- is an (Option cstr) None?
+(defn opt-none? [o : (Option cstr)] : bool
+  (match o (Some _) false (None) true))
+
+;;; text-is? -- does node-text give exactly `want`? Releases the String.
+(defn text-is? [n : Node want : cstr] : bool
+  (let [s  (node-text n)
+        ok (__eq? (to-cstr s) want)]
+    (release s)
+    ok))
+
+;;; ser-is? -- does dom-serialize give exactly `want`?
+(defn ser-is? [n : Node want : cstr] : bool
+  (let [s  (dom-serialize n)
+        ok (__eq? (to-cstr s) want)]
+    (release s)
+    ok))
+
+;;; parse! -- parse a document that must be well-formed.
+(defn parse! [src : cstr] : Document
+  (match (dom-parse-string src)
+    (Ok d)  d
+    (Err e) (do (println (parse-error-message e))
+                (:: (__null-doc) Document))))
+
+;;; __null-doc -- internal; only reached after a reported failure.
+(defn __null-doc [] : ptr<void>
+  ```c
+  return NULL;
+  ```)
+
+;;; root! -- the root element of a parsed document.
+(defn root! [d : Document] : Node
+  (match (dom-root d) (Some r) r (None) (dom-node d)))
+
+;;; __nth -- i-th element of a list.
+(defn __nth [xs : (Cons Node) i : int] : Node
+  (if (= i 0) (thead xs) (__nth (ttail xs) (- i 1))))
+
+;;; child! -- the i-th child (0-based) of a node.
+;;;
+;;; __nth is defined above this on purpose: a call to a function defined
+;;; LATER in the file whose parameter is a (Cons Node) is emitted with an
+;;; int64 cast that clang rejects (turmeric
+;;; docs/reported/forward-call-typed-list-arg-cast-to-int64.md).
+(defn child! [n : Node i : int] : Node
+  (__nth (node-children n) i))
+
+;;; kind-name -- NodeKind as text.
+(defn kind-name [k : NodeKind] : cstr
+  (match k
+    (DocumentNode) "document"
+    (ElementNode)  "element"
+    (TextNode)     "text"
+    (CommentNode)  "comment"
+    (CdataNode)    "cdata"
+    (PiNode)       "pi"
+    (DoctypeNode)  "doctype"))
+
+;;; roundtrips? -- parse, serialize, reparse; structurally equal?
+(defn roundtrips? [src : cstr] : bool
+  (let [d1 (parse! src)
+        s  (dom-serialize (dom-node d1))]
+    (match (dom-parse-string (to-cstr s))
+      (Ok d2) (let [eq (dom-equal? (dom-node d1) (dom-node d2))]
+                (when (not eq) (do (println "# reparse differs:") (println (to-cstr s))))
+                (release s)
+                (dom-free d1)
+                (dom-free d2)
+                eq)
+      (Err e) (do (println "# serialized form does not reparse:")
+                  (println (to-cstr s))
+                  (println (parse-error-message e))
+                  false))))
+
+;;; __feed-doc -- an Atom-ish document used by the navigation tests.
+(defn __feed-doc [] : cstr
+  ```c
+  return "<?xml version=\"1.0\"?>\n"
+         "<!DOCTYPE feed SYSTEM \"feed.dtd\">\n"
+         "<!-- top -->\n"
+         "<feed xmlns=\"http://www.w3.org/2005/Atom\" xmlns:m=\"urn:meta\">\n"
+         "  <title>News &amp; Notes</title>\n"
+         "  <entry m:id=\"1\" lang=\"en\"><title>One</title></entry>\n"
+         "  <entry m:id=\"2\"><title>Two</title><![CDATA[<b>]]></entry>\n"
+         "  <?render fast?>\n"
+         "</feed>\n";
+  ```)
+
+;;; churn -- parse and free n documents.
+(defn churn [n : int] : nil
+  (if (= n 0)
+    nil
+    (do (dom-free (parse! (__feed-doc))) (churn (- n 1)))))
+
+(defn __all-tests [] : void
+  (let [d    (parse! (__feed-doc))
+        top  (dom-node d)
+        feed (root! d)]
+    (describe "xml/dom -- structure and navigation"
+      (it "the document node holds the doctype, a comment and the root"
+        (and (assert-eq 3 (node-child-count top))
+             (and (__eq? (kind-name (node-kind (child! top 0))) "doctype")
+                  (and (__eq? (kind-name (node-kind (child! top 1))) "comment")
+                       (__eq? (kind-name (node-kind (child! top 2))) "element")))))
+      (it "dom-root is the document element"
+        (opt-is? (node-name feed) "feed"))
+      (it "the doctype keeps its name"
+        (opt-is? (node-name (child! top 0)) "feed"))
+      (it "elements carry their namespace URI and local name"
+        (and (opt-is? (node-ns-uri feed) "http://www.w3.org/2005/Atom")
+             (opt-is? (node-local-name feed) "feed")))
+      (it "whitespace text nodes are kept"
+        (assert-eq 9 (node-child-count feed)))
+      (it "parent, sibling and child links agree"
+        (let [title (child! feed 1)]
+          (and (opt-is? (node-name title) "title")
+               (match (node-parent title)
+                 (Some p) (dom-equal? p feed)
+                 (None) false))))
+      (it "node-first-child / node-next-sibling walk the children"
+        (match (node-first-child feed)
+          (Some ws) (match (node-next-sibling ws)
+                      (Some t) (opt-is? (node-name t) "title")
+                      (None) false)
+          (None) false))
+      (it "node-last-child and node-prev-sibling walk back"
+        (match (node-last-child feed)
+          (Some ws) (match (node-prev-sibling ws)
+                      (Some pi) (and (__eq? (kind-name (node-kind pi)) "pi")
+                                     (and (opt-is? (node-name pi) "render")
+                                          (opt-is? (node-value pi) "fast")))
+                      (None) false)
+          (None) false))
+      (it "the document node has no parent"
+        (match (node-parent top) (Some _) false (None) true))
+      (it "node-document leads back to the document"
+        (dom-equal? (dom-node (node-document feed)) top))
+      (it "node-depth counts ancestors"
+        (and (assert-eq 0 (node-depth top))
+             (and (assert-eq 1 (node-depth feed))
+                  (assert-eq 2 (node-depth (child! feed 1))))))
+      (it "dom-node-count counts every node"
+        (assert-eq 18 (dom-node-count d))))
+
+    (describe "xml/dom -- text, values and attributes"
+      (it "node-text concatenates descendant text and CDATA"
+        (text-is? (child! feed 5) "Two<b>"))
+      (it "node-text of the root is all of its text"
+        (text-is? (child! feed 1) "News & Notes"))
+      (it "node-value is a single node's own data"
+        (opt-is? (node-value (child! (child! feed 1) 0)) "News & Notes"))
+      (it "node-value is none for an element"
+        (opt-none? (node-value feed)))
+      (it "node-name is none for text"
+        (opt-none? (node-name (child! (child! feed 1) 0))))
+      (it "a CDATA section is its own node"
+        (__eq? (kind-name (node-kind (child! (child! feed 5) 1))) "cdata"))
+      (it "node-attr matches the qualified name as written"
+        (opt-is? (node-attr (child! feed 3) "m:id") "1"))
+      (it "node-attr matches the Clark form"
+        (opt-is? (node-attr (child! feed 3) "{urn:meta}id") "1"))
+      (it "namespace declarations are attributes"
+        (opt-is? (node-attr feed "xmlns:m") "urn:meta"))
+      (it "an absent attribute is none"
+        (opt-none? (node-attr (child! feed 5) "lang")))
+      (it "attributes are indexed in document order"
+        (let [e (child! feed 3)]
+          (and (assert-eq 2 (node-attr-count e))
+               (and (opt-is? (node-attr-name-at e 1) "lang")
+                    (and (opt-is? (node-attr-value-at e 1) "en")
+                         (opt-none? (node-attr-name-at e 2)))))))
+      (it "node-pos is the 1-based start of the node"
+        (match (node-pos (child! feed 3))
+          (Some p) (and (assert-eq 6 (.line p)) (assert-eq 3 (.col p)))
+          (None) false)))
+
+    (describe "xml/dom -- queries"
+      (it "find-all by local-name-as-written, in document order"
+        (let [ts (find-all top "title")]
+          (and (assert-eq 3 (tlength ts))
+               (text-is? (thead (ttail ts)) "One"))))
+      (it "find-all by Clark name"
+        (assert-eq 2 (tlength (find-all top "{http://www.w3.org/2005/Atom}entry"))))
+      (it "find-all * returns every element"
+        (assert-eq 6 (tlength (find-all top "*"))))
+      (it "find-all searches below the node, not the node itself"
+        (assert-eq 0 (tlength (find-all (child! feed 1) "title"))))
+      (it "find-first returns the first in document order"
+        (match (find-first top "entry")
+          (Some e) (opt-is? (node-attr e "m:id") "1")
+          (None) false))
+      (it "find-first is none when nothing matches"
+        (match (find-first top "nope") (Some _) false (None) true))
+      (it "node-matches? tests one node"
+        (and (node-matches? feed "feed")
+             (and (node-matches? feed "*")
+                  (not (node-matches? (child! feed 0) "*"))))))
+
+    (dom-free d))
+
+  (describe "xml/dom -- serialization"
+    (it "serializes empty elements as <x/> and keeps prefixes and xmlns"
+      (let [d (parse! "<p:a xmlns:p=\"urn:p\" x=\"1\"><p:b/><c>t</c></p:a>")]
+        (let [ok (ser-is? (dom-node d) "<p:a xmlns:p=\"urn:p\" x=\"1\"><p:b/><c>t</c></p:a>")]
+          (dom-free d)
+          ok)))
+    (it "escapes text and attribute values"
+      (let [d (parse! "<a v=\"&lt;&amp;&quot;&#9;&#10;\">&lt;&amp;&gt;</a>")]
+        (let [ok (ser-is? (dom-node d) "<a v=\"&lt;&amp;&quot;&#9;&#10;\">&lt;&amp;&gt;</a>")]
+          (dom-free d)
+          ok)))
+    (it "keeps adjacent CDATA sections that spell ]]> between them"
+      (let [d (parse! "<a><![CDATA[x]]]]><![CDATA[>y]]></a>")]
+        (let [ok (ser-is? (dom-node d) "<a><![CDATA[x]]]]><![CDATA[>y]]></a>")]
+          (dom-free d)
+          ok)))
+    (it "serializes the doctype, comments and PIs at the top level"
+      (let [d (parse! "<!DOCTYPE a PUBLIC \"p\" \"s\"><!--c--><a/><?pi x?>")]
+        (let [ok (ser-is? (dom-node d) "<!DOCTYPE a PUBLIC \"p\" \"s\"><!--c--><a/><?pi x?>")]
+          (dom-free d)
+          ok))))
+
+  (describe "xml/dom -- round trip (parse -> serialize -> parse)"
+    (it "the feed document" (roundtrips? (__feed-doc)))
+    (it "entities, character references and CRLF"
+      (roundtrips? "<!DOCTYPE a [<!ENTITY e \"x&#38;#38;y\">]><a t=\"&e;\">&e;&#x10437;&#13;\n</a>"))
+    (it "nested namespaces and a redefined default"
+      (roundtrips? "<a xmlns=\"urn:1\"><b xmlns=\"urn:2\"><c/></b><p:d xmlns:p=\"urn:3\" p:x=\"1\"/></a>"))
+    (it "CDATA with ]]> and an empty CDATA"
+      (roundtrips? "<a><![CDATA[1]]]]><![CDATA[>2]]><![CDATA[]]></a>"))
+    (it "dom-equal? notices a difference"
+      (let [a (parse! "<a x=\"1\"/>")
+            b (parse! "<a x=\"2\"/>")]
+        (let [eq (dom-equal? (dom-node a) (dom-node b))]
+          (dom-free a)
+          (dom-free b)
+          (not eq)))))
+
+  (describe "xml/dom -- errors and limits"
+    (it "a malformed document is an Err"
+      (match (dom-parse-string "<a><b></a>")
+        (Ok d) (do (dom-free d) false)
+        (Err e) (__eq? (parse-error-message e) "mismatched tag")))
+    (it "the depth cap applies to the tree build"
+      (match (dom-parse-string-opts "<a><b><c/></b></a>" (with (default-parse-opts) [max-depth 2]))
+        (Ok d) (do (dom-free d) false)
+        (Err e) (match (.kind e) (Limit) true _ false)))
+    (it "a missing file is an Io error"
+      (match (dom-parse-file "/nonexistent/tur-xml/x.xml")
+        (Ok d) (do (dom-free d) false)
+        (Err e) (match (.kind e) (Io) true _ false))))
+
+  (describe "xml/dom -- dom-free releases everything (leak check)"
+    (it "parsing and freeing 200 documents returns the arena to its baseline"
+      (let [before (dom-live-bytes)]
+        (churn 200)
+        (assert-eq before (dom-live-bytes))))
+    (it "a live document is visible in dom-live-bytes"
+      (let [before (dom-live-bytes)
+            d      (parse! "<a/>")
+            during (dom-live-bytes)]
+        (dom-free d)
+        (and (> during before) (= before (dom-live-bytes)))))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule dom_tree_test

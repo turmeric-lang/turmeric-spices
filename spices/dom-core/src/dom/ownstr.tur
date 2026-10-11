@@ -1,0 +1,186 @@
+;;; dom/ownstr -- owned String surface shared by tur-xml and tur-html.
+;;;
+;;; The owned counterpart of a borrowed `cstr`: a `String` OWNS its bytes (a
+;;; refcounted, immutable heap payload). SAX events carry their names and text
+;;; as `String`s copied out of the parser's buffer, and `node-text` returns one,
+;;; so the copy-at-the-boundary rule shows up in the type instead of in a
+;;; "valid until the callback returns" comment.
+;;;
+;;; Self-contained, ABI-identical mirror of stdlib `String`, the same shape as
+;;; json/ownstr and regex/ownstr: it declares `(defopaque String :ptr<void>)`
+;;; and thin wrappers over the `tur_string_*` runtime, and carries the
+;;; `tur_string.c` autolink marker so the runtime links. When the spices move
+;;; onto stdlib `String` this module collapses into it.
+;;;
+;;; Since: 0.1.0
+
+(defmodule dom/ownstr
+  (export String from-cstr adopt-cstr to-cstr retain release str-len
+          string=? ownstr-autolink)
+
+;;; String -- an owned, refcounted, immutable string (ABI: ptr<void>).
+(defopaque String :ptr<void> :non-null)
+
+;;; ownstr-autolink -- internal: pull src/runtime/tur_string.c into the link.
+(defn ownstr-autolink [] : int
+  ```c
+  /* __tur_autolink__: src/runtime/tur_string.c -Isrc/runtime */
+  return 0;
+  ```)
+
+;;; __from-cstr-raw -- internal: copy a cstr into a fresh String, as a carrier.
+;;; Returns the bare carrier so the opaque's C lowering never meets the cast
+;;; (see json/ownstr's note on -Wint-conversion under clang).
+(defn __from-cstr-raw [s : cstr] : int
+  ```c
+  extern void *tur_string_from_cstr(const char *);
+  return (int64_t)(intptr_t)tur_string_from_cstr((const char *)(s ? s : ""));
+  ```)
+
+;;; from-cstr -- copy a borrowed cstr into a new owned String.
+;;;
+;;; Parameters:
+;;;   s -- any NUL-terminated cstr (borrowed; not freed)
+;;;
+;;; Returns:
+;;;   String -- a fresh String with refcount 1; release it when done.
+;;;
+;;; Example:
+;;;   (let [s (from-cstr "item")]
+;;;     (println (to-cstr s))   ; prints item
+;;;     (release s))
+;;;
+;;; Since: 0.1.0
+(defn from-cstr [s : cstr] : String
+  (:: (__from-cstr-raw s) String))
+
+;;; __adopt-cstr-raw -- internal: adopt a heap cstr, as a carrier.
+(defn __adopt-cstr-raw [s : cstr] : int
+  ```c
+  extern void *tur_string_adopt_cstr(const char *);
+  return (int64_t)(intptr_t)tur_string_adopt_cstr((const char *)s);
+  ```)
+
+;;; adopt-cstr -- take ownership of a freshly heap-allocated cstr as a String.
+;;;
+;;; Copies the bytes of `s` into a fresh owned String and FREES `s`. `s` must
+;;; be a heap buffer the caller owns; never pass a literal or a borrowed cstr.
+;;;
+;;; Parameters:
+;;;   s -- a malloc'd NUL-terminated cstr; consumed (freed)
+;;;
+;;; Returns:
+;;;   String -- a new owned String holding a copy of s's bytes.
+;;;
+;;; Example:
+;;;   (adopt-cstr (some-fn-returning-malloc-cstr))
+;;;
+;;; Since: 0.1.0
+(defn adopt-cstr [s : cstr] : String
+  (:: (__adopt-cstr-raw s) String))
+
+;;; to-cstr -- borrow the String's NUL-terminated bytes (O(1), no copy).
+;;;
+;;; Valid only while the String is retained; do not use after release.
+;;;
+;;; Parameters:
+;;;   s -- the String to borrow from
+;;;
+;;; Returns:
+;;;   cstr -- a borrowed view of the same bytes.
+;;;
+;;; Example:
+;;;   (println (to-cstr s))
+;;;
+;;; Since: 0.1.0
+(defn to-cstr [s : String] : cstr
+  ```c
+  extern const char *tur_string_cstr(void *);
+  return (const char *)tur_string_cstr((void *)(intptr_t)s);
+  ```)
+
+;;; __retain-raw -- internal: bump the refcount.
+(defn __retain-raw [s : String] : int
+  ```c
+  extern void *tur_string_retain(void *);
+  return (int64_t)(intptr_t)tur_string_retain((void *)(intptr_t)s);
+  ```)
+
+;;; retain -- take an extra reference to a String and return it.
+;;;
+;;; A SAX handler borrows the Strings in the event it is given; they are
+;;; released when the handler returns. `retain` is how a handler keeps one:
+;;; the String then lives until the matching `release`.
+;;;
+;;; Parameters:
+;;;   s -- the String to keep
+;;;
+;;; Returns:
+;;;   String -- the same String, now owned once more by the caller.
+;;;
+;;; Example:
+;;;   (StartElement name _) (do (set! last (retain name)) (Continue))
+;;;
+;;; Since: 0.1.0
+(defn retain [s : String] : String
+  (:: (__retain-raw s) String))
+
+;;; release -- drop one reference; the payload is freed at zero.
+;;;
+;;; Parameters:
+;;;   s -- the String whose owning reference is being dropped
+;;;
+;;; Example:
+;;;   (release (node-text n))
+;;;
+;;; Since: 0.1.0
+(defn release [s : String] : void
+  ```c
+  extern void tur_string_release(void *);
+  tur_string_release((void *)(intptr_t)s);
+  ```)
+
+;;; str-len -- byte length of the String (not counting the NUL).
+;;;
+;;; Parameters:
+;;;   s -- the String to measure
+;;;
+;;; Returns:
+;;;   int -- the byte length.
+;;;
+;;; Example:
+;;;   (str-len (from-cstr "abc"))   ; => 3
+;;;
+;;; Since: 0.1.0
+(defn str-len [s : String] : int
+  ```c
+  extern int64_t tur_string_len(void *);
+  return tur_string_len((void *)(intptr_t)s);
+  ```)
+
+;;; string=? -- does the String hold exactly the bytes of `c`?
+;;;
+;;; Parameters:
+;;;   s -- the String
+;;;   c -- a cstr to compare against
+;;;
+;;; Returns:
+;;;   bool -- true when the bytes are identical.
+;;;
+;;; Example:
+;;;   (string=? name "item")   ; => true for <item>
+;;;
+;;; Since: 0.1.0
+(defn string=? [s : String c : cstr] : bool
+  ```c
+  #include <string.h>
+  extern const char *tur_string_cstr(void *);
+  extern int64_t tur_string_len(void *);
+  const char *a = tur_string_cstr((void *)(intptr_t)s);
+  if (!a || !c) return false;
+  size_t n = strlen((const char *)c);
+  return (size_t)tur_string_len((void *)(intptr_t)s) == n &&
+         memcmp(a, (const char *)c, n) == 0;
+  ```)
+
+) ;; end defmodule dom/ownstr

@@ -1,0 +1,257 @@
+;; sax_tokens.tur -- html/sax: the tokenizer-level event stream, raw-text
+;; switching, references, early stop, and push-parser chunk invariance.
+
+(defmodule sax_tokens_test (export)
+
+(import dom/ownstr :refer [String to-cstr])
+(import dom/core   :refer [ParseError parse-error-message Limit])
+(import dom/event  :refer [SaxEvent SaxControl Attr StartElement EndElement
+                           Chars Comment Pi StartCdata EndCdata Doctype
+                           Continue Stop])
+(import html/dom   :refer [HtmlOpts default-html-opts])
+(import html/sax   :refer [HtmlSaxParser html-sax-parse-string
+                           html-sax-parse-string-opts html-sax-parser-new
+                           html-sax-feed! html-sax-finish! html-sax-parser-free])
+(import test/suite  :refer [describe it])
+(import test/assert :refer [assert-true assert-eq])
+(import test/runner :refer [run-all-status])
+
+;; ---- traces 0 (reference) and 1 (under test) ------------------------------
+
+;;; __t-reset -- clear trace `which` and make it current.
+(defn __t-reset [which : int] : nil
+  ```c
+  /* __tur_include__: #include <stddef.h> */
+  /* __tur_include__: #include <stdint.h> */
+  /* __tur_include__: static char *g_tr[2] = {0, 0}; */
+  /* __tur_include__: static size_t g_tr_len[2] = {0, 0}, g_tr_cap[2] = {0, 0}; */
+  /* __tur_include__: static int g_tr_cur = 0; */
+  g_tr_len[which] = 0;
+  if (g_tr[which]) g_tr[which][0] = '\0';
+  g_tr_cur = (int)which;
+  ```)
+
+;;; __t-put -- append to the current trace.
+(defn __t-put [s : cstr] : nil
+  ```c
+  int w = g_tr_cur;
+  size_t n = strlen((const char *)s);
+  if (g_tr_len[w] + n + 1 > g_tr_cap[w]) {
+    size_t cap = g_tr_cap[w] ? g_tr_cap[w] : 256;
+    while (cap < g_tr_len[w] + n + 1) cap *= 2;
+    g_tr[w] = (char *)realloc(g_tr[w], cap);
+    g_tr_cap[w] = cap;
+  }
+  memcpy(g_tr[w] + g_tr_len[w], s, n);
+  g_tr_len[w] += n;
+  g_tr[w][g_tr_len[w]] = '\0';
+  ```)
+
+;;; __t-is? -- is the current trace exactly `want`?
+(defn __t-is? [want : cstr] : bool
+  ```c
+  #include <stdio.h>
+  const char *got = g_tr[g_tr_cur] ? g_tr[g_tr_cur] : "";
+  if (strcmp(got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+
+;;; __t-same? -- are both traces identical and non-empty?
+(defn __t-same? [] : bool
+  ```c
+  #include <stdio.h>
+  const char *a = g_tr[0] ? g_tr[0] : "", *b = g_tr[1] ? g_tr[1] : "";
+  if (a[0] && strcmp(a, b) == 0) return true;
+  fprintf(stderr, "# one-shot: [%s]\n# pushed:   [%s]\n", a, b);
+  return false;
+  ```)
+
+;;; __trace-attrs -- record attributes.
+(defn __trace-attrs [xs : (Cons Attr)] : nil
+  (if (tnil? xs)
+    nil
+    (do (__t-put " ") (__t-put (to-cstr (.name (thead xs))))
+        (__t-put "=") (__t-put (to-cstr (.value (thead xs))))
+        (__trace-attrs (ttail xs)))))
+
+;;; trace -- record one event and continue.
+(defn trace [e : SaxEvent] : SaxControl
+  (do
+    (match e
+      (StartElement n as) (do (__t-put "S ") (__t-put (to-cstr n))
+                              (__trace-attrs as) (__t-put "|"))
+      (EndElement n)      (do (__t-put "E ") (__t-put (to-cstr n)) (__t-put "|"))
+      (Chars t)           (do (__t-put "T ") (__t-put (to-cstr t)) (__t-put "|"))
+      (Comment t)         (do (__t-put "C ") (__t-put (to-cstr t)) (__t-put "|"))
+      (Pi t d)            (__t-put "P|")
+      (StartCdata)        (__t-put "[|")
+      (EndCdata)          (__t-put "]|")
+      (Doctype n p s)     (do (__t-put "D ") (__t-put (to-cstr n)) (__t-put " [")
+                              (__t-put (to-cstr p)) (__t-put "] [")
+                              (__t-put (to-cstr s)) (__t-put "]|")))
+    (Continue)))
+
+;;; tokens? -- tokenize src into trace 0 and compare.
+(defn tokens? [src : cstr want : cstr] : bool
+  (do (__t-reset 0)
+      (match (html-sax-parse-string src trace)
+        (Ok _)  (__t-is? want)
+        (Err e) (do (println (parse-error-message e)) false))))
+
+;; ---- push helpers ---------------------------------------------------------
+
+;;; __len -- byte length.
+(defn __len [s : cstr] : int
+  ```c
+  return (int64_t)strlen((const char *)s);
+  ```)
+
+;;; __slice -- malloc'd copy of s[off, off+n).
+(defn __slice [s : cstr off : int n : int] : cstr
+  ```c
+  char *p = (char *)malloc((size_t)n + 1);
+  memcpy(p, (const char *)s + off, (size_t)n);
+  p[n] = '\0';
+  return p;
+  ```)
+
+;;; __free-cstr -- free a malloc'd cstr.
+(defn __free-cstr [s : cstr] : nil
+  ```c
+  free((void *)s);
+  ```)
+
+;;; __rand-seed -- seed a xorshift generator.
+(defn __rand-seed [seed : int] : nil
+  ```c
+  /* __tur_include__: static uint64_t g_rng = 1; */
+  g_rng = (uint64_t)seed * 2654435761ULL + 1;
+  ```)
+
+;;; __rand-chunk -- a chunk size in [1, max].
+(defn __rand-chunk [max : int] : int
+  ```c
+  g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
+  return (int64_t)(g_rng % (uint64_t)max) + 1;
+  ```)
+
+;;; feed-all -- push src in chunks (step > 0: fixed; 0: random 1..17); true
+;;; when every feed was ok.
+;;;
+;;; Its own defn, and the feed's result bound and matched: a while loop whose
+;;; body discards a CPS call's result (statement position), or that sits in
+;;; a match arm, loses its loop variables in the CPS translation (undeclared
+;;; identifiers in the emitted C).
+(defn feed-all [p : HtmlSaxParser src : cstr step : int] : bool
+  (let [len      (__len src)
+        ^mut off 0
+        ^mut ok  true]
+    (while (< off len)
+      (let [want  (if (> step 0) step (__rand-chunk 17))
+            n     (if (> (+ off want) len) (- len off) want)
+            chunk (__slice src off n)
+            r     (html-sax-feed! p chunk)]
+        (__free-cstr chunk)
+        (match r (Ok _) nil (Err _) (set! ok false))
+        (set! off (+ off n))))
+    ok))
+
+;;; push? -- push src into trace 1 and compare with the one-shot trace 0.
+(defn push? [src : cstr step : int seed : int] : bool
+  (do (__t-reset 0)
+      (html-sax-parse-string src trace)
+      (__t-reset 1)
+      (__rand-seed seed)
+      (match (html-sax-parser-new trace)
+        (Err _) false
+        (Ok p)  (let [fed (feed-all p src step)
+                      fin (html-sax-finish! p)]
+                  (html-sax-parser-free p)
+                  (and fed (and (match fin (Ok _) true (Err _) false)
+                                (__t-same?)))))))
+
+;;; __doc -- a document exercising every tokenizer state (built in C so the
+;;; test source stays ASCII).
+(defn __doc [] : cstr
+  ```c
+  return "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\">\n"
+         "<html lang=en><head><title>Caf\xC3\xA9 &amp; <b>bar</b></title>\n"
+         "<style>p > a { color: red }</style>\n"
+         "<script>if (a < b && c) { document.write(\"</p>\") }</script></head>\n"
+         "<body class=\"x y\" data-v='1' checked>\n"
+         "<!-- a comment that is long enough to be split -->\n"
+         "<p>text &lt;&#x263A;&nbsp;&notin; more<br/>"
+         "<img src=a.png alt=\"\xF0\x9F\x8C\xB6\"><textarea>&lt;raw&gt; <i></textarea>\n"
+         "<plaintext><everything>is text now</everything>";
+  ```)
+
+(defn __all-tests [] : void
+  (describe "html/sax -- the token stream"
+    (it "tags as written, no implied tags"
+      (tokens? "<p>a<p>b" "S p|T a|S p|T b|"))
+    (it "end tags are reported as they appear, mismatched or not"
+      (tokens? "<b><i></b></i>" "S b|S i|E b|E i|"))
+    (it "a void element has no EndElement; a self-closed tag has one"
+      (tokens? "<br><br/>" "S br|S br|E br|"))
+    (it "names are lower-cased, values decoded, attributes in order"
+      (tokens? "<A HREF=\"x&amp;y\" Title=t>" "S a href=x&y title=t|"))
+    (it "comments and the doctype"
+      (tokens? "<!DOCTYPE html><!--c-->" "D html [] []|C c|"))
+    (it "doctype public and system identifiers"
+      (tokens? "<!DOCTYPE html PUBLIC \"p\" \"s\">" "D html [p] [s]|"))
+    (it "<script> content is text"
+      (tokens? "<script>a<b>c</p></script>" "S script|T a<b>c</p>|E script|"))
+    (it "<style> content is text"
+      (tokens? "<style>p > a {}</style>" "S style|T p > a {}|E style|"))
+    (it "<title> content is text with references decoded"
+      (tokens? "<title>&lt;<b></title>" "S title|T <<b>|E title|"))
+    (it "<textarea> content is text"
+      (tokens? "<textarea><i>x</i></textarea>" "S textarea|T <i>x</i>|E textarea|"))
+    (it "<plaintext> runs to the end"
+      (tokens? "<plaintext><a></plaintext>" "S plaintext|T <a></plaintext>|"))
+    (it "adjacent text across references is one Chars"
+      (tokens? "<p>a &amp; b &lt; c</p>" "S p|T a & b < c|E p|"))
+    (it "stops at the handler's Stop and still returns ok"
+      (do (__t-reset 0)
+          (match (html-sax-parse-string "<a><b><c>"
+                   (fn [e : SaxEvent] : SaxControl
+                     (match e
+                       (StartElement n _) (do (__t-put (to-cstr n))
+                                              (if (string-is-b? (to-cstr n)) (Stop) (Continue)))
+                       _ (Continue))))
+            (Ok _)  (__t-is? "ab")
+            (Err _) false)))
+    (it "input past max-bytes is a Limit error"
+      (match (html-sax-parse-string-opts "<p>0123456789" (with (default-html-opts) [max-bytes 5]) trace)
+        (Ok _) false
+        (Err e) (match (.kind e) (Limit) true _ false))))
+
+  (describe "html/sax -- push tokenizer"
+    (it "one byte at a time gives the one-shot events" (push? (__doc) 1 0))
+    (it "three bytes at a time gives the one-shot events" (push? (__doc) 3 0))
+    (it "chunk boundaries inside lookaheads lexbor gets wrong change nothing"
+      ;; lexbor 3.0.1 repeats characters ("[CDATAA[") or misreads a DOCTYPE
+      ;; keyword when the lookahead straddles chunks; turhtml.c holds back
+      ;; the first unclosed '<' tail instead (see hold_back).
+      (let [src "a<![CDATA[x]]>b<![cdata[y]]>c<![CDA<td>d<!DOCTYPE x PUBLIC\"s\"><!DOCTYPE y SYSTEM'q'>e<![CD"]
+        (and (push? src 1 0) (and (push? src 2 0) (and (push? src 3 0) (push? src 5 0))))))
+    (it "random chunk sizes (20 seeds) give the one-shot events"
+      (let [^mut seed 1
+            ^mut ok   true]
+        (while (<= seed 20)
+          (if (push? (__doc) 0 seed) nil (set! ok false))
+          (set! seed (+ seed 1)))
+        ok))))
+
+;;; string-is-b? -- is s exactly "b"?
+(defn string-is-b? [s : cstr] : bool
+  ```c
+  return strcmp((const char *)s, "b") == 0;
+  ```)
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule sax_tokens_test

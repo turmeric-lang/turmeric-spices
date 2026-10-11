@@ -1,0 +1,967 @@
+;;; dom/core -- the shared Document / Node vocabulary for tur-xml and tur-html.
+;;;
+;;; A `Document` owns an arena-allocated tree (c/dom/turdom.c); every `Node`
+;;; is a borrowed handle into it, valid until `dom-free`. The same node API
+;;; reads a tree that tur-xml built from expat events and one that tur-html
+;;; copied out of lexbor, so a query helper or a serializer written against
+;;; this module works for both.
+;;;
+;;; Strings come back two ways, and the type says which:
+;;;   - `cstr` from `node-name`, `node-value`, `node-attr`, ... is BORROWED
+;;;     from the document: no allocation, valid until `dom-free`.
+;;;   - `String` from `node-text` and `dom-serialize` is OWNED: freshly
+;;;     allocated (text has to be concatenated across descendants), released
+;;;     by the caller with `release`.
+;;;
+;;; Every walk in the C layer is iterative, so no reader here can exhaust the
+;;; C stack on a deep tree. The trees are read-only; a mutable DOM is a
+;;; separate design (see the plan's non-goals).
+;;;
+;;; Since: 0.1.0
+;; Node API over the vendored tree in c/dom/turdom.c.
+
+(defmodule dom/core
+  (export Document Node NodeKind SourcePos ParseError ParseErrorKind
+          dom-live-bytes
+          DocumentNode ElementNode TextNode CommentNode CdataNode PiNode
+          DoctypeNode Syntax Limit Refused Io
+          syntax-kind limit-kind refused-kind io-kind
+          dom-root dom-node dom-free dom-serialize dom-equal? dom-node-count
+          node-kind node-element? node-name node-local-name node-ns-uri
+          node-value node-text node-attr node-attr-count node-attr-name-at
+          node-attr-value-at node-children node-child-count node-first-child
+          node-last-child node-next-sibling node-prev-sibling node-parent
+          node-document node-pos node-depth node-matches? find-all find-first
+          parse-error-message parse-error-release parse-error-pos)
+
+(import dom/ownstr :refer [String to-cstr adopt-cstr release])
+
+;;; Document -- an owned parsed tree. Owns every Node and every borrowed cstr
+;;; handed out from it; release with `dom-free`.
+(defopaque Document :ptr<void>)
+
+;;; Node -- a borrowed handle to one node of a Document. Dangles once its
+;;; Document is freed.
+(defopaque Node :ptr<void>)
+
+;;; NodeKind -- what a Node is. `DocumentNode` is the invisible root that
+;;; holds the doctype, top-level comments and PIs, and the root element.
+(defdata NodeKind :copy
+  (DocumentNode)
+  (ElementNode)
+  (TextNode)
+  (CommentNode)
+  (CdataNode)
+  (PiNode)
+  (DoctypeNode))
+
+;;; SourcePos -- a 1-based line and byte column in the parser's input.
+(defstruct SourcePos :copy [line : int col : int])
+
+;;; ParseErrorKind -- the class of a parse failure.
+;;;   Syntax   -- the input is not well-formed (XML) / not parseable
+;;;   Limit    -- a ParseOpts cap fired (depth, bytes, entity amplification)
+;;;   Refused  -- the input asked for something the options forbid
+;;;               (an external entity with external entities off)
+;;;   Io       -- the file could not be opened or read
+;;;
+;;; A :heap node rather than a by-value sum: ParseError also holds a String
+;;; (a :ptr<void> opaque), and a struct with an opaque field beside a
+;;; by-value aggregate field miscompiles field access today (turmeric
+;;; docs/reported/struct-field-with-opaque-sibling-lowered-to-int.md).
+(defdata ParseErrorKind :heap :copy (Syntax) (Limit) (Refused) (Io))
+
+;; One node per ParseErrorKind, allocated once (see syntax-kind).
+(def __syntax-node (Syntax))
+(def __limit-node (Limit))
+(def __refused-node (Refused))
+(def __io-node (Io))
+
+;;; syntax-kind -- the shared Syntax node.
+;;;
+;;; Every call to a :heap constructor allocates a node that nothing frees, so
+;;; `(Syntax)` once per failed parse is a leak. syntax-kind, limit-kind,
+;;; refused-kind and io-kind each return one node allocated at startup, and
+;;; every ParseError the parsers build points at one of them. Matching is
+;;; unchanged: `(match (.kind e) (Syntax) ...)` reads the tag.
+;;;
+;;; They are functions rather than exported defs because a top-level def of
+;;; a :heap value is emitted as an int64_t global that is read into a typed
+;;; slot without a cast, which clang rejects (turmeric
+;;; docs/reported/heap-adt-def-global-read-missing-cast.md).
+;;;
+;;; Returns:
+;;;   ParseErrorKind -- the shared Syntax node.
+;;;
+;;; Example:
+;;;   (ParseError (syntax-kind) (from-cstr "mismatched tag") 3 7)
+;;;
+;;; Since: 0.1.0
+(defn syntax-kind [] : ParseErrorKind __syntax-node)
+;;; limit-kind -- the shared Limit node (see syntax-kind).
+(defn limit-kind [] : ParseErrorKind __limit-node)
+;;; refused-kind -- the shared Refused node (see syntax-kind).
+(defn refused-kind [] : ParseErrorKind __refused-node)
+;;; io-kind -- the shared Io node (see syntax-kind).
+(defn io-kind [] : ParseErrorKind __io-node)
+
+;;; ParseError -- why a parse failed and where.
+;;;
+;;; `msg` is owned; `parse-error-release` drops it once the error has been
+;;; reported. `line`/`col` are 1-based (0 when there is no position, as for
+;;; a file that could not be opened); `parse-error-pos` packs them into a
+;;; SourcePos. They are flat fields rather than a nested SourcePos because a
+;;; struct holding both a :ptr<void> opaque and a struct field does not
+;;; compile today (turmeric docs/reported/struct-field-with-opaque-sibling-
+;;; lowered-to-int.md).
+(defstruct ParseError :copy [kind : ParseErrorKind msg : String
+                             line : int col : int])
+
+;;; parse-error-pos -- where a ParseError happened.
+;;;
+;;; Parameters:
+;;;   e -- the error
+;;;
+;;; Returns:
+;;;   SourcePos -- 1-based line and byte column; (SourcePos 0 0) when the
+;;;   error has no position (an Io error).
+;;;
+;;; Example:
+;;;   (.line (parse-error-pos e))   ; => 3
+;;;
+;;; Since: 0.1.0
+(defn parse-error-pos [e : ParseError] : SourcePos
+  (SourcePos (.line e) (.col e)))
+
+;;; parse-error-message -- borrow the message of a ParseError.
+;;;
+;;; Parameters:
+;;;   e -- the error
+;;;
+;;; Returns:
+;;;   cstr -- valid until `parse-error-release`.
+;;;
+;;; Example:
+;;;   (println (parse-error-message e))   ; e.g. "mismatched tag"
+;;;
+;;; Since: 0.1.0
+(defn parse-error-message [e : ParseError] : cstr
+  (to-cstr (.msg e)))
+
+;;; parse-error-release -- release the String a ParseError owns.
+;;;
+;;; Parameters:
+;;;   e -- the error, not used afterwards
+;;;
+;;; Example:
+;;;   (parse-error-release e)
+;;;
+;;; Since: 0.1.0
+(defn parse-error-release [e : ParseError] : nil
+  (release (.msg e)))
+
+;; ---------------------------------------------------------------------------
+;; Raw pointer helpers. Inline C returns bare pointers; the opaque is applied
+;; on the Turmeric side, which keeps the C body correct whichever way the
+;; compiler lowers a :ptr<void> opaque (see msgpack/buf.tur).
+;; ---------------------------------------------------------------------------
+
+;;; __null? -- internal: is this a null pointer?
+(defn __null? [p : ptr<void>] : bool
+  ```c
+  return p == NULL;
+  ```)
+
+;;; __null-ptr -- internal: the null pointer.
+(defn __null-ptr [] : ptr<void>
+  ```c
+  return NULL;
+  ```)
+
+;;; __null-cstr? -- internal: is this a null cstr?
+(defn __null-cstr? [p : cstr] : bool
+  ```c
+  return p == NULL;
+  ```)
+
+;;; __opt-node -- internal: a nullable node pointer as an (Option Node).
+(defn __opt-node [p : ptr<void>] : (Option Node)
+  (if (__null? p) (None) (Some (:: p Node))))
+
+;;; __opt-cstr -- internal: a nullable borrowed cstr as an (Option cstr).
+(defn __opt-cstr [p : cstr] : (Option cstr)
+  (if (__null-cstr? p) (None) (Some p)))
+
+;; ---------------------------------------------------------------------------
+;; Document
+;; ---------------------------------------------------------------------------
+
+;;; __doc-node-raw -- internal: the document's invisible root node.
+(defn __doc-node-raw [d : Document] : ptr<void>
+  ```c
+  extern void *turdom_doc_node(void *);
+  return turdom_doc_node((void *)(intptr_t)d);
+  ```)
+
+;;; __root-raw -- internal: the root element, or NULL.
+(defn __root-raw [d : Document] : ptr<void>
+  ```c
+  extern void *turdom_root_element(void *);
+  return turdom_root_element((void *)(intptr_t)d);
+  ```)
+
+;;; dom-root -- the document element (the outermost element).
+;;;
+;;; Parameters:
+;;;   d -- the document
+;;;
+;;; Returns:
+;;;   (Option Node) -- none only for a document with no element at all (an
+;;;   empty HTML fragment, say).
+;;;
+;;; Example:
+;;;   (match (dom-root d)
+;;;     (Some r) (node-name r)   ; => (Some "feed")
+;;;     (None)   (None))
+;;;
+;;; Since: 0.1.0
+(defn dom-root [d : Document] : (Option Node)
+  (__opt-node (__root-raw d)))
+
+;;; dom-node -- the document node itself (kind DocumentNode).
+;;;
+;;; Its children are everything at the top level: the doctype, comments and
+;;; processing instructions outside the root element, and the root element.
+;;;
+;;; Parameters:
+;;;   d -- the document
+;;;
+;;; Returns:
+;;;   Node -- the invisible root.
+;;;
+;;; Example:
+;;;   (node-children (dom-node d))   ; => doctype, comments, root element
+;;;
+;;; Since: 0.1.0
+(defn dom-node [d : Document] : Node
+  (:: (__doc-node-raw d) Node))
+
+;;; dom-free -- release a document and everything it owns.
+;;;
+;;; Every Node taken from `d`, and every borrowed cstr read from one, dangles
+;;; afterwards. Owned Strings (`node-text`, `dom-serialize`) survive.
+;;;
+;;; Parameters:
+;;;   d -- the document, not used afterwards
+;;;
+;;; Example:
+;;;   (dom-free d)
+;;;
+;;; Since: 0.1.0
+(defn dom-free [d : Document] : nil
+  ```c
+  extern void turdom_doc_free(void *);
+  turdom_doc_free((void *)(intptr_t)d);
+  ```)
+
+;;; dom-node-count -- how many nodes the document holds (the document node
+;;; itself not counted).
+;;;
+;;; Parameters:
+;;;   d -- the document
+;;;
+;;; Returns:
+;;;   int -- elements, text, comments, CDATA, PIs and doctypes together.
+;;;
+;;; Example:
+;;;   (dom-node-count d)   ; => 3 for <a>x<b/></a>
+;;;
+;;; Since: 0.1.0
+(defn dom-node-count [d : Document] : int
+  ```c
+  extern int64_t turdom_node_count(void *);
+  return turdom_node_count((void *)(intptr_t)d);
+  ```)
+
+;;; dom-live-bytes -- arena bytes held by every live Document in the process.
+;;;
+;;; A diagnostic: it returns to its earlier value once every Document parsed
+;;; since has been passed to `dom-free`, so a test (or a long-running service)
+;;; can check that documents are not leaking.
+;;;
+;;; Returns:
+;;;   int -- bytes, including each arena chunk's header.
+;;;
+;;; Example:
+;;;   (let [before (dom-live-bytes)]
+;;;     (dom-free (ok-val (dom-parse-string "<a/>")))
+;;;     (= before (dom-live-bytes)))   ; => true
+;;;
+;;; Since: 0.1.0
+(defn dom-live-bytes [] : int
+  ```c
+  extern int64_t turdom_live_bytes(void);
+  return turdom_live_bytes();
+  ```)
+
+;; ---------------------------------------------------------------------------
+;; Node identity
+;; ---------------------------------------------------------------------------
+
+;;; __kind-raw -- internal: the C kind code.
+(defn __kind-raw [n : Node] : int
+  ```c
+  extern int turdom_kind(void *);
+  return (int64_t)turdom_kind((void *)(intptr_t)n);
+  ```)
+
+;;; node-kind -- what kind of node this is.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   NodeKind
+;;;
+;;; Example:
+;;;   (match (node-kind n) (ElementNode) "element" (TextNode) "text" ...)
+;;;
+;;; Since: 0.1.0
+(defn node-kind [n : Node] : NodeKind
+  (let [k (__kind-raw n)]
+    (cond
+      (= k 1) (ElementNode)
+      (= k 2) (TextNode)
+      (= k 3) (CommentNode)
+      (= k 4) (CdataNode)
+      (= k 5) (PiNode)
+      (= k 6) (DoctypeNode)
+      :else   (DocumentNode))))
+
+;;; node-element? -- is this node an element?
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   bool
+;;;
+;;; Example:
+;;;   (node-element? (dom-node d))   ; => false (the document node)
+;;;
+;;; Since: 0.1.0
+(defn node-element? [n : Node] : bool
+  (= (__kind-raw n) 1))
+
+;;; __name-raw -- internal: the C name, or NULL.
+(defn __name-raw [n : Node] : cstr
+  ```c
+  extern const char *turdom_name(void *);
+  return turdom_name((void *)(intptr_t)n);
+  ```)
+
+;;; node-name -- the name of an element, PI target, or doctype.
+;;;
+;;; For an element this is the qualified name as written in the source
+;;; (`atom:link`, `svg`, `div`). HTML element names are lower-case, as the
+;;; HTML parser normalizes them.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   (Option cstr) -- borrowed from the document; none for text, comment,
+;;;   CDATA and document nodes.
+;;;
+;;; Example:
+;;;   (node-name root)   ; => (Some "rss")
+;;;
+;;; Since: 0.1.0
+(defn node-name [n : Node] : (Option cstr)
+  (let [k (__kind-raw n)]
+    (if (or (= k 1) (or (= k 5) (= k 6)))
+      (__opt-cstr (__name-raw n))
+      (None))))
+
+;;; __local-raw -- internal: the C local name, or NULL.
+(defn __local-raw [n : Node] : cstr
+  ```c
+  extern const char *turdom_local_name(void *);
+  extern int turdom_kind(void *);
+  if (turdom_kind((void *)(intptr_t)n) != 1) return NULL;
+  return turdom_local_name((void *)(intptr_t)n);
+  ```)
+
+;;; node-local-name -- an element's name without its namespace prefix.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   (Option cstr) -- `link` for `<atom:link>`; none for non-elements.
+;;;
+;;; Example:
+;;;   (node-local-name n)   ; => (Some "link")
+;;;
+;;; Since: 0.1.0
+(defn node-local-name [n : Node] : (Option cstr)
+  (__opt-cstr (__local-raw n)))
+
+;;; __ns-raw -- internal: the C namespace URI, or NULL.
+(defn __ns-raw [n : Node] : cstr
+  ```c
+  extern const char *turdom_ns_uri(void *);
+  extern int turdom_kind(void *);
+  if (turdom_kind((void *)(intptr_t)n) != 1) return NULL;
+  return turdom_ns_uri((void *)(intptr_t)n);
+  ```)
+
+;;; node-ns-uri -- an element's namespace URI.
+;;;
+;;; XML: the URI its prefix (or the default namespace) is bound to. HTML: the
+;;; HTML, SVG or MathML namespace the parser put the element in.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   (Option cstr) -- none for an element in no namespace, and for
+;;;   non-elements.
+;;;
+;;; Example:
+;;;   (node-ns-uri feed)   ; => (Some "http://www.w3.org/2005/Atom")
+;;;
+;;; Since: 0.1.0
+(defn node-ns-uri [n : Node] : (Option cstr)
+  (__opt-cstr (__ns-raw n)))
+
+;;; __value-raw -- internal: the C character data, or NULL.
+(defn __value-raw [n : Node] : cstr
+  ```c
+  extern const char *turdom_value(void *);
+  return turdom_value((void *)(intptr_t)n);
+  ```)
+
+;;; node-value -- the character data of a text, comment, CDATA or PI node.
+;;;
+;;; This is the borrowed, no-allocation read of a single node's own text; use
+;;; `node-text` for the concatenated text of a whole subtree.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   (Option cstr) -- borrowed from the document; none for elements, the
+;;;   doctype and the document node.
+;;;
+;;; Example:
+;;;   (match (node-first-child p)          ; <p>hello</p>
+;;;     (Some t) (node-value t)            ; => (Some "hello")
+;;;     (None)   (None))
+;;;
+;;; Since: 0.1.0
+(defn node-value [n : Node] : (Option cstr)
+  (__opt-cstr (__value-raw n)))
+
+;;; __text-raw -- internal: malloc'd concatenated text.
+(defn __text-raw [n : Node] : cstr
+  ```c
+  extern char *turdom_text_content(void *, size_t *);
+  size_t len = 0;
+  char *s = turdom_text_content((void *)(intptr_t)n, &len);
+  if (!s) { s = (char *)malloc(1); if (s) s[0] = '\0'; }
+  return s;
+  ```)
+
+;;; node-text -- the text of a node and all its descendants, concatenated.
+;;;
+;;; DOM `textContent` semantics: text and CDATA descendants in document
+;;; order; comments and PIs are skipped. For a text, comment, CDATA or PI node
+;;; it is that node's own data.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   String -- owned; release it when done.
+;;;
+;;; Example:
+;;;   (node-text p)   ; => "abc" for <p>a<b>b</b>c</p>
+;;;
+;;; Since: 0.1.0
+(defn node-text [n : Node] : String
+  (adopt-cstr (__text-raw n)))
+
+;;; __attr-raw -- internal: the attribute value, or NULL.
+(defn __attr-raw [n : Node name : cstr] : cstr
+  ```c
+  extern const char *turdom_attr_get(void *, const char *);
+  return turdom_attr_get((void *)(intptr_t)n, (const char *)name);
+  ```)
+
+;;; node-attr -- look up an element's attribute by name.
+;;;
+;;; `name` may be the qualified name as written (`xlink:href`) or the Clark
+;;; form `{http://www.w3.org/1999/xlink}href`. In an HTML document the match
+;;; ignores ASCII case. Namespace declarations (`xmlns`, `xmlns:p`) are
+;;; ordinary attributes here.
+;;;
+;;; Parameters:
+;;;   n    -- the element
+;;;   name -- the attribute name
+;;;
+;;; Returns:
+;;;   (Option cstr) -- borrowed from the document; none when absent or when
+;;;   `n` is not an element.
+;;;
+;;; Example:
+;;;   (node-attr link "href")   ; => (Some "https://example.com/")
+;;;
+;;; Since: 0.1.0
+(defn node-attr [n : Node name : cstr] : (Option cstr)
+  (__opt-cstr (__attr-raw n name)))
+
+;;; node-attr-count -- how many attributes an element has.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   int -- 0 for non-elements.
+;;;
+;;; Example:
+;;;   (node-attr-count (dom-root d))   ; => 2 for <a x="1" y="2"/>
+;;;
+;;; Since: 0.1.0
+(defn node-attr-count [n : Node] : int
+  ```c
+  extern int64_t turdom_attr_count(void *);
+  return turdom_attr_count((void *)(intptr_t)n);
+  ```)
+
+;;; __attr-name-at-raw -- internal: i-th attribute name, or NULL.
+(defn __attr-name-at-raw [n : Node i : int] : cstr
+  ```c
+  extern const char *turdom_attr_name_at(void *, int64_t);
+  return turdom_attr_name_at((void *)(intptr_t)n, i);
+  ```)
+
+;;; __attr-value-at-raw -- internal: i-th attribute value, or NULL.
+(defn __attr-value-at-raw [n : Node i : int] : cstr
+  ```c
+  extern const char *turdom_attr_value_at(void *, int64_t);
+  return turdom_attr_value_at((void *)(intptr_t)n, i);
+  ```)
+
+;;; node-attr-name-at -- the name of an element's i-th attribute (document
+;;; order, 0-based).
+;;;
+;;; Parameters:
+;;;   n -- the element
+;;;   i -- 0 <= i < (node-attr-count n)
+;;;
+;;; Returns:
+;;;   (Option cstr) -- borrowed; none when out of range.
+;;;
+;;; Example:
+;;;   (node-attr-name-at el 0)   ; => (Some "x")
+;;;
+;;; Since: 0.1.0
+(defn node-attr-name-at [n : Node i : int] : (Option cstr)
+  (__opt-cstr (__attr-name-at-raw n i)))
+
+;;; node-attr-value-at -- the value of an element's i-th attribute.
+;;;
+;;; Parameters:
+;;;   n -- the element
+;;;   i -- 0 <= i < (node-attr-count n)
+;;;
+;;; Returns:
+;;;   (Option cstr) -- borrowed; none when out of range.
+;;;
+;;; Example:
+;;;   (node-attr-value-at el 0)   ; => (Some "1")
+;;;
+;;; Since: 0.1.0
+(defn node-attr-value-at [n : Node i : int] : (Option cstr)
+  (__opt-cstr (__attr-value-at-raw n i)))
+
+;; ---------------------------------------------------------------------------
+;; Navigation
+;; ---------------------------------------------------------------------------
+
+;;; __parent-raw -- internal.
+(defn __parent-raw [n : Node] : ptr<void>
+  ```c
+  extern void *turdom_parent(void *);
+  return turdom_parent((void *)(intptr_t)n);
+  ```)
+
+;;; __first-child-raw -- internal.
+(defn __first-child-raw [n : Node] : ptr<void>
+  ```c
+  extern void *turdom_first_child(void *);
+  return turdom_first_child((void *)(intptr_t)n);
+  ```)
+
+;;; __last-child-raw -- internal.
+(defn __last-child-raw [n : Node] : ptr<void>
+  ```c
+  extern void *turdom_last_child(void *);
+  return turdom_last_child((void *)(intptr_t)n);
+  ```)
+
+;;; __next-raw -- internal.
+(defn __next-raw [n : Node] : ptr<void>
+  ```c
+  extern void *turdom_next_sibling(void *);
+  return turdom_next_sibling((void *)(intptr_t)n);
+  ```)
+
+;;; __prev-raw -- internal.
+(defn __prev-raw [n : Node] : ptr<void>
+  ```c
+  extern void *turdom_prev_sibling(void *);
+  return turdom_prev_sibling((void *)(intptr_t)n);
+  ```)
+
+;;; node-parent -- the node's parent.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   (Option Node) -- the root element's parent is the document node; the
+;;;   document node has none.
+;;;
+;;; Example:
+;;;   (node-parent title)   ; => (Some head)
+;;;
+;;; Since: 0.1.0
+(defn node-parent [n : Node] : (Option Node)
+  (__opt-node (__parent-raw n)))
+
+;;; node-first-child -- the node's first child.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   (Option Node) -- none for a leaf.
+;;;
+;;; Example:
+;;;   (node-first-child (dom-node d))
+;;;
+;;; Since: 0.1.0
+(defn node-first-child [n : Node] : (Option Node)
+  (__opt-node (__first-child-raw n)))
+
+;;; node-last-child -- the node's last child.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   (Option Node) -- none for a leaf.
+;;;
+;;; Example:
+;;;   (node-last-child body)
+;;;
+;;; Since: 0.1.0
+(defn node-last-child [n : Node] : (Option Node)
+  (__opt-node (__last-child-raw n)))
+
+;;; node-next-sibling -- the next node under the same parent.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   (Option Node) -- none for the last child.
+;;;
+;;; Example:
+;;;   (node-next-sibling item)
+;;;
+;;; Since: 0.1.0
+(defn node-next-sibling [n : Node] : (Option Node)
+  (__opt-node (__next-raw n)))
+
+;;; node-prev-sibling -- the previous node under the same parent.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   (Option Node) -- none for the first child.
+;;;
+;;; Example:
+;;;   (node-prev-sibling item)
+;;;
+;;; Since: 0.1.0
+(defn node-prev-sibling [n : Node] : (Option Node)
+  (__opt-node (__prev-raw n)))
+
+;;; node-child-count -- how many children the node has.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   int
+;;;
+;;; Example:
+;;;   (node-child-count (dom-node d))
+;;;
+;;; Since: 0.1.0
+(defn node-child-count [n : Node] : int
+  ```c
+  extern int64_t turdom_child_count(void *);
+  return turdom_child_count((void *)(intptr_t)n);
+  ```)
+
+;;; __children-acc -- internal: build the child list back to front.
+(defn __children-acc [p : ptr<void> acc : (Cons Node)] : (Cons Node)
+  (if (__null? p)
+    acc
+    (let [n (:: p Node)]
+      (__children-acc (__prev-raw n) (tcons-of n acc)))))
+
+;;; node-children -- the node's children, in document order.
+;;;
+;;; Allocates one list cell per child; for a single pass over a large node,
+;;; `node-first-child` / `node-next-sibling` walk without allocating.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   (Cons Node) -- `(tnil)` for a leaf.
+;;;
+;;; Example:
+;;;   (tlength (node-children root))   ; => 3
+;;;
+;;; Since: 0.1.0
+(defn node-children [n : Node] : (Cons Node)
+  (__children-acc (__last-child-raw n) (tnil)))
+
+;;; __doc-of-raw -- internal.
+(defn __doc-of-raw [n : Node] : ptr<void>
+  ```c
+  extern void *turdom_node_doc(void *);
+  return turdom_node_doc((void *)(intptr_t)n);
+  ```)
+
+;;; node-document -- the Document that owns this node.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   Document -- the same handle `dom-free` takes.
+;;;
+;;; Example:
+;;;   (dom-free (node-document root))
+;;;
+;;; Since: 0.1.0
+(defn node-document [n : Node] : Document
+  (:: (__doc-of-raw n) Document))
+
+;;; __line-raw -- internal.
+(defn __line-raw [n : Node] : int
+  ```c
+  extern int64_t turdom_line(void *);
+  return turdom_line((void *)(intptr_t)n);
+  ```)
+
+;;; __col-raw -- internal.
+(defn __col-raw [n : Node] : int
+  ```c
+  extern int64_t turdom_col(void *);
+  return turdom_col((void *)(intptr_t)n);
+  ```)
+
+;;; node-pos -- where the node started in the source.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   (Option SourcePos) -- XML nodes carry their start position; HTML nodes
+;;;   and the document node do not (lexbor's tree does not record them).
+;;;
+;;; Example:
+;;;   (node-pos item)   ; => (Some (SourcePos 4 3))
+;;;
+;;; Since: 0.1.0
+(defn node-pos [n : Node] : (Option SourcePos)
+  (let [line (__line-raw n)]
+    (if (> line 0)
+      (Some (SourcePos line (__col-raw n)))
+      (None))))
+
+;;; node-depth -- how many ancestors the node has.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   int -- 0 for the document node, 1 for the root element.
+;;;
+;;; Example:
+;;;   (node-depth (dom-node d))   ; => 0
+;;;
+;;; Since: 0.1.0
+(defn node-depth [n : Node] : int
+  ```c
+  extern int64_t turdom_depth(void *);
+  return turdom_depth((void *)(intptr_t)n);
+  ```)
+
+;; ---------------------------------------------------------------------------
+;; Queries
+;; ---------------------------------------------------------------------------
+
+;;; node-matches? -- is `n` an element that answers to `name`?
+;;;
+;;; `name` matches the qualified name as written, the Clark form
+;;; `{uri}local`, or `*` for any element. In an HTML document the match
+;;; ignores ASCII case.
+;;;
+;;; Parameters:
+;;;   n    -- the node
+;;;   name -- the name to test
+;;;
+;;; Returns:
+;;;   bool -- false for every non-element.
+;;;
+;;; Example:
+;;;   (node-matches? n "{http://www.w3.org/2005/Atom}entry")
+;;;
+;;; Since: 0.1.0
+(defn node-matches? [n : Node name : cstr] : bool
+  ```c
+  extern int turdom_element_matches(void *, const char *);
+  return turdom_element_matches((void *)(intptr_t)n, (const char *)name) != 0;
+  ```)
+
+;;; __find-prev-raw -- internal: previous match in reverse document order.
+(defn __find-prev-raw [root : Node from : ptr<void> tag : cstr] : ptr<void>
+  ```c
+  extern void *turdom_find_prev(void *, void *, const char *);
+  return turdom_find_prev((void *)(intptr_t)root, from, (const char *)tag);
+  ```)
+
+;;; __find-next-raw -- internal: next match in document order.
+(defn __find-next-raw [root : Node from : ptr<void> tag : cstr] : ptr<void>
+  ```c
+  extern void *turdom_find_next(void *, void *, const char *);
+  return turdom_find_next((void *)(intptr_t)root, from, (const char *)tag);
+  ```)
+
+;;; __find-all-acc -- internal: collect matches back to front.
+(defn __find-all-acc [root : Node from : ptr<void> tag : cstr
+                      acc : (Cons Node)] : (Cons Node)
+  (let [p (__find-prev-raw root from tag)]
+    (if (__null? p)
+      acc
+      (__find-all-acc root p tag (tcons-of (:: p Node) acc)))))
+
+;;; find-all -- every descendant element named `tag`, in document order.
+;;;
+;;; Searches `n`'s subtree, not `n` itself. `tag` is matched as in
+;;; `node-matches?`: the qualified name, the Clark form `{uri}local`, or `*`.
+;;;
+;;; Parameters:
+;;;   n   -- where to search (often `(dom-node d)` for the whole document)
+;;;   tag -- the element name
+;;;
+;;; Returns:
+;;;   (Cons Node) -- `(tnil)` when nothing matches.
+;;;
+;;; Example:
+;;;   (tlength (find-all (dom-node d) "item"))   ; => number of <item>s
+;;;
+;;; Since: 0.1.0
+(defn find-all [n : Node tag : cstr] : (Cons Node)
+  (__find-all-acc n (__null-ptr) tag (tnil)))
+
+;;; find-first -- the first descendant element named `tag`, in document order.
+;;;
+;;; Parameters:
+;;;   n   -- where to search
+;;;   tag -- the element name (as in `find-all`)
+;;;
+;;; Returns:
+;;;   (Option Node) -- none when nothing matches.
+;;;
+;;; Example:
+;;;   (find-first (dom-node d) "title")
+;;;
+;;; Since: 0.1.0
+(defn find-first [n : Node tag : cstr] : (Option Node)
+  (__opt-node (__find-next-raw n (__null-ptr) tag)))
+
+;; ---------------------------------------------------------------------------
+;; Serialization and comparison
+;; ---------------------------------------------------------------------------
+
+;;; __serialize-raw -- internal: malloc'd markup.
+(defn __serialize-raw [n : Node] : cstr
+  ```c
+  extern char *turdom_serialize(void *, size_t *);
+  size_t len = 0;
+  char *s = turdom_serialize((void *)(intptr_t)n, &len);
+  if (!s) { s = (char *)malloc(1); if (s) s[0] = '\0'; }
+  return s;
+  ```)
+
+;;; dom-serialize -- markup for a node and its subtree.
+;;;
+;;; An XML document serializes as XML (empty elements as `<x/>`, no XML
+;;; declaration, the internal DTD subset not reproduced); an HTML document by
+;;; the HTML fragment serialization algorithm (void elements unclosed, raw
+;;; text in `<script>`/`<style>` unescaped). Serializing the document node
+;;; gives the whole document.
+;;;
+;;; SERIALIZING IS NOT SANITIZING. `html-parse` followed by `dom-serialize`
+;;; produces well-formed markup, not safe markup: every `<script>`, event
+;;; handler attribute and `javascript:` URL in the input survives. Never embed
+;;; untrusted HTML on the strength of a round trip through this function.
+;;;
+;;; Parameters:
+;;;   n -- the node (an element, the document node, or any leaf)
+;;;
+;;; Returns:
+;;;   String -- owned; release it when done.
+;;;
+;;; Example:
+;;;   (to-cstr (dom-serialize root))   ; => "<a x=\"1\"><b/></a>"
+;;;
+;;; Since: 0.1.0
+(defn dom-serialize [n : Node] : String
+  (adopt-cstr (__serialize-raw n)))
+
+;;; dom-equal? -- are two subtrees structurally equal?
+;;;
+;;; Compares kinds, names, namespace URIs, attributes (in order), character
+;;; data and doctype identifiers, node by node. Source positions are ignored,
+;;; so `parse -> serialize -> parse` round trips compare equal.
+;;;
+;;; Parameters:
+;;;   a -- a node
+;;;   b -- another node, possibly from another document
+;;;
+;;; Returns:
+;;;   bool
+;;;
+;;; Example:
+;;;   (dom-equal? (dom-node d1) (dom-node d2))
+;;;
+;;; Since: 0.1.0
+(defn dom-equal? [a : Node b : Node] : bool
+  ```c
+  extern int turdom_equal(void *, void *);
+  return turdom_equal((void *)(intptr_t)a, (void *)(intptr_t)b) != 0;
+  ```)
+
+) ;; end defmodule dom/core

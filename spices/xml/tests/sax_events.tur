@@ -1,0 +1,226 @@
+;; sax_events.tur -- the event stream of well-formed documents.
+;;
+;; Every handler here writes one line per event into a C buffer ("S name
+;; k=v ...", "E name", "T text", ...) and the whole trace is compared at
+;; once, so a missing, extra or reordered event fails the assertion rather
+;; than slipping past a count.
+
+(defmodule sax_events_test (export)
+
+(import dom/ownstr :refer [String from-cstr to-cstr retain release string=?])
+(import dom/core   :refer [ParseError parse-error-message])
+(import dom/event  :refer [SaxEvent SaxControl Attr StartElement EndElement
+                           Chars Comment Pi StartCdata EndCdata Doctype
+                           Continue Stop attrs-get])
+(import xml/sax    :refer [ParseOpts default-parse-opts sax-parse-string
+                           sax-parse-string-opts xml-backend-version])
+(import test/suite  :refer [describe it])
+(import test/assert :refer [assert-true assert-false assert-eq])
+(import test/runner :refer [run-all-status])
+
+;; ---- trace buffer ---------------------------------------------------------
+
+;;; __t-reset -- clear the trace.
+(defn __t-reset [] : nil
+  ```c
+  /* __tur_include__: #include <stddef.h> */
+  /* __tur_include__: static char *g_tr = 0; */
+  /* __tur_include__: static size_t g_tr_len = 0, g_tr_cap = 0; */
+  g_tr_len = 0;
+  if (g_tr) g_tr[0] = '\0';
+  ```)
+
+;;; __t-put -- append to the trace.
+(defn __t-put [s : cstr] : nil
+  ```c
+  size_t n = strlen((const char *)s);
+  if (g_tr_len + n + 1 > g_tr_cap) {
+    size_t cap = g_tr_cap ? g_tr_cap : 256;
+    while (cap < g_tr_len + n + 1) cap *= 2;
+    g_tr = (char *)realloc(g_tr, cap);
+    g_tr_cap = cap;
+  }
+  memcpy(g_tr + g_tr_len, s, n);
+  g_tr_len += n;
+  g_tr[g_tr_len] = '\0';
+  ```)
+
+;;; __t-is? -- is the trace exactly `want`? Prints both when not.
+(defn __t-is? [want : cstr] : bool
+  ```c
+  #include <stdio.h>
+  const char *got = g_tr ? g_tr : "";
+  if (strcmp(got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# trace mismatch\n# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+
+;;; __trace-attrs -- " name=value" per attribute.
+(defn __trace-attrs [xs : (Cons Attr)] : nil
+  (if (tnil? xs)
+    nil
+    (do (__t-put " ") (__t-put (to-cstr (.name (thead xs))))
+        (__t-put "=") (__t-put (to-cstr (.value (thead xs))))
+        (__trace-attrs (ttail xs)))))
+
+;;; trace -- record one event and continue.
+(defn trace [e : SaxEvent] : SaxControl
+  (do
+    (match e
+      (StartElement n as) (do (__t-put "S ") (__t-put (to-cstr n))
+                              (__trace-attrs as) (__t-put "|"))
+      (EndElement n)      (do (__t-put "E ") (__t-put (to-cstr n)) (__t-put "|"))
+      (Chars t)           (do (__t-put "T ") (__t-put (to-cstr t)) (__t-put "|"))
+      (Comment t)         (do (__t-put "C ") (__t-put (to-cstr t)) (__t-put "|"))
+      (Pi t d)            (do (__t-put "P ") (__t-put (to-cstr t)) (__t-put " ")
+                              (__t-put (to-cstr d)) (__t-put "|"))
+      (StartCdata)        (__t-put "[|")
+      (EndCdata)          (__t-put "]|")
+      (Doctype n p s)     (do (__t-put "D ") (__t-put (to-cstr n)) (__t-put " ")
+                              (__t-put (to-cstr p)) (__t-put " ")
+                              (__t-put (to-cstr s)) (__t-put "|")))
+    (Continue)))
+
+;;; parsed? -- did the parse succeed?
+(defn parsed? [r : (Result nil ParseError)] : bool
+  (match r (Ok _) true (Err e) (do (__t-put "ERR ") (__t-put (parse-error-message e)) false)))
+
+;;; traces? -- parse src with `trace` and compare the whole trace.
+(defn traces? [src : cstr want : cstr] : bool
+  (do (__t-reset)
+      (and (parsed? (sax-parse-string src trace)) (__t-is? want))))
+
+;;; traces-opts? -- same, with explicit options.
+(defn traces-opts? [src : cstr opts : ParseOpts want : cstr] : bool
+  (do (__t-reset)
+      (and (parsed? (sax-parse-string-opts src opts trace)) (__t-is? want))))
+
+;; ---- early stop -----------------------------------------------------------
+
+;;; stop-at-second-start -- a handler that stops at the second start tag.
+(defn count-then-stop [limit : int] : (fn [SaxEvent] SaxControl)
+  (let [^mut seen 0]
+    (fn [e : SaxEvent] : SaxControl
+      (match e
+        (StartElement n _) (do (set! seen (+ seen 1))
+                               (__t-put (to-cstr n)) (__t-put "|")
+                               (if (>= seen limit) (Stop) (Continue)))
+        _ (Continue)))))
+
+;;; __stash -- keep a String in C, out of any closure's reach.
+(defn __stash [s : String] : nil
+  ```c
+  /* __tur_include__: static void *g_stash = 0; */
+  g_stash = (void *)(intptr_t)s;
+  ```)
+
+;;; __unstash -- the stashed String's pointer.
+(defn __unstash [] : ptr<void>
+  ```c
+  return g_stash;
+  ```)
+
+;;; adopt-version -- a fresh owned String holding the backend version.
+(defn adopt-version [] : String
+  (from-cstr (xml-backend-version)))
+
+(defn __all-tests [] : void
+  (describe "xml/sax -- event stream"
+    (it "links expat 2.9"
+      (string=? (retain (adopt-version)) "expat_2.9.0"))
+
+    (it "reports start, text and end in order, with attributes in document order"
+      (traces? "<a x=\"1\" y=\"2\"><b>hi</b><c/></a>"
+               "S a x=1 y=2|S b|T hi|E b|S c|E c|E a|"))
+
+    (it "reports comments, PIs and the doctype, with absent ids empty"
+      (traces? "<!DOCTYPE a><?go fast?><a><!-- note --></a><?after?>"
+               "D a  |P go fast|S a|C  note |E a|P after |"))
+
+    (it "reports doctype public and system identifiers"
+      (traces? "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \"x.dtd\"><html/>"
+               "D html -//W3C//DTD XHTML 1.0 Strict//EN x.dtd|S html|E html|"))
+
+    (it "brackets CDATA content, which is not unescaped"
+      (traces? "<a>x<![CDATA[<b>&amp;]]>y</a>"
+               "S a|T x|[|T <b>&amp;|]|T y|E a|"))
+
+    (it "reports an empty CDATA section as a bare bracket pair"
+      (traces? "<a><![CDATA[]]></a>" "S a|[|]|E a|"))
+
+    (it "coalesces text split by entity and character references"
+      (traces? "<a>1 &lt; 2 &amp;&amp; &#x41;&#66;</a>" "S a|T 1 < 2 && AB|E a|"))
+
+    (it "expands internal entities declared in the DTD"
+      (traces? "<!DOCTYPE a [<!ENTITY who \"world\">]><a>hello &who;</a>"
+               "D a  |S a|T hello world|E a|"))
+
+    (it "drops an undeclared entity when the external subset was not read"
+      (traces? "<!DOCTYPE a SYSTEM \"a.dtd\"><a>x&nbsp;y</a>"
+               "D a  a.dtd|S a|T xy|E a|"))
+
+    (it "applies default attributes from the internal subset"
+      (traces? "<!DOCTYPE a [<!ATTLIST a v CDATA \"dflt\">]><a/>"
+               "D a  |S a v=dflt|E a|"))
+
+    (it "normalizes whitespace in attribute values and CRLF in text"
+      (traces? "<a v=\"x\ty\nz\">l1\r\nl2</a>" "S a v=x y z|T l1\nl2|E a|"))
+
+    (it "keeps whitespace-only text between elements"
+      (traces? "<a>\n  <b/>\n</a>" "S a|T \n  |S b|E b|T \n|E a|")))
+
+  (describe "xml/sax -- namespaces"
+    (it "names namespaced elements and attributes in Clark form"
+      (traces? "<f:feed xmlns:f=\"urn:f\" xmlns:x=\"urn:x\" x:a=\"1\" b=\"2\"><f:e/></f:feed>"
+               "S {urn:f}feed {urn:x}a=1 b=2|S {urn:f}e|E {urn:f}e|E {urn:f}feed|"))
+
+    (it "puts unprefixed elements in the default namespace"
+      (traces? "<feed xmlns=\"http://www.w3.org/2005/Atom\"><id/></feed>"
+               "S {http://www.w3.org/2005/Atom}feed|S {http://www.w3.org/2005/Atom}id|E {http://www.w3.org/2005/Atom}id|E {http://www.w3.org/2005/Atom}feed|"))
+
+    (it "with namespaces off, reports raw names and xmlns attributes"
+      (traces-opts? "<f:feed xmlns:f=\"urn:f\"><f:e/></f:feed>"
+                    (with (default-parse-opts) [namespaces false])
+                    "S f:feed xmlns:f=urn:f|S f:e|E f:e|E f:feed|")))
+
+  (describe "xml/sax -- early exit and ownership"
+    (it "stops at the handler's Stop and still returns ok"
+      (do (__t-reset)
+          (and (parsed? (sax-parse-string "<a><b><c/></b><d/></a>" (count-then-stop 2)))
+               (__t-is? "a|b|"))))
+
+    (it "Stop before a later malformation still returns ok"
+      (do (__t-reset)
+          (parsed? (sax-parse-string "<a><b></c></a>" (count-then-stop 1)))))
+
+    (it "attrs-get finds an attribute by name"
+      (do (__t-reset)
+          (parsed? (sax-parse-string "<a href=\"/x\" rel=\"me\"/>"
+                 (fn [e : SaxEvent] : SaxControl
+                   (match e
+                     (StartElement _ as) (do (match (attrs-get as "rel")
+                                               (Some v) (__t-put (to-cstr v))
+                                               (None) (__t-put "none"))
+                                             (match (attrs-get as "nope")
+                                               (Some v) (__t-put "bad")
+                                               (None) (__t-put "|none"))
+                                             (Continue))
+                     _ (Continue)))))
+          (__t-is? "me|none")))
+
+    (it "a retained String outlives its event"
+      (do (sax-parse-string "<keep-me/>"
+            (fn [e : SaxEvent] : SaxControl
+              (match e
+                (StartElement n _) (do (__stash (retain n)) (Continue))
+                _ (Continue))))
+          (let [kept (:: (__unstash) String)
+                good (string=? kept "keep-me")]
+            (release kept)
+            good)))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule sax_events_test
