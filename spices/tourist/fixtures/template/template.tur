@@ -1,18 +1,28 @@
-;; Fixture: template -- render-template integration (requires tur-template)
+;; Fixture: template -- render-html / render-template (requires tur-template)
+;;
+;;   * render-html answers 200 text/html with the rendered page;
+;;   * a template that cannot be read is answered 500;
+;;   * render-template hands back the text for a route to wrap itself.
+;;
+;; render-template used to free() render-file's by-value Result as if it were
+;; a heap box -- an ASan "free on address which was not malloc()-ed" on the
+;; first request.  Each route frees its Env; each probe frees its result.
 
 (defmodule tourist/tests/template
   (import tourist/app      :refer [tourist])
   (import tourist/dsl      :refer [get!])
   (import tourist/helpers  :refer [html])
   (import tourist/param    :refer [capture])
-  (import tourist/template :refer [render-template])
-  (import template/env     :refer [env-new env-set])
-  (import httpd/server     :refer [server-stop])
-  (import http/client      :refer [http-get])
+  (import tourist/template :refer [render-template render-html])
+  (import tourist/types    :refer [Ctx])
+  (import template/env     :refer [env-new env-set env-free])
+  (import httpd/types      :refer [Response])
+  (import httpd/server     :refer [server-port server-stop])
+  (import http/client      :refer [http-get http-result-free])
   (import http/response    :refer [response-status response-body])
   (import test/suite       :refer [describe it])
   (import test/assert      :refer [assert-eq assert-true])
-  (import test/runner      :refer [run-all])
+  (import test/runner      :refer [run-all-status])
 
   (defn __cr-ok? [r : ptr<void>] : bool
     ```c
@@ -24,17 +34,24 @@
     return tur_ok_value((int64_t)(intptr_t)r);
     ```)
 
-  (defn cstr-eq? [a : cstr b : cstr] : bool
-    ```c
-    #include <string.h>
-    return strcmp((const char *)a, (const char *)b) == 0;
-    ```)
-
-  ;; cstr-contains? -- true if haystack contains needle
   (defn cstr-contains? [haystack : cstr needle : cstr] : bool
     ```c
     #include <string.h>
-    return strstr((const char *)haystack, (const char *)needle) != NULL;
+    return haystack && strstr((const char *)haystack, (const char *)needle) != NULL;
+    ```)
+
+  (defn cstr-free [s : cstr] : void
+    ```c
+    #include <stdlib.h>
+    free((void *)s);
+    ```)
+
+  (defn url-for [port : int path : cstr] : cstr
+    ```c
+    #include <stdio.h>
+    static char u[256];
+    snprintf(u, sizeof u, "http://127.0.0.1:%d%s", (int)port, path);
+    return u;
     ```)
 
   ;; __setup-template-dir -- write test template to /tmp/tourist-template-test/
@@ -55,36 +72,68 @@
     return path;
     ```)
 
-  (defn sleep-ms [ms : int] #fx{Unsafe} : void
-    ```c
-    #include <unistd.h>
-    if (ms > 0) usleep((useconds_t)ms * 1000u);
-    ```)
+  (defn tpl-path [] : cstr
+    ```c return "/tmp/tourist-template-test/greet.html.tur"; ```)
+
+  (defn name-of [ctx : Ctx] : cstr
+    (let [r (capture ctx "name")]
+      (if (ok? r) (ok-val r) "world")))
+
+  ;; GET /greet/:name -- render-html.
+  (defn greet [ctx : Ctx] : Response
+    (let [e (env-new)]
+      (env-set e "name" (name-of ctx))
+      (let [resp (render-html (tpl-path) e)]
+        (env-free e)
+        resp)))
+
+  ;; GET /missing -- a template file that does not exist.
+  (defn missing [ctx : Ctx] : Response
+    (let [e    (env-new)
+          resp (render-html "/tmp/tourist-template-test/no-such.html.tur" e)]
+      (env-free e)
+      resp))
+
+  ;; GET /text/:name -- render-template, wrapped by the route.
+  (defn greet-text [ctx : Ctx] : Response
+    (let [e (env-new)]
+      (env-set e "name" (name-of ctx))
+      (let [page (render-template (tpl-path) e)
+            resp (html page)]
+        (cstr-free page)
+        (env-free e)
+        resp)))
+
+  (defn status-of [port : int path : cstr] : int
+    (let [r  (http-get (url-for port path))
+          st (if (__cr-ok? r) (response-status (__cr-val r)) 0)]
+      (http-result-free r)
+      st))
+
+  (defn body-has? [port : int path : cstr needle : cstr] : bool
+    (let [r  (http-get (url-for port path))
+          ok (if (__cr-ok? r) (cstr-contains? (response-body (__cr-val r)) needle) false)]
+      (http-result-free r)
+      ok))
+
+  (defn __all-tests [] : void
+    (let [_    (__setup-template-dir)
+          srv  (tourist 0
+                 (get! "/greet/:name" greet)
+                 (get! "/missing" missing)
+                 (get! "/text/:name" greet-text))
+          port (server-port srv)]
+      (describe "tourist template"
+        (it "GET /greet/alice status is 200"
+          (assert-eq 200 (status-of port "/greet/alice")))
+        (it "GET /greet/alice body is the rendered page"
+          (assert-true (body-has? port "/greet/alice" "<p>Hello, alice!</p>")))
+        (it "a template that cannot be read is answered 500"
+          (assert-eq 500 (status-of port "/missing")))
+        (it "render-template returns the text for the route to wrap"
+          (assert-true (body-has? port "/text/bob" "<p>Hello, bob!</p>"))))
+      (server-stop srv)))
 
   (defn main [] : int
-    (let [tpl-path (__setup-template-dir)
-          srv      (tourist 18106
-                     (get! "/greet/:name"
-                       (fn [req]
-                         (let [r   (capture req "name")
-                               nm  (if (ok? r) (ok-val r) "world")
-                               e   (env-new)]
-                           (do
-                             (env-set e "name" nm)
-                             (html (render-template tpl-path e)))))))]
-      (do
-        (unsafe (sleep-ms 50))
-        (describe "tourist template"
-          (it "GET /greet/alice status is 200"
-            (let [r (http-get "http://127.0.0.1:18106/greet/alice")]
-              (if (__cr-ok? r)
-                (assert-eq 200 (response-status (__cr-val r)))
-                (assert-true false))))
-          (it "GET /greet/alice body contains Alice"
-            (let [r (http-get "http://127.0.0.1:18106/greet/alice")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-contains? (response-body (__cr-val r)) "alice"))
-                (assert-true false)))))
-        (server-stop srv)
-        (run-all)))
-    0))
+    (__all-tests)
+    (run-all-status)))

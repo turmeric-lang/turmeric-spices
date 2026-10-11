@@ -142,10 +142,10 @@ stage_errors() {
 
 stage_fixtures() {
   # Whole-program end-to-end fixtures (each with its own main), kept out of
-  # tests/ for the same reason as errors/.  tourist, tourist-ws, tls,
-  # ws-client and ws-server keep fixtures/ whose per-fixture scripts need a
-  # live server or a Python helper; with no aggregate fixtures/run.sh they
-  # are skipped here and stay manual.
+  # tests/ for the same reason as errors/.  template and tourist have an
+  # aggregate fixtures/run.sh.  tourist-ws, tls, ws-client and ws-server keep
+  # fixtures/ whose per-fixture scripts need a live server or a Python helper;
+  # with no aggregate fixtures/run.sh they are skipped here and stay manual.
   [ -x fixtures/run.sh ] || { echo "no fixtures/run.sh"; return 0; }
   fixtures/run.sh "$TUR_BIN"
 }

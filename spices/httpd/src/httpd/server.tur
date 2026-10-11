@@ -1,561 +1,375 @@
-;;; httpd/server -- POSIX socket listener + worker dispatch.
+;;; httpd/server -- start and stop HTTP servers.
 ;;;
 ;;; The public entry points are:
 ;;;
-;;;   server-start       -- bind + dispatch via the bounded pool (default).
+;;;   server-start       -- bind + serve with a pool of 8 worker threads.
 ;;;   server-start-pool  -- like server-start with an explicit pool size.
-;;;   server-start-spawn -- legacy thread-per-connection fallback.
-;;;   server-stop        -- close the listening socket, join the listener,
-;;;                          drain + join the pool (if any).
+;;;   server-start-opts  -- like server-start, configured by a ServerOpts.
+;;;   server-start-spawn -- compatibility name; a pool of 64 workers.
+;;;   server-start-conn / server-start-pool-conn / server-start-conn-opts
+;;;                      -- the same for two-arg (Conn, Request) handlers.
+;;;   server-port        -- the port a server listens on (useful with port 0).
+;;;   server-stop        -- stop accepting, finish queued work, join, free.
 ;;;
 ;;; The handler is a top-level Turmeric defn of type [req :int] :int that
-;;; takes a Request handle (from httpd/parse) and returns a Response handle
-;;; (from httpd/response); the server takes ownership of the returned
-;;; Response and frees it after writing.
+;;; takes a Request handle and returns a Response handle; the server takes
+;;; ownership of the returned Response and frees it after writing.
 ;;;
-;;; Since: H6 (pool dispatch added in H7)
-;; Threading model:
+;;; Since: H6 (pool dispatch added in H7; runs on stdlib httpd since
+;;; tourist-on-stdlib-httpd H2)
 ;;
-;;   server-start
-;;     |
-;;     v
-;;   listener thread          (long-lived; one per server handle)
-;;     loop: accept() ----> worker thread (one per accepted connection,
-;;                                          spawned detached for H6)
-;;                            * read raw bytes from socket
-;;                            * parse-request                       (httpd/parse)
-;;                            * call user handler :: req -> resp
-;;                            * serialize-response                  (httpd/write)
-;;                            * write-all back to client
-;;                            * free everything, close fd
+;; Since tourist-on-stdlib-httpd H2 this module is a typed layer over
+;; stdlib/httpd.tur, the way Node's req/res objects sit over its socket.  The
+;; server underneath -- listener, worker pool, keep-alive, read timeout, body
+;; cap, TLS hook, connection upgrade -- is stdlib httpd's; this spice keeps
+;; only what makes it typed:
 ;;
-;; H6 introduced "spawn" mode: a fresh detached thread per connection.
-;; H7 adds a bounded thread pool (httpd/pool) and makes pool mode the
-;; default.  server-start dispatches via the pool when one is attached
-;; to the server state; otherwise it falls back to spawn mode.  Both
-;; modes share the same worker entry point (srv-worker-loop) -- its
-;; contract is "take a (client-fd, handler) pair, fully service the
-;; connection, return when done".
+;;   * a stdlib handler closure that builds the Request view of the stdlib conn
+;;     (httpd/request), calls the user's handler, and writes the Response value
+;;     it returns onto the conn (status, headers, body -- binary-safe);
+;;   * the two-arg variant hands the handler a Conn (httpd/conn) whose
+;;     conn-mark-upgraded! is stdlib's httpd-conn-detach!;
+;;   * a background thread runs httpd-run, so server-start returns at once.
 ;;
-;; The user handler is a captureless top-level defn of type :int -> :int
-;; (Request handle in, Response handle out), declared in the public API as
-;; `(c-fn [int] int)`.  Capturing closures are rejected at compile time,
-;; since the bare C-ABI function-pointer rep has no environment slot.
-;;
-;; Internal struct layouts duplicated verbatim in every inline-C block:
+;; Server state (duplicated in the inline-C blocks below):
 ;;
 ;;   struct __httpd_server {
-;;     int           listen_fd;       /* listening socket, or -1 once closed */
-;;     void         *handler;         /* int64_t (*)(int64_t)                */
-;;     volatile int  stop_flag;       /* set by server-stop                   */
-;;     void         *listener_thread; /* pthread_t * (malloc'd)               */
-;;     void         *pool;            /* struct __httpd_pool *, or NULL       */
+;;     void    *h;        /* stdlib httpd handle                         */
+;;     void    *thread;   /* pthread_t * running httpd-run (malloc'd)    */
+;;     int64_t  tls_ctx;  /* TLS context httpd/tls frees at stop, or 0   */
 ;;   };
 ;;
-;;   struct __httpd_warg {
-;;     int   client_fd;
-;;     void *handler;
-;;     int   conn_mode;   /* 0: (Request)->Response  1: (Conn,Request)->Response */
-;;   };
+;; Behaviour that differs from the spice's own pre-H2 server, all of it
+;; stdlib httpd's:
 ;;
-;; conn_mode selects which handler shape srv-worker-loop calls: the legacy
-;; single-arg path, or the two-arg path that hands the handler a Conn (for
-;; protocol upgrades).  The struct layout is duplicated verbatim -- and must
-;; stay byte-identical -- in pool.tur, which packs the same work item.
+;;   * HTTP/1.1 keep-alive.  A client that reads to EOF to find the end of a
+;;     response must send `Connection: close` (or read Content-Length).
+;;   * Servers bind 127.0.0.1 unless the program calls httpd-set-bind-any! /
+;;     httpd-set-bind-addr! (or sets TUR_HTTPD_BIND_ANY=1).
+;;   * Request heads must arrive within the read timeout (5 s; 408 past it),
+;;     bodies are capped (8 MiB; 413 past it) -- see ServerOpts.
+
+(load "stdlib/httpd.tur")
 
 (defmodule httpd/server
-  (import httpd/parse    :refer [parse-request free-request])
+  (import httpd/request  :refer [request-view-new request-view-free])
   (import httpd/response :refer [free-response])
-  (import httpd/write    :refer [serialize-response wbuf-bytes wbuf-len free-wbuf])
-  (import httpd/pool     :refer [pool-new pool-new-conn pool-enqueue pool-stop])
-  (import httpd/conn     :refer [conn-new conn-upgraded? conn-free])
-  (import httpd/types    :refer [Request Response Wbuf Conn])
-  (export server-start server-start-pool server-start-spawn
-          server-start-conn server-start-pool-conn server-stop)
+  (import httpd/conn     :refer [conn-of-httpd conn-upgraded? conn-free])
+  (import httpd/types    :refer [Request Response Conn])
+  (export ServerOpts default-server-opts
+          server-start server-start-pool server-start-spawn server-start-opts
+          server-start-conn server-start-pool-conn server-start-conn-opts
+          ServerWrap server-wrap server-start-wrapped server-start-conn-wrapped
+          take-conn-response
+          server-port server-stop
+          serve-httpd-request serve-httpd-request-conn
+          server-launch server-tls-ctx server-set-tls-ctx!)
 
-;; file-scope-c-block: system headers like <pthread.h> and <sys/socket.h>
-;; contain static inline function definitions (e.g. __DARWIN_FD_ISSET on
-;; macOS 14+ / Xcode 15+) that are not legal inside a function body.
-;; Hoist all POSIX headers and the shared struct layouts here.
+;; file-scope-c-block: system headers like <pthread.h> contain static inline
+;; function definitions that are not legal inside a function body on macOS
+;; 14+ / Xcode 15+.  Hoist the headers and the shared struct layouts here.
 ```c
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <errno.h>
 #include <pthread.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
-struct __httpd_rawreq { char *bytes; int len; };
+struct __httpd_server { void *h; void *thread; int64_t tls_ctx; };
 
-struct __httpd_warg { int client_fd; void *handler; int conn_mode; };
-
-struct __httpd_server {
-  int           listen_fd;
-  void         *handler;
-  volatile int  stop_flag;
-  void         *listener_thread;
-  void         *pool;
+struct __httpd_resp {
+  int    status; char  *body; int body_len;
+  char **hdr_keys; char **hdr_vals; int hdr_count; int hdr_cap;
 };
-
-/* Forward-declare the Turmeric-generated static function so the non-static
-   trampoline below can reference it before the actual definition. */
-static void * httpd__server__srv_hyworker_hyloop(void *);
-/* Non-static trampoline exported so pool.tur (separate TU) can call
-   srv-worker-loop without violating the static-only rule. */
-void * httpd__server__srv_worker_loop_trampoline(void *arg) {
-  return httpd__server__srv_hyworker_hyloop(arg);
-}
 ```
 
+;;; ServerOpts -- configuration for server-start-opts / server-start-conn-opts.
+;;;
+;;; Fields:
+;;;   pool-size       -- worker threads (>= 1; server-start uses 8).  A
+;;;                      WebSocket session holds its worker while it runs.
+;;;   max-body        -- request body cap in bytes; a larger Content-Length
+;;;                      is answered 413 before any of the body is read.
+;;;                      -1 keeps stdlib httpd's (8 MiB, httpd-set-max-body!).
+;;;   read-timeout-ms -- how long a request head may take to arrive (408
+;;;                      after it), and each body read may wait.  0 keeps
+;;;                      stdlib httpd's (5 s, httpd-set-read-timeout!).
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defstruct ServerOpts
+  [pool-size : int
+   max-body : int
+   read-timeout-ms : int])
+
+;;; default-server-opts -- the settings server-start uses.
+;;;
+;;; 8 workers, stdlib httpd's body cap and read timeout.
+;;;
+;;; Returns:
+;;;   ServerOpts
+;;;
+;;; Example:
+;;;   (server-start-opts 8080 my-handler
+;;;     (make-struct ServerOpts 16 1048576 2000))
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn default-server-opts [] : ServerOpts
+  (make-struct ServerOpts 8 -1 0))
+
 ;; =============================================================================
-;; Low-level POSIX socket primitives (inline-C, local to this module)
+;; Request dispatch: the stdlib handler body
 ;; =============================================================================
-
-(defn srv-make-listener [port : int] : int
-  ```c
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return -1;
-  int yes = 1;
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-  struct sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port   = htons((uint16_t)(int)port);
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    close(fd);
-    return -1;
-  }
-  if (listen(fd, 128) < 0) {
-    close(fd);
-    return -1;
-  }
-  return (int64_t)fd;
-  ```)
-
-(defn srv-accept-one [listen-fd : int] : int
-  ```c
-  int lf = (int)listen_fd;
-  if (lf < 0) return -1;
-  for (;;) {
-    int c = accept(lf, NULL, NULL);
-    if (c >= 0) return (int64_t)c;
-    if (errno == EINTR) continue;
-    return -1;
-  }
-  ```)
-
-(defn srv-close-fd [fd : int] : void
-  ```c
-  int f = (int)fd;
-  if (f >= 0) close(f);
-  ```)
-
-(defn srv-shutdown-fd [fd : int] : void
-  ```c
-  int f = (int)fd;
-  if (f >= 0) shutdown(f, SHUT_RDWR);
-  ```)
-
-;; Read the full request off a client socket into a malloc'd buffer.
-;; Returns a handle to { char *bytes; int len; }, or 0 on read/parse error.
-;; Stops as soon as we've consumed CRLF CRLF + Content-Length bytes (or the
-;; peer half-closes).
-(defn srv-recv-request [client-fd : int] : int
-  ```c
-  int cf = (int)client_fd;
-  if (cf < 0) return 0;
-
-  size_t cap = 4096;
-  size_t len = 0;
-  char  *buf = malloc(cap);
-  int    hdr_end = -1;        /* index of the second '\n' in CRLF CRLF        */
-  long   content_length = -1; /* -1 = not yet parsed; otherwise the value      */
-  int    need_body = 0;       /* 1 once we know content_length                 */
-
-  for (;;) {
-    if (len + 1 >= cap) {
-      cap *= 2;
-      char *nb = realloc(buf, cap);
-      if (!nb) { free(buf); return 0; }
-      buf = nb;
-    }
-    ssize_t n = read(cf, buf + len, cap - len);
-    if (n < 0) { free(buf); return 0; }
-    if (n == 0) break;        /* peer closed                                  */
-    len += (size_t)n;
-
-    if (hdr_end < 0) {
-      /* Search for CRLF CRLF starting from a bit before the new bytes so we
-         catch a separator that straddles two reads.                          */
-      size_t start = (len > (size_t)(n + 3)) ? (len - (size_t)n - 3) : 0;
-      for (size_t i = start; i + 3 < len; i++) {
-        if (buf[i] == '\r' && buf[i+1] == '\n' &&
-            buf[i+2] == '\r' && buf[i+3] == '\n') {
-          hdr_end = (int)(i + 3);
-          break;
-        }
-      }
-      if (hdr_end >= 0) {
-        /* Find Content-Length in the header block.                            */
-        const char *p = buf;
-        const char *end = buf + hdr_end - 3;     /* just before the trailing CRLF */
-        /* Skip the request line.                                              */
-        while (p < end && !(p[0] == '\r' && p[1] == '\n')) p++;
-        if (p < end) p += 2;
-        while (p < end) {
-          const char *nl = p;
-          while (nl < end && !(nl[0] == '\r' && nl[1] == '\n')) nl++;
-          if (nl - p >= 16 && strncasecmp(p, "Content-Length:", 15) == 0) {
-            const char *vp = p + 15;
-            while (vp < nl && (*vp == ' ' || *vp == '\t')) vp++;
-            content_length = strtol(vp, NULL, 10);
-            if (content_length < 0) content_length = 0;
-            break;
-          }
-          if (nl >= end) break;
-          p = nl + 2;
-        }
-        need_body = (content_length > 0) ? 1 : 0;
-      }
-    }
-
-    if (hdr_end >= 0) {
-      size_t body_have = len - (size_t)(hdr_end + 1);
-      if (!need_body || body_have >= (size_t)content_length) break;
-    }
-  }
-
-  if (hdr_end < 0 && len == 0) { free(buf); return 0; }
-
-  struct __httpd_rawreq *r = malloc(sizeof(*r));
-  r->bytes = buf;
-  r->len   = (int)len;
-  return (int64_t)(intptr_t)r;
-  ```)
-
-(defn srv-raw-bytes [raw : int] : cstr
-  ```c
-  return ((struct __httpd_rawreq *)(intptr_t)raw)->bytes;
-  ```)
-
-(defn srv-raw-len [raw : int] : int
-  ```c
-  return (int64_t)((struct __httpd_rawreq *)(intptr_t)raw)->len;
-  ```)
-
-(defn srv-raw-free [raw : int] : void
-  ```c
-  if (raw == 0) return;
-  struct __httpd_rawreq *r = (struct __httpd_rawreq *)(intptr_t)raw;
-  free(r->bytes);
-  free(r);
-  ```)
-
-;; Loop write(2) until all bytes are sent or an error occurs.  Returns 0 on
-;; success, -1 on error.  EPIPE / EINTR retried as appropriate.
-(defn srv-write-all [fd : int buf : cstr len : int] : int
-  ```c
-  int f = (int)fd;
-  if (f < 0) return -1;
-  const char *p = (const char *)buf;
-  size_t remaining = (size_t)(int)len;
-  while (remaining > 0) {
-    ssize_t n = write(f, p, remaining);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      return -1;
-    }
-    p += (size_t)n;
-    remaining -= (size_t)n;
-  }
-  return 0;
-  ```)
 
 ;; Invoke a handler function pointer: handler(req) -> resp.
-(defn srv-call-handler [handler : ptr<void> req : int] : int
+(defn srv-call-handler [handler : (c-fn [int] int) req : int] : int
   ```c
   typedef int64_t (*handler_fn)(int64_t);
-  return ((handler_fn)handler)((int64_t)req);
+  return ((handler_fn)(intptr_t)handler)((int64_t)req);
   ```)
 
 ;; Invoke a two-arg handler function pointer: handler(conn, req) -> resp.
-(defn srv-call-handler-conn [handler : ptr<void> conn : int req : int] : int
+(defn srv-call-handler-conn [handler : (c-fn [int int] int) conn : int req : int] : int
   ```c
   typedef int64_t (*handler_fn)(int64_t, int64_t);
-  return ((handler_fn)handler)((int64_t)conn, (int64_t)req);
+  return ((handler_fn)(intptr_t)handler)((int64_t)conn, (int64_t)req);
   ```)
+
+;; Write a Response value onto the stdlib conn: status, every header in order
+;; (stdlib owns Content-Length and Connection; a `Connection: close` header is
+;; honoured by closing after this response), and the body, binary-safe.  A
+;; null Response is a handler bug and is answered 500.
+(defn srv-send-response [hc : ptr<void> resp : Response] : void
+  ```c
+  struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
+  if (!r) {
+    __TUR_CNAME_httpd-resp-status!__(hc, 500);
+    __TUR_CNAME_httpd-resp-body!__(hc, "handler returned no response");
+    return;
+  }
+  __TUR_CNAME_httpd-resp-status!__(hc, r->status);
+  for (int i = 0; i < r->hdr_count; i++) {
+    const char *k = r->hdr_keys[i], *v = r->hdr_vals[i];
+    if (strcasecmp(k, "Connection") == 0) {
+      for (const char *p = v; *p; p++)
+        if (strncasecmp(p, "close", 5) == 0) { __TUR_CNAME_httpd-resp-close!__(hc); break; }
+      continue;
+    }
+    __TUR_CNAME_httpd-resp-header-add!__(hc, k, v);
+  }
+  __TUR_CNAME_httpd-resp-body-bytes!__(hc, r->body, (int64_t)r->body_len);
+  ```)
+
+(defn srv-null? [p : ptr<void>] : bool
+  ```c return p == NULL; ```)
+
+;;; take-conn-response -- move what a stdlib helper wrote on the conn into a
+;;; Response.
+;;;
+;;; For a typed handler that lets a stdlib function answer -- stdlib's
+;;; httpd-static-serve!, say -- and must hand the server a Response: the
+;;; conn's status (200 when unset), headers and body (binary-safe) move into a
+;;; new Response, and the conn's pending response is cleared, so the server
+;;; writes them once, from the Response.
+;;;
+;;; Parameters:
+;;;   hc -- the stdlib httpd conn of the current request (request-conn)
+;;;
+;;; Returns:
+;;;   Response -- owned by the caller, like any handler's Response.
+;;;
+;;; Example:
+;;;   (if (httpd-static-serve! hc "./public" path)
+;;;     (take-conn-response hc)
+;;;     (not-found))
+;;;
+;;; Since: tourist-on-stdlib-httpd H5
+(defn take-conn-response [hc : ptr<void>] : Response
+  ```c
+  HttpdConn *c = (HttpdConn *)hc;
+  struct __httpd_resp *r = (struct __httpd_resp *)calloc(1, sizeof *r);
+  if (!r) return 0;
+  int n = 0;
+  for (HttpdHeader *h = c ? (HttpdHeader *)c->resp_headers : NULL; h; h = h->next) n++;
+  r->hdr_cap = n > 4 ? n : 4;
+  r->hdr_keys = (char **)malloc(sizeof(char *) * (size_t)r->hdr_cap);
+  r->hdr_vals = (char **)malloc(sizeof(char *) * (size_t)r->hdr_cap);
+  if (!r->hdr_keys || !r->hdr_vals) {
+    free(r->hdr_keys); free(r->hdr_vals); free(r);
+    return 0;
+  }
+  r->status = (c && c->resp_status) ? c->resp_status : 200;
+  if (c && c->resp_body) {
+    r->body = c->resp_body;
+    r->body_len = c->resp_body_len;
+    c->resp_body = NULL;
+    c->resp_body_len = 0;
+  } else {
+    r->body = (char *)calloc(1, 1);
+  }
+  if (c) {
+    HttpdHeader *h = (HttpdHeader *)c->resp_headers;
+    while (h) {
+      HttpdHeader *nx = h->next;
+      r->hdr_keys[r->hdr_count] = h->name ? h->name : strdup("");
+      r->hdr_vals[r->hdr_count] = h->value ? h->value : strdup("");
+      r->hdr_count++;
+      free(h);
+      h = nx;
+    }
+    c->resp_headers = NULL;
+    c->resp_status = 0;
+  }
+  return (int64_t)(intptr_t)r;
+  ```)
+
+;;; serve-httpd-request -- internal: serve one stdlib httpd request with a
+;;; one-arg (Request -> Response) handler.  The body of the stdlib handler
+;;; closure every server-start* builds.
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn serve-httpd-request [hc : ptr<void> handler : (c-fn [int] int)] : nil
+  (let [req (request-view-new hc)]
+    (if (= (:: req :int) 0)
+      (httpd-resp-status! hc 500)
+      (srv-serve-view hc req handler))))
+
+;; The view is released by a defer, so a handler that panics (under a
+;; server-start-wrapped mw-recover) does not leak it.
+(defn srv-serve-view [hc : ptr<void> req : Request handler : (c-fn [int] int)] : nil
+  (defer (request-view-free req))
+  (let [resp (:: (srv-call-handler handler (:: req :int)) :Response)]
+    (srv-send-response hc resp)
+    (free-response resp)))
+
+;;; serve-httpd-request-conn -- internal: serve one stdlib httpd request with a
+;;; two-arg (Conn, Request -> Response) handler.  When the handler took the
+;;; connection (conn-mark-upgraded!) its Response is discarded unsent.
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn serve-httpd-request-conn [hc : ptr<void> handler : (c-fn [int int] int)] : nil
+  (let [req  (request-view-new hc)
+        conn (conn-of-httpd hc)]
+    (if (or (= (:: req :int) 0) (= (:: conn :int) 0))
+      (do
+        (request-view-free req)
+        (conn-free conn)
+        (httpd-resp-status! hc 500))
+      (srv-serve-view-conn hc conn req handler))))
+
+;; As srv-serve-view, for the two-arg handler.
+(defn srv-serve-view-conn [hc : ptr<void> conn : Conn req : Request
+                           handler : (c-fn [int int] int)] : nil
+  (defer (do (conn-free conn) (request-view-free req)))
+  (let [resp (:: (srv-call-handler-conn handler (:: conn :int) (:: req :int)) :Response)]
+    (when (not (conn-upgraded? conn))
+      (srv-send-response hc resp))
+    (free-response resp)))
 
 ;; =============================================================================
-;; Per-connection worker -- the "dispatch trait" the H7 pool will also reuse.
-;; Entry: a malloc'd __httpd_warg { client_fd, handler }, ownership transferred.
+;; Server state + the thread that runs httpd-run
 ;; =============================================================================
-
-(defn srv-worker-loop [arg : ptr<void>] : ptr<void>
-  ```c
-  ```
-  (let [warg-int (srv-warg->int arg)
-        client-fd (srv-warg-fd warg-int)
-        handler (srv-warg-handler warg-int)
-        conn-mode (srv-warg-conn-mode warg-int)]
-    (srv-warg-free warg-int)
-    (let [raw (srv-recv-request client-fd)]
-      (if (= raw 0)
-        (srv-close-fd client-fd)
-        (let [req (parse-request (srv-raw-bytes raw) (srv-raw-len raw))]
-          (if (= req 0)
-            (do (srv-raw-free raw)
-                (srv-close-fd client-fd))
-            (if (= conn-mode 0)
-              ;; Single-arg handler: Request -> Response. Worker owns the fd.
-              (let [resp (:: (srv-call-handler handler req) :Response)
-                    wbuf (serialize-response resp)]
-                (srv-write-all client-fd (wbuf-bytes wbuf) (wbuf-len wbuf))
-                (free-wbuf wbuf)
-                (free-response resp)
-                (free-request (:: req :Request))
-                (srv-raw-free raw)
-                (srv-close-fd client-fd))
-              ;; Two-arg handler: Conn, Request -> Response. If the handler
-              ;; upgraded the connection it has taken ownership of the fd, so
-              ;; skip serialize / write / close entirely.
-              (let [conn (conn-new client-fd)
-                    resp (:: (srv-call-handler-conn handler (:: conn :int) req) :Response)]
-                (if (conn-upgraded? conn)
-                  (do
-                    (free-response resp)
-                    (free-request (:: req :Request))
-                    (srv-raw-free raw)
-                    (conn-free conn))
-                  (let [wbuf (serialize-response resp)]
-                    (srv-write-all client-fd (wbuf-bytes wbuf) (wbuf-len wbuf))
-                    (free-wbuf wbuf)
-                    (free-response resp)
-                    (free-request (:: req :Request))
-                    (srv-raw-free raw)
-                    (conn-free conn)
-                    (srv-close-fd client-fd))))))))))
-  (srv-null-ptr))
-
-;; WorkerArg accessors -- the worker is a Turmeric function so we expose the
-;; arg struct fields through accessors instead of mutating C locals.
-(defn srv-warg->int [arg : ptr<void>] : int
-  ```c
-  return (int64_t)(intptr_t)arg;
-  ```)
-
-(defn srv-warg-fd [arg : int] : int
-  ```c
-  return (int64_t)((struct __httpd_warg *)(intptr_t)arg)->client_fd;
-  ```)
-
-(defn srv-warg-handler [arg : int] : ptr<void>
-  ```c
-  return ((struct __httpd_warg *)(intptr_t)arg)->handler;
-  ```)
-
-(defn srv-warg-conn-mode [arg : int] : int
-  ```c
-  return (int64_t)((struct __httpd_warg *)(intptr_t)arg)->conn_mode;
-  ```)
-
-(defn srv-warg-free [arg : int] : void
-  ```c
-  free((void *)(intptr_t)arg);
-  ```)
 
 (defn srv-null-ptr [] : ptr<void>
-  ```c
-  return NULL;
-  ```)
+  ```c return NULL; ```)
 
-;; Spawn a detached worker thread for one connection.
-(defn srv-spawn-worker [handler : ptr<void> client-fd : int] : void
-  ```c
-  /* Forward decl: srv-worker-loop is defined in this same translation unit. */
-  extern void *httpd__server__srv_hyworker_hyloop(void *);
-  struct __httpd_warg *wa = malloc(sizeof(*wa));
-  if (!wa) {
-    close((int)client_fd);
-    return;
-  }
-  wa->client_fd = (int)client_fd;
-  wa->handler   = (void *)handler;
-  wa->conn_mode = 0;
-  pthread_t tid;
-  if (pthread_create(&tid, NULL, httpd__server__srv_hyworker_hyloop, wa) != 0) {
-    free(wa);
-    close((int)client_fd);
-    return;
-  }
-  pthread_detach(tid);
-  ```)
+;; Thread entry: run the stdlib server until httpd-stop.
+(defn srv-run-loop [h : ptr<void>] : ptr<void>
+  (httpd-run h)
+  (srv-null-ptr))
 
-;; =============================================================================
-;; Server state + listener thread
-;; =============================================================================
+(defn srv-state-h [s : ptr<void>] : ptr<void>
+  ```c return ((struct __httpd_server *)s)->h; ```)
 
-(defn srv-state-new [listen-fd : int handler : (c-fn [int] int)] : ptr<void>
-  ```c
-  struct __httpd_server *s = malloc(sizeof(*s));
-  s->listen_fd       = (int)listen_fd;
-  s->handler         = (void *)handler;
-  s->stop_flag       = 0;
-  s->listener_thread = NULL;
-  s->pool            = NULL;
-  return (void *)s;
-  ```)
-
-;; Like srv-state-new but with no per-state handler -- used by the pool-conn
-;; dispatchers, where the handler lives in the pool wrapper and the listener
-;; only ever enqueues (it never spawns a worker directly, so the state's
-;; handler slot is unused).
-(defn srv-state-new-pool [listen-fd : int] : ptr<void>
-  ```c
-  struct __httpd_server *s = malloc(sizeof(*s));
-  s->listen_fd       = (int)listen_fd;
-  s->handler         = NULL;
-  s->stop_flag       = 0;
-  s->listener_thread = NULL;
-  s->pool            = NULL;
-  return (void *)s;
-  ```)
-
-(defn srv-state->int [s : ptr<void>] : int
-  ```c
-  return (int64_t)(intptr_t)s;
-  ```)
-
-(defn srv-state-listen-fd [s : int] : int
-  ```c
-  return (int64_t)((struct __httpd_server *)(intptr_t)s)->listen_fd;
-  ```)
-
-(defn srv-state-handler-ptr [s : int] : ptr<void>
-  ```c
-  return ((struct __httpd_server *)(intptr_t)s)->handler;
-  ```)
-
-(defn srv-state-stopping? [s : int] : int
-  ```c
-  __sync_synchronize();
-  return ((struct __httpd_server *)(intptr_t)s)->stop_flag ? 1 : 0;
-  ```)
-
-(defn srv-state-mark-stopping [s : ptr<void>] : void
+(defn srv-state-join [s : ptr<void>] : void
   ```c
   struct __httpd_server *sv = (struct __httpd_server *)s;
-  sv->stop_flag = 1;
-  __sync_synchronize();
-  ```)
-
-(defn srv-state-close-listen [s : ptr<void>] : void
-  ```c
-  struct __httpd_server *sv = (struct __httpd_server *)s;
-  if (sv->listen_fd >= 0) {
-    shutdown(sv->listen_fd, SHUT_RDWR);
-    close(sv->listen_fd);
-    sv->listen_fd = -1;
-  }
-  ```)
-
-(defn srv-state-set-thread [s : ptr<void> tid : ptr<void>] : void
-  ```c
-  ((struct __httpd_server *)s)->listener_thread = tid;
-  ```)
-
-(defn srv-state-get-thread [s : ptr<void>] : ptr<void>
-  ```c
-  return ((struct __httpd_server *)s)->listener_thread;
-  ```)
-
-(defn srv-state-set-pool [s : ptr<void> pool : ptr<void>] : void
-  ```c
-  ((struct __httpd_server *)s)->pool = (void *)pool;
-  ```)
-
-(defn srv-state-pool [s : int] : ptr<void>
-  ```c
-  return ((struct __httpd_server *)(intptr_t)s)->pool;
-  ```)
-
-(defn srv-state-pool-int [s : int] : int
-  ```c
-  return (int64_t)(intptr_t)((struct __httpd_server *)(intptr_t)s)->pool;
+  if (!sv->thread) return;
+  pthread_join(*(pthread_t *)sv->thread, NULL);
+  free(sv->thread);
+  sv->thread = NULL;
   ```)
 
 (defn srv-state-free [s : ptr<void>] : void
-  ```c
-  free(s);
-  ```)
+  ```c free(s); ```)
 
-;; The listener-loop entry: arg = struct __httpd_server *.
-(defn srv-listener-loop [arg : ptr<void>] : ptr<void>
-  (let [s-int (srv-state->int arg)
-        listen-fd (srv-state-listen-fd s-int)
-        handler (srv-state-handler-ptr s-int)]
-    (while (= (srv-state-stopping? s-int) 0)
-      (let [client-fd (srv-accept-one listen-fd)]
-        (when (>= client-fd 0)
-          ;; accept() failed -> loop guard re-checks stop_flag and exits if set.
-          (if (= (srv-state-pool-int s-int) 0)
-            (srv-spawn-worker handler client-fd)
-            (pool-enqueue (srv-state-pool s-int) client-fd))))))
-  (srv-null-ptr))
+;;; server-launch -- internal: run a stdlib httpd server on a background
+;;; thread and wrap it in this spice's server handle.
+;;;
+;;; Takes ownership of `h` (frees it if the thread cannot be started).
+;;;
+;;; Parameters:
+;;;   h -- a stdlib httpd pool server handle, or NULL
+;;;
+;;; Returns:
+;;;   :ptr<void> -- the server handle for server-stop, or NULL.
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn server-launch [h : ptr<void>] : ptr<void>
+  (if (srv-null? h)
+    (srv-null-ptr)
+    (let [s (srv-spawn h)]
+      (when (srv-null? s) (httpd-free h))
+      s)))
 
-(defn srv-spawn-listener [s : ptr<void>] : ptr<void>
+(defn srv-spawn [h : ptr<void>] : ptr<void>
   ```c
-  extern void *httpd__server__srv_hylistener_hyloop(void *);
-  pthread_t *tid = malloc(sizeof(*tid));
-  if (!tid) return NULL;
-  if (pthread_create(tid, NULL, httpd__server__srv_hylistener_hyloop, s) != 0) {
-    free(tid);
-    return NULL;
+  extern void *httpd__server__srv_hyrun_hyloop(void *);
+  struct __httpd_server *s = (struct __httpd_server *)calloc(1, sizeof *s);
+  if (!s) return NULL;
+  pthread_t *tid = (pthread_t *)malloc(sizeof *tid);
+  if (!tid) { free(s); return NULL; }
+  if (pthread_create(tid, NULL, httpd__server__srv_hyrun_hyloop, h) != 0) {
+    free(tid); free(s); return NULL;
   }
-  return (void *)tid;
+  s->h = h;
+  s->thread = (void *)tid;
+  return (void *)s;
   ```)
 
-(defn srv-join-listener [tid : ptr<void>] : void
-  ```c
-  if (!tid) return;
-  pthread_t *t = (pthread_t *)tid;
-  pthread_join(*t, NULL);
-  free(t);
-  ```)
+;;; server-tls-ctx -- internal: the TLS context recorded on a server handle.
+(defn server-tls-ctx [s : ptr<void>] : int
+  ```c return s ? ((struct __httpd_server *)s)->tls_ctx : 0; ```)
+
+;;; server-set-tls-ctx! -- internal: record the TLS context httpd/tls frees.
+(defn server-set-tls-ctx! [s : ptr<void> ctx : int] : void
+  ```c if (s) ((struct __httpd_server *)s)->tls_ctx = (int64_t)ctx; ```)
+
+(defn srv-clamp-pool [size : int] : int
+  (if (< size 1) 1 size))
+
+;; Apply ServerOpts' per-server limits to a stdlib handle (NULL-safe).
+(defn srv-apply-opts [h : ptr<void> opts : ServerOpts] : ptr<void>
+  (httpd-server-set-max-body! h (.max-body opts))
+  (httpd-server-set-read-timeout! h (.read-timeout-ms opts))
+  h)
 
 ;; =============================================================================
 ;; Public API
 ;; =============================================================================
 
-;; Default pool size used by `server-start`.  Kept as a defn rather than a
-;; toplevel def so it can be tweaked without touching the call sites.
+;; Default pool size used by `server-start`: the spice server's historical 8
+;; (stdlib httpd-new uses 4).
 (defn srv-default-pool-size [] : int 8)
 
 ;;; server-start -- bind a TCP listener on `port` and dispatch requests to
-;;; `handler` via a bounded pool of worker threads (default size 8).
+;;; `handler` on a pool of 8 worker threads.
 ;;;
-;;; This is the recommended entry point.  Use server-start-pool to choose
-;;; the pool size explicitly, or server-start-spawn for the legacy
-;;; thread-per-connection model (H6 dispatch mode).
+;;; This is the recommended entry point.  Use server-start-pool to choose the
+;;; pool size, or server-start-opts for the body cap and read timeout too.
 ;;;
 ;;; Parameters:
-;;;   port    -- TCP port to bind on (IPv4, INADDR_ANY)
+;;;   port    -- TCP port to bind on (0 = kernel-assigned; see server-port).
+;;;              127.0.0.1 unless the program called httpd-set-bind-any! or
+;;;              httpd-set-bind-addr!.
 ;;;   handler -- captureless `(c-fn [int] int)` request handler.  Define
 ;;;              it as a top-level defn of type `[req : int] : int`
 ;;;              returning a Response handle, and pass the defn name.
 ;;;              The handler is invoked from a worker thread; it must be
 ;;;              Send-safe.  The server takes ownership of the Response
-;;;              it returns (it is freed after the response is written,
-;;;              regardless of write return value).
+;;;              it returns (it is freed after the response is written).
 ;;;
 ;;; Returns:
 ;;;   :ptr<void> -- opaque server handle.  Pass to server-stop to shut down,
-;;;                 or NULL if the listening socket / pool could not be
-;;;                 created.
+;;;                 or NULL if the listening socket could not be created.
 ;;;
 ;;; Example:
 ;;;   (defn my-handler [req :int] :int
@@ -584,25 +398,30 @@ void * httpd__server__srv_worker_loop_trampoline(void *arg) {
 ;;;
 ;;; Since: H7
 (defn server-start-pool [port : int handler : (c-fn [int] int) size : int] : ptr<void>
-  (let [fd (srv-make-listener port)]
-    (if (< fd 0)
-      (srv-null-ptr)
-      (let [pool (pool-new size handler)]
-        (if (= (srv-state->int pool) 0)
-          (do (srv-close-fd fd)
-              (srv-null-ptr))
-          (let [s (srv-state-new fd handler)]
-            (srv-state-set-pool s pool)
-            (let [tid (srv-spawn-listener s)]
-              (if (= (srv-state->int tid) 0)
-                (do
-                  (pool-stop pool)
-                  (srv-close-fd fd)
-                  (srv-state-free s)
-                  (srv-null-ptr))
-                (do
-                  (srv-state-set-thread s tid)
-                  s)))))))))
+  (server-launch
+    (httpd-new-pool port (srv-clamp-pool size)
+      (fn [c : ptr<void>] : nil (serve-httpd-request c handler)))))
+
+;;; server-start-opts -- like server-start, configured by a ServerOpts.
+;;;
+;;; Parameters:
+;;;   port    -- TCP port to bind on
+;;;   handler -- (c-fn [int] int) request handler (see server-start)
+;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
+;;;
+;;; Returns:
+;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+;;;
+;;; Example:
+;;;   (server-start-opts 8080 my-handler (make-struct ServerOpts 8 65536 1000))
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn server-start-opts [port : int handler : (c-fn [int] int) opts : ServerOpts] : ptr<void>
+  (server-launch
+    (srv-apply-opts
+      (httpd-new-pool port (srv-clamp-pool (.pool-size opts))
+        (fn [c : ptr<void>] : nil (serve-httpd-request c handler)))
+      opts)))
 
 ;;; server-start-conn -- like server-start, but the handler receives a Conn
 ;;; alongside the Request: `(c-fn [int int] int)` = (Conn, Request) ->
@@ -610,7 +429,7 @@ void * httpd__server__srv_worker_loop_trampoline(void *arg) {
 ;;; `ws-upgrade`) require: the handler can read the raw fd via `conn-fd`, write
 ;;; its own switch-protocols response, and call `conn-mark-upgraded!` to take
 ;;; ownership of the socket. When a handler does not upgrade, its Response is
-;;; serialized and written exactly as in the single-arg path.
+;;; written exactly as in the single-arg path.
 ;;;
 ;;; Parameters:
 ;;;   port    -- TCP port to bind on
@@ -638,31 +457,141 @@ void * httpd__server__srv_worker_loop_trampoline(void *arg) {
 ;;;
 ;;; Since: WS0
 (defn server-start-pool-conn [port : int handler : (c-fn [int int] int) size : int] : ptr<void>
-  (let [fd (srv-make-listener port)]
-    (if (< fd 0)
-      (srv-null-ptr)
-      (let [pool (pool-new-conn size handler)]
-        (if (= (srv-state->int pool) 0)
-          (do (srv-close-fd fd)
-              (srv-null-ptr))
-          (let [s (srv-state-new-pool fd)]
-            (srv-state-set-pool s pool)
-            (let [tid (srv-spawn-listener s)]
-              (if (= (srv-state->int tid) 0)
-                (do
-                  (pool-stop pool)
-                  (srv-close-fd fd)
-                  (srv-state-free s)
-                  (srv-null-ptr))
-                (do
-                  (srv-state-set-thread s tid)
-                  s)))))))))
+  (server-launch
+    (httpd-new-pool port (srv-clamp-pool size)
+      (fn [c : ptr<void>] : nil (serve-httpd-request-conn c handler)))))
 
-;;; server-start-spawn -- thread-per-connection fallback (H6 dispatch mode).
+;;; server-start-conn-opts -- like server-start-conn, configured by a ServerOpts.
 ;;;
-;;; Spawns a fresh detached pthread for every accepted connection.  Use this
-;;; only when bounded backpressure is undesirable; the pool-based dispatchers
-;;; (server-start, server-start-pool) are the production-grade default.
+;;; Parameters:
+;;;   port    -- TCP port to bind on
+;;;   handler -- (c-fn [int int] int) (Conn, Request) -> Response handler
+;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
+;;;
+;;; Returns:
+;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn server-start-conn-opts [port : int handler : (c-fn [int int] int) opts : ServerOpts] : ptr<void>
+  (server-launch
+    (srv-apply-opts
+      (httpd-new-pool port (srv-clamp-pool (.pool-size opts))
+        (fn [c : ptr<void>] : nil (serve-httpd-request-conn c handler)))
+      opts)))
+
+;; =============================================================================
+;; Stdlib middleware around the handler (tourist-on-stdlib-httpd H4)
+;; =============================================================================
+
+;;; ServerWrap -- a function that puts stdlib middleware around a server's
+;;; handler.
+;;;
+;;; Built by server-wrap; consumed by server-start-wrapped /
+;;; server-start-conn-wrapped, which call it once and release it.
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defopaque ServerWrap :int)
+
+;;; server-wrap -- package a wrap function for server-start-wrapped.
+;;;
+;;; `f` receives the stdlib httpd handler this spice builds (it makes the
+;;; Request view, calls the typed handler, and writes the Response onto the
+;;; conn) and returns the handler the server runs -- typically that one with
+;;; a stack of stdlib middleware around it, so mw-recover, mw-cors-opts,
+;;; mw-log, mw-rate-limit, mw-secure-headers, ... apply to every request.
+;;; Both handlers are stdlib httpd's own representation, the `ptr<void>`
+;;; every stdlib mw-* takes and returns.
+;;;
+;;; Middleware that answers by itself (a CORS preflight, a 429) never reaches
+;;; the typed handler; middleware that runs after `next` sees the Response
+;;; already written onto the conn and may adjust it.
+;;;
+;;; Parameters:
+;;;   f -- (fn [ptr<void>] ptr<void>), called once when the server starts
+;;;
+;;; Returns:
+;;;   ServerWrap -- pass to exactly one server-start-wrapped call
+;;;
+;;; Example:
+;;;   (server-wrap (fn [inner : ptr<void>] : ptr<void>
+;;;                  (compose-middleware inner mw-recover mw-log)))
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defn server-wrap [^fat f : (fn [ptr<void>] ptr<void>)] : ServerWrap
+  (:: (:: f :int) :ServerWrap))
+
+;; Call a ServerWrap on the base handler and release it.  The wrap arrived
+;; through a ^fat parameter: a { thunk, env } closure whose slot 0 takes
+;; (env, arg).
+(defn srv-wrap-apply [wrap : ServerWrap base : ptr<void>] : ptr<void>
+  ```c
+  if (!wrap) return base;
+  typedef void *(*fn1_t)(void *, int64_t);
+  void *h = ((fn1_t)(intptr_t)((int64_t *)(intptr_t)wrap)[0])((void *)(intptr_t)wrap,
+                                                            (int64_t)(intptr_t)base);
+  TUR_CLOSURE_DROP(wrap);
+  return h;
+  ```)
+
+;;; server-start-wrapped -- server-start-opts with stdlib middleware around
+;;; the handler.
+;;;
+;;; Parameters:
+;;;   port    -- TCP port to bind on
+;;;   handler -- (c-fn [int] int) request handler (see server-start)
+;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
+;;;   wrap    -- ServerWrap from server-wrap; called once and released, so
+;;;              build one per server
+;;;
+;;; Returns:
+;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+;;;
+;;; Example:
+;;;   (server-start-wrapped 8080 my-handler (default-server-opts)
+;;;     (server-wrap (fn [inner : ptr<void>] : ptr<void>
+;;;                    (compose-middleware inner mw-recover mw-log))))
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defn server-start-wrapped [port : int handler : (c-fn [int] int) opts : ServerOpts
+                            wrap : ServerWrap] : ptr<void>
+  (server-launch
+    (srv-apply-opts
+      (httpd-new-pool port (srv-clamp-pool (.pool-size opts))
+        (srv-wrap-apply wrap
+          (:: (fn [c : ptr<void>] : nil (serve-httpd-request c handler)) :ptr<void>)))
+      opts)))
+
+;;; server-start-conn-wrapped -- server-start-conn-opts with stdlib middleware
+;;; around the handler (see server-start-wrapped).
+;;;
+;;; A handler that upgrades the connection leaves the middleware nothing to
+;;; write: post-processing that sets headers on an upgraded request is
+;;; ignored.
+;;;
+;;; Parameters:
+;;;   port    -- TCP port to bind on
+;;;   handler -- (c-fn [int int] int) (Conn, Request) -> Response handler
+;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
+;;;   wrap    -- ServerWrap from server-wrap; called once and released
+;;;
+;;; Returns:
+;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+;;;
+;;; Since: tourist-on-stdlib-httpd H4
+(defn server-start-conn-wrapped [port : int handler : (c-fn [int int] int) opts : ServerOpts
+                                 wrap : ServerWrap] : ptr<void>
+  (server-launch
+    (srv-apply-opts
+      (httpd-new-pool port (srv-clamp-pool (.pool-size opts))
+        (srv-wrap-apply wrap
+          (:: (fn [c : ptr<void>] : nil (serve-httpd-request-conn c handler)) :ptr<void>)))
+      opts)))
+
+;;; server-start-spawn -- compatibility entry point: a pool of 64 workers.
+;;;
+;;; This used to spawn a detached thread per connection.  stdlib httpd has a
+;;; bounded pool only, so it now runs one with 64 workers (and stdlib's cap
+;;; of 512 queued connections); prefer server-start-pool.
 ;;;
 ;;; Parameters:
 ;;;   port    -- TCP port to bind on
@@ -676,28 +605,32 @@ void * httpd__server__srv_worker_loop_trampoline(void *arg) {
 ;;;
 ;;; Since: H7
 (defn server-start-spawn [port : int handler : (c-fn [int] int)] : ptr<void>
-  (let [fd (srv-make-listener port)]
-    (if (< fd 0)
-      (srv-null-ptr)
-      (let [s (srv-state-new fd handler)
-            tid (srv-spawn-listener s)]
-        (if (= (srv-state->int tid) 0)
-          (do
-            (srv-close-fd fd)
-            (srv-state-free s)
-            (srv-null-ptr))
-          (do
-            (srv-state-set-thread s tid)
-            s))))))
+  (server-start-pool port handler 64))
 
-;;; server-stop -- signal the listener to stop, close the socket, join the
-;;; listener thread, and (when a pool is attached) drain + join all workers.
+;;; server-port -- the TCP port a server is listening on.
 ;;;
-;;; In spawn mode, detached worker threads in flight are NOT joined; they
-;;; finish on their own.  In pool mode (the default), every queued
-;;; connection is processed before pool-stop returns, then every worker is
-;;; joined -- so once server-stop returns, no httpd-owned threads are still
-;;; running.
+;;; Useful after starting on port 0 (kernel-assigned).
+;;;
+;;; Parameters:
+;;;   s -- server handle from a server-start* function
+;;;
+;;; Returns:
+;;;   :int -- the port, or -1 for a NULL handle.
+;;;
+;;; Example:
+;;;   (let [srv (server-start 0 my-handler)]
+;;;     (println (server-port srv)))
+;;;
+;;; Since: tourist-on-stdlib-httpd H2
+(defn server-port [s : ptr<void>] : int
+  (if (srv-null? s) -1 (httpd-port (srv-state-h s))))
+
+;;; server-stop -- stop the server and release it.
+;;;
+;;; Stops accepting, lets the workers finish the connections already queued,
+;;; joins every thread, and frees the server.  Once it returns no httpd-owned
+;;; thread is running.  A connection a handler upgraded belongs to that
+;;; handler and is not closed here.
 ;;;
 ;;; Parameters:
 ;;;   s -- :ptr<void> server handle returned by server-start (or NULL: no-op).
@@ -710,13 +643,11 @@ void * httpd__server__srv_worker_loop_trampoline(void *arg) {
 ;;;
 ;;; Since: H6 (pool join added in H7)
 (defn server-stop [s : ptr<void>] : void
-  (when (not= (srv-state->int s) 0)
-    (do
-      (srv-state-mark-stopping s)
-      (srv-state-close-listen s)
-      (srv-join-listener (srv-state-get-thread s))
-      (when (not= (srv-state-pool-int (srv-state->int s)) 0)
-        (pool-stop (srv-state-pool (srv-state->int s))))
+  (when (not (srv-null? s))
+    (let [h (srv-state-h s)]
+      (httpd-stop h)
+      (srv-state-join s)
+      (httpd-free h)
       (srv-state-free s))))
 
 ) ;; end defmodule httpd/server

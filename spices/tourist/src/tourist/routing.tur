@@ -72,6 +72,23 @@
   return ((__tur_cons *)(intptr_t)lst)->tail;
   ```)
 
+;; Replace a cell's tail in place; returns the cell.
+(defn __rt-cons-set-tail! [lst : int t : int] : int
+  ```c
+  typedef struct { int64_t head; int64_t tail; } __tur_cons;
+  ((__tur_cons *)(intptr_t)lst)->tail = t;
+  return lst;
+  ```)
+
+;; Free a list's cells, not what they hold (the heads now belong elsewhere).
+(defn __rt-spine-free [lst : int] : void
+  ```c
+  #include <stdlib.h>
+  typedef struct { int64_t head; int64_t tail; } __tur_cons;
+  __tur_cons *c = (__tur_cons *)(intptr_t)lst;
+  while (c) { __tur_cons *nx = (__tur_cons *)(intptr_t)c->tail; free(c); c = nx; }
+  ```)
+
 ;; -- mount! -- box a (prefix, item) pair into an :int handle ----------------
 
 ;;; mount! -- build a (prefix, sub-app) mount entry for url-map!.
@@ -399,16 +416,18 @@
 ;; -- url-map! constructor ---------------------------------------------------
 
 ;;; __insert-sorted -- insert mount m into a longest-prefix-first MountList.
+;;; Relinks the existing cells (it used to copy the cells ahead of the
+;;; insertion point and drop the originals).
 (defn __insert-sorted [m : Mount lst : MountList] : MountList
   (if (= (:: lst :int) 0)
     (:: (__rt-cons (:: m :int) 0) :MountList)
     (if (> (__mount-prefix-len m)
            (__mount-prefix-len (:: (__rt-cons-head (:: lst :int)) :Mount)))
       (:: (__rt-cons (:: m :int) (:: lst :int)) :MountList)
-      (:: (__rt-cons (__rt-cons-head (:: lst :int))
-                     (:: (__insert-sorted m
-                           (:: (__rt-cons-tail (:: lst :int)) :MountList))
-                         :int))
+      (:: (__rt-cons-set-tail! (:: lst :int)
+                               (:: (__insert-sorted m
+                                     (:: (__rt-cons-tail (:: lst :int)) :MountList))
+                                   :int))
           :MountList))))
 
 ;;; __build-mounts -- consume the variadic cons list of Mount handles and
@@ -452,6 +471,9 @@
   (let [empty  (:: 0 :MountList)
         sorted (__build-mounts (:: mounts :MountList) empty)
         sa     (__subapp-alloc 0 (:: sorted :int))]
+    ;; The sorted list holds the mounts now; the variadic list's own cells
+    ;; are spent.
+    (__rt-spine-free (:: mounts :int))
     (route-new "__subapp" sa 0)))
 
 ;; -- cascade! / cascade-with! ----------------------------------------------

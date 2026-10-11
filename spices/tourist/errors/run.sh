@@ -101,6 +101,9 @@ expect_reject swap-reject.tur TUR-E0001 \
 expect_reject swap-reject.tur TUR-E0001 \
   'expected ItemList, got Item' \
   'mw-chain-run rejects a single Item as an ItemList'
+expect_reject param-type-mismatch.tur TUR-E0001 \
+  'expected cstr, got (Result cstr cstr)' \
+  'a (Result cstr cstr) from param is not a cstr'
 
 echo "1..$n"
 if [ "$fail" -ne 0 ]; then

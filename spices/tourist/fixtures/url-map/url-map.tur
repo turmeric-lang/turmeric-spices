@@ -10,12 +10,21 @@
   (import httpd/types     :refer [Response])
   (import httpd/request   :refer [req-path])
   (import httpd/types     :refer [Request])
-  (import httpd/server    :refer [server-stop])
-  (import http/client     :refer [http-get])
+  (import httpd/server    :refer [server-port server-stop])
+  (import http/client     :refer [http-get http-result-free])
   (import http/response   :refer [response-status response-body])
   (import test/suite      :refer [describe it])
   (import test/assert     :refer [assert-eq assert-true])
-  (import test/runner     :refer [run-all])
+  (import test/runner     :refer [run-all-status])
+
+  ;; url-for -- the test server's URL for `path` (the port is kernel-assigned).
+  (defn url-for [port : int path : cstr] : cstr
+    ```c
+    #include <stdio.h>
+    static __thread char u[256];
+    snprintf(u, sizeof u, "http://127.0.0.1:%d%s", (int)port, path);
+    return u;
+    ```)
 
   (defn __cr-ok? [r : ptr<void>] : bool
     ```c
@@ -27,12 +36,6 @@
     return tur_ok_value((int64_t)(intptr_t)r);
     ```)
 
-  (defn sleep-ms [ms : int] #fx{Unsafe} : void
-    ```c
-    #include <unistd.h>
-    if (ms > 0) usleep((useconds_t)ms * 1000u);
-    ```)
-
   (defn cstr-eq? [a : cstr b : cstr] : bool
     ```c
     #include <string.h>
@@ -42,17 +45,11 @@
   ;; Inline join -- avoid str-concat elaborator issue through multiple spices.
   (defn __join4 [a : cstr b : cstr c : cstr d : cstr] : cstr
     ```c
-    #include <stdlib.h>
-    #include <string.h>
-    const char *sa = (const char *)a, *sb = (const char *)b;
-    const char *sc = (const char *)c, *sd = (const char *)d;
-    size_t la = strlen(sa), lb = strlen(sb), lc = strlen(sc), ld = strlen(sd);
-    char *out = malloc(la + lb + lc + ld + 1);
-    memcpy(out,                sa, la);
-    memcpy(out + la,           sb, lb);
-    memcpy(out + la + lb,      sc, lc);
-    memcpy(out + la + lb + lc, sd, ld + 1);
-    return (const char *)out;
+    #include <stdio.h>
+    static __thread char out[1024];
+    snprintf(out, sizeof out, "%s%s%s%s", (const char *)a, (const char *)b,
+             (const char *)c, (const char *)d);
+    return out;
     ```)
 
   ;; A handler that echoes "stripped=<req-path> full=<req-full-path>"
@@ -65,43 +62,50 @@
               (mount! "/"      (get! "/" echo-paths))))
 
   (defn main [] : int
-    (let [srv (tourist 18120
+    (let [srv (tourist 0
                 (url-map! (mount! "/api" (api-app))
-                          (mount! "/"    (get! "/" echo-paths))))]
+                          (mount! "/"    (get! "/" echo-paths))))
+          port (server-port srv)]
       (do
-        (unsafe (sleep-ms 50))
         (describe "tourist url-map!"
           (it "GET /api/users hits the nested /users sub-app"
-            (let [r (http-get "http://127.0.0.1:18120/api/users")]
-              (if (__cr-ok? r)
-                (do
-                  (assert-eq 200 (response-status (__cr-val r)))
-                  (assert-true
-                    (cstr-eq? "stripped=/ full=/api/users"
-                              (response-body (__cr-val r)))))
-                (assert-true false))))
+            (let [r    (http-get (url-for port "/api/users"))
+                  __ok (if (__cr-ok? r)
+                         (do
+                           (assert-eq 200 (response-status (__cr-val r)))
+                           (assert-true
+                             (cstr-eq? "stripped=/ full=/api/users"
+                                       (response-body (__cr-val r)))))
+                         (assert-true false))]
+              (http-result-free r)
+              __ok))
           (it "GET /api falls through to /api root sub-app"
-            (let [r (http-get "http://127.0.0.1:18120/api")]
-              (if (__cr-ok? r)
-                (assert-eq 200 (response-status (__cr-val r)))
-                (assert-true false))))
+            (let [r    (http-get (url-for port "/api"))
+                  __ok (if (__cr-ok? r)
+                         (assert-eq 200 (response-status (__cr-val r)))
+                         (assert-true false))]
+              (http-result-free r)
+              __ok))
           (it "GET / hits the catch-all"
-            (let [r (http-get "http://127.0.0.1:18120/")]
-              (if (__cr-ok? r)
-                (do
-                  (assert-eq 200 (response-status (__cr-val r)))
-                  (assert-true
-                    (cstr-eq? "stripped=/ full=/"
-                              (response-body (__cr-val r)))))
-                (assert-true false))))
+            (let [r    (http-get (url-for port "/"))
+                  __ok (if (__cr-ok? r)
+                         (do
+                           (assert-eq 200 (response-status (__cr-val r)))
+                           (assert-true
+                             (cstr-eq? "stripped=/ full=/"
+                                       (response-body (__cr-val r)))))
+                         (assert-true false))]
+              (http-result-free r)
+              __ok))
           (it "GET /missing returns 404 (no matching prefix without catch-all in sub-app)"
             ;; "/" catch-all at the top-level matches; req-path is "/missing".
             ;; The inner Route is (get! "/" ...) which only matches "/" -- so
             ;; the inner dispatch returns 0 and the outer dispatcher 404s.
-            (let [r (http-get "http://127.0.0.1:18120/missing")]
-              (if (__cr-ok? r)
-                (assert-eq 404 (response-status (__cr-val r)))
-                (assert-true false)))))
+            (let [r    (http-get (url-for port "/missing"))
+                  __ok (if (__cr-ok? r)
+                         (assert-eq 404 (response-status (__cr-val r)))
+                         (assert-true false))]
+              (http-result-free r)
+              __ok)))
         (server-stop srv)
-        (run-all)))
-    0))
+        (run-all-status)))))

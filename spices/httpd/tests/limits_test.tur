@@ -1,0 +1,319 @@
+;; tests/limits_test.tur -- what the move onto stdlib httpd buys
+;; (tourist-on-stdlib-httpd-plan H2 acceptance).
+;;
+;; The spice's own server had no body cap, no read timeout and no
+;; keep-alive, closed every connection, served cstr bodies only and could not
+;; name the peer.  Each `it` below pins one of those, over raw sockets so the
+;; client controls exactly what is sent and when:
+;;
+;;   * a Content-Length over the ServerOpts body cap is answered 413;
+;;   * a client that sends half a head and stalls is answered 408;
+;;   * a tenth request is served while nine clients stall on an 8-worker pool;
+;;   * two requests share one keep-alive connection;
+;;   * a body holding NUL bytes round-trips (req-body-len / with-body-bytes);
+;;   * req-remote-addr is 127.0.0.1 on loopback;
+;;   * with-header-set replaces case-insensitively and resp-header reads it.
+;;
+;; Servers start on port 0 and the test asks server-port, so nothing here
+;; collides with another suite's fixed port.
+
+(defmodule httpd/tests/limits
+  (import httpd/types    :refer [Request Response])
+  (import httpd/server   :refer [ServerOpts server-start-opts server-port server-stop])
+  (import httpd/request  :refer [req-path req-body req-body-len req-remote-addr])
+  (import httpd/response :refer [resp-ok with-header with-header-set resp-header
+                                 with-body-bytes])
+  (import test/suite     :refer [describe it])
+  (import test/assert    :refer [assert-true assert-eq])
+  (import test/runner    :refer [run-all-status])
+
+```c
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+static int lim__connect(int port) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+  struct sockaddr_in a; memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return -1; }
+  struct timeval tv = { 5, 0 };          /* never hang the suite */
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  return fd;
+}
+
+static void lim__send(int fd, const char *p, size_t n) {
+  while (n > 0) {
+    ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
+    if (w <= 0) return;
+    p += w; n -= (size_t)w;
+  }
+}
+
+/* Read everything until the peer closes (or the 5 s guard fires). */
+static size_t lim__read_all(int fd, char *buf, size_t cap) {
+  size_t got = 0;
+  while (got + 1 < cap) {
+    ssize_t r = recv(fd, buf + got, cap - 1 - got, 0);
+    if (r <= 0) break;
+    got += (size_t)r;
+  }
+  buf[got] = '\0';
+  return got;
+}
+
+/* Read exactly one response framed by Content-Length; returns its total
+   length, body at *body / *body_len.  0 on failure. */
+static size_t lim__read_one(int fd, char *buf, size_t cap, char **body, size_t *body_len) {
+  size_t got = 0;
+  char *end = NULL;
+  while (!end && got + 1 < cap) {
+    ssize_t r = recv(fd, buf + got, cap - 1 - got, 0);
+    if (r <= 0) return 0;
+    got += (size_t)r; buf[got] = '\0';
+    end = strstr(buf, "\r\n\r\n");
+  }
+  if (!end) return 0;
+  const char *cl = strstr(buf, "Content-Length: ");
+  size_t n = cl ? (size_t)strtoul(cl + 16, NULL, 10) : 0;
+  size_t head = (size_t)(end + 4 - buf);
+  while (got < head + n && got + 1 < cap) {
+    ssize_t r = recv(fd, buf + got, cap - 1 - got, 0);
+    if (r <= 0) return 0;
+    got += (size_t)r;
+  }
+  *body = buf + head;
+  *body_len = n;
+  return head + n;
+}
+
+static int lim__status(const char *buf) {
+  int st = 0;
+  if (sscanf(buf, "HTTP/1.1 %d", &st) != 1) return 0;
+  return st;
+}
+
+static int64_t lim__ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+```
+
+  ;; ---------------------------------------------------------------------
+  ;; Client probes
+  ;; ---------------------------------------------------------------------
+
+  ;; POST `n` bytes of body (Content-Length n) and return the status.
+  (defn post-n-status [port : int n : int] : int
+    ```c
+    int fd = lim__connect((int)port);
+    if (fd < 0) return -1;
+    char head[160];
+    int hl = snprintf(head, sizeof head,
+      "POST /len HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: %d\r\n\r\n", (int)n);
+    lim__send(fd, head, (size_t)hl);
+    char *body = (char *)malloc((size_t)n + 1);
+    memset(body, 'b', (size_t)n);
+    lim__send(fd, body, (size_t)n);
+    free(body);
+    char buf[2048];
+    lim__read_all(fd, buf, sizeof buf);
+    close(fd);
+    return lim__status(buf);
+    ```)
+
+  ;; Send half a request head, then nothing: the status the server answers.
+  (defn stalled-status [port : int] : int
+    ```c
+    int fd = lim__connect((int)port);
+    if (fd < 0) return -1;
+    lim__send(fd, "GET / HTTP/1.1\r\nHost:", 21);
+    char buf[2048];
+    lim__read_all(fd, buf, sizeof buf);
+    close(fd);
+    return lim__status(buf);
+    ```)
+
+  ;; Nine connections that send half a head and stall, then a tenth complete
+  ;; request: 1 when the tenth gets its 200 within 4 s, else 0.
+  (defn tenth-served? [port : int] : bool
+    ```c
+    int stall[9];
+    for (int i = 0; i < 9; i++) {
+      stall[i] = lim__connect((int)port);
+      if (stall[i] >= 0) lim__send(stall[i], "GET /s HTTP/1.1\r\n", 17);
+    }
+    int64_t t0 = lim__ms();
+    int fd = lim__connect((int)port);
+    int ok = 0;
+    if (fd >= 0) {
+      const char *r = "GET /tenth HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+      lim__send(fd, r, strlen(r));
+      char buf[2048];
+      lim__read_all(fd, buf, sizeof buf);
+      ok = lim__status(buf) == 200 && (lim__ms() - t0) < 4000;
+      close(fd);
+    }
+    for (int i = 0; i < 9; i++) if (stall[i] >= 0) close(stall[i]);
+    return ok;
+    ```)
+
+  ;; Two GETs on one connection, the first kept alive: 1 when both are 200
+  ;; with the right bodies and the first response said keep-alive.
+  (defn keep-alive-two? [port : int] : bool
+    ```c
+    int fd = lim__connect((int)port);
+    if (fd < 0) return 0;
+    char buf[4096]; char *body; size_t blen;
+    lim__send(fd, "GET /one HTTP/1.1\r\nHost: x\r\n\r\n", 30);
+    int ok = lim__read_one(fd, buf, sizeof buf, &body, &blen) > 0
+          && lim__status(buf) == 200
+          && strstr(buf, "Connection: keep-alive") != NULL
+          && blen == 4 && memcmp(body, "/one", 4) == 0;
+    if (ok) {
+      lim__send(fd, "GET /two HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 49);
+      ok = lim__read_one(fd, buf, sizeof buf, &body, &blen) > 0
+        && lim__status(buf) == 200
+        && blen == 4 && memcmp(body, "/two", 4) == 0;
+    }
+    close(fd);
+    return ok;
+    ```)
+
+  ;; POST "a\0b\0c" to /bytes: 1 when the same five bytes come back.
+  (defn nul-body-round-trips? [port : int] : bool
+    ```c
+    int fd = lim__connect((int)port);
+    if (fd < 0) return 0;
+    const char head[] = "POST /bytes HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 5\r\n\r\n";
+    lim__send(fd, head, sizeof head - 1);
+    lim__send(fd, "a\0b\0c", 5);
+    char buf[4096]; char *body; size_t blen;
+    int ok = lim__read_one(fd, buf, sizeof buf, &body, &blen) > 0
+          && lim__status(buf) == 200
+          && blen == 5 && memcmp(body, "a\0b\0c", 5) == 0;
+    close(fd);
+    return ok;
+    ```)
+
+  ;; GET `path` and compare the whole body with `want`.
+  (defn body-is? [port : int path : cstr want : cstr] : bool
+    ```c
+    int fd = lim__connect((int)port);
+    if (fd < 0) return 0;
+    char req[256];
+    int n = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", path);
+    lim__send(fd, req, (size_t)n);
+    char buf[4096]; char *body; size_t blen;
+    int ok = lim__read_one(fd, buf, sizeof buf, &body, &blen) > 0
+          && blen == strlen(want) && memcmp(body, want, blen) == 0;
+    close(fd);
+    return ok;
+    ```)
+
+  ;; GET `path` and count the response headers named `name` with value `value`.
+  (defn header-count [port : int path : cstr name : cstr value : cstr] : int
+    ```c
+    int fd = lim__connect((int)port);
+    if (fd < 0) return -1;
+    char req[256];
+    int n = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", path);
+    lim__send(fd, req, (size_t)n);
+    char buf[4096];
+    lim__read_all(fd, buf, sizeof buf);
+    close(fd);
+    char *end = strstr(buf, "\r\n\r\n");
+    if (end) *end = '\0';
+    /* Header names compare case-insensitively; count every line named
+       `name` and how many of those carry exactly `value`. */
+    size_t nl = strlen(name), vl = strlen(value);
+    int count = 0, matched = 0;
+    for (char *line = strstr(buf, "\r\n"); line; line = strstr(line + 2, "\r\n")) {
+      char *h = line + 2;
+      if (strncasecmp(h, name, nl) == 0 && h[nl] == ':' && h[nl + 1] == ' ') {
+        count++;
+        char *v = h + nl + 2;
+        if (strncmp(v, value, vl) == 0 && (v[vl] == '\r' || v[vl] == '\0')) matched++;
+      }
+    }
+    return count == matched ? count : -count;
+    ```)
+
+  (defn sleep-ms [ms : int] #fx{Unsafe} : void
+    ```c
+    if (ms > 0) usleep((useconds_t)ms * 1000u);
+    ```)
+
+  (defn path-is? [a : cstr b : cstr] : bool
+    ```c return strcmp(a, b) == 0; ```)
+
+  ;; ---------------------------------------------------------------------
+  ;; Handler
+  ;; ---------------------------------------------------------------------
+
+  (defn limits-handler [req : int] : int
+    (let [r    (:: req :Request)
+          path (req-path r)]
+      (:: (cond
+            (path-is? path "/bytes")
+              (with-body-bytes (resp-ok "application/octet-stream" "")
+                               (:: (req-body r) :ptr<void>) (req-body-len r))
+            (path-is? path "/addr")
+              (let [a (req-remote-addr r)]
+                (resp-ok "text/plain" (if (some? a) (unwrap a) "none")))
+            (path-is? path "/hdr")
+              (let [resp (with-header-set
+                           (with-header (with-header (resp-ok "text/plain" "")
+                                                     "X-A" "1")
+                                        "x-a" "1b")
+                           "X-a" "2")
+                    seen (resp-header resp "x-A")]
+                (with-header resp "X-Seen" (if (some? seen) (unwrap seen) "none")))
+            :else
+              (resp-ok "text/plain" path))
+          :int)))
+
+  ;; ---------------------------------------------------------------------
+  ;; Driver
+  ;; ---------------------------------------------------------------------
+
+  (defn __all-tests [] : void
+    ;; 8 workers, a 16-byte body cap, a 500 ms read timeout.
+    (let [srv  (server-start-opts 0 limits-handler (make-struct ServerOpts 8 16 500))
+          port (server-port srv)]
+      (unsafe (sleep-ms 50))
+      (describe "httpd on stdlib httpd -- limits, keep-alive, bytes, peer"
+        (it "a Content-Length over the body cap is answered 413"
+          (assert-eq 413 (post-n-status port 17)))
+        (it "a body at the cap is served"
+          (assert-eq 200 (post-n-status port 16)))
+        (it "a client that stalls mid-head is answered 408"
+          (assert-eq 408 (stalled-status port)))
+        (it "a tenth request is served while nine clients stall"
+          (assert-true (tenth-served? port)))
+        (it "two requests share one keep-alive connection"
+          (assert-true (keep-alive-two? port)))
+        (it "a body holding NUL bytes round-trips"
+          (assert-true (nul-body-round-trips? port)))
+        (it "req-remote-addr is 127.0.0.1 on loopback"
+          (assert-true (body-is? port "/addr" "127.0.0.1")))
+        (it "with-header-set leaves one header, case-insensitively replaced"
+          (assert-eq 1 (header-count port "/hdr" "X-a" "2")))
+        (it "resp-header reads a header back case-insensitively"
+          (assert-eq 1 (header-count port "/hdr" "X-Seen" "2"))))
+      (server-stop srv)))
+
+  (defn main [] : int
+    (__all-tests)
+    (run-all-status)))

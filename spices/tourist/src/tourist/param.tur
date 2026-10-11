@@ -36,20 +36,30 @@
 ;;     // v0.2.0 additions
 ;;     int64_t attrs;        // head of cons list of __tourist_attr (owned)
 ;;     int64_t resp_headers; // head of cons list of __tourist_hdr  (owned)
+;;     // v0.3.0 additions
+;;     int64_t req;          // the httpd Request this ctx was built from
+;;     int64_t around_rest;  // use-around! items still to run (ItemList)
 ;;   };
+;;
+;; Blocks that only touch the leading fields declare a truncated prefix of the
+;; struct; only __tourist-ctx-alloc (which allocates it) and the accessors of
+;; the trailing fields spell it out to the end.
 ;;
 ;;   struct __tourist_attr { char *key;  int64_t val;  struct __tourist_attr *next; };
 ;;   struct __tourist_hdr  { char *name; char  *value; struct __tourist_hdr  *next; };
 
 (defmodule tourist/param
   (import tourist/router :refer [captures-get captures-free])
-  (import tourist/types  :refer [Ctx Captures])
+  (import tourist/types  :refer [Ctx Captures ItemList])
+  (import httpd/types    :refer [Request])
   (export param capture
           tourist-ctx-new tourist-ctx-free
           tourist-ctx-caps
           tourist-ctx-strip-path req-full-path
           ctx-attr-get ctx-attr-set! ctx-add-header!
-          tourist-ctx-resp-headers tourist-ctx-clear-resp-headers)
+          tourist-ctx-resp-headers tourist-ctx-clear-resp-headers
+          tourist-ctx-req tourist-ctx-around-rest tourist-ctx-set-around-rest!
+          tourist-ctx-own!)
 
 ;; -- Internal: query-string parser ----------------------------------------
 
@@ -240,6 +250,9 @@
     char  *full_path;
     int64_t attrs;
     int64_t resp_headers;
+    int64_t req;
+    int64_t around_rest;
+    int64_t owned;
   };
 
   struct __httpd_req  *r = (struct __httpd_req  *)(intptr_t)req;
@@ -261,6 +274,9 @@
   c->full_path    = r->path;
   c->attrs        = 0;
   c->resp_headers = 0;
+  c->req          = (int64_t)req;
+  c->around_rest  = 0;
+  c->owned        = 0;
 
   return (int64_t)(intptr_t)c;
   ```)
@@ -288,6 +304,7 @@
       (__ctx-free-qp ctx)
       (__ctx-free-attrs ctx)
       (__ctx-free-resp-headers ctx)
+      (__ctx-free-owned ctx)
       (__ctx-free-struct ctx))))
 
 ;;; __ctx-free-attrs -- release the attrs cons list (keys are owned cstr copies).
@@ -616,5 +633,126 @@
 ;;; Since: v0.2.0
 (defn tourist-ctx-clear-resp-headers [ctx : Ctx] : void
   (__ctx-free-resp-headers ctx))
+
+
+;; -- v0.3.0: the trailing fields ---------------------------------------------
+
+;;; tourist-ctx-req -- the httpd Request a ctx was built from.
+;;;
+;;; The Ctx itself reads like a Request for the leading fields (method, path,
+;;; headers, ...); this is the real one, for what needs the server behind it
+;;; (httpd/request's req-remote-addr, request-conn).
+;;;
+;;; Parameters:
+;;;   ctx -- tourist ctx
+;;;
+;;; Returns:
+;;;   Request -- the request handle (valid while the request is served)
+;;;
+;;; Since: v0.3.0
+(defn tourist-ctx-req [ctx : Ctx] : Request
+  ```c
+  struct __tourist_ctx_f {
+    char  *method; char *path; char *query; char *body;
+    char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
+    int64_t caps;
+    char  **qp_keys; char **qp_vals; int qp_count; int qp_cap;
+    char  *full_path;
+    int64_t attrs; int64_t resp_headers;
+    int64_t req; int64_t around_rest;
+  };
+  return ((struct __tourist_ctx_f *)(intptr_t)ctx)->req;
+  ```)
+
+;;; tourist-ctx-around-rest -- internal: use-around! items still to run.
+(defn tourist-ctx-around-rest [ctx : Ctx] : ItemList
+  ```c
+  struct __tourist_ctx_f {
+    char  *method; char *path; char *query; char *body;
+    char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
+    int64_t caps;
+    char  **qp_keys; char **qp_vals; int qp_count; int qp_cap;
+    char  *full_path;
+    int64_t attrs; int64_t resp_headers;
+    int64_t req; int64_t around_rest;
+  };
+  return ((struct __tourist_ctx_f *)(intptr_t)ctx)->around_rest;
+  ```)
+
+;;; tourist-ctx-set-around-rest! -- internal: record the use-around! position.
+(defn tourist-ctx-set-around-rest! [ctx : Ctx rest : ItemList] : void
+  ```c
+  struct __tourist_ctx_f {
+    char  *method; char *path; char *query; char *body;
+    char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
+    int64_t caps;
+    char  **qp_keys; char **qp_vals; int qp_count; int qp_cap;
+    char  *full_path;
+    int64_t attrs; int64_t resp_headers;
+    int64_t req; int64_t around_rest;
+  };
+  ((struct __tourist_ctx_f *)(intptr_t)ctx)->around_rest = (int64_t)rest;
+  ```)
+
+;;; tourist-ctx-own! -- internal: make a malloc'd string the ctx's, freed
+;;; with it.
+;;;
+;;; For the request helpers (tourist/request) that hand out a value the
+;;; caller must not free: it lives exactly as long as the request.
+;;;
+;;; Parameters:
+;;;   ctx -- tourist ctx
+;;;   s   -- a malloc'd string (ownership moves to the ctx)
+;;;
+;;; Returns:
+;;;   :cstr -- s
+;;;
+;;; Since: tourist-on-stdlib-httpd H5
+(defn tourist-ctx-own! [ctx : Ctx s : cstr] : cstr
+  ```c
+  struct __tourist_owned { char *s; struct __tourist_owned *next; };
+  struct __tourist_ctx_f {
+    char  *method; char *path; char *query; char *body;
+    char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
+    int64_t caps;
+    char  **qp_keys; char **qp_vals; int qp_count; int qp_cap;
+    char  *full_path;
+    int64_t attrs; int64_t resp_headers;
+    int64_t req; int64_t around_rest; int64_t owned;
+  };
+  if (!ctx || !s) return s;
+  struct __tourist_ctx_f *c = (struct __tourist_ctx_f *)(intptr_t)ctx;
+  struct __tourist_owned *o = (struct __tourist_owned *)malloc(sizeof *o);
+  if (!o) return s;   /* leaks s rather than freeing what the caller holds */
+  o->s = (char *)s;
+  o->next = (struct __tourist_owned *)(intptr_t)c->owned;
+  c->owned = (int64_t)(intptr_t)o;
+  return s;
+  ```)
+
+;;; __ctx-free-owned -- release the strings tourist-ctx-own! collected.
+(defn __ctx-free-owned [ctx : Ctx] : void
+  ```c
+  struct __tourist_owned { char *s; struct __tourist_owned *next; };
+  struct __tourist_ctx_f {
+    char  *method; char *path; char *query; char *body;
+    char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
+    int64_t caps;
+    char  **qp_keys; char **qp_vals; int qp_count; int qp_cap;
+    char  *full_path;
+    int64_t attrs; int64_t resp_headers;
+    int64_t req; int64_t around_rest; int64_t owned;
+  };
+  if (!ctx) return;
+  struct __tourist_ctx_f *c = (struct __tourist_ctx_f *)(intptr_t)ctx;
+  struct __tourist_owned *o = (struct __tourist_owned *)(intptr_t)c->owned;
+  while (o) {
+    struct __tourist_owned *nx = o->next;
+    free(o->s);
+    free(o);
+    o = nx;
+  }
+  c->owned = 0;
+  ```)
 
 ) ;; end defmodule tourist/param

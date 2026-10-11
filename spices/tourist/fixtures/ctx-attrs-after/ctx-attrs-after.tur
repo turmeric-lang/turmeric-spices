@@ -8,6 +8,10 @@
 ;;      in the response body.
 ;;   3. An after-middleware (use-after!) calls ctx-add-header! to inject
 ;;      X-Request-Id on the outgoing response.
+;;
+;; ctx-attr-get returns a concrete (Option int), which is passed by value:
+;; read it with some? / unwrap, not as an int carrier in inline C (which is
+;; what broke this fixture's compile).
 
 (defmodule tourist/tests/ctx-attrs-after
   (import tourist/app        :refer [tourist])
@@ -17,12 +21,12 @@
   (import tourist/param      :refer [ctx-attr-get ctx-attr-set! ctx-add-header!])
   (import tourist/types      :refer [Ctx])
   (import httpd/types        :refer [Response])
-  (import httpd/server       :refer [server-stop])
-  (import http/client        :refer [http-get])
+  (import httpd/server       :refer [server-port server-stop])
+  (import http/client        :refer [http-get http-result-free])
   (import http/response      :refer [response-status response-body response-header])
   (import test/suite         :refer [describe it])
   (import test/assert        :refer [assert-eq assert-true])
-  (import test/runner        :refer [run-all])
+  (import test/runner        :refer [run-all-status])
 
   (defn __cr-ok? [r : ptr<void>] : bool
     ```c
@@ -34,53 +38,41 @@
     return tur_ok_value((int64_t)(intptr_t)r);
     ```)
 
-  (defn sleep-ms [ms : int] #fx{Unsafe} : void
-    ```c
-    #include <unistd.h>
-    if (ms > 0) usleep((useconds_t)ms * 1000u);
-    ```)
-
   (defn cstr-eq? [a : cstr b : cstr] : bool
     ```c
     #include <string.h>
-    return strcmp((const char *)a, (const char *)b) == 0;
+    return a && strcmp((const char *)a, (const char *)b) == 0;
     ```)
 
-  (defn __none-resp [] : (Option Response)
+  (defn url-for [port : int] : cstr
     ```c
-    return TUR_NONE;
+    #include <stdio.h>
+    static char u[64];
+    snprintf(u, sizeof u, "http://127.0.0.1:%d/", (int)port);
+    return u;
     ```)
 
-  ;; Render "id=<int>" body so the assertions can pin a known numeric id.
+  ;; "id=<int>" in a per-thread buffer; text and ctx-add-header! copy it.
   (defn __body-of-id [id : int] : cstr
     ```c
     #include <stdio.h>
-    #include <stdlib.h>
-    char buf[64];
-    int n = snprintf(buf, sizeof buf, "id=%lld", (long long)id);
-    char *out = malloc((size_t)n + 1);
-    for (int i = 0; i <= n; i++) out[i] = buf[i];
-    return (const char *)out;
+    static __thread char buf[64];
+    snprintf(buf, sizeof buf, "id=%lld", (long long)id);
+    return buf;
     ```)
 
-  ;; Same scheme, but parses the int back so the route handler can format it
-  ;; uniformly with the some-payload from ctx-attr-get.
-  (defn __opt-unwrap-or [o : (Option int) fallback : int] : int
-    ```c
-    int64_t opt = (int64_t)(intptr_t)o;
-    return tur_is_some(opt) ? tur_opt_value(opt) : (int64_t)fallback;
-    ```)
+  (defn __attr-or [o : (Option int) fallback : int] : int
+    (if (some? o) (unwrap o) fallback))
 
   ;; -- Pre middleware: stamp request-id=4242 in ctx attrs. ----------------
   (defn stamp-id [ctx : Ctx] : (Option Response)
     (do
       (ctx-attr-set! ctx "request-id" 4242)
-      (__none-resp)))
+      (none)))
 
   ;; -- Route handler: reads request-id back and renders "id=<value>". -----
   (defn route-root [ctx : Ctx] : Response
-    (let [id (__opt-unwrap-or (ctx-attr-get ctx "request-id") 0)]
-      (text (__body-of-id id))))
+    (text (__body-of-id (__attr-or (ctx-attr-get ctx "request-id") 0))))
 
   ;; -- After middleware: read the id again and inject as a response header.
   ;; Demonstrates that an after-mw observing ctx queued via ctx-add-header!
@@ -88,35 +80,43 @@
   (defn inject-header [ctx : Ctx resp : Response] : Response
     (do
       (ctx-add-header! ctx "X-Request-Id"
-                       (__body-of-id (__opt-unwrap-or
-                                       (ctx-attr-get ctx "request-id") 0)))
+                       (__body-of-id (__attr-or (ctx-attr-get ctx "request-id") 0)))
       resp))
 
+  ;; -- Probes: each frees its client result. -----------------------------
+  (defn body-is? [port : int want : cstr] : bool
+    (let [r  (http-get (url-for port))
+          ok (if (__cr-ok? r) (cstr-eq? want (response-body (__cr-val r))) false)]
+      (http-result-free r)
+      ok))
+
+  (defn status-of [port : int] : int
+    (let [r  (http-get (url-for port))
+          st (if (__cr-ok? r) (response-status (__cr-val r)) 0)]
+      (http-result-free r)
+      st))
+
+  (defn header-is? [port : int name : cstr want : cstr] : bool
+    (let [r  (http-get (url-for port))
+          ok (if (__cr-ok? r) (cstr-eq? want (response-header (__cr-val r) name)) false)]
+      (http-result-free r)
+      ok))
+
+  (defn __all-tests [] : void
+    (let [srv  (tourist 0
+                 (use!       stamp-id)
+                 (use-after! inject-header)
+                 (get! "/" route-root))
+          port (server-port srv)]
+      (describe "tourist ctx attrs + use-after!"
+        (it "GET / round-trips request-id through ctx-attr-set!/get"
+          (assert-true (body-is? port "id=4242")))
+        (it "GET / status is 200"
+          (assert-eq 200 (status-of port)))
+        (it "after-middleware ctx-add-header! lands on the response"
+          (assert-true (header-is? port "X-Request-Id" "id=4242"))))
+      (server-stop srv)))
+
   (defn main [] : int
-    (let [srv (tourist 18130
-                (use!       stamp-id)
-                (use-after! inject-header)
-                (get! "/" route-root))]
-      (do
-        (unsafe (sleep-ms 50))
-        (describe "tourist ctx attrs + use-after!"
-          (it "GET / round-trips request-id through ctx-attr-set!/get"
-            (let [r (http-get "http://127.0.0.1:18130/")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "id=4242" (response-body (__cr-val r))))
-                (assert-true false))))
-          (it "GET / status is 200"
-            (let [r (http-get "http://127.0.0.1:18130/")]
-              (if (__cr-ok? r)
-                (assert-eq 200 (response-status (__cr-val r)))
-                (assert-true false))))
-          (it "after-middleware ctx-add-header! lands on the response"
-            (let [r (http-get "http://127.0.0.1:18130/")]
-              (if (__cr-ok? r)
-                (assert-true
-                  (cstr-eq? "id=4242"
-                            (response-header (__cr-val r) "X-Request-Id")))
-                (assert-true false)))))
-        (server-stop srv)
-        (run-all)))
-    0))
+    (__all-tests)
+    (run-all-status)))

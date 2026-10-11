@@ -1,0 +1,249 @@
+;; tests/middleware_test.tur -- tourist's middleware calling convention
+;; (tourist-on-stdlib-httpd-plan H3).
+;;
+;; Every middleware here is a CAPTURING closure, built by a factory or a
+;; `let`, and the app serves eight client threads at once:
+;;
+;;   * use! counts requests in a captured cell and short-circuits /block with
+;;     403, queueing a header with ctx-add-header! on the way;
+;;   * two use-around! items, each capturing its own tag, wrap every response
+;;     -- the inner one's header lands first, so they nest outside-in;
+;;   * a third use-around! answers /teapot without calling `next`;
+;;   * use-after! stamps a captured value on every response.
+;;
+;; The queued header must reach the short-circuit response too, and the
+;; captured counter must see every request exactly once.
+
+(load "stdlib/thread.tur")
+
+(defmodule tourist/tests/middleware
+  (import tourist/app        :refer [tourist])
+  (import tourist/dsl        :refer [get!])
+  (import tourist/helpers    :refer [text])
+  (import tourist/middleware :refer [use! use-around! use-after!])
+  (import tourist/param      :refer [ctx-add-header!])
+  (import tourist/types      :refer [Ctx])
+  (import httpd/types        :refer [Request Response])
+  (import httpd/request      :refer [req-path])
+  (import httpd/response     :refer [response with-header])
+  (import httpd/server       :refer [server-port server-stop])
+  (import http/client        :refer [http-get http-result-free])
+  (import http/response      :refer [response-status response-body])
+  (import test/suite         :refer [describe it])
+  (import test/assert        :refer [assert-eq assert-true])
+  (import test/runner        :refer [run-all-status])
+
+```c
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+/* GET path with Connection: close and return the raw response (caller
+   frees), so the test can look at repeated headers in order. */
+static char *mwt__get(int port, const char *path) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return NULL;
+  struct sockaddr_in a; memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return NULL; }
+  char req[256];
+  int n = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", path);
+  send(fd, req, (size_t)n, 0);
+  size_t cap = 4096, len = 0;
+  char *buf = (char *)malloc(cap);
+  for (;;) {
+    if (len + 1 >= cap) { cap *= 2; buf = (char *)realloc(buf, cap); }
+    ssize_t r = recv(fd, buf + len, cap - len - 1, 0);
+    if (r <= 0) break;
+    len += (size_t)r;
+  }
+  buf[len] = '\0';
+  close(fd);
+  return buf;
+}
+```
+
+  ;; ---------------------------------------------------------------------
+  ;; A heap counter the middleware captures
+  ;; ---------------------------------------------------------------------
+
+  (defn counter-new [] : ptr<void>
+    ```c return calloc(1, sizeof(int64_t)); ```)
+
+  (defn counter-inc! [c : ptr<void>] : int
+    ```c return __atomic_add_fetch((int64_t *)c, 1, __ATOMIC_SEQ_CST); ```)
+
+  (defn counter-get [c : ptr<void>] : int
+    ```c return __atomic_load_n((int64_t *)c, __ATOMIC_SEQ_CST); ```)
+
+  (defn counter-free [c : ptr<void>] : void
+    ```c free(c); ```)
+
+  (defn path-is? [a : cstr b : cstr] : bool
+    ```c return strcmp(a, b) == 0; ```)
+
+  ;; ---------------------------------------------------------------------
+  ;; Middleware factories: every returned closure captures its arguments
+  ;; ---------------------------------------------------------------------
+
+  ;; Count every request; short-circuit /block with 403.
+  (defn counting-blocker [hits : ptr<void> blocked : cstr] : (fn [Ctx] (Option Response))
+    (fn [ctx : Ctx] : (Option Response)
+      (do
+        (counter-inc! hits)
+        (if (path-is? (req-path (:: ctx :Request)) blocked)
+          (do
+            (ctx-add-header! ctx "X-Pre" "queued-by-use")
+            (some (response 403 "text/plain" "blocked")))
+          (none)))))
+
+  ;; Wrap the response in an X-Around header naming this layer.
+  (defn tagger [tag : cstr] : (fn [Ctx (fn [Ctx] Response)] Response)
+    (fn [ctx : Ctx next : (fn [Ctx] Response)] : Response
+      (with-header (next ctx) "X-Around" tag)))
+
+  ;; Answer `path` itself, never calling next.
+  (defn short-path [path : cstr] : (fn [Ctx (fn [Ctx] Response)] Response)
+    (fn [ctx : Ctx next : (fn [Ctx] Response)] : Response
+      (if (path-is? (req-path (:: ctx :Request)) path)
+        (response 418 "text/plain" "teapot")
+        (next ctx))))
+
+  (defn stamper [value : cstr] : (fn [Ctx Response] Response)
+    (fn [ctx : Ctx resp : Response] : Response
+      (with-header resp "X-After" value)))
+
+  ;; ---------------------------------------------------------------------
+  ;; Probes
+  ;; ---------------------------------------------------------------------
+
+  ;; The raw response to GET path contains `needle`.
+  (defn has? [port : int path : cstr needle : cstr] : bool
+    ```c
+    char *r = mwt__get((int)port, path);
+    int ok = r && strstr(r, needle) != NULL;
+    free(r);
+    return ok;
+    ```)
+
+  ;; The status of GET path.
+  (defn status-at [port : int path : cstr] : int
+    ```c
+    char *r = mwt__get((int)port, path);
+    int st = 0;
+    if (r) sscanf(r, "HTTP/1.1 %d", &st);
+    free(r);
+    return st;
+    ```)
+
+  ;; Eight threads, each issuing five requests through the client spice.
+  (defn port-cell [mode : int v : int] : int
+    ```c
+    static int64_t port = 0;
+    if (mode) port = v;
+    return port;
+    ```)
+
+  (defn ok-count-cell [] : ptr<void>
+    ```c
+    static int64_t n = 0;
+    return &n;
+    ```)
+
+  (defn url-for [port : int] : cstr
+    ```c
+    static __thread char u[64];
+    snprintf(u, sizeof u, "http://127.0.0.1:%d/", (int)port);
+    return u;
+    ```)
+
+  (defn __cr-ok? [r : ptr<void>] : bool
+    ```c return tur_is_ok((int64_t)(intptr_t)r); ```)
+
+  (defn __cr-val [r : ptr<void>] : int
+    ```c return tur_ok_value((int64_t)(intptr_t)r); ```)
+
+  (defn one-get-ok? [] : bool
+    (let [r  (http-get (url-for (port-cell 0 0)))
+          ok (if (__cr-ok? r) (= 200 (response-status (__cr-val r))) false)]
+      (http-result-free r)
+      ok))
+
+  (defn client-task [arg : ptr<void>] : ptr<void>
+    (do
+      (when (one-get-ok?) (counter-inc! (ok-count-cell)))
+      (when (one-get-ok?) (counter-inc! (ok-count-cell)))
+      (when (one-get-ok?) (counter-inc! (ok-count-cell)))
+      (when (one-get-ok?) (counter-inc! (ok-count-cell)))
+      (when (one-get-ok?) (counter-inc! (ok-count-cell)))
+      arg))
+
+  (defn null-ptr [] : ptr<void>
+    ```c return NULL; ```)
+
+  (defn run-clients [] : void
+    (unsafe
+      (let [t1 (thread-spawn-fn client-task (null-ptr))
+            t2 (thread-spawn-fn client-task (null-ptr))
+            t3 (thread-spawn-fn client-task (null-ptr))
+            t4 (thread-spawn-fn client-task (null-ptr))
+            t5 (thread-spawn-fn client-task (null-ptr))
+            t6 (thread-spawn-fn client-task (null-ptr))
+            t7 (thread-spawn-fn client-task (null-ptr))
+            t8 (thread-spawn-fn client-task (null-ptr))]
+        (do
+          (thread-join t1) (thread-join t2) (thread-join t3) (thread-join t4)
+          (thread-join t5) (thread-join t6) (thread-join t7) (thread-join t8)))))
+
+  (defn sleep-ms [ms : int] #fx{Unsafe} : void
+    ```c if (ms > 0) usleep((useconds_t)ms * 1000u); ```)
+
+  ;; ---------------------------------------------------------------------
+  ;; Driver
+  ;; ---------------------------------------------------------------------
+
+  (defn __all-tests [] : void
+    (let [hits (counter-new)
+          srv  (tourist 0
+                 (use! (counting-blocker hits "/block"))
+                 (use-around! (tagger "outer"))
+                 (use-around! (tagger "inner"))
+                 (use-around! (short-path "/teapot"))
+                 (use-after! (stamper "after-captured"))
+                 (get! "/" (fn [_] (text "ok")))
+                 (get! "/block" (fn [_] (text "route must not run"))))
+          port (server-port srv)]
+      (port-cell 1 port)
+      (unsafe (sleep-ms 50))
+      (run-clients)
+      (describe "tourist middleware -- capturing closures, use-around!"
+        (it "40 concurrent requests through capturing middleware all succeed"
+          (assert-eq 40 (counter-get (ok-count-cell))))
+        (it "the use! closure's captured counter saw every request"
+          (assert-eq 40 (counter-get hits)))
+        (it "nested use-around! items run outside-in"
+          (assert-true (has? port "/" "X-Around: inner\r\nX-Around: outer\r\n")))
+        (it "use-after! runs on the outermost around's response"
+          (assert-true (has? port "/" "X-Around: outer\r\nX-After: after-captured\r\n")))
+        (it "a use! short-circuit is answered with its own response"
+          (assert-eq 403 (status-at port "/block")))
+        (it "ctx-add-header! from use! lands on the short-circuit response"
+          (assert-true (has? port "/block" "X-Pre: queued-by-use")))
+        (it "the around items wrap a use! short-circuit too"
+          (assert-true (has? port "/block" "X-Around: outer")))
+        (it "a use-around! can answer without calling next"
+          (assert-eq 418 (status-at port "/teapot")))
+        (it "outer layers still wrap an around that did not call next"
+          (assert-true (has? port "/teapot" "X-Around: inner\r\nX-Around: outer\r\n"))))
+      (server-stop srv)
+      (counter-free hits)))
+
+  (defn main [] : int
+    (__all-tests)
+    (run-all-status)))

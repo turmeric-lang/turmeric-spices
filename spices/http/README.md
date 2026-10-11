@@ -48,6 +48,37 @@ let [r http-get("https://httpbin.org/get")]
       println $ response-body resp
 ```
 
+## Freeing results and requests
+
+Every request function returns a heap result box that the caller owns.
+`(http-result-free r)` releases it along with what it carries: the response
+(status, body, headers -- strings you read with `response-body` /
+`response-header` go with it, so read first), or the error message.
+`(request-free req)` releases a record built by `request` / `json-request`,
+including the `Content-Type` cells `json-request` added; the rest of a header
+list belongs to whoever built it.
+
+```turmeric
+(import http/client   :refer [http-get http-result-free])
+(import http/response :refer [response-status])
+
+(let [r      (http-get "http://127.0.0.1:8080/health")
+      status (if (ok? r) (response-status (ok-val r)) 0)]
+  (http-result-free r)
+  status)
+```
+
+```sweet-exp
+#lang sweet-exp
+import http/client   :refer [http-get http-result-free]
+import http/response :refer [response-status]
+
+let [r      http-get("http://127.0.0.1:8080/health")
+     status if(ok?(r) response-status(ok-val(r)) 0)]
+  http-result-free(r)
+  status
+```
+
 ## Typed JSON bodies
 
 `http/request` and `http/response` expose typed JSON codecs built on the json

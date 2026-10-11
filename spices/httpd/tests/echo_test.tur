@@ -11,7 +11,7 @@
   (import httpd/request  :refer [req-method req-path])
   (import httpd/response :refer [resp-ok])
   (import httpd/types    :refer [Request])
-  (import http/client    :refer [http-get])
+  (import http/client    :refer [http-get http-result-free])
   (import http/response  :refer [response-status response-body response-header])
   (import test/suite     :refer [describe it])
   (import test/assert    :refer [assert-eq assert-true])
@@ -59,9 +59,37 @@
   ;; Handler: echo "<METHOD> <PATH>" with status 200, text/plain.
   ;; ---------------------------------------------------------------------
 
+  (defn cstr-free [s : cstr] : void
+    ```c free((void *)s); ```)
+
   (defn echo-handler [req : int] : int
-    (let [r (:: req :Request)]
-      (:: (resp-ok "text/plain" (echo-join (req-method r) (req-path r))) :int)))
+    (let [r    (:: req :Request)
+          body (echo-join (req-method r) (req-path r))
+          resp (resp-ok "text/plain" body)]
+      (cstr-free body)
+      (:: resp :int)))
+
+  ;; ---------------------------------------------------------------------
+  ;; Client helpers: fetch, read one thing, free the result.
+  ;; ---------------------------------------------------------------------
+
+  (defn get-status [url : cstr] : int
+    (let [r (http-get url)
+          s (if (__cr-ok? r) (response-status (__cr-val r)) -1)]
+      (http-result-free r)
+      s))
+
+  (defn get-body-is? [url : cstr want : cstr] : bool
+    (let [r  (http-get url)
+          ok (if (__cr-ok? r) (cstr-eq? want (response-body (__cr-val r))) false)]
+      (http-result-free r)
+      ok))
+
+  (defn get-header-is? [url : cstr name : cstr want : cstr] : bool
+    (let [r  (http-get url)
+          ok (if (__cr-ok? r) (cstr-eq? want (response-header (__cr-val r) name)) false)]
+      (http-result-free r)
+      ok))
 
   (defn sleep-ms [ms : int] #fx{Unsafe} : void
     ```c
@@ -81,29 +109,16 @@
         (describe "httpd echo -- default (pool) dispatch"
 
           (it "GET / returns 200"
-            (let [r (http-get "http://127.0.0.1:18081/")]
-              (if (__cr-ok? r)
-                (assert-eq 200 (response-status (__cr-val r)))
-                (assert-true false))))
+            (assert-eq 200 (get-status "http://127.0.0.1:18081/")))
 
           (it "GET / echoes 'GET /'"
-            (let [r (http-get "http://127.0.0.1:18081/")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "GET /" (response-body (__cr-val r))))
-                (assert-true false))))
+            (assert-true (get-body-is? "http://127.0.0.1:18081/" "GET /")))
 
           (it "GET /hello echoes 'GET /hello'"
-            (let [r (http-get "http://127.0.0.1:18081/hello")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "GET /hello" (response-body (__cr-val r))))
-                (assert-true false))))
+            (assert-true (get-body-is? "http://127.0.0.1:18081/hello" "GET /hello")))
 
           (it "Content-Type is text/plain"
-            (let [r (http-get "http://127.0.0.1:18081/x")]
-              (if (__cr-ok? r)
-                (assert-true (cstr-eq? "text/plain"
-                                       (response-header (__cr-val r) "Content-Type")))
-                (assert-true false)))))
+            (assert-true (get-header-is? "http://127.0.0.1:18081/x" "Content-Type" "text/plain"))))
 
         (server-stop srv)
         ))

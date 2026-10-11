@@ -1,12 +1,17 @@
 ;; http/request.tur -- HTTP request record constructor.
 ;;
-;; A request is a heap-allocated struct { method, url, body, headers } where
-;; method/url/body are char* and headers is an opaque cons-list handle
-;; (int64_t) of alternating key/value strings.  Pass to http-request.
+;; A request is a heap-allocated struct { method, url, body, headers,
+;; owned_cells } where method/url/body are char* copies and headers is an
+;; opaque cons-list handle (int64_t) of alternating key/value strings.  Pass
+;; to http-request, then release with request-free.
+;;
+;; The header list belongs to whoever built it, except for the cells the
+;; request prepended itself (`owned_cells` of them: json-request's
+;; Content-Type pair), which request-free releases.
 
 (defmodule http/request
   (import json/encode)
-  (export request json-request)
+  (export request json-request request-free)
 
 ;;; request -- create an HTTP request handle.
 ;;;
@@ -33,13 +38,15 @@
     char    *method;
     char    *url;
     char    *body;
-    int64_t  headers; /* opaque cons-list handle */
+    int64_t  headers;     /* opaque cons-list handle */
+    int64_t  owned_cells; /* leading header cells the request owns */
   };
   struct __req *req = malloc(sizeof(*req));
   req->method  = strdup((const char *)method);
   req->url     = strdup((const char *)url);
   req->body    = strdup((const char *)body);
   req->headers = headers;
+  req->owned_cells = 0;
   return (int64_t)(intptr_t)req;
   ```)
 
@@ -73,11 +80,57 @@
 ;;; Example:
 ;;;   (let [req (json-request "POST" url (make-struct User 1 "ann") (nil-value))]
 ;;;     (http-request req))
+(defn __req-own-cells! [req : int n : int] #fx{Unsafe} : int
+  ```c
+  struct __req { char *method; char *url; char *body; int64_t headers; int64_t owned_cells; };
+  ((struct __req *)(intptr_t)req)->owned_cells = n;
+  return req;
+  ```)
+
 (defn json-request [^EncodeJson T  method : cstr  url : cstr  x : T  headers : int] : int
   (let [frag (encode-json x)
         hdrs (unsafe (__hdr-cons "Content-Type" "application/json" headers))
         req  (request method url frag hdrs)]
     (unsafe (__cstr-free frag))
-    req))
+    ;; The Content-Type key and value cells are the request's own.
+    (unsafe (__req-own-cells! req 2))))
+
+;;; request-free -- release a request record built by request / json-request.
+;;;
+;;; Frees the method, URL and body copies and the header cells the request
+;;; added itself (json-request's Content-Type); the rest of the header list
+;;; belongs to the caller who built it.  Safe on 0.
+;;;
+;;; Parameters:
+;;;   req -- request handle
+;;;
+;;; Returns:
+;;;   :void
+;;;
+;;; Example:
+;;;   (let [req (request "GET" "http://127.0.0.1:8080/" "" 0)
+;;;         r   (http-request req)]
+;;;     (request-free req)
+;;;     (http-result-free r))
+;;;
+;;; Since: 0.2.0
+(defn request-free [req : int] : void
+  ```c
+  #include <stdlib.h>
+  struct __req { char *method; char *url; char *body; int64_t headers; int64_t owned_cells; };
+  struct __cons { int64_t value; int64_t next; };
+  if (req == 0) return;
+  struct __req *r = (struct __req *)(intptr_t)req;
+  struct __cons *c = (struct __cons *)(intptr_t)r->headers;
+  for (int64_t i = 0; i < r->owned_cells && c; i++) {
+    struct __cons *nx = (struct __cons *)(intptr_t)c->next;
+    free(c);
+    c = nx;
+  }
+  free(r->method);
+  free(r->url);
+  free(r->body);
+  free(r);
+  ```)
 
 ) ;; end defmodule http/request

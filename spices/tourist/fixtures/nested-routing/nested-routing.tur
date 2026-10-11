@@ -11,12 +11,21 @@
   (import httpd/types        :refer [Response])
   (import httpd/request      :refer [req-path])
   (import httpd/types        :refer [Request])
-  (import httpd/server       :refer [server-stop])
-  (import http/client        :refer [http-get])
+  (import httpd/server       :refer [server-port server-stop])
+  (import http/client        :refer [http-get http-result-free])
   (import http/response      :refer [response-status response-body response-header])
   (import test/suite         :refer [describe it])
   (import test/assert        :refer [assert-eq assert-true])
-  (import test/runner        :refer [run-all])
+  (import test/runner        :refer [run-all-status])
+
+  ;; url-for -- the test server's URL for `path` (the port is kernel-assigned).
+  (defn url-for [port : int path : cstr] : cstr
+    ```c
+    #include <stdio.h>
+    static __thread char u[256];
+    snprintf(u, sizeof u, "http://127.0.0.1:%d%s", (int)port, path);
+    return u;
+    ```)
 
   (defn __cr-ok? [r : ptr<void>] : bool
     ```c
@@ -28,12 +37,6 @@
     return tur_ok_value((int64_t)(intptr_t)r);
     ```)
 
-  (defn sleep-ms [ms : int] #fx{Unsafe} : void
-    ```c
-    #include <unistd.h>
-    if (ms > 0) usleep((useconds_t)ms * 1000u);
-    ```)
-
   (defn cstr-eq? [a : cstr b : cstr] : bool
     ```c
     #include <string.h>
@@ -41,12 +44,9 @@
     ```)
 
   ;; Outer middleware tags every response by short-circuiting nothing
-  ;; (returns the (none) option, NULL); it just observes the request.
+  ;; (returns none); it just observes the request.
   (defn tag-mw [ctx : Ctx] : (Option Response)
-    ```c
-    (void)ctx;
-    return TUR_NONE;
-    ```)
+    (none))
 
   ;; Two leaf handlers
   (defn users-handler [ctx : Ctx] : Response (text (req-path (:: ctx :Request))))
@@ -67,41 +67,48 @@
     (cascade! (v2-app) (v1-app)))
 
   (defn main [] : int
-    (let [srv (tourist 18122
+    (let [srv (tourist 0
                 (use! tag-mw)
                 (url-map! (mount! "/api" (api-app))
-                          (mount! "/"    (get! "/" (fn [_] (text "home"))))))]
+                          (mount! "/"    (get! "/" (fn [_] (text "home"))))))
+          port (server-port srv)]
       (do
-        (unsafe (sleep-ms 50))
         (describe "tourist nested routing"
           (it "GET /api/users hits nested url-map within cascade"
-            (let [r (http-get "http://127.0.0.1:18122/api/users")]
-              (if (__cr-ok? r)
-                (do
-                  (assert-eq 200 (response-status (__cr-val r)))
-                  ;; req-path inside the inner sub-app sees "/" (stripped twice).
-                  (assert-true
-                    (cstr-eq? "/" (response-body (__cr-val r)))))
-                (assert-true false))))
+            (let [r    (http-get (url-for port "/api/users"))
+                  __ok (if (__cr-ok? r)
+                         (do
+                           (assert-eq 200 (response-status (__cr-val r)))
+                           ;; req-path inside the inner sub-app sees "/" (stripped twice).
+                           (assert-true
+                             (cstr-eq? "/" (response-body (__cr-val r)))))
+                         (assert-true false))]
+              (http-result-free r)
+              __ok))
           (it "GET /api/items hits the items sub-app"
-            (let [r (http-get "http://127.0.0.1:18122/api/items")]
-              (if (__cr-ok? r)
-                (assert-eq 200 (response-status (__cr-val r)))
-                (assert-true false))))
+            (let [r    (http-get (url-for port "/api/items"))
+                  __ok (if (__cr-ok? r)
+                         (assert-eq 200 (response-status (__cr-val r)))
+                         (assert-true false))]
+              (http-result-free r)
+              __ok))
           (it "GET /api/legacy cascades to v1 after v2 misses"
-            (let [r (http-get "http://127.0.0.1:18122/api/legacy")]
-              (if (__cr-ok? r)
-                (do
-                  (assert-eq 200 (response-status (__cr-val r)))
-                  (assert-true
-                    (cstr-eq? "legacy-v1" (response-body (__cr-val r)))))
-                (assert-true false))))
+            (let [r    (http-get (url-for port "/api/legacy"))
+                  __ok (if (__cr-ok? r)
+                         (do
+                           (assert-eq 200 (response-status (__cr-val r)))
+                           (assert-true
+                             (cstr-eq? "legacy-v1" (response-body (__cr-val r)))))
+                         (assert-true false))]
+              (http-result-free r)
+              __ok))
           (it "GET / hits the top-level catch-all"
-            (let [r (http-get "http://127.0.0.1:18122/")]
-              (if (__cr-ok? r)
-                (assert-true
-                  (cstr-eq? "home" (response-body (__cr-val r))))
-                (assert-true false)))))
+            (let [r    (http-get (url-for port "/"))
+                  __ok (if (__cr-ok? r)
+                         (assert-true
+                           (cstr-eq? "home" (response-body (__cr-val r))))
+                         (assert-true false))]
+              (http-result-free r)
+              __ok)))
         (server-stop srv)
-        (run-all)))
-    0))
+        (run-all-status)))))

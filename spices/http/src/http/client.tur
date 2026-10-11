@@ -7,12 +7,16 @@
 ;; http:// works, but an https:// call returns an err whose message
 ;; tells the caller to rebuild with mbedTLS available.
 ;;
-;; All five public functions return result<response-handle>.
+;; All five request functions return result<response-handle>: a heap box the
+;; caller owns, released with http-result-free (which frees the response, or
+;; the error message, with it).  Every error message is heap-allocated so that
+;; one call can free either arm.
 ;; TLS certificate verification is disabled (MBEDTLS_SSL_VERIFY_NONE).
 ;; TODO: expose verify-peer in a future milestone.
 
 (defmodule http/client
-  (export http-get http-post http-put http-delete http-request)
+  (export http-get http-post http-put http-delete http-request
+          http-result-free)
 
 ;; Private request-struct accessors
 (defn __req-method [req : int] : cstr
@@ -96,7 +100,7 @@
   const char *raw = (const char *)url;
   int use_tls = (strncmp(raw, "https://", 8) == 0);
   if (!use_tls && strncmp(raw, "http://", 7) != 0) {
-    return (void *)(intptr_t)tur_err_ptr((void *)"unsupported scheme");
+    return (void *)(intptr_t)tur_err_ptr(strdup("unsupported scheme"));
   }
   const char *hoststart = raw + (use_tls ? 8 : 7);
   char host[512]; char port_str[8]; char path[4096];
@@ -216,8 +220,7 @@
     mbedtls_net_free(&server_fd);
   #else
     free(resp_buf);
-    return (void *)(intptr_t)tur_err_ptr(
-      (void *)"https:// not supported: rebuild tur-http with mbedTLS available");
+    return (void *)(intptr_t)tur_err_ptr(strdup("https:// not supported: rebuild tur-http with mbedTLS available"));
   #endif
   } else {
     /* Plain HTTP via raw POSIX sockets -- no native deps. */
@@ -227,14 +230,14 @@
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host, port_str, &hints, &ai) != 0 || !ai) {
       free(resp_buf);
-      return (void *)(intptr_t)tur_err_ptr((void *)"getaddrinfo failed");
+      return (void *)(intptr_t)tur_err_ptr(strdup("getaddrinfo failed"));
     }
     int sfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
     if (sfd < 0 || connect(sfd, ai->ai_addr, (socklen_t)ai->ai_addrlen) != 0) {
       if (sfd >= 0) close(sfd);
       freeaddrinfo(ai);
       free(resp_buf);
-      return (void *)(intptr_t)tur_err_ptr((void *)"connect failed");
+      return (void *)(intptr_t)tur_err_ptr(strdup("connect failed"));
     }
     freeaddrinfo(ai);
     size_t wr = 0;
@@ -369,5 +372,56 @@
 ;;; Since: P5
 (defn http-request [req : int] : ptr<void>
   (__do-request (__req-method req) (__req-url req) (__req-body req) (__req-hdrs req)))
+
+;;; http-result-free -- release a result returned by http-get & co.
+;;;
+;;; Frees the result box and what it carries: on ok the response (status,
+;;; body and headers -- every string response-body / response-header returned
+;;; from it is freed too), on err the message.  Read what you need first.
+;;; Safe on NULL; do not call it twice on the same result.
+;;;
+;;; Parameters:
+;;;   r -- the ptr<void> result from http-get, http-post, http-put,
+;;;        http-delete or http-request
+;;;
+;;; Returns:
+;;;   :void
+;;;
+;;; Example:
+;;;   (let [r (http-get "http://127.0.0.1:8080/")
+;;;         s (if (ok? r) (response-status (ok-val r)) 0)]
+;;;     (http-result-free r)
+;;;     s)
+;;;
+;;; Since: 0.2.0
+(defn http-result-free [r : ptr<void>] : void
+  ```c
+  #include <stdlib.h>
+  struct __resp {
+    int    status;
+    char  *body;
+    char **hdr_keys;
+    char **hdr_vals;
+    int    hdr_count;
+  };
+  if (!r) return;
+  int64_t box = (int64_t)(intptr_t)r;
+  if (tur_is_ok(box)) {
+    struct __resp *resp = (struct __resp *)(intptr_t)tur_ok_value(box);
+    if (resp) {
+      for (int i = 0; i < resp->hdr_count; i++) {
+        free(resp->hdr_keys[i]);
+        free(resp->hdr_vals[i]);
+      }
+      free(resp->hdr_keys);
+      free(resp->hdr_vals);
+      free(resp->body);
+      free(resp);
+    }
+  } else {
+    free((void *)(intptr_t)tur_err_value(box));
+  }
+  free(r);
+  ```)
 
 ) ;; end defmodule http/client

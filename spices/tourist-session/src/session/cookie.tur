@@ -1,160 +1,20 @@
-;;; session/cookie -- Cookie header parsing and Set-Cookie construction.
+;;; session/cookie -- signing and verifying the session cookie's value.
 ;;;
-;;; cookie-find          -- pull one cookie value out of a raw Cookie header
-;;; cookie-build         -- build a Set-Cookie value from id + cookie attrs
-;;; cookie-build-expired -- build a Set-Cookie that immediately clears a cookie
+;;; cookie-sign   -- "<id>.<mac>" under the configured key (or the bare id)
+;;; cookie-unsign -- check and strip the MAC
 ;;;
-;;; All builders take primitive arguments (not the SessionConfig struct) so the
-;;; inline-C stays in pure-C territory; session/mw destructures the config and
-;;; threads the fields through.
+;;; Reading the Cookie header and writing Set-Cookie are tourist's
+;;; req-cookie / set-cookie! (tourist/request), over stdlib httpd's cookie
+;;; parser and formatter; this module's own parser and builders went with
+;;; v0.4.0.
 ;;;
 ;;; Since: v0.1.0
+;; (module docstring ends)
 
 (defmodule session/cookie
   (import session/hmac   :refer [hmac-sign ct-eq?])
   (import session/ownstr :refer [String adopt-cstr])
-  (export cookie-find cookie-build cookie-build-expired
-          cookie-sign cookie-unsign)
-
-;;; cookie-find -- extract a single cookie's value from a Cookie header.
-;;;
-;;; Parses the standard "name=value; name2=value2" cookie list (semicolon +
-;;; optional space separated) and returns the value for `name`.
-;;;
-;;; Parameters:
-;;;   header -- raw Cookie header value (borrowed); may be empty
-;;;   name   -- cookie name to look up
-;;;
-;;; Returns:
-;;;   (Result cstr cstr) -- ok(value) with a freshly allocated value string
-;;;                         (caller frees), or err("missing") if not present.
-;;;
-;;; Since: v0.1.0
-(defn cookie-find [header : cstr name : cstr] : (Result cstr cstr)
-  (let [v (__cookie-find-raw header name)]
-    (if (__ck-null? v)
-      (:: (err "missing") (Result cstr cstr))
-      (:: (ok v) (Result cstr cstr)))))
-
-;;; __ck-null? -- true if a cstr handle is NULL.
-(defn __ck-null? [s : cstr] : bool
-  ```c
-  return ((const char *)s) == 0;
-  ```)
-
-;;; __cookie-find-raw -- find a cookie value; NULL if absent (malloc'd copy).
-(defn __cookie-find-raw [header : cstr name : cstr] : cstr
-  ```c
-  #include <stdlib.h>
-  #include <string.h>
-  const char *h = (const char *)header;
-  const char *nm = (const char *)name;
-  size_t nlen = strlen(nm);
-  const char *p = h;
-  while (p && *p) {
-    while (*p == ' ' || *p == '\t' || *p == ';') p++;
-    if (!*p) break;
-    const char *eq  = strchr(p, '=');
-    const char *semi = strchr(p, ';');
-    if (!eq || (semi && eq > semi)) {
-      /* malformed segment with no '=' before the next ';'; skip it. */
-      if (!semi) break;
-      p = semi + 1;
-      continue;
-    }
-    size_t klen = (size_t)(eq - p);
-    const char *vstart = eq + 1;
-    size_t vlen = semi ? (size_t)(semi - vstart) : strlen(vstart);
-    if (klen == nlen && strncmp(p, nm, nlen) == 0) {
-      char *out = malloc(vlen + 1);
-      memcpy(out, vstart, vlen);
-      out[vlen] = '\0';
-      return (const char *)out;
-    }
-    if (!semi) break;
-    p = semi + 1;
-  }
-  return (const char *)0;
-  ```)
-
-;;; cookie-build -- construct a Set-Cookie header value.
-;;;
-;;; Produces e.g.
-;;;   "tur_session=<id>; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax"
-;;;
-;;; The Domain attribute is included only when `domain` is non-empty. The
-;;; Secure and HttpOnly attributes are included only when their flag is 1.
-;;;
-;;; Parameters:
-;;;   name       -- cookie name
-;;;   value      -- cookie value (the session ID)
-;;;   path       -- Path attribute
-;;;   domain     -- Domain attribute, or "" to omit
-;;;   max-age    -- Max-Age in seconds
-;;;   secure?    -- 1 to add "; Secure"
-;;;   http-only? -- 1 to add "; HttpOnly"
-;;;   same-site  -- SameSite value ("Strict" | "Lax" | "None")
-;;;
-;;; Returns:
-;;;   :cstr -- newly allocated header value; caller frees.
-;;;
-;;; Since: v0.1.0
-(defn cookie-build [name : cstr value : cstr path : cstr domain : cstr
-                    max-age : int secure? : int http-only? : int
-                    same-site : cstr] : cstr
-  ```c
-  #include <stdlib.h>
-  #include <stdio.h>
-  #include <string.h>
-  const char *nm = (const char *)name;
-  const char *vl = (const char *)value;
-  const char *pt = (const char *)path;
-  const char *dm = (const char *)domain;
-  const char *ss = (const char *)same_site;
-
-  size_t cap = strlen(nm) + strlen(vl) + strlen(pt) + strlen(dm) + strlen(ss) + 128;
-  char *out = malloc(cap);
-  int n = snprintf(out, cap, "%s=%s; Path=%s; Max-Age=%lld",
-                   nm, vl, pt, (long long)max_age);
-  if (dm[0] != '\0')
-    n += snprintf(out + n, cap - (size_t)n, "; Domain=%s", dm);
-  if (http_only_qu != 0)
-    n += snprintf(out + n, cap - (size_t)n, "; HttpOnly");
-  if (secure_qu != 0)
-    n += snprintf(out + n, cap - (size_t)n, "; Secure");
-  n += snprintf(out + n, cap - (size_t)n, "; SameSite=%s", ss);
-  return (const char *)out;
-  ```)
-
-;;; cookie-build-expired -- construct a Set-Cookie that deletes the cookie.
-;;;
-;;; Emits an empty value with Max-Age=0 so the browser drops the cookie
-;;; immediately. Used by session-destroy!.
-;;;
-;;; Parameters:
-;;;   name   -- cookie name
-;;;   path   -- Path attribute (must match the original for deletion to work)
-;;;   domain -- Domain attribute, or "" to omit
-;;;
-;;; Returns:
-;;;   :cstr -- newly allocated header value; caller frees.
-;;;
-;;; Since: v0.1.0
-(defn cookie-build-expired [name : cstr path : cstr domain : cstr] : cstr
-  ```c
-  #include <stdlib.h>
-  #include <stdio.h>
-  #include <string.h>
-  const char *nm = (const char *)name;
-  const char *pt = (const char *)path;
-  const char *dm = (const char *)domain;
-  size_t cap = strlen(nm) + strlen(pt) + strlen(dm) + 64;
-  char *out = malloc(cap);
-  int n = snprintf(out, cap, "%s=; Path=%s; Max-Age=0", nm, pt);
-  if (dm[0] != '\0')
-    n += snprintf(out + n, cap - (size_t)n, "; Domain=%s", dm);
-  return (const char *)out;
-  ```)
+  (export cookie-sign cookie-unsign)
 
 ;; -- HMAC signing of the cookie value (S0) ---------------------------------
 ;;

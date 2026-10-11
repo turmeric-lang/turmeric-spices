@@ -65,11 +65,14 @@ like tourist's own dispatch state) and returns a tourist **after-middleware**
 item. There is no separate "before" middleware — the session is loaded
 **lazily** the first time a handler calls a `session-*` helper:
 
-1. the configured cookie is read from the request;
+1. the configured cookie is read from the request (tourist's `req-cookie`);
 2. if it names a session the store knows, that ID + map are adopted;
 3. otherwise a fresh 256-bit ID and an empty map are minted.
 
-On the way out, the after-middleware inspects the per-request session state:
+On the way out, the after-middleware inspects the per-request session state
+and writes the cookie with tourist's `set-cookie!` -- both are stdlib httpd's
+cookie parser and formatter, so the session spice no longer has its own
+(`session/cookie` is down to signing since v0.4.0):
 
 | Situation | Action |
 |-----------|--------|
@@ -179,11 +182,13 @@ is constant-time. Safe methods (GET/HEAD/OPTIONS) always pass.
 
 ## Writing a custom store
 
-The store is a small vtable, not a typeclass — tourist registers middleware as
-a bare C-ABI function pointer with no captured environment, so the middleware
-reads its store from a process-global, and a global cannot hold a value of an
-erased typeclass-instance type. A backend therefore provides three functions
-and an opaque state pointer and calls `store-new`:
+The store is a small vtable, not a typeclass. The middleware reads its store
+from a process-global -- because the `session-*` helpers your routes call
+read it too, not because tourist middleware cannot capture: tourist's `use!`,
+`use-around!` and `use-after!` all accept capturing closures (tourist v0.3.0
+pins it with a concurrent test). A global cannot hold a value of an erased
+typeclass-instance type, so a backend provides three functions and an opaque
+state pointer and calls `store-new`:
 
 ```turmeric
 ;; load   : (c-fn [state:int id:cstr] int)            -> SessMap handle, 0 = miss
@@ -195,7 +200,7 @@ and an opaque state pointer and calls `store-new`:
 Session data is a `SessMap` (see `session/data`) — a compact owned
 string→string map. Stores clone on the way in and out so a request's working
 copy never aliases the master copy. This is the same open-set extensibility a
-typeclass would give, expressed in tourist's established fn-pointer idiom.
+typeclass would give, expressed as a plain function-pointer vtable.
 
 ## Security notes
 
