@@ -1,0 +1,208 @@
+;; Signal Processing -- Sample buffers and buffer scanning
+;;
+;; A Buffer is a fixed-length array of samples. Fill it by rendering a signal
+;; into it (`buffer-render`) or by writing samples (`buffer-set!`), then read it
+;; back as a signal by SCANNING it: `scan` is an SF whose input signal is the
+;; read position, so whatever drives the position -- a ramp, an LFO, an
+;; envelope, another buffer -- decides how the buffer is played.
+;;
+;;   ((scan buf) ((sawtooth 220.0) z))        one cycle per 1/220 s: a
+;;                                            wavetable oscillator at 220 Hz
+;;   ((scan buf) ((sawtooth (/ sr n)) z))     the whole n-sample buffer once
+;;                                            per n / sr seconds: looped
+;;                                            playback at the original speed
+;;   ((scan buf) slow-lfo)                    scrubbing back and forth
+;;
+;; Positions are in BUFFER LENGTHS: 0.0 is the first sample, 0.5 the middle,
+;; and the position wraps, so 1.0 is the first sample again and -0.25 is
+;; three quarters of the way in. That makes signal/osc `sawtooth`, a ramp in
+;; [0, 1), the natural scan driver. Between two samples the read interpolates
+;; linearly, and the last sample interpolates toward the first, so a buffer
+;; holding exactly one cycle loops without a click.
+;;
+;; `scan` keeps no state of its own: if its position signal is a pure function
+;; of t (an oscillator), so is the scanned signal, and it may be sampled in any
+;; order. `buffer-render` samples its signal once per index, in order, so it is
+;; also the way to freeze a stateful signal (noise, a filter) into a repeatable
+;; one.
+;;
+;; Buffers hold up to 16777216 samples and live for the process, like the
+;; filter and delay state cells. A Buffer is a handle: writing to it with
+;; `buffer-set!` is seen by every scan of it.
+
+(defmodule signal/buffer
+  (export Buffer buffer-new buffer-render buffer-len buffer-get buffer-set!
+          buffer-read scan)
+
+;;; Buffer -- a fixed-length array of samples, shared by handle.
+;;;
+;;; Layout: [int64 len][double samples[len]].
+(defopaque Buffer :ptr<void>)
+
+;;; __buffer_alloc -- allocate a zeroed buffer of `n` samples (clamped).
+(defn __buffer_alloc [n :int] : ptr<void>
+  ```c
+  int64_t len = n;
+  if (len < 1) len = 1;
+  if (len > 16777216) len = 16777216;
+  int64_t *p = (int64_t *)calloc(1, sizeof(int64_t) + (size_t)len * sizeof(double));
+  if (!p) { fprintf(stderr, "buffer: alloc failed\n"); abort(); }
+  p[0] = len;
+  return p;
+  ```)
+
+;;; buffer-new -- a buffer of `n` silent samples.
+;;;
+;;; Parameters:
+;;;   n -- length in samples, clamped to [1, 16777216]
+;;;
+;;; Returns:
+;;;   A Buffer of n zeros.
+;;;
+;;; Example:
+;;;   (buffer-len (buffer-new 64))  ; => 64
+(defn buffer-new [n :int] : Buffer
+  (:: (__buffer_alloc n) Buffer))
+
+;;; buffer-len -- number of samples in a buffer.
+;;;
+;;; Parameters:
+;;;   buf -- the buffer
+;;;
+;;; Returns:
+;;;   The length in samples.
+;;;
+;;; Example:
+;;;   (buffer-len (buffer-new 64))  ; => 64
+(defn buffer-len [buf : Buffer] : int
+  ```c
+  return ((int64_t *)(intptr_t)buf)[0];
+  ```)
+
+;;; buffer-get -- the sample at index `i`, wrapping out-of-range indices.
+;;;
+;;; Parameters:
+;;;   buf -- the buffer
+;;;   i   -- index; taken modulo the length, so -1 is the last sample
+;;;
+;;; Returns:
+;;;   The stored sample.
+;;;
+;;; Example:
+;;;   (buffer-get buf 0)
+(defn buffer-get [buf : Buffer i :int] : float
+  ```c
+  int64_t *p = (int64_t *)(intptr_t)buf;
+  int64_t len = p[0];
+  int64_t k = i % len;
+  if (k < 0) k += len;
+  return ((double *)(p + 1))[k];
+  ```)
+
+;;; buffer-set! -- store sample `x` at index `i`, wrapping like `buffer-get`.
+;;;
+;;; Parameters:
+;;;   buf -- the buffer
+;;;   i   -- index; taken modulo the length
+;;;   x   -- the sample to store
+;;;
+;;; Example:
+;;;   (buffer-set! buf 0 1.0)
+(defn buffer-set! [buf : Buffer i :int x :float] : nil
+  ```c
+  int64_t *p = (int64_t *)(intptr_t)buf;
+  int64_t len = p[0];
+  int64_t k = i % len;
+  if (k < 0) k += len;
+  ((double *)(p + 1))[k] = x;
+  ```)
+
+;;; buffer-read -- linearly interpolated read at a position in buffer lengths.
+;;;
+;;; Position 0.0 is sample 0, 1.0 wraps back to sample 0, and in between the
+;;; read is `pos * len` samples in, interpolated between its two neighbours
+;;; (the last sample's right neighbour is the first). NaN or infinite
+;;; positions read sample 0.
+;;;
+;;; Parameters:
+;;;   buf -- the buffer
+;;;   pos -- read position; wraps, so any float is valid
+;;;
+;;; Returns:
+;;;   The interpolated sample.
+;;;
+;;; Example:
+;;;   (buffer-read buf 0.5)   ;; the middle of the buffer
+(defn buffer-read [buf : Buffer pos :float] : float
+  ```c
+  /* __tur_autolink__: -lm */
+  extern double floor(double);
+  int64_t *p = (int64_t *)(intptr_t)buf;
+  int64_t len = p[0];
+  const double *d = (const double *)(p + 1);
+  double x = pos - floor(pos);
+  if (!(x >= 0.0 && x < 1.0)) x = 0.0;
+  double idx = x * (double)len;
+  int64_t i0 = (int64_t)idx;
+  if (i0 >= len) i0 = len - 1;
+  double frac = idx - (double)i0;
+  int64_t i1 = (i0 + 1 == len) ? 0 : i0 + 1;
+  return d[i0] + frac * (d[i1] - d[i0]);
+  ```)
+
+;;; __buffer_fill -- write sig(k / sample-rate) into every slot, in order.
+;;;
+;;; A `while` loop, not self recursion: a recursive fill is not turned into a
+;;; loop and overflows the C stack well short of ten seconds of audio.
+(defn __buffer_fill [buf : Buffer ^fat sig : (fn [float] float) sample-rate :float] : Buffer
+  (let [n      (buffer-len buf)
+        ^mut k 0]
+    (while (< k n)
+      (buffer-set! buf k (sig (/ (as float k) sample-rate)))
+      (set! k (+ k 1)))
+    buf))
+
+;;; buffer-render -- record `n` samples of a signal into a new buffer.
+;;;
+;;; Sample k holds `sig` at t = k / sample-rate, sampled in order from k = 0,
+;;; so stateful signals (noise, filters, delays) render correctly. A
+;;; non-positive sample rate is treated as 1.0 (t = k).
+;;;
+;;; Parameters:
+;;;   sample-rate -- the rate to sample `sig` at, in Hz
+;;;   n           -- length in samples, clamped to [1, 16777216]
+;;;   sig         -- the signal to record
+;;;
+;;; Returns:
+;;;   A new Buffer.
+;;;
+;;; Example:
+;;;   ;; one cycle of a 1 Hz sine over 2048 samples: a wavetable
+;;;   (buffer-render 2048.0 2048 ((sine 1.0 0.0) (constant 0.0)))
+(defn buffer-render [sample-rate :float n :int ^fat sig : (fn [float] float)] : Buffer
+  (let [buf (buffer-new n)
+        sr  (if (> sample-rate 0.0) sample-rate 1.0)]
+    (__buffer_fill buf sig sr)))
+
+;;; scan -- read a buffer at the position given by the input signal.
+;;;
+;;; An SF: apply it to a position signal (in buffer lengths, wrapping) to get
+;;; the buffer's contents along that path, interpolated. Drive it with a
+;;; `sawtooth` at f Hz and a one-cycle buffer becomes an f Hz oscillator; with
+;;; a slow LFO it scrubs.
+;;;
+;;; Parameters:
+;;;   buf -- the buffer to scan
+;;;
+;;; Returns:
+;;;   SF Sample Sample: position -> sample. Stateless.
+;;;
+;;; Example:
+;;;   ((scan table) ((sawtooth 220.0) (constant 0.0)))
+(defn scan [buf : Buffer]
+  (let [bv buf]
+    (fn [^fat pos : (fn [float] float)]
+      (fn [t :float] :float
+        (buffer-read bv (pos t))))))
+
+) ;; end defmodule signal/buffer
