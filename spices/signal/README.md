@@ -3,14 +3,15 @@
 Typed Signal Function (SF) library for [Turmeric](https://github.com/turmeric-lang/turmeric):
 oscillators (including FM and PM), one-pole / biquad / state-variable / ladder
 filters, delays and combs, colored noise, sample buffers and buffer scanning,
-shapers, ADSR envelopes, and SF-pipeline composition.
+MIDI note / Hz conversion, shapers, ADSR envelopes, and SF-pipeline
+composition.
 
 ---
 
 ## Status
 
-Runs end-to-end against turmeric `main` (checked with v0.64.1). All ten
-modules `tur check` clean, all nine examples run and print the values in
+Runs end-to-end against turmeric `main` (checked with v0.64.1). All eleven
+modules `tur check` clean, all ten examples run and print the values in
 their comments, and the full `tests/signal/` suite passes:
 
 ```
@@ -24,14 +25,16 @@ PASS test_filter
 PASS test_hf_osc
 PASS test_noise
 PASS test_osc
+PASS test_pitch
 PASS test_shaper
-..........
-10 tests, 10 passed, 0 failed
+...........
+11 tests, 11 passed, 0 failed
 ```
 
 Not provided: Karplus-Strong and granular synthesis, band-limited wavetable
 sets, saturating (analog-modeled) filters, voice management / poly-synths /
-sequencers, and audio device or file output. The
+sequencers (the guide shows a melody and a `cycle` built from the parts), and
+audio device or file output. The
 [guide](https://spices.turmeric-lang.com/docs/html/guides/signal-guide.html)
 walks every module with runnable examples.
 
@@ -98,6 +101,7 @@ A few constructors need a specific call shape:
 | `signal/hf-osc`   | `hf-sawtooth`, `hf-square`, `hf-triangle` -- band-limited, for hearing-range pitches     |
 | `signal/filter`   | one-pole (`low-pass`, `high-pass`, `one-pole-lp`, `one-pole-hp`, `dc-block`), RBJ biquads (`biquad-*`, `biquad`), state-variable (`svf-*`), `ladder` |
 | `signal/buffer`   | `Buffer`, `buffer-new`, `buffer-render`, `buffer-len`, `buffer-get`, `buffer-set!`, `buffer-read`, `scan` |
+| `signal/pitch`    | `mtof`, `ftom` -- MIDI note number <-> Hz                                                  |
 | `signal/delay`    | `delay`, `comb-ff`, `comb`, `allpass` (+ sample-counted `*-n` forms) -- ring-buffer effects |
 | `signal/noise`    | `white`, `pink`, `brown`, `blue`, `violet` (+ injected-source `*-from`, and `rng`)       |
 | `signal/shaper`   | `gain`, `offset`, `invert`, `abs-sf`, `scale`, `saturate-tanh`, `hard-clip`, `clip`, `mix`, `add`, `multiply` |
@@ -235,6 +239,17 @@ Scanned by a `sawtooth` at f Hz, a one-cycle buffer is an f Hz wavetable
 oscillator; a recording scanned once per its duration plays back looped, and
 faster or slower ramps transpose it like tape.
 
+### `signal/pitch`
+
+Twelve-tone equal temperament, A4 = 440 Hz = note 69 (middle C is note 60).
+Note numbers are floats: each 1.0 is a semitone. Both are plain
+`:float -> :float` functions; lift one onto a signal with `map-signal`.
+
+| Symbol | Produces |
+|---|---|
+| `mtof m` | `440 * 2^((m - 69) / 12)` Hz |
+| `ftom f` | `69 + 12 * log2(f / 440)`; fractional between notes, `f` must be > 0 |
+
 ### Stateful signals are pull-order dependent
 
 Every filter, every delay effect, every noise generator and `fm-sine` advance
@@ -301,36 +316,31 @@ Then `tur fetch`. There is no `signal-v*` release tag yet, so track `main`.
 (defmodule my/app
   (import signal/core     :refer [constant sample pair-signals])
   (import signal/osc      :refer [sine])
-  (import signal/filter   :refer [low-pass biquad-lp])
-  (import signal/shaper   :refer [gain multiply])
+  (import signal/filter   :refer [biquad-lp])
+  (import signal/shaper   :refer [multiply])
   (import signal/envelope :refer [ADSRParams adsr-fixed])
-  (import signal/compose  :refer [effects-chain])
+  (import signal/pitch    :refer [mtof])
 
   (defn main [] : int
-    ;; A constant, and an oscillator sampled at its peak.
+    ;; A constant, and an A4 sine a quarter cycle in: its peak.
     (println (sample (constant 0.5) 0.0))               ;; 0.5
-    (let [s1 ((sine 1.0 0.0) (constant 0.0))]
-      (println (sample s1 0.25)))                       ;; 1
+    (let [a4 ((sine (mtof 69.0) 0.0) (constant 0.0))]
+      (println (sample a4 (/ 0.25 440.0))))             ;; 1
 
     ;; Filters are stateful: each sample call advances them.
     (let [lp ((biquad-lp 48000.0 1000.0 0.7071) (constant 1.0))]
       (println (sample lp 0.0))                         ;; 0.00391612
       (println (sample lp 0.0)))                        ;; 0.0188575
 
-    ;; An ADSR envelope half way up its attack.
-    (let [env ((adsr-fixed (make-struct ADSRParams 0.01 0.1 0.7 0.3) 0.5)
-               (constant 0.0))]
-      (println (sample env 0.005)))                     ;; 0.5
-
-    ;; A simple voice: sine -> [gain, low-pass] -> * envelope.
-    (let [osc   ((sine 2.0 0.0) (constant 0.0))
-          ^fat chain : (fn [float] float)
-                (effects-chain (vec-of (gain 0.8) (low-pass 0.5)) osc)
-          env   ((adsr-fixed (make-struct ADSRParams 0.1 0.1 0.6 0.2) 0.5)
+    ;; A voice: an A3 sine times the envelope of a half-second note.  At a
+    ;; crest of the sine during the sustain, it reads the sustain level.
+    (let [env   ((adsr-fixed (make-struct ADSRParams 0.01 0.1 0.6 0.2) 0.5)
                  (constant 0.0))
+          a3    ((sine (mtof 57.0) 0.0) (constant 0.0))
           ml    (multiply)
-          voice (ml (pair-signals chain env))]
-      (println (sample voice 0.05)))                    ;; 0.117557
+          voice (ml (pair-signals a3 env))]
+      (println (sample env 0.005))                      ;; 0.5 (half way up the attack)
+      (println (sample voice (+ 0.25 (/ 0.25 220.0)))))  ;; 0.6
     0))
 ```
 
@@ -338,36 +348,31 @@ Then `tur fetch`. There is no `signal-v*` release tag yet, so track `main`.
 defmodule my/app
   import signal/core     :refer [constant sample pair-signals]
   import signal/osc      :refer [sine]
-  import signal/filter   :refer [low-pass biquad-lp]
-  import signal/shaper   :refer [gain multiply]
+  import signal/filter   :refer [biquad-lp]
+  import signal/shaper   :refer [multiply]
   import signal/envelope :refer [ADSRParams adsr-fixed]
-  import signal/compose  :refer [effects-chain]
+  import signal/pitch    :refer [mtof]
 
   defn main [] : int
-    ;; A constant, and an oscillator sampled at its peak.
+    ;; A constant, and an A4 sine a quarter cycle in: its peak.
     println $ sample constant(0.5) 0.0                ;; 0.5
-    let [s1 (sine(1.0 0.0) constant(0.0))]
-      println $ sample s1 0.25                        ;; 1
+    let [a4 (sine(mtof(69.0) 0.0) constant(0.0))]
+      println $ sample a4 {0.25 / 440.0}              ;; 1
 
     ;; Filters are stateful: each sample call advances them.
     let [lp (biquad-lp(48000.0 1000.0 0.7071) constant(1.0))]
       println $ sample lp 0.0                         ;; 0.00391612
       println $ sample lp 0.0                         ;; 0.0188575
 
-    ;; An ADSR envelope half way up its attack.
-    let [env (adsr-fixed(make-struct(ADSRParams 0.01 0.1 0.7 0.3) 0.5)
-              constant(0.0))]
-      println $ sample env 0.005                      ;; 0.5
-
-    ;; A simple voice: sine -> [gain, low-pass] -> * envelope.
-    let [osc   (sine(2.0 0.0) constant(0.0))
-         ^fat chain : (fn [float] float)
-               effects-chain(vec-of(gain(0.8) low-pass(0.5)) osc)
-         env   (adsr-fixed(make-struct(ADSRParams 0.1 0.1 0.6 0.2) 0.5)
+    ;; A voice: an A3 sine times the envelope of a half-second note.  At a
+    ;; crest of the sine during the sustain, it reads the sustain level.
+    let [env   (adsr-fixed(make-struct(ADSRParams 0.01 0.1 0.6 0.2) 0.5)
                  constant(0.0))
+         a3    (sine(mtof(57.0) 0.0) constant(0.0))
          ml    multiply()
-         voice ml(pair-signals(chain env))]
-      println $ sample voice 0.05                     ;; 0.117557
+         voice ml(pair-signals(a3 env))]
+      println $ sample env 0.005                      ;; 0.5 (half way up the attack)
+      println $ sample voice {0.25 + {0.25 / 220.0}}  ;; 0.6
     0
 ```
 
@@ -375,19 +380,20 @@ defmodule my/app
 
 ## Examples
 
-Nine runnable examples live under `examples/`:
+Ten runnable examples live under `examples/`:
 
 ```sh
 cd spices/signal
 tur run examples/01_constant_and_time.tur     # constant + time-signal
-tur run examples/02_oscillators.tur           # sine/square/sawtooth/triangle
+tur run examples/02_oscillators.tur           # sine/square/sawtooth/triangle at audible pitches
 tur run examples/03_filters_and_shapers.tur   # filters + scalar shapers
 tur run examples/04_envelopes.tur             # ADSR
-tur run examples/05_simple_voice.tur          # capstone: every module wired together
+tur run examples/05_simple_voice.tur          # an A3 voice: oscillator, chain, envelope
 tur run examples/06_hf_oscillators.tur        # naive vs band-limited sawtooth at 7.9 kHz
 tur run examples/07_delay_and_noise.tur       # delay, comb, allpass, colored noise
 tur run examples/08_filters.tur               # biquads, state-variable sweep, ladder
 tur run examples/09_modulation_and_buffers.tur  # ring, AM, PM, FM, wavetable, tape
+tur run examples/10_pitch_and_sequences.tur   # mtof/ftom, a melody in order, a cycle
 ```
 
 Each prints sample values that match the hand-computed references in its
@@ -404,7 +410,7 @@ tur test tests/signal                                 # all pass
 ```
 
 Modules that call libm (`signal/osc`, `signal/hf-osc`, `signal/filter`,
-`signal/shaper`, `signal/buffer`) carry a `__tur_autolink__: -lm` directive
+`signal/shaper`, `signal/buffer`, `signal/pitch`) carry a `__tur_autolink__: -lm` directive
 so any program importing them links against the math library automatically.
 
 ## See also

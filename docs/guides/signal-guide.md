@@ -1,7 +1,7 @@
 ---
 title: Signal Processing with Typed Signal Functions
 category: Audio
-description: Oscillators (LFO, band-limited, FM and PM), one-pole, biquad, state-variable and ladder filters, delays and combs, colored noise, sample buffers and scanning, shapers, ADSR envelopes, and SF-pipeline composition -- a typed Signal/SF abstraction for building audio DSP graphs
+description: Oscillators (LFO, band-limited, FM and PM), one-pole, biquad, state-variable and ladder filters, delays and combs, colored noise, sample buffers and scanning, MIDI note/Hz conversion and sequencing, shapers, ADSR envelopes, and SF-pipeline composition -- a typed Signal/SF abstraction for building audio DSP graphs
 audience: developers building audio synthesis, DSP pipelines, or signal-driven applications in Turmeric
 since: signal v0.1.0
 ---
@@ -26,6 +26,7 @@ This guide walks the things you will do most often:
 7. [Noise](#7-noise)
 8. [Modulation: ring, AM, PM and FM](#8-modulation)
 9. [Buffers and buffer scanning](#9-buffers-and-buffer-scanning)
+10. [Pitches, melodies and cycles](#10-pitches-melodies-and-cycles)
 
 Every example is a complete program: save it inside a project that depends
 on the spice and `tur run` it. The comments show what it prints.
@@ -125,7 +126,10 @@ defmodule demo
 ## 2. Oscillators
 
 Each oscillator is an `SF () Sample` -- it ignores its input signal. Apply
-it to any signal (typically `(constant 0.0)`) to get a `Signal Sample`:
+it to any signal (typically `(constant 0.0)`) to get a `Signal Sample`. The
+pitches here are notes you can hear -- 440 Hz is A4, 220 Hz is A3, 110 Hz is
+A2 ([section 10](#10-pitches-melodies-and-cycles) converts between note
+numbers and Hz) -- so each is sampled at a fraction of its own period:
 
 ```turmeric
 (defmodule demo
@@ -134,14 +138,14 @@ it to any signal (typically `(constant 0.0)`) to get a `Signal Sample`:
 
   (defn main [] : int
     (let [z   (constant 0.0)
-          s1  ((sine 1.0 0.0) z)
-          sq  ((square 2.0 0.5) z)
-          saw ((sawtooth 1.0) z)
-          tri ((triangle 1.0) z)]
-      (println (sample s1 0.25))     ;; 1 (peak of a 1 Hz sine)
-      (println (sample sq 0.1))      ;; 1 (on-portion of the duty cycle)
-      (println (sample saw 0.5))     ;; 0.5 (mid-ramp)
-      (println (sample tri 0.25)))   ;; 0 (zero crossing)
+          s1  ((sine 440.0 0.0) z)
+          sq  ((square 220.0 0.5) z)
+          saw ((sawtooth 110.0) z)
+          tri ((triangle 220.0) z)]
+      (println (sample s1 (/ 0.25 440.0)))    ;; 1 (a quarter cycle in: the peak)
+      (println (sample sq (/ 0.25 220.0)))    ;; 1 (inside the on-portion)
+      (println (sample saw (/ 0.5 110.0)))    ;; 0.5 (half a cycle in: mid-ramp)
+      (println (sample tri (/ 0.25 220.0))))  ;; 0 (a quarter cycle in: zero crossing)
     0))
 ```
 
@@ -152,14 +156,14 @@ defmodule demo
 
   defn main [] : int
     let [z   constant(0.0)
-         s1  (sine(1.0 0.0) z)
-         sq  (square(2.0 0.5) z)
-         saw (sawtooth(1.0) z)
-         tri (triangle(1.0) z)]
-      println $ sample s1 0.25      ;; 1 (peak of a 1 Hz sine)
-      println $ sample sq 0.1       ;; 1 (on-portion of the duty cycle)
-      println $ sample saw 0.5      ;; 0.5 (mid-ramp)
-      println $ sample tri 0.25     ;; 0 (zero crossing)
+         s1  (sine(440.0 0.0) z)
+         sq  (square(220.0 0.5) z)
+         saw (sawtooth(110.0) z)
+         tri (triangle(220.0) z)]
+      println $ sample s1 {0.25 / 440.0}     ;; 1 (a quarter cycle in: the peak)
+      println $ sample sq {0.25 / 220.0}     ;; 1 (inside the on-portion)
+      println $ sample saw {0.5 / 110.0}     ;; 0.5 (half a cycle in: mid-ramp)
+      println $ sample tri {0.25 / 220.0}    ;; 0 (a quarter cycle in: zero crossing)
     0
 ```
 
@@ -169,6 +173,12 @@ defmodule demo
 | `square` | freq, dutycycle | +1 for the on-portion, -1 otherwise |
 | `sawtooth` | freq | rising ramp in [0, 1) |
 | `triangle` | freq | rises -1 to 1, falls 1 to -1 each cycle |
+
+These four are the naive shapes. A sine is clean at any pitch, but the square,
+sawtooth and triangle alias at audio pitches like these -- the values above are
+exact, the sound is not. For a voice, use their band-limited twins in
+[section 2b](#2b-band-limited-oscillators-hf-osc); the naive ones are right for
+LFOs and other control signals.
 
 `signal/osc` also has two oscillators that *read* their input signal as a
 modulator, `pm-sine` and `fm-sine`; they are in [section 8](#8-modulation).
@@ -627,53 +637,90 @@ gate duration in seconds; `adsr-gen` is the convenience that uses a unit
 
 ### A complete voice
 
-Oscillator through a gain and low-pass chain, multiplied by an envelope:
+An A3 (220 Hz) sawtooth through a gain and a 2 kHz low-pass, multiplied by
+the envelope of a half-second note. The low-pass is stateful, so the note is
+rendered on the 48 kHz grid with `buffer-render` ([section 9](#9-buffers-and-buffer-scanning)),
+and `peak` reads its level back at four points in its life:
 
 ```turmeric
 (defmodule demo
-  (import signal/core     :refer [constant sample pair-signals])
-  (import signal/osc      :refer [sine])
-  (import signal/filter   :refer [low-pass])
+  (import signal/core     :refer [constant pair-signals])
+  (import signal/hf-osc   :refer [hf-sawtooth])
+  (import signal/filter   :refer [biquad-lp])
   (import signal/shaper   :refer [gain multiply])
   (import signal/envelope :refer [ADSRParams adsr-fixed])
   (import signal/compose  :refer [effects-chain])
+  (import signal/buffer   :refer [Buffer buffer-render buffer-get])
+
+  ;; peak -- the largest |sample| of `b` in [from, to).
+  (defn peak [b : Buffer from : int to : int] : float
+    (let [^mut i from
+          ^mut m 0.0]
+      (while (< i to)
+        (let [v (buffer-get b i)
+              a (if (< v 0.0) (- 0.0 v) v)]
+          (when (> a m) (set! m a)))
+        (set! i (+ i 1)))
+      m))
 
   (defn main [] : int
-    (let [osc   ((sine 2.0 0.0) (constant 0.0))
+    (let [osc   ((hf-sawtooth 220.0 48000.0) (constant 0.0))
           ^fat chain : (fn [float] float)
-                (effects-chain (vec-of (gain 0.8) (low-pass 0.5)) osc)
-          env   ((adsr-fixed (make-struct ADSRParams 0.1 0.1 0.6 0.2) 0.5)
+                (effects-chain (vec-of (gain 0.8) (biquad-lp 48000.0 2000.0 0.7071)) osc)
+          env   ((adsr-fixed (make-struct ADSRParams 0.01 0.1 0.6 0.2) 0.5)
                  (constant 0.0))
           ml    (multiply)
-          voice (ml (pair-signals chain env))]
-      (println (sample voice 0.05)))    ;; 0.117557
+          voice (ml (pair-signals chain env))
+          note  (buffer-render 48000.0 36000 voice)]   ;; 0.75 s: gate + release
+      (println (peak note 0 240))          ;; 0.385413 (the first 5 ms: rising)
+      (println (peak note 12000 14400))    ;; 0.474386 (0.25 .. 0.3 s: sustain)
+      (println (peak note 28800 31200))    ;; 0.236298 (0.6 .. 0.65 s: releasing)
+      (println (peak note 33600 36000)))   ;; 9.9799e-17 (0.7 .. 0.75 s: done)
     0))
 ```
 
 ```sweet-exp
 defmodule demo
-  import signal/core     :refer [constant sample pair-signals]
-  import signal/osc      :refer [sine]
-  import signal/filter   :refer [low-pass]
+  import signal/core     :refer [constant pair-signals]
+  import signal/hf-osc   :refer [hf-sawtooth]
+  import signal/filter   :refer [biquad-lp]
   import signal/shaper   :refer [gain multiply]
   import signal/envelope :refer [ADSRParams adsr-fixed]
   import signal/compose  :refer [effects-chain]
+  import signal/buffer   :refer [Buffer buffer-render buffer-get]
+
+  ;; peak -- the largest |sample| of `b` in [from, to).
+  defn peak [b : Buffer from : int to : int] : float
+    let [^mut i from
+         ^mut m 0.0]
+      while {i < to}
+        let [v buffer-get(b i)
+             a (if {v < 0.0} {0.0 - v} v)]
+          when {a > m} set!(m a)
+        set! i {i + 1}
+      m
 
   defn main [] : int
-    let [osc   (sine(2.0 0.0) constant(0.0))
+    let [osc   (hf-sawtooth(220.0 48000.0) constant(0.0))
          ^fat chain : (fn [float] float)
-               effects-chain(vec-of(gain(0.8) low-pass(0.5)) osc)
-         env   (adsr-fixed(make-struct(ADSRParams 0.1 0.1 0.6 0.2) 0.5)
+               effects-chain(vec-of(gain(0.8) biquad-lp(48000.0 2000.0 0.7071)) osc)
+         env   (adsr-fixed(make-struct(ADSRParams 0.01 0.1 0.6 0.2) 0.5)
                  constant(0.0))
          ml    multiply()
-         voice ml(pair-signals(chain env))]
-      println $ sample voice 0.05     ;; 0.117557
+         voice ml(pair-signals(chain env))
+         note  buffer-render(48000.0 36000 voice)]   ;; 0.75 s: gate + release
+      println $ peak note 0 240           ;; 0.385413 (the first 5 ms: rising)
+      println $ peak note 12000 14400     ;; 0.474386 (0.25 .. 0.3 s: sustain)
+      println $ peak note 28800 31200     ;; 0.236298 (0.6 .. 0.65 s: releasing)
+      println $ peak note 33600 36000     ;; 9.9799e-17 (0.7 .. 0.75 s: done)
     0
 ```
 
-`effects-chain` applies a `Vec` of SFs left-to-right to an input signal. It
-returns the chained signal as a raw pointer, so bind the result as a `^fat`
-signal (as `chain` is here) before sampling it.
+The sustain level is the filtered sawtooth's peak (about 0.99 after the
+low-pass) times the gain, 0.8, times the sustain, 0.6. `effects-chain` applies
+a `Vec` of SFs left-to-right to an input signal. It returns the chained signal
+as a raw pointer, so bind the result as a `^fat` signal (as `chain` is here)
+before using it.
 
 ---
 
@@ -1182,6 +1229,244 @@ about 4e-4.
 
 ---
 
+## 10. Pitches, melodies and cycles
+
+### Note numbers and Hz: `mtof` and `ftom`
+
+`signal/pitch` converts between MIDI note numbers and frequencies, in
+twelve-tone equal temperament with A4 = 440 Hz = note 69, so middle C (C4) is
+note 60. `mtof` goes from note to Hz, `ftom` back. Note numbers are floats:
+each 1.0 is a semitone, each 12.0 an octave, and 60.5 is a quarter tone above
+middle C. Both are plain `float -> float` functions; `map-signal` lifts one
+onto a signal, so a pitch contour in notes becomes a frequency signal:
+
+```turmeric
+(defmodule demo
+  (import signal/core  :refer [sample map-signal])
+  (import signal/pitch :refer [mtof ftom])
+
+  (defn main [] : int
+    (println (mtof 69.0))       ;; 440 (A4)
+    (println (mtof 60.0))       ;; 261.626 (middle C)
+    (println (mtof 72.0))       ;; 523.251 (an octave up: twice the Hz)
+    (println (ftom 450.0))      ;; 69.3891 (A4, 39 cents sharp)
+    ;; A glide up one whole tone a second, from A4.
+    (let [glide (fn [t : float] : float (+ 69.0 (* 2.0 t)))
+          hz    (map-signal mtof glide)]
+      (println (sample hz 0.5)))  ;; 466.164 (B-flat 4, half way)
+    0))
+```
+
+```sweet-exp
+defmodule demo
+  import signal/core  :refer [sample map-signal]
+  import signal/pitch :refer [mtof ftom]
+
+  defn main [] : int
+    println $ mtof 69.0         ;; 440 (A4)
+    println $ mtof 60.0         ;; 261.626 (middle C)
+    println $ mtof 72.0         ;; 523.251 (an octave up: twice the Hz)
+    println $ ftom 450.0        ;; 69.3891 (A4, 39 cents sharp)
+    ;; A glide up one whole tone a second, from A4.
+    let [glide (fn [t : float] : float {69.0 + {2.0 * t}})
+         hz    map-signal(mtof glide)]
+      println $ sample hz 0.5   ;; 466.164 (B-flat 4, half way)
+    0
+```
+
+`ftom` of a frequency that is not a tempered pitch is fractional: round it
+for the nearest note, and the rest is the offset in semitones (times 100 for
+cents). The frequency must be positive.
+
+### Playing a list of pitches in order
+
+A melody is a list of note numbers and a step length. The note sounding at
+time `t` is the one at index `t / step`, so the pitch is a pure function of
+time and needs no state of its own. Two details make it sound right:
+
+- **The oscillator is `fm-sine` with a carrier of 0**, so its input signal is
+  its whole frequency. It integrates that frequency, so the phase runs on
+  smoothly from one note into the next; switching between separate `sine`s
+  would jump the phase at every note and click.
+- **The envelope restarts every step.** The ADSR is a function of time, so
+  the per-note envelope is the ADSR sampled at the time since the step began.
+
+`heard` checks the result: it counts the rendered audio's zero crossings
+while each note is held and converts the count back to a note with `ftom`.
+
+```turmeric
+(defmodule demo
+  (import signal/core     :refer [constant sample pair-signals])
+  (import signal/osc      :refer [fm-sine])
+  (import signal/pitch    :refer [mtof ftom])
+  (import signal/shaper   :refer [multiply])
+  (import signal/envelope :refer [ADSRParams adsr-fixed])
+  (import signal/buffer   :refer [Buffer buffer-render buffer-get])
+
+  ;; note-at -- the note sounding at time t: one note per `step` seconds,
+  ;; in order, starting over after the last.
+  (defn note-at [notes : (Vec float) step : float t : float] : float
+    (vec-get notes (mod (as int (/ t step)) (vec-len notes))))
+
+  ;; heard -- the nearest note to what `b` plays in [from, from + n) at
+  ;; 48 kHz: upward zero crossings per second, back to a note number.
+  (defn heard [b : Buffer from : int n : int] : int
+    (let [^mut i  (+ from 1)
+          ^mut up 0]
+      (while (< i (+ from n))
+        (when (and (< (buffer-get b (- i 1)) 0.0) (>= (buffer-get b i) 0.0))
+          (set! up (+ up 1)))
+        (set! i (+ i 1)))
+      (as int (+ 0.5 (ftom (/ (as float up) (/ (as float n) 48000.0)))))))
+
+  (defn main [] : int
+    (let [melody [60.0 64.0 67.0 72.0]   ;; C4 E4 G4 C5
+          step   0.25                     ;; seconds per note
+          z      (constant 0.0)
+          freq   (fn [t : float] : float (mtof (note-at melody step t)))
+          tone   ((fm-sine 48000.0 0.0) freq)
+          env    ((adsr-fixed (make-struct ADSRParams 0.005 0.05 0.7 0.04) 0.2) z)
+          per    (fn [t : float] : float
+                   (sample env (- t (* step (as float (as int (/ t step)))))))
+          ml     (multiply)
+          voice  (ml (pair-signals tone per))
+          out    (buffer-render 48000.0 48000 voice)]   ;; one pass: 1 s
+      (println (heard out 0 9600))       ;; 60
+      (println (heard out 12000 9600))   ;; 64
+      (println (heard out 24000 9600))   ;; 67
+      (println (heard out 36000 9600)))  ;; 72
+    0))
+```
+
+```sweet-exp
+defmodule demo
+  import signal/core     :refer [constant sample pair-signals]
+  import signal/osc      :refer [fm-sine]
+  import signal/pitch    :refer [mtof ftom]
+  import signal/shaper   :refer [multiply]
+  import signal/envelope :refer [ADSRParams adsr-fixed]
+  import signal/buffer   :refer [Buffer buffer-render buffer-get]
+
+  ;; note-at -- the note sounding at time t: one note per `step` seconds,
+  ;; in order, starting over after the last.
+  defn note-at [notes : (Vec float) step : float t : float] : float
+    vec-get notes mod(as(int {t / step}) vec-len(notes))
+
+  ;; heard -- the nearest note to what `b` plays in [from, from + n) at
+  ;; 48 kHz: upward zero crossings per second, back to a note number.
+  defn heard [b : Buffer from : int n : int] : int
+    let [^mut i  {from + 1}
+         ^mut up 0]
+      while {i < {from + n}}
+        when (and {buffer-get(b {i - 1}) < 0.0} {buffer-get(b i) >= 0.0})
+          set! up {up + 1}
+        set! i {i + 1}
+      as int {0.5 + ftom({as(float up) / {as(float n) / 48000.0}})}
+
+  defn main [] : int
+    let [melody [60.0 64.0 67.0 72.0]   ;; C4 E4 G4 C5
+         step   0.25                     ;; seconds per note
+         z      constant(0.0)
+         freq   (fn [t : float] : float mtof(note-at(melody step t)))
+         tone   (fm-sine(48000.0 0.0) freq)
+         env    (adsr-fixed(make-struct(ADSRParams 0.005 0.05 0.7 0.04) 0.2) z)
+         per    (fn [t : float] : float
+                  sample(env {t - {step * as(float as(int {t / step}))}}))
+         ml     multiply()
+         voice  ml(pair-signals(tone per))
+         out    buffer-render(48000.0 48000 voice)]   ;; one pass: 1 s
+      println $ heard out 0 9600        ;; 60
+      println $ heard out 12000 9600    ;; 64
+      println $ heard out 24000 9600    ;; 67
+      println $ heard out 36000 9600    ;; 72
+    0
+```
+
+Change `melody` and `step` to play something else; past the last note it
+starts over. To play it once, clamp the index instead of wrapping it. Swap
+`fm-sine` for a band-limited sawtooth and the pitch still has to reach it as a
+frequency signal, which is what `fm-sine`'s input is for.
+
+### A `cycle`: the next value, each time it is asked
+
+`note-at` answers "what is playing at time `t`?". Event-driven code asks a
+different question -- "what comes next?" -- every time a note starts, a step
+fires or a key is pressed. The natural shape for that is a **closure that
+owns its position**: `cycle` takes a list and returns a function of no
+arguments that hands out the values in order, one per call, starting over
+after the last. It is the same pattern as `signal/noise`'s `rng`: the state
+lives in a mutable only the closure can reach, so each `cycle` call makes an
+independent source.
+
+```turmeric
+(defmodule demo
+  (import signal/pitch :refer [mtof])
+
+  ;; cycle -- hand out `values` in order, one per call, wrapping around.
+  (defn cycle [values : (Vec float)] : (fn [] float)
+    (let [^mut i 0]
+      (fn [] : float
+        (let [v (vec-get values (mod i (vec-len values)))]
+          (set! i (+ i 1))
+          v))))
+
+  (defn main [] : int
+    (let [next-note (cycle [60.0 64.0 67.0])
+          next-amp  (cycle [1.0 0.5 0.75 0.5])
+          other     (cycle [60.0 64.0 67.0])]
+      ;; Three notes against four accents: the pairing repeats every 12.
+      (println (next-note))      ;; 60
+      (println (next-amp))       ;; 1
+      (println (next-note))      ;; 64
+      (println (next-amp))       ;; 0.5
+      (println (next-note))      ;; 67
+      (println (next-amp))       ;; 0.75
+      (println (next-note))      ;; 60
+      (println (next-amp))       ;; 0.5
+      (println (mtof (next-note)))   ;; 329.628 (E4)
+      (println (other)))             ;; 60 (its own position)
+    0))
+```
+
+```sweet-exp
+defmodule demo
+  import signal/pitch :refer [mtof]
+
+  ;; cycle -- hand out `values` in order, one per call, wrapping around.
+  defn cycle [values : (Vec float)] : (fn [] float)
+    let [^mut i 0]
+      (fn [] : float
+        (let [v vec-get(values mod(i vec-len(values)))]
+          set!(i {i + 1})
+          v))
+
+  defn main [] : int
+    let [next-note cycle([60.0 64.0 67.0])
+         next-amp  cycle([1.0 0.5 0.75 0.5])
+         other     cycle([60.0 64.0 67.0])]
+      ;; Three notes against four accents: the pairing repeats every 12.
+      println $ next-note()     ;; 60
+      println $ next-amp()      ;; 1
+      println $ next-note()     ;; 64
+      println $ next-amp()      ;; 0.5
+      println $ next-note()     ;; 67
+      println $ next-amp()      ;; 0.75
+      println $ next-note()     ;; 60
+      println $ next-amp()      ;; 0.5
+      println $ mtof next-note()  ;; 329.628 (E4)
+      println $ other()           ;; 60 (its own position)
+    0
+```
+
+A cycle is stateful in the same way a filter or a noise generator is: every
+call advances it. Do not sample it from inside a signal -- a signal is asked
+for a value 48,000 times a second, and would race through the list -- and do
+not share one cycle between two consumers that each expect the whole
+sequence; give each its own. When the question really is "what is playing at
+time `t`", use the pure `note-at` shape above instead.
+
+---
+
 ## Stateful signals and sample order
 
 `low-pass`, `high-pass` and every other filter, every delay effect, every noise
@@ -1221,8 +1506,10 @@ restriction.
 - **You need analog-modeled saturation.** The ladder is the linear model and
   nothing in `signal/filter` saturates; put `saturate-tanh` before or after a
   filter, not inside it.
-- **You need a poly-synth, step-sequencer, or voice manager.** Those are
-  composition layers above this spice.
+- **You need a poly-synth, a full step sequencer, or a voice manager.**
+  Section 10 shows the building blocks -- a time-indexed melody and a
+  `cycle` -- but scheduling, polyphony and voice allocation are composition
+  layers above this spice.
 - **You need throughput.** Every sample of every stage is a closure call, which
   is fine for offline rendering and tests, and slow for many real-time voices.
 
@@ -1230,19 +1517,20 @@ restriction.
 
 ## Examples
 
-Nine runnable examples live under `examples/`:
+Ten runnable examples live under `examples/`:
 
 ```sh
 cd spices/signal
 tur run examples/01_constant_and_time.tur       # constant + time-signal
-tur run examples/02_oscillators.tur             # sine/square/sawtooth/triangle
+tur run examples/02_oscillators.tur             # sine/square/sawtooth/triangle at audible pitches
 tur run examples/03_filters_and_shapers.tur     # one-pole filters + scalar shapers
 tur run examples/04_envelopes.tur               # ADSR
-tur run examples/05_simple_voice.tur            # capstone: every module wired together
+tur run examples/05_simple_voice.tur            # an A3 voice: oscillator, chain, envelope
 tur run examples/06_hf_oscillators.tur          # naive vs band-limited sawtooth at 7.9 kHz
 tur run examples/07_delay_and_noise.tur         # delay, comb, allpass, colored noise
 tur run examples/08_filters.tur                 # biquads, state-variable sweep, ladder
 tur run examples/09_modulation_and_buffers.tur  # ring, AM, PM, FM, wavetable, tape
+tur run examples/10_pitch_and_sequences.tur     # mtof/ftom, a melody in order, a cycle
 ```
 
 Each prints sample values that match the hand-computed references in its
@@ -1254,7 +1542,7 @@ comments.
 
 ```sh
 cd spices/signal
-tur test tests/signal    # 10 tests, all pass
+tur test tests/signal    # 11 tests, all pass
 ```
 
 ---
