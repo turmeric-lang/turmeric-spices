@@ -23,6 +23,14 @@ that react to row changes without polling.
 }
 ```
 
+libpq itself comes from the system -- there is no source build to fall back
+on, so `tur fetch` stops with a message naming it when it is missing:
+
+- Debian/Ubuntu: `apt-get install libpq-dev`
+- macOS: `brew install libpq`. Homebrew keeps it keg-only; the spice already
+  points CMake at `/opt/homebrew/opt/libpq`, so on an Intel Mac or a custom
+  Homebrew prefix also `export PostgreSQL_ROOT="$(brew --prefix libpq)"`.
+
 ## Quick start
 
 ```turmeric
