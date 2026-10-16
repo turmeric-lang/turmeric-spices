@@ -180,6 +180,11 @@ static void test_xml_clark(void) {
     E(w, "r");
     CHECK(out_is(w, "<r xmlns:p=\"urn:u\"><s xmlns:p=\"urn:other\" xmlns:ns1=\"urn:u\" ns1:k=\"1\"/></r>"));
 
+    /* A URI may contain '}'; the local name is after the last one. */
+    w = X();
+    S(w, "{urn:a}b}r"); A(w, "{urn:a}b}k", "1"); E(w, "{urn:a}b}r");
+    CHECK(out_is(w, "<r xmlns=\"urn:a}b\" xmlns:ns1=\"urn:a}b\" ns1:k=\"1\"/>"));
+
     /* The URI is escaped in the declaration it lands in. */
     w = X();
     S(w, "{urn:a&\"b}r"); E(w, "{urn:a&\"b}r");
@@ -291,8 +296,12 @@ static void test_xml_refusals(void) {
     CHECK(turdom_writer_pi(w, "xml", "v") == TURDOM_E_BAD_NAME);
     CHECK(refused(w, TURDOM_E_BAD_NAME));
     w = X(); S(w, "a");
-    CHECK(turdom_writer_pi(w, "a:b", "v") == TURDOM_E_BAD_NAME);
+    CHECK(turdom_writer_pi(w, "1a", "v") == TURDOM_E_BAD_NAME);
     CHECK(refused(w, TURDOM_E_BAD_NAME));
+    w = X(); S(w, "a");
+    CHECK(turdom_writer_pi(w, "a:b", "v") == TURDOM_OK);   /* a Name, namespaces off */
+    E(w, "a");
+    CHECK(out_is(w, "<a><?a:b v?></a>"));
     w = X(); S(w, "a");
     CHECK(turdom_writer_pi(w, "p", "x?>y") == TURDOM_E_BAD_CONTENT);
     CHECK(refused(w, TURDOM_E_BAD_CONTENT));

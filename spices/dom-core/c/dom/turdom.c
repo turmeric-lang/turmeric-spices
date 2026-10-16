@@ -2056,11 +2056,12 @@ static const char *w_gen_prefix(turdom_writer *w, const char *uri, size_t ulen) 
     return w->bind[w->nb - 1].pre;
 }
 
-/* Split a Clark name {uri}local.  0 when name is not one. */
+/* Split a Clark name {uri}local, at the last '}': a URI may hold one, a
+ * local name may not.  0 when name is not one. */
 static int clark(const char *name, const char **uri, size_t *ulen,
                  const char **local) {
     if (name[0] != '{') return 0;
-    const char *close = strchr(name, '}');
+    const char *close = strrchr(name, '}');
     if (!close) return 0;
     *uri = name + 1;
     *ulen = (size_t)(close - name - 1);
@@ -2470,9 +2471,13 @@ int turdom_writer_pi(turdom_writer *w, const char *target, const char *data) {
     int rc = w_gate(w);
     if (rc != TURDOM_OK) return rc;
     if (w->in_cdata) return w_fail(w, TURDOM_E_HIERARCHY);
+    if (w->html) return w_fail(w, TURDOM_E_HIERARCHY);
     const char *d = data ? data : "";
     size_t n = strlen(d);
-    rc = pi_rc(w->html, target, d, n);
+    /* A Name, as for elements: namespaces off allows `a:b`. */
+    if (!target || !xml_name(target, strlen(target)) || eq_ci(target, strlen(target), "xml"))
+        return w_fail(w, TURDOM_E_BAD_NAME);
+    rc = pi_rc(0, "x", d, n);                       /* the data rules */
     if (rc == TURDOM_OK) rc = w_close_tag(w, 0);
     if (rc != TURDOM_OK) return w_fail(w, rc);
     ob_puts(&w->b, "<?");
