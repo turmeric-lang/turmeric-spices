@@ -1,0 +1,98 @@
+;;; html/transform -- rewrite HTML at the token level as it streams past.
+;;;
+;;; `html-sax-transform` tokenizes with html/sax, runs every event through a
+;;; function that returns the events to write in its place, and serializes
+;;; those with a dom/writer `SaxWriter`. Like html/sax it works on TOKENS,
+;;; not on the tree a browser would build: no implied tags, end tags as
+;;; written, `<br/>` and `<div/>` both as a start and an end. The identity
+;;; transform `sax-keep` gives back markup that tokenizes to the same events.
+;;; The writer refuses what it cannot write back that way -- a `<plaintext>`
+;;; element, a comment that holds `<!--`, `<script>` text that holds
+;;; `<!--` or `</script` -- and the transform stops there.
+;;;
+;;; For input too large to hold, plug `sax-transform-handler` (dom/writer)
+;;; into `html-sax-parser-new` and feed it chunks, with a writer from
+;;; `sax-writer-to-file`.
+;;;
+;;; Since: 0.2.0
+;; html-sax-transform: html/sax driving dom/writer.
+
+(defmodule html/transform
+  (export html-sax-transform html-sax-transform-opts)
+
+(import dom/ownstr :refer [String])
+(import dom/core   :refer [ParseError])
+(import dom/event  :refer [SaxEvent])
+(import dom/edit   :refer [HtmlFlavor OutOfMemory])
+(import dom/writer :refer [SaxWriter Rejected TransformError InputError
+                           OutputError sax-writer-new sax-writer-finish!
+                           sax-writer-free sax-transform-handler])
+(import html/dom   :refer [HtmlOpts default-html-opts])
+(import html/sax   :refer [html-sax-parse-string-opts])
+
+;;; __ht-finish -- internal: the tokenizer's outcome, then the writer's.
+(defn __ht-finish [w : SaxWriter r : (Result nil ParseError)]
+  : (Result String TransformError)
+  (match r
+    (Err e) (Err (InputError e))
+    (Ok _)  (match (sax-writer-finish! w)
+              (Ok s)  (Ok s)
+              (Err e) (Err (OutputError e)))))
+
+;;; html-sax-transform-opts -- transform HTML with explicit caps.
+;;;
+;;; Parameters:
+;;;   src  -- the markup
+;;;   opts -- caps (only the byte cap applies to tokenizing)
+;;;   f    -- one event in (owned), the events to write out
+;;;
+;;; Returns:
+;;;   (Result String TransformError) -- the rewritten markup, owned by the
+;;;   caller; InputError only for the byte cap or memory, OutputError when the
+;;;   writer refuses what f returned.
+;;;
+;;; Example:
+;;;   (html-sax-transform-opts src (default-html-opts) sax-keep)
+;;;
+;;; Since: 0.2.0
+(defn html-sax-transform-opts [src : cstr opts : HtmlOpts
+                               f : (fn [SaxEvent] (Cons SaxEvent))]
+  : (Result String TransformError)
+  (match (sax-writer-new (HtmlFlavor))
+    (None)   (Err (OutputError (Rejected (OutOfMemory))))
+    (Some w) (let [h (sax-transform-handler w f)
+                   r (__ht-finish w (html-sax-parse-string-opts src opts h))]
+               (sax-writer-free w)
+               r)))
+
+;;; html-sax-transform -- transform HTML with the default caps.
+;;;
+;;; Parameters:
+;;;   src -- the markup
+;;;   f   -- one event in (owned), the events to write out
+;;;
+;;; Returns:
+;;;   (Result String TransformError)
+;;;
+;;; Example:
+;;;   ;; Drop every <script> start and end tag and the text between.
+;;;   (let [^mut in-script false]
+;;;     (html-sax-transform src
+;;;       (fn [ev : SaxEvent] : (Cons SaxEvent)
+;;;         (match ev
+;;;           (StartElement n _) (if (string=? n "script")
+;;;                                (do (set! in-script true) (sax-event-release ev) (tnil))
+;;;                                (sax-keep ev))
+;;;           (EndElement n)     (if (string=? n "script")
+;;;                                (do (set! in-script false) (sax-event-release ev) (tnil))
+;;;                                (sax-keep ev))
+;;;           _                  (if in-script
+;;;                                (do (sax-event-release ev) (tnil))
+;;;                                (sax-keep ev))))))
+;;;
+;;; Since: 0.2.0
+(defn html-sax-transform [src : cstr f : (fn [SaxEvent] (Cons SaxEvent))]
+  : (Result String TransformError)
+  (html-sax-transform-opts src (default-html-opts) f))
+
+) ;; end defmodule html/transform

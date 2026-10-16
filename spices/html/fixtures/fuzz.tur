@@ -10,7 +10,11 @@
 ;;      deliver the same events;
 ;;   3. html-parse always yields a tree with <html>, <head> and <body>, and
 ;;      its serialization parses again (also always to a full tree);
-;;   4. html-parse-fragment survives the same input in a range of contexts.
+;;   4. html-parse-fragment survives the same input in a range of contexts;
+;;   5. the identity transform (html/transform) gives back markup that
+;;      tokenizes to the same events, or the writer refuses it as BadName or
+;;      BadContent (xml-html-parsers-plan B4's HTML gate; tests/html5lib.tur
+;;      checks each refusal's cause).
 ;;
 ;; TUR_FUZZ_ITERS and TUR_FUZZ_SEED override the defaults; a failure names
 ;; the iteration and prints the input.
@@ -27,6 +31,10 @@
 (import html/sax   :refer [HtmlSaxParser html-sax-parse-string
                            html-sax-parser-new html-sax-feed! html-sax-finish!
                            html-sax-parser-free])
+(import html/transform :refer [html-sax-transform])
+(import dom/edit   :refer [BadName BadContent])
+(import dom/writer :refer [Rejected OutputError transform-error-message
+                           transform-error-release sax-keep])
 
 ;; ---- traces (0 = one-shot, 1 = push) --------------------------------------
 
@@ -262,6 +270,43 @@
     (release s)
     ok))
 
+;;; __id-count -- tally an identity check; refused or not.
+(defn __id-count [refused : bool] : nil
+  ```c
+  /* __tur_include__: static long g_id_checked = 0, g_id_refused = 0; */
+  g_id_checked++;
+  if (refused) g_id_refused++;
+  ```)
+
+;;; __id-summary -- print the identity tallies.
+(defn __id-summary [] : nil
+  ```c
+  printf("# identity: %ld inputs, %ld refused by the writer\n", g_id_checked, g_id_refused);
+  ```)
+
+;;; __note -- print a line to stderr.
+(defn __note [s : cstr] : nil
+  ```c
+  #include <stdio.h>
+  fprintf(stderr, "#   %s\n", (const char *)s);
+  ```)
+
+;;; identity-ok? -- property 5; trace 0 holds doc's one-shot events.
+(defn identity-ok? [doc : cstr] : bool
+  (match (html-sax-transform doc sax-keep)
+    (Ok out) (do (__id-count false)
+                 (__t-reset 1)
+                 (let [p    (ok-release? (html-sax-parse-string (to-cstr out) trace))
+                       same (__t-same?)]
+                   (if (and p same) nil (__note (to-cstr out)))
+                   (release out)
+                   (and p same)))
+    (Err (OutputError (Rejected (BadName))))    (do (__id-count true) true)
+    (Err (OutputError (Rejected (BadContent)))) (do (__id-count true) true)
+    (Err e)  (do (__note (transform-error-message e))
+                 (transform-error-release e)
+                 false)))
+
 ;;; one -- run every check on one mutant; true when all hold.
 (defn one [iter : int] : bool
   (let [doc      (__mutant (__rnd 5))
@@ -280,11 +325,14 @@
                        (do (__report "html-parse lost html/head/body" iter doc) false)
                        (if (not reparsed)
                          (do (__report "serialization does not reparse to a full tree" iter doc) false)
-                         true))))]
+                         true))))
+        ident    (if (identity-ok? doc)
+                   true
+                   (do (__report "identity transform changed the tokens" iter doc) false))]
     (dom-free d)
     (dom-free frag)
     (__free-cstr doc)
-    good))
+    (and good ident)))
 
 (defn main [] : int
   ;; The loop is in main so each iteration's continuation frames are handed
@@ -296,6 +344,7 @@
     (while (< i iters)
       (if (one i) nil (set! fails (+ fails 1)))
       (set! i (+ i 1)))
+    (__id-summary)
     (if (= fails 0)
       (do (println "ok - html fuzz: every property held") 0)
       (do (println "not ok - html fuzz: property failures") 1))))

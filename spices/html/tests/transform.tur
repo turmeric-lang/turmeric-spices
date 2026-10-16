@@ -1,0 +1,153 @@
+;; transform.tur -- html/transform: identity output, real transforms, and
+;; the refusals. tests/html5lib.tur runs the token-level identity gate over
+;; every html5lib input; here the outputs are pinned exactly, and for
+;; ordinary pages the tree a parser builds is checked to be unchanged too.
+
+(defmodule html_transform_test (export)
+
+(import dom/ownstr :refer [String from-cstr to-cstr release string=?])
+(import dom/core   :refer [Document dom-node dom-free dom-equal?])
+(import dom/event  :refer [SaxEvent SaxControl Attr StartElement EndElement
+                           Chars Comment Doctype Continue sax-event-release])
+(import dom/edit   :refer [EditError BadPlacement BadName BadContent])
+(import dom/writer :refer [WriteError Rejected IoFailed TransformError
+                           InputError OutputError transform-error-message
+                           transform-error-release sax-keep])
+(import html/dom   :refer [html-parse])
+(import html/transform :refer [html-sax-transform])
+(import test/suite  :refer [describe it])
+(import test/assert :refer [assert-true assert-eq])
+(import test/runner :refer [run-all-status])
+
+;;; same? -- byte equality, printing both sides when they differ.
+(defn same? [got : cstr want : cstr] : bool
+  ```c
+  #include <stdio.h>
+  #include <string.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# got:  [%s]\n# want: [%s]\n", (const char *)got, (const char *)want);
+  return false;
+  ```)
+
+;;; out-is? -- did a transform succeed with exactly `want`?
+(defn out-is? [r : (Result String TransformError) want : cstr] : bool
+  (match r
+    (Ok s)  (let [ok (same? (to-cstr s) want)] (release s) ok)
+    (Err e) (do (same? (transform-error-message e) want)
+                (transform-error-release e)
+                false)))
+
+;;; err-code -- 8/9 for a writer refusal, 1 for anything else, 0 for ok.
+(defn err-code [r : (Result String TransformError)] : int
+  (match r
+    (Ok s)                                        (do (release s) 0)
+    (Err (OutputError (Rejected (BadName))))      8
+    (Err (OutputError (Rejected (BadContent))))   9
+    (Err e)                                       (do (transform-error-release e) 1)))
+
+;;; tree-kept? -- does the identity output parse to the same tree?
+(defn tree-kept? [src : cstr] : bool
+  (match (html-sax-transform src sax-keep)
+    (Err e)  (do (transform-error-release e) false)
+    (Ok out) (let [a  (html-parse src)
+                   b  (html-parse (to-cstr out))
+                   eq (dom-equal? (dom-node a) (dom-node b))]
+               (if eq true (same? (to-cstr out) src))
+               (dom-free a)
+               (dom-free b)
+               (release out)
+               eq)))
+
+;;; renamed -- n renamed to `to` if it is `from`, else n; consumes n.
+(defn renamed [n : String from : cstr to : cstr] : String
+  (if (string=? n from)
+    (do (release n) (from-cstr to))
+    n))
+
+;;; b->strong -- rename <b> to <strong>.
+(defn b->strong [ev : SaxEvent] : (Cons SaxEvent)
+  (match ev
+    (StartElement n as) (tcons-of (StartElement (renamed n "b" "strong") as) (tnil))
+    (EndElement n)      (tcons-of (EndElement (renamed n "b" "strong")) (tnil))
+    _                   (sax-keep ev)))
+
+;;; noopener -- add rel="noopener" to every <a>.
+(defn noopener [ev : SaxEvent] : (Cons SaxEvent)
+  (match ev
+    (StartElement n as) (if (string=? n "a")
+                          (tcons-of (StartElement n (tcons-of (Attr (from-cstr "rel")
+                                                                    (from-cstr "noopener"))
+                                                              as))
+                                    (tnil))
+                          (sax-keep ev))
+    _                   (sax-keep ev)))
+
+;;; no-scripts -- drop every <script> with its text.
+(defn no-scripts [src : cstr] : (Result String TransformError)
+  (let [^mut in-script false]
+    (html-sax-transform src
+      (fn [ev : SaxEvent] : (Cons SaxEvent)
+        (match ev
+          (StartElement n _) (if (string=? n "script")
+                               (do (set! in-script true) (sax-event-release ev) (tnil))
+                               (sax-keep ev))
+          (EndElement n)     (if (string=? n "script")
+                               (do (set! in-script false) (sax-event-release ev) (tnil))
+                               (sax-keep ev))
+          _                  (if in-script
+                               (do (sax-event-release ev) (tnil))
+                               (sax-keep ev)))))))
+
+;;; inject-script -- write a <script> holding a breakout into <head>.
+(defn inject-script [ev : SaxEvent] : (Cons SaxEvent)
+  (match ev
+    (StartElement n _) (if (string=? n "head")
+                         (tcons-of ev (tcons-of (StartElement (from-cstr "script") (tnil))
+                                                (tcons-of (Chars (from-cstr "x</script><b>"))
+                                                          (tcons-of (EndElement (from-cstr "script"))
+                                                                    (tnil)))))
+                         (sax-keep ev))
+    _                  (sax-keep ev)))
+
+(def page
+  "<!DOCTYPE html><html lang=en><head><meta charset=utf-8><title>a &lt; b</title><style>p > a { color: red }</style><script>if (a < b && c) { go(); }</script></head><body><h1 id=top>Hi &amp; bye</h1><p class=\"x y\">One<br>two<img src=\"a.png\" alt=''/></p><ul><li>a<li>b</ul><table><tr><td>1<td>2</table><!-- note --><textarea>\n&lt;raw&gt;</textarea><svg viewBox=\"0 0 1 1\"><path d=\"M0 0\"/></svg></body></html>")
+
+(defn __all-tests [] : void
+  (describe "identity"
+    (it "writes a page back token for token"
+      (out-is? (html-sax-transform page sax-keep)
+               "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>a &lt; b</title><style>p > a { color: red }</style><script>if (a < b && c) { go(); }</script></head><body><h1 id=\"top\">Hi &amp; bye</h1><p class=\"x y\">One<br>two<img src=\"a.png\" alt=\"\"/></p><ul><li>a<li>b</ul><table><tr><td>1<td>2</table><!-- note --><textarea>\n&lt;raw&gt;</textarea><svg viewbox=\"0 0 1 1\"><path d=\"M0 0\"></path></svg></body></html>"))
+    (it "the page parses to the same tree"
+      (tree-kept? page))
+    (it "a fragment with implied and stray tags parses to the same tree"
+      (tree-kept? "<p>a<p>b</div><table><td>x</table>c<b><i>d</b>e</i>"))
+    (it "keeps a doctype's identifiers"
+      (out-is? (html-sax-transform "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\"><p>" sax-keep)
+               "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\"><p>"))
+    (it "the HTML 4 strict doctype keeps the document out of quirks mode"
+      (tree-kept? "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\"><p><table><tr><td>x</table>")))
+
+  (describe "transforms"
+    (it "renames"
+      (out-is? (html-sax-transform "<p><b>bold</b> and <B>more</B></p>" b->strong)
+               "<p><strong>bold</strong> and <strong>more</strong></p>"))
+    (it "adds an attribute"
+      (out-is? (html-sax-transform "<a href=/x>x</a><a href=/y target=_blank>y</a>" noopener)
+               "<a rel=\"noopener\" href=\"/x\">x</a><a rel=\"noopener\" href=\"/y\" target=\"_blank\">y</a>"))
+    (it "drops scripts, with state in a closure"
+      (out-is? (no-scripts "<p>a<script>alert(1)</script>b<script src=x></script></p>")
+               "<p>ab</p>")))
+
+  (describe "refusals"
+    (it "a <plaintext> element is BadName"
+      (assert-eq 8 (err-code (html-sax-transform "<p><plaintext>x" sax-keep))))
+    (it "script text holding <!-- is BadContent"
+      (assert-eq 9 (err-code (html-sax-transform "<script><!--x</script>" sax-keep))))
+    (it "a transform that injects a </script> breakout is BadContent"
+      (assert-eq 9 (err-code (html-sax-transform "<html><head></head></html>" inject-script))))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule html_transform_test
