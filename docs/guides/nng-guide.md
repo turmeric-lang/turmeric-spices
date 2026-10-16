@@ -1,7 +1,7 @@
 ---
 title: Scalability Protocols with nng
 category: Networking
-description: Request/reply, pub/sub, pipeline, pair, bus, and survey messaging over inproc, ipc, and tcp -- blocking calls over a linear socket handle, poll fds for event loops, completion-based async (nng/aio), and per-conversation contexts (nng/ctx)
+description: Request/reply, pub/sub, pipeline, pair, bus, and survey messaging over inproc, ipc, tcp, and ws (WebSocket, browser peers included) -- blocking calls over a linear socket handle, poll fds for event loops, completion-based async (nng/aio), and per-conversation contexts (nng/ctx)
 audience: developers building distributed or inter-process messaging in Turmeric
 since: nng v0.1.0
 ---
@@ -14,7 +14,7 @@ one worker, a subscriber sees every message whose topic it matches. nng
 (nanomsg-next-generation) implements those patterns; this spice wraps them
 in a thin surface of blocking calls over one linear `Socket` handle.
 
-This guide walks the nine things you will do most often:
+This guide walks the ten things you will do most often:
 
 1. [Request/reply: the RPC round trip](#1-requestreply)
 2. [Pipeline: a load-balanced job queue](#2-pipeline)
@@ -25,6 +25,7 @@ This guide walks the nine things you will do most often:
 7. [Event loops: poll fds and try-*](#7-event-loops)
 8. [Async: submit now, collect later](#8-async-nngaio)
 9. [Contexts: many conversations on one socket](#9-contexts-nngctx)
+10. [WebSocket: ws:// and browser peers](#10-websocket-ws)
 
 Each section is a self-contained snippet you can drop into a `defmodule`.
 
@@ -268,9 +269,16 @@ Topic matching is a raw byte **prefix**, not a namespace: subscribing to
 | `inproc://` | `inproc://jobs` | same process, no network; the name is a bare label, not a path |
 | `ipc://` | `ipc:///tmp/jobs.sock` | same machine, Unix domain socket (named pipe on Windows) |
 | `tcp://` | `tcp://0.0.0.0:5555` to listen, `tcp://host:5555` to dial | across machines |
+| `ws://` | `ws://0.0.0.0:8080/jobs` to listen, `ws://host:8080/jobs` to dial | WebSocket; the path is part of the address (section 10) |
 
 `listen` binds and fails immediately if the address is taken; `dial`
 connects and reconnects in the background if the peer goes away.
+
+Port 0 (`tcp://127.0.0.1:0`, `ws://127.0.0.1:0/jobs`) asks the OS for a free
+port. `listen` binds it but cannot say which; `listen-bound-port` does the
+same bind and returns the port, which is how a test avoids hard-coding one.
+On `inproc://` and `ipc://`, which have no port, it is `(err NNG_ENOTSUP)`
+and leaves nothing bound.
 
 ---
 
@@ -610,6 +618,82 @@ The rules:
 
 ---
 
+## 10. WebSocket (`ws://`)
+
+`ws://` is one more transport: every protocol runs over it, and `listen` /
+`dial` take the address as they take any other. Use it when a peer is a
+browser, or when the only way through a network is an HTTP port. nng
+carries its own HTTP server, SHA-1 and base64, so it adds no dependency, and
+the spice's `build.tur` pins it on.
+
+```turmeric no-check
+(import nng/socket :refer [rep-open listen-bound-port close])
+
+(let [rep  (ok-val (rep-open))
+      port (ok-val (listen-bound-port rep "ws://127.0.0.1:0/rpc"))]
+  ;; ... a REQ peer dials ws://127.0.0.1:<port>/rpc, exactly as over tcp:// ...
+  (close rep))
+```
+
+Three things differ from `tcp://`:
+
+- **The path is part of the address.** Sockets in one process can share a
+  host and port on different paths (`ws://0.0.0.0:8080/jobs`,
+  `ws://0.0.0.0:8080/feed`); nng serves them from one HTTP listener. The
+  same path twice is `NNG_EADDRINUSE`.
+- **The protocol is checked in the handshake.** nng puts the socket's
+  protocol in the WebSocket subprotocol header, so a REQ socket dialing a
+  PAIR listener fails at `dial` with `NNG_EPROTO` instead of connecting and
+  then going quiet.
+- **There is no `wss://`.** It needs nng's TLS support, which is off in this
+  build; the address is `(err NNG_ENOTSUP)`. Terminate TLS in a proxy in
+  front of the listener if you need it.
+
+### Browsers and other plain WebSocket clients
+
+A browser has no nng, but it can be a peer of a tur-nng listener. The
+transport is ordinary RFC 6455 plus three rules:
+
+1. **Offer the listener's protocol as the subprotocol:**
+   `<protocol>.sp.nanomsg.org`, naming the socket you connect *to*. A client
+   that offers nothing, or the wrong name, gets HTTP 400.
+2. **Send binary frames.** A text frame closes the connection and delivers
+   nothing, so in JavaScript send a `Uint8Array`, never a string.
+3. **Expect a header on some protocols:**
+
+| nng listener | Subprotocol | Each WebSocket message is |
+|--------------|-------------|---------------------------|
+| `pub-open` | `pub.sp.nanomsg.org` | the message bytes; topic filtering is the subscriber's job, so filter in the browser |
+| `push-open` | `push.sp.nanomsg.org` | the message bytes (the browser pulls) |
+| `pull-open` | `pull.sp.nanomsg.org` | the message bytes (the browser pushes) |
+| `bus-open` | `bus.sp.nanomsg.org` | the message bytes, both ways |
+| `pair-open` | `pair1.sp.nanomsg.org` | a 4-byte big-endian hop count, then the message: send `00 00 00 01` first, drop 4 bytes on receipt |
+| `rep-open` | `rep.sp.nanomsg.org` | a 4-byte request id with its high bit set, then the request; the reply comes back behind the same id |
+
+A live feed is the common case, and it needs no header at all:
+
+```js
+const ws = new WebSocket("ws://localhost:8080/feed", "pub.sp.nanomsg.org");
+ws.binaryType = "arraybuffer";
+ws.onmessage = (e) => console.log(new TextDecoder().decode(e.data));
+```
+
+A job queue the browser feeds is the same shape the other way:
+
+```js
+const ws = new WebSocket("ws://localhost:8080/jobs", "pull.sp.nanomsg.org");
+ws.onopen = () => ws.send(new TextEncoder().encode("job:42"));
+```
+
+Remember the slow joiner from section 3: a PUB or BUS socket drops messages
+for a connection nng has not finished attaching, and that includes the
+moment just after the browser's handshake completes.
+
+`tests/nng/ws_test.tur` asserts every row of the table byte for byte, using a
+small hand-written RFC 6455 client in place of a browser.
+
+---
+
 ## Operations with no result value
 
 `dial`, `listen`, `sub-subscribe`, and the timeout setters return
@@ -621,8 +705,12 @@ read out, and the type says so.
 
 ## When not to use this
 
-- **You need TLS, WebSocket, or ZeroTier transports.** TLS is off in the
-  build (`NNG_ENABLE_TLS=OFF`); the other transports are not compiled in.
+- **You need TLS, `wss://`, or ZeroTier transports.** TLS is off in the
+  build (`NNG_ENABLE_TLS=OFF`), which rules out `tls+tcp://` and `wss://`,
+  and ZeroTier is not compiled in. Plain `ws://` is (section 10).
+- **You need to tune WebSocket endpoints** -- extra request/response
+  headers, frame sizes. nng sets those on dialer and listener handles, which
+  the spice does not hand out yet.
 - **You want per-protocol socket types.** Ten opaques would turn "receive on
   a PUB socket" into a compile error, which is the right end state -- but it
   multiplies every shared operation by ten or needs a typeclass over socket
@@ -634,7 +722,8 @@ read out, and the type says so.
 
 ```sh
 tur fetch --update      # clone + build nng (once)
-tur test tests/nng      # 82 assertions in 8 suites, all over inproc:// -- no network
+tur test tests/nng      # 102 assertions in 9 suites; all over inproc:// except
+                        # ws_test.tur, which uses ws:// and tcp:// on 127.0.0.1
 errors/run.sh           # the nine compile-fail linear fixtures (Socket, Aio, NngCtx)
 ```
 
