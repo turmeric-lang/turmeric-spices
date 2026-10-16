@@ -1,0 +1,190 @@
+;;; html/edit -- innerHTML and outerHTML for edited HTML documents.
+;;;
+;;; `set-inner-html!` parses markup with the HTML fragment algorithm, in the
+;;; element's own context (so "<td>" means a cell inside a <tr>, and
+;;; everything is text inside a <textarea>), and puts the result in place of
+;;; the element's children. It is `dom/edit` over a parsed fragment: the new
+;;; nodes are imported into the element's Document and placed with the same
+;;; checks every edit gets, and a refused call changes nothing.
+;;;
+;;; PARSING IS NOT SANITIZING. A <script>, an event-handler attribute or a
+;;; `javascript:` URL in the markup is parsed and kept like anything else.
+;;; Never hand `set-inner-html!` untrusted markup on the strength of this.
+;;;
+;;; Since: 0.2.0
+;; Fragment parsing through html/dom, edits through dom-core's C layer.
+
+(defmodule html/edit
+  (export set-inner-html! node-inner-html node-outer-html)
+
+(import dom/ownstr :refer [String adopt-cstr])
+(import dom/core   :refer [Document Node dom-node dom-free dom-serialize
+                           node-local-name])
+(import dom/edit   :refer [EditError WrongDocument WouldCycle NotAContainer
+                           BadPlacement Detached WrongKind BadName BadContent
+                           OutOfMemory])
+(import html/dom   :refer [html-parse-fragment])
+
+;;; __he-context-ok -- internal: 0 when el is an HTML element of an HTML
+;;; document, else the turdom code for WrongKind (6).
+(defn __he-context-ok [el : Node] : int
+  ```c
+  #include <string.h>
+  extern int turdom_kind(void *);
+  extern void *turdom_node_doc(void *);
+  extern int turdom_doc_flavor(void *);
+  extern const char *turdom_ns_uri(void *);
+  void *e = (void *)(intptr_t)el;
+  if (turdom_kind(e) != 1) return 6;
+  if (turdom_doc_flavor(turdom_node_doc(e)) != 1) return 6;
+  const char *ns = turdom_ns_uri(e);
+  if (ns && ns[0] && strcmp(ns, "http://www.w3.org/1999/xhtml") != 0) return 6;
+  return 0;
+  ```)
+
+;;; __he-replace -- internal: put copies of the fragment's top-level nodes in
+;;; place of el's children, checking every placement first.
+(defn __he-replace [el : Node frag : Document] : int
+  ```c
+  #include <stdlib.h>
+  extern void *turdom_doc_node(void *);
+  extern void *turdom_node_doc(void *);
+  extern void *turdom_first_child(void *);
+  extern void *turdom_next_sibling(void *);
+  extern void *turdom_import(void *, void *);
+  extern void  turdom_remove(void *);
+  extern int   turdom_append(void *, void *);
+  extern int   turdom_check_placement(void *, void *);
+  void *e = (void *)(intptr_t)el;
+  void *top = turdom_doc_node((void *)(intptr_t)frag);
+  size_t n = 0;
+  for (void *c = turdom_first_child(top); c; c = turdom_next_sibling(c)) {
+    int rc = turdom_check_placement(e, c);
+    if (rc) return rc;
+    n++;
+  }
+  void **copies = (void **)malloc((n ? n : 1) * sizeof(void *));
+  if (!copies) return 7;
+  size_t k = 0;
+  for (void *c = turdom_first_child(top); c; c = turdom_next_sibling(c)) {
+    copies[k] = turdom_import(turdom_node_doc(e), c);
+    if (!copies[k]) { free(copies); return 7; }
+    k++;
+  }
+  /* Nothing can be refused from here on: e is an element, every copy is a
+   * fresh detached node of e's document, and each placement was checked. */
+  while (turdom_first_child(e)) turdom_remove(turdom_first_child(e));
+  for (k = 0; k < n; k++) turdom_append(e, copies[k]);
+  free(copies);
+  return 0;
+  ```)
+
+;;; __he-error -- internal: a turdom error code as an EditError.
+(defn __he-error [rc : int] : EditError
+  (cond
+    (= rc 1) (WrongDocument)
+    (= rc 2) (WouldCycle)
+    (= rc 3) (NotAContainer)
+    (= rc 4) (BadPlacement)
+    (= rc 5) (Detached)
+    (= rc 6) (WrongKind)
+    (= rc 8) (BadName)
+    (= rc 9) (BadContent)
+    :else    (OutOfMemory)))
+
+;;; set-inner-html! -- replace an element's children with parsed markup.
+;;;
+;;; The markup is parsed as the contents of `el` (the HTML fragment
+;;; algorithm, with `el`'s tag name as the context), then the resulting nodes
+;;; replace `el`'s children. The old children are detached, not freed. On an
+;;; error nothing changes.
+;;;
+;;; Parameters:
+;;;   el  -- an HTML element of an HTML Document
+;;;   src -- the markup
+;;;
+;;; Returns:
+;;;   (Result nil EditError) -- `WrongKind` when `el` is not an HTML element
+;;;   of an HTML Document (an SVG element, say, or anything in an XML one);
+;;;   `BadPlacement` for a void element such as <br> given content.
+;;;
+;;; Example:
+;;;   (set-inner-html! ul "<li>one<li>two")   ; two <li> children
+;;;
+;;; Since: 0.2.0
+(defn set-inner-html! [el : Node src : cstr] : (Result nil EditError)
+  (let [ok (__he-context-ok el)]
+    (if (= ok 0)
+      (let [ctx  (match (node-local-name el) (Some l) l (None) "body")
+            frag (html-parse-fragment ctx src)
+            rc   (__he-replace el frag)]
+        (dom-free frag)
+        (if (= rc 0) (Ok nil) (Err (__he-error rc))))
+      (Err (__he-error ok)))))
+
+;;; __he-inner-raw -- internal: the children's serializations, concatenated.
+(defn __he-inner-raw [n : Node] : cstr
+  ```c
+  #include <stdlib.h>
+  #include <string.h>
+  extern void *turdom_first_child(void *);
+  extern void *turdom_next_sibling(void *);
+  extern char *turdom_serialize(void *, size_t *);
+  size_t cap = 256, len = 0;
+  char *out = (char *)malloc(cap);
+  if (!out) return NULL;
+  out[0] = '\0';
+  for (void *c = turdom_first_child((void *)(intptr_t)n); c; c = turdom_next_sibling(c)) {
+    size_t k = 0;
+    char *s = turdom_serialize(c, &k);
+    if (!s) continue;
+    if (len + k + 1 > cap) {
+      while (len + k + 1 > cap) cap *= 2;
+      char *grown = (char *)realloc(out, cap);
+      if (!grown) { free(s); free(out); return NULL; }
+      out = grown;
+    }
+    memcpy(out + len, s, k);
+    len += k;
+    out[len] = '\0';
+    free(s);
+  }
+  return out;
+  ```)
+
+;;; node-inner-html -- the serialized children of a node (innerHTML).
+;;;
+;;; Works on any node of either flavour; for an XML Document it is the inner
+;;; XML. SERIALIZING IS NOT SANITIZING (see `dom-serialize`).
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   String -- owned; release it when done.
+;;;
+;;; Example:
+;;;   (to-cstr (node-inner-html p))   ; => "a <b>b</b> c"
+;;;
+;;; Since: 0.2.0
+(defn node-inner-html [n : Node] : String
+  (adopt-cstr (__he-inner-raw n)))
+
+;;; node-outer-html -- the serialized node itself (outerHTML).
+;;;
+;;; The same as `dom-serialize`, under the DOM's name.
+;;;
+;;; Parameters:
+;;;   n -- the node
+;;;
+;;; Returns:
+;;;   String -- owned; release it when done.
+;;;
+;;; Example:
+;;;   (to-cstr (node-outer-html p))   ; => "<p>a <b>b</b> c</p>"
+;;;
+;;; Since: 0.2.0
+(defn node-outer-html [n : Node] : String
+  (dom-serialize n))
+
+) ;; end defmodule html/edit

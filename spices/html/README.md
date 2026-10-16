@@ -19,6 +19,10 @@ back as the tree a browser builds, and `html-parse` never fails.
   `node-text` and `dom-serialize` are the same as for XML.
 - **Tokenizer events** (`html/sax`) -- tags as written, in the same `SaxEvent`
   vocabulary as [`tur-xml`](../xml/README.md)'s SAX. One-shot or push.
+- **innerHTML** (`html/edit`) -- `set-inner-html!` parses markup in an
+  element's own context and puts it in place of the element's children,
+  through dom-core's validated `dom/edit`; `node-inner-html` and
+  `node-outer-html` serialize.
 
 ## Install
 
@@ -81,6 +85,7 @@ defn main [] : int
 | Module | Exports |
 |--------|---------|
 | `html/dom` | `HtmlOpts`, `default-html-opts`, `html-parse`, `html-parse-opts`, `html-parse-fragment`, `html-parse-fragment-opts`, `html-parse-file`, `html-parse-file-opts`, `html-backend-version` |
+| `html/edit` | `set-inner-html!`, `node-inner-html`, `node-outer-html` |
 | `html/sax` | `HtmlSaxParser`, `html-sax-parse-string`, `html-sax-parse-string-opts`, `html-sax-parser-new`, `html-sax-parser-new-opts`, `html-sax-feed!`, `html-sax-finish!`, `html-sax-parser-free` |
 
 The [HTML guide](../../docs/guides/html-guide.md) covers both, the tree's
@@ -92,7 +97,9 @@ differs from the tree.
 `html-parse` followed by `dom-serialize` produces well-formed markup, **not
 safe markup**: every `<script>`, inline event handler and `javascript:` URL in
 the input survives the round trip. Never embed untrusted HTML on the strength
-of having parsed it. A sanitizer is a separate (planned) piece of work.
+of having parsed it -- nor of having passed it through `set-inner-html!`,
+which parses it the same way. A sanitizer is a separate (planned) piece of
+work.
 
 ## Limits
 
@@ -110,6 +117,9 @@ apply the depth cap and no byte cap (the input is already in memory); the
 dump of the dom-core tree with the expected one -- so it checks lexbor's tree
 construction and the copy into dom-core together. Five tests newer than lexbor
 3.0.1 are listed as known failures, and the suite fails if one of them starts
-passing. `tests/` also covers a tag-soup corpus, fragments, the depth cap,
-options and files, and the token stream (including push parsing one byte at a
-time). `fixtures/run.sh` runs a mutation fuzz pass.
+passing. Every fragment test runs a second time through `set-inner-html!` on
+an element built with `dom/edit`. `tests/` also covers a tag-soup corpus,
+fragments, the depth cap, options and files, and the token stream (including
+push parsing one byte at a time). `fixtures/run.sh` runs a mutation fuzz pass
+and a `dom/edit` fuzz pass (random edits; refused ones change nothing; the
+result reparses to the same tree whenever the parser would not re-nest it).

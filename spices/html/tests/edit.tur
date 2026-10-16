@@ -1,0 +1,144 @@
+;; edit.tur -- html/edit: set-inner-html!, node-inner-html, node-outer-html.
+
+(defmodule html_edit_test (export)
+
+(import dom/ownstr :refer [String to-cstr release])
+(import dom/core   :refer [Document Node dom-node dom-free node-children
+                           node-first-child find-first])
+(import dom/edit   :refer [EditError XmlFlavor HtmlFlavor WrongKind BadPlacement
+                           BadContent dom-new create-element create-element-ns
+                           create-text node-append! node-attached?])
+(import html/dom   :refer [html-parse])
+(import html/edit  :refer [set-inner-html! node-inner-html node-outer-html])
+(import test/suite  :refer [describe it])
+(import test/assert :refer [assert-true assert-eq])
+(import test/runner :refer [run-all-status])
+
+;;; __eq? -- byte equality.
+(defn __eq? [a : cstr b : cstr] : bool
+  ```c
+  #include <string.h>
+  return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+
+;;; inner-is? -- does node-inner-html give exactly `want`?
+(defn inner-is? [n : Node want : cstr] : bool
+  (let [s  (node-inner-html n)
+        ok (__eq? (to-cstr s) want)]
+    (release s)
+    ok))
+
+;;; outer-is? -- does node-outer-html give exactly `want`?
+(defn outer-is? [n : Node want : cstr] : bool
+  (let [s  (node-outer-html n)
+        ok (__eq? (to-cstr s) want)]
+    (release s)
+    ok))
+
+;;; ok? -- did an edit succeed?
+(defn edit-ok? [r : (Result nil EditError)] : bool
+  (match r (Ok _) true (Err _) false))
+
+;;; code -- a few EditErrors as numbers.
+(defn code [r : (Result nil EditError)] : int
+  (match r
+    (Ok _) 0
+    (Err e) (match e (WrongKind) 6 (BadPlacement) 4 (BadContent) 9 _ 99)))
+
+;;; el -- an element of an HTML document (attached under the document node
+;;; when it is the first one).
+(defn el [d : Document name : cstr] : Node
+  (match (create-element d name)
+    (Ok n) n
+    (Err _) (dom-node d)))
+
+(defn __all-tests [] : void
+  (describe "html/edit -- set-inner-html!"
+    (it "replaces the children with the parsed markup"
+      (let [d   (dom-new (HtmlFlavor))
+            div (el d "div")]
+        (node-append! (dom-node d) div)
+        (match (create-text d "old") (Ok t) (node-append! div t) (Err _) (Ok nil))
+        (let [old (match (node-first-child div) (Some c) c (None) div)
+              ok  (and (edit-ok? (set-inner-html! div "<p>a <b>b</b></p>tail &amp; more"))
+                       (and (inner-is? div "<p>a <b>b</b></p>tail &amp; more")
+                            (not (node-attached? old))))]
+          (dom-free d)
+          ok)))
+    (it "parses in the element's own context"
+      (let [d  (dom-new (HtmlFlavor))
+            ul (el d "ul")
+            tr (el d "tr")
+            ok (and (edit-ok? (set-inner-html! ul "<li>one<li>two"))
+                    (and (= 2 (tlength (node-children ul)))
+                         (and (edit-ok? (set-inner-html! tr "<td>a<td>b"))
+                              (inner-is? tr "<td>a</td><td>b</td>"))))]
+        (dom-free d)
+        ok))
+    (it "text in a textarea, code in a script"
+      (let [d  (dom-new (HtmlFlavor))
+            ta (el d "textarea")
+            sc (el d "script")
+            ok (and (edit-ok? (set-inner-html! ta "<b>not bold</b>"))
+                    (and (inner-is? ta "&lt;b&gt;not bold&lt;/b&gt;")
+                         (and (edit-ok? (set-inner-html! sc "if (a < b) {}"))
+                              (inner-is? sc "if (a < b) {}"))))]
+        (dom-free d)
+        ok))
+    (it "refuses markup that would close a script early, and changes nothing"
+      (let [d  (dom-new (HtmlFlavor))
+            sc (el d "script")]
+        (set-inner-html! sc "keep()")
+        (let [ok (and (= 9 (code (set-inner-html! sc "x</script><img src=x onerror=go()>")))
+                      (inner-is? sc "keep()"))]
+          (dom-free d)
+          ok)))
+    (it "BadPlacement for content in a void element"
+      (let [d  (dom-new (HtmlFlavor))
+            br (el d "br")
+            ok (= 4 (code (set-inner-html! br "x")))]
+        (dom-free d)
+        ok))
+    (it "WrongKind for an SVG element, or an element of an XML document"
+      (let [h (dom-new (HtmlFlavor))
+            x (dom-new (XmlFlavor))
+            s (match (create-element-ns h "http://www.w3.org/2000/svg" "svg")
+                (Ok n) n (Err _) (dom-node h))
+            e (match (create-element x "e") (Ok n) n (Err _) (dom-node x))
+            ok (and (= 6 (code (set-inner-html! s "<circle/>")))
+                    (= 6 (code (set-inner-html! e "<p>x</p>"))))]
+        (dom-free h)
+        (dom-free x)
+        ok))
+    (it "works on a parsed page"
+      (let [d  (html-parse "<!DOCTYPE html><title>t</title><main id=m>old</main>")
+            ok (match (find-first (dom-node d) "main")
+                 (Some m) (and (edit-ok? (set-inner-html! m "<h1>new</h1>"))
+                               (outer-is? m "<main id=\"m\"><h1>new</h1></main>"))
+                 (None) false)]
+        (dom-free d)
+        ok)))
+
+  (describe "html/edit -- node-inner-html and node-outer-html"
+    (it "outer includes the element, inner only its children"
+      (let [d (dom-new (HtmlFlavor))
+            p (el d "p")]
+        (set-inner-html! p "a<i>b</i>")
+        (let [ok (and (inner-is? p "a<i>b</i>") (outer-is? p "<p>a<i>b</i></p>"))]
+          (dom-free d)
+          ok)))
+    (it "node-inner-html of an XML element is its inner XML"
+      (let [x (dom-new (XmlFlavor))
+            e (match (create-element x "e") (Ok n) n (Err _) (dom-node x))
+            c (match (create-element x "c") (Ok n) n (Err _) (dom-node x))]
+        (node-append! (dom-node x) e)
+        (node-append! e c)
+        (let [ok (inner-is? e "<c/>")]
+          (dom-free x)
+          ok)))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule html_edit_test

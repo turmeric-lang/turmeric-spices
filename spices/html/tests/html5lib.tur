@@ -13,6 +13,19 @@
 ;; off), fragments whose context is an SVG or MathML element (the API takes
 ;; an HTML tag name), and tests whose data contains a NUL byte (not a cstr).
 ;;
+;; Every `#document-fragment` test also runs a second way (xml-html-parsers-
+;; plan follow-up B3): its context element is built with dom/edit, the markup
+;; is set as that element's innerHTML with `set-inner-html!`, and the
+;; element's children are dumped. That checks the import of a parsed fragment
+;; into another document, and that no edit check refuses what a parser
+;; built. The `plaintext` context is skipped there: dom/edit refuses that
+;; element name. And a raw-text context whose markup holds the element's own
+;; end tag (`<!-- inside </script> -->` in `script`) is REFUSED, with
+;; BadContent, rather than matched: with no start tag in a fragment the
+;; parser keeps that `</script>` as text, but serialized into a document it
+;; would close the element early, which is the breakout dom/edit exists to
+;; stop.
+;;
 ;; Five tests are known failures (see `__known?` and the data README): newer
 ;; than lexbor 3.0.1, they describe tree-builder behaviour that release does
 ;; not have. A known failure that starts to pass FAILS this suite, so the
@@ -20,8 +33,11 @@
 
 (defmodule html5lib_test (export)
 
-(import dom/core   :refer [Document dom-node dom-free])
+(import dom/core   :refer [Document Node dom-node dom-free])
+(import dom/edit   :refer [EditError HtmlFlavor BadContent dom-new
+                           create-element])
 (import html/dom   :refer [html-parse html-parse-fragment])
+(import html/edit  :refer [set-inner-html!])
 (import test/suite  :refer [describe it])
 (import test/assert :refer [assert-true assert-eq])
 (import test/runner :refer [run-all-status])
@@ -285,6 +301,68 @@
           true)
         ok))))
 
+;;; __node-raw -- a Node as a bare pointer.
+(defn __node-raw [n : Node] : ptr<void>
+  ```c
+  return (void *)(intptr_t)n;
+  ```)
+
+;;; __breakout? -- would this markup, as the text of raw-text element ctx,
+;;; close it early when serialized (dom/edit's raw-text rule)?
+(defn __breakout? [ctx : cstr data : cstr] : bool
+  ```c
+  #include <string.h>
+  #include <strings.h>
+  static const char *RAW[] = {"script", "style", "xmp", "iframe", "noembed",
+                              "noframes", NULL};
+  const char *c = (const char *)ctx, *d = (const char *)data;
+  int raw = 0;
+  for (const char **r = RAW; *r; r++) if (strcasecmp(c, *r) == 0) raw = 1;
+  if (!raw) return false;
+  size_t cl = strlen(c), n = strlen(d);
+  for (size_t i = 0; i + 1 < n; i++) {
+    if (d[i] != '<') continue;
+    if (d[i + 1] == '/' && i + 2 + cl <= n && strncasecmp(d + i + 2, c, cl) == 0)
+      return true;
+    if (strcasecmp(c, "script") == 0 && i + 4 <= n && strncmp(d + i, "<!--", 4) == 0)
+      return true;
+  }
+  return false;
+  ```)
+
+;;; run-one-inner -- run fragment test i through set-inner-html!; true when
+;;; it behaved as expected (or is not a fragment test).
+(defn run-one-inner [i : int file : cstr] : bool
+  (if (or (__dat-skip? i) (not (__dat-fragment? i)))
+    true
+    (let [known (__known? file i)
+          d     (dom-new (HtmlFlavor))]
+      (match (create-element d (__dat-context i))
+        (Err _) (do (dom-free d) true)      ;; plaintext: refused as a name
+        (Ok el)
+          (let [ok (match (set-inner-html! el (__dat-data i))
+                     (Ok _)  (__dump-matches? (__node-raw el) i file known)
+                     (Err e) (match e
+                               (BadContent) (__breakout? (__dat-context i) (__dat-data i))
+                               _            false))]
+            (dom-free d)
+            (if known
+              (if ok
+                (do (__say "known failure now passes; remove it from __known?" file i) false)
+                true)
+              ok))))))
+
+;;; run-file-inner -- how many of a .dat file's fragment tests misbehave
+;;; through set-inner-html!.
+(defn run-file-inner [path : cstr] : int
+  (let [n          (__dat-load path)
+        ^mut i     0
+        ^mut fails 0]
+    (while (< i n)
+      (if (run-one-inner i path) nil (set! fails (+ fails 1)))
+      (set! i (+ i 1)))
+    fails))
+
 ;;; run-file -- how many of a .dat file's tests misbehave.
 (defn run-file [path : cstr] : int
   (let [n          (__dat-load path)
@@ -335,7 +413,13 @@
       (let [^mut i 0]
         (while (< i n)
           (it (__file i) (= 0 (run-file (__file i))))
-          (set! i (+ i 1)))))))
+          (set! i (+ i 1))))))
+  (describe "html5lib fragment tests through set-inner-html!"
+    (let [n      (__nfiles)
+          ^mut i 0]
+      (while (< i n)
+        (it (__file i) (= 0 (run-file-inner (__file i))))
+        (set! i (+ i 1))))))
 
 (defn main [] : int
   (__all-tests)
