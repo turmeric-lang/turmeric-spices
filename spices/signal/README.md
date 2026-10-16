@@ -2,16 +2,17 @@
 
 Typed Signal Function (SF) library for [Turmeric](https://github.com/turmeric-lang/turmeric):
 oscillators (including FM and PM), one-pole / biquad / state-variable / ladder
-filters, delays and combs, colored noise, sample buffers and buffer scanning,
-MIDI note / Hz conversion, shapers, ADSR envelopes, and SF-pipeline
-composition.
+filters, delays and combs, colored noise, sample buffers and buffer scanning
+(nearest, linear, cubic and windowed-sinc interpolation), MIDI note / Hz
+conversion, Scala `.scl` / `.kbm` tunings with tuning-aware note / Hz
+conversion, shapers, ADSR envelopes, and SF-pipeline composition.
 
 ---
 
 ## Status
 
-Runs end-to-end against turmeric `main` (checked with v0.64.1). All eleven
-modules `tur check` clean, all ten examples run and print the values in
+Runs end-to-end against turmeric `main` (checked with v0.65.2). All twelve
+modules `tur check` clean, all twelve examples run and print the values in
 their comments, and the full `tests/signal/` suite passes:
 
 ```
@@ -27,8 +28,9 @@ PASS test_noise
 PASS test_osc
 PASS test_pitch
 PASS test_shaper
-...........
-11 tests, 11 passed, 0 failed
+PASS test_tuning
+............
+12 tests, 12 passed, 0 failed
 ```
 
 Not provided: Karplus-Strong and granular synthesis, band-limited wavetable
@@ -100,8 +102,9 @@ A few constructors need a specific call shape:
 | `signal/osc`      | `sine`, `square`, `sawtooth`, `triangle`, `pm-sine`, `fm-sine`                           |
 | `signal/hf-osc`   | `hf-sawtooth`, `hf-square`, `hf-triangle` -- band-limited, for hearing-range pitches     |
 | `signal/filter`   | one-pole (`low-pass`, `high-pass`, `one-pole-lp`, `one-pole-hp`, `dc-block`), RBJ biquads (`biquad-*`, `biquad`), state-variable (`svf-*`), `ladder` |
-| `signal/buffer`   | `Buffer`, `buffer-new`, `buffer-render`, `buffer-len`, `buffer-get`, `buffer-set!`, `buffer-read`, `scan` |
+| `signal/buffer`   | `Buffer`, `buffer-new`, `buffer-render`, `buffer-len`, `buffer-get`, `buffer-set!`, `buffer-read` (+ `-nearest` / `-cubic` / `-sinc`), `scan` (+ `scan-nearest` / `-cubic` / `-sinc`) |
 | `signal/pitch`    | `mtof`, `ftom` -- MIDI note number <-> Hz                                                  |
+| `signal/tuning`   | `Scale`, `Keymap`, `Tuning`; Scala `.scl` / `.kbm` parse, load and write; `mtof-tuned`, `ftom-tuned` |
 | `signal/delay`    | `delay`, `comb-ff`, `comb`, `allpass` (+ sample-counted `*-n` forms) -- ring-buffer effects |
 | `signal/noise`    | `white`, `pink`, `brown`, `blue`, `violet` (+ injected-source `*-from`, and `rng`)       |
 | `signal/shaper`   | `gain`, `offset`, `invert`, `abs-sf`, `scale`, `saturate-tanh`, `hard-clip`, `clip`, `mix`, `add`, `multiply` |
@@ -233,11 +236,22 @@ handle and living for the process. `scan` reads one as a signal.
 | `buffer-len buf` | the length |
 | `buffer-get buf i` / `buffer-set! buf i x` | one sample; the index wraps |
 | `buffer-read buf pos` | linearly interpolated read at `pos` buffer lengths; wraps |
+| `buffer-read-nearest buf pos` | the nearest sample (no interpolation) |
+| `buffer-read-cubic buf pos` | 4-point cubic Hermite (Catmull-Rom) interpolation |
+| `buffer-read-sinc buf pos` | 32-tap Kaiser-windowed sinc interpolation, normalized to unity gain |
 | `scan buf` | SF: input = read position in buffer lengths, output = the buffer there; stateless |
+| `scan-nearest buf` / `scan-cubic buf` / `scan-sinc buf` | `scan` with the matching interpolator |
 
 Scanned by a `sawtooth` at f Hz, a one-cycle buffer is an f Hz wavetable
 oscillator; a recording scanned once per its duration plays back looped, and
 faster or slower ramps transpose it like tape.
+
+All four reads return the stored sample on the grid. Off it, on a 440 Hz
+recording at 48 kHz, nearest is good to 3e-2, linear to 4e-4 and cubic and
+sinc to 3e-6; on a 16.8 kHz one (0.35 cycles per sample) only sinc stays close
+(4e-6, against 0.36 for cubic). The sinc read costs about 20 times a linear
+one. None of them filters: scanning faster than one sample per sample period
+still aliases what the buffer holds above the new Nyquist.
 
 ### `signal/pitch`
 
@@ -250,6 +264,45 @@ Note numbers are floats: each 1.0 is a semitone. Both are plain
 | `mtof m` | `440 * 2^((m - 69) / 12)` Hz |
 | `ftom f` | `69 + 12 * log2(f / 440)`; fractional between notes, `f` must be > 0 |
 
+For any other tuning, see `signal/tuning`'s `mtof-tuned` / `ftom-tuned`.
+
+### `signal/tuning`
+
+A tuning in Scala's terms: a **scale** (pitches above 1/1, the last the period
+it repeats at) played through a **keymap** (which note plays which degree, and
+which note sounds at which frequency). Scales, keymaps and tunings are
+immutable handles that live for the process.
+
+| Symbol | Produces |
+|---|---|
+| `Pitch` = `(Cents c)` or `(Ratio n d)` | one scale degree |
+| `scale-new desc pitches` | `(Result Scale String)`; the pitches above 1/1, the last the period |
+| `scale-edo n` | `n` equal divisions of the octave (`(scale-edo 12)` is 12-TET) |
+| `scale-size s`, `scale-description s`, `scale-period s` | the note count, description, period in cents |
+| `scale-cents s k` | cents of degree `k`, any integer: degrees past the period wrap |
+| `scale-pitch s k` | `(Option Pitch)`: degree `k` as given, `0 <= k <= size` |
+| `scl-parse text`, `scl-load path` | `(Result Scale String)` from `.scl` text or a file |
+| `scale->scl s` | the `.scl` text (`String`); reads back to the same scale |
+| `MapEntry` = `(Degree d)` or `(Unmapped)` | one key of a keymap pattern |
+| `keymap-linear middle ref-key ref-freq` | every note plays the next degree; `ref-key` sounds at `ref-freq` |
+| `keymap-new middle ref-key ref-freq octave-degree entries` | `(Result Keymap String)`; a pattern of entries repeating every `size` notes, `octave-degree` degrees higher |
+| `keymap-size`, `-first`, `-last`, `-middle`, `-reference`, `-frequency`, `-octave-degree`, `-entries` | the keymap's fields |
+| `kbm-parse text`, `kbm-load path` | `(Result Keymap String)` from `.kbm` text or a file |
+| `keymap->kbm k` | the `.kbm` text (`String`); reads back to the same keymap |
+| `tuning-new s k` | a `Tuning`; `tuning-scale` / `tuning-keymap` give the parts back |
+| `mtof-tuned t m` | Hz of note `m` (fractional notes interpolate in cents); `(mtof-tuned t)` lifts with `map-signal` |
+| `ftom-tuned t f` | the note number of `f` Hz; NaN for a tuning that does not rise note to note |
+| `tuning-mapped? t key` | whether the keymap maps the note (an unmapped note still has a pitch, between its neighbours) |
+
+`(tuning-new (scale-edo 12) (keymap-linear 60 69 440.0))` makes `mtof-tuned`
+equal `mtof`. Mappings whose formal octave is the scale's size (the normal
+case) agree note for note with the Surge `tuning-library`; where they differ
+(a mapping written for another scale), this follows the Scala format's
+definition of the formal octave. The first/last-note fields are kept and
+written back but `mtof-tuned` retunes every note.
+
+A program that uses the `String` results loads `stdlib/string.tur` *before*
+its `defmodule`, as `signal/tuning` does, so both share one `String` type.
 ### Stateful signals are pull-order dependent
 
 Every filter, every delay effect, every noise generator and `fm-sine` advance
@@ -258,7 +311,7 @@ instance exactly once per sample period, in order. Feeding one instance to two
 consumers (for example both halves of `pair-signals`) advances it twice, so
 each consumer sees only part of the stream and a delay's effective length
 changes. Build one instance per consumer, or render the signal into a `Buffer` and
-scan that. The other oscillators, the shapers, the envelopes and `scan` are
+scan that. The other oscillators, the shapers, the envelopes and the scans are
 pure functions of `t` and have no such restriction.
 
 ### `signal/shaper`
@@ -380,7 +433,7 @@ defmodule my/app
 
 ## Examples
 
-Ten runnable examples live under `examples/`:
+Twelve runnable examples live under `examples/`:
 
 ```sh
 cd spices/signal
@@ -394,6 +447,8 @@ tur run examples/07_delay_and_noise.tur       # delay, comb, allpass, colored no
 tur run examples/08_filters.tur               # biquads, state-variable sweep, ladder
 tur run examples/09_modulation_and_buffers.tur  # ring, AM, PM, FM, wavetable, tape
 tur run examples/10_pitch_and_sequences.tur   # mtof/ftom, a melody in order, a cycle
+tur run examples/11_interpolation.tur         # nearest/linear/cubic/sinc reads, a note table
+tur run examples/12_tunings.tur               # 19-EDO, just intonation on the white keys, .scl/.kbm
 ```
 
 Each prints sample values that match the hand-computed references in its
