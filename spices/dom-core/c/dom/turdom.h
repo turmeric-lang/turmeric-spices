@@ -150,7 +150,8 @@ enum {
     TURDOM_E_BAD_KIND      = 6,  /* the operation does not apply to this kind */
     TURDOM_E_OOM           = 7,
     TURDOM_E_BAD_NAME      = 8,  /* see the turdom_check_* functions below */
-    TURDOM_E_BAD_CONTENT   = 9
+    TURDOM_E_BAD_CONTENT   = 9,
+    TURDOM_E_IO            = 10  /* the streaming writer's output file */
 };
 
 /* Detached nodes, owned by d's arena until inserted.  In an HTML document,
@@ -291,5 +292,61 @@ int          turdom_edit_set_value(turdom_node *n, const char *s, size_t len);
 int          turdom_edit_set_text(turdom_node *n, const char *s, size_t len);
 int          turdom_edit_rename(turdom_node *el, const char *qname,
                                 const char *ns_uri);
+
+/* ---- streaming writer --------------------------------------------------------
+ *
+ * Serializes a stream of SAX events the way turdom_serialize writes a tree:
+ * the same escaping, `<x/>` for an empty XML element, raw text inside an HTML
+ * <script> or <style>.  It is checked the way edits are, for what it writes
+ * verbatim -- names, comment bodies, PI data, CDATA, HTML raw text, doctype
+ * ids -- and for structure: no duplicate attribute, and in XML an end tag
+ * must match the open element, there is exactly one root, text stays inside
+ * it.  HTML end tags need not balance (a tokenizer's do not); an end tag
+ * directly after a void element's start (`<br/>`) writes the self-closed
+ * form.  The first refusal sticks: later calls return it and write nothing.
+ *
+ * XML names are Names as written (namespaces off: `a:b` is just a name), or
+ * Clark form `{uri}local` as a namespace-aware parser reports them.  A start
+ * tag is held until the next event, so the `xmlns` / `xmlns:p` attributes
+ * written on it are in scope for its own Clark names; for those the writer
+ * reuses a binding in scope or declares one (a default namespace for an
+ * element, a generated `nsN` prefix for an attribute or for an element whose
+ * own `xmlns` says otherwise).  A plain name with no colon under a default
+ * the writer generated gets `xmlns=""`, so it stays in no namespace.
+ *
+ * Memory: the output, unless turdom_writer_to_file sends it to a file in
+ * 64 KiB writes; plus the open elements, the held start tag and an open HTML
+ * raw-text element's text. */
+
+typedef struct turdom_writer turdom_writer;
+
+turdom_writer *turdom_writer_new(int flavor);
+/* Before any event: write the output to path rather than keeping it.
+ * TURDOM_E_IO (not sticky) when the file cannot be created. */
+int            turdom_writer_to_file(turdom_writer *w, const char *path);
+void           turdom_writer_free(turdom_writer *w);
+int            turdom_writer_start(turdom_writer *w, const char *name);
+/* Only directly after start, before any other event. */
+int            turdom_writer_attr(turdom_writer *w, const char *name,
+                                  const char *value, size_t vlen);
+int            turdom_writer_end(turdom_writer *w, const char *name);
+int            turdom_writer_chars(turdom_writer *w, const char *s, size_t n);
+int            turdom_writer_comment(turdom_writer *w, const char *s, size_t n);
+int            turdom_writer_pi(turdom_writer *w, const char *target,
+                                const char *data);
+/* start != 0 opens a CDATA section, 0 closes it. */
+int            turdom_writer_cdata(turdom_writer *w, int start);
+/* An absent id is NULL or "". */
+int            turdom_writer_doctype(turdom_writer *w, const char *name,
+                                     const char *public_id,
+                                     const char *system_id);
+int            turdom_writer_error(const turdom_writer *w);
+/* Ends the output: closes a held start tag, checks that the XML document is
+ * complete, and flushes and closes the file.  Returns the output (empty when
+ * it went to a file), malloc'd for the caller to free; NULL with *rc set when
+ * the writer has refused something.  Later events are refused with
+ * TURDOM_E_HIERARCHY; finishing again returns the output again.  The writer
+ * still needs turdom_writer_free. */
+char          *turdom_writer_finish(turdom_writer *w, size_t *len, int *rc);
 
 #endif /* TURDOM_H */

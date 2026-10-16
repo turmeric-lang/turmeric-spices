@@ -2,6 +2,7 @@
 
 #include "turdom.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1408,6 +1409,21 @@ static int xml_qname(const char *q, size_t *plen) {
     return xml_ncname(q, *plen) && xml_ncname(c + 1, n - *plen - 1);
 }
 
+/* A Name: what a document read with namespaces off may use, colons and all. */
+static int xml_name(const char *s, size_t n) {
+    if (n == 0) return 0;
+    const unsigned char *u = (const unsigned char *)s;
+    size_t i = 0;
+    int first = 1;
+    while (i < n) {
+        uint32_t c;
+        if (!utf8_next(u, n, &i, &c)) return 0;
+        if (first ? !xml_name_start(c) : !xml_name_char(c)) return 0;
+        first = 0;
+    }
+    return 1;
+}
+
 static int xml_chars(const char *s, size_t n) {
     const unsigned char *u = (const unsigned char *)s;
     size_t i = 0;
@@ -1841,4 +1857,726 @@ int turdom_edit_rename(turdom_node *el, const char *qname, const char *ns_uri) {
     int rc = turdom_check_rename(el, qname, ns_uri);
     if (rc != TURDOM_OK) return rc;
     return turdom_rename(el, qname, ns_uri, local_or_null(qname));
+}
+
+/* ---- streaming writer -------------------------------------------------------
+ *
+ * See turdom.h.  A start tag is held (`open`, `tag`, `pa`) until the next
+ * event closes it, so its own namespace declarations are known before any
+ * Clark name on it gets a prefix.  Output builds up in `b`; with a file sink
+ * it is written out once 64 KiB have accumulated. */
+
+#define TURDOM_WRITER_SPILL ((size_t)64 * 1024)
+
+typedef struct {
+    char *event_name;       /* the name as the event gave it, to match the end */
+    char *qname;            /* the name as written, for the end tag */
+    size_t nbind;           /* bindings this element pushed */
+} wframe;
+
+typedef struct {
+    char *pre;
+    char *uri;
+    int generated;          /* declared by the writer for a Clark name */
+} wbind;
+
+typedef struct {
+    char *name;             /* as the event gave it */
+    char *value;
+    size_t vlen;
+} wattr;
+
+struct turdom_writer {
+    int html;
+    obuf b;
+    FILE *out;              /* NULL: the output stays in b */
+    int err;
+    int used;               /* an event has been accepted */
+    int done;               /* finished */
+    int open;               /* a start tag is held */
+    char *tag;              /* its name as the event gave it */
+    int tag_void;           /* HTML: a void element, which has no frame */
+    wattr *pa;              /* its attributes */
+    size_t npa, cpa;
+    wframe *st;
+    size_t depth, cap;
+    wbind *bind;
+    size_t nb, cb;
+    int genid;
+    int root_done;          /* XML: the root element has ended */
+    int doctype_done;       /* XML */
+    int in_cdata;
+    int cdata_tail;         /* ']' just written in the current section, max 2 */
+    obuf raw;               /* text of the open HTML raw-text element */
+    int raw_open;
+};
+
+static char *w_strdup(const char *s, size_t n) {
+    char *p = (char *)malloc(n + 1);
+    if (!p) return NULL;
+    if (n) memcpy(p, s, n);
+    p[n] = '\0';
+    return p;
+}
+
+turdom_writer *turdom_writer_new(int flavor) {
+    turdom_writer *w = (turdom_writer *)calloc(1, sizeof(turdom_writer));
+    if (w) w->html = flavor == TURDOM_FLAVOR_HTML;
+    return w;
+}
+
+int turdom_writer_to_file(turdom_writer *w, const char *path) {
+    if (!w || !path) return TURDOM_E_BAD_KIND;
+    if (w->err) return w->err;
+    if (w->used || w->out || w->done) return TURDOM_E_HIERARCHY;
+    FILE *f = fopen(path, "wb");
+    if (!f) return TURDOM_E_IO;
+    w->out = f;
+    return TURDOM_OK;
+}
+
+static void w_pop_bindings(turdom_writer *w, size_t n) {
+    while (n-- && w->nb) {
+        w->nb--;
+        free(w->bind[w->nb].pre);
+        free(w->bind[w->nb].uri);
+    }
+}
+
+static void w_pop_frame(turdom_writer *w) {
+    wframe *f = &w->st[--w->depth];
+    w_pop_bindings(w, f->nbind);
+    free(f->event_name);
+    free(f->qname);
+}
+
+static void w_drop_tag(turdom_writer *w) {
+    for (size_t i = 0; i < w->npa; i++) {
+        free(w->pa[i].name);
+        free(w->pa[i].value);
+    }
+    w->npa = 0;
+    free(w->tag);
+    w->tag = NULL;
+    w->open = 0;
+}
+
+void turdom_writer_free(turdom_writer *w) {
+    if (!w) return;
+    while (w->depth) w_pop_frame(w);
+    w_pop_bindings(w, w->nb);
+    free(w->st);
+    free(w->bind);
+    w_drop_tag(w);
+    free(w->pa);
+    if (w->out) fclose(w->out);
+    free(w->b.p);
+    free(w->raw.p);
+    free(w);
+}
+
+int turdom_writer_error(const turdom_writer *w) {
+    return w ? w->err : TURDOM_E_BAD_KIND;
+}
+
+static int w_fail(turdom_writer *w, int rc) {
+    if (!w->err) w->err = rc;
+    return w->err;
+}
+
+/* The common gate of every event: a refusal sticks, finishing ends it. */
+static int w_gate(const turdom_writer *w) {
+    if (w->err) return w->err;
+    return w->done ? TURDOM_E_HIERARCHY : TURDOM_OK;
+}
+
+static int w_spill(turdom_writer *w, int all) {
+    if (w->b.oom || w->raw.oom) return TURDOM_E_OOM;
+    if (!w->out || !w->b.len || (!all && w->b.len < TURDOM_WRITER_SPILL)) return TURDOM_OK;
+    if (fwrite(w->b.p, 1, w->b.len, w->out) != w->b.len) return TURDOM_E_IO;
+    w->b.len = 0;
+    return TURDOM_OK;
+}
+
+/* The end of every accepted event. */
+static int w_accept(turdom_writer *w) {
+    int rc = w_spill(w, 0);
+    if (rc != TURDOM_OK) return w_fail(w, rc);
+    w->used = 1;
+    return TURDOM_OK;
+}
+
+static int w_push_bind(turdom_writer *w, const char *pre, size_t plen,
+                       const char *uri, size_t ulen, int generated) {
+    if (w->nb == w->cb) {
+        size_t cap = w->cb ? w->cb * 2 : 16;
+        wbind *nv = (wbind *)realloc(w->bind, cap * sizeof(wbind));
+        if (!nv) return TURDOM_E_OOM;
+        w->bind = nv;
+        w->cb = cap;
+    }
+    char *p = w_strdup(pre, plen), *u = w_strdup(uri, ulen);
+    if (!p || !u) { free(p); free(u); return TURDOM_E_OOM; }
+    w->bind[w->nb].pre = p;
+    w->bind[w->nb].uri = u;
+    w->bind[w->nb].generated = generated;
+    w->nb++;
+    w->st[w->depth - 1].nbind++;
+    return TURDOM_OK;
+}
+
+static const wbind *w_lookup_pre(const turdom_writer *w, const char *pre,
+                                 size_t plen) {
+    for (size_t i = w->nb; i-- > 0;)
+        if (strlen(w->bind[i].pre) == plen && memcmp(w->bind[i].pre, pre, plen) == 0)
+            return &w->bind[i];
+    return NULL;
+}
+
+static int w_uri_is(const char *uri, size_t ulen, const char *want) {
+    return strlen(want) == ulen && memcmp(uri, want, ulen) == 0;
+}
+
+/* A prefix (non-empty, not shadowed) currently bound to uri, or NULL. */
+static const char *w_prefix_for(const turdom_writer *w, const char *uri, size_t ulen) {
+    for (size_t i = w->nb; i-- > 0;) {
+        const wbind *b = &w->bind[i];
+        if (!b->pre[0] || !w_uri_is(uri, ulen, b->uri)) continue;
+        if (w_lookup_pre(w, b->pre, strlen(b->pre)) == b) return b->pre;
+    }
+    return NULL;
+}
+
+/* Bind a fresh nsN prefix to uri on the held element; NULL on OOM. */
+static const char *w_gen_prefix(turdom_writer *w, const char *uri, size_t ulen) {
+    char gen[32];
+    do snprintf(gen, sizeof gen, "ns%d", ++w->genid);
+    while (w_lookup_pre(w, gen, strlen(gen)));
+    if (w_push_bind(w, gen, strlen(gen), uri, ulen, 1) != TURDOM_OK) return NULL;
+    return w->bind[w->nb - 1].pre;
+}
+
+/* Split a Clark name {uri}local.  0 when name is not one. */
+static int clark(const char *name, const char **uri, size_t *ulen,
+                 const char **local) {
+    if (name[0] != '{') return 0;
+    const char *close = strchr(name, '}');
+    if (!close) return 0;
+    *uri = name + 1;
+    *ulen = (size_t)(close - name - 1);
+    *local = close + 1;
+    return 1;
+}
+
+/* An XML element or attribute name as an event gives it. */
+static int w_xml_name_ok(const char *name) {
+    const char *uri, *local;
+    size_t ulen;
+    if (name[0] != '{') return xml_name(name, strlen(name));
+    if (!clark(name, &uri, &ulen, &local)) return 0;
+    return xml_ncname(local, strlen(local)) && xml_chars(uri, ulen) &&
+           !w_uri_is(uri, ulen, TURDOM_XMLNS_NS);
+}
+
+/* Is a written attribute name a namespace declaration?  Sets its prefix. */
+static int w_decl(const char *name, const char **pre, size_t *plen) {
+    if (strcmp(name, "xmlns") == 0) { *pre = ""; *plen = 0; return 1; }
+    if (strncmp(name, "xmlns:", 6) == 0 && name[6]) {
+        *pre = name + 6;
+        *plen = strlen(name + 6);
+        return 1;
+    }
+    return 0;
+}
+
+static char *w_join(const char *pre, const char *local) {
+    size_t pl = strlen(pre), ll = strlen(local);
+    char *q = (char *)malloc(pl + 1 + ll + 1);
+    if (!q) return NULL;
+    memcpy(q, pre, pl);
+    q[pl] = ':';
+    memcpy(q + pl + 1, local, ll + 1);
+    return q;
+}
+
+static void w_put_decl(obuf *b, const char *pre, size_t plen, const char *uri,
+                       size_t ulen) {
+    ob_puts(b, plen ? " xmlns:" : " xmlns");
+    ob_put(b, pre, plen);
+    ob_puts(b, "=\"");
+    escape_into(b, uri, ulen, 1, 0);
+    ob_puts(b, "\"");
+}
+
+static int w_cmp(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static int w_cmp_ci(const void *a, const void *b) {
+    const unsigned char *x = *(const unsigned char *const *)a;
+    const unsigned char *y = *(const unsigned char *const *)b;
+    for (;; x++, y++) {
+        int cx = ascii_lower(*x), cy = ascii_lower(*y);
+        if (cx != cy || !cx) return cx - cy;
+    }
+}
+
+/* Any two of names equal (HTML: ASCII case-insensitively)?  -1 on OOM. */
+static int w_has_dup(char *const *names, size_t n, int ci) {
+    if (n < 2) return 0;
+    char **v = (char **)malloc(n * sizeof(char *));
+    if (!v) return -1;
+    memcpy(v, names, n * sizeof(char *));
+    int (*cmp)(const void *, const void *) = ci ? w_cmp_ci : w_cmp;
+    qsort(v, n, sizeof(char *), cmp);
+    int dup = 0;
+    for (size_t i = 1; i < n && !dup; i++) dup = cmp(&v[i - 1], &v[i]) == 0;
+    free(v);
+    return dup;
+}
+
+static int w_close_html(turdom_writer *w, int selfclose) {
+    char **names = (char **)malloc((w->npa ? w->npa : 1) * sizeof(char *));
+    if (!names) return TURDOM_E_OOM;
+    for (size_t i = 0; i < w->npa; i++) names[i] = w->pa[i].name;
+    int dup = w_has_dup(names, w->npa, 1);
+    free(names);
+    if (dup) return dup < 0 ? TURDOM_E_OOM : TURDOM_E_BAD_NAME;
+    ob_puts(&w->b, "<");
+    ob_puts(&w->b, w->tag);
+    for (size_t i = 0; i < w->npa; i++) {
+        ob_puts(&w->b, " ");
+        ob_puts(&w->b, w->pa[i].name);
+        ob_puts(&w->b, "=\"");
+        escape_into(&w->b, w->pa[i].value, w->pa[i].vlen, 1, 1);
+        ob_puts(&w->b, "\"");
+    }
+    ob_puts(&w->b, selfclose ? "/>" : ">");
+    return TURDOM_OK;
+}
+
+/* Resolve and write the held XML start tag.  fin[i] gets attribute i's name
+ * as written; gen[i] says the writer declares its prefix. */
+static int w_close_xml_into(turdom_writer *w, int selfclose, char **fin, int *gen) {
+    wframe *f = &w->st[w->depth - 1];
+    const char *uri = "", *local = "", *pre = NULL;
+    size_t ulen = 0, plen = 0;
+    int own_default = 0;
+
+    /* The element's own declarations are in scope for its own names. */
+    for (size_t i = 0; i < w->npa; i++) {
+        if (!w_decl(w->pa[i].name, &pre, &plen)) continue;
+        if (!plen) own_default = 1;
+        if (w_push_bind(w, pre, plen, w->pa[i].value, w->pa[i].vlen, 0) != TURDOM_OK)
+            return TURDOM_E_OOM;
+    }
+
+    /* The element name.  decl: 0 none, 1 xmlns="uri", 2 xmlns="", 3 a
+     * generated prefix (the last binding pushed). */
+    int decl = 0;
+    char *qn = NULL;
+    const wbind *def = w_lookup_pre(w, "", 0);
+    if (clark(w->tag, &uri, &ulen, &local) && ulen) {
+        if (w_uri_is(uri, ulen, TURDOM_XML_NS)) {
+            qn = w_join("xml", local);
+        } else if (def && w_uri_is(uri, ulen, def->uri)) {
+            qn = w_strdup(local, strlen(local));
+        } else if ((pre = w_prefix_for(w, uri, ulen)) != NULL) {
+            qn = w_join(pre, local);
+        } else if (!own_default) {
+            decl = 1;
+            qn = w_strdup(local, strlen(local));
+        } else {
+            if (!(pre = w_gen_prefix(w, uri, ulen))) return TURDOM_E_OOM;
+            decl = 3;
+            qn = w_join(pre, local);
+        }
+    } else if (w->tag[0] == '{') {
+        /* {}local: in no namespace, whatever the default in scope. */
+        if (def && def->uri[0]) {
+            if (own_default) return TURDOM_E_BAD_NAME;
+            decl = 2;
+        }
+        qn = w_strdup(local, strlen(local));
+    } else {
+        /* As written; only a default the writer itself declared is undone. */
+        if (!strchr(w->tag, ':') && !own_default && def && def->generated && def->uri[0])
+            decl = 2;
+        qn = w_strdup(w->tag, strlen(w->tag));
+    }
+    if (!qn) return TURDOM_E_OOM;
+    f->qname = qn;
+    if ((decl == 1 && w_push_bind(w, "", 0, uri, ulen, 1) != TURDOM_OK) ||
+        (decl == 2 && w_push_bind(w, "", 0, "", 0, 1) != TURDOM_OK))
+        return TURDOM_E_OOM;
+    const wbind *ebind = decl ? &w->bind[w->nb - 1] : NULL;
+    char *edecl_pre = ebind ? ebind->pre : NULL;
+    size_t edecl_plen = ebind ? strlen(ebind->pre) : 0;
+    const char *edecl_uri = ebind ? ebind->uri : NULL;
+
+    /* Attribute names. */
+    for (size_t i = 0; i < w->npa; i++) {
+        const char *name = w->pa[i].name;
+        gen[i] = 0;
+        if (!clark(name, &uri, &ulen, &local)) {
+            fin[i] = w_strdup(name, strlen(name));
+        } else if (!ulen) {
+            if (strcmp(local, "xmlns") == 0) return TURDOM_E_BAD_NAME;
+            fin[i] = w_strdup(local, strlen(local));
+        } else if (w_uri_is(uri, ulen, TURDOM_XML_NS)) {
+            fin[i] = w_join("xml", local);
+        } else {
+            if (!(pre = w_prefix_for(w, uri, ulen))) {
+                if (!(pre = w_gen_prefix(w, uri, ulen))) return TURDOM_E_OOM;
+                gen[i] = 1;
+            }
+            fin[i] = w_join(pre, local);
+        }
+        if (!fin[i]) return TURDOM_E_OOM;
+    }
+    int dup = w_has_dup(fin, w->npa, 0);
+    if (dup) return dup < 0 ? TURDOM_E_OOM : TURDOM_E_BAD_NAME;
+
+    ob_puts(&w->b, "<");
+    ob_puts(&w->b, qn);
+    if (ebind) w_put_decl(&w->b, edecl_pre, edecl_plen, edecl_uri, strlen(edecl_uri));
+    for (size_t i = 0; i < w->npa; i++) {
+        if (gen[i]) {
+            clark(w->pa[i].name, &uri, &ulen, &local);
+            w_put_decl(&w->b, fin[i], (size_t)(strchr(fin[i], ':') - fin[i]), uri, ulen);
+        }
+        ob_puts(&w->b, " ");
+        ob_puts(&w->b, fin[i]);
+        ob_puts(&w->b, "=\"");
+        escape_into(&w->b, w->pa[i].value, w->pa[i].vlen, 1, 0);
+        ob_puts(&w->b, "\"");
+    }
+    ob_puts(&w->b, selfclose ? "/>" : ">");
+    return TURDOM_OK;
+}
+
+static int w_close_xml(turdom_writer *w, int selfclose) {
+    size_t n = w->npa ? w->npa : 1;
+    char **fin = (char **)calloc(n, sizeof(char *));
+    int *gen = (int *)calloc(n, sizeof(int));
+    int rc = (fin && gen) ? w_close_xml_into(w, selfclose, fin, gen) : TURDOM_E_OOM;
+    if (fin)
+        for (size_t i = 0; i < w->npa; i++) free(fin[i]);
+    free(fin);
+    free(gen);
+    return rc;
+}
+
+/* Write the held start tag, if any. */
+static int w_close_tag(turdom_writer *w, int selfclose) {
+    if (!w->open) return TURDOM_OK;
+    int rc = w->html ? w_close_html(w, selfclose) : w_close_xml(w, selfclose);
+    if (rc == TURDOM_OK) w_drop_tag(w);
+    return rc;
+}
+
+static int w_push_frame(turdom_writer *w, const char *name) {
+    if (w->depth == w->cap) {
+        size_t cap = w->cap ? w->cap * 2 : 16;
+        wframe *nv = (wframe *)realloc(w->st, cap * sizeof(wframe));
+        if (!nv) return TURDOM_E_OOM;
+        w->st = nv;
+        w->cap = cap;
+    }
+    char *e = w_strdup(name, strlen(name));
+    char *q = w->html ? w_strdup(name, strlen(name)) : NULL;
+    if (!e || (w->html && !q)) { free(e); free(q); return TURDOM_E_OOM; }
+    w->st[w->depth].event_name = e;
+    w->st[w->depth].qname = q;
+    w->st[w->depth].nbind = 0;
+    w->depth++;
+    return TURDOM_OK;
+}
+
+int turdom_writer_start(turdom_writer *w, const char *name) {
+    if (!w || !name) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (w->in_cdata || w->raw_open) return w_fail(w, TURDOM_E_HIERARCHY);
+    size_t n = strlen(name);
+    int is_void = 0, raw = 0;
+    if (w->html) {
+        rc = element_name_rc(1, name, NULL);
+        if (rc != TURDOM_OK) return w_fail(w, rc);
+        is_void = in_set_ci(name, n, html_void);
+        raw = !is_void && in_set_ci(name, n, html_rawtext);
+    } else {
+        if (w->depth == 0 && w->root_done) return w_fail(w, TURDOM_E_HIERARCHY);
+        if (!w_xml_name_ok(name)) return w_fail(w, TURDOM_E_BAD_NAME);
+    }
+    rc = w_close_tag(w, 0);
+    if (rc != TURDOM_OK) return w_fail(w, rc);
+    char *t = w_strdup(name, n);
+    if (!t) return w_fail(w, TURDOM_E_OOM);
+    if (!is_void && w_push_frame(w, name) != TURDOM_OK) {
+        free(t);
+        return w_fail(w, TURDOM_E_OOM);
+    }
+    w->tag = t;
+    w->tag_void = is_void;
+    w->open = 1;
+    if (raw) { w->raw_open = 1; w->raw.len = 0; }
+    return w_accept(w);
+}
+
+int turdom_writer_attr(turdom_writer *w, const char *name, const char *value,
+                       size_t vlen) {
+    if (!w || !name) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (!w->open) return w_fail(w, TURDOM_E_HIERARCHY);
+    const char *v = value ? value : "";
+    if (!value) vlen = 0;
+    if (w->html) {
+        if (!html_attr_name(name)) return w_fail(w, TURDOM_E_BAD_NAME);
+    } else {
+        if (!w_xml_name_ok(name)) return w_fail(w, TURDOM_E_BAD_NAME);
+        if (!xml_chars(v, vlen)) return w_fail(w, TURDOM_E_BAD_CONTENT);
+    }
+    if (w->npa == w->cpa) {
+        size_t cap = w->cpa ? w->cpa * 2 : 8;
+        wattr *nv = (wattr *)realloc(w->pa, cap * sizeof(wattr));
+        if (!nv) return w_fail(w, TURDOM_E_OOM);
+        w->pa = nv;
+        w->cpa = cap;
+    }
+    char *nm = w_strdup(name, strlen(name)), *vv = w_strdup(v, vlen);
+    if (!nm || !vv) { free(nm); free(vv); return w_fail(w, TURDOM_E_OOM); }
+    w->pa[w->npa].name = nm;
+    w->pa[w->npa].value = vv;
+    w->pa[w->npa].vlen = vlen;
+    w->npa++;
+    return w_accept(w);
+}
+
+/* Write an HTML raw-text element's buffered text, if it is safe. */
+static int w_flush_raw(turdom_writer *w) {
+    if (!w->raw_open) return TURDOM_OK;
+    const char *tag = w->st[w->depth - 1].qname;
+    if (!rawtext_ok(tag, strlen(tag), w->raw.p ? w->raw.p : "", w->raw.len))
+        return TURDOM_E_BAD_CONTENT;
+    int rc = w_close_tag(w, 0);
+    if (rc != TURDOM_OK) return rc;
+    ob_put(&w->b, w->raw.p, w->raw.len);
+    w->raw.len = 0;
+    w->raw_open = 0;
+    return TURDOM_OK;
+}
+
+int turdom_writer_end(turdom_writer *w, const char *name) {
+    if (!w || !name) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (w->in_cdata) return w_fail(w, TURDOM_E_HIERARCHY);
+    size_t n = strlen(name);
+    if (w->html) {
+        if (!html_element_name(name)) return w_fail(w, TURDOM_E_BAD_NAME);
+        if (w->raw_open) {
+            if (!eq_ci(name, n, w->st[w->depth - 1].qname))
+                return w_fail(w, TURDOM_E_HIERARCHY);
+            rc = w_flush_raw(w);
+        } else if (w->open && w->tag_void && eq_ci(name, n, w->tag)) {
+            rc = w_close_tag(w, 1);             /* <br/> */
+            return rc != TURDOM_OK ? w_fail(w, rc) : w_accept(w);
+        } else {
+            rc = w_close_tag(w, 0);
+        }
+        if (rc != TURDOM_OK) return w_fail(w, rc);
+        ob_puts(&w->b, "</");
+        ob_puts(&w->b, name);
+        ob_puts(&w->b, ">");
+        /* A tokenizer's end tags need not balance: close the nearest match. */
+        for (size_t i = w->depth; i-- > 0;)
+            if (eq_ci(name, n, w->st[i].qname)) {
+                while (w->depth > i) w_pop_frame(w);
+                break;
+            }
+        return w_accept(w);
+    }
+    if (!w->depth || strcmp(w->st[w->depth - 1].event_name, name) != 0)
+        return w_fail(w, TURDOM_E_HIERARCHY);
+    if (w->open) {
+        rc = w_close_tag(w, 1);
+        if (rc != TURDOM_OK) return w_fail(w, rc);
+    } else {
+        ob_puts(&w->b, "</");
+        ob_puts(&w->b, w->st[w->depth - 1].qname);
+        ob_puts(&w->b, ">");
+    }
+    w_pop_frame(w);
+    if (!w->depth) w->root_done = 1;
+    return w_accept(w);
+}
+
+int turdom_writer_chars(turdom_writer *w, const char *s, size_t n) {
+    if (!w) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (!s || !n) return TURDOM_OK;
+    if (w->html) {
+        if (w->raw_open) {
+            ob_put(&w->raw, s, n);
+            return w_accept(w);
+        }
+        rc = w_close_tag(w, 0);
+        if (rc != TURDOM_OK) return w_fail(w, rc);
+        escape_into(&w->b, s, n, 0, 1);
+        return w_accept(w);
+    }
+    if (!w->depth) return w_fail(w, TURDOM_E_HIERARCHY);    /* outside the root */
+    if (!xml_chars(s, n)) return w_fail(w, TURDOM_E_BAD_CONTENT);
+    if (w->in_cdata) {
+        /* CDATA cannot escape: a \r would come back as \n, and a `]]>` --
+         * even across calls -- would end the section. */
+        if (memchr(s, '\r', n)) return w_fail(w, TURDOM_E_BAD_CONTENT);
+        int tail = w->cdata_tail;
+        for (size_t i = 0; i < n; i++) {
+            if (s[i] == '>' && tail >= 2) return w_fail(w, TURDOM_E_BAD_CONTENT);
+            tail = s[i] == ']' ? (tail < 2 ? tail + 1 : 2) : 0;
+        }
+        w->cdata_tail = tail;
+        ob_put(&w->b, s, n);
+        return w_accept(w);
+    }
+    rc = w_close_tag(w, 0);
+    if (rc != TURDOM_OK) return w_fail(w, rc);
+    escape_into(&w->b, s, n, 0, 0);
+    return w_accept(w);
+}
+
+int turdom_writer_comment(turdom_writer *w, const char *s, size_t n) {
+    if (!w) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    const char *v = s ? s : "";
+    if (!s) n = 0;
+    if (w->in_cdata || w->raw_open) return w_fail(w, TURDOM_E_HIERARCHY);
+    rc = chars_rc(w->html, TURDOM_COMMENT, v, n);
+    if (rc == TURDOM_OK) rc = w_close_tag(w, 0);
+    if (rc != TURDOM_OK) return w_fail(w, rc);
+    ob_puts(&w->b, "<!--");
+    ob_put(&w->b, v, n);
+    ob_puts(&w->b, "-->");
+    return w_accept(w);
+}
+
+int turdom_writer_pi(turdom_writer *w, const char *target, const char *data) {
+    if (!w) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (w->in_cdata) return w_fail(w, TURDOM_E_HIERARCHY);
+    const char *d = data ? data : "";
+    size_t n = strlen(d);
+    rc = pi_rc(w->html, target, d, n);
+    if (rc == TURDOM_OK) rc = w_close_tag(w, 0);
+    if (rc != TURDOM_OK) return w_fail(w, rc);
+    ob_puts(&w->b, "<?");
+    ob_puts(&w->b, target);
+    if (n) { ob_puts(&w->b, " "); ob_put(&w->b, d, n); }
+    ob_puts(&w->b, "?>");
+    return w_accept(w);
+}
+
+int turdom_writer_cdata(turdom_writer *w, int start) {
+    if (!w) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (w->html) return w_fail(w, TURDOM_E_HIERARCHY);
+    if (start) {
+        if (w->in_cdata || !w->depth) return w_fail(w, TURDOM_E_HIERARCHY);
+        rc = w_close_tag(w, 0);
+        if (rc != TURDOM_OK) return w_fail(w, rc);
+        ob_puts(&w->b, "<![CDATA[");
+        w->in_cdata = 1;
+        w->cdata_tail = 0;
+    } else {
+        if (!w->in_cdata) return w_fail(w, TURDOM_E_HIERARCHY);
+        ob_puts(&w->b, "]]>");
+        w->in_cdata = 0;
+    }
+    return w_accept(w);
+}
+
+static int pubid_char(unsigned char c) {
+    return c == ' ' || c == '\r' || c == '\n' || (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           (c && strchr("-'()+,./:=?;!*#@$_%", c));
+}
+
+int turdom_writer_doctype(turdom_writer *w, const char *name,
+                          const char *public_id, const char *system_id) {
+    if (!w || !name) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (w->in_cdata || w->raw_open) return w_fail(w, TURDOM_E_HIERARCHY);
+    const char *p = public_id ? public_id : "", *s = system_id ? system_id : "";
+    /* put_quoted_id picks the quote; it cannot hold both. */
+    if ((strchr(p, '"') && strchr(p, '\'')) || (strchr(s, '"') && strchr(s, '\'')))
+        return w_fail(w, TURDOM_E_BAD_CONTENT);
+    if (w->html) {
+        /* Anywhere: a tokenizer reports misplaced ones too. */
+        for (const char *c = name; *c; c++)
+            if (html_space(*c) || *c == '>') return w_fail(w, TURDOM_E_BAD_NAME);
+        if (!name[0] && (p[0] || s[0])) return w_fail(w, TURDOM_E_BAD_NAME);
+        if (strchr(p, '>') || strchr(s, '>')) return w_fail(w, TURDOM_E_BAD_CONTENT);
+    } else {
+        if (w->depth || w->root_done || w->doctype_done)
+            return w_fail(w, TURDOM_E_HIERARCHY);
+        if (!xml_name(name, strlen(name))) return w_fail(w, TURDOM_E_BAD_NAME);
+        for (const char *c = p; *c; c++)
+            if (!pubid_char((unsigned char)*c)) return w_fail(w, TURDOM_E_BAD_CONTENT);
+        if (!xml_chars(s, strlen(s))) return w_fail(w, TURDOM_E_BAD_CONTENT);
+        w->doctype_done = 1;
+    }
+    rc = w_close_tag(w, 0);
+    if (rc != TURDOM_OK) return w_fail(w, rc);
+    ob_puts(&w->b, "<!DOCTYPE ");
+    ob_puts(&w->b, name);
+    if (p[0]) {
+        ob_puts(&w->b, " PUBLIC ");
+        put_quoted_id(&w->b, p);
+        if (s[0] || !w->html) {
+            ob_puts(&w->b, " ");
+            put_quoted_id(&w->b, s);
+        }
+    } else if (s[0]) {
+        ob_puts(&w->b, " SYSTEM ");
+        put_quoted_id(&w->b, s);
+    }
+    ob_puts(&w->b, ">");
+    return w_accept(w);
+}
+
+char *turdom_writer_finish(turdom_writer *w, size_t *len, int *rc) {
+    int dummy;
+    if (!rc) rc = &dummy;
+    if (len) *len = 0;
+    if (!w) { *rc = TURDOM_E_BAD_KIND; return NULL; }
+    if (!w->err && !w->done) {
+        int r = TURDOM_OK;
+        if (w->html) {
+            r = w_flush_raw(w);
+            if (r == TURDOM_OK) r = w_close_tag(w, 0);
+        } else if (w->depth || w->in_cdata || !w->root_done) {
+            r = TURDOM_E_HIERARCHY;
+        }
+        if (r == TURDOM_OK) r = w_spill(w, 1);
+        if (r == TURDOM_OK && w->out) {
+            if (fclose(w->out) != 0) r = TURDOM_E_IO;
+            w->out = NULL;
+        }
+        if (r != TURDOM_OK) w_fail(w, r);
+        else w->done = 1;
+    }
+    if (w->err) { *rc = w->err; return NULL; }
+    char *out = w_strdup(w->b.p ? w->b.p : "", w->b.len);
+    if (!out) { *rc = TURDOM_E_OOM; return NULL; }
+    if (len) *len = w->b.len;
+    *rc = TURDOM_OK;
+    return out;
 }
