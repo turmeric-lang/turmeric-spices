@@ -195,7 +195,7 @@ static void test_content(void) {
     CHECK(strcmp(turdom_value(t), "xyz") == 0);
     CHECK(turdom_set_text(r, "new", 3) == TURDOM_OK);
     CHECK(turdom_child_count(r) == 1 && turdom_parent(t) == NULL);
-    CHECK(ser_is(r, "<r c=\"4\" x:k=\"6\">new</r>"));
+    CHECK(ser_is(r, "<r c=\"4\" x:k=\"6\" xmlns:x=\"urn:x\">new</r>"));
     CHECK(turdom_set_text(r, "", 0) == TURDOM_OK);
     CHECK(turdom_child_count(r) == 0);
     /* rename keeps attributes and children */
@@ -203,11 +203,11 @@ static void test_content(void) {
     int64_t g = turdom_garbage_bytes(d);
     CHECK(turdom_rename(r, "s", NULL, NULL) == TURDOM_OK);
     CHECK(turdom_garbage_bytes(d) > g);
-    CHECK(ser_is(top, "<s c=\"4\" x:k=\"6\">k</s>"));
+    CHECK(ser_is(top, "<s c=\"4\" x:k=\"6\" xmlns:x=\"urn:x\">k</s>"));
     turdom_node *pi = turdom_create_pi(d, "go", "now");
     CHECK(turdom_append(top, pi) == TURDOM_OK);
     CHECK(turdom_set_value(pi, "later", 5) == TURDOM_OK);
-    CHECK(ser_is(top, "<s c=\"4\" x:k=\"6\">k</s><?go later?>"));
+    CHECK(ser_is(top, "<s c=\"4\" x:k=\"6\" xmlns:x=\"urn:x\">k</s><?go later?>"));
     CHECK(links_ok(top));
     turdom_doc_free(d);
 }
@@ -354,6 +354,177 @@ static void test_deep(void) {
     CHECK(turdom_live_bytes() == base);
 }
 
+
+static void test_check_names(void) {
+    turdom_doc *x = turdom_doc_new(TURDOM_FLAVOR_XML);
+    turdom_doc *h = turdom_doc_new(TURDOM_FLAVOR_HTML);
+    /* XML element names */
+    CHECK(turdom_check_element_name(x, "item", NULL) == TURDOM_OK);
+    CHECK(turdom_check_element_name(x, "\xC3\xA9t\xC3\xA9", NULL) == TURDOM_OK);  /* été */
+    CHECK(turdom_check_element_name(x, "a:b", "urn:a") == TURDOM_OK);
+    CHECK(turdom_check_element_name(x, "1a", NULL) == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_element_name(x, "a b", NULL) == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_element_name(x, "x onload=y", NULL) == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_element_name(x, "", NULL) == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_element_name(x, "a:b", NULL) == TURDOM_E_BAD_NAME);   /* prefix, no ns */
+    CHECK(turdom_check_element_name(x, ":a", "urn:a") == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_element_name(x, "a:b:c", "urn:a") == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_element_name(x, "xmlns:a", "urn:a") == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_element_name(x, "xml:a", "urn:a") == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_element_name(x, "a\xC3", NULL) == TURDOM_E_BAD_NAME);   /* bad UTF-8 */
+    /* HTML element names */
+    CHECK(turdom_check_element_name(h, "my-widget", NULL) == TURDOM_OK);
+    CHECK(turdom_check_element_name(h, "foreignObject", SVG) == TURDOM_OK);
+    CHECK(turdom_check_element_name(h, "1a", NULL) == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_element_name(h, "a/b", NULL) == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_element_name(h, "a>b", NULL) == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_element_name(h, "x onload=y", NULL) == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_element_name(h, "PlainText", NULL) == TURDOM_E_BAD_NAME);
+    /* attributes */
+    turdom_node *xe = el(x, "e"), *he = el(h, "e");
+    CHECK(turdom_check_attr(he, "data-x", NULL, "v", 1) == TURDOM_OK);
+    CHECK(turdom_check_attr(he, "a\"b", NULL, "v", 1) == TURDOM_OK);     /* round-trips */
+    CHECK(turdom_check_attr(he, "a=b", NULL, "v", 1) == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_attr(he, "a b", NULL, "v", 1) == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_attr(he, "", NULL, "v", 1) == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_attr(he, "a", NULL, "\x01", 1) == TURDOM_OK);     /* escaped */
+    CHECK(turdom_check_attr(xe, "a", NULL, "\x01", 1) == TURDOM_E_BAD_CONTENT);
+    CHECK(turdom_check_attr(xe, "a", "urn:a", "v", 1) == TURDOM_E_BAD_NAME);  /* unprefixed+ns */
+    CHECK(turdom_check_attr(xe, "p:a", NULL, "v", 1) == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_attr(xe, "xml:lang", "http://www.w3.org/XML/1998/namespace", "en", 2) == TURDOM_OK);
+    CHECK(turdom_check_attr(xe, "xmlns:p", NULL, "urn:p", 5) == TURDOM_OK);
+    CHECK(turdom_check_attr(xe, "xmlns:p", NULL, "", 0) == TURDOM_E_BAD_CONTENT);
+    CHECK(turdom_check_attr(xe, "xmlns:xmlns", NULL, "urn:p", 5) == TURDOM_E_BAD_NAME);
+    turdom_set_attr(xe, "p:a", "urn:1", NULL, "v", 1);
+    CHECK(turdom_check_attr(xe, "p:b", "urn:2", "v", 1) == TURDOM_E_BAD_NAME);  /* p bound twice */
+    CHECK(turdom_check_attr(xe, "p:b", "urn:1", "v", 1) == TURDOM_OK);
+    CHECK(turdom_check_attr(xe, "xmlns:p", NULL, "urn:2", 5) == TURDOM_E_BAD_CONTENT);
+    CHECK(turdom_check_rename(xe, "p:e", "urn:2") == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_rename(xe, "p:e", "urn:1") == TURDOM_OK);
+    /* PIs */
+    CHECK(turdom_check_pi(x, "go", "now") == TURDOM_OK);
+    CHECK(turdom_check_pi(x, "xml", "v") == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_pi(x, "a:b", "v") == TURDOM_E_BAD_NAME);
+    CHECK(turdom_check_pi(x, "go", "a?>b") == TURDOM_E_BAD_CONTENT);
+    CHECK(turdom_check_pi(x, "go", " lead") == TURDOM_E_BAD_CONTENT);
+    CHECK(turdom_check_pi(h, "go", "now") == TURDOM_E_HIERARCHY);
+    turdom_doc_free(x);
+    turdom_doc_free(h);
+}
+
+static void test_check_content(void) {
+    turdom_doc *x = turdom_doc_new(TURDOM_FLAVOR_XML);
+    turdom_doc *h = turdom_doc_new(TURDOM_FLAVOR_HTML);
+#define CC(d, k, s) turdom_check_chars(d, k, s, strlen(s))
+    CHECK(CC(x, TURDOM_TEXT, "a < b & c") == TURDOM_OK);
+    CHECK(CC(x, TURDOM_TEXT, "bell\x07") == TURDOM_E_BAD_CONTENT);
+    CHECK(CC(x, TURDOM_TEXT, "\xFF") == TURDOM_E_BAD_CONTENT);
+    CHECK(CC(x, TURDOM_TEXT, "\xED\xA0\x80") == TURDOM_E_BAD_CONTENT);   /* surrogate */
+    CHECK(CC(x, TURDOM_TEXT, "\xC0\xAF") == TURDOM_E_BAD_CONTENT);       /* overlong */
+    CHECK(CC(x, TURDOM_CDATA, "a]]b>") == TURDOM_OK);
+    CHECK(CC(x, TURDOM_CDATA, "a]]>b") == TURDOM_E_BAD_CONTENT);         /* two sections */
+    CHECK(CC(x, TURDOM_CDATA, "a\rb") == TURDOM_E_BAD_CONTENT);
+    CHECK(CC(h, TURDOM_COMMENT, "a\rb") == TURDOM_E_BAD_CONTENT);
+    CHECK(CC(h, TURDOM_CDATA, "x") == TURDOM_E_HIERARCHY);               /* no CDATA in HTML */
+    CHECK(turdom_check_pi(x, "go", "a\rb") == TURDOM_E_BAD_CONTENT);
+    CHECK(CC(x, TURDOM_COMMENT, " ok ") == TURDOM_OK);
+    CHECK(CC(x, TURDOM_COMMENT, "a--b") == TURDOM_E_BAD_CONTENT);
+    CHECK(CC(x, TURDOM_COMMENT, "a-") == TURDOM_E_BAD_CONTENT);
+    CHECK(CC(h, TURDOM_TEXT, "bell\x07") == TURDOM_OK);
+    CHECK(CC(h, TURDOM_COMMENT, " ok - fine ") == TURDOM_OK);
+    CHECK(CC(h, TURDOM_COMMENT, "a-->b") == TURDOM_E_BAD_CONTENT);
+    CHECK(CC(h, TURDOM_COMMENT, "a--!>b") == TURDOM_E_BAD_CONTENT);
+    CHECK(CC(h, TURDOM_COMMENT, ">a") == TURDOM_E_BAD_CONTENT);
+    CHECK(CC(h, TURDOM_COMMENT, "->a") == TURDOM_E_BAD_CONTENT);
+    CHECK(CC(h, TURDOM_COMMENT, "a<!-") == TURDOM_E_BAD_CONTENT);
+    CHECK(CC(h, TURDOM_COMMENT, "a<!--b") == TURDOM_E_BAD_CONTENT);
+#undef CC
+    turdom_doc_free(x);
+    turdom_doc_free(h);
+}
+
+static void test_check_placement(void) {
+    turdom_doc *h = turdom_doc_new(TURDOM_FLAVOR_HTML);
+    turdom_node *body = el(h, "body"), *script = el(h, "script"), *style = el(h, "style");
+    turdom_node *br = el(h, "br"), *svg = turdom_create_element(h, "svg", SVG, NULL);
+    turdom_node *cd = turdom_create_chars(h, TURDOM_CDATA, "x", 1);
+    turdom_node *ok = text(h, "if (a < b) {}");
+    turdom_node *breakout = text(h, "x</ScRiPt><img src=x onerror=alert(1)>");
+    turdom_node *escaped = text(h, "<!--<script>");
+    CHECK(turdom_check_placement(script, ok) == TURDOM_OK);
+    CHECK(turdom_check_placement(script, breakout) == TURDOM_E_BAD_CONTENT);
+    CHECK(turdom_check_placement(script, escaped) == TURDOM_E_BAD_CONTENT);
+    CHECK(turdom_check_placement(style, escaped) == TURDOM_OK);     /* only script escapes */
+    CHECK(turdom_check_placement(style, text(h, "</style")) == TURDOM_E_BAD_CONTENT);
+    CHECK(turdom_check_placement(script, el(h, "b")) == TURDOM_E_HIERARCHY);
+    CHECK(turdom_check_placement(br, text(h, "x")) == TURDOM_E_HIERARCHY);
+    CHECK(turdom_check_placement(body, cd) == TURDOM_E_HIERARCHY);
+    CHECK(turdom_check_placement(svg, cd) == TURDOM_OK);
+    CHECK(turdom_check_placement(body, breakout) == TURDOM_OK);      /* escaped there */
+    /* set_value / set_text under a raw-text parent */
+    turdom_append(script, ok);
+    CHECK(turdom_check_value(ok, "y</script>", 10) == TURDOM_E_BAD_CONTENT);
+    CHECK(turdom_check_value(ok, "y", 1) == TURDOM_OK);
+    CHECK(turdom_check_text(script, "</script>", 9) == TURDOM_E_BAD_CONTENT);
+    CHECK(turdom_check_text(body, "</script>", 9) == TURDOM_OK);
+    CHECK(turdom_check_text(br, "x", 1) == TURDOM_E_HIERARCHY);
+    /* rename into a raw-text or void element checks the children */
+    turdom_node *div = el(h, "div");
+    turdom_append(div, text(h, "a</script>b"));
+    CHECK(turdom_check_rename(div, "script", NULL) == TURDOM_E_BAD_CONTENT);
+    CHECK(turdom_check_rename(div, "br", NULL) == TURDOM_E_HIERARCHY);
+    CHECK(turdom_check_rename(div, "style", NULL) == TURDOM_OK);
+    CHECK(turdom_check_rename(div, "x onclick=y", NULL) == TURDOM_E_BAD_NAME);
+    /* importing across flavours */
+    turdom_doc *x = turdom_doc_new(TURDOM_FLAVOR_XML);
+    turdom_node *p = el(h, "p");
+    turdom_set_attr(p, "a\"b", NULL, NULL, "1", 1);
+    CHECK(turdom_check_subtree(h, p) == TURDOM_OK);
+    CHECK(turdom_check_subtree(x, p) == TURDOM_E_BAD_NAME);
+    turdom_doc_free(x);
+    turdom_doc_free(h);
+}
+
+static void test_ns_fixup(void) {
+    turdom_doc *d = turdom_doc_new(TURDOM_FLAVOR_XML);
+    turdom_node *top = turdom_doc_node(d);
+    /* a "parsed" root: declarations as attributes, no fixup flag */
+    turdom_node *root = turdom_append_element(d, top, "feed", "urn:atom", "feed", 1, 1);
+    turdom_add_attr(d, root, "xmlns", NULL, NULL, "urn:atom", 8);
+    turdom_add_attr(d, root, "xmlns:m", NULL, NULL, "urn:m", 5);
+    turdom_node *e = turdom_append_element(d, root, "entry", "urn:atom", "entry", 2, 1);
+    CHECK(ser_is(top, "<feed xmlns=\"urn:atom\" xmlns:m=\"urn:m\"><entry/></feed>"));
+    CHECK(ser_is(e, "<entry/>"));          /* ancestors' declarations are in scope */
+    /* created nodes get declarations only where needed */
+    turdom_append(e, turdom_create_element(d, "title", "urn:atom", NULL));
+    turdom_append(e, turdom_create_element(d, "m:x", "urn:m", "x"));
+    turdom_append(e, turdom_create_element(d, "g:y", "urn:g", "y"));
+    turdom_node *plain = turdom_create_element(d, "plain", NULL, NULL);
+    turdom_append(e, plain);
+    turdom_set_attr(plain, "g:k", "urn:g", "k", "1", 1);
+    turdom_set_attr(plain, "m:k", "urn:m", "k", "2", 1);
+    CHECK(ser_is(top, "<feed xmlns=\"urn:atom\" xmlns:m=\"urn:m\"><entry>"
+                      "<title/><m:x/><g:y xmlns:g=\"urn:g\"/>"
+                      "<plain g:k=\"1\" m:k=\"2\" xmlns=\"\" xmlns:g=\"urn:g\"/>"
+                      "</entry></feed>"));
+    /* a declaration made by a fixup is in scope for the subtree */
+    turdom_node *g = turdom_create_element(d, "g:z", "urn:g", "z");
+    turdom_append(e, g);
+    turdom_append(g, turdom_create_element(d, "g:w", "urn:g", "w"));
+    size_t len;
+    char *out = turdom_serialize(g, &len);
+    CHECK(out && strcmp(out, "<g:z xmlns:g=\"urn:g\"><g:w/></g:z>") == 0);
+    free(out);
+    /* a parsed tree without namespace processing is written as-is */
+    turdom_doc *n = turdom_doc_new(TURDOM_FLAVOR_XML);
+    turdom_node *r = turdom_append_element(n, turdom_doc_node(n), "r", NULL, NULL, 1, 1);
+    turdom_add_attr(n, r, "xmlns", NULL, NULL, "urn:x", 5);
+    turdom_append_element(n, r, "p:c", NULL, NULL, 1, 1);
+    CHECK(ser_is(turdom_doc_node(n), "<r xmlns=\"urn:x\"><p:c/></r>"));
+    turdom_doc_free(n);
+    turdom_doc_free(d);
+}
+
 int main(void) {
     test_build_and_order();
     test_errors();
@@ -364,6 +535,10 @@ int main(void) {
     test_normalize();
     test_compact_and_bytes();
     test_deep();
+    test_check_names();
+    test_check_content();
+    test_check_placement();
+    test_ns_fixup();
     CHECK(turdom_live_bytes() == 0);
     if (g_fails) {
         printf("# %d of %d checks failed\n", g_fails, g_checks);

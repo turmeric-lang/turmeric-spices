@@ -148,12 +148,14 @@ enum {
                                     or a doctype after the root element */
     TURDOM_E_DETACHED      = 5,  /* the reference node has no parent */
     TURDOM_E_BAD_KIND      = 6,  /* the operation does not apply to this kind */
-    TURDOM_E_OOM           = 7
+    TURDOM_E_OOM           = 7,
+    TURDOM_E_BAD_NAME      = 8,  /* see the turdom_check_* functions below */
+    TURDOM_E_BAD_CONTENT   = 9
 };
 
 /* Detached nodes, owned by d's arena until inserted.  In an HTML document,
- * an element created with no namespace or the XHTML namespace has its name
- * lower-cased, as createElement does.  kind is TURDOM_TEXT, TURDOM_COMMENT or
+ * an element created with no namespace is put in the XHTML namespace, and an
+ * XHTML element's name is lower-cased, as createElement does.  kind is TURDOM_TEXT, TURDOM_COMMENT or
  * TURDOM_CDATA.  NULL only on allocation failure. */
 turdom_node *turdom_create_element(turdom_doc *d, const char *qname,
                                    const char *ns_uri, const char *local);
@@ -207,5 +209,87 @@ turdom_doc  *turdom_compact(const turdom_doc *d);
 int64_t      turdom_garbage_bytes(const turdom_doc *d);
 /* Is n reachable from its document node? */
 int          turdom_attached(const turdom_node *n);
+
+/* ---- validation ---------------------------------------------------------
+ *
+ * What dom/edit checks before an edit, so that serializing an edited tree and
+ * parsing it back cannot produce structure the edits did not make.  The
+ * serializer escapes text and attribute values but writes names, comment
+ * bodies, PI data and HTML raw text verbatim; these are the rules for those.
+ * Each returns TURDOM_OK, TURDOM_E_BAD_NAME, TURDOM_E_BAD_CONTENT or
+ * TURDOM_E_HIERARCHY.
+ *
+ * Names.  XML: a QName (the Name production, at most one colon, neither end),
+ * a prefix only with a namespace, `xml` only for the XML namespace, and no
+ * `xmlns` element prefix.  HTML: an element name starts with an ASCII letter
+ * and holds no whitespace, `/` or `>`; an attribute name is non-empty and
+ * holds no whitespace, `/`, `>` or `=`.  `plaintext` is refused, because its
+ * end tag is never recognized and it would swallow every later sibling.
+ *
+ * Content.  XML text, attribute values, comments, CDATA and PI data must be
+ * well-formed UTF-8 made of XML Chars; a comment holds no `--` and does not
+ * end in `-`; PI data holds no `?>` and does not start with whitespace; a PI
+ * target is an NCName and not `xml`.  In either flavour, comments, CDATA, PI
+ * data and raw text hold no `\r` (it cannot be escaped there and would come
+ * back as `\n`), and CDATA holds no `]]>` (it would come back as two
+ * sections).
+ * HTML comments follow the HTML spec's comment-text rule (not starting with
+ * `>` or `->`, no `<!--`, `-->` or `--!>`, not ending in `<!-`).  HTML has no
+ * PIs and no CDATA nodes (its parser reads `<![CDATA[` in SVG as text), so
+ * creating either is TURDOM_E_HIERARCHY.
+ *
+ * Placement (HTML).  A raw-text element (script, style, xmp, iframe,
+ * noembed, noframes) holds only text, and that text never contains `</` and
+ * the element's name (ASCII case-insensitive), nor, for script, `<!--`.  A
+ * void element holds nothing. */
+int          turdom_check_element_name(const turdom_doc *d, const char *qname,
+                                       const char *ns_uri);
+int          turdom_check_attr(const turdom_node *el, const char *qname,
+                               const char *ns_uri, const char *value,
+                               size_t vlen);
+/* kind is TURDOM_TEXT, TURDOM_COMMENT or TURDOM_CDATA. */
+int          turdom_check_chars(const turdom_doc *d, int kind, const char *s,
+                                size_t n);
+int          turdom_check_pi(const turdom_doc *d, const char *target,
+                             const char *data);
+/* May child go under parent?  Only the placement rules above; turdom_append
+ * and friends check the structural ones themselves. */
+int          turdom_check_placement(const turdom_node *parent,
+                                    const turdom_node *child);
+/* May n's data become s (set_value), or element n's text become s
+ * (set_text)?  Content and, under a raw-text element, placement. */
+int          turdom_check_value(const turdom_node *n, const char *s, size_t len);
+int          turdom_check_text(const turdom_node *el, const char *s, size_t len);
+/* May element el be renamed to (qname, ns_uri)?  The name, and its current
+ * children under the new name. */
+int          turdom_check_rename(const turdom_node *el, const char *qname,
+                                 const char *ns_uri);
+/* Is every name and string in n's subtree valid in document d?  For an
+ * import across flavours; a same-flavour import is valid by construction. */
+int          turdom_check_subtree(const turdom_doc *d, const turdom_node *n);
+
+/* ---- checked edits ---------------------------------------------------------
+ *
+ * The editing operations with the validation above applied first, in one
+ * call: on any error nothing changes.  dom/edit is built on these.  A local
+ * name is the part of qname after its colon. */
+
+enum {
+    TURDOM_AT_APPEND  = 0,  /* at is the parent */
+    TURDOM_AT_PREPEND = 1,  /* at is the parent */
+    TURDOM_AT_BEFORE  = 2,  /* at is the reference sibling */
+    TURDOM_AT_AFTER   = 3,  /* at is the reference sibling */
+    TURDOM_AT_REPLACE = 4   /* at is the node replaced */
+};
+
+int          turdom_edit_insert(int where, turdom_node *at, turdom_node *child);
+int          turdom_edit_unwrap(turdom_node *n);
+int          turdom_edit_set_attr(turdom_node *el, const char *qname,
+                                  const char *ns_uri, const char *value,
+                                  size_t vlen);
+int          turdom_edit_set_value(turdom_node *n, const char *s, size_t len);
+int          turdom_edit_set_text(turdom_node *n, const char *s, size_t len);
+int          turdom_edit_rename(turdom_node *el, const char *qname,
+                                const char *ns_uri);
 
 #endif /* TURDOM_H */

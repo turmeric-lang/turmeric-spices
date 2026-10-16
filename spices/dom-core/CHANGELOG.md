@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.0
+
+### Added
+
+- `dom/edit` (xml-html-parsers-plan follow-up B): editing a `Document` in
+  place. `dom-new` / `dom-flavor`; `create-element`, `create-element-ns`,
+  `create-text`, `create-comment`, `create-cdata`, `create-pi`;
+  `node-clone` and `node-import` (deep copies, across documents);
+  `node-append!`, `node-prepend!`, `node-insert-before!`,
+  `node-insert-after!`, `node-replace!`, `node-remove!`, `node-unwrap!`;
+  `set-attr!`, `set-attr-ns!`, `remove-attr!`, `set-text!`, `set-value!`,
+  `rename!`, `rename-ns!`, `node-normalize!`; `dom-garbage-bytes`,
+  `dom-compact`, `node-attached?`; and `EditError`.
+- Every edit is validated and a refused one changes nothing. Names cannot
+  carry extra structure (`x onload=...`); comments, PI data and HTML raw text
+  cannot close themselves early (`-->`, `?>`, `</script>`); HTML void and
+  raw-text elements keep their content model; HTML documents refuse CDATA
+  and PIs (its parser produces neither); XML content must be XML Chars.
+  Content a parser would not read back as written is refused too: `\r`
+  where it cannot be escaped, and `]]>` in CDATA.
+- The C layer (`c/dom/turdom.c`) gains the mutators behind it, iterative
+  throughout, plus `turdom_check_*` validation and `turdom_edit_*` checked
+  entry points. `fixtures/c/edit_test.c` tests them under ASan and UBSan
+  (`fixtures/run.sh`).
+
+### Changed
+
+- `dom-serialize` of an XML document declares the namespace of a node that
+  an edit created or renamed wherever its prefix is not already bound. A
+  parsed tree carries its declarations as attributes and serializes exactly
+  as before.
+- The HTML serializer escapes `\r` as `&#13;`, as the XML one already did.
+  A parsed HTML tree never holds one, so this only shows in edited content.
+- `dom-node-count` counts detached nodes too: every node the arena holds.
+
 ## 0.1.0
 
 Initial release: the shared markup tree and SAX event vocabulary behind
