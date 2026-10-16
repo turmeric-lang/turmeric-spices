@@ -16,11 +16,12 @@
 ;; Event types for the SAX front doors of tur-xml and tur-html.
 
 (defmodule dom/event
-  (export SaxEvent SaxControl Attr sax-event-release sax-dispatch attrs-get
+  (export SaxEvent SaxControl Attr sax-event-release sax-event-retain
+          sax-dispatch attrs-get
           StartElement EndElement Chars Comment Pi StartCdata EndCdata Doctype
           Continue Stop)
 
-(import dom/ownstr :refer [String release string=?])
+(import dom/ownstr :refer [String retain release string=?])
 
 ;;; Attr -- one attribute of a StartElement event: name and value.
 (defstruct Attr :heap :copy [name : String value : String])
@@ -88,6 +89,45 @@
     (StartCdata)        nil
     (EndCdata)          nil
     (Doctype n p s)     (do (release n) (release p) (release s))))
+
+;;; __retain-attrs -- internal: retain every String of an attribute list.
+(defn __retain-attrs [xs : (Cons Attr)] : nil
+  (if (tnil? xs)
+    nil
+    (let [a (thead xs)
+          n (retain (.name a))
+          v (retain (.value a))]
+      (__retain-attrs (ttail xs)))))
+
+;;; sax-event-retain -- take a reference to every String an event holds.
+;;;
+;;; A handler borrows its event; retaining it keeps the Strings alive past
+;;; the handler's return, until a matching `sax-event-release`. The event
+;;; node itself lives in the SAX driver's per-chunk region, so keep the
+;;; Strings, not the node, beyond the chunk. dom/writer's
+;;; `sax-transform-handler` uses this to hand a transform an event it owns.
+;;;
+;;; Returns nil rather than the event: a `:heap` parameter returned through
+;;; a `do` is emitted without its cast, which clang rejects (turmeric
+;;; docs/reported/heap-adt-word-slot-missing-cast.md).
+;;;
+;;; Parameters:
+;;;   ev -- the event
+;;;
+;;; Example:
+;;;   (sax-event-retain ev)   ; ... later (sax-event-release ev)
+;;;
+;;; Since: 0.2.0
+(defn sax-event-retain [ev : SaxEvent] : nil
+  (match ev
+    (StartElement n as) (let [k (retain n)] (__retain-attrs as))
+    (EndElement n)      (let [k (retain n)] nil)
+    (Chars t)           (let [k (retain t)] nil)
+    (Comment t)         (let [k (retain t)] nil)
+    (Pi t d)            (let [k (retain t) j (retain d)] nil)
+    (StartCdata)        nil
+    (EndCdata)          nil
+    (Doctype n p s)     (let [k (retain n) j (retain p) i (retain s)] nil)))
 
 ;;; sax-dispatch -- call a handler with an event.
 ;;;
