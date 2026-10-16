@@ -9,6 +9,7 @@ Usage:
 import argparse
 import html as _html
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -73,6 +74,46 @@ SIDEBAR_TOGGLE_JS = '''\
       overlay && overlay.addEventListener('click', close);
     });
   </script>'''
+
+RECENT_TABS_JS = '''\
+  <script>
+  document.addEventListener('DOMContentLoaded', function(){
+    var btns = Array.prototype.slice.call(
+      document.querySelectorAll('.recent-tablist .seg-btn'));
+    function select(slug, focus) {
+      if (!btns.some(function(b){ return b.dataset.recentTab === slug; })) return false;
+      btns.forEach(function(b){
+        var on = b.dataset.recentTab === slug;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+        b.tabIndex = on ? 0 : -1;
+        var panel = document.getElementById(b.dataset.recentTab);
+        if (panel) panel.hidden = !on;
+        if (on && focus) b.focus();
+      });
+      return true;
+    }
+    btns.forEach(function(b, i){
+      b.addEventListener('click', function(){ select(b.dataset.recentTab, false); });
+      // Arrow / Home / End move between tabs (WAI-ARIA tabs pattern).
+      b.addEventListener('keydown', function(e){
+        var n = btns.length, j = -1;
+        if (e.key === 'ArrowRight') j = (i + 1) % n;
+        else if (e.key === 'ArrowLeft') j = (i - 1 + n) % n;
+        else if (e.key === 'Home') j = 0;
+        else if (e.key === 'End') j = n - 1;
+        if (j < 0) return;
+        e.preventDefault();
+        select(btns[j].dataset.recentTab, true);
+      });
+    });
+    // The sidebar's #recently-added / #recently-updated links pick the tab.
+    function fromHash() { select(location.hash.slice(1), false); }
+    window.addEventListener('hashchange', fromHash);
+    fromHash();
+  });
+  </script>'''
+
 
 SYNTAX_TOGGLE_JS = '''\
   <script>
@@ -348,6 +389,30 @@ def render_guide(stem: str, src: Path, out: Path, all_stems: set, meta: dict | N
     print(f'  {stem}.html')
 
 
+def _git_dates(path: Path, repo_root: Path) -> tuple[str | None, str | None]:
+    """Return (added, updated) as YYYY-MM-DD from git history, None when unknown.
+
+    `added` is the commit that first added the file (following renames);
+    `updated` is the newest commit touching it. Both are None outside a git
+    checkout, so the index simply omits the Recently tabs there.
+    """
+    def log(*args: str) -> list[str]:
+        try:
+            r = subprocess.run(['git', 'log', '--format=%ad', '--date=short',
+                                *args, '--', str(path.resolve())],
+                               cwd=repo_root, capture_output=True, text=True,
+                               check=False)
+        except FileNotFoundError:
+            return []
+        return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()] \
+            if r.returncode == 0 else []
+
+    added = log('--diff-filter=A', '--follow')
+    latest = log('-1')
+    return (added[-1] if added else None, latest[0] if latest else None)
+
+
+
 def _fmt_desc(text: str) -> str:
     """Normalize and render a guide description for the index page.
 
@@ -361,7 +426,11 @@ def _fmt_desc(text: str) -> str:
     return text
 
 
-def render_index(categories: list[dict], all_stems: set[str], out_dir: Path) -> None:
+def render_index(categories: list[dict], all_stems: set[str], out_dir: Path,
+                 recent: list[dict] | None = None,
+                 recent_updated: list[dict] | None = None) -> None:
+    recent = recent or []
+    recent_updated = recent_updated or []
     categorized_stems = {g['stem'] for c in categories for g in c['guides']}
 
     def guide_item(g: dict) -> str:
@@ -394,12 +463,46 @@ def render_index(categories: list[dict], all_stems: set[str], out_dir: Path) -> 
       <ul style="list-style:none;margin:0">{"".join(items)}</ul>
     </div>''')
 
+    # Recently Added / Recently Updated, as two tabs of one card. A guide whose
+    # newest commit is the one that added it is new, not updated, so it appears
+    # only under Recently Added. The first tab is selected server-side, so the
+    # page reads correctly with no JS at all.
+    tabs = [(slug, heading, entries) for slug, heading, entries in (
+        ('recently-added', 'Recently Added', recent),
+        ('recently-updated', 'Recently Updated', recent_updated),
+    ) if entries]
+
+    def dated_items(entries: list[dict]) -> str:
+        return ''.join(
+            f'<li><a href="{r["stem"]}.html">{_html.escape(r["label"])}</a>'
+            f'<span style="color:var(--text-sec)"> -- {r["date"]}</span></li>'
+            for r in entries)
+
+    buttons = ''.join(
+        f'<button class="seg-btn{" active" if i == 0 else ""}" role="tab"'
+        f' id="{slug}-tab" data-recent-tab="{slug}" aria-controls="{slug}"'
+        f' aria-selected="{"true" if i == 0 else "false"}"'
+        f' tabindex="{0 if i == 0 else -1}">{heading}</button>'
+        for i, (slug, heading, _) in enumerate(tabs))
+    panels = ''.join(
+        f'<ul class="recent-panel" role="tabpanel" id="{slug}"'
+        f' aria-labelledby="{slug}-tab" style="list-style:none;margin:0"'
+        f'{"" if i == 0 else " hidden"}>{dated_items(entries)}</ul>'
+        for i, (slug, _, entries) in enumerate(tabs))
+    recent_html = f'''\
+      <div class="index-card recent-tabs" style="display:block;margin-bottom:1.5rem">
+        <div class="recent-tablist" role="tablist" aria-label="Recent guide changes">{buttons}</div>
+        {panels}
+      </div>''' if tabs else ''
+
     sidebar_cats = '\n'.join(
         f'<li><a href="#{re.sub(r" +", "-", c["name"].lower())}">{c["name"]}</a></li>'
         for c in categories if any(g['stem'] in all_stems for g in c['guides'])
     )
+    recent_links = ''.join(
+        f'<li><a href="#{slug}">{heading}</a></li>' for slug, heading, _ in tabs)
     index_sidebar = build_sidebar(
-        toc=f'      <h3>Categories</h3>\n      <ul>{sidebar_cats}</ul>')
+        toc=f'      <h3>Categories</h3>\n      <ul>{recent_links}{sidebar_cats}</ul>')
 
     html = f'''<!DOCTYPE html>
 <html lang="en">
@@ -418,6 +521,12 @@ def render_index(categories: list[dict], all_stems: set[str], out_dir: Path) -> 
     .index-card ul li {{ margin:0.3rem 0; font-size:0.875rem; }}
     .index-card ul li a {{ color:var(--text-primary); }}
     .index-card ul li a:hover {{ color:var(--gold); }}
+    .recent-tablist {{ display:inline-flex; border:1px solid var(--border); border-radius:4px; overflow:hidden; margin-bottom:0.6rem; font-family:system-ui; font-size:0.8rem; }}
+    .recent-tablist .seg-btn {{ padding:4px 12px; background:transparent; color:var(--text-sec); border:none; cursor:pointer; font:inherit; transition:all 0.14s; }}
+    .recent-tablist .seg-btn + .seg-btn {{ border-left:1px solid var(--border); }}
+    .recent-tablist .seg-btn:hover {{ color:var(--text-primary); }}
+    .recent-tablist .seg-btn.active {{ color:var(--gold-bright); background:var(--bg-hover); }}
+    .recent-tablist .seg-btn:focus-visible {{ outline:2px solid var(--gold); outline-offset:-2px; }}
   </style>
 </head>
 <body>
@@ -432,6 +541,7 @@ def render_index(categories: list[dict], all_stems: set[str], out_dir: Path) -> 
         <h1 style="font-family:system-ui;color:var(--gold)">Guides</h1>
         <div class="module-path">Tutorials, how-tos, and in-depth feature guides for Turmeric</div>
       </div>
+      {recent_html}
       <div class="index-grid">
         {"".join(cards)}
       </div>
@@ -441,6 +551,7 @@ def render_index(categories: list[dict], all_stems: set[str], out_dir: Path) -> 
     Auto-generated by <code>tools/genguides.py</code>
   </footer>
 {TURMERIC_HIGHLIGHT_JS}
+{RECENT_TABS_JS}
 </body>
 </html>
 '''
@@ -468,11 +579,32 @@ def main() -> None:
 
     categories = build_categories_from_meta(meta_by_stem, all_stems)
 
+    # Git dates for the Recently Added / Updated tabs. A checkout with no
+    # history (or no git) yields None dates and the tabs are left out.
+    repo_root = guides_dir.resolve()
+    while repo_root != repo_root.parent and not (repo_root / '.git').exists():
+        repo_root = repo_root.parent
+
+    def label_for(src: Path) -> str:
+        m = meta_by_stem.get(src.stem, {})
+        return m.get('title', src.stem.replace('-', ' ').title()).strip()
+
+    dates = {src: _git_dates(src, repo_root) for src in md_files}
+    added = sorted(((a, src) for src, (a, _) in dates.items() if a),
+                   key=lambda t: t[0], reverse=True)
+    recent = [{'stem': src.stem, 'label': label_for(src), 'date': d}
+              for d, src in added[:10]]
+    edited = sorted(((u, src) for src, (a, u) in dates.items() if u and u != a),
+                    key=lambda t: t[0], reverse=True)
+    recent_updated = [{'stem': src.stem, 'label': label_for(src), 'date': d}
+                      for d, src in edited[:10]]
+
     print('Generating guides:')
     for src in md_files:
         render_guide(src.stem, src, out_dir / f'{src.stem}.html', all_stems,
                      meta_by_stem.get(src.stem, {}))
-    render_index(categories, all_stems, out_dir)
+    render_index(categories, all_stems, out_dir, recent=recent,
+                 recent_updated=recent_updated)
     print(f'Done: {len(md_files)} guides + index → {out_dir}')
 
 
