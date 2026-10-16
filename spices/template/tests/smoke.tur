@@ -1,4 +1,7 @@
 ;; tests/smoke.tur -- end-to-end smoke test for tur-template.
+;;
+;; `tur test` judges a file by its exit code, so main returns the number of
+;; failed checks (tap returns 1 for a failure), not a hardcoded 0.
 
 (defmodule template/tests/smoke
   (import template/env    :refer [env-new env-set env-set-list env-free])
@@ -16,11 +19,12 @@
     if (p) free((void *)(intptr_t)p);
     ```)
 
-  (defn tap [idx : int name : cstr ok : bool] : void
+  (defn tap [idx : int name : cstr ok : bool] : int
     ```c
     #include <stdio.h>
     printf("%s %lld - %s\n", ok ? "ok" : "not ok",
            (long long)idx, (const char *)name);
+    return ok ? 0 : 1;
     ```)
 
   (defn cons2 [a : cstr b : cstr] : int
@@ -108,6 +112,50 @@
               ok (cstr-eq? out "[a][c]")]
           (do (cstr-free out) (env-free e) ok)))))
 
+  ;; render-eq? -- render src against a one-binding env and compare with want.
+  (defn render-eq? [src : cstr key : cstr val : cstr want : cstr] : bool
+    (let [e (env-new)]
+      (do
+        (env-set e key val)
+        (let [out (render src e)
+              ok (cstr-eq? out want)]
+          (do (cstr-free out) (env-free e) ok)))))
+
+  (defn test9-emit-escapes [] : bool
+    (render-eq? "<p><%= x %></p>"
+                "x" "<a href=\"u\">Tom & 'Jerry'</a>"
+                "<p>&lt;a href=&quot;u&quot;&gt;Tom &amp; &#39;Jerry&#39;&lt;/a&gt;</p>"))
+
+  (defn test10-raw-emit [] : bool
+    (render-eq? "<p><%== x %></p>"
+                "x" "<a href=\"u\">Tom & 'Jerry'</a>"
+                "<p><a href=\"u\">Tom & 'Jerry'</a></p>"))
+
+  (defn test11-attr-breakout [] : bool
+    (render-eq? "<a title=\"<%= t %>\" class='<%= t %>'>"
+                "t" "\" onmouseover='go()"
+                "<a title=\"&quot; onmouseover=&#39;go()\" class='&quot; onmouseover=&#39;go()'>"))
+
+  (defn test12-escape-edges [] : bool
+    (render-eq? "[<%= x %>]" "x" "&a<" "[&amp;a&lt;]"))
+
+  (defn test13-for-escapes [] : bool
+    (let [e (env-new)]
+      (do
+        (env-set-list e "items" (cons2 "<b>" "&"))
+        (let [out (render "<% for [x items] %><%= x %>;<% end %>" e)
+              ok (cstr-eq? out "&lt;b&gt;;&amp;;")]
+          (do (cstr-free out) (env-free e) ok)))))
+
+  (defn test14-let-escapes [] : bool
+    (let [e (env-new)]
+      (let [out (render "<% let [g \"<i>\"] %><%= g %>|<%== g %><% end %>" e)
+            ok (cstr-eq? out "&lt;i&gt;|<i>")]
+        (do (cstr-free out) (env-free e) ok))))
+
+  (defn test15-literal-emit-tag [] : bool
+    (render-eq? "<%%= x %> <%%== x %>" "x" "<" "<%= x %> <%== x %>"))
+
   (defn plan-line [n : int] : void
     ```c
     #include <stdio.h>
@@ -116,15 +164,21 @@
 
   (defn main [] : int
     (do
-      (plan-line 8)
-      (tap 1 "basic interpolation" (test1-basic))
-      (tap 2 "if-true branch"      (test2-if-true))
-      (tap 3 "if-false branch"     (test3-if-false))
-      (tap 4 "for over list"       (test4-for))
-      (tap 5 "<%% escape"          (test5-escape))
-      (tap 6 "comment skipped"     (test6-comment))
-      (tap 7 "let binding"         (test7-let))
-      (tap 8 "nested for/if"       (test8-nested-for-if))
-      0))
+      (plan-line 15)
+      (+ (tap 1  "basic interpolation"          (test1-basic))
+         (tap 2  "if-true branch"               (test2-if-true))
+         (tap 3  "if-false branch"              (test3-if-false))
+         (tap 4  "for over list"                (test4-for))
+         (tap 5  "<%% escape"                   (test5-escape))
+         (tap 6  "comment skipped"              (test6-comment))
+         (tap 7  "let binding"                  (test7-let))
+         (tap 8  "nested for/if"                (test8-nested-for-if))
+         (tap 9  "<%= HTML-escapes"             (test9-emit-escapes))
+         (tap 10 "<%== writes verbatim"         (test10-raw-emit))
+         (tap 11 "no attribute breakout"        (test11-attr-breakout))
+         (tap 12 "escape at value edges"        (test12-escape-edges))
+         (tap 13 "for items are escaped"        (test13-for-escapes))
+         (tap 14 "let values escaped, raw kept" (test14-let-escapes))
+         (tap 15 "<%%= stays literal"           (test15-literal-emit-tag)))))
 
 ) ;; end defmodule
