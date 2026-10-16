@@ -58,6 +58,7 @@ struct turdom_doc {
     arena_chunk *chunks;
     turdom_node *docnode;
     int64_t count;
+    int64_t garbage;        /* arena bytes abandoned by edits (see turdom.h) */
 };
 
 /* Bytes of arena currently held by every live document in the process.
@@ -81,9 +82,14 @@ int64_t turdom_live_bytes(void) {
 #endif
 }
 
-static void *arena_alloc(turdom_doc *d, size_t n) {
+/* The bytes arena_alloc really takes for a request of n. */
+static size_t arena_size(size_t n) {
     n = (n + 7u) & ~(size_t)7u;
-    if (n == 0) n = 8;
+    return n ? n : 8;
+}
+
+static void *arena_alloc(turdom_doc *d, size_t n) {
+    n = arena_size(n);
     arena_chunk *c = d->chunks;
     if (c && c->used + n <= c->cap) {
         void *p = c->data + c->used;
@@ -191,9 +197,9 @@ turdom_node *turdom_doc_node(turdom_doc *d) { return d ? d->docnode : NULL; }
 turdom_doc *turdom_node_doc(const turdom_node *n) { return n ? n->doc : NULL; }
 int64_t turdom_node_count(const turdom_doc *d) { return d ? d->count : 0; }
 
-static turdom_node *new_node(turdom_doc *d, turdom_node *parent, int kind,
-                             int64_t line, int64_t col) {
-    if (!d || !parent) return NULL;
+/* A detached node in d's arena. */
+static turdom_node *alloc_node(turdom_doc *d, int kind, int64_t line,
+                               int64_t col) {
     turdom_node *n = (turdom_node *)arena_alloc(d, sizeof(turdom_node));
     if (!n) return NULL;
     memset(n, 0, sizeof(*n));
@@ -201,13 +207,42 @@ static turdom_node *new_node(turdom_doc *d, turdom_node *parent, int kind,
     n->doc = d;
     n->line = line;
     n->col = col;
-    n->parent = parent;
-    n->prev = parent->last;
-    if (parent->last) parent->last->next = n;
-    else parent->first = n;
-    parent->last = n;
-    parent->nchildren++;
     d->count++;
+    return n;
+}
+
+/* Link a detached child into parent before ref (ref NULL: at the end).  No
+ * checks: callers have done them. */
+static void link_before(turdom_node *parent, turdom_node *child,
+                        turdom_node *ref) {
+    child->parent = parent;
+    child->next = ref;
+    child->prev = ref ? ref->prev : parent->last;
+    if (child->prev) child->prev->next = child;
+    else parent->first = child;
+    if (ref) ref->prev = child;
+    else parent->last = child;
+    parent->nchildren++;
+}
+
+/* Unlink n from its parent; it keeps its own children. */
+static void unlink_node(turdom_node *n) {
+    turdom_node *p = n->parent;
+    if (!p) return;
+    if (n->prev) n->prev->next = n->next;
+    else p->first = n->next;
+    if (n->next) n->next->prev = n->prev;
+    else p->last = n->prev;
+    p->nchildren--;
+    n->parent = n->next = n->prev = NULL;
+}
+
+static turdom_node *new_node(turdom_doc *d, turdom_node *parent, int kind,
+                             int64_t line, int64_t col) {
+    if (!d || !parent) return NULL;
+    turdom_node *n = alloc_node(d, kind, line, col);
+    if (!n) return NULL;
+    link_before(parent, n, NULL);
     return n;
 }
 
@@ -256,6 +291,7 @@ turdom_node *turdom_append_chars(turdom_doc *d, turdom_node *parent, int kind,
         memcpy(joined, t->value, t->value_len);
         if (n) memcpy(joined + t->value_len, s, n);
         joined[t->value_len + n] = '\0';
+        d->garbage += (int64_t)arena_size(t->value_len + 1);
         t->value = joined;
         t->value_len += n;
         return t;
@@ -701,4 +737,451 @@ int turdom_equal(const turdom_node *a, const turdom_node *b) {
         y = turdom_next_in(b, y);
     }
     return x == NULL && y == NULL;
+}
+
+/* ---- editing ------------------------------------------------------------
+ *
+ * See turdom.h.  Nothing here frees: a replaced string or a removed attribute
+ * is counted in d->garbage and left where it is, so a borrowed pointer to it
+ * stays valid until turdom_doc_free. */
+
+#define TURDOM_XHTML_NS "http://www.w3.org/1999/xhtml"
+
+int64_t turdom_garbage_bytes(const turdom_doc *d) { return d ? d->garbage : 0; }
+
+static int64_t str_bytes(const char *s) {
+    return s ? (int64_t)arena_size(strlen(s) + 1) : 0;
+}
+
+static int is_container(const turdom_node *n) {
+    return n->kind == TURDOM_ELEMENT || n->kind == TURDOM_DOCUMENT;
+}
+
+/* Does a name in this namespace get HTML's lower-casing in document d? */
+static int lowers_names(const turdom_doc *d, const char *ns_uri) {
+    return d->flavor == TURDOM_FLAVOR_HTML &&
+           (!ns_uri || !ns_uri[0] || strcmp(ns_uri, TURDOM_XHTML_NS) == 0);
+}
+
+static char *arena_strdup_lower(turdom_doc *d, const char *s) {
+    size_t n = strlen(s);
+    char *p = arena_strndup(d, s, n);
+    if (!p) return NULL;
+    for (size_t i = 0; i < n; i++) p[i] = (char)ascii_lower((unsigned char)p[i]);
+    return p;
+}
+
+/* Give element n the name (qname, ns_uri, local), lower-cased where HTML
+ * would.  On failure n keeps its old names. */
+static int set_names(turdom_doc *d, turdom_node *n, const char *qname,
+                     const char *ns_uri, const char *local) {
+    int lower = lowers_names(d, ns_uri);
+    const char *q = qname ? qname : "";
+    const char *name = lower ? arena_strdup_lower(d, q) : arena_strdup_opt(d, q);
+    const char *uri = (ns_uri && ns_uri[0]) ? arena_strdup_opt(d, ns_uri) : NULL;
+    const char *loc = !local ? name
+                      : lower ? arena_strdup_lower(d, local)
+                              : arena_strdup_opt(d, local);
+    if (!name || !loc || (ns_uri && ns_uri[0] && !uri)) return TURDOM_E_OOM;
+    n->name = name;
+    n->ns_uri = uri;
+    n->local = loc;
+    return TURDOM_OK;
+}
+
+static int64_t name_bytes(const char *name, const char *local,
+                          const char *ns_uri) {
+    return str_bytes(name) + (local != name ? str_bytes(local) : 0) +
+           str_bytes(ns_uri);
+}
+
+turdom_node *turdom_create_element(turdom_doc *d, const char *qname,
+                                   const char *ns_uri, const char *local) {
+    if (!d) return NULL;
+    turdom_node *n = alloc_node(d, TURDOM_ELEMENT, 0, 0);
+    if (!n) return NULL;
+    return set_names(d, n, qname, ns_uri, local) == TURDOM_OK ? n : NULL;
+}
+
+turdom_node *turdom_create_chars(turdom_doc *d, int kind, const char *s,
+                                 size_t n) {
+    if (!d || (kind != TURDOM_TEXT && kind != TURDOM_COMMENT &&
+               kind != TURDOM_CDATA))
+        return NULL;
+    turdom_node *t = alloc_node(d, kind, 0, 0);
+    if (!t) return NULL;
+    t->value = arena_strndup(d, s ? s : "", s ? n : 0);
+    t->value_len = s ? n : 0;
+    return t->value ? t : NULL;
+}
+
+turdom_node *turdom_create_pi(turdom_doc *d, const char *target,
+                              const char *data) {
+    if (!d) return NULL;
+    turdom_node *n = alloc_node(d, TURDOM_PI, 0, 0);
+    if (!n) return NULL;
+    n->name = arena_strdup_opt(d, target ? target : "");
+    n->local = n->name;
+    const char *dd = data ? data : "";
+    n->value_len = strlen(dd);
+    n->value = arena_strndup(d, dd, n->value_len);
+    return (n->name && n->value) ? n : NULL;
+}
+
+/* May child go into parent before ref (ref NULL: at the end)?  The DOM's
+ * pre-insertion rules, restricted to the node kinds this tree has. */
+static int check_insert(const turdom_node *parent, const turdom_node *child,
+                        const turdom_node *ref) {
+    if (!parent || !child) return TURDOM_E_BAD_KIND;
+    if (child->doc != parent->doc) return TURDOM_E_WRONG_DOC;
+    if (!is_container(parent)) return TURDOM_E_NOT_CONTAINER;
+    if (child->kind == TURDOM_DOCUMENT) return TURDOM_E_HIERARCHY;
+    /* Only a node with children can be an ancestor of parent, so a fresh
+     * node (the usual case) skips the O(depth) walk -- building a deep chain
+     * one append at a time stays linear. */
+    if (child == parent) return TURDOM_E_CYCLE;
+    if (child->first)
+        for (const turdom_node *a = parent->parent; a; a = a->parent)
+            if (a == child) return TURDOM_E_CYCLE;
+    if (parent->kind == TURDOM_ELEMENT)
+        return child->kind == TURDOM_DOCTYPE ? TURDOM_E_HIERARCHY : TURDOM_OK;
+    /* parent is the document node */
+    switch (child->kind) {
+    case TURDOM_TEXT:
+    case TURDOM_CDATA:
+        return TURDOM_E_HIERARCHY;
+    case TURDOM_ELEMENT:
+        for (const turdom_node *c = parent->first; c; c = c->next)
+            if (c != child && c->kind == TURDOM_ELEMENT) return TURDOM_E_HIERARCHY;
+        for (const turdom_node *c = ref; c; c = c->next)
+            if (c->kind == TURDOM_DOCTYPE) return TURDOM_E_HIERARCHY;
+        return TURDOM_OK;
+    case TURDOM_DOCTYPE:
+        for (const turdom_node *c = parent->first; c; c = c->next)
+            if (c != child && c->kind == TURDOM_DOCTYPE) return TURDOM_E_HIERARCHY;
+        for (const turdom_node *c = ref ? ref->prev : parent->last; c; c = c->prev)
+            if (c->kind == TURDOM_ELEMENT) return TURDOM_E_HIERARCHY;
+        return TURDOM_OK;
+    default:
+        return TURDOM_OK;       /* comment, PI */
+    }
+}
+
+static int do_insert(turdom_node *parent, turdom_node *child, turdom_node *ref) {
+    if (ref == child) ref = child->next;    /* before itself: it stays put */
+    int rc = check_insert(parent, child, ref);
+    if (rc != TURDOM_OK) return rc;
+    unlink_node(child);
+    link_before(parent, child, ref);
+    return TURDOM_OK;
+}
+
+int turdom_append(turdom_node *parent, turdom_node *child) {
+    return do_insert(parent, child, NULL);
+}
+
+int turdom_prepend(turdom_node *parent, turdom_node *child) {
+    if (!parent) return TURDOM_E_BAD_KIND;
+    return do_insert(parent, child, parent->first);
+}
+
+int turdom_insert_before(turdom_node *ref, turdom_node *child) {
+    if (!ref || !child) return TURDOM_E_BAD_KIND;
+    if (!ref->parent) return TURDOM_E_DETACHED;
+    return do_insert(ref->parent, child, ref);
+}
+
+int turdom_insert_after(turdom_node *ref, turdom_node *child) {
+    if (!ref || !child) return TURDOM_E_BAD_KIND;
+    if (!ref->parent) return TURDOM_E_DETACHED;
+    if (child == ref) return TURDOM_OK;
+    return do_insert(ref->parent, child, ref->next);
+}
+
+int turdom_replace(turdom_node *old, turdom_node *repl) {
+    if (!old || !repl) return TURDOM_E_BAD_KIND;
+    if (!old->parent) return TURDOM_E_DETACHED;
+    if (old == repl) return TURDOM_OK;
+    turdom_node *parent = old->parent, *ref = old->next;
+    /* Take old out first, so the document node's one-element rule does not
+     * count it; put it back if repl cannot go there. */
+    unlink_node(old);
+    int rc = do_insert(parent, repl, ref);
+    if (rc != TURDOM_OK) link_before(parent, old, ref);
+    return rc;
+}
+
+void turdom_remove(turdom_node *n) {
+    if (n) unlink_node(n);
+}
+
+int turdom_unwrap(turdom_node *n) {
+    if (!n) return TURDOM_E_BAD_KIND;
+    if (n->kind == TURDOM_DOCUMENT) return TURDOM_E_BAD_KIND;
+    if (!n->parent) return TURDOM_E_DETACHED;
+    turdom_node *parent = n->parent;
+    if (parent->kind == TURDOM_DOCUMENT) {
+        /* n is going away, so count what would be left at the top level. */
+        int elements = 0;
+        for (const turdom_node *c = parent->first; c; c = c->next)
+            if (c != n && c->kind == TURDOM_ELEMENT) elements++;
+        for (const turdom_node *c = n->first; c; c = c->next) {
+            if (c->kind == TURDOM_TEXT || c->kind == TURDOM_CDATA)
+                return TURDOM_E_HIERARCHY;
+            if (c->kind == TURDOM_ELEMENT) elements++;
+        }
+        if (elements > 1) return TURDOM_E_HIERARCHY;
+    }
+    while (n->first) {
+        turdom_node *c = n->first;
+        unlink_node(c);
+        link_before(parent, c, n);
+    }
+    unlink_node(n);
+    return TURDOM_OK;
+}
+
+int turdom_set_attr(turdom_node *el, const char *qname, const char *ns_uri,
+                    const char *local, const char *value, size_t vlen) {
+    if (!el || el->kind != TURDOM_ELEMENT) return TURDOM_E_BAD_KIND;
+    turdom_doc *d = el->doc;
+    const char *q = qname ? qname : "";
+    int has_ns = ns_uri && ns_uri[0];
+    int fold = d->flavor == TURDOM_FLAVOR_HTML;
+    turdom_attr *hit = NULL;
+    for (turdom_attr *a = el->attrs; a && !hit; a = a->next) {
+        if (has_ns) {
+            const char *want = local ? local : q;
+            if (a->ns_uri && strcmp(a->ns_uri, ns_uri) == 0 &&
+                strcmp(a->local, want) == 0)
+                hit = a;
+        } else if (name_eq(a->name, q, strlen(q), fold)) {
+            hit = a;
+        }
+    }
+    const char *v = arena_strndup(d, value ? value : "", value ? vlen : 0);
+    if (!v) return TURDOM_E_OOM;
+    if (hit) {
+        d->garbage += (int64_t)arena_size(hit->vlen + 1);
+        hit->value = v;
+        hit->vlen = value ? vlen : 0;
+        return TURDOM_OK;
+    }
+    turdom_attr *a = (turdom_attr *)arena_alloc(d, sizeof(turdom_attr));
+    if (!a) return TURDOM_E_OOM;
+    /* setAttribute lower-cases on an HTML element in an HTML document. */
+    int lower = !has_ns && lowers_names(d, el->ns_uri);
+    a->name = lower ? arena_strdup_lower(d, q) : arena_strdup_opt(d, q);
+    a->ns_uri = has_ns ? arena_strdup_opt(d, ns_uri) : NULL;
+    a->local = !local ? a->name
+               : lower ? arena_strdup_lower(d, local) : arena_strdup_opt(d, local);
+    a->value = v;
+    a->vlen = value ? vlen : 0;
+    a->next = NULL;
+    if (!a->name || !a->local || (has_ns && !a->ns_uri)) return TURDOM_E_OOM;
+    if (el->attrs_tail) el->attrs_tail->next = a;
+    else el->attrs = a;
+    el->attrs_tail = a;
+    el->nattrs++;
+    return TURDOM_OK;
+}
+
+int turdom_remove_attr(turdom_node *el, const char *name) {
+    if (!el || el->kind != TURDOM_ELEMENT || !name) return 0;
+    int fold = el->doc->flavor == TURDOM_FLAVOR_HTML;
+    turdom_attr *prev = NULL;
+    for (turdom_attr *a = el->attrs; a; prev = a, a = a->next) {
+        if (!qname_matches(a->name, a->ns_uri, a->local, name, fold)) continue;
+        if (prev) prev->next = a->next;
+        else el->attrs = a->next;
+        if (el->attrs_tail == a) el->attrs_tail = prev;
+        el->nattrs--;
+        el->doc->garbage += (int64_t)arena_size(sizeof(turdom_attr)) +
+                            name_bytes(a->name, a->local, a->ns_uri) +
+                            (int64_t)arena_size(a->vlen + 1);
+        return 1;
+    }
+    return 0;
+}
+
+int turdom_set_value(turdom_node *n, const char *s, size_t len) {
+    if (!n) return TURDOM_E_BAD_KIND;
+    switch (n->kind) {
+    case TURDOM_TEXT: case TURDOM_COMMENT: case TURDOM_CDATA: case TURDOM_PI:
+        break;
+    default:
+        return TURDOM_E_BAD_KIND;
+    }
+    char *v = arena_strndup(n->doc, s ? s : "", s ? len : 0);
+    if (!v) return TURDOM_E_OOM;
+    n->doc->garbage += (int64_t)arena_size(n->value_len + 1);
+    n->value = v;
+    n->value_len = s ? len : 0;
+    return TURDOM_OK;
+}
+
+int turdom_set_text(turdom_node *n, const char *s, size_t len) {
+    if (!n) return TURDOM_E_BAD_KIND;
+    if (n->kind != TURDOM_ELEMENT) return turdom_set_value(n, s, len);
+    turdom_node *t = NULL;
+    if (s && len) {
+        t = turdom_create_chars(n->doc, TURDOM_TEXT, s, len);
+        if (!t) return TURDOM_E_OOM;
+    }
+    while (n->first) unlink_node(n->first);
+    if (t) link_before(n, t, NULL);
+    return TURDOM_OK;
+}
+
+int turdom_rename(turdom_node *el, const char *qname, const char *ns_uri,
+                  const char *local) {
+    if (!el || el->kind != TURDOM_ELEMENT) return TURDOM_E_BAD_KIND;
+    int64_t old = name_bytes(el->name, el->local, el->ns_uri);
+    int rc = set_names(el->doc, el, qname, ns_uri, local);
+    if (rc == TURDOM_OK) el->doc->garbage += old;
+    return rc;
+}
+
+/* A detached copy of s (no children) in d's arena. */
+static turdom_node *copy_shallow(turdom_doc *d, const turdom_node *s) {
+    turdom_node *n = alloc_node(d, s->kind, s->line, s->col);
+    if (!n) return NULL;
+    n->name = arena_strdup_opt(d, s->name);
+    n->local = s->local == s->name ? n->name : arena_strdup_opt(d, s->local);
+    n->ns_uri = arena_strdup_opt(d, s->ns_uri);
+    n->public_id = arena_strdup_opt(d, s->public_id);
+    n->system_id = arena_strdup_opt(d, s->system_id);
+    if ((s->name && !n->name) || (s->local && !n->local) ||
+        (s->ns_uri && !n->ns_uri) || (s->public_id && !n->public_id) ||
+        (s->system_id && !n->system_id))
+        return NULL;
+    if (s->value) {
+        n->value = arena_strndup(d, s->value, s->value_len);
+        if (!n->value) return NULL;
+        n->value_len = s->value_len;
+    }
+    for (const turdom_attr *sa = s->attrs; sa; sa = sa->next) {
+        turdom_attr *a = (turdom_attr *)arena_alloc(d, sizeof(turdom_attr));
+        if (!a) return NULL;
+        a->name = arena_strdup_opt(d, sa->name);
+        a->local = sa->local == sa->name ? a->name : arena_strdup_opt(d, sa->local);
+        a->ns_uri = arena_strdup_opt(d, sa->ns_uri);
+        a->value = arena_strndup(d, sa->value, sa->vlen);
+        a->vlen = sa->vlen;
+        a->next = NULL;
+        if (!a->name || !a->local || (sa->ns_uri && !a->ns_uri) || !a->value)
+            return NULL;
+        if (n->attrs_tail) n->attrs_tail->next = a;
+        else n->attrs = a;
+        n->attrs_tail = a;
+        n->nattrs++;
+    }
+    return n;
+}
+
+/* A detached deep copy of src in d's arena.  Walks src and the copy in step,
+ * without recursion. */
+static turdom_node *deep_copy(turdom_doc *d, const turdom_node *src) {
+    turdom_node *root = copy_shallow(d, src);
+    if (!root) return NULL;
+    const turdom_node *s = src;
+    turdom_node *c = root;
+    for (;;) {
+        if (s->first) {
+            s = s->first;
+            turdom_node *k = copy_shallow(d, s);
+            if (!k) return NULL;
+            link_before(c, k, NULL);
+            c = k;
+            continue;
+        }
+        for (;;) {
+            if (s == src) return root;
+            if (s->next) {
+                s = s->next;
+                turdom_node *k = copy_shallow(d, s);
+                if (!k) return NULL;
+                link_before(c->parent, k, NULL);
+                c = k;
+                break;
+            }
+            s = s->parent;
+            c = c->parent;
+        }
+    }
+}
+
+turdom_node *turdom_clone(const turdom_node *n) {
+    if (!n || n->kind == TURDOM_DOCUMENT) return NULL;
+    return deep_copy(n->doc, n);
+}
+
+turdom_node *turdom_import(turdom_doc *d, const turdom_node *n) {
+    if (!d || !n || n->kind == TURDOM_DOCUMENT) return NULL;
+    return deep_copy(d, n);
+}
+
+void turdom_normalize(turdom_node *root) {
+    if (!root) return;
+    for (turdom_node *n = root; n; n = turdom_next_in(root, n)) {
+        if (!is_container(n)) continue;
+        turdom_node *c = n->first;
+        while (c) {
+            turdom_node *nx = c->next;
+            if (c->kind != TURDOM_TEXT) { c = nx; continue; }
+            /* c starts a run of text nodes: size it, join it, unlink the rest. */
+            size_t total = c->value_len;
+            for (turdom_node *r = nx; r && r->kind == TURDOM_TEXT; r = r->next)
+                total += r->value_len;
+            if (total == 0) {
+                while (nx && nx->kind == TURDOM_TEXT) {
+                    turdom_node *nn = nx->next;
+                    unlink_node(nx);
+                    nx = nn;
+                }
+                unlink_node(c);
+                c = nx;
+                continue;
+            }
+            if (total != c->value_len) {
+                char *joined = (char *)arena_alloc(c->doc, total + 1);
+                if (!joined) return;
+                size_t at = 0;
+                memcpy(joined, c->value, c->value_len);
+                at = c->value_len;
+                for (turdom_node *r = nx; r && r->kind == TURDOM_TEXT; r = r->next) {
+                    memcpy(joined + at, r->value, r->value_len);
+                    at += r->value_len;
+                }
+                joined[total] = '\0';
+                c->doc->garbage += (int64_t)arena_size(c->value_len + 1);
+                c->value = joined;
+                c->value_len = total;
+            }
+            while (nx && nx->kind == TURDOM_TEXT) {
+                turdom_node *nn = nx->next;
+                unlink_node(nx);
+                nx = nn;
+            }
+            c = nx;
+        }
+    }
+}
+
+turdom_doc *turdom_compact(const turdom_doc *d) {
+    if (!d) return NULL;
+    turdom_doc *nd = turdom_doc_new(d->flavor);
+    if (!nd) return NULL;
+    for (const turdom_node *c = d->docnode->first; c; c = c->next) {
+        turdom_node *k = deep_copy(nd, c);
+        if (!k) { turdom_doc_free(nd); return NULL; }
+        link_before(nd->docnode, k, NULL);
+    }
+    return nd;
+}
+
+int turdom_attached(const turdom_node *n) {
+    if (!n) return 0;
+    while (n->parent) n = n->parent;
+    return n == n->doc->docnode;
 }

@@ -118,8 +118,94 @@ char        *turdom_serialize(const turdom_node *n, size_t *len);
 
 int          turdom_equal(const turdom_node *a, const turdom_node *b);
 int64_t      turdom_depth(const turdom_node *n);
+/* Nodes the document's arena holds, attached or detached (the document node
+ * itself not counted). */
 int64_t      turdom_node_count(const turdom_doc *d);
 /* Arena bytes held by all live documents in the process. */
 int64_t      turdom_live_bytes(void);
+
+/* ---- editing ------------------------------------------------------------
+ *
+ * Nothing is freed before turdom_doc_free.  A replaced string, a removed
+ * attribute or a removed subtree stays in the arena, so every pointer a
+ * reader borrowed stays valid: a removed node is DETACHED (parent NULL), not
+ * dangling, and can be read, re-inserted or ignored.  turdom_garbage_bytes
+ * counts what edits abandoned for certain (replaced strings and removed
+ * attributes; not detached nodes, which a caller may still hold), and
+ * turdom_compact copies the reachable tree into a fresh document.
+ *
+ * Every function here is iterative.  None validates names or content: that
+ * is the caller's job (dom/edit), because the serializer writes names,
+ * comment bodies, PI data and HTML raw text verbatim. */
+
+enum {
+    TURDOM_OK              = 0,
+    TURDOM_E_WRONG_DOC     = 1,  /* the node belongs to another arena: import it */
+    TURDOM_E_CYCLE         = 2,  /* inserting an ancestor under its descendant */
+    TURDOM_E_NOT_CONTAINER = 3,  /* children under a text/comment/CDATA/PI/doctype */
+    TURDOM_E_HIERARCHY     = 4,  /* a document node, a second root element or doctype,
+                                    text at the top level, a doctype in an element,
+                                    or a doctype after the root element */
+    TURDOM_E_DETACHED      = 5,  /* the reference node has no parent */
+    TURDOM_E_BAD_KIND      = 6,  /* the operation does not apply to this kind */
+    TURDOM_E_OOM           = 7
+};
+
+/* Detached nodes, owned by d's arena until inserted.  In an HTML document,
+ * an element created with no namespace or the XHTML namespace has its name
+ * lower-cased, as createElement does.  kind is TURDOM_TEXT, TURDOM_COMMENT or
+ * TURDOM_CDATA.  NULL only on allocation failure. */
+turdom_node *turdom_create_element(turdom_doc *d, const char *qname,
+                                   const char *ns_uri, const char *local);
+turdom_node *turdom_create_chars(turdom_doc *d, int kind, const char *s,
+                                 size_t n);
+turdom_node *turdom_create_pi(turdom_doc *d, const char *target,
+                              const char *data);
+
+/* Tree surgery.  A child that is attached elsewhere is moved.  O(1) apart
+ * from the cycle check, which is O(depth). */
+int          turdom_append(turdom_node *parent, turdom_node *child);
+int          turdom_prepend(turdom_node *parent, turdom_node *child);
+int          turdom_insert_before(turdom_node *ref, turdom_node *child);
+int          turdom_insert_after(turdom_node *ref, turdom_node *child);
+int          turdom_replace(turdom_node *old, turdom_node *repl);
+/* Detach n; a no-op when it is already detached. */
+void         turdom_remove(turdom_node *n);
+/* n's children take its place, then n is detached. */
+int          turdom_unwrap(turdom_node *n);
+
+/* Content.  set_attr replaces the value of a matching attribute in place
+ * (matched by namespace and local name when ns_uri is given, otherwise by
+ * qualified name, ignoring ASCII case in an HTML document) or appends a new
+ * one.  remove_attr matches as turdom_attr_get does and returns 1 when it
+ * removed something.  set_value sets the data of a text, comment, CDATA or
+ * PI node.  set_text is textContent=: on an element or the document node it
+ * detaches every child and appends one text node (none for ""). */
+int          turdom_set_attr(turdom_node *el, const char *qname,
+                             const char *ns_uri, const char *local,
+                             const char *value, size_t vlen);
+int          turdom_remove_attr(turdom_node *el, const char *name);
+int          turdom_set_value(turdom_node *n, const char *s, size_t len);
+int          turdom_set_text(turdom_node *n, const char *s, size_t len);
+int          turdom_rename(turdom_node *el, const char *qname,
+                           const char *ns_uri, const char *local);
+
+/* Deep copies, detached.  clone copies into n's own arena; import copies into
+ * d (another document, or the same one).  The document node itself cannot be
+ * copied: NULL. */
+turdom_node *turdom_clone(const turdom_node *n);
+turdom_node *turdom_import(turdom_doc *d, const turdom_node *n);
+
+/* Merge adjacent text nodes and drop empty ones in n's subtree, as the DOM's
+ * normalize() does.  A parser only ever produces normalized trees. */
+void         turdom_normalize(turdom_node *n);
+
+/* A fresh document holding a copy of d's reachable tree.  The one operation
+ * that invalidates handles: nodes of d do not belong to the copy.  The caller
+ * frees both. */
+turdom_doc  *turdom_compact(const turdom_doc *d);
+int64_t      turdom_garbage_bytes(const turdom_doc *d);
+/* Is n reachable from its document node? */
+int          turdom_attached(const turdom_node *n);
 
 #endif /* TURDOM_H */
