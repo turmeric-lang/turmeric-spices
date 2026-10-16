@@ -24,6 +24,25 @@
   throughout, plus `turdom_check_*` validation and `turdom_edit_*` checked
   entry points. `fixtures/c/edit_test.c` tests them under ASan and UBSan
   (`fixtures/run.sh`).
+- `dom/writer` (follow-up B4): `SaxWriter` serializes a stream of
+  `SaxEvent`s with `dom-serialize`'s escaping -- in memory
+  (`sax-writer-new`) or streamed to a file in 64 KiB writes
+  (`sax-writer-to-file`) -- through `sax-write!`, `sax-write-all!`,
+  `sax-writer-finish!` and `sax-writer-free`. It refuses, with a sticky
+  `WriteError` (`Rejected EditError`, `IoFailed`), what it cannot write back
+  as given: the `dom/edit` checks on names and bodies, a duplicate attribute,
+  and in XML an end tag that does not match, a second root, text outside it.
+  XML names may be Clark names; the writer declares prefixes, honouring an
+  `xmlns` attribute on the same start tag. `sax-transform-handler` runs each
+  event through a `(fn [SaxEvent] (Cons SaxEvent))` that owns it and writes
+  what comes back; `sax-keep` is the identity. `TransformError`
+  (`InputError`, `OutputError`) is the error of tur-xml's and tur-html's
+  transforms.
+- `sax-event-retain` (dom/event) takes a reference to every String in an
+  event.
+- The C layer gains `turdom_writer_*` and the `TURDOM_E_IO` code;
+  `fixtures/c/writer_test.c` tests them (`fixtures/run.sh` now builds every
+  C test).
 
 ### Changed
 

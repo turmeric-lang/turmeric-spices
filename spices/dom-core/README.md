@@ -138,13 +138,31 @@ defn main [] : int
   0
 ```
 
+## Streaming writes
+
+`dom/writer` is the streaming counterpart: a `SaxWriter` turns `SaxEvent`s
+back into markup with the same escaping as `dom-serialize`, at memory
+proportional to the nesting depth -- in memory, or straight to a file with
+`sax-writer-to-file`. It applies the `dom/edit` checks to what it writes
+verbatim, refuses a duplicate attribute, and in XML insists on matching end
+tags and a single root; the first refusal sticks. XML names may be Clark
+names (`{uri}local`), for which the writer chooses or declares the prefix.
+
+`sax-transform-handler` turns a function from one event to a list of events
+into a SAX handler that writes the result: tur-xml's `sax-transform` and
+tur-html's `html-sax-transform` are built on it, and it plugs into any push
+parser. The function owns the event it is given -- it returns it to write it
+or releases it to drop it -- and every event it returns is written and then
+released. `sax-keep` is the identity.
+
 ## API
 
 | Module | Exports |
 |--------|---------|
 | `dom/core` | `Document`, `Node`, `NodeKind` (`DocumentNode` `ElementNode` `TextNode` `CommentNode` `CdataNode` `PiNode` `DoctypeNode`), `SourcePos`, `ParseError`, `ParseErrorKind` (`Syntax` `Limit` `Refused` `Io`), `syntax-kind`, `limit-kind`, `refused-kind`, `io-kind`, `dom-root`, `dom-node`, `dom-free`, `dom-serialize`, `dom-equal?`, `dom-node-count`, `dom-live-bytes`, `node-kind`, `node-element?`, `node-name`, `node-local-name`, `node-ns-uri`, `node-value`, `node-text`, `node-attr`, `node-attr-count`, `node-attr-name-at`, `node-attr-value-at`, `node-children`, `node-child-count`, `node-first-child`, `node-last-child`, `node-next-sibling`, `node-prev-sibling`, `node-parent`, `node-document`, `node-pos`, `node-depth`, `node-matches?`, `find-all`, `find-first`, `parse-error-message`, `parse-error-release`, `parse-error-pos` |
 | `dom/edit` | `DomFlavor` (`XmlFlavor` `HtmlFlavor`), `EditError` (`WrongDocument` `WouldCycle` `NotAContainer` `BadPlacement` `Detached` `WrongKind` `BadName` `BadContent` `OutOfMemory`), `edit-error-message`, `dom-new`, `dom-flavor`, `create-element`, `create-element-ns`, `create-text`, `create-comment`, `create-cdata`, `create-pi`, `node-import`, `node-clone`, `node-append!`, `node-prepend!`, `node-insert-before!`, `node-insert-after!`, `node-replace!`, `node-remove!`, `node-unwrap!`, `set-attr!`, `set-attr-ns!`, `remove-attr!`, `set-text!`, `set-value!`, `rename!`, `rename-ns!`, `node-normalize!`, `dom-garbage-bytes`, `dom-compact`, `node-attached?` |
-| `dom/event` | `SaxEvent` (`StartElement` `EndElement` `Chars` `Comment` `Pi` `StartCdata` `EndCdata` `Doctype`), `SaxControl` (`Continue` `Stop`), `Attr`, `attrs-get`, `sax-event-release`, `sax-dispatch` |
+| `dom/event` | `SaxEvent` (`StartElement` `EndElement` `Chars` `Comment` `Pi` `StartCdata` `EndCdata` `Doctype`), `SaxControl` (`Continue` `Stop`), `Attr`, `attrs-get`, `sax-event-release`, `sax-event-retain`, `sax-dispatch` |
+| `dom/writer` | `SaxWriter`, `WriteError` (`Rejected` `IoFailed`), `write-error-message`, `TransformError` (`InputError` `OutputError`), `transform-error-message`, `transform-error-release`, `sax-writer-new`, `sax-writer-to-file`, `sax-write!`, `sax-write-all!`, `sax-writer-finish!`, `sax-writer-free`, `sax-transform-handler`, `sax-keep` |
 | `dom/ownstr` | `String`, `from-cstr`, `adopt-cstr`, `to-cstr`, `retain`, `release`, `str-len`, `string=?` |
 
 The [XML guide](../../docs/guides/xml-guide.md) documents the node API and the

@@ -14,6 +14,15 @@
 - `tests/html5lib.tur` runs every fragment test a second time through
   `set-inner-html!`; `fixtures/edit-fuzz.tur` fuzzes `dom/edit` on HTML
   documents.
+- `html/transform` (follow-up B4): `html-sax-transform` and
+  `html-sax-transform-opts` run tokenizer-level events through a
+  `(fn [SaxEvent] (Cons SaxEvent))` and serialize the result with a dom-core
+  `SaxWriter`. The identity gives back markup that tokenizes to the same
+  events, doctype identifiers included; `tests/html5lib.tur` checks that for
+  every html5lib input, and that each input the writer refuses (`<plaintext>`,
+  a comment holding `<!--`, raw text holding `<!--` or a `</script`
+  lookalike) is refused for one of those reasons. The fuzz pass gains the
+  property.
 
 ## 0.1.0
 

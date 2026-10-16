@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.0
+
+### Added
+
+- `xml/transform` (xml-html-parsers-plan follow-up B4): `sax-transform` and
+  `sax-transform-opts` run a document's events through a
+  `(fn [SaxEvent] (Cons SaxEvent))` and serialize the result with a dom-core
+  `SaxWriter`; `sax-transform-file` streams one file into another without
+  holding either. Errors are a `TransformError`: `InputError` (the parse)
+  or `OutputError` (the writer's refusal).
+- With namespaces off, the identity transform reproduces `dom-serialize`
+  byte for byte: `tests/transform.tur`, every xmltest `valid/sa` document in
+  `fixtures/conformance.tur`, and a new property of the fuzz pass. With
+  namespaces on, the output parses to the same events (tests and fuzz).
+- `fixtures/edit-fuzz.tur` fuzzes dom-core's `dom/edit` on XML documents
+  (follow-up B2): random edit sequences, refused edits change nothing, and
+  the result reparses to an equal tree.
+
 ## 0.1.0
 
 Initial release: XML parsing via expat 2.9.0 (turmeric

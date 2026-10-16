@@ -22,6 +22,7 @@ what is particular to HTML.
 5. [Serializing (and why it is not sanitizing)](#5-serializing)
 6. [Tokenizer events](#6-tokenizer-events)
 7. [Options, files and encodings](#7-options-files-and-encodings)
+8. [Editing and token-level transforms](#8-editing-and-token-level-transforms)
 
 ---
 
@@ -199,3 +200,38 @@ no byte cap -- the input is already in memory. The `-opts` variants and
 
 Input is UTF-8. lexbor's encoding sniffing (`<meta charset>`, BOMs) lives in
 a module this spice does not build, so convert other encodings first.
+
+---
+
+## 8. Editing and token-level transforms
+
+A parsed tree is edited with `tur-dom-core`'s `dom/edit` (see the
+[dom-core README](../../spices/dom-core/README.md#editing)), and
+`html/edit` adds the HTML-specific pieces: `set-inner-html!` parses markup in
+an element's own context and puts it in place of the element's children,
+checked like any other edit, so markup that would close a `<script>` early is
+refused; `node-inner-html` and `node-outer-html` serialize.
+
+`html/transform` is the streaming counterpart, and it works on **tokens**,
+like `html/sax`: `html-sax-transform` runs every event through a function
+that returns the events to write in its place, then serializes them. See the
+[XML guide](xml-guide.md#9-editing-and-streaming-transforms) for the function's
+ownership rule. The identity transform gives back markup that tokenizes to
+the same events -- including a doctype's identifiers, so the quirks mode does
+not change -- which for ordinary pages parses to the same tree too. Two
+things to know:
+
+- Since the stream has no tree behind it, end tags are written as the
+  tokenizer saw them (missing, stray or misnested), and `<br/>` comes back
+  as `<br/>`. A self-closed non-void element, `<div/>`, comes back as
+  `<div></div>`: the two tokenize alike, but a parser keeps `<div/>` open.
+- The writer refuses what it cannot write back as given, and the transform
+  stops there with `OutputError`: a `<plaintext>` element (`BadName`), a
+  comment that holds `<!--`, and `<script>` text holding `<!--` or a
+  `</script` lookalike (`BadContent`). The test suite runs every html5lib
+  input through the identity; about 9% of them -- that suite aims at exactly
+  these edges -- are refused, the rest come back token for token.
+
+For input too large to hold, plug `dom/writer`'s `sax-transform-handler` into
+`html-sax-parser-new`, with a writer from `sax-writer-to-file`, and feed the
+input in chunks.

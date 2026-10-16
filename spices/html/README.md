@@ -87,10 +87,12 @@ defn main [] : int
 | `html/dom` | `HtmlOpts`, `default-html-opts`, `html-parse`, `html-parse-opts`, `html-parse-fragment`, `html-parse-fragment-opts`, `html-parse-file`, `html-parse-file-opts`, `html-backend-version` |
 | `html/edit` | `set-inner-html!`, `node-inner-html`, `node-outer-html` |
 | `html/sax` | `HtmlSaxParser`, `html-sax-parse-string`, `html-sax-parse-string-opts`, `html-sax-parser-new`, `html-sax-parser-new-opts`, `html-sax-feed!`, `html-sax-finish!`, `html-sax-parser-free` |
+| `html/transform` | `html-sax-transform`, `html-sax-transform-opts` |
 
 The [HTML guide](../../docs/guides/html-guide.md) covers both, the tree's
-shape (namespaces, templates, the depth cap) and how the tokenizer stream
-differs from the tree.
+shape (namespaces, templates, the depth cap), how the tokenizer stream
+differs from the tree, and editing: in place with `html/edit` and dom-core's
+`dom/edit`, or as a token stream with `html/transform`.
 
 ## Parsing is not sanitizing
 
@@ -118,7 +120,9 @@ dump of the dom-core tree with the expected one -- so it checks lexbor's tree
 construction and the copy into dom-core together. Five tests newer than lexbor
 3.0.1 are listed as known failures, and the suite fails if one of them starts
 passing. Every fragment test runs a second time through `set-inner-html!` on
-an element built with `dom/edit`. `tests/` also covers a tag-soup corpus,
+an element built with `dom/edit`, and every input runs through the identity
+transform, which must give back the same tokens (or refuse for a known
+reason). `tests/` also covers a tag-soup corpus,
 fragments, the depth cap, options and files, and the token stream (including
 push parsing one byte at a time). `fixtures/run.sh` runs a mutation fuzz pass
 and a `dom/edit` fuzz pass (random edits; refused ones change nothing; the
