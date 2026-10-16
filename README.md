@@ -67,7 +67,7 @@ turmeric's [Emscripten spice audit](https://github.com/turmeric-lang/turmeric/bl
 | [`tur-rtmidi`](spices/rtmidi/) | Cross-platform MIDI I/O via RtMidi | 3 | ✅ | ✅ | ✅ | ❌ | RtMidi 6.0.0 |
 | [`tur-sdf-raylib`](spices/sdf-raylib/) | SDF-based solid modeling with raylib rendering and colored mesh export | 3 | ✅ | ✅ | ✅ | ⚠️ | raylib 5.5 |
 | [`tur-valkey`](spices/valkey/) | Valkey/Redis client via hiredis | 3 | ✅ | ✅ | ✅ | ❌ | hiredis 1.2.0 |
-| [`tur-nng`](spices/nng/) | nanomsg-next-generation scalability protocols (req/rep, pub/sub, pipeline, pair, bus, survey) | 3 | ✅ | ✅ | ✅ | ❌ | nng 1.12.4 |
+| [`tur-nng`](spices/nng/) | nanomsg-next-generation scalability protocols (req/rep, pub/sub, pipeline, pair, bus, survey) over inproc, ipc, tcp and ws | 3 | ✅ | ✅ | ✅ | ❌ | nng 1.12.4 |
 | [`tur-wav`](spices/wav/) | WAV and PCM audio file read/write via libsndfile | 3 | ✅ | ✅ | ✅ | ✅ | libsndfile 1.2.2 |
 | [`tur-tls`](spices/tls/) | TLS termination for tur/httpd via mbedTLS | 3 | ✅ | ✅ | ❌ | ❌ | mbedTLS 3.6.2 |
 | [`tur-ws-client`](spices/ws-client/) | RFC 6455 WebSocket client (ws:// and wss://) for Turmeric | 3 | ✅ | ✅ | ❌ | ❌ | mbedTLS 3.6.2 (wss:// only) |
@@ -103,7 +103,10 @@ turmeric's [Emscripten spice audit](https://github.com/turmeric-lang/turmeric/bl
   `tur-httpd`, whose server is BSD sockets + pthreads. Both need a Winsock
   port for Windows. No browser offers raw TCP or UDP, so `tur-http` would have
   to be remapped onto `fetch()`, and `tur-osc`, `tur-postgres`, `tur-valkey`
-  and `tur-nng` have no browser story at all.
+  and `tur-nng` have no browser story at all. (A browser can still be a
+  WebSocket *peer* of a native `tur-nng` listener over `ws://` -- see the
+  [nng guide](docs/guides/nng-guide.md#10-websocket-ws) -- but the spice
+  itself does not run there.)
 - **`tur-osc`** is the one unaudited cell: liblo's own Windows support is
   partial, and the spice links a system liblo rather than building it from
   source (see the CI notes on why). Neither half has been tried on MinGW.

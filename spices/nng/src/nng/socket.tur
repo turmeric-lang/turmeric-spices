@@ -28,7 +28,7 @@
           req-open rep-open pub-open sub-open
           push-open pull-open pair-open bus-open
           surveyor-open respondent-open
-          dial listen close
+          dial listen listen-bound-port close
           set-recv-timeout-ms set-send-timeout-ms
           err-str timed-out?
           PollFd poll-fd->int recv-poll-fd send-poll-fd)
@@ -309,7 +309,8 @@
 ;;;
 ;;; Parameters:
 ;;;   s   -- the socket (borrowed)
-;;;   url -- e.g. "inproc://jobs", "ipc:///tmp/x.sock", "tcp://host:5555"
+;;;   url -- e.g. "inproc://jobs", "ipc:///tmp/x.sock", "tcp://host:5555",
+;;;          "ws://host:8080/jobs"
 ;;;
 ;;; Returns:
 ;;;   (Result nil int) -- err carries the nng error code.
@@ -338,7 +339,8 @@
 ;;;
 ;;; Parameters:
 ;;;   s   -- the socket (borrowed)
-;;;   url -- e.g. "inproc://jobs", "ipc:///tmp/x.sock", "tcp://0.0.0.0:5555"
+;;;   url -- e.g. "inproc://jobs", "ipc:///tmp/x.sock", "tcp://0.0.0.0:5555",
+;;;          "ws://0.0.0.0:8080/jobs"
 ;;;
 ;;; Returns:
 ;;;   (Result nil int) -- err carries the nng error code.
@@ -355,6 +357,51 @@
   int rv = nng_listen(sk, (const char *)url, NULL, 0);
   if (rv != 0) return tur_err_int((int64_t)rv);
   return tur_ok_int(0);
+  ```)
+
+;;; listen-bound-port -- bind the socket and report the TCP port it got.
+;;;
+;;; `listen` with port 0 in the address (`tcp://127.0.0.1:0`,
+;;; `ws://127.0.0.1:0/jobs`) binds a free port the OS picks, but it keeps no
+;;; listener handle, so nothing can ask which port that was. This is the same
+;;; bind with the answer: the port actually bound. With a fixed port it simply
+;;; returns that port.
+;;;
+;;; It works for every transport that sits on TCP: `tcp://` and `ws://`, plus
+;;; their `4`/`6` variants. `inproc://` and `ipc://` have no port; there the
+;;; listener is closed again and the result is `err` carrying NNG_ENOTSUP, so
+;;; an `err` never leaves anything bound.
+;;;
+;;; Like `listen`, the listener's lifetime is tied to the socket's.
+;;;
+;;; Parameters:
+;;;   s   -- the socket (borrowed)
+;;;   url -- a tcp:// or ws:// address; port 0 asks the OS for a free one
+;;;
+;;; Returns:
+;;;   (Result int int) -- ok carries the bound port; err carries the nng
+;;;   error code.
+;;;
+;;; Example:
+;;;   (let [port (ok-val (listen-bound-port s "ws://127.0.0.1:0/jobs"))]
+;;;     (println port))   ; => e.g. 41733
+;;;
+;;; Since: Phase NG-WS
+(defn listen-bound-port [^borrow s : Socket url : cstr] #fx{Net} : (Result int int)
+  ```c
+  #include <nng/nng.h>
+  nng_socket sk;
+  sk.id = (uint32_t)s;
+  nng_listener l;
+  int rv = nng_listen(sk, (const char *)url, &l, 0);
+  if (rv != 0) return tur_err_int((int64_t)rv);
+  int port = 0;
+  rv = nng_listener_get_int(l, NNG_OPT_TCP_BOUND_PORT, &port);
+  if (rv != 0) {
+    nng_listener_close(l);
+    return tur_err_int((int64_t)rv);
+  }
+  return tur_ok_int((int64_t)port);
   ```)
 
 ;;; close -- close the socket. The single linear consumer.
