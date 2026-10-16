@@ -1,0 +1,91 @@
+;; 12_tunings -- scales, keyboard mappings, and tuned note numbers.
+;;
+;; signal/tuning describes a tuning the way Scala and most microtonal
+;; software do: a SCALE (pitches above 1/1, the last one the period it
+;; repeats at) played through a KEYMAP (which note plays which degree, and
+;; which note sounds at which frequency). `mtof-tuned` and `ftom-tuned` are
+;; `mtof` and `ftom` for any such tuning. Scales and keymaps read and write
+;; Scala's .scl and .kbm files. Expected outputs are in comments.
+
+;; Owned String, for scale->scl and parse errors; loaded outside the module
+;; so this program and signal/tuning share it.
+(load "stdlib/string.tur")
+
+(defmodule signal/examples/12_tunings
+  (import signal/core   :refer [sample map-signal])
+  (import signal/pitch  :refer [mtof])
+  (import signal/tuning :refer [Pitch Cents Ratio Scale Keymap Tuning
+                                scale-new scale-edo scale-cents scl-parse
+                                scale->scl kbm-parse keymap-linear tuning-new
+                                tuning-mapped? mtof-tuned ftom-tuned])
+
+;;; white-keys -- a 7-note scale on the white keys from middle C, A4 = 440.
+;;;
+;;; The .kbm text: map size 12, retune notes 0..127, middle note 60, A4 (69)
+;;; at 440 Hz, formal octave = degree 7, then one entry per key of the octave,
+;;; `x` for each black key.
+(defn white-keys [s : Scale] : Tuning
+  (match (kbm-parse "12\n0\n127\n60\n69\n440.0\n7\n0\nx\n1\nx\n2\n3\nx\n4\nx\n5\nx\n6\n")
+    (Ok k)  (tuning-new s k)
+    (Err m) (do (println (string/to-cstr m))
+                (tuning-new s (keymap-linear 60 69 440.0)))))
+
+(defn main [] : int
+  ;; ---------------------------------------------------------------------
+  ;; Equal divisions. 12-EDO through a linear map is standard tuning.
+  ;; ---------------------------------------------------------------------
+  (let [std (tuning-new (scale-edo 12) (keymap-linear 60 69 440.0))
+        t19 (tuning-new (scale-edo 19) (keymap-linear 60 69 440.0))]
+    (println (mtof-tuned std 60.0))      ;; 261.626
+    (println (mtof 60.0))                ;; 261.626 (the same)
+    (println (mtof-tuned t19 70.0))      ;; 456.348 (a nineteenth of an octave up)
+    (println (mtof-tuned t19 88.0))      ;; 880 (19 notes up: the octave)
+    (println (ftom-tuned t19 500.0))     ;; 72.5041 (between notes 72 and 73)
+    ;; A pitch bend glides through the tuning's own steps.
+    (let [bend (map-signal (mtof-tuned t19) (fn [t : float] : float (+ 69.0 t)))]
+      (println (sample bend 0.5))))      ;; 448.1 (half a 19-EDO step)
+
+  ;; ---------------------------------------------------------------------
+  ;; Just intonation from ratios, on the white keys, written as a .scl.
+  ;; ---------------------------------------------------------------------
+  (match (scale-new "5-limit just major"
+                    [(Ratio 9 8) (Ratio 5 4) (Ratio 4 3) (Ratio 3 2)
+                     (Ratio 5 3) (Ratio 15 8) (Ratio 2 1)])
+    (Ok just)
+      (let [white (white-keys just)]
+        (println (scale-cents just 4))         ;; 701.955 (a pure fifth)
+        (println (mtof-tuned white 60.0))      ;; 264 (C: A4 * 3/5)
+        (println (mtof-tuned white 64.0))      ;; 330 (E: C * 5/4)
+        (println (mtof-tuned white 67.0))      ;; 396 (G: C * 3/2)
+        (println (mtof-tuned white 72.0))      ;; 528 (C5)
+        (println (tuning-mapped? white 61))    ;; false (a black key ...)
+        (println (mtof-tuned white 61.0))      ;; 280.014 (... sits between C and D)
+        (println (ftom-tuned white 396.0))     ;; 67
+        (println (string/to-cstr (scale->scl just))))
+        ;; ! Written by tur-signal
+        ;; !
+        ;; 5-limit just major
+        ;;  7
+        ;; !
+        ;;  9/8
+        ;;  5/4
+        ;;  4/3
+        ;;  3/2
+        ;;  5/3
+        ;;  15/8
+        ;;  2/1
+        ;; (and a blank line: the text ends in a newline)
+    (Err m) (println (string/to-cstr m)))
+
+  ;; ---------------------------------------------------------------------
+  ;; Reading .scl text, and what a bad line says.
+  ;; ---------------------------------------------------------------------
+  (match (scl-parse "! slendro.scl\n!\nA slendro approximation\n 5\n!\n 240.\n 480.\n 720.\n 960.\n 2/1\n")
+    (Ok s)  (println (scale-cents s 3))       ;; 720
+    (Err m) (println (string/to-cstr m)))
+  (match (scl-parse "! broken.scl\nTwo notes\n 2\n 3/0\n 2/1\n")
+    (Ok s)  (println "parsed?")
+    (Err m) (println (string/to-cstr m)))     ;; line 4: the ratio '3/0' is not positive
+  0)
+
+) ;; end defmodule signal/examples/12_tunings

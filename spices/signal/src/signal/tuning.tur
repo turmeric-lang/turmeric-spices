@@ -1,0 +1,1405 @@
+;; Signal Processing -- Tunings: Scala scales, keyboard mappings, tuned pitch
+;;
+;; signal/pitch converts note numbers in twelve-tone equal temperament. This
+;; module does the same for ANY tuning, described the way the Scala program
+;; (huygens-fokker.org/scala) and most microtonal software describe one: a
+;; scale plus a keyboard mapping.
+;;
+;; A SCALE is a list of pitches above an implicit 1/1, each a ratio (3/2) or a
+;; size in cents (701.955); the last one is the PERIOD the scale repeats at,
+;; usually the octave 2/1. Degree 0 is the 1/1, degree k the k-th pitch, and
+;; degrees past the period wrap into the next one:
+;;
+;;   (scale-cents just 9) of a 7-note scale = period + degree 2
+;;
+;; A KEYMAP says which note numbers play which degrees and how high: the
+;; MIDDLE note plays degree 0 (or the mapping's first entry), the REFERENCE
+;; note sounds at the reference FREQUENCY, and an optional pattern of entries
+;; maps a run of keys onto degrees (skipping keys with `Unmapped`, e.g. the
+;; black keys under a 7-note scale), repeating one FORMAL OCTAVE higher every
+;; pattern. `keymap-linear` is the common case: every key plays the next
+;; degree.
+;;
+;; A TUNING joins the two, and `mtof-tuned` / `ftom-tuned` are the
+;; tuning-aware `mtof` / `ftom`:
+;;
+;;   (let [t (tuning-new (scale-edo 19) (keymap-linear 60 69 440.0))]
+;;     (mtof-tuned t 70.0))                   ;; 456.348 Hz: one 19-EDO step up
+;;
+;; Note numbers are floats, as in signal/pitch: a fractional note lies that
+;; fraction of the way between its two keys, in cents. With `(scale-edo 12)`
+;; and `(keymap-linear 60 69 440.0)`, `mtof-tuned` is exactly `mtof`.
+;;
+;; Scales and keymaps read and write the Scala file formats: `.scl` for a
+;; scale (`scl-parse`, `scl-load`, `scale->scl`) and `.kbm` for a keyboard
+;; mapping (`kbm-parse`, `kbm-load`, `keymap->kbm`). Parsing returns a Result
+;; whose error names the offending line.
+;;
+;; Scales, keymaps and tunings are immutable handles that live for the
+;; process, like signal/buffer buffers.
+
+;; Owned String, for parse errors and the generated file text. Loaded outside
+;; the module so that a program which loads it too shares the one String: a
+;; load inside a defmodule claims the file for that module alone (turmeric
+;; docs/reported/load-in-defmodule-claims-file-for-one-module.md).
+(load "stdlib/string.tur")
+
+(defmodule signal/tuning
+  (export Pitch Cents Ratio MapEntry Degree Unmapped Scale Keymap Tuning
+          scale-new scale-edo scale-size scale-description scale-pitch
+          scale-cents scale-period scl-parse scl-load scale->scl
+          keymap-linear keymap-new keymap-size keymap-first keymap-last
+          keymap-middle keymap-reference keymap-frequency
+          keymap-octave-degree keymap-entries kbm-parse kbm-load keymap->kbm
+          tuning-new tuning-scale tuning-keymap tuning-mapped?
+          mtof-tuned ftom-tuned)
+
+;;; Pitch -- one degree of a scale: a frequency ratio or a size in cents.
+;;;
+;;; `(Ratio 3 2)` is the just fifth, exactly; `(Cents 700.0)` the tempered
+;;; one. A ratio's numerator and denominator must both be positive. The two
+;;; forms are kept apart so that `scale->scl` writes back what was given.
+(defdata Pitch :copy
+  (Cents :float)
+  (Ratio :int :int))
+
+;;; MapEntry -- one key of a keymap pattern: the scale degree it plays, or
+;;; nothing.
+(defdata MapEntry :copy
+  (Degree :int)
+  (Unmapped))
+
+;;; Scale -- a list of pitches above 1/1, the last of them the period.
+;;;
+;;; Layout: [int64 n][char *description][n x {double cents; int64 num, den}],
+;;; den = 0 for a pitch given in cents.
+(defopaque Scale :ptr<void>)
+
+;;; Keymap -- which notes play which scale degrees, and the reference pitch.
+;;;
+;;; Layout: [int64 size, first, last, middle, reference][double freq]
+;;; [int64 octave][int64 map[size]], map entries < 0 unmapped.
+(defopaque Keymap :ptr<void>)
+
+;;; Tuning -- a scale under a keymap, flattened into one repeating pattern.
+;;;
+;;; Layout: [void *scale, *keymap][int64 plen][double delta, ref][int64 asc]
+;;; [double pc[plen]][unsigned char mapped[plen]]: key middle + q*plen + i
+;;; sounds q*delta + pc[i] - ref cents above the reference note.
+(defopaque Tuning :ptr<void>)
+
+;; ---------------------------------------------------------------------------
+;; Internal helpers
+;; ---------------------------------------------------------------------------
+
+;;; __tuning_msg -- a fresh heap copy of `fmt` with one integer formatted in.
+(defn __tuning_msg [fmt :cstr k :int] : cstr
+  ```c
+  char *b = (char *)malloc(256);
+  if (!b) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  snprintf(b, 256, fmt, (long long)k);
+  return b;
+  ```)
+
+;;; __scale_alloc -- a scale of `n` (clamped to [1, 1048576]) zero-cent
+;;; degrees, with a copy of `desc` (trimmed, line breaks turned into spaces).
+(defn __scale_alloc [n :int desc :cstr] : ptr<void>
+  ```c
+  typedef struct { double cents; int64_t num, den; } Deg;
+  typedef struct { int64_t n; char *desc; Deg d[]; } Scl;
+  int64_t len = n;
+  if (len < 1) len = 1;
+  if (len > 1048576) len = 1048576;
+  Scl *s = (Scl *)calloc(1, sizeof(Scl) + (size_t)len * sizeof(Deg));
+  /* one line, trimmed, as scl-parse would read it back */
+  const char *a = desc, *e = desc + strlen(desc);
+  while (*a == ' ' || *a == '\t' || *a == '\n' || *a == '\r') a++;
+  while (e > a && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' || e[-1] == '\r')) e--;
+  size_t dn = (size_t)(e - a);
+  char *dc = (char *)malloc(dn + 1);
+  if (!s || !dc) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  for (size_t i = 0; i < dn; i++) dc[i] = (a[i] == '\n' || a[i] == '\r') ? ' ' : a[i];
+  dc[dn] = 0;
+  s->n = len;
+  s->desc = dc;
+  return s;
+  ```)
+
+;;; __scale_free -- release a scale `scale-new` rejected.
+(defn __scale_free [s : ptr<void>] : nil
+  ```c
+  typedef struct { int64_t n; char *desc; } Scl;
+  free(((Scl *)s)->desc);
+  free(s);
+  ```)
+
+;;; __scale_set_cents! -- make degree `k` (1-based) of `s` `c` cents.
+(defn __scale_set_cents! [s : ptr<void> k :int c :float] : nil
+  ```c
+  typedef struct { double cents; int64_t num, den; } Deg;
+  typedef struct { int64_t n; char *desc; Deg d[]; } Scl;
+  Deg *d = &((Scl *)s)->d[k - 1];
+  d->cents = c; d->num = 0; d->den = 0;
+  ```)
+
+;;; __scale_set_ratio! -- make degree `k` (1-based) of `s` the ratio num/den.
+(defn __scale_set_ratio! [s : ptr<void> k :int num :int den :int] : nil
+  ```c
+  /* __tur_autolink__: -lm */
+  extern double log2(double);
+  typedef struct { double cents; int64_t num, den; } Deg;
+  typedef struct { int64_t n; char *desc; Deg d[]; } Scl;
+  Deg *d = &((Scl *)s)->d[k - 1];
+  d->num = num; d->den = den;
+  d->cents = 1200.0 * log2((double)num / (double)den);
+  ```)
+
+;;; __finite? -- true unless `x` is NaN or infinite.
+(defn __finite? [x :float] : bool
+  (and (= x x) (< x 1.0e308) (> x -1.0e308)))
+
+;;; __scale_ratio? -- whether degree `k` (1-based) was given as a ratio.
+(defn __scale_ratio? [s : Scale k :int] : bool
+  ```c
+  typedef struct { double cents; int64_t num, den; } Deg;
+  typedef struct { int64_t n; char *desc; Deg d[]; } Scl;
+  return ((Scl *)(intptr_t)s)->d[k - 1].den != 0;
+  ```)
+
+;;; __scale_num -- numerator of ratio degree `k` (1-based).
+(defn __scale_num [s : Scale k :int] : int
+  ```c
+  typedef struct { double cents; int64_t num, den; } Deg;
+  typedef struct { int64_t n; char *desc; Deg d[]; } Scl;
+  return ((Scl *)(intptr_t)s)->d[k - 1].num;
+  ```)
+
+;;; __scale_den -- denominator of ratio degree `k` (1-based).
+(defn __scale_den [s : Scale k :int] : int
+  ```c
+  typedef struct { double cents; int64_t num, den; } Deg;
+  typedef struct { int64_t n; char *desc; Deg d[]; } Scl;
+  return ((Scl *)(intptr_t)s)->d[k - 1].den;
+  ```)
+
+;; ---------------------------------------------------------------------------
+;; Scales
+;; ---------------------------------------------------------------------------
+
+;;; __scale_fill -- store `pitches` into `s`; 0, or the 1-based index of the
+;;; first pitch that is not a positive ratio or a finite cents value.
+(defn __scale_fill [s : ptr<void> pitches : (Vec Pitch)] : int
+  (let [n      (vec-len pitches)
+        ^mut i 0
+        ^mut bad 0]
+    (while (< i n)
+      (match (vec-get pitches i)
+        (Cents c)   (if (__finite? c)
+                      (__scale_set_cents! s (+ i 1) c)
+                      (when (= bad 0) (set! bad (+ i 1))))
+        (Ratio a b) (if (and (> a 0) (> b 0))
+                      (__scale_set_ratio! s (+ i 1) a b)
+                      (when (= bad 0) (set! bad (+ i 1)))))
+      (set! i (+ i 1)))
+    bad))
+
+;;; scale-new -- a scale from a description and its pitches.
+;;;
+;;; The pitches are the scale's degrees in order, above an implicit 1/1 that
+;;; is not listed; the last is the period (usually `(Ratio 2 1)`). They need
+;;; not be ascending, but `ftom-tuned` only inverts a tuning that rises.
+;;;
+;;; Parameters:
+;;;   description -- one line of text, kept for `scale->scl`
+;;;   pitches     -- the degrees, at least one; ratios must be positive and
+;;;                  cents finite
+;;;
+;;; Returns:
+;;;   (Ok scale), or (Err message) naming the first bad pitch.
+;;;
+;;; Example:
+;;;   ;; 5-limit just major
+;;;   (scale-new "Just major" [(Ratio 9 8) (Ratio 5 4) (Ratio 4 3) (Ratio 3 2)
+;;;                            (Ratio 5 3) (Ratio 15 8) (Ratio 2 1)])
+;;;
+;;; Since: signal v0.1.0
+(defn scale-new [description : cstr pitches : (Vec Pitch)] : (Result Scale String)
+  (if (< (vec-len pitches) 1)
+    (Err (string/from-cstr "a scale needs at least one pitch"))
+    (let [s   (__scale_alloc (vec-len pitches) description)
+          bad (__scale_fill s pitches)]
+      (if (= bad 0)
+        (Ok (:: s Scale))
+        (do (__scale_free s)
+            (Err (string/adopt-cstr
+                   (__tuning_msg "pitch %lld: a ratio must be positive and cents finite"
+                                 bad))))))))
+
+;;; __scale_edo -- n equal divisions of 2/1 (see scale-edo).
+(defn __scale_edo [n :int] : ptr<void>
+  ```c
+  typedef struct { double cents; int64_t num, den; } Deg;
+  typedef struct { int64_t n; char *desc; Deg d[]; } Scl;
+  int64_t len = n;
+  if (len < 1) len = 1;
+  if (len > 1048576) len = 1048576;
+  Scl *s = (Scl *)calloc(1, sizeof(Scl) + (size_t)len * sizeof(Deg));
+  char *dc = (char *)malloc(64);
+  if (!s || !dc) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  snprintf(dc, 64, "%lld equal divisions of the octave", (long long)len);
+  s->n = len;
+  s->desc = dc;
+  for (int64_t i = 1; i < len; i++) s->d[i - 1].cents = 1200.0 * (double)i / (double)len;
+  s->d[len - 1].cents = 1200.0;
+  s->d[len - 1].num = 2;
+  s->d[len - 1].den = 1;
+  return s;
+  ```)
+
+;;; scale-edo -- `n` equal divisions of the octave.
+;;;
+;;; Degrees 1 .. n-1 are 1200*k/n cents and the period is the ratio 2/1, so
+;;; `(scale-edo 12)` is twelve-tone equal temperament.
+;;;
+;;; Parameters:
+;;;   n -- steps per octave, clamped to [1, 1048576]
+;;;
+;;; Returns:
+;;;   The scale.
+;;;
+;;; Example:
+;;;   (scale-cents (scale-edo 19) 1)  ; => 63.1579
+;;;
+;;; Since: signal v0.1.0
+(defn scale-edo [n :int] : Scale
+  (:: (__scale_edo n) Scale))
+
+;;; scale-size -- the number of pitches in a scale, the period included.
+;;;
+;;; Parameters:
+;;;   s -- the scale
+;;;
+;;; Returns:
+;;;   The note count of its `.scl` file; 12 for `(scale-edo 12)`.
+;;;
+;;; Example:
+;;;   (scale-size (scale-edo 31))  ; => 31
+;;;
+;;; Since: signal v0.1.0
+(defn scale-size [s : Scale] : int
+  ```c
+  return ((int64_t *)(intptr_t)s)[0];
+  ```)
+
+;;; scale-description -- the scale's one-line description.
+;;;
+;;; Parameters:
+;;;   s -- the scale
+;;;
+;;; Returns:
+;;;   The description, owned by the scale (valid for the process).
+;;;
+;;; Example:
+;;;   (scale-description (scale-edo 19))  ; => "19 equal divisions of the octave"
+;;;
+;;; Since: signal v0.1.0
+(defn scale-description [s : Scale] : cstr
+  ```c
+  typedef struct { int64_t n; char *desc; } Scl;
+  return ((Scl *)(intptr_t)s)->desc;
+  ```)
+
+;;; __scale_degree_cents -- cents of degree `k` (1-based, in range).
+(defn __scale_degree_cents [s : Scale k :int] : float
+  ```c
+  typedef struct { double cents; int64_t num, den; } Deg;
+  typedef struct { int64_t n; char *desc; Deg d[]; } Scl;
+  return ((Scl *)(intptr_t)s)->d[k - 1].cents;
+  ```)
+
+;;; scale-pitch -- degree `k` of a scale, as it was given.
+;;;
+;;; Parameters:
+;;;   s -- the scale
+;;;   k -- the degree: 0 is the implicit 1/1, `(scale-size s)` the period
+;;;
+;;; Returns:
+;;;   (some pitch) for 0 <= k <= size -- degree 0 is `(Ratio 1 1)` -- and
+;;;   (none) outside that range.
+;;;
+;;; Example:
+;;;   (scale-pitch (scale-edo 12) 12)  ; => (some (Ratio 2 1))
+;;;
+;;; Since: signal v0.1.0
+(defn scale-pitch [s : Scale k :int] : (Option Pitch)
+  (if (or (< k 0) (> k (scale-size s)))
+    (none)
+    (if (= k 0)
+      (some (Ratio 1 1))
+      (if (__scale_ratio? s k)
+        (some (Ratio (__scale_num s k) (__scale_den s k)))
+        (some (Cents (__scale_degree_cents s k)))))))
+
+;;; scale-cents -- the size of degree `k` in cents, for any integer `k`.
+;;;
+;;; Degree 0 is 0 cents and degree size is the period; past either end the
+;;; scale repeats a period up or down, so degree size + 2 is the period plus
+;;; degree 2, and degree -1 is degree size - 1 less a period.
+;;;
+;;; Parameters:
+;;;   s -- the scale
+;;;   k -- any degree
+;;;
+;;; Returns:
+;;;   Cents above the 1/1.
+;;;
+;;; Example:
+;;;   (scale-cents (scale-edo 12) 7)    ; => 700
+;;;   (scale-cents (scale-edo 12) 14)   ; => 1400
+;;;   (scale-cents (scale-edo 12) -1)   ; => -100
+;;;
+;;; Since: signal v0.1.0
+(defn scale-cents [s : Scale k :int] : float
+  ```c
+  typedef struct { double cents; int64_t num, den; } Deg;
+  typedef struct { int64_t n; char *desc; Deg d[]; } Scl;
+  const Scl *sc = (const Scl *)(intptr_t)s;
+  int64_t n = sc->n, q = k / n, r = k % n;
+  if (r < 0) { r += n; q -= 1; }
+  return (double)q * sc->d[n - 1].cents + (r ? sc->d[r - 1].cents : 0.0);
+  ```)
+
+;;; scale-period -- the interval the scale repeats at, in cents.
+;;;
+;;; Parameters:
+;;;   s -- the scale
+;;;
+;;; Returns:
+;;;   The size of its last degree; 1200 for an octave-repeating scale.
+;;;
+;;; Example:
+;;;   (scale-period (scale-edo 19))  ; => 1200
+;;;
+;;; Since: signal v0.1.0
+(defn scale-period [s : Scale] : float
+  (scale-cents s (scale-size s)))
+
+;;; __scl_parse -- the .scl parser; the error is a heap cstr.
+(defn __scl_parse [text :cstr] : (Result ptr<void> cstr)
+  ```c
+  /* __tur_autolink__: -lm */
+  #include <errno.h>
+  extern double log2(double);
+  typedef struct { double cents; int64_t num, den; } Deg;
+  typedef struct { int64_t n; char *desc; Deg d[]; } Scl;
+  char *err = (char *)malloc(256);
+  if (!err) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  const char *p = text;
+  int64_t lineno = 0, state = 0, count = 0, got = 0, lines = 1;
+  char *desc = NULL;
+  Scl *s = NULL;
+  /* every degree is on a line of its own, so the line count bounds them */
+  for (const char *q = text; *q; q++)
+    if (*q == '\n' || (*q == '\r' && q[1] != '\n')) lines++;
+  while (*p) {
+    const char *a = p, *b;
+    while (*p && *p != '\n' && *p != '\r') p++;
+    b = p;
+    if (*p == '\r' && p[1] == '\n') p += 2; else if (*p) p++;
+    lineno++;
+    if (a < b && *a == '!') continue;                /* a comment */
+    while (a < b && (*a == ' ' || *a == '\t')) a++;
+    while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+    if (state == 0) {                                /* the description */
+      desc = (char *)malloc((size_t)(b - a) + 1);
+      if (!desc) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+      memcpy(desc, a, (size_t)(b - a));
+      desc[b - a] = 0;
+      state = 1;
+      continue;
+    }
+    if (a == b) continue;                            /* a blank line */
+    /* The value is the first word; anything after it is a comment. */
+    const char *t = a;
+    while (t < b && *t != ' ' && *t != '\t' && *t != '!') t++;
+    char tok[64];
+    size_t tn = (size_t)(t - a);
+    if (tn >= sizeof tok) {
+      snprintf(err, 256, "line %lld: value too long", (long long)lineno);
+      goto fail;
+    }
+    memcpy(tok, a, tn);
+    tok[tn] = 0;
+    if (state == 1) {                                /* the note count */
+      char *e;
+      errno = 0;
+      long long c = strtoll(tok, &e, 10);
+      if (tn == 0 || *e || errno) {
+        snprintf(err, 256, "line %lld: expected the number of notes, got '%s'", (long long)lineno, tok);
+        goto fail;
+      }
+      if (c < 1) {
+        snprintf(err, 256, "line %lld: a scale needs at least one note, got %lld", (long long)lineno, c);
+        goto fail;
+      }
+      if (c > lines || c > 1048576) {
+        snprintf(err, 256, "line %lld: %lld notes, but the file cannot hold that many", (long long)lineno, c);
+        goto fail;
+      }
+      count = c;
+      s = (Scl *)calloc(1, sizeof(Scl) + (size_t)count * sizeof(Deg));
+      if (!s) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+      s->n = count;
+      s->desc = desc;
+      desc = NULL;
+      state = 2;
+      continue;
+    }
+    /* a pitch: cents if it has a '.', else a ratio n/d or a whole number n */
+    Deg d = {0.0, 0, 0};
+    if (strchr(tok, '.')) {
+      char *e;
+      d.cents = strtod(tok, &e);
+      if (e == tok || *e || !(d.cents == d.cents) || d.cents > 1e300 || d.cents < -1e300) {
+        snprintf(err, 256, "line %lld: bad cents value '%s'", (long long)lineno, tok);
+        goto fail;
+      }
+    } else {
+      char *sl = strchr(tok, '/'), *e;
+      long long nu, de = 1;
+      int ok = tok[0] >= '0' && tok[0] <= '9';
+      errno = 0;
+      nu = strtoll(tok, &e, 10);
+      if (!ok || errno || (sl ? e != sl : *e != 0)) ok = 0;
+      if (ok && sl) {
+        ok = sl[1] >= '0' && sl[1] <= '9';
+        errno = 0;
+        de = strtoll(sl + 1, &e, 10);
+        if (errno || *e) ok = 0;
+      }
+      if (!ok) {
+        snprintf(err, 256, "line %lld: bad pitch '%s' (expected cents like 701.955 or a ratio like 3/2)", (long long)lineno, tok);
+        goto fail;
+      }
+      if (nu <= 0 || de <= 0) {
+        snprintf(err, 256, "line %lld: the ratio '%s' is not positive", (long long)lineno, tok);
+        goto fail;
+      }
+      d.num = nu;
+      d.den = de;
+      d.cents = 1200.0 * log2((double)nu / (double)de);
+    }
+    s->d[got++] = d;
+    if (got == count) { state = 3; break; }          /* the rest is ignored */
+  }
+  if (state == 0) { snprintf(err, 256, "no description line"); goto fail; }
+  if (state == 1) { snprintf(err, 256, "no note count"); goto fail; }
+  if (state == 2) {
+    snprintf(err, 256, "expected %lld notes, found %lld", (long long)count, (long long)got);
+    goto fail;
+  }
+  free(err);
+  return tur_ok_ptr(s);
+fail:
+  if (s) { free(s->desc); free(s); }
+  free(desc);
+  return tur_err_ptr(err);
+  ```)
+
+;;; scl-parse -- read a scale from the text of a Scala `.scl` file.
+;;;
+;;; The format: lines starting with `!` are comments; the first other line is
+;;; the description (possibly empty), the next the number of notes, then one
+;;; pitch per line -- cents if it contains a `.` (`701.955`, `-5.`), else a
+;;; ratio (`3/2`) or a whole number (`2`, meaning 2/1). Text after the value
+;;; on a pitch line is ignored, as are blank lines between pitches and every
+;;; line after the last. Line endings may be LF, CRLF or CR.
+;;;
+;;; Parameters:
+;;;   text -- the file's contents
+;;;
+;;; Returns:
+;;;   (Ok scale), or (Err message) naming the line at fault.
+;;;
+;;; Example:
+;;;   (scl-parse "! pelog.scl\nA pentatonic\n 5\n 120.\n 270.\n 540.\n 670.\n 2/1\n")
+;;;
+;;; Since: signal v0.1.0
+(defn scl-parse [text : cstr] : (Result Scale String)
+  (match (__scl_parse text)
+    (Ok s)  (Ok (:: s Scale))
+    (Err m) (Err (string/adopt-cstr m))))
+
+;;; __tuning_slurp -- a file's contents as a heap cstr, or an error message.
+(defn __tuning_slurp [path :cstr] #fx{FS} : (Result cstr cstr)
+  ```c
+  #include <errno.h>
+  char *err = (char *)malloc(512);
+  if (!err) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    snprintf(err, 512, "cannot read '%s': %s", path, strerror(errno));
+    return tur_err_ptr(err);
+  }
+  size_t cap = 4096, len = 0;
+  char *buf = (char *)malloc(cap);
+  if (!buf) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  for (;;) {
+    if (cap - len < 2) {
+      char *g = (char *)realloc(buf, cap * 2);
+      if (!g) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+      buf = g;
+      cap *= 2;
+    }
+    size_t got = fread(buf + len, 1, cap - len - 1, f);
+    len += got;
+    if (got == 0) break;
+  }
+  int bad = ferror(f);
+  fclose(f);
+  if (bad) {
+    free(buf);
+    snprintf(err, 512, "cannot read '%s': read error", path);
+    return tur_err_ptr(err);
+  }
+  buf[len] = 0;
+  free(err);
+  return tur_ok_ptr(buf);
+  ```)
+
+;;; __tuning_free -- free a heap cstr from __tuning_slurp.
+(defn __tuning_free [p :cstr] : nil
+  ```c
+  free((void *)p);
+  ```)
+
+;;; scl-load -- read a scale from a Scala `.scl` file.
+;;;
+;;; Parameters:
+;;;   path -- the file
+;;;
+;;; Returns:
+;;;   (Ok scale), or (Err message) if the file cannot be read or parsed.
+;;;
+;;; Example:
+;;;   (scl-load "scales/marvel12.scl")
+;;;
+;;; Since: signal v0.1.0
+(defn scl-load [path : cstr] #fx{FS} : (Result Scale String)
+  (match (__tuning_slurp path)
+    (Ok text) (let [r (scl-parse text)]
+                (__tuning_free text)
+                r)
+    (Err m)   (Err (string/adopt-cstr m))))
+
+;;; __tuning_fmt_num -- the shortest decimal that reads back as `v`, always
+;;; with a '.', as a heap cstr.
+;;;
+;;; Neither format can carry an exponent, so `%g` output with one is skipped.
+(defn __tuning_fmt_num [v :float] : cstr
+  ```c
+  char *o = (char *)malloc(400);
+  if (!o) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  int found = 0;
+  for (int prec = 1; prec <= 17 && !found; prec++) {
+    snprintf(o, 400, "%.*g", prec, v);
+    found = !strchr(o, 'e') && strtod(o, NULL) == v;
+  }
+  if (!found) snprintf(o, 400, (v >= 1.0 || v <= -1.0) ? "%.1f" : "%.17f", v);
+  if (!strchr(o, '.')) strcat(o, ".0");
+  return o;
+  ```)
+
+;;; __scl_header -- the .scl text up to the first pitch, as a heap cstr.
+(defn __scl_header [s : Scale] : cstr
+  ```c
+  typedef struct { int64_t n; char *desc; } Scl;
+  const Scl *sc = (const Scl *)(intptr_t)s;
+  size_t cap = 96 + strlen(sc->desc);
+  char *o = (char *)malloc(cap);
+  if (!o) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  /* a description starting with '!' would read back as a comment */
+  snprintf(o, cap, "! Written by tur-signal\n!\n%s%s\n %lld\n!\n",
+           sc->desc[0] == '!' ? " " : "", sc->desc, (long long)sc->n);
+  return o;
+  ```)
+
+;;; __scl_ratio -- "n/d" for ratio degree `k` (1-based), as a heap cstr.
+(defn __scl_ratio [s : Scale k :int] : cstr
+  ```c
+  typedef struct { double cents; int64_t num, den; } Deg;
+  typedef struct { int64_t n; char *desc; Deg d[]; } Scl;
+  const Deg *d = &((const Scl *)(intptr_t)s)->d[k - 1];
+  char *o = (char *)malloc(48);
+  if (!o) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  snprintf(o, 48, "%lld/%lld", (long long)d->num, (long long)d->den);
+  return o;
+  ```)
+
+;;; __scl_line! -- append " <value>\n" to the builder, taking `v` (heap).
+(defn __scl_line! [b : StringBuilder v :cstr] : nil
+  (builder/push-cstr! b " ")
+  (builder/push-cstr! b v)
+  (builder/push-cstr! b "\n")
+  (__tuning_free v))
+
+;;; scale->scl -- the text of a Scala `.scl` file for a scale.
+;;;
+;;; Ratios are written as ratios and cents in the fewest digits that read
+;;; back exactly, so `(scl-parse (scale->scl s))` is `s` again. Write it to a
+;;; file with stdlib `fs/write-text`.
+;;;
+;;; Parameters:
+;;;   s -- the scale
+;;;
+;;; Returns:
+;;;   The file's contents.
+;;;
+;;; Example:
+;;;   (println (string/to-cstr (scale->scl (scale-edo 5))))
+;;;   ;; ! Written by tur-signal
+;;;   ;; !
+;;;   ;; 5 equal divisions of the octave
+;;;   ;;  5
+;;;   ;; !
+;;;   ;;  240.0
+;;;   ;;  480.0
+;;;   ;;  720.0
+;;;   ;;  960.0
+;;;   ;;  2/1
+;;;
+;;; Since: signal v0.1.0
+(defn scale->scl [s : Scale] : String
+  (let [b      (builder/new)
+        n      (scale-size s)
+        ^mut k 1]
+    (let [h (__scl_header s)]
+      (builder/push-cstr! b h)
+      (__tuning_free h))
+    (while (<= k n)
+      (if (__scale_ratio? s k)
+        (__scl_line! b (__scl_ratio s k))
+        (__scl_line! b (__tuning_fmt_num (__scale_degree_cents s k))))
+      (set! k (+ k 1)))
+    (builder/finish b)))
+
+;; ---------------------------------------------------------------------------
+;; Keymaps
+;; ---------------------------------------------------------------------------
+
+;;; __keymap_alloc -- a keymap with `size` unmapped entries.
+(defn __keymap_alloc [size :int first :int last :int middle :int ref :int freq :float octave :int] : ptr<void>
+  ```c
+  typedef struct { int64_t size, first, last, middle, ref; double freq; int64_t octave; int64_t map[]; } Kbm;
+  int64_t n = size < 0 ? 0 : size;
+  Kbm *k = (Kbm *)calloc(1, sizeof(Kbm) + (size_t)n * sizeof(int64_t));
+  if (!k) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  k->size = n; k->first = first; k->last = last; k->middle = middle;
+  k->ref = ref; k->freq = freq; k->octave = octave;
+  for (int64_t i = 0; i < n; i++) k->map[i] = -1;
+  return k;
+  ```)
+
+;;; __keymap_map! -- make entry `i` of `k` play degree `d` (>= 0).
+(defn __keymap_map! [k : ptr<void> i :int d :int] : nil
+  ```c
+  typedef struct { int64_t size, first, last, middle, ref; double freq; int64_t octave; int64_t map[]; } Kbm;
+  ((Kbm *)k)->map[i] = d;
+  ```)
+
+;;; __keymap_raw -- entry `i` of `k`: the degree, or -1 if unmapped.
+(defn __keymap_raw [k : Keymap i :int] : int
+  ```c
+  typedef struct { int64_t size, first, last, middle, ref; double freq; int64_t octave; int64_t map[]; } Kbm;
+  return ((const Kbm *)(intptr_t)k)->map[i];
+  ```)
+
+;;; keymap-linear -- every key plays the next scale degree.
+;;;
+;;; The Scala keymap of size 0: note `middle` plays degree 0, `middle + 1`
+;;; degree 1 and so on through the periods, and note `ref-key` sounds at
+;;; `ref-freq` Hz. `(keymap-linear 60 69 440.0)` puts the scale's 1/1 on
+;;; middle C and tunes A4 to 440 Hz, which under `(scale-edo 12)` is standard
+;;; tuning. Retunes notes 0 to 127 in its `.kbm` form.
+;;;
+;;; Parameters:
+;;;   middle   -- the note that plays degree 0
+;;;   ref-key  -- the note whose frequency is fixed
+;;;   ref-freq -- its frequency in Hz, > 0
+;;;
+;;; Returns:
+;;;   The keymap.
+;;;
+;;; Example:
+;;;   (keymap-linear 60 69 440.0)
+;;;
+;;; Since: signal v0.1.0
+(defn keymap-linear [middle :int ref-key :int ref-freq :float] : Keymap
+  (:: (__keymap_alloc 0 0 127 middle ref-key ref-freq 0) Keymap))
+
+;;; __keymap_fill -- store `entries` into `k`; 0, or the 1-based index of the
+;;; first negative degree.
+(defn __keymap_fill [k : ptr<void> entries : (Vec MapEntry)] : int
+  (let [n      (vec-len entries)
+        ^mut i 0
+        ^mut bad 0]
+    (while (< i n)
+      (match (vec-get entries i)
+        (Degree d) (if (>= d 0)
+                     (__keymap_map! k i d)
+                     (when (= bad 0) (set! bad (+ i 1))))
+        (Unmapped) (set! bad bad))
+      (set! i (+ i 1)))
+    bad))
+
+;;; __keymap_ref_mapped? -- whether the reference note plays a degree.
+(defn __keymap_ref_mapped? [k : Keymap] : bool
+  ```c
+  typedef struct { int64_t size, first, last, middle, ref; double freq; int64_t octave; int64_t map[]; } Kbm;
+  const Kbm *km = (const Kbm *)(intptr_t)k;
+  if (km->size == 0) return 1;
+  int64_t j = (km->ref - km->middle) % km->size;
+  if (j < 0) j += km->size;
+  return km->map[j] >= 0;
+  ```)
+
+;;; keymap-new -- a keymap that repeats a pattern of entries.
+;;;
+;;; Note `middle + i` plays entry i, for i in [0, size); the pattern then
+;;; repeats every `size` notes, each repetition `octave-degree` scale degrees
+;;; higher (the Scala "formal octave": 0 means the scale's own period). So a
+;;; 7-note scale on the white keys from middle C is the 12 entries
+;;; `[(Degree 0) (Unmapped) (Degree 1) (Unmapped) (Degree 2) (Degree 3)
+;;;   (Unmapped) (Degree 4) (Unmapped) (Degree 5) (Unmapped) (Degree 6)]`
+;;; with formal octave 7. An empty pattern is a linear map, as
+;;; `keymap-linear`. The `.kbm` form retunes notes 0 to 127.
+;;;
+;;; Parameters:
+;;;   middle        -- the note that plays the first entry
+;;;   ref-key       -- the note whose frequency is fixed; must be mapped
+;;;   ref-freq      -- its frequency in Hz, > 0
+;;;   octave-degree -- the degree each repetition rises by, >= 0
+;;;   entries       -- the pattern; degrees must be >= 0
+;;;
+;;; Returns:
+;;;   (Ok keymap), or (Err message).
+;;;
+;;; Example:
+;;;   ;; two keys: the 1/1 and the fifth (degree 7 of 12), repeating by octaves
+;;;   (keymap-new 60 60 261.6256 12 [(Degree 0) (Degree 7)])
+;;;
+;;; Since: signal v0.1.0
+(defn keymap-new [middle :int ref-key :int ref-freq :float octave-degree :int entries : (Vec MapEntry)] : (Result Keymap String)
+  (if (not (and (__finite? ref-freq) (> ref-freq 0.0)))
+    (Err (string/from-cstr "the reference frequency must be a positive number"))
+    (if (< octave-degree 0)
+      (Err (string/from-cstr "the formal octave degree must be >= 0"))
+      (let [k   (__keymap_alloc (vec-len entries) 0 127 middle ref-key ref-freq octave-degree)
+            bad (__keymap_fill k entries)]
+        (if (> bad 0)
+          (Err (string/adopt-cstr (__tuning_msg "entry %lld: a degree must be >= 0" bad)))
+          (if (__keymap_ref_mapped? (:: k Keymap))
+            (Ok (:: k Keymap))
+            (Err (string/adopt-cstr
+                   (__tuning_msg "the reference note %lld is unmapped" ref-key)))))))))
+
+;;; keymap-size -- the length of the pattern; 0 for a linear map.
+;;;
+;;; Parameters:
+;;;   k -- the keymap
+;;;
+;;; Returns:
+;;;   The number of entries.
+;;;
+;;; Example:
+;;;   (keymap-size (keymap-linear 60 69 440.0))  ; => 0
+;;;
+;;; Since: signal v0.1.0
+(defn keymap-size [k : Keymap] : int
+  ```c
+  return ((const int64_t *)(intptr_t)k)[0];
+  ```)
+
+;;; keymap-first -- the first note the `.kbm` file retunes.
+;;;
+;;; Kept for `keymap->kbm`; `mtof-tuned` retunes every note.
+;;;
+;;; Parameters:
+;;;   k -- the keymap
+;;;
+;;; Returns:
+;;;   The note number; 0 unless a `.kbm` said otherwise.
+;;;
+;;; Example:
+;;;   (keymap-first (keymap-linear 60 69 440.0))  ; => 0
+;;;
+;;; Since: signal v0.1.0
+(defn keymap-first [k : Keymap] : int
+  ```c
+  return ((const int64_t *)(intptr_t)k)[1];
+  ```)
+
+;;; keymap-last -- the last note the `.kbm` file retunes.
+;;;
+;;; Kept for `keymap->kbm`; `mtof-tuned` retunes every note.
+;;;
+;;; Parameters:
+;;;   k -- the keymap
+;;;
+;;; Returns:
+;;;   The note number; 127 unless a `.kbm` said otherwise.
+;;;
+;;; Example:
+;;;   (keymap-last (keymap-linear 60 69 440.0))  ; => 127
+;;;
+;;; Since: signal v0.1.0
+(defn keymap-last [k : Keymap] : int
+  ```c
+  return ((const int64_t *)(intptr_t)k)[2];
+  ```)
+
+;;; keymap-middle -- the note that plays the pattern's first entry.
+;;;
+;;; Parameters:
+;;;   k -- the keymap
+;;;
+;;; Returns:
+;;;   The note number.
+;;;
+;;; Example:
+;;;   (keymap-middle (keymap-linear 60 69 440.0))  ; => 60
+;;;
+;;; Since: signal v0.1.0
+(defn keymap-middle [k : Keymap] : int
+  ```c
+  return ((const int64_t *)(intptr_t)k)[3];
+  ```)
+
+;;; keymap-reference -- the note whose frequency is fixed.
+;;;
+;;; Parameters:
+;;;   k -- the keymap
+;;;
+;;; Returns:
+;;;   The note number.
+;;;
+;;; Example:
+;;;   (keymap-reference (keymap-linear 60 69 440.0))  ; => 69
+;;;
+;;; Since: signal v0.1.0
+(defn keymap-reference [k : Keymap] : int
+  ```c
+  return ((const int64_t *)(intptr_t)k)[4];
+  ```)
+
+;;; keymap-frequency -- the reference note's frequency.
+;;;
+;;; Parameters:
+;;;   k -- the keymap
+;;;
+;;; Returns:
+;;;   Hz.
+;;;
+;;; Example:
+;;;   (keymap-frequency (keymap-linear 60 69 440.0))  ; => 440
+;;;
+;;; Since: signal v0.1.0
+(defn keymap-frequency [k : Keymap] : float
+  ```c
+  typedef struct { int64_t size, first, last, middle, ref; double freq; } Kbm;
+  return ((const Kbm *)(intptr_t)k)->freq;
+  ```)
+
+;;; keymap-octave-degree -- the scale degree each repetition rises by.
+;;;
+;;; Parameters:
+;;;   k -- the keymap
+;;;
+;;; Returns:
+;;;   The formal octave; 0 means the scale's period.
+;;;
+;;; Example:
+;;;   (keymap-octave-degree (keymap-linear 60 69 440.0))  ; => 0
+;;;
+;;; Since: signal v0.1.0
+(defn keymap-octave-degree [k : Keymap] : int
+  ```c
+  typedef struct { int64_t size, first, last, middle, ref; double freq; int64_t octave; } Kbm;
+  return ((const Kbm *)(intptr_t)k)->octave;
+  ```)
+
+;;; keymap-entries -- the pattern, as `keymap-new` takes it.
+;;;
+;;; Parameters:
+;;;   k -- the keymap
+;;;
+;;; Returns:
+;;;   A new Vec of `(keymap-size k)` entries; empty for a linear map.
+;;;
+;;; Example:
+;;;   (vec-len (keymap-entries (keymap-linear 60 69 440.0)))  ; => 0
+;;;
+;;; Since: signal v0.1.0
+(defn keymap-entries [k : Keymap] : (Vec MapEntry)
+  (let [out    (:: (vec-new) (Vec MapEntry))
+        n      (keymap-size k)
+        ^mut i 0]
+    (while (< i n)
+      (let [d (__keymap_raw k i)]
+        (if (< d 0)
+          (vec-push! out (Unmapped))
+          (vec-push! out (Degree d))))
+      (set! i (+ i 1)))
+    out))
+
+;;; __kbm_parse -- the .kbm parser; the error is a heap cstr.
+(defn __kbm_parse [text :cstr] : (Result ptr<void> cstr)
+  ```c
+  #include <errno.h>
+  typedef struct { int64_t size, first, last, middle, ref; double freq; int64_t octave; int64_t map[]; } Kbm;
+  static const char *what[] = {"map size", "first note", "last note", "middle note",
+                               "reference note", "reference frequency",
+                               "formal octave degree"};
+  char *err = (char *)malloc(256);
+  if (!err) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  Kbm hdr = {0, 0, 0, 0, 0, 0.0, 0};
+  Kbm *k = NULL;
+  const char *p = text;
+  int64_t lineno = 0, field = 0, got = 0;
+  while (*p && field < 8) {
+    const char *a = p, *b;
+    while (*p && *p != '\n' && *p != '\r') p++;
+    b = p;
+    if (*p == '\r' && p[1] == '\n') p += 2; else if (*p) p++;
+    lineno++;
+    if (a < b && *a == '!') continue;                /* a comment */
+    while (a < b && (*a == ' ' || *a == '\t')) a++;
+    if (a == b) continue;                            /* a blank line */
+    const char *t = a;
+    while (t < b && *t != ' ' && *t != '\t' && *t != '!') t++;
+    char tok[64];
+    size_t tn = (size_t)(t - a);
+    if (tn >= sizeof tok) {
+      snprintf(err, 256, "line %lld: value too long", (long long)lineno);
+      goto fail;
+    }
+    memcpy(tok, a, tn);
+    tok[tn] = 0;
+    if (field == 7) {                                /* a mapping entry */
+      if ((tok[0] == 'x' || tok[0] == 'X') && tok[1] == 0) {
+        got++;
+      } else {
+        char *e;
+        errno = 0;
+        long long v = strtoll(tok, &e, 10);
+        if (e == tok || *e || errno || v < 0) {
+          snprintf(err, 256, "line %lld: a mapping entry must be a scale degree >= 0 or x, got '%s'", (long long)lineno, tok);
+          goto fail;
+        }
+        k->map[got++] = v;
+      }
+      if (got == k->size) field = 8;                 /* the rest is ignored */
+      continue;
+    }
+    if (field == 5) {                                /* the frequency */
+      char *e;
+      double f = strtod(tok, &e);
+      if (e == tok || *e || !(f > 0.0 && f < 1e300)) {
+        snprintf(err, 256, "line %lld: the reference frequency must be a positive number, got '%s'", (long long)lineno, tok);
+        goto fail;
+      }
+      hdr.freq = f;
+      field++;
+      continue;
+    }
+    char *e;
+    errno = 0;
+    long long v = strtoll(tok, &e, 10);
+    if (e == tok || *e || errno) {
+      snprintf(err, 256, "line %lld: expected the %s, got '%s'", (long long)lineno, what[field], tok);
+      goto fail;
+    }
+    switch (field) {
+    case 0:
+      if (v < 0 || v > 65536) {
+        snprintf(err, 256, "line %lld: the map size must be in [0, 65536], got %lld", (long long)lineno, v);
+        goto fail;
+      }
+      hdr.size = v;
+      break;
+    case 1: hdr.first = v; break;
+    case 2: hdr.last = v; break;
+    case 3: hdr.middle = v; break;
+    case 4: hdr.ref = v; break;
+    case 6:
+      if (v < 0) {
+        snprintf(err, 256, "line %lld: the formal octave degree must be >= 0, got %lld", (long long)lineno, v);
+        goto fail;
+      }
+      hdr.octave = v;
+      break;
+    }
+    field++;
+    if (field == 7) {
+      k = (Kbm *)calloc(1, sizeof(Kbm) + (size_t)hdr.size * sizeof(int64_t));
+      if (!k) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+      *k = hdr;
+      for (int64_t i = 0; i < k->size; i++) k->map[i] = -1;
+      if (k->size == 0) field = 8;
+    }
+  }
+  if (field < 7) { snprintf(err, 256, "missing the %s", what[field]); goto fail; }
+  /* entries left out at the end are unmapped */
+  if (k->size > 0) {
+    int64_t j = (k->ref - k->middle) % k->size;
+    if (j < 0) j += k->size;
+    if (k->map[j] < 0) {
+      snprintf(err, 256, "the reference note %lld is unmapped", (long long)k->ref);
+      goto fail;
+    }
+  }
+  free(err);
+  return tur_ok_ptr(k);
+fail:
+  free(k);
+  return tur_err_ptr(err);
+  ```)
+
+;;; kbm-parse -- read a keymap from the text of a Scala `.kbm` file.
+;;;
+;;; The format: `!` lines are comments; the others are, in order, the map
+;;; size, the first and last notes to retune, the middle note, the reference
+;;; note, its frequency, the formal octave degree, and then `size` mapping
+;;; entries, each a scale degree or `x` for an unmapped key. Entries left out
+;;; at the end are unmapped. The reference note must be mapped.
+;;;
+;;; Parameters:
+;;;   text -- the file's contents
+;;;
+;;; Returns:
+;;;   (Ok keymap), or (Err message) naming the line at fault.
+;;;
+;;; Example:
+;;;   ;; linear, A4 = 432 Hz
+;;;   (kbm-parse "0\n0\n127\n60\n69\n432.0\n0\n")
+;;;
+;;; Since: signal v0.1.0
+(defn kbm-parse [text : cstr] : (Result Keymap String)
+  (match (__kbm_parse text)
+    (Ok k)  (Ok (:: k Keymap))
+    (Err m) (Err (string/adopt-cstr m))))
+
+;;; kbm-load -- read a keymap from a Scala `.kbm` file.
+;;;
+;;; Parameters:
+;;;   path -- the file
+;;;
+;;; Returns:
+;;;   (Ok keymap), or (Err message) if the file cannot be read or parsed.
+;;;
+;;; Example:
+;;;   (kbm-load "maps/whitekeys.kbm")
+;;;
+;;; Since: signal v0.1.0
+(defn kbm-load [path : cstr] #fx{FS} : (Result Keymap String)
+  (match (__tuning_slurp path)
+    (Ok text) (let [r (kbm-parse text)]
+                (__tuning_free text)
+                r)
+    (Err m)   (Err (string/adopt-cstr m))))
+
+;;; __kbm_format -- the .kbm text of a keymap, given its frequency as text,
+;;; as a heap cstr.
+(defn __kbm_format [k : Keymap f :cstr] : cstr
+  ```c
+  typedef struct { int64_t size, first, last, middle, ref; double freq; int64_t octave; int64_t map[]; } Kbm;
+  const Kbm *km = (const Kbm *)(intptr_t)k;
+  size_t cap = 1024 + strlen(f) + (size_t)km->size * 24, len = 0;
+  char *o = (char *)malloc(cap);
+  if (!o) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  len += (size_t)snprintf(o + len, cap - len,
+    "! Written by tur-signal\n"
+    "! Size of map:\n%lld\n"
+    "! First MIDI note number to retune:\n%lld\n"
+    "! Last MIDI note number to retune:\n%lld\n"
+    "! Middle note where the first entry of the mapping is mapped to:\n%lld\n"
+    "! Reference note for which frequency is given:\n%lld\n"
+    "! Frequency to tune the above note to:\n%s\n"
+    "! Scale degree to consider as formal octave:\n%lld\n"
+    "! Mapping.\n",
+    (long long)km->size, (long long)km->first, (long long)km->last,
+    (long long)km->middle, (long long)km->ref, f, (long long)km->octave);
+  for (int64_t i = 0; i < km->size; i++) {
+    if (km->map[i] < 0) len += (size_t)snprintf(o + len, cap - len, "x\n");
+    else len += (size_t)snprintf(o + len, cap - len, "%lld\n", (long long)km->map[i]);
+  }
+  return o;
+  ```)
+
+;;; keymap->kbm -- the text of a Scala `.kbm` file for a keymap.
+;;;
+;;; The frequency is written in the fewest digits that read back exactly, so
+;;; `(kbm-parse (keymap->kbm k))` is `k` again.
+;;;
+;;; Parameters:
+;;;   k -- the keymap
+;;;
+;;; Returns:
+;;;   The file's contents.
+;;;
+;;; Example:
+;;;   (println (string/to-cstr (keymap->kbm (keymap-linear 60 69 440.0))))
+;;;
+;;; Since: signal v0.1.0
+(defn keymap->kbm [k : Keymap] : String
+  (let [f   (__tuning_fmt_num (keymap-frequency k))
+        out (string/adopt-cstr (__kbm_format k f))]
+    (__tuning_free f)
+    out))
+
+;; ---------------------------------------------------------------------------
+;; Tunings
+;; ---------------------------------------------------------------------------
+
+;;; __tuning_build -- flatten a scale under a keymap into one pattern.
+;;;
+;;; A linear map's pattern is the scale itself (plen = n, delta = period).
+;;; Otherwise the pattern is the keymap's: entry i sounds at the cents of its
+;;; degree, an unmapped entry at the point between its nearest mapped
+;;; neighbours (by key distance, in cents), and the pattern repeats delta =
+;;; the cents of the formal octave degree higher.
+(defn __tuning_build [s : Scale k : Keymap] : ptr<void>
+  ```c
+  typedef struct { double cents; int64_t num, den; } Deg;
+  typedef struct { int64_t n; char *desc; Deg d[]; } Scl;
+  typedef struct { int64_t size, first, last, middle, ref; double freq; int64_t octave; int64_t map[]; } Kbm;
+  typedef struct { void *s, *k; int64_t plen; double delta, ref; int64_t asc; double pc[]; } Tun;
+  const Scl *sc = (const Scl *)(intptr_t)s;
+  const Kbm *km = (const Kbm *)(intptr_t)k;
+  int64_t n = sc->n, plen = km->size ? km->size : n;
+  Tun *t = (Tun *)calloc(1, sizeof(Tun) + (size_t)plen * (sizeof(double) + 1));
+  if (!t) { fprintf(stderr, "tuning: alloc failed\n"); abort(); }
+  unsigned char *mapped = (unsigned char *)(t->pc + plen);
+  t->s = (void *)sc;
+  t->k = (void *)km;
+  t->plen = plen;
+  #define TUR_DEG_CENTS(deg, out) do { \
+      int64_t q_ = (deg) / n, r_ = (deg) % n; \
+      if (r_ < 0) { r_ += n; q_ -= 1; } \
+      (out) = (double)q_ * sc->d[n - 1].cents + (r_ ? sc->d[r_ - 1].cents : 0.0); \
+    } while (0)
+  if (km->size == 0) {
+    t->delta = sc->d[n - 1].cents;
+    for (int64_t i = 0; i < n; i++) { t->pc[i] = i ? sc->d[i - 1].cents : 0.0; mapped[i] = 1; }
+  } else {
+    int64_t od = km->octave > 0 ? km->octave : n;
+    TUR_DEG_CENTS(od, t->delta);
+    for (int64_t i = 0; i < plen; i++) {
+      mapped[i] = km->map[i] >= 0;
+      if (mapped[i]) TUR_DEG_CENTS(km->map[i], t->pc[i]);
+    }
+    /* The reference note is mapped, so every gap is closed within a pattern. */
+    for (int64_t i = 0; i < plen; i++) {
+      if (mapped[i]) continue;
+      int64_t a = 1, b = 1;
+      while (!mapped[(i - a + plen) % plen]) a++;
+      while (!mapped[(i + b) % plen]) b++;
+      double lo = i - a < 0 ? t->pc[i - a + plen] - t->delta : t->pc[i - a];
+      double hi = i + b >= plen ? t->pc[i + b - plen] + t->delta : t->pc[i + b];
+      t->pc[i] = lo + (hi - lo) * (double)a / (double)(a + b);
+    }
+  }
+  #undef TUR_DEG_CENTS
+  {
+    int64_t j = km->ref - km->middle, q = j / plen, r = j % plen;
+    if (r < 0) { r += plen; q -= 1; }
+    t->ref = (double)q * t->delta + t->pc[r];
+  }
+  /* ftom-tuned needs the pitch to rise (not fall) from each key to the next */
+  t->asc = t->delta > 0.0 && t->pc[plen - 1] <= t->pc[0] + t->delta;
+  for (int64_t i = 0; i + 1 < plen && t->asc; i++) if (t->pc[i + 1] < t->pc[i]) t->asc = 0;
+  return t;
+  ```)
+
+;;; tuning-new -- a scale played through a keymap.
+;;;
+;;; Parameters:
+;;;   s -- the scale
+;;;   k -- the keymap
+;;;
+;;; Returns:
+;;;   The tuning, for `mtof-tuned` and `ftom-tuned`.
+;;;
+;;; Example:
+;;;   ;; standard tuning: mtof-tuned of it is mtof
+;;;   (tuning-new (scale-edo 12) (keymap-linear 60 69 440.0))
+;;;
+;;; Since: signal v0.1.0
+(defn tuning-new [s : Scale k : Keymap] : Tuning
+  (:: (__tuning_build s k) Tuning))
+
+;;; __tuning_scale -- the scale pointer of a tuning.
+(defn __tuning_scale [t : Tuning] : ptr<void>
+  ```c
+  return ((void **)(intptr_t)t)[0];
+  ```)
+
+;;; __tuning_keymap -- the keymap pointer of a tuning.
+(defn __tuning_keymap [t : Tuning] : ptr<void>
+  ```c
+  return ((void **)(intptr_t)t)[1];
+  ```)
+
+;;; tuning-scale -- the scale a tuning plays.
+;;;
+;;; Parameters:
+;;;   t -- the tuning
+;;;
+;;; Returns:
+;;;   Its scale.
+;;;
+;;; Example:
+;;;   (scale-size (tuning-scale t))
+;;;
+;;; Since: signal v0.1.0
+(defn tuning-scale [t : Tuning] : Scale
+  (:: (__tuning_scale t) Scale))
+
+;;; tuning-keymap -- the keymap a tuning plays through.
+;;;
+;;; Parameters:
+;;;   t -- the tuning
+;;;
+;;; Returns:
+;;;   Its keymap.
+;;;
+;;; Example:
+;;;   (keymap-frequency (tuning-keymap t))  ; => the reference frequency
+;;;
+;;; Since: signal v0.1.0
+(defn tuning-keymap [t : Tuning] : Keymap
+  (:: (__tuning_keymap t) Keymap))
+
+;;; tuning-mapped? -- whether a note plays a scale degree of its own.
+;;;
+;;; An unmapped note (an `x` in the keymap) still has a pitch -- `mtof-tuned`
+;;; puts it between its mapped neighbours, so pitch bends glide through it --
+;;; but a player would normally leave it silent.
+;;;
+;;; Parameters:
+;;;   t   -- the tuning
+;;;   key -- a note number
+;;;
+;;; Returns:
+;;;   True if the keymap maps it; always true for a linear keymap.
+;;;
+;;; Example:
+;;;   (tuning-mapped? white-keys 61)  ; => false (C#4)
+;;;
+;;; Since: signal v0.1.0
+(defn tuning-mapped? [t : Tuning key :int] : bool
+  ```c
+  typedef struct { void *s, *k; int64_t plen; double delta, ref; int64_t asc; double pc[]; } Tun;
+  typedef struct { int64_t size, first, last, middle; } Kbm;
+  const Tun *tn = (const Tun *)(intptr_t)t;
+  const unsigned char *mapped = (const unsigned char *)(tn->pc + tn->plen);
+  int64_t j = (key - ((const Kbm *)tn->k)->middle) % tn->plen;
+  if (j < 0) j += tn->plen;
+  return mapped[j] != 0;
+  ```)
+
+;;; mtof-tuned -- note number to frequency in Hz, in a tuning.
+;;;
+;;; The tuning-aware `mtof`. Whole notes sound at the pitch of the degree the
+;;; keymap gives them (an unmapped note: between its mapped neighbours), the
+;;; reference note at the reference frequency. A fractional note lies that
+;;; fraction of the way to the next note, in cents, so a pitch bend in notes
+;;; glides through the tuning's own steps. Partially applied, `(mtof-tuned t)`
+;;; is a `float -> float` function to lift with `map-signal`.
+;;;
+;;; Parameters:
+;;;   t -- the tuning
+;;;   m -- note number; any float
+;;;
+;;; Returns:
+;;;   The frequency in Hz; NaN for a NaN note.
+;;;
+;;; Example:
+;;;   (mtof-tuned (tuning-new (scale-edo 19) (keymap-linear 60 69 440.0)) 70.0)
+;;;   ; => 456.348 (one nineteenth of an octave above A4)
+;;;
+;;; Since: signal v0.1.0
+(defn mtof-tuned [t : Tuning m :float] : float
+  ```c
+  /* __tur_autolink__: -lm */
+  extern double floor(double);
+  extern double exp2(double);
+  typedef struct { void *s, *k; int64_t plen; double delta, ref; int64_t asc; double pc[]; } Tun;
+  typedef struct { int64_t size, first, last, middle, ref; double freq; } Kbm;
+  const Tun *tn = (const Tun *)(intptr_t)t;
+  const Kbm *km = (const Kbm *)tn->k;
+  if (!(m == m)) return m;
+  double P = (double)tn->plen, j = m - (double)km->middle;
+  double kf = floor(j), frac = j - kf;
+  double q = floor(kf / P), rr = kf - q * P;
+  /* clamp in double: an infinite note leaves rr NaN, and huge ones inexact */
+  if (!(rr >= 0.0)) rr = 0.0;
+  if (rr > P - 1.0) rr = P - 1.0;
+  int64_t r = (int64_t)rr;
+  double c0 = q * tn->delta + tn->pc[r];
+  double c1 = r + 1 == tn->plen ? (q + 1.0) * tn->delta + tn->pc[0] : q * tn->delta + tn->pc[r + 1];
+  double c = frac > 0.0 ? c0 + frac * (c1 - c0) : c0;
+  return km->freq * exp2((c - tn->ref) / 1200.0);
+  ```)
+
+;;; ftom-tuned -- frequency in Hz to note number, in a tuning.
+;;;
+;;; The inverse of `mtof-tuned`: whole where `f` is a note's pitch,
+;;; fractional (in cents between the two notes it falls between) where it is
+;;; not. The tuning must rise from each note to the next, as every real one
+;;; does; for one that does not (a scale with a degree below its predecessor,
+;;; or a period of 0 cents or less) there is no single answer, and the result
+;;; is NaN. Like `ftom`, 0 Hz gives negative infinity and a negative
+;;; frequency NaN.
+;;;
+;;; Parameters:
+;;;   t -- the tuning
+;;;   f -- frequency in Hz, > 0
+;;;
+;;; Returns:
+;;;   The note number.
+;;;
+;;; Example:
+;;;   (ftom-tuned (tuning-new (scale-edo 19) (keymap-linear 60 69 440.0)) 456.348)
+;;;   ; => 70
+;;;
+;;; Since: signal v0.1.0
+(defn ftom-tuned [t : Tuning f :float] : float
+  ```c
+  /* __tur_autolink__: -lm */
+  extern double floor(double);
+  extern double log2(double);
+  typedef struct { void *s, *k; int64_t plen; double delta, ref; int64_t asc; double pc[]; } Tun;
+  typedef struct { int64_t size, first, last, middle, ref; double freq; } Kbm;
+  const Tun *tn = (const Tun *)(intptr_t)t;
+  const Kbm *km = (const Kbm *)tn->k;
+  double c = 1200.0 * log2(f / km->freq);
+  if (!(c == c)) return c;
+  if (c < -1e300) return c;                          /* 0 Hz: -inf */
+  if (!tn->asc) return 0.0 / 0.0;
+  if (c > 1e300) return c;
+  c += tn->ref;
+  double q = floor((c - tn->pc[0]) / tn->delta);
+  double base = c - q * tn->delta;                   /* in [pc[0], pc[0] + delta) */
+  int64_t lo = 0, hi = tn->plen;                     /* the last i with pc[i] <= base */
+  while (hi - lo > 1) {
+    int64_t mid = lo + (hi - lo) / 2;
+    if (tn->pc[mid] <= base) lo = mid; else hi = mid;
+  }
+  double c0 = tn->pc[lo];
+  double c1 = lo + 1 == tn->plen ? tn->pc[0] + tn->delta : tn->pc[lo + 1];
+  double frac = c1 > c0 ? (base - c0) / (c1 - c0) : 0.0;
+  return (double)km->middle + q * (double)tn->plen + (double)lo + frac;
+  ```)
+
+) ;; end defmodule signal/tuning

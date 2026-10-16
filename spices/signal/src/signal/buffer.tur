@@ -16,9 +16,25 @@
 ;; Positions are in BUFFER LENGTHS: 0.0 is the first sample, 0.5 the middle,
 ;; and the position wraps, so 1.0 is the first sample again and -0.25 is
 ;; three quarters of the way in. That makes signal/osc `sawtooth`, a ramp in
-;; [0, 1), the natural scan driver. Between two samples the read interpolates
-;; linearly, and the last sample interpolates toward the first, so a buffer
-;; holding exactly one cycle loops without a click.
+;; [0, 1), the natural scan driver. Between two samples the read interpolates,
+;; and the interpolation wraps too -- the last sample's right neighbour is the
+;; first -- so a buffer holding exactly one cycle loops without a click.
+;;
+;; Four interpolators, from cheapest to most accurate, each as a read and as a
+;; scan:
+;;
+;;   buffer-read-nearest  scan-nearest   the nearest sample; a step function
+;;   buffer-read          scan           linear, between the two neighbours
+;;   buffer-read-cubic    scan-cubic     4-point cubic Hermite (Catmull-Rom)
+;;   buffer-read-sinc     scan-sinc      32-tap Kaiser-windowed sinc
+;;
+;; All four agree on the sample grid. Off it, they differ in how much of the
+;; band they reconstruct: on a sine of f cycles per sample, linear is good to
+;; about 1e-2 at f = 0.05 and cubic to about 5e-4, but both are off by 0.2 or
+;; more by f = 0.3; the sinc read stays within 1e-5 up to f = 0.4 (19.2 kHz at
+;; 48 kHz). None of them filters: a buffer scanned FASTER than one sample per
+;; sample period (transposed up) still aliases whatever it holds above the new
+;; Nyquist, so render tables band-limited for the pitches they will play.
 ;;
 ;; `scan` keeps no state of its own: if its position signal is a pure function
 ;; of t (an oscillator), so is the scanned signal, and it may be sampled in any
@@ -32,7 +48,8 @@
 
 (defmodule signal/buffer
   (export Buffer buffer-new buffer-render buffer-len buffer-get buffer-set!
-          buffer-read scan)
+          buffer-read buffer-read-nearest buffer-read-cubic buffer-read-sinc
+          scan scan-nearest scan-cubic scan-sinc)
 
 ;;; Buffer -- a fixed-length array of samples, shared by handle.
 ;;;
@@ -150,6 +167,154 @@
   return d[i0] + frac * (d[i1] - d[i0]);
   ```)
 
+;;; buffer-read-nearest -- the sample nearest a position in buffer lengths.
+;;;
+;;; No interpolation: position `pos` reads sample `round(pos * len)`, wrapping,
+;;; so the result steps from one stored value to the next half way between
+;;; them. The cheapest read, and the right one for a buffer of discrete values
+;;; -- a table of note numbers, a step sequence -- where a value between two
+;;; entries means nothing. Each sample owns the positions within half a
+;;; sample of it; to have entry k of an n-entry sequence cover [k/n, (k+1)/n)
+;;; of a ramp, read at `pos - 0.5/n`. NaN or infinite positions read sample 0.
+;;;
+;;; Parameters:
+;;;   buf -- the buffer
+;;;   pos -- read position; wraps, so any float is valid
+;;;
+;;; Returns:
+;;;   The nearest stored sample.
+;;;
+;;; Example:
+;;;   ;; a 4-sample buffer: 0.3 * 4 = 1.2 rounds to sample 1
+;;;   (buffer-read-nearest buf 0.3)
+;;;
+;;; Since: signal v0.1.0
+(defn buffer-read-nearest [buf : Buffer pos :float] : float
+  ```c
+  extern double floor(double);
+  int64_t *p = (int64_t *)(intptr_t)buf;
+  int64_t len = p[0];
+  const double *d = (const double *)(p + 1);
+  double x = pos - floor(pos);
+  if (!(x >= 0.0 && x < 1.0)) x = 0.0;
+  int64_t i = (int64_t)floor(x * (double)len + 0.5);
+  if (i >= len) i -= len;
+  return d[i];
+  ```)
+
+;;; buffer-read-cubic -- cubic-interpolated read at a position in buffer lengths.
+;;;
+;;; The 4-point, third-order Hermite (Catmull-Rom) interpolator: the curve
+;;; through the two neighbours of the read point whose slope at each is set by
+;;; the samples either side, so it is smooth (no corners at the samples, unlike
+;;; linear). Wraps like `buffer-read`, at both ends of the four-sample window.
+;;; Read off the grid, a 440 Hz recording at 48 kHz comes back within 3e-6
+;;; (linear: 4e-4), for little more work than linear; but like linear it loses
+;;; the top of the band -- see `buffer-read-sinc`. NaN or infinite positions
+;;; read sample 0.
+;;;
+;;; Parameters:
+;;;   buf -- the buffer
+;;;   pos -- read position; wraps, so any float is valid
+;;;
+;;; Returns:
+;;;   The interpolated sample.
+;;;
+;;; Example:
+;;;   (buffer-read-cubic buf 0.5)   ;; the middle of the buffer
+;;;
+;;; Since: signal v0.1.0
+(defn buffer-read-cubic [buf : Buffer pos :float] : float
+  ```c
+  extern double floor(double);
+  int64_t *p = (int64_t *)(intptr_t)buf;
+  int64_t len = p[0];
+  const double *d = (const double *)(p + 1);
+  double x = pos - floor(pos);
+  if (!(x >= 0.0 && x < 1.0)) x = 0.0;
+  double idx = x * (double)len;
+  int64_t i0 = (int64_t)idx;
+  if (i0 >= len) i0 = len - 1;
+  double f = idx - (double)i0;
+  double ym1 = d[(i0 + len - 1) % len], y0 = d[i0];
+  double y1 = d[(i0 + 1) % len], y2 = d[(i0 + 2) % len];
+  double c1 = 0.5 * (y1 - ym1);
+  double c2 = ym1 - 2.5 * y0 + 2.0 * y1 - 0.5 * y2;
+  double c3 = 0.5 * (y2 - ym1) + 1.5 * (y0 - y1);
+  return ((c3 * f + c2) * f + c1) * f + y0;
+  ```)
+
+;;; buffer-read-sinc -- band-limited read at a position in buffer lengths.
+;;;
+;;; Windowed-sinc interpolation: the sum of the 32 samples around the read
+;;; point (16 each side, wrapping), each weighted by sinc(distance) times a
+;;; Kaiser window (beta = 10), normalized so a constant buffer reads back
+;;; exactly. It reconstructs the signal the samples came from across nearly
+;;; the whole band: on a sine of up to 0.4 cycles per sample (19.2 kHz at
+;;; 48 kHz) it is within 1e-5, where linear and cubic reads are off by more
+;;; than a third of the amplitude. On a sample it returns that sample. Each
+;;; read costs roughly 20 times a `buffer-read`.
+;;;
+;;; It interpolates; it does not filter. Scanned faster than one sample per
+;;; sample period, a buffer still aliases whatever it holds above the new
+;;; Nyquist frequency. NaN or infinite positions read sample 0.
+;;;
+;;; Parameters:
+;;;   buf -- the buffer
+;;;   pos -- read position; wraps, so any float is valid
+;;;
+;;; Returns:
+;;;   The interpolated sample.
+;;;
+;;; Example:
+;;;   (buffer-read-sinc buf 0.5)    ;; the middle of the buffer
+;;;
+;;; Since: signal v0.1.0
+(defn buffer-read-sinc [buf : Buffer pos :float] : float
+  ```c
+  extern double floor(double);
+  extern double sin(double);
+  extern double sqrt(double);
+  int64_t *p = (int64_t *)(intptr_t)buf;
+  int64_t len = p[0];
+  const double *d = (const double *)(p + 1);
+  double x = pos - floor(pos);
+  if (!(x >= 0.0 && x < 1.0)) x = 0.0;
+  double idx = x * (double)len;
+  int64_t i0 = (int64_t)idx;
+  if (i0 >= len) i0 = len - 1;
+  double f = idx - (double)i0;
+  if (f <= 0.0) return d[i0];
+  const double pi = 3.14159265358979323846, beta = 10.0;
+  /* I0(beta), the Kaiser window's normalizer: the power series of the
+     modified Bessel function of the first kind, order 0. */
+  double term = 1.0, i0beta = 1.0;
+  for (int m = 1; m < 64; m++) {
+    term *= (beta * beta / 4.0) / ((double)m * (double)m);
+    i0beta += term;
+    if (term < 1e-17 * i0beta) break;
+  }
+  /* sin(pi * (f - k)) is (-1)^k sin(pi * f): one sin for all 32 taps. */
+  double sf = sin(pi * f), acc = 0.0, wsum = 0.0;
+  for (int k = -15; k <= 16; k++) {
+    double dx = f - (double)k;
+    double u = dx / 16.0;
+    double arg = beta * sqrt(1.0 - u * u);
+    double t = 1.0, w = 1.0;
+    for (int m = 1; m < 64; m++) {
+      t *= (arg * arg / 4.0) / ((double)m * (double)m);
+      w += t;
+      if (t < 1e-17 * w) break;
+    }
+    double h = ((k & 1) ? -sf : sf) / (pi * dx) * (w / i0beta);
+    int64_t j = (i0 + k) % len;
+    if (j < 0) j += len;
+    acc += h * d[j];
+    wsum += h;
+  }
+  return acc / wsum;
+  ```)
+
 ;;; __buffer_fill -- write sig(k / sample-rate) into every slot, in order.
 ;;;
 ;;; A `while` loop, not self recursion: a recursive fill is not turned into a
@@ -204,5 +369,68 @@
     (fn [^fat pos : (fn [float] float)]
       (fn [t :float] :float
         (buffer-read bv (pos t))))))
+
+;;; scan-nearest -- `scan` with no interpolation: each position reads the
+;;; nearest sample (`buffer-read-nearest`).
+;;;
+;;; For buffers of discrete values -- steps, note numbers, gates -- and for the
+;;; deliberately stepped sound of a coarse table.
+;;;
+;;; Parameters:
+;;;   buf -- the buffer to scan
+;;;
+;;; Returns:
+;;;   SF Sample Sample: position -> nearest sample. Stateless.
+;;;
+;;; Example:
+;;;   ((scan-nearest steps) ((sawtooth 2.0) (constant 0.0)))
+;;;
+;;; Since: signal v0.1.0
+(defn scan-nearest [buf : Buffer]
+  (let [bv buf]
+    (fn [^fat pos : (fn [float] float)]
+      (fn [t :float] :float
+        (buffer-read-nearest bv (pos t))))))
+
+;;; scan-cubic -- `scan` with 4-point cubic Hermite interpolation
+;;; (`buffer-read-cubic`).
+;;;
+;;; Parameters:
+;;;   buf -- the buffer to scan
+;;;
+;;; Returns:
+;;;   SF Sample Sample: position -> interpolated sample. Stateless.
+;;;
+;;; Example:
+;;;   ((scan-cubic table) ((sawtooth 220.0) (constant 0.0)))
+;;;
+;;; Since: signal v0.1.0
+(defn scan-cubic [buf : Buffer]
+  (let [bv buf]
+    (fn [^fat pos : (fn [float] float)]
+      (fn [t :float] :float
+        (buffer-read-cubic bv (pos t))))))
+
+;;; scan-sinc -- `scan` with 32-tap windowed-sinc interpolation
+;;; (`buffer-read-sinc`).
+;;;
+;;; The scan to use when the buffer holds content near the top of the band
+;;; and is played at or below its recorded speed.
+;;;
+;;; Parameters:
+;;;   buf -- the buffer to scan
+;;;
+;;; Returns:
+;;;   SF Sample Sample: position -> interpolated sample. Stateless.
+;;;
+;;; Example:
+;;;   ((scan-sinc recording) ((sawtooth 1.0) (constant 0.0)))
+;;;
+;;; Since: signal v0.1.0
+(defn scan-sinc [buf : Buffer]
+  (let [bv buf]
+    (fn [^fat pos : (fn [float] float)]
+      (fn [t :float] :float
+        (buffer-read-sinc bv (pos t))))))
 
 ) ;; end defmodule signal/buffer

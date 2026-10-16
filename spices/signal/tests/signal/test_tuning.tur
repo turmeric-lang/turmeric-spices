@@ -1,0 +1,472 @@
+;; test_tuning -- correctness tests for signal/tuning.
+;;
+;; Scales: equal divisions, degrees past the period, the Pitch forms, and
+;; scale-new's validation. Scala files: .scl and .kbm parsing (comments, CRLF,
+;; trailing text, whole-number ratios, left-out mapping entries), every parse
+;; error with its line, writing a scale or keymap and reading it back to the
+;; same values, and loading from a file. Tunings: 12-EDO under a linear map is
+;; exactly signal/pitch `mtof`; ftom-tuned inverts mtof-tuned; and three
+;; tunings checked note for note against the Surge tuning-library (the
+;; reference implementation of the formats) -- a 31-EDO meantone mapping, a
+;; just major scale on the white keys (with the black keys between their
+;; neighbours), and a scale whose keymap pattern is two keys long.
+;;
+;; main returns the failure count for `tur test`.
+
+(load "stdlib/string.tur")
+
+(defmodule signal/tests/test_tuning
+  (import signal/core   :refer [sample map-signal])
+  (import signal/pitch  :refer [mtof ftom])
+  (import signal/tuning :refer [Pitch Cents Ratio MapEntry Degree Unmapped
+                                Scale Keymap Tuning
+                                scale-new scale-edo scale-size
+                                scale-description scale-pitch scale-cents
+                                scale-period scl-parse scl-load scale->scl
+                                keymap-linear keymap-new keymap-size
+                                keymap-first keymap-last keymap-middle
+                                keymap-reference keymap-frequency
+                                keymap-octave-degree keymap-entries kbm-parse
+                                kbm-load keymap->kbm tuning-new tuning-scale
+                                tuning-keymap tuning-mapped? mtof-tuned
+                                ftom-tuned])
+
+(defn near? [a :float b :float] :bool
+  (let [d (- a b)]
+    (if (< d 0.0) (< (- 0.0 d) 0.0001) (< d 0.0001))))
+
+;;; close? -- |a - b| <= 1e-9 * |b|: the same double, give or take rounding.
+(defn close? [a :float b :float] :bool
+  (let [d  (if (< a b) (- b a) (- a b))
+        mb (if (< b 0.0) (- 0.0 b) b)]
+    (<= d (* 0.000000001 (+ mb 1.0)))))
+
+(defn fail-unless [cond :bool label :cstr] :int
+  (if cond 0 (do (println label) 1)))
+
+;;; same? -- two strings hold the same bytes.
+(defn same? [s : String c : cstr] :bool
+  (string/eq? s (string/from-cstr c)))
+
+;;; scl-err? -- r failed, with message `msg`.
+(defn scl-err? [r : (Result Scale String) msg : cstr] :bool
+  (match r
+    (Ok s)  false
+    (Err m) (if (same? m msg) true (do (println (string/to-cstr m)) false))))
+
+;;; kbm-err? -- r failed, with message `msg`.
+(defn kbm-err? [r : (Result Keymap String) msg : cstr] :bool
+  (match r
+    (Ok k)  false
+    (Err m) (if (same? m msg) true (do (println (string/to-cstr m)) false))))
+
+;;; scl! -- the scale in r; a parse failure prints and yields 12-EDO.
+(defn scl! [r : (Result Scale String)] : Scale
+  (match r
+    (Ok s)  s
+    (Err m) (do (println (string/to-cstr m)) (scale-edo 12))))
+
+;;; kbm! -- the keymap in r; a parse failure prints and yields A4 = 440.
+(defn kbm! [r : (Result Keymap String)] : Keymap
+  (match r
+    (Ok k)  k
+    (Err m) (do (println (string/to-cstr m)) (keymap-linear 60 69 440.0))))
+
+;;; ratio? -- p is the ratio a/b.
+(defn ratio? [p : (Option Pitch) a :int b :int] :bool
+  (match p
+    (Some (Ratio x y)) (and (= x a) (= y b))
+    _                  false))
+
+;;; cents? -- p is c cents, given as cents.
+(defn cents? [p : (Option Pitch) c :float] :bool
+  (match p
+    (Some (Cents x)) (near? x c)
+    _                false))
+
+;;; nothing? -- p is none.
+(defn nothing? [p : (Option Pitch)] :bool
+  (match p
+    (Some _) false
+    (None)   true))
+
+;;; degree? -- entry i of es plays degree d.
+;;;
+;;; The entry is let-bound before it is matched: passing `(vec-get es i)`
+;;; straight to a function taking a MapEntry miscompiles on turmeric v0.65
+;;; (the element is dereferenced twice; turmeric
+;;; docs/reported/byvalue-sum-from-vec-get-bridged-twice.md).
+(defn degree? [es : (Vec MapEntry) i :int d :int] :bool
+  (let [e (vec-get es i)]
+    (match e
+      (Degree x) (= x d)
+      (Unmapped) false)))
+
+;;; unmapped? -- entry i of es is unmapped.
+(defn unmapped? [es : (Vec MapEntry) i :int] :bool
+  (let [e (vec-get es i)]
+    (match e
+      (Degree _) false
+      (Unmapped) true)))
+
+;;; same-scale? -- a and b have the same size, description and degrees, each
+;;; in the same form.
+(defn same-scale? [a : Scale b : Scale] :bool
+  (let [n      (scale-size a)
+        ^mut k 1
+        ^mut ok (and (= n (scale-size b))
+                     (same? (string/from-cstr (scale-description a))
+                            (scale-description b)))]
+    (while (and ok (<= k n))
+      (set! ok (match (scale-pitch a k)
+                 (Some (Ratio x y)) (ratio? (scale-pitch b k) x y)
+                 (Some (Cents c))   (match (scale-pitch b k)
+                                      (Some (Cents d)) (= c d)
+                                      _                false)
+                 _                  false))
+      (set! k (+ k 1)))
+    ok))
+
+;;; temp-file -- write `text` to a fresh temporary file; its path.
+(defn temp-file [text :cstr] : cstr
+  ```c
+  #include <unistd.h>
+  #include <stdlib.h>
+  char *path = (char *)malloc(64);
+  strcpy(path, "/tmp/tur-signal-tuning-XXXXXX");
+  int fd = mkstemp(path);
+  if (fd < 0) return "/nonexistent/tur-signal-tuning";
+  size_t n = strlen(text);
+  if (write(fd, text, n) != (ssize_t)n) { close(fd); return "/nonexistent/tur-signal-tuning"; }
+  close(fd);
+  return path;
+  ```)
+
+;;; remove-file -- delete a file written by temp-file.
+(defn remove-file [path :cstr] : nil
+  ```c
+  #include <stdio.h>
+  remove(path);
+  ```)
+
+;; ---------------------------------------------------------------------------
+
+(defn scale-failures [] :int
+  (let [e12  (scale-edo 12)
+        e19  (scale-edo 19)
+        just (scale-new "5-limit just major"
+                        [(Ratio 9 8) (Ratio 5 4) (Ratio 4 3) (Ratio 3 2)
+                         (Ratio 5 3) (Ratio 15 8) (Ratio 2 1)])
+        js   (scl! just)]
+    (+ (fail-unless (= (scale-size e12) 12) "FAIL: scale-edo 12 size")
+       (fail-unless (near? (scale-cents e12 7) 700.0) "FAIL: 12-EDO degree 7")
+       (fail-unless (near? (scale-cents e12 0) 0.0) "FAIL: degree 0 is 0 cents")
+       (fail-unless (near? (scale-cents e12 14) 1400.0) "FAIL: a degree past the period wraps up")
+       (fail-unless (near? (scale-cents e12 -1) -100.0) "FAIL: a negative degree wraps down")
+       (fail-unless (near? (scale-cents e12 -12) -1200.0) "FAIL: degree -12 is an octave down")
+       (fail-unless (near? (scale-period e19) 1200.0) "FAIL: 19-EDO period")
+       (fail-unless (near? (scale-cents e19 1) 63.1578947) "FAIL: 19-EDO step")
+       (fail-unless (same? (string/from-cstr (scale-description e19))
+                           "19 equal divisions of the octave")
+                    "FAIL: scale-edo description")
+       (fail-unless (= (scale-size (scale-edo 0)) 1) "FAIL: scale-edo 0 should clamp to 1")
+       (fail-unless (near? (scale-period (scale-edo 0)) 1200.0) "FAIL: 1-EDO is the octave")
+       (fail-unless (ratio? (scale-pitch e12 12) 2 1) "FAIL: 12-EDO period is 2/1")
+       (fail-unless (ratio? (scale-pitch e12 0) 1 1) "FAIL: degree 0 is 1/1")
+       (fail-unless (cents? (scale-pitch e12 7) 700.0) "FAIL: 12-EDO degree 7 is 700 cents")
+       (fail-unless (and (nothing? (scale-pitch e12 13)) (nothing? (scale-pitch e12 -1)))
+                    "FAIL: scale-pitch out of range should be none")
+       (fail-unless (ok? just) "FAIL: scale-new just major")
+       (fail-unless (near? (scale-cents js 4) 701.955001) "FAIL: just fifth in cents")
+       (fail-unless (ratio? (scale-pitch js 6) 15 8) "FAIL: scale-new keeps ratios")
+       (fail-unless (near? (scale-cents js 9) 1586.313714) "FAIL: just degree 9 = octave + major third")
+       (fail-unless (scl-err? (scale-new "none" (:: (vec-new) (Vec Pitch)))
+                              "a scale needs at least one pitch")
+                    "FAIL: scale-new of no pitches")
+       (fail-unless (scl-err? (scale-new "bad" [(Cents 100.0) (Ratio 0 1) (Ratio 2 1)])
+                              "pitch 2: a ratio must be positive and cents finite")
+                    "FAIL: scale-new zero ratio")
+       (fail-unless (scl-err? (scale-new "bad" [(Ratio 3 -2) (Ratio 2 1)])
+                              "pitch 1: a ratio must be positive and cents finite")
+                    "FAIL: scale-new negative ratio")
+       (fail-unless (scl-err? (scale-new "bad" [(Cents (/ 0.0 0.0))])
+                              "pitch 1: a ratio must be positive and cents finite")
+                    "FAIL: scale-new NaN cents"))))
+
+(defn scl-failures [] :int
+  (let [text (scl! (scl-parse "! a comment\n!\nA test scale  \n 5\n!\n 150.0 ! trailing comment\n\n 3/2 the fifth\n -5.\n 7/4\n 2\n! after the last note\n1/0\n"))
+        crlf (scl! (scl-parse "! dos.scl\r\nDOS line endings\r\n2\r\n600.0\r\n2/1\r\n"))
+        cr   (scl! (scl-parse "! mac.scl\rOld Mac line endings\r2\r600.0\r2/1\r"))
+        bare (scl! (scl-parse "\n1\n1200.\n"))]
+    (+ (fail-unless (= (scale-size text) 5) "FAIL: scl-parse size")
+       (fail-unless (same? (string/from-cstr (scale-description text)) "A test scale")
+                    "FAIL: scl-parse description")
+       (fail-unless (cents? (scale-pitch text 1) 150.0) "FAIL: scl-parse cents with a trailing comment")
+       (fail-unless (ratio? (scale-pitch text 2) 3 2) "FAIL: scl-parse ratio with trailing text")
+       (fail-unless (cents? (scale-pitch text 3) -5.0) "FAIL: scl-parse negative cents '-5.'")
+       (fail-unless (near? (scale-cents text 4) 968.825906) "FAIL: scl-parse 7/4")
+       (fail-unless (ratio? (scale-pitch text 5) 2 1) "FAIL: scl-parse whole number '2' is 2/1")
+       (fail-unless (and (= (scale-size crlf) 2) (cents? (scale-pitch crlf 1) 600.0)
+                         (same? (string/from-cstr (scale-description crlf)) "DOS line endings"))
+                    "FAIL: scl-parse CRLF")
+       (fail-unless (and (= (scale-size cr) 2) (ratio? (scale-pitch cr 2) 2 1))
+                    "FAIL: scl-parse CR")
+       (fail-unless (and (= (scale-size bare) 1)
+                         (same? (string/from-cstr (scale-description bare)) "")
+                         (near? (scale-period bare) 1200.0))
+                    "FAIL: scl-parse empty description")
+       ;; errors name the line
+       (fail-unless (scl-err? (scl-parse "! only comments\n") "no description line")
+                    "FAIL: scl-parse empty file")
+       (fail-unless (scl-err? (scl-parse "desc\n") "no note count")
+                    "FAIL: scl-parse missing count")
+       (fail-unless (scl-err? (scl-parse "desc\ntwelve\n")
+                              "line 2: expected the number of notes, got 'twelve'")
+                    "FAIL: scl-parse bad count")
+       (fail-unless (scl-err? (scl-parse "desc\n0\n")
+                              "line 2: a scale needs at least one note, got 0")
+                    "FAIL: scl-parse zero notes")
+       (fail-unless (scl-err? (scl-parse "desc\n9\n100.0\n2/1\n")
+                              "line 2: 9 notes, but the file cannot hold that many")
+                    "FAIL: scl-parse count beyond the file")
+       (fail-unless (scl-err? (scl-parse "desc\n3\n100.0\n2/1\n\n\n")
+                              "expected 3 notes, found 2")
+                    "FAIL: scl-parse too few notes")
+       (fail-unless (scl-err? (scl-parse "desc\n2\n3/0\n2/1\n")
+                              "line 3: the ratio '3/0' is not positive")
+                    "FAIL: scl-parse zero denominator")
+       (fail-unless (scl-err? (scl-parse "desc\n2\n-3/2\n2/1\n")
+                              "line 3: bad pitch '-3/2' (expected cents like 701.955 or a ratio like 3/2)")
+                    "FAIL: scl-parse negative ratio")
+       (fail-unless (scl-err? (scl-parse "desc\n2\n100.0\nfifth\n")
+                              "line 4: bad pitch 'fifth' (expected cents like 701.955 or a ratio like 3/2)")
+                    "FAIL: scl-parse a word")
+       (fail-unless (scl-err? (scl-parse "desc\n1\n12.5c\n")
+                              "line 3: bad cents value '12.5c'")
+                    "FAIL: scl-parse bad cents"))))
+
+(defn scl-roundtrip-failures [] :int
+  (let [e5    (scale-edo 5)
+        just  (scl! (scale-new "5-limit just major"
+                               [(Ratio 9 8) (Ratio 5 4) (Ratio 4 3) (Ratio 3 2)
+                                (Ratio 5 3) (Ratio 15 8) (Ratio 2 1)]))
+        odd   (scl! (scale-new "!looks like a comment"
+                               [(Cents 0.1) (Cents 701.9550008653874)
+                                (Cents -3.25) (Cents 1200.0)]))
+        e19   (scale-edo 19)]
+    (+ (fail-unless (same? (scale->scl e5)
+                           "! Written by tur-signal\n!\n5 equal divisions of the octave\n 5\n!\n 240.0\n 480.0\n 720.0\n 960.0\n 2/1\n")
+                    "FAIL: scale->scl of 5-EDO")
+       (fail-unless (same-scale? just (scl! (scl-parse (string/to-cstr (scale->scl just)))))
+                    "FAIL: just major does not survive scale->scl / scl-parse")
+       (fail-unless (same-scale? odd (scl! (scl-parse (string/to-cstr (scale->scl odd)))))
+                    "FAIL: cents and a '!' description do not survive scale->scl / scl-parse")
+       (fail-unless (same-scale? e19 (scl! (scl-parse (string/to-cstr (scale->scl e19)))))
+                    "FAIL: 19-EDO does not survive scale->scl / scl-parse"))))
+
+(defn kbm-failures [] :int
+  (let [lin   (keymap-linear 60 69 440.0)
+        white (kbm! (kbm-parse "! white keys\n12\n0\n127\n60\n69\n440.0\n7\n! Mapping.\n0\nx\n1\nx\n2\n3\nx\n4\nx\n5\nx\n6\n"))
+        short (kbm! (kbm-parse "! entries left out at the end\n8\n10\n100\n60\n60\n261.625565280\n5\n0\n1\n2\n"))
+        ents  (keymap-entries white)]
+    (+ (fail-unless (and (= (keymap-size lin) 0) (= (keymap-first lin) 0)
+                         (= (keymap-last lin) 127) (= (keymap-middle lin) 60)
+                         (= (keymap-reference lin) 69) (near? (keymap-frequency lin) 440.0)
+                         (= (keymap-octave-degree lin) 0)
+                         (= (vec-len (keymap-entries lin)) 0))
+                    "FAIL: keymap-linear fields")
+       (fail-unless (and (= (keymap-size white) 12) (= (keymap-octave-degree white) 7)
+                         (= (keymap-reference white) 69) (= (vec-len ents) 12))
+                    "FAIL: kbm-parse white keys header")
+       (fail-unless (and (degree? ents 0 0) (unmapped? ents 1)
+                         (degree? ents 5 3) (degree? ents 11 6))
+                    "FAIL: kbm-parse white keys entries")
+       (fail-unless (and (= (keymap-first short) 10) (= (keymap-last short) 100)
+                         (close? (keymap-frequency short) 261.62556528))
+                    "FAIL: kbm-parse first/last/frequency")
+       (let [es (keymap-entries short)]
+         (fail-unless (and (= (vec-len es) 8) (degree? es 2 2)
+                           (unmapped? es 3) (unmapped? es 7))
+                      "FAIL: entries left out at the end should be unmapped"))
+       ;; round trips
+       (let [back (kbm! (kbm-parse (string/to-cstr (keymap->kbm short))))]
+         (fail-unless (and (= (keymap-size back) 8) (= (keymap-first back) 10)
+                           (= (keymap-last back) 100) (= (keymap-middle back) 60)
+                           (= (keymap-reference back) 60) (= (keymap-octave-degree back) 5)
+                           (= (keymap-frequency back) (keymap-frequency short))
+                           (unmapped? (keymap-entries back) 4))
+                      "FAIL: a keymap does not survive keymap->kbm / kbm-parse"))
+       (fail-unless (same? (keymap->kbm lin)
+                           "! Written by tur-signal\n! Size of map:\n0\n! First MIDI note number to retune:\n0\n! Last MIDI note number to retune:\n127\n! Middle note where the first entry of the mapping is mapped to:\n60\n! Reference note for which frequency is given:\n69\n! Frequency to tune the above note to:\n440.0\n! Scale degree to consider as formal octave:\n0\n! Mapping.\n")
+                    "FAIL: keymap->kbm of keymap-linear")
+       ;; keymap-new
+       (let [k (keymap-new 60 69 440.0 7 ents)]
+         (fail-unless (match k
+                        (Ok km) (and (= (keymap-size km) 12)
+                                     (unmapped? (keymap-entries km) 10))
+                        (Err m) false)
+                      "FAIL: keymap-new from keymap-entries"))
+       (fail-unless (kbm-err? (keymap-new 60 61 440.0 7 ents) "the reference note 61 is unmapped")
+                    "FAIL: keymap-new unmapped reference")
+       (fail-unless (kbm-err? (keymap-new 60 60 440.0 7 [(Degree 0) (Degree -2)])
+                              "entry 2: a degree must be >= 0")
+                    "FAIL: keymap-new negative degree")
+       (fail-unless (kbm-err? (keymap-new 60 60 0.0 7 [(Degree 0)])
+                              "the reference frequency must be a positive number")
+                    "FAIL: keymap-new zero frequency")
+       (fail-unless (kbm-err? (keymap-new 60 60 440.0 -1 [(Degree 0)])
+                              "the formal octave degree must be >= 0")
+                    "FAIL: keymap-new negative octave")
+       ;; kbm-parse errors
+       (fail-unless (kbm-err? (kbm-parse "12\n0\n127\n60\n61\n440.0\n7\n0\nx\n1\n")
+                              "the reference note 61 is unmapped")
+                    "FAIL: kbm-parse unmapped reference")
+       (fail-unless (kbm-err? (kbm-parse "0\n0\n127\n60\n69\n") "missing the reference frequency")
+                    "FAIL: kbm-parse truncated")
+       (fail-unless (kbm-err? (kbm-parse "0\n0\n127\n60\n69\n-440\n0\n")
+                              "line 6: the reference frequency must be a positive number, got '-440'")
+                    "FAIL: kbm-parse negative frequency")
+       (fail-unless (kbm-err? (kbm-parse "! c\n2\n0\n127\n60\n60\n440.0\n12\n0\n-7\n")
+                              "line 10: a mapping entry must be a scale degree >= 0 or x, got '-7'")
+                    "FAIL: kbm-parse negative entry")
+       (fail-unless (kbm-err? (kbm-parse "-1\n") "line 1: the map size must be in [0, 65536], got -1")
+                    "FAIL: kbm-parse negative size")
+       (fail-unless (kbm-err? (kbm-parse "0\n0\n127\nsixty\n") "line 4: expected the middle note, got 'sixty'")
+                    "FAIL: kbm-parse a word"))))
+
+(defn load-failures [] :int
+  (let [sp (temp-file "! written by test_tuning\nfile scale\n2\n386.3137\n2/1\n")
+        kp (temp-file "0\n0\n127\n60\n69\n432\n0\n")
+        s  (scl-load sp)
+        k  (kbm-load kp)
+        f  (+ (fail-unless (match s
+                             (Ok sc) (and (= (scale-size sc) 2) (near? (scale-cents sc 1) 386.3137))
+                             (Err m) false)
+                           "FAIL: scl-load")
+              (fail-unless (match k
+                             (Ok km) (near? (keymap-frequency km) 432.0)
+                             (Err m) false)
+                           "FAIL: kbm-load")
+              (fail-unless (match (scl-load "/nonexistent/x.scl")
+                             (Ok sc) false
+                             (Err m) (string/starts-with? m (string/from-cstr "cannot read '/nonexistent/x.scl': ")))
+                           "FAIL: scl-load of a missing file")
+              (fail-unless (match (kbm-load "/nonexistent/x.kbm")
+                             (Ok km) false
+                             (Err m) (string/starts-with? m (string/from-cstr "cannot read '/nonexistent/x.kbm': ")))
+                           "FAIL: kbm-load of a missing file"))]
+    (remove-file sp)
+    (remove-file kp)
+    f))
+
+;;; mtof-agrees -- mtof-tuned of standard tuning is mtof, fractional notes too.
+(defn mtof-agrees [t : Tuning] :int
+  (let [^mut m    -30.3
+        ^mut fail 0]
+    (while (< m 150.0)
+      (when (not (close? (mtof-tuned t m) (mtof m))) (set! fail (+ fail 1)))
+      (when (not (close? (ftom-tuned t (mtof m)) m)) (set! fail (+ fail 1)))
+      (set! m (+ m 1.37)))
+    (fail-unless (= fail 0) "FAIL: 12-EDO, A4 = 440 is not mtof/ftom")))
+
+;;; roundtrip -- ftom-tuned (mtof-tuned m) = m over a spread of notes.
+(defn roundtrip [t : Tuning label :cstr] :int
+  (let [^mut m    -20.25
+        ^mut fail 0]
+    (while (< m 140.0)
+      (when (not (close? (ftom-tuned t (mtof-tuned t m)) m)) (set! fail (+ fail 1)))
+      (set! m (+ m 0.71)))
+    (fail-unless (= fail 0) label)))
+
+(defn tuning-failures [] :int
+  (let [std    (tuning-new (scale-edo 12) (keymap-linear 60 69 440.0))
+        e19    (tuning-new (scale-edo 19) (keymap-linear 60 69 440.0))
+        ;; 31-EDO through a meantone 12-key map (Surge tuning-library's
+        ;; 31edo_meantone.kbm): reference values from that library, for
+        ;; exact 31-EDO
+        mean   (tuning-new (scale-edo 31)
+                           (kbm! (kbm-parse "12\n0\n127\n69\n69\n440.0\n31\n0\n3\n5\n8\n10\n13\n16\n18\n21\n23\n26\n29\n")))
+        just   (scl! (scale-new "5-limit just major"
+                                [(Ratio 9 8) (Ratio 5 4) (Ratio 4 3) (Ratio 3 2)
+                                 (Ratio 5 3) (Ratio 15 8) (Ratio 2 1)]))
+        white  (tuning-new just
+                           (kbm! (kbm-parse "12\n0\n127\n60\n69\n440.0\n7\n0\nx\n1\nx\n2\n3\nx\n4\nx\n5\nx\n6\n")))
+        ;; a two-key pattern rising by octaves: the 1/1, then the fifth
+        fifths (tuning-new (scale-edo 12)
+                           (kbm! (keymap-new 60 60 250.0 12 [(Degree 0) (Degree 7)])))
+        bent   (tuning-new (scl! (scale-new "down" [(Cents 200.0) (Cents 100.0) (Ratio 2 1)]))
+                           (keymap-linear 60 60 261.0))
+        hz     (map-signal (mtof-tuned e19) (fn [t : float] : float (+ 69.0 t)))]
+    (+ (mtof-agrees std)
+       (fail-unless (near? (mtof-tuned e19 69.0) 440.0) "FAIL: 19-EDO reference")
+       (fail-unless (near? (mtof-tuned e19 70.0) 456.3482196) "FAIL: 19-EDO one step up")
+       (fail-unless (near? (mtof-tuned e19 88.0) 880.0) "FAIL: 19-EDO octave")
+       (fail-unless (near? (mtof-tuned e19 69.5) 448.0995610) "FAIL: 19-EDO half a step")
+       (fail-unless (near? (ftom-tuned e19 456.3482196) 70.0) "FAIL: ftom-tuned 19-EDO")
+       (fail-unless (near? (sample hz 1.0) 456.3482196) "FAIL: (mtof-tuned t) lifted with map-signal")
+       (roundtrip e19 "FAIL: ftom-tuned does not invert mtof-tuned (19-EDO)")
+       (fail-unless (and (close? (mtof-tuned mean 57.0) 220.0)
+                         (close? (mtof-tuned mean 60.0) 263.092120289711)
+                         (close? (mtof-tuned mean 61.0) 275.124414315209)
+                         (close? (mtof-tuned mean 70.0) 470.527067371270)
+                         (close? (mtof-tuned mean 76.0) 658.027868233212)
+                         (close? (mtof-tuned mean 81.0) 880.0))
+                    "FAIL: 31-EDO meantone map differs from tuning-library")
+       (roundtrip mean "FAIL: ftom-tuned does not invert mtof-tuned (31-EDO meantone)")
+       (fail-unless (and (close? (mtof-tuned white 57.0) 220.0)
+                         (close? (mtof-tuned white 59.0) 247.5)
+                         (close? (mtof-tuned white 60.0) 264.0)
+                         (close? (mtof-tuned white 62.0) 297.0)
+                         (close? (mtof-tuned white 64.0) 330.0)
+                         (close? (mtof-tuned white 65.0) 352.0)
+                         (close? (mtof-tuned white 67.0) 396.0)
+                         (close? (mtof-tuned white 69.0) 440.0)
+                         (close? (mtof-tuned white 72.0) 528.0))
+                    "FAIL: just major on the white keys differs from tuning-library")
+       (fail-unless (and (close? (mtof-tuned white 61.0) 280.014285349873)
+                         (close? (mtof-tuned white 66.0) 373.352380466497)
+                         (close? (mtof-tuned white 70.0) 466.690475583121))
+                    "FAIL: black keys should sit between their neighbours, as tuning-library")
+       (fail-unless (and (tuning-mapped? white 60) (not (tuning-mapped? white 61))
+                         (tuning-mapped? white 71) (not (tuning-mapped? white 46))
+                         (tuning-mapped? white 48) (tuning-mapped? std 61))
+                    "FAIL: tuning-mapped?")
+       (roundtrip white "FAIL: ftom-tuned does not invert mtof-tuned (white keys)")
+       (fail-unless (near? (ftom-tuned white 264.0) 60.0) "FAIL: ftom-tuned of a white key")
+       (fail-unless (and (close? (mtof-tuned fifths 60.0) 250.0)
+                         (close? (mtof-tuned fifths 61.0) (* 250.0 1.4983070768766815))
+                         (close? (mtof-tuned fifths 62.0) 500.0)
+                         (close? (mtof-tuned fifths 59.0) (* 125.0 1.4983070768766815)))
+                    "FAIL: a two-key pattern should rise by the formal octave")
+       (fail-unless (and (near? (scale-period (tuning-scale white)) 1200.0)
+                         (= (keymap-size (tuning-keymap white)) 12))
+                    "FAIL: tuning-scale / tuning-keymap")
+       ;; a scale that falls has no inverse
+       (fail-unless (near? (mtof-tuned bent 61.0) (* 261.0 1.122462048)) "FAIL: falling scale mtof")
+       (let [v (ftom-tuned bent 300.0)]
+         (fail-unless (not (= v v)) "FAIL: ftom-tuned of a falling scale should be NaN"))
+       (let [z (ftom-tuned std 0.0)
+             n (ftom-tuned std -5.0)
+             q (mtof-tuned std (/ 0.0 0.0))]
+         (fail-unless (and (< z -1.0e308) (not (= n n)) (not (= q q)))
+                      "FAIL: ftom-tuned 0 / negative, mtof-tuned NaN"))
+       (fail-unless (and (> (mtof-tuned white (/ 1.0 0.0)) 1.0e308)
+                         (= (mtof-tuned white (/ -1.0 0.0)) 0.0)
+                         (> (ftom-tuned white (/ 1.0 0.0)) 1.0e308)
+                         (> (mtof-tuned white 1.0e6) 1.0e308)
+                         (= (mtof-tuned white -1.0e6) 0.0))
+                    "FAIL: infinite and far-off notes"))))
+
+(defn main [] : int
+  (let [f (+ (scale-failures)
+             (scl-failures)
+             (scl-roundtrip-failures)
+             (kbm-failures)
+             (load-failures)
+             (tuning-failures))]
+    (if (= f 0)
+      (println "PASS test_tuning")
+      (println "test_tuning: failures above"))
+    f))
+
+) ;; end defmodule signal/tests/test_tuning

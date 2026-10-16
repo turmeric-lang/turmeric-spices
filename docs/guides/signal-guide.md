@@ -1,7 +1,7 @@
 ---
 title: Signal Processing with Typed Signal Functions
 category: Audio
-description: Oscillators (LFO, band-limited, FM and PM), one-pole, biquad, state-variable and ladder filters, delays and combs, colored noise, sample buffers and scanning, MIDI note/Hz conversion and sequencing, shapers, ADSR envelopes, and SF-pipeline composition -- a typed Signal/SF abstraction for building audio DSP graphs
+description: Oscillators (LFO, band-limited, FM and PM), one-pole, biquad, state-variable and ladder filters, delays and combs, colored noise, sample buffers and scanning with nearest/linear/cubic/sinc interpolation, MIDI note/Hz conversion and sequencing, Scala .scl/.kbm tunings, shapers, ADSR envelopes, and SF-pipeline composition -- a typed Signal/SF abstraction for building audio DSP graphs
 audience: developers building audio synthesis, DSP pipelines, or signal-driven applications in Turmeric
 since: signal v0.1.0
 ---
@@ -25,8 +25,10 @@ This guide walks the things you will do most often:
 6. [Delays, combs and allpasses](#6-delays-combs-and-allpasses)
 7. [Noise](#7-noise)
 8. [Modulation: ring, AM, PM and FM](#8-modulation)
-9. [Buffers and buffer scanning](#9-buffers-and-buffer-scanning)
+9. [Buffers and buffer scanning](#9-buffers-and-buffer-scanning), and
+   [reading between samples](#reading-between-samples-four-interpolators)
 10. [Pitches, melodies and cycles](#10-pitches-melodies-and-cycles)
+11. [Tunings: Scala scales and keyboard mappings](#11-tunings-scala-scales-and-keyboard-mappings)
 
 Every example is a complete program: save it inside a project that depends
 on the spice and `tur run` it. The comments show what it prints.
@@ -76,7 +78,7 @@ hand-computed references -- no audio hardware, no real-time loop.
 Two kinds of signal behave differently, and it matters everywhere below:
 
 - **Pure** signals -- `constant`, the oscillators except `fm-sine`, the
-  shapers, the envelopes, `scan` -- are functions of `t` and nothing else.
+  shapers, the envelopes, the scans -- are functions of `t` and nothing else.
   Sample them at any time, in any order, as often as you like, and share one
   between several consumers.
 - **Stateful** signals -- every filter, delay and noise generator, and
@@ -1220,12 +1222,123 @@ defmodule demo
 also how to *freeze* a stateful signal: `(buffer-render 48000.0 n ((white 1) z))`
 is noise you can sample in any order, loop, or read twice.
 
-Two cautions. A table scanned at a high pitch aliases just as a naive
-oscillator does whenever it holds harmonics above Nyquist divided by the
-pitch; render bright tables for low notes, or several tables band-limited per
-octave. And linear interpolation is exact only on the sample grid: off it, a
-2048-point sine table is good to about 1e-6, a 440 Hz recording at 48 kHz to
-about 4e-4.
+A table scanned at a high pitch aliases just as a naive oscillator does
+whenever it holds harmonics above Nyquist divided by the pitch; render bright
+tables for low notes, or several tables band-limited per octave.
+
+### Reading between samples: four interpolators
+
+A read at a position between two samples has to make a value up, and how is
+a choice. `buffer-read` and `scan` draw a straight line between the two
+neighbours. Three more pairs make other choices:
+
+| Read | Scan | Between two samples | Cost per read |
+|---|---|---|---|
+| `buffer-read-nearest` | `scan-nearest` | the nearer sample: a step function | least |
+| `buffer-read` | `scan` | a straight line between the neighbours | -- |
+| `buffer-read-cubic` | `scan-cubic` | a smooth curve through four samples (4-point Hermite, Catmull-Rom) | a little more than linear |
+| `buffer-read-sinc` | `scan-sinc` | a 32-tap Kaiser-windowed sinc: the band-limited signal the samples came from | about 20 times linear |
+
+All four return the stored sample on the grid and wrap the same way, so they
+are interchangeable wherever `scan` is used. Off the grid they differ in how
+much of the band survives. Read 0.37 or 0.037 samples further on per sample,
+against the sine each recording holds, the worst errors are:
+
+| Recording at 48 kHz | nearest | linear | cubic | sinc |
+|---|---|---|---|---|
+| 440 Hz | 3e-2 | 4e-4 | 3e-6 | 3e-6 |
+| 16.8 kHz (0.35 cycles per sample) | 1.04 | 0.54 | 0.36 | 4e-6 |
+
+Linear is fine for low content and smooth control tables; cubic buys two
+orders of magnitude there for almost nothing; only sinc keeps the top of the
+band, up to 0.4 cycles per sample (19.2 kHz at 48 kHz) within 1e-5. Nearest is
+for tables whose entries are not samples of anything -- note numbers, steps
+-- where a value between two of them means nothing:
+
+```turmeric
+(defmodule demo
+  (import signal/core   :refer [constant sample map-signal])
+  (import signal/osc    :refer [sawtooth])
+  (import signal/buffer :refer [Buffer buffer-new buffer-set! buffer-read
+                                buffer-read-nearest buffer-read-cubic
+                                buffer-read-sinc scan-nearest])
+
+  ;; one cycle of a sine, sampled four times: 0, 1, 0, -1
+  (defn diamond [] : Buffer
+    (let [b (buffer-new 4)]
+      (buffer-set! b 1 1.0)
+      (buffer-set! b 3 -1.0)
+      b))
+
+  (defn main [] : int
+    ;; half way from sample 0 to sample 1, where the sine is 0.707107
+    (let [d (diamond)]
+      (println (buffer-read-nearest d 0.125))   ;; 1 (0.5 rounds up)
+      (println (buffer-read d 0.125))           ;; 0.5
+      (println (buffer-read-cubic d 0.125))     ;; 0.625
+      (println (buffer-read-sinc d 0.125)))     ;; 0.707112
+    ;; four notes, one per quarter cycle of a 1 Hz ramp
+    (let [notes (buffer-new 4)
+          z     (constant 0.0)
+          pos   (map-signal (fn [p : float] : float (- p 0.125))
+                            ((sawtooth 1.0) z))
+          step  ((scan-nearest notes) pos)]
+      (buffer-set! notes 0 60.0)
+      (buffer-set! notes 1 64.0)
+      (buffer-set! notes 2 67.0)
+      (buffer-set! notes 3 72.0)
+      (println (buffer-read notes 0.4))          ;; 65.8 (no such note)
+      (println (sample step 0.3))                ;; 64
+      (println (sample step 0.5)))               ;; 67
+    0))
+```
+
+```sweet-exp
+defmodule demo
+  import signal/core   :refer [constant sample map-signal]
+  import signal/osc    :refer [sawtooth]
+  import signal/buffer :refer [Buffer buffer-new buffer-set! buffer-read
+                               buffer-read-nearest buffer-read-cubic
+                               buffer-read-sinc scan-nearest]
+
+  ;; one cycle of a sine, sampled four times: 0, 1, 0, -1
+  defn diamond [] : Buffer
+    let [b buffer-new(4)]
+      buffer-set! b 1 1.0
+      buffer-set! b 3 -1.0
+      b
+
+  defn main [] : int
+    ;; half way from sample 0 to sample 1, where the sine is 0.707107
+    let [d diamond()]
+      println $ buffer-read-nearest d 0.125     ;; 1 (0.5 rounds up)
+      println $ buffer-read d 0.125             ;; 0.5
+      println $ buffer-read-cubic d 0.125       ;; 0.625
+      println $ buffer-read-sinc d 0.125        ;; 0.707112
+    ;; four notes, one per quarter cycle of a 1 Hz ramp
+    let [notes buffer-new(4)
+         z     constant(0.0)
+         pos   map-signal((fn [p : float] : float {p - 0.125})
+                          (sawtooth(1.0) z))
+         step  (scan-nearest(notes) pos)]
+      buffer-set! notes 0 60.0
+      buffer-set! notes 1 64.0
+      buffer-set! notes 2 67.0
+      buffer-set! notes 3 72.0
+      println $ buffer-read notes 0.4           ;; 65.8 (no such note)
+      println $ sample step 0.3                 ;; 64
+      println $ sample step 0.5                 ;; 67
+    0
+```
+
+Each sample owns the positions within half a sample of it, so the ramp is
+moved back half a step (`- 0.125`, half of 1/4): entry k then plays for the
+quarter cycle `[k/4, (k+1)/4)` instead of the quarter centred on `k/4`.
+
+None of the four filters. Scan a buffer faster than one sample per sample
+period -- transpose a recording up -- and whatever it holds above the new
+Nyquist frequency aliases, sinc or not: the sinc read reconstructs the
+recorded band, it does not narrow it.
 
 ---
 
@@ -1467,6 +1580,225 @@ time `t`", use the pure `note-at` shape above instead.
 
 ---
 
+## 11. Tunings: Scala scales and keyboard mappings
+
+`mtof` knows one tuning. `signal/tuning` handles any, described the way the
+Scala program and most microtonal software describe one -- in two parts:
+
+- A **scale** lists pitches above an implicit 1/1, each a ratio
+  (`(Ratio 3 2)`) or a size in cents (`(Cents 701.955)`). The last one is the
+  **period** the scale repeats at, usually `(Ratio 2 1)`, and degrees past it
+  wrap into the next period: degree 9 of a 7-note scale is an octave plus
+  degree 2. `scale-edo n` makes `n` equal divisions of the octave;
+  `scale-new` takes a description and a list of pitches.
+- A **keymap** says which notes play which degrees and how high. The simple
+  one, `(keymap-linear 60 69 440.0)`, puts degree 0 on note 60, gives each
+  next note the next degree, and tunes note 69 to 440 Hz.
+
+`tuning-new` joins a scale and a keymap, and `mtof-tuned` / `ftom-tuned` are
+`mtof` / `ftom` for that tuning. Note numbers are floats, as before: note
+69.5 lies half way, in cents, between notes 69 and 70, so a pitch bend glides
+through the tuning's own steps. Under `(scale-edo 12)` and
+`(keymap-linear 60 69 440.0)`, `mtof-tuned` is `mtof`. Partially applied,
+`(mtof-tuned t)` is a `float -> float` function, ready for `map-signal`:
+
+```turmeric
+(defmodule demo
+  (import signal/core   :refer [sample map-signal])
+  (import signal/pitch  :refer [mtof])
+  (import signal/tuning :refer [Pitch Ratio scale-new scale-edo scale-cents
+                                keymap-linear tuning-new mtof-tuned
+                                ftom-tuned])
+
+  (defn main [] : int
+    (let [std (tuning-new (scale-edo 12) (keymap-linear 60 69 440.0))
+          t19 (tuning-new (scale-edo 19) (keymap-linear 60 69 440.0))]
+      (println (mtof-tuned std 60.0))     ;; 261.626
+      (println (mtof 60.0))               ;; 261.626 (the same)
+      (println (mtof-tuned t19 70.0))     ;; 456.348 (a 19th of an octave up)
+      (println (mtof-tuned t19 88.0))     ;; 880 (19 notes: the octave)
+      (println (ftom-tuned t19 500.0))    ;; 72.5041
+      (let [bend (map-signal (mtof-tuned t19)
+                             (fn [t : float] : float (+ 69.0 t)))]
+        (println (sample bend 0.5))))     ;; 448.1 (half a step up)
+    ;; 5-limit just intonation, from ratios
+    (match (scale-new "5-limit just major"
+                      [(Ratio 9 8) (Ratio 5 4) (Ratio 4 3) (Ratio 3 2)
+                       (Ratio 5 3) (Ratio 15 8) (Ratio 2 1)])
+      (Ok just) (let [t (tuning-new just (keymap-linear 60 60 264.0))]
+                  (println (scale-cents just 4))      ;; 701.955 (a pure fifth)
+                  (println (mtof-tuned t 64.0))       ;; 396 (degree 4: 264 * 3/2)
+                  (println (mtof-tuned t 67.0)))      ;; 528 (degree 7: the 2/1)
+      (Err m)   (println "bad scale"))
+    0))
+```
+
+```sweet-exp
+defmodule demo
+  import signal/core   :refer [sample map-signal]
+  import signal/pitch  :refer [mtof]
+  import signal/tuning :refer [Pitch Ratio scale-new scale-edo scale-cents
+                               keymap-linear tuning-new mtof-tuned
+                               ftom-tuned]
+
+  defn main [] : int
+    let [std tuning-new(scale-edo(12) keymap-linear(60 69 440.0))
+         t19 tuning-new(scale-edo(19) keymap-linear(60 69 440.0))]
+      println $ mtof-tuned std 60.0       ;; 261.626
+      println $ mtof 60.0                 ;; 261.626 (the same)
+      println $ mtof-tuned t19 70.0       ;; 456.348 (a 19th of an octave up)
+      println $ mtof-tuned t19 88.0       ;; 880 (19 notes: the octave)
+      println $ ftom-tuned t19 500.0      ;; 72.5041
+      let [bend map-signal(mtof-tuned(t19)
+                           (fn [t : float] : float {69.0 + t}))]
+        println $ sample bend 0.5         ;; 448.1 (half a step up)
+    ;; 5-limit just intonation, from ratios
+    (match (scale-new "5-limit just major"
+                      [(Ratio 9 8) (Ratio 5 4) (Ratio 4 3) (Ratio 3 2)
+                       (Ratio 5 3) (Ratio 15 8) (Ratio 2 1)])
+      (Ok just) (let [t (tuning-new just (keymap-linear 60 60 264.0))]
+                  (println (scale-cents just 4))      ;; 701.955 (a pure fifth)
+                  (println (mtof-tuned t 64.0))       ;; 396 (degree 4: 264 * 3/2)
+                  (println (mtof-tuned t 67.0)))      ;; 528 (degree 7: the 2/1)
+      (Err m)   (println "bad scale"))
+    0
+```
+
+Under a linear keymap a scale's degrees fall on consecutive notes, so a
+7-note scale's octave is 7 notes wide: note 67 above is degree 7, the 2/1.
+To lay such a scale out on the white keys instead, map it -- next.
+
+### Scala files: `.scl` and `.kbm`
+
+Scales and keymaps read and write Scala's text formats, so the thousands of
+scales in the Scala archive, and the mappings other synths export, load
+directly. In both, lines starting with `!` are comments.
+
+| Format | Reads | Writes | Lines, in order |
+|---|---|---|---|
+| `.scl` | `scl-parse text`, `scl-load path` | `scale->scl scale` | a description; the number of pitches; one pitch per line -- cents if it holds a `.` (`701.955`), else a ratio (`3/2`) or a whole number (`2`) |
+| `.kbm` | `kbm-parse text`, `kbm-load path` | `keymap->kbm keymap` | map size; first and last note to retune; middle note; reference note; its frequency; formal octave degree; then one mapping entry per key, a degree or `x` |
+
+The readers return `(Ok value)` or `(Err message)`, the message naming the
+line at fault; the writers return the file's text as an owned `String`, which
+reads back to the same value (cents are written in the fewest digits that
+round-trip). Programs using either load `stdlib/string.tur` *before* their
+`defmodule`, as signal/tuning does, so the two share one `String` type.
+
+A **mapping pattern** maps a run of keys onto degrees and repeats. Its
+classic use is a 7-note scale on the white keys: a 12-key pattern starting at
+middle C, `x` for each black key, repeating a **formal octave** of 7 degrees
+higher each time. A key marked `x` is *unmapped*: `tuning-mapped?` says so,
+and a player would normally leave it silent, but `mtof-tuned` still gives it
+the pitch between its mapped neighbours, so that a bend passes through it
+smoothly.
+
+```turmeric
+(load "stdlib/string.tur")
+
+(defmodule demo
+  (import signal/tuning :refer [Pitch Ratio Scale Tuning scale-new scl-parse
+                                scale->scl kbm-parse keymap-linear tuning-new
+                                tuning-mapped? mtof-tuned])
+
+  ;; 12 keys from middle C (60); A4 (69) at 440 Hz; formal octave 7 degrees
+  (defn white-keys [s : Scale] : Tuning
+    (match (kbm-parse "12\n0\n127\n60\n69\n440.0\n7\n0\nx\n1\nx\n2\n3\nx\n4\nx\n5\nx\n6\n")
+      (Ok k)  (tuning-new s k)
+      (Err m) (tuning-new s (keymap-linear 60 69 440.0))))
+
+  (defn main [] : int
+    (match (scl-parse "! just.scl\n5-limit just major\n 7\n 9/8\n 5/4\n 4/3\n 3/2\n 5/3\n 15/8\n 2/1\n")
+      (Ok just) (let [t (white-keys just)]
+                  (println (mtof-tuned t 60.0))       ;; 264 (C: A4 * 3/5)
+                  (println (mtof-tuned t 62.0))       ;; 297 (D: C * 9/8)
+                  (println (mtof-tuned t 72.0))       ;; 528 (C5)
+                  (println (tuning-mapped? t 61))     ;; false (C#4 ...)
+                  (println (mtof-tuned t 61.0))       ;; 280.014 (... between C and D)
+                  (println (string/to-cstr (scale->scl just))))
+      (Err m)   (println (string/to-cstr m)))
+    (match (scl-parse "Two notes\n 2\n 3/0\n 2/1\n")
+      (Ok s)  (println "parsed?")
+      (Err m) (println (string/to-cstr m)))   ;; line 3: the ratio '3/0' is not positive
+    0))
+```
+
+```sweet-exp
+load "stdlib/string.tur"
+
+defmodule demo
+  import signal/tuning :refer [Pitch Ratio Scale Tuning scale-new scl-parse
+                               scale->scl kbm-parse keymap-linear tuning-new
+                               tuning-mapped? mtof-tuned]
+
+  ;; 12 keys from middle C (60); A4 (69) at 440 Hz; formal octave 7 degrees
+  defn white-keys [s : Scale] : Tuning
+    (match (kbm-parse "12\n0\n127\n60\n69\n440.0\n7\n0\nx\n1\nx\n2\n3\nx\n4\nx\n5\nx\n6\n")
+      (Ok k)  (tuning-new s k)
+      (Err m) (tuning-new s (keymap-linear 60 69 440.0)))
+
+  defn main [] : int
+    (match (scl-parse "! just.scl\n5-limit just major\n 7\n 9/8\n 5/4\n 4/3\n 3/2\n 5/3\n 15/8\n 2/1\n")
+      (Ok just) (let [t (white-keys just)]
+                  (println (mtof-tuned t 60.0))       ;; 264 (C: A4 * 3/5)
+                  (println (mtof-tuned t 62.0))       ;; 297 (D: C * 9/8)
+                  (println (mtof-tuned t 72.0))       ;; 528 (C5)
+                  (println (tuning-mapped? t 61))     ;; false (C#4 ...)
+                  (println (mtof-tuned t 61.0))       ;; 280.014 (... between C and D)
+                  (println (string/to-cstr (scale->scl just))))
+      (Err m)   (println (string/to-cstr m)))
+    (match (scl-parse "Two notes\n 2\n 3/0\n 2/1\n")
+      (Ok s)  (println "parsed?")
+      (Err m) (println (string/to-cstr m)))   ;; line 3: the ratio '3/0' is not positive
+    0
+```
+
+The `scale->scl` text is the same scale in a canonical layout:
+
+```text
+! Written by tur-signal
+!
+5-limit just major
+ 7
+!
+ 9/8
+ 5/4
+ 4/3
+ 3/2
+ 5/3
+ 15/8
+ 2/1
+```
+
+`scl-load` and `kbm-load` read a file and carry the `#fx{FS}` effect row;
+to write one, hand the text to stdlib `fs/write-text`:
+`(fs/write-text "just.scl" (string/to-cstr (scale->scl just)))`. The same
+pattern is available without a file: `keymap-new` takes the middle note, the
+reference note and frequency, the formal octave degree and a list of
+`(Degree d)` / `(Unmapped)` entries, and `keymap-entries` gives such a list
+back.
+
+Three details of the mapping follow the Scala format's own definitions:
+
+- **The formal octave** is a scale *degree*, and each repetition of the
+  pattern sounds that degree's interval higher; 0 means the scale's period.
+  When the formal octave is the scale's size -- every mapping written for the
+  scale it maps -- the result is note for note what the Surge
+  `tuning-library` computes; the tests check three such tunings against it.
+  Where a mapping meant for one scale is applied to another, Scala's
+  definition and that library's differ, and this module follows Scala's.
+- **The first and last notes to retune** are kept, and written back by
+  `keymap->kbm`, but `mtof-tuned` retunes every note.
+- **The reference note must be mapped**; `kbm-parse` and `keymap-new` refuse a
+  keymap whose reference key is an `x`.
+
+`ftom-tuned` inverts `mtof-tuned` for any tuning whose pitch rises from each
+note to the next, which is every musical one. For a scale with a degree below
+the one before it, or a period of zero or fewer cents, there is no single
+answer, and it returns NaN.
+
+---
+
 ## Stateful signals and sample order
 
 `low-pass`, `high-pass` and every other filter, every delay effect, every noise
@@ -1477,7 +1809,7 @@ example both halves of `pair-signals`) advances it twice, so each consumer sees
 only part of the stream and a delay's effective length changes. Build one
 instance per consumer -- applying the SF again is cheap -- or render the
 signal into a buffer and scan that. The oscillators (other than `fm-sine`),
-shapers, envelopes and `scan` are pure functions of `t` and have no such
+shapers, envelopes and scans are pure functions of `t` and have no such
 restriction.
 
 ## Calling conventions worth knowing
@@ -1517,7 +1849,7 @@ restriction.
 
 ## Examples
 
-Ten runnable examples live under `examples/`:
+Twelve runnable examples live under `examples/`:
 
 ```sh
 cd spices/signal
@@ -1531,6 +1863,8 @@ tur run examples/07_delay_and_noise.tur         # delay, comb, allpass, colored 
 tur run examples/08_filters.tur                 # biquads, state-variable sweep, ladder
 tur run examples/09_modulation_and_buffers.tur  # ring, AM, PM, FM, wavetable, tape
 tur run examples/10_pitch_and_sequences.tur     # mtof/ftom, a melody in order, a cycle
+tur run examples/11_interpolation.tur           # nearest/linear/cubic/sinc reads, a note table
+tur run examples/12_tunings.tur                 # 19-EDO, just intonation on the white keys, .scl/.kbm
 ```
 
 Each prints sample values that match the hand-computed references in its
@@ -1542,7 +1876,7 @@ comments.
 
 ```sh
 cd spices/signal
-tur test tests/signal    # 11 tests, all pass
+tur test tests/signal    # 12 tests, all pass
 ```
 
 ---
