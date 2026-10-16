@@ -73,11 +73,25 @@ let [e env-new()]
 
 | Syntax | Meaning |
 |--------|---------|
-| `<%= var %>` | Interpolate the string value of `var` |
+| `<%= var %>` | Interpolate the value of `var`, HTML-escaped |
+| `<%== var %>` | Interpolate the value of `var` verbatim (trusted markup, non-HTML output) |
 | `<% if cond %>...<% else %>...<% end %>` | Conditional branch (truthy = non-empty string) |
 | `<% for [x list] %>...<% end %>` | Iterate over a list binding |
 | `<% let x val %>...<% end %>` | Bind `x` to `val` for the body |
 | `<%% ... %>` | Literal `<% ... %>` (escaped) |
+
+### HTML escaping
+
+Since 0.3.0, `<%= var %>` HTML-escapes the value: `&`, `<`, `>`, `"` and
+`'` become `&amp;`, `&lt;`, `&gt;`, `&quot;` and `&#39;`. That makes a value
+safe in element content and inside a quoted attribute value, so a name taken
+from a URL or a form cannot inject markup. It does not make a value safe in
+every position: an unquoted attribute, a `<script>` or `<style>` body, an
+`on*` handler, or a URL attribute given `javascript:...` still need care.
+
+`<%== var %>` writes the value verbatim. Use it for markup you produced and
+trust, and for templates whose output is not HTML (plain-text email, config
+files), where entities would be wrong.
 
 ### Modules
 

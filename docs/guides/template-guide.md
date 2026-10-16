@@ -24,7 +24,7 @@ This guide walks the five things you'll do most often:
 1. [Render a template string](#1-rendering-a-template-string)
 2. [Render a template file](#2-rendering-a-template-file)
 3. [Conditionals and loops](#3-conditionals-and-loops)
-4. [Local bindings and escaping](#4-local-bindings-and-escaping)
+4. [Local bindings, HTML escaping and literal tags](#4-local-bindings-html-escaping-and-literal-tags)
 5. [Using templates with tourist](#5-using-templates-with-tourist)
 
 Each section is a self-contained snippet you can drop into a `defmodule`.
@@ -180,7 +180,7 @@ is a cons-list of cstr values (int handles pointing to string cells).
 
 ---
 
-## 4. Local bindings and escaping
+## 4. Local bindings, HTML escaping and literal tags
 
 ### Local bindings
 
@@ -196,7 +196,37 @@ Template:
 
 This renders as `Hello, Alice!` when `name` is `Alice`.
 
-### Escaping
+### HTML escaping
+
+`<%= var %>` HTML-escapes the value (since template 0.3.0): `&`, `<`, `>`,
+`"` and `'` become `&amp;`, `&lt;`, `&gt;`, `&quot;` and `&#39;`. With
+`name` set to `<b>Tom & 'Jerry'</b>`, this template:
+
+```html
+<p title="<%= name %>"><%= name %></p>
+```
+
+renders as:
+
+```
+<p title="&lt;b&gt;Tom &amp; &#39;Jerry&#39;&lt;/b&gt;">&lt;b&gt;Tom &amp; &#39;Jerry&#39;&lt;/b&gt;</p>
+```
+
+That is what makes it safe to interpolate a value from a request, as the
+tourist example below does. The escaping covers element content and quoted
+attribute values. It does not cover an unquoted attribute, a `<script>` or
+`<style>` body, an `on*` handler, or a URL attribute given a
+`javascript:` URL -- keep request values out of those.
+
+`<%== var %>` writes the value verbatim. Use it for markup you built and
+trust, and in templates whose output is not HTML (plain-text email, config
+files), where entities would be wrong:
+
+```html
+<div class="body"><%== rendered-markdown %></div>
+```
+
+### Literal tags
 
 `<%%` emits a literal `<%` in the output. This is for templates that need
 to produce `<%` text without it being interpreted as a tag:
@@ -286,7 +316,9 @@ defn main [] :int
 ```
 
 `render-view` returns `render-file`'s heap buffer past `env-free`, so the
-caller owns those bytes. The `html` helper wraps it in a 200
+caller owns those bytes. The `name` capture comes straight from the URL;
+`<%= name %>` in `views/hello.html.tur` HTML-escapes it, so a request for
+`/hello/<script>...` renders text, not a script. The `html` helper wraps it in a 200
 `text/html` response.
 
 For the full web stack -- routing, sessions, TLS, and templates together
@@ -298,7 +330,8 @@ For the full web stack -- routing, sessions, TLS, and templates together
 
 | Syntax | Meaning |
 |--------|---------|
-| `<%= var %>` | Interpolate the string value of `var` |
+| `<%= var %>` | Interpolate the value of `var`, HTML-escaped |
+| `<%== var %>` | Interpolate the value of `var` verbatim |
 | `<% if cond %>...<% else %>...<% end %>` | Conditional branch (truthy = non-empty string) |
 | `<% for [x list] %>...<% end %>` | Iterate over a list binding |
 | `<% let x val %>...<% end %>` | Bind `x` to `val` for the body (`@key` = env lookup) |
