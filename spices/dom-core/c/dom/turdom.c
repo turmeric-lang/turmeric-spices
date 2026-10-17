@@ -2,6 +2,7 @@
 
 #include "turdom.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -28,6 +29,7 @@ typedef struct turdom_attr {
     const char *value;
     size_t vlen;
     struct turdom_attr *next;
+    int ns_fixup;           /* set by an edit: serialize declares its prefix */
 } turdom_attr;
 
 struct turdom_node {
@@ -51,6 +53,7 @@ struct turdom_node {
     int64_t nchildren;
     int64_t line;
     int64_t col;
+    int ns_fixup;           /* created or renamed by an edit (see serialize) */
 };
 
 struct turdom_doc {
@@ -58,6 +61,7 @@ struct turdom_doc {
     arena_chunk *chunks;
     turdom_node *docnode;
     int64_t count;
+    int64_t garbage;        /* arena bytes abandoned by edits (see turdom.h) */
 };
 
 /* Bytes of arena currently held by every live document in the process.
@@ -81,9 +85,14 @@ int64_t turdom_live_bytes(void) {
 #endif
 }
 
-static void *arena_alloc(turdom_doc *d, size_t n) {
+/* The bytes arena_alloc really takes for a request of n. */
+static size_t arena_size(size_t n) {
     n = (n + 7u) & ~(size_t)7u;
-    if (n == 0) n = 8;
+    return n ? n : 8;
+}
+
+static void *arena_alloc(turdom_doc *d, size_t n) {
+    n = arena_size(n);
     arena_chunk *c = d->chunks;
     if (c && c->used + n <= c->cap) {
         void *p = c->data + c->used;
@@ -191,9 +200,9 @@ turdom_node *turdom_doc_node(turdom_doc *d) { return d ? d->docnode : NULL; }
 turdom_doc *turdom_node_doc(const turdom_node *n) { return n ? n->doc : NULL; }
 int64_t turdom_node_count(const turdom_doc *d) { return d ? d->count : 0; }
 
-static turdom_node *new_node(turdom_doc *d, turdom_node *parent, int kind,
-                             int64_t line, int64_t col) {
-    if (!d || !parent) return NULL;
+/* A detached node in d's arena. */
+static turdom_node *alloc_node(turdom_doc *d, int kind, int64_t line,
+                               int64_t col) {
     turdom_node *n = (turdom_node *)arena_alloc(d, sizeof(turdom_node));
     if (!n) return NULL;
     memset(n, 0, sizeof(*n));
@@ -201,13 +210,42 @@ static turdom_node *new_node(turdom_doc *d, turdom_node *parent, int kind,
     n->doc = d;
     n->line = line;
     n->col = col;
-    n->parent = parent;
-    n->prev = parent->last;
-    if (parent->last) parent->last->next = n;
-    else parent->first = n;
-    parent->last = n;
-    parent->nchildren++;
     d->count++;
+    return n;
+}
+
+/* Link a detached child into parent before ref (ref NULL: at the end).  No
+ * checks: callers have done them. */
+static void link_before(turdom_node *parent, turdom_node *child,
+                        turdom_node *ref) {
+    child->parent = parent;
+    child->next = ref;
+    child->prev = ref ? ref->prev : parent->last;
+    if (child->prev) child->prev->next = child;
+    else parent->first = child;
+    if (ref) ref->prev = child;
+    else parent->last = child;
+    parent->nchildren++;
+}
+
+/* Unlink n from its parent; it keeps its own children. */
+static void unlink_node(turdom_node *n) {
+    turdom_node *p = n->parent;
+    if (!p) return;
+    if (n->prev) n->prev->next = n->next;
+    else p->first = n->next;
+    if (n->next) n->next->prev = n->prev;
+    else p->last = n->prev;
+    p->nchildren--;
+    n->parent = n->next = n->prev = NULL;
+}
+
+static turdom_node *new_node(turdom_doc *d, turdom_node *parent, int kind,
+                             int64_t line, int64_t col) {
+    if (!d || !parent) return NULL;
+    turdom_node *n = alloc_node(d, kind, line, col);
+    if (!n) return NULL;
+    link_before(parent, n, NULL);
     return n;
 }
 
@@ -236,6 +274,7 @@ void turdom_add_attr(turdom_doc *d, turdom_node *el,
     a->value = arena_strndup(d, value ? value : "", value ? vlen : 0);
     a->vlen = value ? vlen : 0;
     a->next = NULL;
+    a->ns_fixup = 0;
     if (!a->name || !a->local || !a->value) return;
     if (el->attrs_tail) el->attrs_tail->next = a;
     else el->attrs = a;
@@ -256,6 +295,7 @@ turdom_node *turdom_append_chars(turdom_doc *d, turdom_node *parent, int kind,
         memcpy(joined, t->value, t->value_len);
         if (n) memcpy(joined + t->value_len, s, n);
         joined[t->value_len + n] = '\0';
+        d->garbage += (int64_t)arena_size(t->value_len + 1);
         t->value = joined;
         t->value_len += n;
         return t;
@@ -500,7 +540,9 @@ static int html_is_void(const turdom_node *n) {
 /* XML: & < > always; in attributes also " and the whitespace that attribute
  * normalization would otherwise fold (\t \n \r).  HTML: the fragment
  * serialization algorithm -- & and U+00A0 everywhere, < > in text, and " in
- * attributes (plus < > there too, as current browsers do). */
+ * attributes (plus < > there too, as current browsers do).  Both escape \r,
+ * which a parser would otherwise turn into \n; a parsed HTML tree never holds
+ * one, so this only shows in edited content. */
 static void escape_into(obuf *b, const char *s, size_t n, int attr, int html) {
     size_t run = 0;
     for (size_t i = 0; i < n; i++) {
@@ -514,7 +556,7 @@ static void escape_into(obuf *b, const char *s, size_t n, int attr, int html) {
         case '"': if (attr) rep = "&quot;"; break;
         case '\t': if (attr && !html) rep = "&#9;"; break;
         case '\n': if (attr && !html) rep = "&#10;"; break;
-        case '\r': if (!html) rep = "&#13;"; break;
+        case '\r': rep = "&#13;"; break;
         case 0xC2:
             if (html && i + 1 < n && (unsigned char)s[i + 1] == 0xA0) {
                 rep = "&nbsp;";
@@ -554,7 +596,129 @@ static void put_quoted_id(obuf *b, const char *s) {
     ob_put(b, &q, 1);
 }
 
-static void open_node(obuf *b, const turdom_node *n, int has_kids) {
+/* ---- namespace fixup ------------------------------------------------------
+ *
+ * A parsed XML tree carries its namespace declarations as ordinary `xmlns`
+ * attributes, so it serializes as written.  A node an edit created or renamed
+ * (ns_fixup set) may sit where its prefix is undeclared, or bound to another
+ * URI; for those -- and only those -- the XML serializer adds the
+ * declaration, tracking what is in scope as it walks.  A parsed tree's output
+ * is byte for byte what it was. */
+
+#define TURDOM_XML_NS "http://www.w3.org/XML/1998/namespace"
+
+typedef struct {
+    const char *pre;
+    size_t plen;
+    const char *uri;
+    int64_t depth;          /* -1: declared on an ancestor of the top node */
+} ns_bind;
+
+typedef struct {
+    ns_bind *v;
+    size_t n, cap;
+} ns_scope;
+
+static void ns_push(ns_scope *sc, const char *pre, size_t plen,
+                    const char *uri, int64_t depth) {
+    if (sc->n == sc->cap) {
+        size_t cap = sc->cap ? sc->cap * 2 : 16;
+        ns_bind *nv = (ns_bind *)realloc(sc->v, cap * sizeof(ns_bind));
+        if (!nv) return;                /* a missed fixup, never a crash */
+        sc->v = nv;
+        sc->cap = cap;
+    }
+    sc->v[sc->n].pre = pre;
+    sc->v[sc->n].plen = plen;
+    sc->v[sc->n].uri = uri;
+    sc->v[sc->n].depth = depth;
+    sc->n++;
+}
+
+static void ns_pop_to(ns_scope *sc, int64_t depth) {
+    while (sc->n && sc->v[sc->n - 1].depth >= depth) sc->n--;
+}
+
+/* The URI bound to a prefix; "" for an undeclared default, NULL for an
+ * undeclared prefix. */
+static const char *ns_lookup(const ns_scope *sc, const char *pre, size_t plen) {
+    for (size_t i = sc->n; i-- > 0;)
+        if (sc->v[i].plen == plen && memcmp(sc->v[i].pre, pre, plen) == 0)
+            return sc->v[i].uri;
+    if (plen == 3 && memcmp(pre, "xml", 3) == 0) return TURDOM_XML_NS;
+    return plen == 0 ? "" : NULL;
+}
+
+/* Is attribute name a namespace declaration?  Sets its prefix. */
+static int xmlns_decl(const char *name, const char **pre, size_t *plen) {
+    if (strcmp(name, "xmlns") == 0) { *pre = ""; *plen = 0; return 1; }
+    if (strncmp(name, "xmlns:", 6) == 0) {
+        *pre = name + 6;
+        *plen = strlen(name + 6);
+        return 1;
+    }
+    return 0;
+}
+
+static size_t prefix_len(const char *qname) {
+    const char *c = strchr(qname, ':');
+    return c ? (size_t)(c - qname) : 0;
+}
+
+static void push_decls_of(ns_scope *sc, const turdom_node *el, int64_t depth) {
+    for (const turdom_attr *a = el->attrs; a; a = a->next) {
+        const char *pre;
+        size_t plen;
+        if (xmlns_decl(a->name, &pre, &plen)) ns_push(sc, pre, plen, a->value, depth);
+    }
+}
+
+/* Declarations in scope at top: its ancestors', outermost first. */
+static void seed_scope(ns_scope *sc, const turdom_node *top) {
+    int64_t k = 0;
+    for (const turdom_node *a = top->parent; a; a = a->parent) k++;
+    if (!k) return;
+    const turdom_node **chain =
+        (const turdom_node **)malloc((size_t)k * sizeof(*chain));
+    if (!chain) return;
+    int64_t i = k;
+    for (const turdom_node *a = top->parent; a; a = a->parent) chain[--i] = a;
+    for (i = 0; i < k; i++)
+        if (chain[i]->kind == TURDOM_ELEMENT) push_decls_of(sc, chain[i], -1);
+    free(chain);
+}
+
+static void put_decl(obuf *b, ns_scope *sc, const char *pre, size_t plen,
+                     const char *uri, int64_t depth) {
+    ob_puts(b, plen ? " xmlns:" : " xmlns");
+    ob_put(b, pre, plen);
+    ob_puts(b, "=\"");
+    escape_into(b, uri, strlen(uri), 1, 0);
+    ob_puts(b, "\"");
+    ns_push(sc, pre, plen, uri, depth);
+}
+
+static void fix_namespaces(obuf *b, ns_scope *sc, const turdom_node *n,
+                           int64_t depth) {
+    if (n->ns_fixup) {
+        size_t plen = prefix_len(n->name);
+        const char *uri = n->ns_uri ? n->ns_uri : "";
+        const char *bound = ns_lookup(sc, n->name, plen);
+        if ((!bound || strcmp(bound, uri) != 0) && (plen == 0 || uri[0]))
+            put_decl(b, sc, n->name, plen, uri, depth);
+    }
+    for (const turdom_attr *a = n->attrs; a; a = a->next) {
+        if (!a->ns_fixup || !a->ns_uri) continue;
+        size_t plen = prefix_len(a->name);
+        if (!plen) continue;
+        const char *bound = ns_lookup(sc, a->name, plen);
+        if (!bound || strcmp(bound, a->ns_uri) != 0)
+            put_decl(b, sc, a->name, plen, a->ns_uri, depth);
+    }
+}
+
+static void open_node(obuf *b, const turdom_node *n, int has_kids,
+                      ns_scope *sc, int64_t depth) {
     int html = n->doc->flavor == TURDOM_FLAVOR_HTML;
     switch (n->kind) {
     case TURDOM_DOCUMENT:
@@ -568,6 +732,10 @@ static void open_node(obuf *b, const turdom_node *n, int has_kids) {
             ob_puts(b, "=\"");
             escape_into(b, a->value, a->vlen, 1, html);
             ob_puts(b, "\"");
+        }
+        if (sc) {
+            push_decls_of(sc, n, depth);
+            fix_namespaces(b, sc, n, depth);
         }
         if (!html && !has_kids) ob_puts(b, "/>");
         else ob_puts(b, ">");
@@ -636,19 +804,26 @@ static void close_node(obuf *b, const turdom_node *n, int had_kids) {
 char *turdom_serialize(const turdom_node *top, size_t *len) {
     obuf b = {0};
     if (!top) return ob_finish(&b, len);
+    ns_scope scope = {0};
+    ns_scope *sc = top->doc->flavor == TURDOM_FLAVOR_XML ? &scope : NULL;
+    if (sc) seed_scope(sc, top);
+    int64_t depth = 0;
     const turdom_node *n = top;
     for (;;) {
         /* An HTML void element's children (only reachable by building the
          * tree by hand) are not serialized, matching the spec. */
         int descend = n->first != NULL && !html_is_void(n);
-        open_node(&b, n, descend);
-        if (descend) { n = n->first; continue; }
+        open_node(&b, n, descend, sc, depth);
+        if (descend) { n = n->first; depth++; continue; }
         close_node(&b, n, 0);
+        if (sc) ns_pop_to(sc, depth);
         for (;;) {
-            if (n == top) return ob_finish(&b, len);
+            if (n == top) { free(scope.v); return ob_finish(&b, len); }
             if (n->next) { n = n->next; break; }
             n = n->parent;
+            depth--;
             close_node(&b, n, 1);
+            if (sc) ns_pop_to(sc, depth);
         }
     }
 }
@@ -701,4 +876,1712 @@ int turdom_equal(const turdom_node *a, const turdom_node *b) {
         y = turdom_next_in(b, y);
     }
     return x == NULL && y == NULL;
+}
+
+/* ---- editing ------------------------------------------------------------
+ *
+ * See turdom.h.  Nothing here frees: a replaced string or a removed attribute
+ * is counted in d->garbage and left where it is, so a borrowed pointer to it
+ * stays valid until turdom_doc_free. */
+
+#define TURDOM_XHTML_NS "http://www.w3.org/1999/xhtml"
+
+int64_t turdom_garbage_bytes(const turdom_doc *d) { return d ? d->garbage : 0; }
+
+static int64_t str_bytes(const char *s) {
+    return s ? (int64_t)arena_size(strlen(s) + 1) : 0;
+}
+
+static int is_container(const turdom_node *n) {
+    return n->kind == TURDOM_ELEMENT || n->kind == TURDOM_DOCUMENT;
+}
+
+/* Does a name in this namespace get HTML's lower-casing in document d? */
+static int lowers_names(const turdom_doc *d, const char *ns_uri) {
+    return d->flavor == TURDOM_FLAVOR_HTML &&
+           (!ns_uri || !ns_uri[0] || strcmp(ns_uri, TURDOM_XHTML_NS) == 0);
+}
+
+static char *arena_strdup_lower(turdom_doc *d, const char *s) {
+    size_t n = strlen(s);
+    char *p = arena_strndup(d, s, n);
+    if (!p) return NULL;
+    for (size_t i = 0; i < n; i++) p[i] = (char)ascii_lower((unsigned char)p[i]);
+    return p;
+}
+
+/* Give element n the name (qname, ns_uri, local), lower-cased where HTML
+ * would.  On failure n keeps its old names. */
+static int set_names(turdom_doc *d, turdom_node *n, const char *qname,
+                     const char *ns_uri, const char *local) {
+    /* In an HTML document an element with no namespace is an HTML element,
+     * which is how the parser builds them too. */
+    if (d->flavor == TURDOM_FLAVOR_HTML && (!ns_uri || !ns_uri[0]))
+        ns_uri = TURDOM_XHTML_NS;
+    int lower = lowers_names(d, ns_uri);
+    const char *q = qname ? qname : "";
+    const char *name = lower ? arena_strdup_lower(d, q) : arena_strdup_opt(d, q);
+    const char *uri = (ns_uri && ns_uri[0]) ? arena_strdup_opt(d, ns_uri) : NULL;
+    const char *loc = !local ? name
+                      : lower ? arena_strdup_lower(d, local)
+                              : arena_strdup_opt(d, local);
+    if (!name || !loc || (ns_uri && ns_uri[0] && !uri)) return TURDOM_E_OOM;
+    n->name = name;
+    n->ns_uri = uri;
+    n->local = loc;
+    return TURDOM_OK;
+}
+
+static int64_t name_bytes(const char *name, const char *local,
+                          const char *ns_uri) {
+    return str_bytes(name) + (local != name ? str_bytes(local) : 0) +
+           str_bytes(ns_uri);
+}
+
+turdom_node *turdom_create_element(turdom_doc *d, const char *qname,
+                                   const char *ns_uri, const char *local) {
+    if (!d) return NULL;
+    turdom_node *n = alloc_node(d, TURDOM_ELEMENT, 0, 0);
+    if (!n) return NULL;
+    n->ns_fixup = 1;
+    return set_names(d, n, qname, ns_uri, local) == TURDOM_OK ? n : NULL;
+}
+
+turdom_node *turdom_create_chars(turdom_doc *d, int kind, const char *s,
+                                 size_t n) {
+    if (!d || (kind != TURDOM_TEXT && kind != TURDOM_COMMENT &&
+               kind != TURDOM_CDATA))
+        return NULL;
+    turdom_node *t = alloc_node(d, kind, 0, 0);
+    if (!t) return NULL;
+    t->value = arena_strndup(d, s ? s : "", s ? n : 0);
+    t->value_len = s ? n : 0;
+    return t->value ? t : NULL;
+}
+
+turdom_node *turdom_create_pi(turdom_doc *d, const char *target,
+                              const char *data) {
+    if (!d) return NULL;
+    turdom_node *n = alloc_node(d, TURDOM_PI, 0, 0);
+    if (!n) return NULL;
+    n->name = arena_strdup_opt(d, target ? target : "");
+    n->local = n->name;
+    const char *dd = data ? data : "";
+    n->value_len = strlen(dd);
+    n->value = arena_strndup(d, dd, n->value_len);
+    return (n->name && n->value) ? n : NULL;
+}
+
+/* May child go into parent before ref (ref NULL: at the end)?  The DOM's
+ * pre-insertion rules, restricted to the node kinds this tree has. */
+static int check_insert(const turdom_node *parent, const turdom_node *child,
+                        const turdom_node *ref) {
+    if (!parent || !child) return TURDOM_E_BAD_KIND;
+    if (child->doc != parent->doc) return TURDOM_E_WRONG_DOC;
+    if (!is_container(parent)) return TURDOM_E_NOT_CONTAINER;
+    if (child->kind == TURDOM_DOCUMENT) return TURDOM_E_HIERARCHY;
+    /* Only a node with children can be an ancestor of parent, so a fresh
+     * node (the usual case) skips the O(depth) walk -- building a deep chain
+     * one append at a time stays linear. */
+    if (child == parent) return TURDOM_E_CYCLE;
+    if (child->first)
+        for (const turdom_node *a = parent->parent; a; a = a->parent)
+            if (a == child) return TURDOM_E_CYCLE;
+    if (parent->kind == TURDOM_ELEMENT)
+        return child->kind == TURDOM_DOCTYPE ? TURDOM_E_HIERARCHY : TURDOM_OK;
+    /* parent is the document node */
+    switch (child->kind) {
+    case TURDOM_TEXT:
+    case TURDOM_CDATA:
+        return TURDOM_E_HIERARCHY;
+    case TURDOM_ELEMENT:
+        for (const turdom_node *c = parent->first; c; c = c->next)
+            if (c != child && c->kind == TURDOM_ELEMENT) return TURDOM_E_HIERARCHY;
+        for (const turdom_node *c = ref; c; c = c->next)
+            if (c->kind == TURDOM_DOCTYPE) return TURDOM_E_HIERARCHY;
+        return TURDOM_OK;
+    case TURDOM_DOCTYPE:
+        for (const turdom_node *c = parent->first; c; c = c->next)
+            if (c != child && c->kind == TURDOM_DOCTYPE) return TURDOM_E_HIERARCHY;
+        for (const turdom_node *c = ref ? ref->prev : parent->last; c; c = c->prev)
+            if (c->kind == TURDOM_ELEMENT) return TURDOM_E_HIERARCHY;
+        return TURDOM_OK;
+    default:
+        return TURDOM_OK;       /* comment, PI */
+    }
+}
+
+static int do_insert(turdom_node *parent, turdom_node *child, turdom_node *ref) {
+    if (ref == child) ref = child->next;    /* before itself: it stays put */
+    int rc = check_insert(parent, child, ref);
+    if (rc != TURDOM_OK) return rc;
+    unlink_node(child);
+    link_before(parent, child, ref);
+    return TURDOM_OK;
+}
+
+int turdom_append(turdom_node *parent, turdom_node *child) {
+    return do_insert(parent, child, NULL);
+}
+
+int turdom_prepend(turdom_node *parent, turdom_node *child) {
+    if (!parent) return TURDOM_E_BAD_KIND;
+    return do_insert(parent, child, parent->first);
+}
+
+int turdom_insert_before(turdom_node *ref, turdom_node *child) {
+    if (!ref || !child) return TURDOM_E_BAD_KIND;
+    if (!ref->parent) return TURDOM_E_DETACHED;
+    return do_insert(ref->parent, child, ref);
+}
+
+int turdom_insert_after(turdom_node *ref, turdom_node *child) {
+    if (!ref || !child) return TURDOM_E_BAD_KIND;
+    if (!ref->parent) return TURDOM_E_DETACHED;
+    if (child == ref) return TURDOM_OK;
+    return do_insert(ref->parent, child, ref->next);
+}
+
+int turdom_replace(turdom_node *old, turdom_node *repl) {
+    if (!old || !repl) return TURDOM_E_BAD_KIND;
+    if (!old->parent) return TURDOM_E_DETACHED;
+    if (old == repl) return TURDOM_OK;
+    turdom_node *parent = old->parent, *ref = old->next;
+    /* Take old out first, so the document node's one-element rule does not
+     * count it; put it back if repl cannot go there. */
+    unlink_node(old);
+    int rc = do_insert(parent, repl, ref);
+    if (rc != TURDOM_OK) link_before(parent, old, ref);
+    return rc;
+}
+
+void turdom_remove(turdom_node *n) {
+    if (n) unlink_node(n);
+}
+
+int turdom_unwrap(turdom_node *n) {
+    if (!n) return TURDOM_E_BAD_KIND;
+    if (n->kind == TURDOM_DOCUMENT) return TURDOM_E_BAD_KIND;
+    if (!n->parent) return TURDOM_E_DETACHED;
+    turdom_node *parent = n->parent;
+    if (parent->kind == TURDOM_DOCUMENT) {
+        /* n is going away, so count what would be left at the top level. */
+        int elements = 0;
+        for (const turdom_node *c = parent->first; c; c = c->next)
+            if (c != n && c->kind == TURDOM_ELEMENT) elements++;
+        for (const turdom_node *c = n->first; c; c = c->next) {
+            if (c->kind == TURDOM_TEXT || c->kind == TURDOM_CDATA)
+                return TURDOM_E_HIERARCHY;
+            if (c->kind == TURDOM_ELEMENT) elements++;
+        }
+        if (elements > 1) return TURDOM_E_HIERARCHY;
+    }
+    while (n->first) {
+        turdom_node *c = n->first;
+        unlink_node(c);
+        link_before(parent, c, n);
+    }
+    unlink_node(n);
+    return TURDOM_OK;
+}
+
+int turdom_set_attr(turdom_node *el, const char *qname, const char *ns_uri,
+                    const char *local, const char *value, size_t vlen) {
+    if (!el || el->kind != TURDOM_ELEMENT) return TURDOM_E_BAD_KIND;
+    turdom_doc *d = el->doc;
+    const char *q = qname ? qname : "";
+    int has_ns = ns_uri && ns_uri[0];
+    int fold = d->flavor == TURDOM_FLAVOR_HTML;
+    turdom_attr *hit = NULL;
+    for (turdom_attr *a = el->attrs; a && !hit; a = a->next) {
+        if (has_ns) {
+            const char *want = local ? local : q;
+            if (a->ns_uri && strcmp(a->ns_uri, ns_uri) == 0 &&
+                strcmp(a->local, want) == 0)
+                hit = a;
+        } else if (name_eq(a->name, q, strlen(q), fold)) {
+            hit = a;
+        }
+    }
+    const char *v = arena_strndup(d, value ? value : "", value ? vlen : 0);
+    if (!v) return TURDOM_E_OOM;
+    if (hit) {
+        d->garbage += (int64_t)arena_size(hit->vlen + 1);
+        hit->value = v;
+        hit->vlen = value ? vlen : 0;
+        return TURDOM_OK;
+    }
+    turdom_attr *a = (turdom_attr *)arena_alloc(d, sizeof(turdom_attr));
+    if (!a) return TURDOM_E_OOM;
+    /* setAttribute lower-cases on an HTML element in an HTML document. */
+    int lower = !has_ns && lowers_names(d, el->ns_uri);
+    a->name = lower ? arena_strdup_lower(d, q) : arena_strdup_opt(d, q);
+    a->ns_uri = has_ns ? arena_strdup_opt(d, ns_uri) : NULL;
+    a->local = !local ? a->name
+               : lower ? arena_strdup_lower(d, local) : arena_strdup_opt(d, local);
+    a->value = v;
+    a->vlen = value ? vlen : 0;
+    a->next = NULL;
+    a->ns_fixup = has_ns;
+    if (!a->name || !a->local || (has_ns && !a->ns_uri)) return TURDOM_E_OOM;
+    if (el->attrs_tail) el->attrs_tail->next = a;
+    else el->attrs = a;
+    el->attrs_tail = a;
+    el->nattrs++;
+    return TURDOM_OK;
+}
+
+int turdom_remove_attr(turdom_node *el, const char *name) {
+    if (!el || el->kind != TURDOM_ELEMENT || !name) return 0;
+    int fold = el->doc->flavor == TURDOM_FLAVOR_HTML;
+    turdom_attr *prev = NULL;
+    for (turdom_attr *a = el->attrs; a; prev = a, a = a->next) {
+        if (!qname_matches(a->name, a->ns_uri, a->local, name, fold)) continue;
+        if (prev) prev->next = a->next;
+        else el->attrs = a->next;
+        if (el->attrs_tail == a) el->attrs_tail = prev;
+        el->nattrs--;
+        el->doc->garbage += (int64_t)arena_size(sizeof(turdom_attr)) +
+                            name_bytes(a->name, a->local, a->ns_uri) +
+                            (int64_t)arena_size(a->vlen + 1);
+        return 1;
+    }
+    return 0;
+}
+
+int turdom_set_value(turdom_node *n, const char *s, size_t len) {
+    if (!n) return TURDOM_E_BAD_KIND;
+    switch (n->kind) {
+    case TURDOM_TEXT: case TURDOM_COMMENT: case TURDOM_CDATA: case TURDOM_PI:
+        break;
+    default:
+        return TURDOM_E_BAD_KIND;
+    }
+    char *v = arena_strndup(n->doc, s ? s : "", s ? len : 0);
+    if (!v) return TURDOM_E_OOM;
+    n->doc->garbage += (int64_t)arena_size(n->value_len + 1);
+    n->value = v;
+    n->value_len = s ? len : 0;
+    return TURDOM_OK;
+}
+
+int turdom_set_text(turdom_node *n, const char *s, size_t len) {
+    if (!n) return TURDOM_E_BAD_KIND;
+    if (n->kind != TURDOM_ELEMENT) return turdom_set_value(n, s, len);
+    turdom_node *t = NULL;
+    if (s && len) {
+        t = turdom_create_chars(n->doc, TURDOM_TEXT, s, len);
+        if (!t) return TURDOM_E_OOM;
+    }
+    while (n->first) unlink_node(n->first);
+    if (t) link_before(n, t, NULL);
+    return TURDOM_OK;
+}
+
+int turdom_rename(turdom_node *el, const char *qname, const char *ns_uri,
+                  const char *local) {
+    if (!el || el->kind != TURDOM_ELEMENT) return TURDOM_E_BAD_KIND;
+    int64_t old = name_bytes(el->name, el->local, el->ns_uri);
+    int rc = set_names(el->doc, el, qname, ns_uri, local);
+    if (rc == TURDOM_OK) {
+        el->doc->garbage += old;
+        el->ns_fixup = 1;
+    }
+    return rc;
+}
+
+/* A detached copy of s (no children) in d's arena. */
+static turdom_node *copy_shallow(turdom_doc *d, const turdom_node *s) {
+    turdom_node *n = alloc_node(d, s->kind, s->line, s->col);
+    if (!n) return NULL;
+    n->ns_fixup = s->ns_fixup;
+    n->name = arena_strdup_opt(d, s->name);
+    n->local = s->local == s->name ? n->name : arena_strdup_opt(d, s->local);
+    n->ns_uri = arena_strdup_opt(d, s->ns_uri);
+    n->public_id = arena_strdup_opt(d, s->public_id);
+    n->system_id = arena_strdup_opt(d, s->system_id);
+    if ((s->name && !n->name) || (s->local && !n->local) ||
+        (s->ns_uri && !n->ns_uri) || (s->public_id && !n->public_id) ||
+        (s->system_id && !n->system_id))
+        return NULL;
+    if (s->value) {
+        n->value = arena_strndup(d, s->value, s->value_len);
+        if (!n->value) return NULL;
+        n->value_len = s->value_len;
+    }
+    for (const turdom_attr *sa = s->attrs; sa; sa = sa->next) {
+        turdom_attr *a = (turdom_attr *)arena_alloc(d, sizeof(turdom_attr));
+        if (!a) return NULL;
+        a->name = arena_strdup_opt(d, sa->name);
+        a->local = sa->local == sa->name ? a->name : arena_strdup_opt(d, sa->local);
+        a->ns_uri = arena_strdup_opt(d, sa->ns_uri);
+        a->value = arena_strndup(d, sa->value, sa->vlen);
+        a->vlen = sa->vlen;
+        a->next = NULL;
+        a->ns_fixup = sa->ns_fixup;
+        if (!a->name || !a->local || (sa->ns_uri && !a->ns_uri) || !a->value)
+            return NULL;
+        if (n->attrs_tail) n->attrs_tail->next = a;
+        else n->attrs = a;
+        n->attrs_tail = a;
+        n->nattrs++;
+    }
+    return n;
+}
+
+/* A detached deep copy of src in d's arena.  Walks src and the copy in step,
+ * without recursion. */
+static turdom_node *deep_copy(turdom_doc *d, const turdom_node *src) {
+    turdom_node *root = copy_shallow(d, src);
+    if (!root) return NULL;
+    const turdom_node *s = src;
+    turdom_node *c = root;
+    for (;;) {
+        if (s->first) {
+            s = s->first;
+            turdom_node *k = copy_shallow(d, s);
+            if (!k) return NULL;
+            link_before(c, k, NULL);
+            c = k;
+            continue;
+        }
+        for (;;) {
+            if (s == src) return root;
+            if (s->next) {
+                s = s->next;
+                turdom_node *k = copy_shallow(d, s);
+                if (!k) return NULL;
+                link_before(c->parent, k, NULL);
+                c = k;
+                break;
+            }
+            s = s->parent;
+            c = c->parent;
+        }
+    }
+}
+
+turdom_node *turdom_clone(const turdom_node *n) {
+    if (!n || n->kind == TURDOM_DOCUMENT) return NULL;
+    return deep_copy(n->doc, n);
+}
+
+turdom_node *turdom_import(turdom_doc *d, const turdom_node *n) {
+    if (!d || !n || n->kind == TURDOM_DOCUMENT) return NULL;
+    return deep_copy(d, n);
+}
+
+void turdom_normalize(turdom_node *root) {
+    if (!root) return;
+    for (turdom_node *n = root; n; n = turdom_next_in(root, n)) {
+        if (!is_container(n)) continue;
+        turdom_node *c = n->first;
+        while (c) {
+            turdom_node *nx = c->next;
+            if (c->kind != TURDOM_TEXT) { c = nx; continue; }
+            /* c starts a run of text nodes: size it, join it, unlink the rest. */
+            size_t total = c->value_len;
+            for (turdom_node *r = nx; r && r->kind == TURDOM_TEXT; r = r->next)
+                total += r->value_len;
+            if (total == 0) {
+                while (nx && nx->kind == TURDOM_TEXT) {
+                    turdom_node *nn = nx->next;
+                    unlink_node(nx);
+                    nx = nn;
+                }
+                unlink_node(c);
+                c = nx;
+                continue;
+            }
+            if (total != c->value_len) {
+                char *joined = (char *)arena_alloc(c->doc, total + 1);
+                if (!joined) return;
+                size_t at = 0;
+                memcpy(joined, c->value, c->value_len);
+                at = c->value_len;
+                for (turdom_node *r = nx; r && r->kind == TURDOM_TEXT; r = r->next) {
+                    memcpy(joined + at, r->value, r->value_len);
+                    at += r->value_len;
+                }
+                joined[total] = '\0';
+                c->doc->garbage += (int64_t)arena_size(c->value_len + 1);
+                c->value = joined;
+                c->value_len = total;
+            }
+            while (nx && nx->kind == TURDOM_TEXT) {
+                turdom_node *nn = nx->next;
+                unlink_node(nx);
+                nx = nn;
+            }
+            c = nx;
+        }
+    }
+}
+
+turdom_doc *turdom_compact(const turdom_doc *d) {
+    if (!d) return NULL;
+    turdom_doc *nd = turdom_doc_new(d->flavor);
+    if (!nd) return NULL;
+    for (const turdom_node *c = d->docnode->first; c; c = c->next) {
+        turdom_node *k = deep_copy(nd, c);
+        if (!k) { turdom_doc_free(nd); return NULL; }
+        link_before(nd->docnode, k, NULL);
+    }
+    return nd;
+}
+
+int turdom_attached(const turdom_node *n) {
+    if (!n) return 0;
+    while (n->parent) n = n->parent;
+    return n == n->doc->docnode;
+}
+
+/* ---- validation ------------------------------------------------------------
+ *
+ * See turdom.h.  Pure checks over the arguments and the tree; nothing here
+ * edits. */
+
+#define TURDOM_XMLNS_NS "http://www.w3.org/2000/xmlns/"
+
+/* Decode one UTF-8 code point at s[*i] and advance; 0 when malformed
+ * (truncated, overlong, a surrogate or past U+10FFFF). */
+static int utf8_next(const unsigned char *s, size_t n, size_t *i, uint32_t *cp) {
+    unsigned char c = s[*i];
+    if (c < 0x80) { *cp = c; (*i)++; return 1; }
+    size_t k;
+    uint32_t v, min;
+    if ((c & 0xE0) == 0xC0)      { k = 1; v = c & 0x1Fu; min = 0x80; }
+    else if ((c & 0xF0) == 0xE0) { k = 2; v = c & 0x0Fu; min = 0x800; }
+    else if ((c & 0xF8) == 0xF0) { k = 3; v = c & 0x07u; min = 0x10000; }
+    else return 0;
+    if (*i + k >= n) return 0;
+    for (size_t j = 1; j <= k; j++) {
+        unsigned char b = s[*i + j];
+        if ((b & 0xC0) != 0x80) return 0;
+        v = (v << 6) | (b & 0x3Fu);
+    }
+    if (v < min || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) return 0;
+    *cp = v;
+    *i += k + 1;
+    return 1;
+}
+
+static int xml_char(uint32_t c) {
+    return c == 0x9 || c == 0xA || c == 0xD || (c >= 0x20 && c <= 0xD7FF) ||
+           (c >= 0xE000 && c <= 0xFFFD) || (c >= 0x10000 && c <= 0x10FFFF);
+}
+
+static int xml_name_start(uint32_t c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' ||
+           c == ':' || (c >= 0xC0 && c <= 0xD6) || (c >= 0xD8 && c <= 0xF6) ||
+           (c >= 0xF8 && c <= 0x2FF) || (c >= 0x370 && c <= 0x37D) ||
+           (c >= 0x37F && c <= 0x1FFF) || (c >= 0x200C && c <= 0x200D) ||
+           (c >= 0x2070 && c <= 0x218F) || (c >= 0x2C00 && c <= 0x2FEF) ||
+           (c >= 0x3001 && c <= 0xD7FF) || (c >= 0xF900 && c <= 0xFDCF) ||
+           (c >= 0xFDF0 && c <= 0xFFFD) || (c >= 0x10000 && c <= 0xEFFFF);
+}
+
+static int xml_name_char(uint32_t c) {
+    return xml_name_start(c) || c == '-' || c == '.' || (c >= '0' && c <= '9') ||
+           c == 0xB7 || (c >= 0x300 && c <= 0x36F) || (c >= 0x203F && c <= 0x2040);
+}
+
+static int xml_ncname(const char *s, size_t n) {
+    if (n == 0) return 0;
+    const unsigned char *u = (const unsigned char *)s;
+    size_t i = 0;
+    int first = 1;
+    while (i < n) {
+        uint32_t c;
+        if (!utf8_next(u, n, &i, &c) || c == ':') return 0;
+        if (first ? !xml_name_start(c) : !xml_name_char(c)) return 0;
+        first = 0;
+    }
+    return 1;
+}
+
+/* A QName: NCName, or NCName ':' NCName.  *plen gets the prefix length. */
+static int xml_qname(const char *q, size_t *plen) {
+    size_t n = strlen(q);
+    const char *c = (const char *)memchr(q, ':', n);
+    if (!c) { *plen = 0; return xml_ncname(q, n); }
+    *plen = (size_t)(c - q);
+    return xml_ncname(q, *plen) && xml_ncname(c + 1, n - *plen - 1);
+}
+
+/* A Name: what a document read with namespaces off may use, colons and all. */
+static int xml_name(const char *s, size_t n) {
+    if (n == 0) return 0;
+    const unsigned char *u = (const unsigned char *)s;
+    size_t i = 0;
+    int first = 1;
+    while (i < n) {
+        uint32_t c;
+        if (!utf8_next(u, n, &i, &c)) return 0;
+        if (first ? !xml_name_start(c) : !xml_name_char(c)) return 0;
+        first = 0;
+    }
+    return 1;
+}
+
+static int xml_chars(const char *s, size_t n) {
+    const unsigned char *u = (const unsigned char *)s;
+    size_t i = 0;
+    while (i < n) {
+        uint32_t c;
+        if (!utf8_next(u, n, &i, &c) || !xml_char(c)) return 0;
+    }
+    return 1;
+}
+
+static int html_space(int c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r';
+}
+
+static int html_element_name(const char *s) {
+    int c0 = (unsigned char)s[0];
+    if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z'))) return 0;
+    for (const char *p = s; *p; p++)
+        if (html_space(*p) || *p == '/' || *p == '>') return 0;
+    return 1;
+}
+
+static int html_attr_name(const char *s) {
+    if (!s[0]) return 0;
+    for (const char *p = s; *p; p++)
+        if (html_space(*p) || *p == '/' || *p == '>' || *p == '=') return 0;
+    return 1;
+}
+
+static int has_sub(const char *s, size_t n, const char *needle) {
+    size_t k = strlen(needle);
+    for (size_t i = 0; i + k <= n; i++)
+        if (memcmp(s + i, needle, k) == 0) return 1;
+    return 0;
+}
+
+static int eq_ci(const char *a, size_t alen, const char *b) {
+    return name_eq(b, a, alen, 1);
+}
+
+static int in_set_ci(const char *s, size_t n, const char *const *set) {
+    for (; *set; set++)
+        if (eq_ci(s, n, *set)) return 1;
+    return 0;
+}
+
+/* The local part of a qualified name. */
+static const char *local_part(const char *qname, size_t *n) {
+    const char *c = strchr(qname, ':');
+    const char *l = c ? c + 1 : qname;
+    *n = strlen(l);
+    return l;
+}
+
+/* Would text s end raw-text element `tag` early when reparsed, or not come
+ * back as written (a \r, which raw text cannot escape)? */
+static int rawtext_ok(const char *tag, size_t tlen, const char *s, size_t n) {
+    if (memchr(s, '\r', n)) return 0;
+    for (size_t i = 0; i + 1 < n; i++) {
+        if (s[i] != '<') continue;
+        if (s[i + 1] == '/' && i + 2 + tlen <= n) {
+            size_t j = 0;
+            while (j < tlen && ascii_lower((unsigned char)s[i + 2 + j]) ==
+                               ascii_lower((unsigned char)tag[j]))
+                j++;
+            if (j == tlen) return 0;
+        }
+        if (tlen == 6 && eq_ci(tag, 6, "script") && i + 4 <= n &&
+            memcmp(s + i, "<!--", 4) == 0)
+            return 0;
+    }
+    return 1;
+}
+
+static int is_html_ns_uri(const char *u) {
+    return !u || !u[0] || strcmp(u, TURDOM_XHTML_NS) == 0;
+}
+
+/* Placement rules for a child under an element whose (html-ness, local name)
+ * are given -- so a rename can ask before it happens. */
+static int placement_rc(int html, const char *ns_uri, const char *local,
+                        size_t llen, const turdom_node *child) {
+    if (!html || !is_html_ns_uri(ns_uri)) return TURDOM_OK;
+    if (in_set_ci(local, llen, html_void)) return TURDOM_E_HIERARCHY;
+    if (in_set_ci(local, llen, html_rawtext)) {
+        if (child->kind != TURDOM_TEXT) return TURDOM_E_HIERARCHY;
+        return rawtext_ok(local, llen, child->value, child->value_len)
+                   ? TURDOM_OK : TURDOM_E_BAD_CONTENT;
+    }
+    if (child->kind == TURDOM_CDATA) return TURDOM_E_HIERARCHY;
+    return TURDOM_OK;
+}
+
+static int element_name_rc(int html, const char *qname, const char *ns_uri) {
+    if (!qname) return TURDOM_E_BAD_NAME;
+    int has_ns = ns_uri && ns_uri[0];
+    if (html) {
+        if (!html_element_name(qname)) return TURDOM_E_BAD_NAME;
+        if (is_html_ns_uri(ns_uri) && eq_ci(qname, strlen(qname), "plaintext"))
+            return TURDOM_E_BAD_NAME;
+        return TURDOM_OK;
+    }
+    size_t plen;
+    if (!xml_qname(qname, &plen)) return TURDOM_E_BAD_NAME;
+    if (has_ns && strcmp(ns_uri, TURDOM_XMLNS_NS) == 0) return TURDOM_E_BAD_NAME;
+    int xml_ns = has_ns && strcmp(ns_uri, TURDOM_XML_NS) == 0;
+    if (!plen) return xml_ns ? TURDOM_E_BAD_NAME : TURDOM_OK;
+    if (!has_ns) return TURDOM_E_BAD_NAME;
+    if (plen == 5 && memcmp(qname, "xmlns", 5) == 0) return TURDOM_E_BAD_NAME;
+    int xml_pre = plen == 3 && memcmp(qname, "xml", 3) == 0;
+    return xml_pre == xml_ns ? TURDOM_OK : TURDOM_E_BAD_NAME;
+}
+
+int turdom_check_element_name(const turdom_doc *d, const char *qname,
+                              const char *ns_uri) {
+    if (!d) return TURDOM_E_BAD_KIND;
+    return element_name_rc(d->flavor == TURDOM_FLAVOR_HTML, qname, ns_uri);
+}
+
+/* On element el, is prefix pre bound -- by el's own name (unless skip_el), a
+ * namespaced attribute, or an xmlns declaration (other than the attribute
+ * named skip) -- to something other than uri? */
+static int prefix_conflict(const turdom_node *el, const char *pre, size_t plen,
+                           const char *uri, int skip_el, const char *skip) {
+    if (!skip_el) {
+        size_t ep = prefix_len(el->name);
+        const char *eu = el->ns_uri ? el->ns_uri : "";
+        if (ep == plen && memcmp(el->name, pre, plen) == 0 && strcmp(eu, uri) != 0)
+            return 1;
+    }
+    for (const turdom_attr *a = el->attrs; a; a = a->next) {
+        if (skip && strcmp(a->name, skip) == 0) continue;
+        const char *dp;
+        size_t dl;
+        if (xmlns_decl(a->name, &dp, &dl)) {
+            if (dl == plen && memcmp(dp, pre, plen) == 0 && strcmp(a->value, uri) != 0)
+                return 1;
+        } else if (a->ns_uri && plen) {
+            size_t ap = prefix_len(a->name);
+            if (ap == plen && memcmp(a->name, pre, plen) == 0 &&
+                strcmp(a->ns_uri, uri) != 0)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static int attr_rc(int html, const char *qname, const char *ns_uri,
+                   const char *value, size_t vlen) {
+    if (!qname) return TURDOM_E_BAD_NAME;
+    if (html) return html_attr_name(qname) ? TURDOM_OK : TURDOM_E_BAD_NAME;
+    size_t plen;
+    if (!xml_qname(qname, &plen)) return TURDOM_E_BAD_NAME;
+    if (!xml_chars(value ? value : "", value ? vlen : 0)) return TURDOM_E_BAD_CONTENT;
+    int has_ns = ns_uri && ns_uri[0];
+    const char *dp;
+    size_t dl;
+    if (xmlns_decl(qname, &dp, &dl)) {
+        if (has_ns && strcmp(ns_uri, TURDOM_XMLNS_NS) != 0) return TURDOM_E_BAD_NAME;
+        if (dl == 5 && memcmp(dp, "xmlns", 5) == 0) return TURDOM_E_BAD_NAME;
+        const char *v = value ? value : "";
+        if (dl && !vlen) return TURDOM_E_BAD_CONTENT;   /* cannot undeclare a prefix */
+        int xml_pre = dl == 3 && memcmp(dp, "xml", 3) == 0;
+        if (xml_pre != (strcmp(v, TURDOM_XML_NS) == 0)) return TURDOM_E_BAD_CONTENT;
+        if (strcmp(v, TURDOM_XMLNS_NS) == 0) return TURDOM_E_BAD_CONTENT;
+        return TURDOM_OK;
+    }
+    if (!plen) return has_ns ? TURDOM_E_BAD_NAME : TURDOM_OK;
+    if (!has_ns) return TURDOM_E_BAD_NAME;
+    if (strcmp(ns_uri, TURDOM_XMLNS_NS) == 0) return TURDOM_E_BAD_NAME;
+    int xml_pre = plen == 3 && memcmp(qname, "xml", 3) == 0;
+    return xml_pre == (strcmp(ns_uri, TURDOM_XML_NS) == 0) ? TURDOM_OK
+                                                           : TURDOM_E_BAD_NAME;
+}
+
+int turdom_check_attr(const turdom_node *el, const char *qname,
+                      const char *ns_uri, const char *value, size_t vlen) {
+    if (!el || el->kind != TURDOM_ELEMENT) return TURDOM_E_BAD_KIND;
+    int html = el->doc->flavor == TURDOM_FLAVOR_HTML;
+    int rc = attr_rc(html, qname, ns_uri, value, vlen);
+    if (rc != TURDOM_OK || html) return rc;
+    /* The binding this attribute makes must agree with the element's other
+     * names, or the serialized element would declare one prefix twice. */
+    const char *dp;
+    size_t dl;
+    if (xmlns_decl(qname, &dp, &dl)) {
+        char *v = (char *)malloc(vlen + 1);
+        if (!v) return TURDOM_E_OOM;
+        memcpy(v, value ? value : "", value ? vlen : 0);
+        v[value ? vlen : 0] = '\0';
+        int bad = prefix_conflict(el, dp, dl, v, 0, qname);
+        free(v);
+        return bad ? TURDOM_E_BAD_CONTENT : TURDOM_OK;
+    }
+    size_t plen = prefix_len(qname);
+    if (plen && prefix_conflict(el, qname, plen, ns_uri, 0, qname))
+        return TURDOM_E_BAD_NAME;
+    return TURDOM_OK;
+}
+
+static int chars_rc(int html, int kind, const char *s, size_t n) {
+    /* HTML has no CDATA nodes: its parser reads <![CDATA[ in SVG or MathML as
+     * text, and as a bogus comment anywhere else. */
+    if (html && kind == TURDOM_CDATA) return TURDOM_E_HIERARCHY;
+    /* Comments and CDATA cannot escape: a \r would come back as \n, and a
+     * `]]>` would split one CDATA section into two. */
+    if ((kind == TURDOM_COMMENT || kind == TURDOM_CDATA) && memchr(s, '\r', n))
+        return TURDOM_E_BAD_CONTENT;
+    if (kind == TURDOM_CDATA && has_sub(s, n, "]]>")) return TURDOM_E_BAD_CONTENT;
+    if (!html) {
+        if (!xml_chars(s, n)) return TURDOM_E_BAD_CONTENT;
+        if (kind == TURDOM_COMMENT && (has_sub(s, n, "--") || (n && s[n - 1] == '-')))
+            return TURDOM_E_BAD_CONTENT;
+        return TURDOM_OK;
+    }
+    if (kind == TURDOM_COMMENT) {
+        if ((n >= 1 && s[0] == '>') || (n >= 2 && s[0] == '-' && s[1] == '>'))
+            return TURDOM_E_BAD_CONTENT;
+        if (has_sub(s, n, "<!--") || has_sub(s, n, "-->") || has_sub(s, n, "--!>"))
+            return TURDOM_E_BAD_CONTENT;
+        if (n >= 3 && memcmp(s + n - 3, "<!-", 3) == 0) return TURDOM_E_BAD_CONTENT;
+    }
+    return TURDOM_OK;
+}
+
+int turdom_check_chars(const turdom_doc *d, int kind, const char *s, size_t n) {
+    if (!d || (kind != TURDOM_TEXT && kind != TURDOM_COMMENT && kind != TURDOM_CDATA))
+        return TURDOM_E_BAD_KIND;
+    return chars_rc(d->flavor == TURDOM_FLAVOR_HTML, kind, s ? s : "", s ? n : 0);
+}
+
+static int xml_space(int c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+
+static int pi_rc(int html, const char *target, const char *data, size_t n) {
+    if (html) return TURDOM_E_HIERARCHY;
+    if (!target || !xml_ncname(target, strlen(target))) return TURDOM_E_BAD_NAME;
+    if (eq_ci(target, strlen(target), "xml")) return TURDOM_E_BAD_NAME;
+    /* The parser drops the whitespace between target and data. */
+    if (!xml_chars(data, n) || has_sub(data, n, "?>") || (n && xml_space(data[0])) ||
+        memchr(data, '\r', n))
+        return TURDOM_E_BAD_CONTENT;
+    return TURDOM_OK;
+}
+
+int turdom_check_pi(const turdom_doc *d, const char *target, const char *data) {
+    if (!d) return TURDOM_E_BAD_KIND;
+    const char *dd = data ? data : "";
+    return pi_rc(d->flavor == TURDOM_FLAVOR_HTML, target, dd, strlen(dd));
+}
+
+int turdom_check_placement(const turdom_node *parent, const turdom_node *child) {
+    if (!parent || !child) return TURDOM_E_BAD_KIND;
+    if (parent->kind != TURDOM_ELEMENT) return TURDOM_OK;
+    return placement_rc(parent->doc->flavor == TURDOM_FLAVOR_HTML, parent->ns_uri,
+                        parent->local, strlen(parent->local), child);
+}
+
+int turdom_check_value(const turdom_node *n, const char *s, size_t len) {
+    if (!n) return TURDOM_E_BAD_KIND;
+    int html = n->doc->flavor == TURDOM_FLAVOR_HTML;
+    const char *v = s ? s : "";
+    if (!s) len = 0;
+    switch (n->kind) {
+    case TURDOM_PI:
+        return pi_rc(html, n->name, v, len);
+    case TURDOM_TEXT: case TURDOM_COMMENT: case TURDOM_CDATA: {
+        int rc = chars_rc(html, n->kind, v, len);
+        if (rc != TURDOM_OK || n->kind != TURDOM_TEXT || !n->parent ||
+            n->parent->kind != TURDOM_ELEMENT)
+            return rc;
+        turdom_node probe = *n;             /* the node as it would be */
+        probe.value = (char *)v;
+        probe.value_len = len;
+        return turdom_check_placement(n->parent, &probe);
+    }
+    default:
+        return TURDOM_E_BAD_KIND;
+    }
+}
+
+int turdom_check_text(const turdom_node *el, const char *s, size_t len) {
+    if (!el) return TURDOM_E_BAD_KIND;
+    if (el->kind != TURDOM_ELEMENT) return turdom_check_value(el, s, len);
+    const char *v = s ? s : "";
+    if (!s) len = 0;
+    int rc = chars_rc(el->doc->flavor == TURDOM_FLAVOR_HTML, TURDOM_TEXT, v, len);
+    if (rc != TURDOM_OK || !len) return rc;
+    turdom_node probe;
+    memset(&probe, 0, sizeof probe);
+    probe.kind = TURDOM_TEXT;
+    probe.doc = el->doc;
+    probe.value = (char *)v;
+    probe.value_len = len;
+    return turdom_check_placement(el, &probe);
+}
+
+int turdom_check_rename(const turdom_node *el, const char *qname,
+                        const char *ns_uri) {
+    if (!el || el->kind != TURDOM_ELEMENT) return TURDOM_E_BAD_KIND;
+    int html = el->doc->flavor == TURDOM_FLAVOR_HTML;
+    int rc = element_name_rc(html, qname, ns_uri);
+    if (rc != TURDOM_OK) return rc;
+    if (!html) {
+        size_t plen = prefix_len(qname);
+        return prefix_conflict(el, qname, plen, ns_uri ? ns_uri : "", 1, NULL)
+                   ? TURDOM_E_BAD_NAME : TURDOM_OK;
+    }
+    size_t llen;
+    const char *local = local_part(qname, &llen);
+    for (const turdom_node *c = el->first; c; c = c->next) {
+        rc = placement_rc(1, ns_uri, local, llen, c);
+        if (rc != TURDOM_OK) return rc;
+    }
+    return TURDOM_OK;
+}
+
+int turdom_check_subtree(const turdom_doc *d, const turdom_node *top) {
+    if (!d || !top) return TURDOM_E_BAD_KIND;
+    int html = d->flavor == TURDOM_FLAVOR_HTML;
+    for (const turdom_node *n = top; n; n = turdom_next_in(top, n)) {
+        int rc = TURDOM_OK;
+        switch (n->kind) {
+        case TURDOM_ELEMENT:
+            rc = element_name_rc(html, n->name, n->ns_uri);
+            for (const turdom_attr *a = n->attrs; a && rc == TURDOM_OK; a = a->next)
+                rc = attr_rc(html, a->name, a->ns_uri, a->value, a->vlen);
+            for (const turdom_node *c = n->first; c && rc == TURDOM_OK; c = c->next)
+                rc = placement_rc(html, n->ns_uri, n->local, strlen(n->local), c);
+            break;
+        case TURDOM_TEXT: case TURDOM_COMMENT: case TURDOM_CDATA:
+            rc = chars_rc(html, n->kind, n->value, n->value_len);
+            break;
+        case TURDOM_PI:
+            rc = pi_rc(html, n->name, n->value, n->value_len);
+            break;
+        case TURDOM_DOCTYPE:
+            if ((n->public_id && strchr(n->public_id, '"') && strchr(n->public_id, '\'')) ||
+                (n->system_id && strchr(n->system_id, '"') && strchr(n->system_id, '\'')))
+                rc = TURDOM_E_BAD_CONTENT;
+            break;
+        default:
+            break;
+        }
+        if (rc != TURDOM_OK) return rc;
+    }
+    return TURDOM_OK;
+}
+
+/* ---- checked edits ------------------------------------------------------- */
+
+static const char *local_or_null(const char *qname) {
+    const char *c = qname ? strchr(qname, ':') : NULL;
+    return c ? c + 1 : NULL;
+}
+
+int turdom_edit_insert(int where, turdom_node *at, turdom_node *child) {
+    if (!at || !child) return TURDOM_E_BAD_KIND;
+    turdom_node *parent, *ref;
+    switch (where) {
+    case TURDOM_AT_APPEND:
+        parent = at; ref = NULL;
+        break;
+    case TURDOM_AT_PREPEND:
+        parent = at; ref = at->first;
+        break;
+    case TURDOM_AT_BEFORE:
+        if (!at->parent) return TURDOM_E_DETACHED;
+        parent = at->parent; ref = at;
+        break;
+    case TURDOM_AT_AFTER:
+        if (!at->parent) return TURDOM_E_DETACHED;
+        if (child == at) return TURDOM_OK;
+        parent = at->parent; ref = at->next;
+        break;
+    case TURDOM_AT_REPLACE: {
+        if (!at->parent) return TURDOM_E_DETACHED;
+        if (child == at) return TURDOM_OK;
+        parent = at->parent; ref = at->next;
+        unlink_node(at);
+        if (ref == child) ref = child->next;
+        int rc = check_insert(parent, child, ref);
+        if (rc == TURDOM_OK) rc = turdom_check_placement(parent, child);
+        if (rc == TURDOM_OK) {
+            unlink_node(child);
+            link_before(parent, child, ref);
+        } else {
+            link_before(parent, at, ref);
+        }
+        return rc;
+    }
+    default:
+        return TURDOM_E_BAD_KIND;
+    }
+    if (ref == child) ref = child->next;
+    int rc = check_insert(parent, child, ref);
+    if (rc == TURDOM_OK) rc = turdom_check_placement(parent, child);
+    if (rc != TURDOM_OK) return rc;
+    unlink_node(child);
+    link_before(parent, child, ref);
+    return TURDOM_OK;
+}
+
+int turdom_edit_unwrap(turdom_node *n) {
+    if (!n) return TURDOM_E_BAD_KIND;
+    if (n->parent)
+        for (const turdom_node *c = n->first; c; c = c->next) {
+            int rc = turdom_check_placement(n->parent, c);
+            if (rc != TURDOM_OK) return rc;
+        }
+    return turdom_unwrap(n);
+}
+
+int turdom_edit_set_attr(turdom_node *el, const char *qname, const char *ns_uri,
+                         const char *value, size_t vlen) {
+    int rc = turdom_check_attr(el, qname, ns_uri, value, vlen);
+    if (rc != TURDOM_OK) return rc;
+    return turdom_set_attr(el, qname, ns_uri, local_or_null(qname), value, vlen);
+}
+
+int turdom_edit_set_value(turdom_node *n, const char *s, size_t len) {
+    int rc = turdom_check_value(n, s, len);
+    return rc != TURDOM_OK ? rc : turdom_set_value(n, s, len);
+}
+
+int turdom_edit_set_text(turdom_node *n, const char *s, size_t len) {
+    int rc = turdom_check_text(n, s, len);
+    return rc != TURDOM_OK ? rc : turdom_set_text(n, s, len);
+}
+
+int turdom_edit_rename(turdom_node *el, const char *qname, const char *ns_uri) {
+    int rc = turdom_check_rename(el, qname, ns_uri);
+    if (rc != TURDOM_OK) return rc;
+    return turdom_rename(el, qname, ns_uri, local_or_null(qname));
+}
+
+/* ---- streaming writer -------------------------------------------------------
+ *
+ * See turdom.h.  A start tag is held (`open`, `tag`, `pa`) until the next
+ * event closes it, so its own namespace declarations are known before any
+ * Clark name on it gets a prefix.  Output builds up in `b`; with a file sink
+ * it is written out once 64 KiB have accumulated. */
+
+#define TURDOM_WRITER_SPILL ((size_t)64 * 1024)
+
+typedef struct {
+    char *event_name;       /* the name as the event gave it, to match the end */
+    char *qname;            /* the name as written, for the end tag */
+    size_t nbind;           /* bindings this element pushed */
+} wframe;
+
+typedef struct {
+    char *pre;
+    char *uri;
+    int generated;          /* declared by the writer for a Clark name */
+} wbind;
+
+typedef struct {
+    char *name;             /* as the event gave it */
+    char *value;
+    size_t vlen;
+} wattr;
+
+struct turdom_writer {
+    int html;
+    obuf b;
+    FILE *out;              /* NULL: the output stays in b */
+    int err;
+    int used;               /* an event has been accepted */
+    int done;               /* finished */
+    int open;               /* a start tag is held */
+    char *tag;              /* its name as the event gave it */
+    int tag_void;           /* HTML: a void element, which has no frame */
+    wattr *pa;              /* its attributes */
+    size_t npa, cpa;
+    wframe *st;
+    size_t depth, cap;
+    wbind *bind;
+    size_t nb, cb;
+    int genid;
+    int root_done;          /* XML: the root element has ended */
+    int doctype_done;       /* XML */
+    int in_cdata;
+    int cdata_tail;         /* ']' just written in the current section, max 2 */
+    obuf raw;               /* text of the open HTML raw-text element */
+    int raw_open;
+};
+
+static char *w_strdup(const char *s, size_t n) {
+    char *p = (char *)malloc(n + 1);
+    if (!p) return NULL;
+    if (n) memcpy(p, s, n);
+    p[n] = '\0';
+    return p;
+}
+
+turdom_writer *turdom_writer_new(int flavor) {
+    turdom_writer *w = (turdom_writer *)calloc(1, sizeof(turdom_writer));
+    if (w) w->html = flavor == TURDOM_FLAVOR_HTML;
+    return w;
+}
+
+int turdom_writer_to_file(turdom_writer *w, const char *path) {
+    if (!w || !path) return TURDOM_E_BAD_KIND;
+    if (w->err) return w->err;
+    if (w->used || w->out || w->done) return TURDOM_E_HIERARCHY;
+    FILE *f = fopen(path, "wb");
+    if (!f) return TURDOM_E_IO;
+    w->out = f;
+    return TURDOM_OK;
+}
+
+static void w_pop_bindings(turdom_writer *w, size_t n) {
+    while (n-- && w->nb) {
+        w->nb--;
+        free(w->bind[w->nb].pre);
+        free(w->bind[w->nb].uri);
+    }
+}
+
+static void w_pop_frame(turdom_writer *w) {
+    wframe *f = &w->st[--w->depth];
+    w_pop_bindings(w, f->nbind);
+    free(f->event_name);
+    free(f->qname);
+}
+
+static void w_drop_tag(turdom_writer *w) {
+    for (size_t i = 0; i < w->npa; i++) {
+        free(w->pa[i].name);
+        free(w->pa[i].value);
+    }
+    w->npa = 0;
+    free(w->tag);
+    w->tag = NULL;
+    w->open = 0;
+}
+
+void turdom_writer_free(turdom_writer *w) {
+    if (!w) return;
+    while (w->depth) w_pop_frame(w);
+    w_pop_bindings(w, w->nb);
+    free(w->st);
+    free(w->bind);
+    w_drop_tag(w);
+    free(w->pa);
+    if (w->out) fclose(w->out);
+    free(w->b.p);
+    free(w->raw.p);
+    free(w);
+}
+
+int turdom_writer_error(const turdom_writer *w) {
+    return w ? w->err : TURDOM_E_BAD_KIND;
+}
+
+static int w_fail(turdom_writer *w, int rc) {
+    if (!w->err) w->err = rc;
+    return w->err;
+}
+
+/* The common gate of every event: a refusal sticks, finishing ends it. */
+static int w_gate(const turdom_writer *w) {
+    if (w->err) return w->err;
+    return w->done ? TURDOM_E_HIERARCHY : TURDOM_OK;
+}
+
+static int w_spill(turdom_writer *w, int all) {
+    if (w->b.oom || w->raw.oom) return TURDOM_E_OOM;
+    if (!w->out || !w->b.len || (!all && w->b.len < TURDOM_WRITER_SPILL)) return TURDOM_OK;
+    if (fwrite(w->b.p, 1, w->b.len, w->out) != w->b.len) return TURDOM_E_IO;
+    w->b.len = 0;
+    return TURDOM_OK;
+}
+
+/* The end of every accepted event. */
+static int w_accept(turdom_writer *w) {
+    int rc = w_spill(w, 0);
+    if (rc != TURDOM_OK) return w_fail(w, rc);
+    w->used = 1;
+    return TURDOM_OK;
+}
+
+static int w_push_bind(turdom_writer *w, const char *pre, size_t plen,
+                       const char *uri, size_t ulen, int generated) {
+    if (w->nb == w->cb) {
+        size_t cap = w->cb ? w->cb * 2 : 16;
+        wbind *nv = (wbind *)realloc(w->bind, cap * sizeof(wbind));
+        if (!nv) return TURDOM_E_OOM;
+        w->bind = nv;
+        w->cb = cap;
+    }
+    char *p = w_strdup(pre, plen), *u = w_strdup(uri, ulen);
+    if (!p || !u) { free(p); free(u); return TURDOM_E_OOM; }
+    w->bind[w->nb].pre = p;
+    w->bind[w->nb].uri = u;
+    w->bind[w->nb].generated = generated;
+    w->nb++;
+    w->st[w->depth - 1].nbind++;
+    return TURDOM_OK;
+}
+
+static const wbind *w_lookup_pre(const turdom_writer *w, const char *pre,
+                                 size_t plen) {
+    for (size_t i = w->nb; i-- > 0;)
+        if (strlen(w->bind[i].pre) == plen && memcmp(w->bind[i].pre, pre, plen) == 0)
+            return &w->bind[i];
+    return NULL;
+}
+
+static int w_uri_is(const char *uri, size_t ulen, const char *want) {
+    return strlen(want) == ulen && memcmp(uri, want, ulen) == 0;
+}
+
+/* A prefix (non-empty, not shadowed) currently bound to uri, or NULL. */
+static const char *w_prefix_for(const turdom_writer *w, const char *uri, size_t ulen) {
+    for (size_t i = w->nb; i-- > 0;) {
+        const wbind *b = &w->bind[i];
+        if (!b->pre[0] || !w_uri_is(uri, ulen, b->uri)) continue;
+        if (w_lookup_pre(w, b->pre, strlen(b->pre)) == b) return b->pre;
+    }
+    return NULL;
+}
+
+/* Bind a fresh nsN prefix to uri on the held element; NULL on OOM. */
+static const char *w_gen_prefix(turdom_writer *w, const char *uri, size_t ulen) {
+    char gen[32];
+    do snprintf(gen, sizeof gen, "ns%d", ++w->genid);
+    while (w_lookup_pre(w, gen, strlen(gen)));
+    if (w_push_bind(w, gen, strlen(gen), uri, ulen, 1) != TURDOM_OK) return NULL;
+    return w->bind[w->nb - 1].pre;
+}
+
+/* Split a Clark name {uri}local, at the last '}': a URI may hold one, a
+ * local name may not.  0 when name is not one. */
+static int clark(const char *name, const char **uri, size_t *ulen,
+                 const char **local) {
+    if (name[0] != '{') return 0;
+    const char *close = strrchr(name, '}');
+    if (!close) return 0;
+    *uri = name + 1;
+    *ulen = (size_t)(close - name - 1);
+    *local = close + 1;
+    return 1;
+}
+
+/* An XML element or attribute name as an event gives it. */
+static int w_xml_name_ok(const char *name) {
+    const char *uri, *local;
+    size_t ulen;
+    if (name[0] != '{') return xml_name(name, strlen(name));
+    if (!clark(name, &uri, &ulen, &local)) return 0;
+    return xml_ncname(local, strlen(local)) && xml_chars(uri, ulen) &&
+           !w_uri_is(uri, ulen, TURDOM_XMLNS_NS);
+}
+
+/* Is a written attribute name a namespace declaration?  Sets its prefix. */
+static int w_decl(const char *name, const char **pre, size_t *plen) {
+    if (strcmp(name, "xmlns") == 0) { *pre = ""; *plen = 0; return 1; }
+    if (strncmp(name, "xmlns:", 6) == 0 && name[6]) {
+        *pre = name + 6;
+        *plen = strlen(name + 6);
+        return 1;
+    }
+    return 0;
+}
+
+static char *w_join(const char *pre, const char *local) {
+    size_t pl = strlen(pre), ll = strlen(local);
+    char *q = (char *)malloc(pl + 1 + ll + 1);
+    if (!q) return NULL;
+    memcpy(q, pre, pl);
+    q[pl] = ':';
+    memcpy(q + pl + 1, local, ll + 1);
+    return q;
+}
+
+static void w_put_decl(obuf *b, const char *pre, size_t plen, const char *uri,
+                       size_t ulen) {
+    ob_puts(b, plen ? " xmlns:" : " xmlns");
+    ob_put(b, pre, plen);
+    ob_puts(b, "=\"");
+    escape_into(b, uri, ulen, 1, 0);
+    ob_puts(b, "\"");
+}
+
+static int w_cmp(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static int w_cmp_ci(const void *a, const void *b) {
+    const unsigned char *x = *(const unsigned char *const *)a;
+    const unsigned char *y = *(const unsigned char *const *)b;
+    for (;; x++, y++) {
+        int cx = ascii_lower(*x), cy = ascii_lower(*y);
+        if (cx != cy || !cx) return cx - cy;
+    }
+}
+
+/* Any two of names equal (HTML: ASCII case-insensitively)?  -1 on OOM. */
+static int w_has_dup(char *const *names, size_t n, int ci) {
+    if (n < 2) return 0;
+    char **v = (char **)malloc(n * sizeof(char *));
+    if (!v) return -1;
+    memcpy(v, names, n * sizeof(char *));
+    int (*cmp)(const void *, const void *) = ci ? w_cmp_ci : w_cmp;
+    qsort(v, n, sizeof(char *), cmp);
+    int dup = 0;
+    for (size_t i = 1; i < n && !dup; i++) dup = cmp(&v[i - 1], &v[i]) == 0;
+    free(v);
+    return dup;
+}
+
+static int w_close_html(turdom_writer *w, int selfclose) {
+    char **names = (char **)malloc((w->npa ? w->npa : 1) * sizeof(char *));
+    if (!names) return TURDOM_E_OOM;
+    for (size_t i = 0; i < w->npa; i++) names[i] = w->pa[i].name;
+    int dup = w_has_dup(names, w->npa, 1);
+    free(names);
+    if (dup) return dup < 0 ? TURDOM_E_OOM : TURDOM_E_BAD_NAME;
+    ob_puts(&w->b, "<");
+    ob_puts(&w->b, w->tag);
+    for (size_t i = 0; i < w->npa; i++) {
+        ob_puts(&w->b, " ");
+        ob_puts(&w->b, w->pa[i].name);
+        ob_puts(&w->b, "=\"");
+        escape_into(&w->b, w->pa[i].value, w->pa[i].vlen, 1, 1);
+        ob_puts(&w->b, "\"");
+    }
+    ob_puts(&w->b, selfclose ? "/>" : ">");
+    return TURDOM_OK;
+}
+
+/* Resolve and write the held XML start tag.  fin[i] gets attribute i's name
+ * as written; gen[i] says the writer declares its prefix. */
+static int w_close_xml_into(turdom_writer *w, int selfclose, char **fin, int *gen) {
+    wframe *f = &w->st[w->depth - 1];
+    const char *uri = "", *local = "", *pre = NULL;
+    size_t ulen = 0, plen = 0;
+    int own_default = 0;
+
+    /* The element's own declarations are in scope for its own names. */
+    for (size_t i = 0; i < w->npa; i++) {
+        if (!w_decl(w->pa[i].name, &pre, &plen)) continue;
+        if (!plen) own_default = 1;
+        if (w_push_bind(w, pre, plen, w->pa[i].value, w->pa[i].vlen, 0) != TURDOM_OK)
+            return TURDOM_E_OOM;
+    }
+
+    /* The element name.  decl: 0 none, 1 xmlns="uri", 2 xmlns="", 3 a
+     * generated prefix (the last binding pushed). */
+    int decl = 0;
+    char *qn = NULL;
+    const wbind *def = w_lookup_pre(w, "", 0);
+    if (clark(w->tag, &uri, &ulen, &local) && ulen) {
+        if (w_uri_is(uri, ulen, TURDOM_XML_NS)) {
+            qn = w_join("xml", local);
+        } else if (def && w_uri_is(uri, ulen, def->uri)) {
+            qn = w_strdup(local, strlen(local));
+        } else if ((pre = w_prefix_for(w, uri, ulen)) != NULL) {
+            qn = w_join(pre, local);
+        } else if (!own_default) {
+            decl = 1;
+            qn = w_strdup(local, strlen(local));
+        } else {
+            if (!(pre = w_gen_prefix(w, uri, ulen))) return TURDOM_E_OOM;
+            decl = 3;
+            qn = w_join(pre, local);
+        }
+    } else if (w->tag[0] == '{') {
+        /* {}local: in no namespace, whatever the default in scope. */
+        if (def && def->uri[0]) {
+            if (own_default) return TURDOM_E_BAD_NAME;
+            decl = 2;
+        }
+        qn = w_strdup(local, strlen(local));
+    } else {
+        /* As written; only a default the writer itself declared is undone. */
+        if (!strchr(w->tag, ':') && !own_default && def && def->generated && def->uri[0])
+            decl = 2;
+        qn = w_strdup(w->tag, strlen(w->tag));
+    }
+    if (!qn) return TURDOM_E_OOM;
+    f->qname = qn;
+    if ((decl == 1 && w_push_bind(w, "", 0, uri, ulen, 1) != TURDOM_OK) ||
+        (decl == 2 && w_push_bind(w, "", 0, "", 0, 1) != TURDOM_OK))
+        return TURDOM_E_OOM;
+    const wbind *ebind = decl ? &w->bind[w->nb - 1] : NULL;
+    char *edecl_pre = ebind ? ebind->pre : NULL;
+    size_t edecl_plen = ebind ? strlen(ebind->pre) : 0;
+    const char *edecl_uri = ebind ? ebind->uri : NULL;
+
+    /* Attribute names. */
+    for (size_t i = 0; i < w->npa; i++) {
+        const char *name = w->pa[i].name;
+        gen[i] = 0;
+        if (!clark(name, &uri, &ulen, &local)) {
+            fin[i] = w_strdup(name, strlen(name));
+        } else if (!ulen) {
+            if (strcmp(local, "xmlns") == 0) return TURDOM_E_BAD_NAME;
+            fin[i] = w_strdup(local, strlen(local));
+        } else if (w_uri_is(uri, ulen, TURDOM_XML_NS)) {
+            fin[i] = w_join("xml", local);
+        } else {
+            if (!(pre = w_prefix_for(w, uri, ulen))) {
+                if (!(pre = w_gen_prefix(w, uri, ulen))) return TURDOM_E_OOM;
+                gen[i] = 1;
+            }
+            fin[i] = w_join(pre, local);
+        }
+        if (!fin[i]) return TURDOM_E_OOM;
+    }
+    int dup = w_has_dup(fin, w->npa, 0);
+    if (dup) return dup < 0 ? TURDOM_E_OOM : TURDOM_E_BAD_NAME;
+
+    ob_puts(&w->b, "<");
+    ob_puts(&w->b, qn);
+    if (ebind) w_put_decl(&w->b, edecl_pre, edecl_plen, edecl_uri, strlen(edecl_uri));
+    for (size_t i = 0; i < w->npa; i++) {
+        if (gen[i]) {
+            clark(w->pa[i].name, &uri, &ulen, &local);
+            w_put_decl(&w->b, fin[i], (size_t)(strchr(fin[i], ':') - fin[i]), uri, ulen);
+        }
+        ob_puts(&w->b, " ");
+        ob_puts(&w->b, fin[i]);
+        ob_puts(&w->b, "=\"");
+        escape_into(&w->b, w->pa[i].value, w->pa[i].vlen, 1, 0);
+        ob_puts(&w->b, "\"");
+    }
+    ob_puts(&w->b, selfclose ? "/>" : ">");
+    return TURDOM_OK;
+}
+
+static int w_close_xml(turdom_writer *w, int selfclose) {
+    size_t n = w->npa ? w->npa : 1;
+    char **fin = (char **)calloc(n, sizeof(char *));
+    int *gen = (int *)calloc(n, sizeof(int));
+    int rc = (fin && gen) ? w_close_xml_into(w, selfclose, fin, gen) : TURDOM_E_OOM;
+    if (fin)
+        for (size_t i = 0; i < w->npa; i++) free(fin[i]);
+    free(fin);
+    free(gen);
+    return rc;
+}
+
+/* Write the held start tag, if any. */
+static int w_close_tag(turdom_writer *w, int selfclose) {
+    if (!w->open) return TURDOM_OK;
+    int rc = w->html ? w_close_html(w, selfclose) : w_close_xml(w, selfclose);
+    if (rc == TURDOM_OK) w_drop_tag(w);
+    return rc;
+}
+
+static int w_push_frame(turdom_writer *w, const char *name) {
+    if (w->depth == w->cap) {
+        size_t cap = w->cap ? w->cap * 2 : 16;
+        wframe *nv = (wframe *)realloc(w->st, cap * sizeof(wframe));
+        if (!nv) return TURDOM_E_OOM;
+        w->st = nv;
+        w->cap = cap;
+    }
+    char *e = w_strdup(name, strlen(name));
+    char *q = w->html ? w_strdup(name, strlen(name)) : NULL;
+    if (!e || (w->html && !q)) { free(e); free(q); return TURDOM_E_OOM; }
+    w->st[w->depth].event_name = e;
+    w->st[w->depth].qname = q;
+    w->st[w->depth].nbind = 0;
+    w->depth++;
+    return TURDOM_OK;
+}
+
+int turdom_writer_start(turdom_writer *w, const char *name) {
+    if (!w || !name) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (w->in_cdata || w->raw_open) return w_fail(w, TURDOM_E_HIERARCHY);
+    size_t n = strlen(name);
+    int is_void = 0, raw = 0;
+    if (w->html) {
+        rc = element_name_rc(1, name, NULL);
+        if (rc != TURDOM_OK) return w_fail(w, rc);
+        is_void = in_set_ci(name, n, html_void);
+        raw = !is_void && in_set_ci(name, n, html_rawtext);
+    } else {
+        if (w->depth == 0 && w->root_done) return w_fail(w, TURDOM_E_HIERARCHY);
+        if (!w_xml_name_ok(name)) return w_fail(w, TURDOM_E_BAD_NAME);
+    }
+    rc = w_close_tag(w, 0);
+    if (rc != TURDOM_OK) return w_fail(w, rc);
+    char *t = w_strdup(name, n);
+    if (!t) return w_fail(w, TURDOM_E_OOM);
+    if (!is_void && w_push_frame(w, name) != TURDOM_OK) {
+        free(t);
+        return w_fail(w, TURDOM_E_OOM);
+    }
+    w->tag = t;
+    w->tag_void = is_void;
+    w->open = 1;
+    if (raw) { w->raw_open = 1; w->raw.len = 0; }
+    return w_accept(w);
+}
+
+int turdom_writer_attr(turdom_writer *w, const char *name, const char *value,
+                       size_t vlen) {
+    if (!w || !name) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (!w->open) return w_fail(w, TURDOM_E_HIERARCHY);
+    const char *v = value ? value : "";
+    if (!value) vlen = 0;
+    if (w->html) {
+        if (!html_attr_name(name)) return w_fail(w, TURDOM_E_BAD_NAME);
+    } else {
+        if (!w_xml_name_ok(name)) return w_fail(w, TURDOM_E_BAD_NAME);
+        if (!xml_chars(v, vlen)) return w_fail(w, TURDOM_E_BAD_CONTENT);
+    }
+    if (w->npa == w->cpa) {
+        size_t cap = w->cpa ? w->cpa * 2 : 8;
+        wattr *nv = (wattr *)realloc(w->pa, cap * sizeof(wattr));
+        if (!nv) return w_fail(w, TURDOM_E_OOM);
+        w->pa = nv;
+        w->cpa = cap;
+    }
+    char *nm = w_strdup(name, strlen(name)), *vv = w_strdup(v, vlen);
+    if (!nm || !vv) { free(nm); free(vv); return w_fail(w, TURDOM_E_OOM); }
+    w->pa[w->npa].name = nm;
+    w->pa[w->npa].value = vv;
+    w->pa[w->npa].vlen = vlen;
+    w->npa++;
+    return w_accept(w);
+}
+
+/* Write an HTML raw-text element's buffered text, if it is safe. */
+static int w_flush_raw(turdom_writer *w) {
+    if (!w->raw_open) return TURDOM_OK;
+    const char *tag = w->st[w->depth - 1].qname;
+    if (!rawtext_ok(tag, strlen(tag), w->raw.p ? w->raw.p : "", w->raw.len))
+        return TURDOM_E_BAD_CONTENT;
+    int rc = w_close_tag(w, 0);
+    if (rc != TURDOM_OK) return rc;
+    ob_put(&w->b, w->raw.p, w->raw.len);
+    w->raw.len = 0;
+    w->raw_open = 0;
+    return TURDOM_OK;
+}
+
+int turdom_writer_end(turdom_writer *w, const char *name) {
+    if (!w || !name) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (w->in_cdata) return w_fail(w, TURDOM_E_HIERARCHY);
+    size_t n = strlen(name);
+    if (w->html) {
+        if (!html_element_name(name)) return w_fail(w, TURDOM_E_BAD_NAME);
+        if (w->raw_open) {
+            if (!eq_ci(name, n, w->st[w->depth - 1].qname))
+                return w_fail(w, TURDOM_E_HIERARCHY);
+            rc = w_flush_raw(w);
+        } else if (w->open && w->tag_void && eq_ci(name, n, w->tag)) {
+            rc = w_close_tag(w, 1);             /* <br/> */
+            return rc != TURDOM_OK ? w_fail(w, rc) : w_accept(w);
+        } else {
+            rc = w_close_tag(w, 0);
+        }
+        if (rc != TURDOM_OK) return w_fail(w, rc);
+        ob_puts(&w->b, "</");
+        ob_puts(&w->b, name);
+        ob_puts(&w->b, ">");
+        /* A tokenizer's end tags need not balance: close the nearest match. */
+        for (size_t i = w->depth; i-- > 0;)
+            if (eq_ci(name, n, w->st[i].qname)) {
+                while (w->depth > i) w_pop_frame(w);
+                break;
+            }
+        return w_accept(w);
+    }
+    if (!w->depth || strcmp(w->st[w->depth - 1].event_name, name) != 0)
+        return w_fail(w, TURDOM_E_HIERARCHY);
+    if (w->open) {
+        rc = w_close_tag(w, 1);
+        if (rc != TURDOM_OK) return w_fail(w, rc);
+    } else {
+        ob_puts(&w->b, "</");
+        ob_puts(&w->b, w->st[w->depth - 1].qname);
+        ob_puts(&w->b, ">");
+    }
+    w_pop_frame(w);
+    if (!w->depth) w->root_done = 1;
+    return w_accept(w);
+}
+
+int turdom_writer_chars(turdom_writer *w, const char *s, size_t n) {
+    if (!w) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (!s || !n) return TURDOM_OK;
+    if (w->html) {
+        if (w->raw_open) {
+            ob_put(&w->raw, s, n);
+            return w_accept(w);
+        }
+        rc = w_close_tag(w, 0);
+        if (rc != TURDOM_OK) return w_fail(w, rc);
+        escape_into(&w->b, s, n, 0, 1);
+        return w_accept(w);
+    }
+    if (!w->depth) return w_fail(w, TURDOM_E_HIERARCHY);    /* outside the root */
+    if (!xml_chars(s, n)) return w_fail(w, TURDOM_E_BAD_CONTENT);
+    if (w->in_cdata) {
+        /* CDATA cannot escape: a \r would come back as \n, and a `]]>` --
+         * even across calls -- would end the section. */
+        if (memchr(s, '\r', n)) return w_fail(w, TURDOM_E_BAD_CONTENT);
+        int tail = w->cdata_tail;
+        for (size_t i = 0; i < n; i++) {
+            if (s[i] == '>' && tail >= 2) return w_fail(w, TURDOM_E_BAD_CONTENT);
+            tail = s[i] == ']' ? (tail < 2 ? tail + 1 : 2) : 0;
+        }
+        w->cdata_tail = tail;
+        ob_put(&w->b, s, n);
+        return w_accept(w);
+    }
+    rc = w_close_tag(w, 0);
+    if (rc != TURDOM_OK) return w_fail(w, rc);
+    escape_into(&w->b, s, n, 0, 0);
+    return w_accept(w);
+}
+
+int turdom_writer_comment(turdom_writer *w, const char *s, size_t n) {
+    if (!w) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    const char *v = s ? s : "";
+    if (!s) n = 0;
+    if (w->in_cdata || w->raw_open) return w_fail(w, TURDOM_E_HIERARCHY);
+    rc = chars_rc(w->html, TURDOM_COMMENT, v, n);
+    if (rc == TURDOM_OK) rc = w_close_tag(w, 0);
+    if (rc != TURDOM_OK) return w_fail(w, rc);
+    ob_puts(&w->b, "<!--");
+    ob_put(&w->b, v, n);
+    ob_puts(&w->b, "-->");
+    return w_accept(w);
+}
+
+int turdom_writer_pi(turdom_writer *w, const char *target, const char *data) {
+    if (!w) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (w->in_cdata) return w_fail(w, TURDOM_E_HIERARCHY);
+    if (w->html) return w_fail(w, TURDOM_E_HIERARCHY);
+    const char *d = data ? data : "";
+    size_t n = strlen(d);
+    /* A Name, as for elements: namespaces off allows `a:b`. */
+    if (!target || !xml_name(target, strlen(target)) || eq_ci(target, strlen(target), "xml"))
+        return w_fail(w, TURDOM_E_BAD_NAME);
+    rc = pi_rc(0, "x", d, n);                       /* the data rules */
+    if (rc == TURDOM_OK) rc = w_close_tag(w, 0);
+    if (rc != TURDOM_OK) return w_fail(w, rc);
+    ob_puts(&w->b, "<?");
+    ob_puts(&w->b, target);
+    if (n) { ob_puts(&w->b, " "); ob_put(&w->b, d, n); }
+    ob_puts(&w->b, "?>");
+    return w_accept(w);
+}
+
+int turdom_writer_cdata(turdom_writer *w, int start) {
+    if (!w) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (w->html) return w_fail(w, TURDOM_E_HIERARCHY);
+    if (start) {
+        if (w->in_cdata || !w->depth) return w_fail(w, TURDOM_E_HIERARCHY);
+        rc = w_close_tag(w, 0);
+        if (rc != TURDOM_OK) return w_fail(w, rc);
+        ob_puts(&w->b, "<![CDATA[");
+        w->in_cdata = 1;
+        w->cdata_tail = 0;
+    } else {
+        if (!w->in_cdata) return w_fail(w, TURDOM_E_HIERARCHY);
+        ob_puts(&w->b, "]]>");
+        w->in_cdata = 0;
+    }
+    return w_accept(w);
+}
+
+static int pubid_char(unsigned char c) {
+    return c == ' ' || c == '\r' || c == '\n' || (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           (c && strchr("-'()+,./:=?;!*#@$_%", c));
+}
+
+int turdom_writer_doctype(turdom_writer *w, const char *name,
+                          const char *public_id, const char *system_id) {
+    if (!w || !name) return TURDOM_E_BAD_KIND;
+    int rc = w_gate(w);
+    if (rc != TURDOM_OK) return rc;
+    if (w->in_cdata || w->raw_open) return w_fail(w, TURDOM_E_HIERARCHY);
+    const char *p = public_id ? public_id : "", *s = system_id ? system_id : "";
+    /* put_quoted_id picks the quote; it cannot hold both. */
+    if ((strchr(p, '"') && strchr(p, '\'')) || (strchr(s, '"') && strchr(s, '\'')))
+        return w_fail(w, TURDOM_E_BAD_CONTENT);
+    if (w->html) {
+        /* Anywhere: a tokenizer reports misplaced ones too. */
+        for (const char *c = name; *c; c++)
+            if (html_space(*c) || *c == '>') return w_fail(w, TURDOM_E_BAD_NAME);
+        if (!name[0] && (p[0] || s[0])) return w_fail(w, TURDOM_E_BAD_NAME);
+        if (strchr(p, '>') || strchr(s, '>')) return w_fail(w, TURDOM_E_BAD_CONTENT);
+    } else {
+        if (w->depth || w->root_done || w->doctype_done)
+            return w_fail(w, TURDOM_E_HIERARCHY);
+        if (!xml_name(name, strlen(name))) return w_fail(w, TURDOM_E_BAD_NAME);
+        for (const char *c = p; *c; c++)
+            if (!pubid_char((unsigned char)*c)) return w_fail(w, TURDOM_E_BAD_CONTENT);
+        if (!xml_chars(s, strlen(s))) return w_fail(w, TURDOM_E_BAD_CONTENT);
+        w->doctype_done = 1;
+    }
+    rc = w_close_tag(w, 0);
+    if (rc != TURDOM_OK) return w_fail(w, rc);
+    ob_puts(&w->b, "<!DOCTYPE ");
+    ob_puts(&w->b, name);
+    if (p[0]) {
+        ob_puts(&w->b, " PUBLIC ");
+        put_quoted_id(&w->b, p);
+        if (s[0] || !w->html) {
+            ob_puts(&w->b, " ");
+            put_quoted_id(&w->b, s);
+        }
+    } else if (s[0]) {
+        ob_puts(&w->b, " SYSTEM ");
+        put_quoted_id(&w->b, s);
+    }
+    ob_puts(&w->b, ">");
+    return w_accept(w);
+}
+
+char *turdom_writer_finish(turdom_writer *w, size_t *len, int *rc) {
+    int dummy;
+    if (!rc) rc = &dummy;
+    if (len) *len = 0;
+    if (!w) { *rc = TURDOM_E_BAD_KIND; return NULL; }
+    if (!w->err && !w->done) {
+        int r = TURDOM_OK;
+        if (w->html) {
+            r = w_flush_raw(w);
+            if (r == TURDOM_OK) r = w_close_tag(w, 0);
+        } else if (w->depth || w->in_cdata || !w->root_done) {
+            r = TURDOM_E_HIERARCHY;
+        }
+        if (r == TURDOM_OK) r = w_spill(w, 1);
+        if (r == TURDOM_OK && w->out) {
+            if (fclose(w->out) != 0) r = TURDOM_E_IO;
+            w->out = NULL;
+        }
+        if (r != TURDOM_OK) w_fail(w, r);
+        else w->done = 1;
+    }
+    if (w->err) { *rc = w->err; return NULL; }
+    char *out = w_strdup(w->b.p ? w->b.p : "", w->b.len);
+    if (!out) { *rc = TURDOM_E_OOM; return NULL; }
+    if (len) *len = w->b.len;
+    *rc = TURDOM_OK;
+    return out;
 }

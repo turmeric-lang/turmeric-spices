@@ -10,7 +10,11 @@
 ;;      same events and agree on success or failure;
 ;;   3. the DOM build agrees with SAX on success or failure;
 ;;   4. a document that parses survives serialize -> reparse structurally
-;;      equal.
+;;      equal;
+;;   5. with namespaces off, the identity transform (xml/transform) of a
+;;      document that parses is dom-serialize of it, byte for byte;
+;;   6. with namespaces on, the identity transform's output parses to the
+;;      same events as the input (xml-html-parsers-plan B4's gates).
 ;;
 ;; The generator is seeded, so a failure names the iteration that reproduces
 ;; it: TUR_FUZZ_ITERS and TUR_FUZZ_SEED override the defaults.
@@ -25,7 +29,11 @@
                            Continue])
 (import xml/sax    :refer [SaxParser sax-parse-string sax-parser-new sax-feed!
                            sax-finish! sax-parser-free])
-(import xml/dom    :refer [dom-parse-string])
+(import xml/dom    :refer [dom-parse-string dom-parse-string-opts])
+(import xml/sax    :refer [ParseOpts default-parse-opts])
+(import xml/transform :refer [sax-transform sax-transform-opts])
+(import dom/writer :refer [TransformError transform-error-message
+                           transform-error-release sax-keep])
 
 ;; ---- traces (0 = one-shot, 1 = push) --------------------------------------
 
@@ -244,6 +252,59 @@
                 eq)
       (Err e) (do (parse-error-release e) (release s) false))))
 
+;;; __note -- print a line to stderr.
+(defn __note [s : cstr] : nil
+  ```c
+  #include <stdio.h>
+  fprintf(stderr, "#   %s\n", (const char *)s);
+  ```)
+
+;;; __cstr= -- byte equality.
+(defn __cstr= [a : cstr b : cstr] : bool
+  ```c
+  return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+
+;;; refused -- note why a transform failed; false.
+(defn refused [e : TransformError] : bool
+  (do (__note (transform-error-message e))
+      (transform-error-release e)
+      false))
+
+;;; ns-off -- XML 1.0 without Namespaces.
+(defn ns-off [] : ParseOpts
+  (with (default-parse-opts) [namespaces false]))
+
+;;; identity-off-ok? -- property 5: when doc parses with namespaces off,
+;;; sax-keep through a SaxWriter reproduces dom-serialize byte for byte.
+(defn identity-off-ok? [doc : cstr] : bool
+  (match (dom-parse-string-opts doc (ns-off))
+    (Err e) (do (parse-error-release e) true)
+    (Ok d)  (let [want (dom-serialize (dom-node d))
+                  ok   (match (sax-transform-opts doc (ns-off) sax-keep)
+                         (Ok out) (let [b (__cstr= (to-cstr out) (to-cstr want))]
+                                    (if b nil (do (__note (to-cstr out)) (__note (to-cstr want))))
+                                    (release out)
+                                    b)
+                         (Err e)  (refused e))]
+              (release want)
+              (dom-free d)
+              ok)))
+
+;;; identity-on-ok? -- property 6: when doc parsed (trace 0 holds its
+;;; events, namespaces on), the identity output parses to the same events.
+(defn identity-on-ok? [doc : cstr sax-ok : bool] : bool
+  (if (not sax-ok)
+    true
+    (match (sax-transform doc sax-keep)
+      (Err e)  (refused e)
+      (Ok out) (do (__t-reset 1)
+                   (let [p    (ok-release? (sax-parse-string (to-cstr out) trace))
+                         same (__t-same?)]
+                     (if (and p same) nil (__note (to-cstr out)))
+                     (release out)
+                     (and p same))))))
+
 ;;; one -- run every check on one mutant; true when all hold.
 (defn one [iter : int] : bool
   (let [doc     (__mutant (__rnd 4))
@@ -266,9 +327,17 @@
                       (Err e) (do (parse-error-release e)
                                   (if sax-ok
                                     (do (__report "DOM rejected what SAX accepted" iter doc) false)
-                                    true)))))]
+                                    true)))))
+        id-off  (if (identity-off-ok? doc)
+                  true
+                  (do (__report "identity (namespaces off) differs from dom-serialize" iter doc)
+                      false))
+        id-on   (if (identity-on-ok? doc sax-ok)
+                  true
+                  (do (__report "identity (namespaces on) changed the events" iter doc)
+                      false))]
     (__free-cstr doc)
-    good))
+    (and good id-off id-on)))
 
 (defn main [] : int
   ;; The iteration loop lives in main on purpose. Every SAX entry point calls

@@ -1,0 +1,354 @@
+;; edit.tur -- dom/edit: building and editing trees in place, and every way
+;; an edit is refused.  The parsers live in tur-xml / tur-html, so the round
+;; trips through a parser are in those spices' fixtures; here the serialized
+;; text is compared directly.
+
+(defmodule dom_core_edit_test (export)
+
+(import dom/ownstr :refer [String to-cstr release])
+(import dom/core   :refer [Document Node dom-node dom-root dom-free
+                           dom-serialize dom-equal? dom-live-bytes
+                           dom-node-count node-attr node-name node-children
+                           node-first-child node-parent])
+(import dom/edit   :refer [DomFlavor XmlFlavor HtmlFlavor EditError
+                           WrongDocument WouldCycle NotAContainer BadPlacement
+                           Detached WrongKind BadName BadContent OutOfMemory
+                           edit-error-message dom-new dom-flavor
+                           create-element create-element-ns create-text
+                           create-comment create-cdata create-pi node-import
+                           node-clone node-append! node-prepend!
+                           node-insert-before! node-insert-after!
+                           node-replace! node-remove! node-unwrap!
+                           set-attr! set-attr-ns! remove-attr! set-text!
+                           set-value! rename! rename-ns! node-normalize!
+                           dom-garbage-bytes dom-compact node-attached?])
+(import test/suite  :refer [describe it])
+(import test/assert :refer [assert-true assert-eq])
+(import test/runner :refer [run-all-status])
+
+;;; __eq? -- byte equality of two cstrs.
+(defn __eq? [a : cstr b : cstr] : bool
+  ```c
+  #include <string.h>
+  return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+
+;;; ser-is? -- does dom-serialize give exactly `want`?
+(defn ser-is? [n : Node want : cstr] : bool
+  (let [s  (dom-serialize n)
+        ok (__eq? (to-cstr s) want)]
+    (release s)
+    ok))
+
+;;; code -- an EditError as a number, so tests can compare them.
+(defn code [e : EditError] : int
+  (match e
+    (WrongDocument) 1 (WouldCycle) 2 (NotAContainer) 3 (BadPlacement) 4
+    (Detached) 5 (WrongKind) 6 (BadName) 8 (BadContent) 9 (OutOfMemory) 7))
+
+;;; must -- the node of a successful create; a fresh text node otherwise, so
+;;; a test that expected success fails on its own assertion.
+(defn must [d : Document r : (Result Node EditError)] : Node
+  (match r
+    (Ok n)  n
+    (Err _) (must d (create-text d "UNEXPECTED ERROR"))))
+
+;;; done? -- did an edit succeed?
+(defn done? [r : (Result nil EditError)] : bool
+  (match r (Ok _) true (Err _) false))
+
+;;; fails? -- did an edit fail with exactly this error?
+(defn fails? [r : (Result nil EditError) want : EditError] : bool
+  (match r (Ok _) false (Err e) (= (code e) (code want))))
+
+;;; refused? -- did a create fail with exactly this error?
+(defn refused? [r : (Result Node EditError) want : EditError] : bool
+  (match r (Ok _) false (Err e) (= (code e) (code want))))
+
+;;; el -- a created element (it must succeed).
+(defn el [d : Document name : cstr] : Node
+  (must d (create-element d name)))
+
+;;; txt -- a created text node (it must succeed).
+(defn txt [d : Document s : cstr] : Node
+  (must d (create-text d s)))
+
+;;; xml-doc -- `<r><a>t</a></r>` built by hand: (doc, r, a, t).
+(defn xml-doc [] : Document
+  (let [d (dom-new (XmlFlavor))
+        r (el d "r")
+        a (el d "a")]
+    (node-append! (dom-node d) r)
+    (node-append! r a)
+    (node-append! a (txt d "t"))
+    d))
+
+;;; root -- the root element of a document built by these tests.
+(defn root [d : Document] : Node
+  (match (dom-root d) (Some r) r (None) (dom-node d)))
+
+(defn __all-tests [] : void
+  (describe "dom/edit -- building a document"
+    (it "builds an XML document from nothing"
+      (let [d (dom-new (XmlFlavor))
+            r (el d "feed")
+            e (el d "entry")]
+        (node-append! (dom-node d) r)
+        (node-append! r e)
+        (set-attr! e "id" "1 & <2>")
+        (node-append! e (txt d "a < b"))
+        (node-prepend! r (must d (create-comment d " generated ")))
+        (node-append! (dom-node d) (must d (create-pi d "go" "now")))
+        (let [ok (ser-is? (dom-node d)
+                          "<feed><!-- generated --><entry id=\"1 &amp; &lt;2&gt;\">a &lt; b</entry></feed><?go now?>")]
+          (dom-free d)
+          ok)))
+    (it "lower-cases HTML element and attribute names, as createElement does"
+      (let [d (dom-new (HtmlFlavor))
+            b (el d "BODY")]
+        (node-append! (dom-node d) b)
+        (set-attr! b "CLASS" "x")
+        (set-attr! b "class" "y")
+        (let [ok (and (ser-is? (dom-node d) "<body class=\"y\"></body>")
+                      (match (dom-flavor d) (HtmlFlavor) true (XmlFlavor) false))]
+          (dom-free d)
+          ok)))
+    (it "moves a node that is already in the tree"
+      (let [d (xml-doc)
+            r (root d)
+            b (el d "b")]
+        (node-append! r b)
+        (node-insert-before! (must d (Ok (node-first-child-or r))) b)
+        (let [ok (ser-is? (dom-node d) "<r><b/><a>t</a></r>")]
+          (dom-free d)
+          ok))))
+
+  (describe "dom/edit -- every EditError"
+    (it "WrongDocument: a node from another document"
+      (let [d (xml-doc)
+            o (dom-new (XmlFlavor))
+            ok (fails? (node-append! (root d) (el o "x")) (WrongDocument))]
+        (dom-free o)
+        (dom-free d)
+        ok))
+    (it "WouldCycle: an ancestor under its descendant"
+      (let [d (xml-doc)
+            r (root d)
+            ok (match (node-first-child r)
+                 (Some a) (fails? (node-append! a r) (WouldCycle))
+                 (None) false)]
+        (dom-free d)
+        ok))
+    (it "NotAContainer: children under a text node"
+      (let [d (xml-doc)
+            t (txt d "leaf")
+            ok (fails? (node-append! t (el d "x")) (NotAContainer))]
+        (dom-free d)
+        ok))
+    (it "BadPlacement: a second root element, and text at the top level"
+      (let [d (xml-doc)
+            ok (and (fails? (node-append! (dom-node d) (el d "r2")) (BadPlacement))
+                    (fails? (node-append! (dom-node d) (txt d " ")) (BadPlacement)))]
+        (dom-free d)
+        ok))
+    (it "BadPlacement: an element inside <script>, a child of <br>, CDATA in HTML"
+      (let [d  (dom-new (HtmlFlavor))
+            s  (el d "script")
+            br (el d "br")
+            ok (and (fails? (node-append! s (el d "b")) (BadPlacement))
+                    (and (fails? (node-append! br (txt d "x")) (BadPlacement))
+                         (refused? (create-cdata d "x") (BadPlacement))))]
+        (dom-free d)
+        ok))
+    (it "BadPlacement: a processing instruction in an HTML document"
+      (let [d (dom-new (HtmlFlavor))
+            ok (refused? (create-pi d "go" "now") (BadPlacement))]
+        (dom-free d)
+        ok))
+    (it "Detached: inserting next to a node that has no parent"
+      (let [d (xml-doc)
+            ok (and (fails? (node-insert-before! (el d "loose") (el d "x")) (Detached))
+                    (fails? (node-insert-after! (el d "loose") (el d "x")) (Detached)))]
+        (dom-free d)
+        ok))
+    (it "WrongKind: set-value! on an element, node-clone of the document node"
+      (let [d (xml-doc)
+            ok (and (fails? (set-value! (root d) "x") (WrongKind))
+                    (refused? (node-clone (dom-node d)) (WrongKind)))]
+        (dom-free d)
+        ok))
+    (it "BadName: the `<x onload=...>` injection, through each name"
+      (let [x (dom-new (XmlFlavor))
+            h (dom-new (HtmlFlavor))
+            ok (and (refused? (create-element x "x onload=alert(1)") (BadName))
+                    (and (refused? (create-element h "x onload=alert(1)") (BadName))
+                         (and (fails? (set-attr! (el h "p") "a onload" "1") (BadName))
+                              (and (fails? (rename! (el h "p") "p onclick=go()") (BadName))
+                                   (refused? (create-pi x "xml" "v") (BadName))))))]
+        (dom-free x)
+        (dom-free h)
+        ok))
+    (it "BadName: a prefix with no namespace in XML"
+      (let [x (dom-new (XmlFlavor))
+            ok (refused? (create-element x "atom:entry") (BadName))]
+        (dom-free x)
+        ok))
+    (it "BadContent: comments that would close early"
+      (let [x (dom-new (XmlFlavor))
+            h (dom-new (HtmlFlavor))
+            ok (and (refused? (create-comment x "a--b") (BadContent))
+                    (and (refused? (create-comment h "a-->b") (BadContent))
+                         (refused? (create-comment h ">x") (BadContent))))]
+        (dom-free x)
+        (dom-free h)
+        ok))
+    (it "BadContent: the `</script>` breakout, by set-text!, append and rename!"
+      (let [d  (dom-new (HtmlFlavor))
+            s  (el d "script")
+            dv (el d "div")
+            bad "x</script><img src=x onerror=alert(1)>"]
+        (node-append! dv (txt d bad))
+        (let [ok (and (fails? (set-text! s bad) (BadContent))
+                      (and (fails? (node-append! s (txt d bad)) (BadContent))
+                           (and (fails? (rename! dv "script") (BadContent))
+                                (done? (set-text! s "if (a < b) {}")))))]
+          (dom-free d)
+          ok)))
+    (it "BadContent: XML text with a character XML forbids"
+      (let [x (dom-new (XmlFlavor))
+            ok (refused? (create-text x "bell \x07") (BadContent))]
+        (dom-free x)
+        ok))
+    (it "edit-error-message describes each error"
+      (__eq? (edit-error-message (BadName)) "not a valid name here")))
+
+  (describe "dom/edit -- a refused edit changes nothing"
+    (it "a failed replace leaves the old node in place"
+      (let [d (xml-doc)
+            r (root d)
+            ok (match (node-first-child r)
+                 (Some a) (and (fails? (node-replace! a r) (WouldCycle))
+                               (ser-is? (dom-node d) "<r><a>t</a></r>"))
+                 (None) false)]
+        (dom-free d)
+        ok))
+    (it "a failed unwrap of the root keeps the tree"
+      (let [d (xml-doc)
+            r (root d)]
+        (node-append! r (txt d "loose text"))
+        (match (node-first-child r)
+          (Some a) (node-remove! a)
+          (None) nil)
+        (let [ok (and (fails? (node-unwrap! r) (BadPlacement))
+                      (ser-is? (dom-node d) "<r>loose text</r>"))]
+          (dom-free d)
+          ok))))
+
+  (describe "dom/edit -- borrows survive edits"
+    (it "a cstr read before set-attr! still reads the old value"
+      (let [d (xml-doc)
+            r (root d)]
+        (set-attr! r "k" "old")
+        (let [before (match (node-attr r "k") (Some v) v (None) "")]
+          (set-attr! r "k" "new")
+          (let [ok (and (__eq? before "old")
+                        (match (node-attr r "k") (Some v) (__eq? v "new") (None) false))]
+            (dom-free d)
+            ok))))
+    (it "a removed node is detached, readable and re-insertable"
+      (let [d (xml-doc)
+            r (root d)
+            ok (match (node-first-child r)
+                 (Some a)
+                   (do (node-remove! a)
+                       (and (not (node-attached? a))
+                            (and (match (node-name a) (Some n) (__eq? n "a") (None) false)
+                                 (and (ser-is? (dom-node d) "<r/>")
+                                      (and (done? (node-append! r a))
+                                           (node-attached? a))))))
+                 (None) false)]
+        (dom-free d)
+        ok)))
+
+  (describe "dom/edit -- garbage and compaction"
+    (it "replacing values counts garbage; dom-compact copies the live tree"
+      (let [before (dom-live-bytes)
+            d (xml-doc)
+            r (root d)]
+        (set-attr! r "k" "first value")
+        (set-attr! r "k" "second value")
+        (node-append! r (el d "dropped"))
+        (match (node-first-child r) (Some a) (set-text! a "u") (None) (Ok nil))
+        (let [g (dom-garbage-bytes d)]
+          (match (dom-compact d)
+            (Some c)
+              (let [ok (and (> g 0)
+                            (and (dom-equal? (dom-node c) (dom-node d))
+                                 (= 0 (dom-garbage-bytes c))))]
+                (dom-free c)
+                (dom-free d)
+                (and ok (= before (dom-live-bytes))))
+            (None) (do (dom-free d) false))))))
+
+  (describe "dom/edit -- copies and normalize"
+    (it "node-clone is equal and independent"
+      (let [d (xml-doc)
+            r (root d)
+            c (must d (node-clone r))]
+        (set-attr! c "changed" "1")
+        (let [ok (and (not (node-attached? c))
+                      (and (not (dom-equal? c r)) (ser-is? r "<r><a>t</a></r>")))]
+          (dom-free d)
+          ok)))
+    (it "node-import validates across flavours"
+      (let [h (dom-new (HtmlFlavor))
+            x (dom-new (XmlFlavor))
+            p (el h "p")]
+        (set-attr! p "a\"b" "1")
+        (let [ok (and (refused? (node-import x p) (BadName))
+                      (match (node-import h p) (Ok _) true (Err _) false))]
+          (dom-free h)
+          (dom-free x)
+          ok)))
+    (it "node-normalize! merges adjacent text and drops empty text"
+      (let [d (xml-doc)
+            r (root d)]
+        (node-append! r (txt d ""))
+        (node-append! r (txt d "x"))
+        (node-append! r (txt d "y"))
+        (node-normalize! (dom-node d))
+        (let [ok (and (= 2 (tlength (node-children r))) (ser-is? r "<r><a>t</a>xy</r>"))]
+          (dom-free d)
+          ok))))
+
+  (describe "dom/edit -- XML namespaces"
+    (it "a created namespaced node is declared where its prefix is unbound"
+      (let [d (dom-new (XmlFlavor))
+            r (must d (create-element-ns d "http://www.w3.org/2005/Atom" "feed"))
+            e (must d (create-element-ns d "http://www.w3.org/2005/Atom" "entry"))
+            m (must d (create-element-ns d "urn:media" "m:thumb"))]
+        (node-append! (dom-node d) r)
+        (node-append! r e)
+        (node-append! e m)
+        (set-attr-ns! m "http://www.w3.org/1999/xlink" "xlink:href" "#a")
+        (let [ok (ser-is? (dom-node d)
+                          "<feed xmlns=\"http://www.w3.org/2005/Atom\"><entry><m:thumb xlink:href=\"#a\" xmlns:m=\"urn:media\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"/></entry></feed>")]
+          (dom-free d)
+          ok)))
+    (it "rename-ns! moves an element to another namespace"
+      (let [d (xml-doc)
+            r (root d)]
+        (rename-ns! r "urn:n" "n:r")
+        (let [ok (ser-is? (dom-node d) "<n:r xmlns:n=\"urn:n\"><a>t</a></n:r>")]
+          (dom-free d)
+          ok)))))
+
+;;; node-first-child-or -- the first child, or the node itself.
+(defn node-first-child-or [n : Node] : Node
+  (match (node-first-child n) (Some c) c (None) n))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule dom_core_edit_test

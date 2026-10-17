@@ -127,12 +127,15 @@ defn main [] : int
 |--------|---------|
 | `xml/sax` | `ParseOpts`, `default-parse-opts`, `sax-parse-string`, `sax-parse-string-opts`, `sax-parse-file`, `sax-parse-file-opts`, `SaxParser`, `sax-parser-new`, `sax-parser-new-opts`, `sax-feed!`, `sax-finish!`, `sax-parser-free`, `xml-backend-version` |
 | `xml/dom` | `dom-parse-string`, `dom-parse-string-opts`, `dom-parse-file`, `dom-parse-file-opts` |
+| `xml/transform` | `sax-transform`, `sax-transform-opts`, `sax-transform-file` |
 
 Events (`SaxEvent`, `SaxControl`, `Attr`) and the tree (`Document`, `Node`,
 navigation, queries, serialization) come from
 [`tur-dom-core`](../dom-core/README.md). The
 [XML guide](../../docs/guides/xml-guide.md) covers both in depth, including
-when to choose SAX over DOM.
+when to choose SAX over DOM, and editing: a tree in place with dom-core's
+`dom/edit`, or a stream with `xml/transform` (rename, drop, wrap, inject at
+memory proportional to the depth).
 
 ## Safe by default
 
@@ -164,7 +167,8 @@ UTF-16 and Latin-1 input, early stop, push parsing one byte at a time and in
 random chunks, the DOM node API, serialization, round trips and `dom-free`
 accounting. `fixtures/run.sh` runs James Clark's `xmltest` from the W3C XML
 Conformance Test Suite -- every `valid/sa` document's events must reproduce its
-canonical XML byte for byte, and every `not-wf/sa` document must be rejected --
-and a mutation fuzz pass. The suite is fetched from W3C (and checked against a
+canonical XML byte for byte, its identity transform must reproduce
+`dom-serialize` byte for byte, and every `not-wf/sa` document must be
+rejected -- plus a mutation fuzz pass and a `dom/edit` fuzz pass. The suite is fetched from W3C (and checked against a
 pinned SHA-256) rather than vendored, because its licence only permits
 redistributing the unmodified archive.

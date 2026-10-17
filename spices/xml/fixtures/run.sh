@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# fixtures/run.sh -- tur-xml's end-to-end fixtures: the W3C conformance slice
-# and the mutation fuzz pass.
+# fixtures/run.sh -- tur-xml's end-to-end fixtures: the W3C conformance slice,
+# the mutation fuzz pass, and the dom/edit fuzz pass.
 #
 # Both are whole programs with their own `main`, so they live outside tests/
 # (`tur test` recurses and would count them as suites).  scripts/run-shard.sh
@@ -85,6 +85,11 @@ esac
 
 echo "== fuzz (mutated inputs through every entry point)"
 if ! "$TUR_BIN" run fixtures/fuzz.tur; then
+  fails=$((fails + 1))
+fi
+
+echo "== edit fuzz (random dom/edit sequences, refusals and round trips)"
+if ! "$TUR_BIN" run fixtures/edit-fuzz.tur; then
   fails=$((fails + 1))
 fi
 

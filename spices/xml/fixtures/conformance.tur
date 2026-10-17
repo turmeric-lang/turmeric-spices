@@ -14,17 +14,26 @@
 ;;                line-end normalization, CDATA, PIs and UTF-16 input, not just
 ;;                "did it parse".
 ;;   not-wf/sa -- every document must be rejected.
+;;   valid/sa, again -- the identity transform (xml/transform's sax-keep
+;;                through a dom/writer SaxWriter) must reproduce
+;;                dom-serialize of the same file byte for byte:
+;;                xml-html-parsers-plan B4's gate.
 ;;
 ;; xmltest predates XML Namespaces (valid/sa/012 has an attribute named ":"),
 ;; so the suite runs with namespace processing off.
 
 (defmodule conformance_fixture (export)
 
-(import dom/ownstr :refer [String to-cstr])
+(import dom/ownstr :refer [String to-cstr release])
 (import dom/event  :refer [SaxEvent SaxControl Attr StartElement EndElement
                            Chars Comment Pi StartCdata EndCdata Doctype
                            Continue Stop])
+(import dom/core   :refer [dom-node dom-free dom-serialize parse-error-release])
+(import dom/edit   :refer [XmlFlavor])
+(import dom/writer :refer [sax-writer-new sax-writer-finish! sax-writer-free
+                           sax-transform-handler sax-keep])
 (import xml/sax    :refer [ParseOpts default-parse-opts sax-parse-file-opts])
+(import xml/dom    :refer [dom-parse-file-opts])
 (import test/suite  :refer [describe it])
 (import test/assert :refer [assert-true assert-eq])
 (import test/runner :refer [run-all-status])
@@ -266,6 +275,48 @@
         (Err _) (do (__report "rejected a valid document" path)
                     (valid-loop dir outdir (+ i 1) n ok))))))
 
+;;; __cstr= -- byte equality.
+(defn __cstr= [a : cstr b : cstr] : bool
+  ```c
+  return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+
+;;; identity-of -- path through the identity transform, compared with want.
+(defn identity-of? [path : cstr want : cstr] : bool
+  (match (sax-writer-new (XmlFlavor))
+    (None)   false
+    (Some w) (let [h  (sax-transform-handler w sax-keep)
+                   ok (match (sax-parse-file-opts path (opts) h)
+                        (Err e) (do (parse-error-release e) false)
+                        (Ok _)  (match (sax-writer-finish! w)
+                                  (Ok out) (let [b (__cstr= (to-cstr out) want)]
+                                             (release out)
+                                             b)
+                                  (Err _)  false))]
+               (sax-writer-free w)
+               ok)))
+
+;;; identity-matches? -- does the identity transform of path reproduce
+;;; dom-serialize of the same file?
+(defn identity-matches? [path : cstr] : bool
+  (match (dom-parse-file-opts path (opts))
+    (Err e) (do (parse-error-release e) false)
+    (Ok d)  (let [want (dom-serialize (dom-node d))
+                  ok   (identity-of? path (to-cstr want))]
+              (release want)
+              (dom-free d)
+              ok)))
+
+;;; identity-loop -- count valid/sa documents whose identity transform matches.
+(defn identity-loop [dir : cstr i : int n : int ok : int] : int
+  (if (>= i n)
+    ok
+    (let [path (__dir-path dir i)]
+      (if (identity-matches? path)
+        (identity-loop dir (+ i 1) n (+ ok 1))
+        (do (__report "identity transform differs from dom-serialize" path)
+            (identity-loop dir (+ i 1) n ok))))))
+
 ;;; ignore -- a handler that accepts every event.
 (defn ignore [e : SaxEvent] : SaxControl (Continue))
 
@@ -286,6 +337,10 @@
       (it "every document parses to its canonical form"
         (assert-eq n (valid-loop "fixtures/.xmlconf/xmlconf/xmltest/valid/sa"
                                  "fixtures/.xmlconf/xmlconf/xmltest/valid/sa/out" 0 n 0)))))
+  (describe "xmltest valid/sa -- identity transform == dom-serialize (plan B4)"
+    (let [n (__dir-load "fixtures/.xmlconf/xmlconf/xmltest/valid/sa")]
+      (it "every document comes back byte for byte"
+        (assert-eq n (identity-loop "fixtures/.xmlconf/xmlconf/xmltest/valid/sa" 0 n 0)))))
   (describe "xmltest not-wf/sa -- every document is rejected"
     (let [n (__dir-load "fixtures/.xmlconf/xmlconf/xmltest/not-wf/sa")]
       (it "finds the suite's documents" (= n 186))

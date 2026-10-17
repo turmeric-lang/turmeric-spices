@@ -22,7 +22,8 @@ events carries over to HTML.
 6. [Options and security](#6-options-and-security)
 7. [Errors](#7-errors)
 8. [Encodings](#8-encodings)
-9. [Limitations](#9-limitations)
+9. [Editing and streaming transforms](#9-editing-and-streaming-transforms)
+10. [Limitations](#10-limitations)
 
 ---
 
@@ -193,7 +194,8 @@ Elements with qualified names, namespace URIs and attributes (namespace
 declarations included, as `xmlns` / `xmlns:p` attributes, so serialization
 reproduces them); text, CDATA sections, comments and processing instructions,
 each with its source position; the doctype's name and identifiers. Adjacent
-text is one node. The tree is read-only.
+text is one node. Parsing builds it; `dom/edit` changes it in place (see
+[section 9](#9-editing-and-streaming-transforms)).
 
 ### Checking for leaks
 
@@ -384,14 +386,74 @@ not characters.
 
 ---
 
-## 9. Limitations
+## 9. Editing and streaming transforms
+
+There are two ways to change a document, matching the two ways to read one.
+
+**A tree you hold**: `dom/edit` in `tur-dom-core` creates, inserts, removes,
+renames and re-attributes nodes in place (see the
+[dom-core README](../../spices/dom-core/README.md#editing)). Every edit is
+checked first -- a name cannot carry `x onload=...`, a comment cannot hold
+`--` -- and a refused edit changes nothing.
+
+**A document too big to hold**: `xml/transform` runs each event through a
+function that returns the events to write in its place, and serializes those
+as it goes. Rename, drop, wrap and inject at memory proportional to the
+nesting depth; `sax-transform-file` streams file to file.
+
+```turmeric
+(import dom/ownstr    :refer [from-cstr release string=?])
+(import dom/event     :refer [SaxEvent StartElement EndElement])
+(import dom/writer    :refer [sax-keep])
+(import xml/transform :refer [sax-transform])
+
+;; <item> becomes <entry>; everything else passes through.
+(defn rename [ev : SaxEvent] : (Cons SaxEvent)
+  (match ev
+    (StartElement n as) (if (string=? n "item")
+                          (do (release n)
+                              (tcons-of (StartElement (from-cstr "entry") as) (tnil)))
+                          (sax-keep ev))
+    (EndElement n)      (if (string=? n "item")
+                          (do (release n)
+                              (tcons-of (EndElement (from-cstr "entry")) (tnil)))
+                          (sax-keep ev))
+    _                   (sax-keep ev)))
+
+(sax-transform "<list><item>a</item></list>" rename)
+;; => (Ok "<list><entry>a</entry></list>")
+```
+
+The function **owns** the event it is given: return it to write it,
+`sax-event-release` it to drop it. Every event it returns is written and then
+released, so an event rebuilt from the input reuses its strings. The writer
+checks what it cannot escape, as `dom/edit` does, plus the document's shape
+(end tags that match, one root, no text outside it), and the transform stops
+with `OutputError` at its first refusal.
+
+With namespace processing on, names arrive in Clark form (`{uri}local`) and
+the writer picks the prefixes: one already in scope, else a default
+namespace for an element or a generated `nsN` for an attribute. Write an
+`xmlns:p` attribute on the start tag to choose the prefix yourself. With
+namespaces off, names pass through as written, and the identity transform
+(`sax-keep`) reproduces `dom-serialize` of the same document byte for byte;
+the test suite checks that over xmltest.
+
+For other event sources -- a push parser fed from a socket, events you build
+yourself -- use `dom/writer` directly: `sax-writer-new` or
+`sax-writer-to-file`, then `sax-write!` per event or `sax-transform-handler`
+as the parser's handler, and `sax-writer-finish!`.
+
+---
+
+## 10. Limitations
 
 - No XPath, XSLT, XML Schema or DTD validation; expat is a non-validating
   parser (default attributes from the internal subset are applied, though).
 - Notation declarations are not reported, and the tree drops the internal
   DTD subset and the XML declaration.
-- The tree is read-only; a mutable DOM is a separate design.
-- Serialization is whole-subtree (`dom-serialize`), not streaming.
+- `dom-serialize` writes a whole subtree; streaming output is for event
+  streams (`xml/transform`, `dom/writer`), not for a tree.
 
 The test suite runs James Clark's `xmltest` from the W3C XML Conformance Test
 Suite (every `valid/sa` document's events must reproduce its canonical XML,

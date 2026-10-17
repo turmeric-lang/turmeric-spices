@@ -118,8 +118,235 @@ char        *turdom_serialize(const turdom_node *n, size_t *len);
 
 int          turdom_equal(const turdom_node *a, const turdom_node *b);
 int64_t      turdom_depth(const turdom_node *n);
+/* Nodes the document's arena holds, attached or detached (the document node
+ * itself not counted). */
 int64_t      turdom_node_count(const turdom_doc *d);
 /* Arena bytes held by all live documents in the process. */
 int64_t      turdom_live_bytes(void);
+
+/* ---- editing ------------------------------------------------------------
+ *
+ * Nothing is freed before turdom_doc_free.  A replaced string, a removed
+ * attribute or a removed subtree stays in the arena, so every pointer a
+ * reader borrowed stays valid: a removed node is DETACHED (parent NULL), not
+ * dangling, and can be read, re-inserted or ignored.  turdom_garbage_bytes
+ * counts what edits abandoned for certain (replaced strings and removed
+ * attributes; not detached nodes, which a caller may still hold), and
+ * turdom_compact copies the reachable tree into a fresh document.
+ *
+ * Every function here is iterative.  None validates names or content: that
+ * is the caller's job (dom/edit), because the serializer writes names,
+ * comment bodies, PI data and HTML raw text verbatim. */
+
+enum {
+    TURDOM_OK              = 0,
+    TURDOM_E_WRONG_DOC     = 1,  /* the node belongs to another arena: import it */
+    TURDOM_E_CYCLE         = 2,  /* inserting an ancestor under its descendant */
+    TURDOM_E_NOT_CONTAINER = 3,  /* children under a text/comment/CDATA/PI/doctype */
+    TURDOM_E_HIERARCHY     = 4,  /* a document node, a second root element or doctype,
+                                    text at the top level, a doctype in an element,
+                                    or a doctype after the root element */
+    TURDOM_E_DETACHED      = 5,  /* the reference node has no parent */
+    TURDOM_E_BAD_KIND      = 6,  /* the operation does not apply to this kind */
+    TURDOM_E_OOM           = 7,
+    TURDOM_E_BAD_NAME      = 8,  /* see the turdom_check_* functions below */
+    TURDOM_E_BAD_CONTENT   = 9,
+    TURDOM_E_IO            = 10  /* the streaming writer's output file */
+};
+
+/* Detached nodes, owned by d's arena until inserted.  In an HTML document,
+ * an element created with no namespace is put in the XHTML namespace, and an
+ * XHTML element's name is lower-cased, as createElement does.  kind is TURDOM_TEXT, TURDOM_COMMENT or
+ * TURDOM_CDATA.  NULL only on allocation failure. */
+turdom_node *turdom_create_element(turdom_doc *d, const char *qname,
+                                   const char *ns_uri, const char *local);
+turdom_node *turdom_create_chars(turdom_doc *d, int kind, const char *s,
+                                 size_t n);
+turdom_node *turdom_create_pi(turdom_doc *d, const char *target,
+                              const char *data);
+
+/* Tree surgery.  A child that is attached elsewhere is moved.  O(1) apart
+ * from the cycle check, which is O(depth). */
+int          turdom_append(turdom_node *parent, turdom_node *child);
+int          turdom_prepend(turdom_node *parent, turdom_node *child);
+int          turdom_insert_before(turdom_node *ref, turdom_node *child);
+int          turdom_insert_after(turdom_node *ref, turdom_node *child);
+int          turdom_replace(turdom_node *old, turdom_node *repl);
+/* Detach n; a no-op when it is already detached. */
+void         turdom_remove(turdom_node *n);
+/* n's children take its place, then n is detached. */
+int          turdom_unwrap(turdom_node *n);
+
+/* Content.  set_attr replaces the value of a matching attribute in place
+ * (matched by namespace and local name when ns_uri is given, otherwise by
+ * qualified name, ignoring ASCII case in an HTML document) or appends a new
+ * one.  remove_attr matches as turdom_attr_get does and returns 1 when it
+ * removed something.  set_value sets the data of a text, comment, CDATA or
+ * PI node.  set_text is textContent=: on an element or the document node it
+ * detaches every child and appends one text node (none for ""). */
+int          turdom_set_attr(turdom_node *el, const char *qname,
+                             const char *ns_uri, const char *local,
+                             const char *value, size_t vlen);
+int          turdom_remove_attr(turdom_node *el, const char *name);
+int          turdom_set_value(turdom_node *n, const char *s, size_t len);
+int          turdom_set_text(turdom_node *n, const char *s, size_t len);
+int          turdom_rename(turdom_node *el, const char *qname,
+                           const char *ns_uri, const char *local);
+
+/* Deep copies, detached.  clone copies into n's own arena; import copies into
+ * d (another document, or the same one).  The document node itself cannot be
+ * copied: NULL. */
+turdom_node *turdom_clone(const turdom_node *n);
+turdom_node *turdom_import(turdom_doc *d, const turdom_node *n);
+
+/* Merge adjacent text nodes and drop empty ones in n's subtree, as the DOM's
+ * normalize() does.  A parser only ever produces normalized trees. */
+void         turdom_normalize(turdom_node *n);
+
+/* A fresh document holding a copy of d's reachable tree.  The one operation
+ * that invalidates handles: nodes of d do not belong to the copy.  The caller
+ * frees both. */
+turdom_doc  *turdom_compact(const turdom_doc *d);
+int64_t      turdom_garbage_bytes(const turdom_doc *d);
+/* Is n reachable from its document node? */
+int          turdom_attached(const turdom_node *n);
+
+/* ---- validation ---------------------------------------------------------
+ *
+ * What dom/edit checks before an edit, so that serializing an edited tree and
+ * parsing it back cannot produce structure the edits did not make.  The
+ * serializer escapes text and attribute values but writes names, comment
+ * bodies, PI data and HTML raw text verbatim; these are the rules for those.
+ * Each returns TURDOM_OK, TURDOM_E_BAD_NAME, TURDOM_E_BAD_CONTENT or
+ * TURDOM_E_HIERARCHY.
+ *
+ * Names.  XML: a QName (the Name production, at most one colon, neither end),
+ * a prefix only with a namespace, `xml` only for the XML namespace, and no
+ * `xmlns` element prefix.  HTML: an element name starts with an ASCII letter
+ * and holds no whitespace, `/` or `>`; an attribute name is non-empty and
+ * holds no whitespace, `/`, `>` or `=`.  `plaintext` is refused, because its
+ * end tag is never recognized and it would swallow every later sibling.
+ *
+ * Content.  XML text, attribute values, comments, CDATA and PI data must be
+ * well-formed UTF-8 made of XML Chars; a comment holds no `--` and does not
+ * end in `-`; PI data holds no `?>` and does not start with whitespace; a PI
+ * target is an NCName and not `xml`.  In either flavour, comments, CDATA, PI
+ * data and raw text hold no `\r` (it cannot be escaped there and would come
+ * back as `\n`), and CDATA holds no `]]>` (it would come back as two
+ * sections).
+ * HTML comments follow the HTML spec's comment-text rule (not starting with
+ * `>` or `->`, no `<!--`, `-->` or `--!>`, not ending in `<!-`).  HTML has no
+ * PIs and no CDATA nodes (its parser reads `<![CDATA[` in SVG as text), so
+ * creating either is TURDOM_E_HIERARCHY.
+ *
+ * Placement (HTML).  A raw-text element (script, style, xmp, iframe,
+ * noembed, noframes) holds only text, and that text never contains `</` and
+ * the element's name (ASCII case-insensitive), nor, for script, `<!--`.  A
+ * void element holds nothing. */
+int          turdom_check_element_name(const turdom_doc *d, const char *qname,
+                                       const char *ns_uri);
+int          turdom_check_attr(const turdom_node *el, const char *qname,
+                               const char *ns_uri, const char *value,
+                               size_t vlen);
+/* kind is TURDOM_TEXT, TURDOM_COMMENT or TURDOM_CDATA. */
+int          turdom_check_chars(const turdom_doc *d, int kind, const char *s,
+                                size_t n);
+int          turdom_check_pi(const turdom_doc *d, const char *target,
+                             const char *data);
+/* May child go under parent?  Only the placement rules above; turdom_append
+ * and friends check the structural ones themselves. */
+int          turdom_check_placement(const turdom_node *parent,
+                                    const turdom_node *child);
+/* May n's data become s (set_value), or element n's text become s
+ * (set_text)?  Content and, under a raw-text element, placement. */
+int          turdom_check_value(const turdom_node *n, const char *s, size_t len);
+int          turdom_check_text(const turdom_node *el, const char *s, size_t len);
+/* May element el be renamed to (qname, ns_uri)?  The name, and its current
+ * children under the new name. */
+int          turdom_check_rename(const turdom_node *el, const char *qname,
+                                 const char *ns_uri);
+/* Is every name and string in n's subtree valid in document d?  For an
+ * import across flavours; a same-flavour import is valid by construction. */
+int          turdom_check_subtree(const turdom_doc *d, const turdom_node *n);
+
+/* ---- checked edits ---------------------------------------------------------
+ *
+ * The editing operations with the validation above applied first, in one
+ * call: on any error nothing changes.  dom/edit is built on these.  A local
+ * name is the part of qname after its colon. */
+
+enum {
+    TURDOM_AT_APPEND  = 0,  /* at is the parent */
+    TURDOM_AT_PREPEND = 1,  /* at is the parent */
+    TURDOM_AT_BEFORE  = 2,  /* at is the reference sibling */
+    TURDOM_AT_AFTER   = 3,  /* at is the reference sibling */
+    TURDOM_AT_REPLACE = 4   /* at is the node replaced */
+};
+
+int          turdom_edit_insert(int where, turdom_node *at, turdom_node *child);
+int          turdom_edit_unwrap(turdom_node *n);
+int          turdom_edit_set_attr(turdom_node *el, const char *qname,
+                                  const char *ns_uri, const char *value,
+                                  size_t vlen);
+int          turdom_edit_set_value(turdom_node *n, const char *s, size_t len);
+int          turdom_edit_set_text(turdom_node *n, const char *s, size_t len);
+int          turdom_edit_rename(turdom_node *el, const char *qname,
+                                const char *ns_uri);
+
+/* ---- streaming writer --------------------------------------------------------
+ *
+ * Serializes a stream of SAX events the way turdom_serialize writes a tree:
+ * the same escaping, `<x/>` for an empty XML element, raw text inside an HTML
+ * <script> or <style>.  It is checked the way edits are, for what it writes
+ * verbatim -- names, comment bodies, PI data, CDATA, HTML raw text, doctype
+ * ids -- and for structure: no duplicate attribute, and in XML an end tag
+ * must match the open element, there is exactly one root, text stays inside
+ * it.  HTML end tags need not balance (a tokenizer's do not); an end tag
+ * directly after a void element's start (`<br/>`) writes the self-closed
+ * form.  The first refusal sticks: later calls return it and write nothing.
+ *
+ * XML names are Names as written (namespaces off: `a:b` is just a name), or
+ * Clark form `{uri}local` as a namespace-aware parser reports them.  A start
+ * tag is held until the next event, so the `xmlns` / `xmlns:p` attributes
+ * written on it are in scope for its own Clark names; for those the writer
+ * reuses a binding in scope or declares one (a default namespace for an
+ * element, a generated `nsN` prefix for an attribute or for an element whose
+ * own `xmlns` says otherwise).  A plain name with no colon under a default
+ * the writer generated gets `xmlns=""`, so it stays in no namespace.
+ *
+ * Memory: the output, unless turdom_writer_to_file sends it to a file in
+ * 64 KiB writes; plus the open elements, the held start tag and an open HTML
+ * raw-text element's text. */
+
+typedef struct turdom_writer turdom_writer;
+
+turdom_writer *turdom_writer_new(int flavor);
+/* Before any event: write the output to path rather than keeping it.
+ * TURDOM_E_IO (not sticky) when the file cannot be created. */
+int            turdom_writer_to_file(turdom_writer *w, const char *path);
+void           turdom_writer_free(turdom_writer *w);
+int            turdom_writer_start(turdom_writer *w, const char *name);
+/* Only directly after start, before any other event. */
+int            turdom_writer_attr(turdom_writer *w, const char *name,
+                                  const char *value, size_t vlen);
+int            turdom_writer_end(turdom_writer *w, const char *name);
+int            turdom_writer_chars(turdom_writer *w, const char *s, size_t n);
+int            turdom_writer_comment(turdom_writer *w, const char *s, size_t n);
+int            turdom_writer_pi(turdom_writer *w, const char *target,
+                                const char *data);
+/* start != 0 opens a CDATA section, 0 closes it. */
+int            turdom_writer_cdata(turdom_writer *w, int start);
+/* An absent id is NULL or "". */
+int            turdom_writer_doctype(turdom_writer *w, const char *name,
+                                     const char *public_id,
+                                     const char *system_id);
+int            turdom_writer_error(const turdom_writer *w);
+/* Ends the output: closes a held start tag, checks that the XML document is
+ * complete, and flushes and closes the file.  Returns the output (empty when
+ * it went to a file), malloc'd for the caller to free; NULL with *rc set when
+ * the writer has refused something.  Later events are refused with
+ * TURDOM_E_HIERARCHY; finishing again returns the output again.  The writer
+ * still needs turdom_writer_free. */
+char          *turdom_writer_finish(turdom_writer *w, size_t *len, int *rc);
 
 #endif /* TURDOM_H */
