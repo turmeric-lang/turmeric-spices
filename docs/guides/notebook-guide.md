@@ -47,6 +47,10 @@ tur install tur-notebook    ;; puts `tur-nb` on $PATH
 No external C dependencies -- the parser, renderer, and TUI are pure Turmeric
 plus a vendored libturi for in-process cell execution.
 
+The spice needs turmeric v0.66.0 or later (`:tur-version ">=0.66.0"`), the
+first release whose `tur/markdown` has the GFM extensions, math and
+per-block HTML the notebook parses and renders its prose with.
+
 ---
 
 ## 1. Your first notebook

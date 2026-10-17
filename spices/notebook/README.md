@@ -17,6 +17,10 @@ embedded CSS in `src/notebook/render-html.tur` in sync.
 
 ## Installation
 
+Requires turmeric v0.66.0 or later (`:tur-version ">=0.66.0"`), the first
+release whose stdlib `tur/markdown` has the GFM extensions, math and
+per-block HTML the notebook uses.
+
 Install the notebook spice globally with `tur install`:
 
 ```sh
