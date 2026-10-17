@@ -19,13 +19,13 @@ import re
 import sys
 from pathlib import Path
 
-import markdown as md_lib
-
 sys.path.insert(0, str(Path(__file__).parent))
 from genguides import (SIDEBAR_TOGGLE_JS, SYNTAX_TOGGLE_JS,
                        TURMERIC_HIGHLIGHT_JS, GUIDE_CSS,
-                       inject_syntax_toggles, toc_tokens_to_sidebar)
+                       inject_syntax_toggles, report_raw_html,
+                       toc_tokens_to_sidebar)
 from gendocs import render_tree, collect_doc_entries
+import mdrender
 from sitechrome import GITHUB_URL, build_page_header, build_sidebar
 
 # Same repo URL the chrome's GitHub link uses -- one constant, so a transfer
@@ -156,17 +156,22 @@ def _split_front_matter(text: str) -> tuple[dict, str]:
     return meta, body
 
 
-def _inline_md(text: str) -> str:
-    """Render a summary's inline markdown (bold, italic, code) to HTML.
+def render_summaries(guides: list[dict]) -> None:
+    """Render each guide's summary's inline markdown (bold, italic, code) to HTML.
 
-    Links are flattened to their anchor text on purpose: a guide's relative
-    target is written relative to the guide, not to the index page that embeds
-    the summary, so rendering it as an <a> would emit a broken link.
+    All of them in one renderer run (tools/mdrender.py), into each entry's
+    'summary_html'. Links are flattened to their anchor text on purpose: a
+    guide's relative target is written relative to the guide, not to the
+    index page that embeds the summary, so rendering it as an <a> would emit a
+    broken link.
     """
-    flat = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', text)
-    out = md_lib.markdown(flat).strip()
-    m = re.fullmatch(r'<p>(.*)</p>', out, re.S)
-    return m.group(1).strip() if m else out
+    pages = mdrender.render_batch({
+        g['stem']: re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', g['summary'])
+        for g in guides})
+    for g in guides:
+        out = pages[g['stem']]['html'].strip()
+        m = re.fullmatch(r'<p>(.*)</p>', out, re.S)
+        g['summary_html'] = m.group(1).strip() if m else out
 
 
 def _extract_guide_summary(text: str) -> str:
@@ -272,27 +277,26 @@ Docs in progress.
 '''
 
 
-def render_front_page(meta: SpiceMeta, out_dir: Path, style_rel: str) -> None:
-    """Render docs/html/<name>/index.html from the spice's README.md."""
-    out_dir.mkdir(parents=True, exist_ok=True)
+def front_page_source(meta: SpiceMeta) -> tuple[str, str]:
+    """A spice's front-page Markdown, and the label its footer names it by:
+    the README, or a stub when the spice has none."""
     readme = meta['path'] / 'README.md'
-
     if readme.is_file():
-        text = readme.read_text(encoding='utf-8')
-        source_label = f'spices/{meta["name"]}/README.md'
-    else:
-        text = STUB_FRONT_PAGE.format(name=meta['name'], github=GITHUB_BASE)
-        source_label = '(no README -- stub)'
+        return (readme.read_text(encoding='utf-8'),
+                f'spices/{meta["name"]}/README.md')
+    return (STUB_FRONT_PAGE.format(name=meta['name'], github=GITHUB_BASE),
+            '(no README -- stub)')
 
-    text = re.sub(r'^(`{3,})(turmeric|sweet-exp)\s+no-check\b[^\n]*', r'\1\2', text,
-                  flags=re.MULTILINE)
-    conv = md_lib.Markdown(
-        extensions=['fenced_code', 'tables', 'toc'],
-        extension_configs={'toc': {'permalink': False}},
-    )
-    body_html = conv.convert(text)
-    body_html = inject_syntax_toggles(body_html)
-    toc_tokens = getattr(conv, 'toc_tokens', [])
+
+def render_front_page(meta: SpiceMeta, page: dict, source_label: str,
+                      out_dir: Path, style_rel: str) -> None:
+    """Write docs/html/<name>/index.html from the spice's rendered README.
+
+    `page` is the README as tools/mdrender.py renders it.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    body_html = inject_syntax_toggles(page['html'])
+    toc_tokens = page['toc_tokens']
 
     sidebar_items = toc_tokens_to_sidebar(toc_tokens)
     sidebar_html = build_sidebar(
@@ -384,7 +388,7 @@ def render_top_index(metas: list[SpiceMeta], out_dir: Path,
         for g in guides:
             stem = html_module.escape(g['stem'])
             title = html_module.escape(g['title'])
-            summary = _inline_md(g['summary'])
+            summary = g['summary_html']
             guide_rows.append(
                 '      <tr>'
                 f'<td><a href="guides/{stem}.html">{title}</a></td>'
@@ -573,12 +577,18 @@ def main() -> None:
     metas = collect_spice_meta(spice_dirs, table)
 
     print(f'Generating docs for {len(metas)} spices into {out_dir}/')
+    # Every front page through the renderer in one run (tools/mdrender.py).
+    sources = {meta['name']: front_page_source(meta) for meta in metas}
+    pages = mdrender.render_batch({name: text for name, (text, _) in sources.items()})
     all_entries: list[dict] = []
     for meta in metas:
         print(f'-> {meta["name"]}')
         spice_out = out_dir / meta['name']
+        text, source_label = sources[meta['name']]
+        report_raw_html(source_label, pages[meta['name']])
         # Front page links to /styles/style.css (deployed alongside the docs tree)
-        render_front_page(meta, spice_out, style_rel='/styles/style.css')
+        render_front_page(meta, pages[meta['name']], source_label, spice_out,
+                          style_rel='/styles/style.css')
         modules = render_api_reference(meta, spice_out)
         if modules is None:
             print(f'   (no src/ directory; skipping API reference)')
@@ -588,6 +598,7 @@ def main() -> None:
     guides = discover_guides(SPICES_REPO / 'docs' / 'guides')
     if guides:
         print(f'Found {len(guides)} guide(s) for landing-page Guides section')
+        render_summaries(guides)
     render_top_index(metas, out_dir, guides=guides)
     if args.emit_json:
         out_json = Path(args.emit_json)

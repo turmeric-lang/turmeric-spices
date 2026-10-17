@@ -91,7 +91,7 @@ defmodule demo
 | `remap x in-lo in-hi out-lo out-hi` | `out-lo + ((x-in-lo)/(in-hi-in-lo)) * (out-hi-out-lo)` |
 | `deg->rad deg` | `deg * pi/180` |
 | `rad->deg rad` | `rad * 180/pi` |
-| `approx-eq a b eps` | `|a-b| < eps` |
+| `approx-eq a b eps` | `\|a-b\| < eps` |
 
 ---
 

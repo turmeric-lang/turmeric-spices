@@ -194,8 +194,8 @@ round `seconds * sample-rate` to the nearest sample. Delays clamp to
 |---|---|
 | `delay-n n` / `delay sr secs` | the input, `n` samples late (first `n` outputs are 0) |
 | `comb-ff-n n g` / `comb-ff sr secs g` | feedforward comb: `y = x + g*x[n-D]` (always stable) |
-| `comb-n n g` / `comb sr secs g` | feedback comb: `y = x + g*y[n-D]`; needs `|g| < 1` |
-| `allpass-n n g` / `allpass sr secs g` | Schroeder allpass: `v = x + g*v[n-D]`, `y = v[n-D] - g*v`; needs `|g| < 1` |
+| `comb-n n g` / `comb sr secs g` | feedback comb: `y = x + g*y[n-D]`; needs `\|g\| < 1` |
+| `allpass-n n g` / `allpass sr secs g` | Schroeder allpass: `v = x + g*v[n-D]`, `y = v[n-D] - g*v`; needs `\|g\| < 1` |
 
 Feedback gains are not clamped: `|g| >= 1` grows without bound.
 

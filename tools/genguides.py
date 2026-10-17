@@ -13,7 +13,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-import markdown as md_lib
+# Markdown is rendered by tur/markdown, the stdlib's CommonMark + GFM renderer
+# (turmeric markdown-library-plan M4), through tools/mdrender.py -- a verbatim
+# copy of turmeric's, as tools/md/render.tur is.  It needs a tur: $TUR, the
+# vendor/tur/ that scripts/install-tur.sh unpacks, or one on PATH.
+import mdrender
 
 # Topbar and sidebar globals come from the one chrome module, so the guides,
 # the spice front pages and the API trees all name the same set of places --
@@ -312,9 +316,17 @@ def toc_tokens_to_sidebar(tokens: list) -> str:
     return '\n'.join(items)
 
 
-def render_guide(stem: str, src: Path, out: Path, all_stems: set, meta: dict | None = None) -> None:
+def guide_source(src: Path, meta: dict | None = None) -> tuple[str, str, dict]:
+    """A guide's Markdown as the renderer sees it.
+
+    Returns (text, body, meta). `text` is what is rendered: the source with
+    its front matter blanked out, so the renderer's line numbers are the
+    file's, and its local `href="x.md"` links pointed at `x.html`. `body` is
+    the source after its front matter, and `meta` the front matter unless the
+    caller gave it.
+    """
     raw = src.read_text(encoding='utf-8')
-    fm_meta, text = parse_front_matter(raw)
+    fm_meta, body = parse_front_matter(raw)
     if meta is None:
         meta = fm_meta
 
@@ -325,21 +337,36 @@ def render_guide(stem: str, src: Path, out: Path, all_stems: set, meta: dict | N
             return m.group(0)
         return f'href="{Path(href).stem}.html"'
 
+    text = '\n' * raw[:len(raw) - len(body)].count('\n') + body
     text = re.sub(r'href="([^"]+\.md)"', rewrite_md_link, text)
-    text = re.sub(r'^(`{3,})(turmeric|sweet-exp)\s+no-check\b[^\n]*', r'\1\2', text,
-                  flags=re.MULTILINE)
+    return text, body, meta
 
-    conv = md_lib.Markdown(extensions=['fenced_code', 'tables', 'toc'],
-                            extension_configs={'toc': {'permalink': False}})
-    body_html = conv.convert(text)
-    body_html = inject_syntax_toggles(body_html)
-    toc_tokens = getattr(conv, 'toc_tokens', [])
+
+def report_raw_html(label: str, page: dict) -> None:
+    """Warn about each raw-HTML node the renderer passed through.
+
+    Raw HTML in a guide or README is almost always an accident: Turmeric type
+    syntax such as `ptr<void>` written outside a code span is a tag to the
+    browser, which hides it. Warned about, not refused: this repository's CI
+    renders no docs, so a refusal would first surface in turmeric's release
+    cut, which deploys this site.
+    """
+    for r in page['raw_html']:
+        snippet = ' '.join(r['html'].split())[:60]
+        print(f'warning: {label}:{r["line"]}: raw HTML: {snippet}', file=sys.stderr)
+
+
+def render_guide(stem: str, page: dict, body: str, out: Path,
+                 meta: dict | None = None) -> None:
+    """Write one guide's page from its rendered Markdown (tools/mdrender.py)."""
+    body_html = inject_syntax_toggles(page['html'])
+    toc_tokens = page['toc_tokens']
 
     fm_title = meta.get('title', '').strip() if meta else ''
     if fm_title:
         title = fm_title
     else:
-        title_match = re.match(r'^#\s+(.+)', text, re.MULTILINE)
+        title_match = re.match(r'^#\s+(.+)', body, re.MULTILINE)
         title = title_match.group(1) if title_match else stem.replace('-', ' ').title()
 
     sidebar_items = toc_tokens_to_sidebar(toc_tokens)
@@ -600,9 +627,14 @@ def main() -> None:
                       for d, src in edited[:10]]
 
     print('Generating guides:')
+    # Every guide through the renderer in one run (tools/mdrender.py).
+    prepared = {src.stem: guide_source(src, meta_by_stem.get(src.stem, {}))
+                for src in md_files}
+    pages = mdrender.render_batch({stem: text for stem, (text, _, _) in prepared.items()})
     for src in md_files:
-        render_guide(src.stem, src, out_dir / f'{src.stem}.html', all_stems,
-                     meta_by_stem.get(src.stem, {}))
+        _, body, meta = prepared[src.stem]
+        report_raw_html(f'docs/guides/{src.name}', pages[src.stem])
+        render_guide(src.stem, pages[src.stem], body, out_dir / f'{src.stem}.html', meta)
     render_index(categories, all_stems, out_dir, recent=recent,
                  recent_updated=recent_updated)
     print(f'Done: {len(md_files)} guides + index → {out_dir}')
