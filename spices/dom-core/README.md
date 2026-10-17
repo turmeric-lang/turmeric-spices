@@ -26,6 +26,13 @@ its modules are what you import to read what they produce:
 Because both parsers build into the same tree, a helper written against
 `dom/core` works on XML and HTML alike.
 
+## Requirements
+
+Turmeric newer than v0.65.5: the first release after it, or `main` from
+2026-10-17 on. Earlier compilers drop casts this spice relies on
+([heap-adt-word-slot-missing-cast](https://github.com/turmeric-lang/turmeric/blob/main/docs/archive/heap-adt-word-slot-missing-cast.md)).
+tur-xml and tur-html build on it, so they need the same.
+
 ## Ownership in one paragraph
 
 A `Document` owns every node and every string in it, in one arena that
