@@ -517,7 +517,7 @@ def render_top_index(metas: list[SpiceMeta], out_dir: Path,
     .spices-table td.platform, .spices-table th[title] {{ text-align:center; white-space:nowrap; }}
     .guides-table th:first-child, .guides-table td:first-child {{ white-space:nowrap; }}
     .index-tabs {{ display:flex; gap:2px; border-bottom:1px solid var(--border); margin-bottom:1.5rem; }}
-    .index-tab {{ padding:0.5rem 1.1rem; background:transparent; color:var(--text-sec); border:none; border-bottom:2px solid transparent; cursor:pointer; font-size:0.95rem; font-family:inherit; transition:all 0.14s; }}
+    .index-tab {{ padding:0.5rem 1.1rem; background:transparent; color:var(--text-sec); border:none; border-bottom:2px solid transparent; cursor:pointer; font-size:0.95rem; font-family:inherit; }}
     .index-tab:hover {{ color:var(--text-primary); }}
     .index-tab.active {{ color:var(--gold-bright); border-bottom-color:var(--gold); }}
     .index-panel h2:first-child {{ margin-top:0; }}
