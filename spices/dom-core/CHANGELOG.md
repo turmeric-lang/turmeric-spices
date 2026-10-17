@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `sax-event-retain` returns the event it retained, so a handler can write
+  `(f (sax-event-retain ev))`. It returned `nil` to sidestep a compiler bug
+  (turmeric `heap-adt-word-slot-missing-cast`), which is fixed.
+- The tur-xml and tur-html SAX drivers call their handler directly.
+  `sax-dispatch` stays, as `(h ev)`, for callers that use it.
+- Needs a turmeric newer than v0.65.5: the first release after it, or `main`
+  from 2026-10-17 on.
+
 ## 0.2.0
 
 ### Added
