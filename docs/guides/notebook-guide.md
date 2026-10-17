@@ -1,6 +1,6 @@
 # tur-notebook -- Notebook Guide
 
-> Spice version 0.1.0 -- Literate `.tur.md` notebooks with a static renderer
+> Spice version 0.3.0 -- Literate `.tur.md` notebooks with a static renderer
 > and an interactive terminal TUI.
 > Audience: Turmeric users who want a Jupyter-style workflow for exploratory
 > code, reproducible analyses, and shareable HTML reports.
@@ -206,6 +206,25 @@ tur nb render analysis.tur.md --watch
 Watch mode uses `kqueue` on macOS and `inotify` on Linux. Each re-render
 starts with a fresh session -- predictability over warm caches. If you want
 warm-cache exploration, use the TUI instead.
+
+### What the prose can hold
+
+Prose is parsed and rendered by the stdlib's `tur/markdown`: all of
+CommonMark, GitHub's tables, strikethrough, task lists and bare-URL links,
+and TeX math. The HTML is what GitHub would show, and writing a notebook back
+out (the TUI's save, markdown export) keeps each prose block exactly as you
+wrote it.
+
+Math is `$...$` in a line and `$$...$$` for a display formula, either in a
+line or as a block: a `$$` line, the formula's lines, and a closing `$$`
+line. The HTML page renders it with KaTeX.
+
+- The opening `$` of an inline formula has no space or digit after it, so
+  `$5 and $10` stays text. Write a formula that starts with a digit in
+  braces: `${2^n}$`.
+- The closing `$` has no space before it, and a formula stays on one line.
+- A `$$` line that is never closed is ordinary text.
+- `\$` is a literal dollar sign.
 
 ---
 
@@ -442,18 +461,15 @@ not handle 256-color escapes well, or for screen-readers.
 
 ---
 
-## Limitations in v0.1.0
+## Limitations in v0.3.0
 
 - **No undo for cell-level edits.** Insert / delete / paste are not yet
   reversible from inside the TUI. The save-on-quit prompt protects against
-  accidental loss; full undo is planned for v0.2.
-- **HTML blocks and reference-style links** are not parsed by the included
-  CommonMark subset; they render as their literal source text. Inline links,
-  GFM tables, task lists, and strikethrough are supported.
+  accidental loss; full undo is planned.
 - **Terminal image protocols vary.** Inline images work in Kitty, iTerm2,
   and WezTerm; other terminals fall back to a `[image: path]` placeholder
   in the TUI. Rendered HTML and markdown carry the image regardless.
 
-The parser scope and the included / deferred features are documented in
-`docs/notebook-spice-plan.md` -- file an issue if a missing CommonMark feature
-is blocking real notebook work.
+Prose is full CommonMark and GFM since 0.3.0, when the notebook's own
+subset parser gave way to the stdlib's `tur/markdown`
+(markdown-library-plan M5).

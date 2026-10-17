@@ -1,4 +1,22 @@
-;; notebook/cmark -- block-level CommonMark subset parser for tur-notebook.
+;;; notebook/cmark -- the notebook's Markdown API, over the stdlib's tur/markdown.
+;;;
+;;; md-parse reads a notebook's Markdown with tur/markdown -- CommonMark, the
+;;; GFM extensions and $ / $$ math -- and hands back the tree the rest of the
+;;; spice walks: node handles, a tag per node, md-node-children, md-node-text
+;;; and the rest.  The parser this module used to carry (2,084 lines, most of
+;;; it inline C) is gone; markdown-library-plan M5.
+;;;
+;;; The tree is copied out of tur/markdown's document, which md-parse then
+;;; releases, so a node owns everything it hands out.  Each block also keeps
+;;; its Markdown source (the lines it spans, as written) for md-emit and its
+;;; HTML (as tur/markdown renders it in place) for md-emit-html.  Lines
+;;; between top-level blocks that are not blank -- link reference
+;;; definitions, which are no block of their own -- become a paragraph node
+;;; whose HTML is empty, so writing a notebook back keeps them.
+;;;
+;;; Since: NB0
+;; Nodes are C records behind int handles, the API the spice has always had.
+(load "stdlib/markdown.tur")
 
 (defmodule notebook/cmark
   (export md-tag-document md-tag-heading md-tag-paragraph
@@ -10,6 +28,7 @@
           md-tag-strikethrough
           md-tag-autolink md-tag-hard-break md-tag-soft-break
           md-tag-math-block md-tag-math-inline
+          md-tag-html-block md-tag-html-inline
           md-parse
           md-node-tag md-node-children md-node-text
           md-node-info md-node-meta md-source-span
@@ -17,157 +36,7 @@
           md-node-free md-node-free-shell md-children-free md-span-free
           __md-drop-kids-cache)
 
-  ;; Minimal cons helpers so the module stays self-contained.
-  (defn nil-value [] #fx{Unsafe} : int
-    ```c
-    return 0;
-    ```)
-
-  (defn list-nil? [lst : int] #fx{Unsafe} : bool
-    ```c
-    return lst == 0;
-    ```)
-
-  (defn cons [value : int next : int] #fx{Unsafe} : int
-    ```c
-    struct { int64_t head; int64_t tail; } *cell = malloc(sizeof(*cell));
-    cell->head = value;
-    cell->tail = next;
-    return (int64_t)(intptr_t)cell;
-    ```)
-
-  (defn head [lst : int] #fx{Unsafe} : int
-    ```c
-    struct { int64_t head; int64_t tail; } *cell = (void*)(intptr_t)lst;
-    if (!cell) { fprintf(stderr, "head: empty list\n"); exit(1); }
-    return cell->head;
-    ```)
-
-  (defn tail [lst : int] #fx{Unsafe} : int
-    ```c
-    struct { int64_t head; int64_t tail; } *cell = (void*)(intptr_t)lst;
-    if (!cell) { fprintf(stderr, "tail: empty list\n"); exit(1); }
-    return cell->tail;
-    ```)
-
-  (defn __str-concat [a : cstr b : cstr] #fx{Unsafe} : cstr
-    ```c
-    const char *sa = a ? (const char *)(intptr_t)a : "";
-    const char *sb = b ? (const char *)(intptr_t)b : "";
-    size_t la = strlen(sa), lb = strlen(sb);
-    char *out = malloc(la + lb + 1);
-    memcpy(out, sa, la);
-    memcpy(out + la, sb, lb);
-    out[la + lb] = '\0';
-    return out;
-    ```)
-
-  (defn __repeat-char [ch : int count : int] #fx{Unsafe} : cstr
-    ```c
-    if (count <= 0) {
-      char *out = malloc(1);
-      out[0] = '\0';
-      return out;
-    }
-    char *out = malloc((size_t)count + 1);
-    for (int i = 0; i < count; i++) out[i] = (char)ch;
-    out[count] = '\0';
-    return out;
-    ```)
-
-  (defn __int->cstr [value : int] #fx{Unsafe} : cstr
-    ```c
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%lld", (long long)value);
-    return strdup(buf);
-    ```)
-
-  (defn __int-as-cstr [value : int] #fx{Unsafe} : cstr
-    ```c
-    return (const char *)(intptr_t)value;
-    ```)
-
-  (defn __cstr-as-int [value : cstr] #fx{Unsafe} : int
-    ```c
-    return (int64_t)(intptr_t)value;
-    ```)
-
-  (defn __cstr-eq? [a : cstr b : cstr] #fx{Unsafe} : bool
-    ```c
-    const char *sa = a ? (const char *)(intptr_t)a : "";
-    const char *sb = b ? (const char *)(intptr_t)b : "";
-    return strcmp(sa, sb) == 0;
-    ```)
-
-  (defn __prefix-lines [prefix : cstr body : cstr] #fx{Unsafe} : cstr
-    ```c
-    const char *p = prefix ? (const char *)(intptr_t)prefix : "";
-    const char *s = body ? (const char *)(intptr_t)body : "";
-    size_t lp = strlen(p), ls = strlen(s);
-    size_t cap = lp + ls + 16;
-    char *out = malloc(cap);
-    size_t len = 0;
-    bool need_prefix = true;
-    if (ls == 0) {
-      memcpy(out, p, lp);
-      out[lp] = '\0';
-      return out;
-    }
-    for (size_t i = 0; i < ls; i++) {
-      if (need_prefix) {
-        if (len + lp + 2 >= cap) { cap *= 2; out = realloc(out, cap); }
-        memcpy(out + len, p, lp);
-        len += lp;
-        need_prefix = false;
-      }
-      if (len + 2 >= cap) { cap *= 2; out = realloc(out, cap); }
-      out[len++] = s[i];
-      if (s[i] == '\n') need_prefix = true;
-    }
-    out[len] = '\0';
-    return out;
-    ```)
-
-  (defn __format-list-item [prefix : cstr body : cstr] #fx{Unsafe} : cstr
-    ```c
-    const char *p = prefix ? (const char *)(intptr_t)prefix : "";
-    const char *s = body ? (const char *)(intptr_t)body : "";
-    size_t lp = strlen(p), ls = strlen(s);
-    char *indent = malloc(lp + 1);
-    memset(indent, ' ', lp);
-    indent[lp] = '\0';
-    size_t cap = lp + ls + 16;
-    char *out = malloc(cap);
-    size_t len = 0;
-    memcpy(out + len, p, lp);
-    len += lp;
-    if (ls == 0) {
-      out[len] = '\0';
-      free(indent);
-      return out;
-    }
-    bool at_line_start = true;
-    for (size_t i = 0; i < ls; i++) {
-      if (at_line_start) {
-        if (len + strlen(indent) + 2 >= cap) { cap *= 2; out = realloc(out, cap); }
-        if (i == 0) {
-          at_line_start = false;
-        } else {
-          memcpy(out + len, indent, lp);
-          len += lp;
-          at_line_start = false;
-        }
-      }
-      if (len + 2 >= cap) { cap *= 2; out = realloc(out, cap); }
-      out[len++] = s[i];
-      if (s[i] == '\n') at_line_start = true;
-    }
-    out[len] = '\0';
-    free(indent);
-    return out;
-    ```)
-
-  ;; AST tags used in NB0.
+  ;; AST tags.  md-tag-autolink is no longer produced: an autolink is a link.
   (defn md-tag-document [] : int 0)
   (defn md-tag-heading [] : int 1)
   (defn md-tag-paragraph [] : int 2)
@@ -191,36 +60,82 @@
   (defn md-tag-soft-break [] : int 20)
   (defn md-tag-math-block [] : int 22)
   (defn md-tag-math-inline [] : int 23)
+  (defn md-tag-html-block [] : int 24)
+  (defn md-tag-html-inline [] : int 25)
 
-  ;;; md-node-tag -- return the block tag of a parsed markdown node.
-  ;;;
-  ;;; Parameters:
-  ;;;   n -- node handle returned by md-parse or md-node-children
-  ;;;
-  ;;; Returns:
-  ;;;   One of the md-tag-* integer constants implemented in NB0.
-  ;;;
-  ;;; Example:
-  ;;;   (md-node-tag (md-parse "# Hi"))
-  ;;;
-  ;;; Since: NB0
 ;; ---------------------------------------------------------------------
-;; Ownership
+;; Node records
 ;;
-;; md-parse returns a document node that owns its whole subtree.  Two of the
-;; accessors below hand back freshly allocated cons lists rather than views --
-;; md-node-children builds a new spine on every call, and md-source-span
-;; builds a two-cell list -- so those belong to the caller.  Nothing here used
-;; to be releasable at all.
-;;
-;; All four are safe on 0.
+;; md-parse returns a document node that owns its whole subtree.  Every
+;; function below names the record with the same typedef; md and html are
+;; the block's Markdown source and HTML ("" for an inline node).
 ;; ---------------------------------------------------------------------
 
-;;; md-node-free -- free a node and its entire subtree.
+;;; __md-node-new -- a fresh node record holding copies of text and info.
+  (defn __md-node-new [kind : int
+                       text : cstr
+                       info : cstr
+                       meta : int
+                       start : int
+                       end : int] #fx{Unsafe} : int
+    ```c
+    typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
+    MdNode *n = calloc(1, sizeof(*n));
+    n->kind = (int)kind;
+    n->text = strdup(text ? (const char *)(intptr_t)text : "");
+    n->info = strdup(info ? (const char *)(intptr_t)info : "");
+    n->meta = (int)meta;
+    n->start_line = (int)start;
+    n->end_line = (int)end;
+    n->md = strdup("");
+    n->html = strdup("");
+    return (int64_t)(intptr_t)n;
+    ```)
+
+;;; __md-add-child! -- append child to parent's children.
+  (defn __md-add-child! [parent : int child : int] #fx{Unsafe} : void
+    ```c
+    typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
+    MdNode *p = (MdNode *)(intptr_t)parent;
+    if (p->child_count == p->child_cap) {
+      p->child_cap = p->child_cap ? p->child_cap * 2 : 4;
+      p->children = realloc(p->children, (size_t)p->child_cap * sizeof(int64_t));
+    }
+    p->children[p->child_count++] = child;
+    ```)
+
+;;; __md-set-md! -- give node a copy of s as its Markdown source.
+  (defn __md-set-md! [node : int s : cstr] #fx{Unsafe} : void
+    ```c
+    typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
+    MdNode *n = (MdNode *)(intptr_t)node;
+    free(n->md);
+    n->md = strdup(s ? (const char *)(intptr_t)s : "");
+    ```)
+
+;;; __md-set-html! -- give node a copy of s as its HTML.
+  (defn __md-set-html! [node : int s : cstr] #fx{Unsafe} : void
+    ```c
+    typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
+    MdNode *n = (MdNode *)(intptr_t)node;
+    free(n->html);
+    n->html = strdup(s ? (const char *)(intptr_t)s : "");
+    ```)
+
+;;; md-node-free -- free a node and its entire subtree.  Safe on 0.
   (defn md-node-free [n : int] #fx{Unsafe} : void
     ```c
     typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
-                     int64_t *children; int child_count; int child_cap; int64_t kids; } MdNode;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
     typedef struct { int64_t head; int64_t tail; } Cons;
     MdNode *root = (MdNode*)(intptr_t)n;
     if (!root) return;
@@ -231,7 +146,6 @@
     stack[top++] = root;
     while (top) {
       MdNode *node = stack[--top];
-      /* Copy the child pointers out before releasing the array they live in. */
       for (int i = 0; i < node->child_count; i++) {
         MdNode *kid = (MdNode*)(intptr_t)node->children[i];
         if (!kid) continue;
@@ -242,6 +156,8 @@
         while (c) { Cons *nx = (Cons *)(intptr_t)c->tail; free(c); c = nx; } }
       free(node->text);
       free(node->info);
+      free(node->md);
+      free(node->html);
       free(node->children);
       free(node);
     }
@@ -256,7 +172,8 @@
   (defn md-node-free-shell [n : int] #fx{Unsafe} : void
     ```c
     typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
-                     int64_t *children; int child_count; int child_cap; int64_t kids; } MdNode;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
     typedef struct { int64_t head; int64_t tail; } Cons;
     MdNode *node = (MdNode*)(intptr_t)n;
     if (!node) return;
@@ -264,12 +181,13 @@
     while (c) { Cons *nx = (Cons *)(intptr_t)c->tail; free(c); c = nx; }
     free(node->text);
     free(node->info);
+    free(node->md);
+    free(node->html);
     free(node->children);
     free(node);
     ```)
 
-;;; md-children-free -- free the cons spine md-node-children returned.
-;;; The nodes themselves belong to the parent and are left alone.
+;;; md-children-free -- free a cons spine, leaving the nodes it names alone.
   (defn md-children-free [lst : int] #fx{Unsafe} : void
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
@@ -285,15 +203,32 @@
   (defn md-span-free [span : int] #fx{Unsafe} : void
     (md-children-free span))
 
+  ;;; md-node-tag -- the tag of a parsed markdown node.
+  ;;;
+  ;;; Parameters:
+  ;;;   n -- node handle returned by md-parse or md-node-children
+  ;;;
+  ;;; Returns:
+  ;;;   One of the md-tag-* constants, or -1 for 0.
+  ;;;
+  ;;; Example:
+  ;;;   (md-node-tag (md-parse "# Hi"))  ; => (md-tag-document)
+  ;;;
+  ;;; Since: NB0
   (defn md-node-tag [n : int] #fx{Unsafe} : int
     ```c
     typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
-                     int64_t *children; int child_count; int child_cap; int64_t kids; } MdNode;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
     MdNode *node = (MdNode*)(intptr_t)n;
     return node ? node->kind : -1;
     ```)
 
-  ;;; md-node-children -- return the children of a node as a cons list.
+  ;;; md-node-children -- the children of a node as a cons list.
+  ;;;
+  ;;; The spine belongs to the node, not to the caller: it is built on the
+  ;;; first call and cached, so repeated calls hand back the same list and
+  ;;; md-node-free releases it.
   ;;;
   ;;; Parameters:
   ;;;   n -- node handle
@@ -305,17 +240,11 @@
   ;;;   (md-node-children doc)
   ;;;
   ;;; Since: NB0
-  ;;;
-  ;;; The spine belongs to the node, not to the caller: it is built on the
-  ;;; first call and cached, so repeated calls hand back the same list and
-  ;;; md-node-free releases it.  It used to malloc a fresh spine on every
-  ;;; call and hand it over with no way to free it -- and it is called from
-  ;;; 30-odd places inside the emit and annotate passes, so a single md-emit
-  ;;; leaked one spine per node it walked.
   (defn md-node-children [n : int] #fx{Unsafe} : int
     ```c
     typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
-                     int64_t *children; int child_count; int child_cap; int64_t kids; } MdNode;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
     typedef struct { int64_t head; int64_t tail; } Cons;
     MdNode *node = (MdNode*)(intptr_t)n;
     if (!node) return 0;
@@ -332,12 +261,11 @@
     ```)
 
 ;;; __md-drop-kids-cache -- release a node's cached children spine, if any.
-;;; Called by the two destructors; also used after the tree is mutated, since
-;;; a stale spine would name children that have moved.
   (defn __md-drop-kids-cache [n : int] #fx{Unsafe} : void
     ```c
     typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
-                     int64_t *children; int child_count; int child_cap; int64_t kids; } MdNode;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
     typedef struct { int64_t head; int64_t tail; } Cons;
     MdNode *node = (MdNode*)(intptr_t)n;
     if (!node) return;
@@ -346,73 +274,83 @@
     node->kids = 0;
     ```)
 
-  ;;; md-node-text -- return the node text payload for block-level nodes.
+  ;;; md-node-text -- a node's text.
   ;;;
   ;;; Parameters:
   ;;;   n -- node handle
   ;;;
   ;;; Returns:
-  ;;;   Paragraph text, heading text, or code-block body depending on node kind.
+  ;;;   A paragraph's, heading's or table cell's source text (inline syntax
+  ;;;   kept), a code block's or formula's body without its final line feed,
+  ;;;   an HTML block's or inline's HTML, a text or code span's text, or a
+  ;;;   link's or image's title; "" otherwise.  Borrowed from the node.
   ;;;
   ;;; Example:
-  ;;;   (md-node-text heading)
+  ;;;   (md-node-text heading)  ; => "Hello" for "# Hello"
   ;;;
   ;;; Since: NB0
   (defn md-node-text [n : int] #fx{Unsafe} : cstr
     ```c
     typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
-                     int64_t *children; int child_count; int child_cap; int64_t kids; } MdNode;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
     MdNode *node = (MdNode*)(intptr_t)n;
     return node && node->text ? node->text : "";
     ```)
 
-  ;;; md-node-info -- return the node info payload.
+  ;;; md-node-info -- a node's info.
   ;;;
   ;;; Parameters:
   ;;;   n -- node handle
   ;;;
   ;;; Returns:
-  ;;;   Fence info string for code blocks, or list marker info for list nodes.
+  ;;;   A fenced code block's info string, a list's marker ("-", "+", "*", "."
+  ;;;   or ")"), or a link's or image's destination; "" otherwise.  Borrowed.
   ;;;
   ;;; Example:
-  ;;;   (md-node-info code-block)
+  ;;;   (md-node-info code-block)  ; => "turmeric {id=demo}"
   ;;;
   ;;; Since: NB0
   (defn md-node-info [n : int] #fx{Unsafe} : cstr
     ```c
     typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
-                     int64_t *children; int child_count; int child_cap; int64_t kids; } MdNode;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
     MdNode *node = (MdNode*)(intptr_t)n;
     return node && node->info ? node->info : "";
     ```)
 
-  ;;; md-node-meta -- return the node integer metadata field.
+  ;;; md-node-meta -- a node's integer fact.
   ;;;
   ;;; Parameters:
   ;;;   n -- node handle
   ;;;
   ;;; Returns:
-  ;;;   Heading level for headings or list start number for ordered lists.
+  ;;;   A heading's level; an ordered list's start (0 for a bullet list); a
+  ;;;   list item's task box (0 none, 1 [ ], 2 [x]); 1 on a table's header row;
+  ;;;   a table cell's alignment (0 none, 1 left, 2 center, 3 right); else 0.
   ;;;
   ;;; Example:
-  ;;;   (md-node-meta heading)
+  ;;;   (md-node-meta heading)  ; => 2 for "## Two"
   ;;;
   ;;; Since: NB0
   (defn md-node-meta [n : int] #fx{Unsafe} : int
     ```c
     typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
-                     int64_t *children; int child_count; int child_cap; int64_t kids; } MdNode;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
     MdNode *node = (MdNode*)(intptr_t)n;
     return node ? node->meta : 0;
     ```)
 
-  ;;; md-source-span -- return the start/end line pair for a node.
+  ;;; md-source-span -- the start/end line pair for a node.
   ;;;
   ;;; Parameters:
   ;;;   n -- node handle
   ;;;
   ;;; Returns:
-  ;;;   A cons pair (start-line . end-line), both 1-based.
+  ;;;   A fresh cons pair (start-line . end-line), both 1-based and inclusive;
+  ;;;   free it with md-span-free.  An inline node has its block's lines.
   ;;;
   ;;; Example:
   ;;;   (md-source-span node)
@@ -421,7 +359,8 @@
   (defn md-source-span [n : int] #fx{Unsafe} : int
     ```c
     typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
-                     int64_t *children; int child_count; int child_cap; int64_t kids; } MdNode;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
     typedef struct { int64_t head; int64_t tail; } Cons;
     MdNode *node = (MdNode*)(intptr_t)n;
     Cons *b = malloc(sizeof(*b));
@@ -433,1652 +372,386 @@
     return (int64_t)(intptr_t)a;
     ```)
 
-  (defn __md-void [] #fx{Unsafe} : void
-    ```c
-    (void)0;
-    ```)
-
-  (defn __md-inline-fill [n : int] #fx{Unsafe} : void
-    ```c
-    typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
-                     int64_t *children; int child_count; int child_cap; int64_t kids; } MdNode;
-    #define NEW_NODE(K,T,I,M,S,E) ({ \
-      MdNode *nn = malloc(sizeof(*nn)); \
-      nn->kind = (K); \
-      nn->text = (T) ? strdup(T) : NULL; \
-      nn->info = (I) ? strdup(I) : NULL; \
-      nn->meta = (M); \
-      nn->start_line = (S); \
-      nn->end_line = (E); \
-      nn->children = NULL; \
-      nn->child_count = 0; \
-      nn->child_cap = 0; \
-      nn->kids = 0; \
-      (int64_t)(intptr_t)nn; \
-    })
-    #define ADD_CHILD(P,C) do { \
-      MdNode *pp = (MdNode*)(intptr_t)(P); \
-      if (pp->child_count >= pp->child_cap) { \
-        pp->child_cap = pp->child_cap ? pp->child_cap * 2 : 4; \
-        pp->children = realloc(pp->children, (size_t)pp->child_cap * sizeof(int64_t)); \
-      } \
-      pp->children[pp->child_count++] = (C); \
-      /* Any structural change invalidates the cached children spine. */ \
-      { typedef struct { int64_t head; int64_t tail; } KidsCons; \
-        KidsCons *kc = (KidsCons *)(intptr_t)pp->kids; \
-        while (kc) { KidsCons *nx = (KidsCons *)(intptr_t)kc->tail; free(kc); kc = nx; } \
-        pp->kids = 0; } \
-    } while (0)
-    #define TBUF_INIT() size_t tlen = 0, tcap = 64; char *tbuf = malloc(tcap); tbuf[0] = '\0'
-    #define TBUF_APPEND_CH(CH) do { \
-      if (tlen + 2 > tcap) { tcap *= 2; tbuf = realloc(tbuf, tcap); } \
-      tbuf[tlen++] = (char)(CH); \
-      tbuf[tlen] = '\0'; \
-    } while (0)
-    #define TBUF_APPEND_BYTES(PTR,LEN) do { \
-      size_t need = tlen + (size_t)(LEN) + 1; \
-      while (need > tcap) { tcap *= 2; tbuf = realloc(tbuf, tcap); } \
-      memcpy(tbuf + tlen, (PTR), (size_t)(LEN)); \
-      tlen += (size_t)(LEN); \
-      tbuf[tlen] = '\0'; \
-    } while (0)
-    #define TBUF_FLUSH() do { \
-      if (tlen > 0) { \
-        ADD_CHILD(n, NEW_NODE(11, tbuf, NULL, 0, node->start_line, node->end_line)); \
-        tlen = 0; \
-        tbuf[0] = '\0'; \
-      } \
-    } while (0)
-    MdNode *node = (MdNode*)(intptr_t)n;
-    if (!node || !node->text || node->child_count > 0) return;
-    const char *src = node->text;
-    size_t slen = strlen(src);
-    TBUF_INIT();
-    for (size_t i = 0; i < slen; ) {
-      if (src[i] == '\\') {
-        if (i + 1 < slen && src[i + 1] == '\n') {
-          TBUF_FLUSH();
-          ADD_CHILD(n, NEW_NODE(19, NULL, NULL, 0, node->start_line, node->end_line));
-          i += 2;
-          continue;
-        }
-        if (i + 1 < slen && strchr("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", src[i + 1])) {
-          TBUF_APPEND_CH(src[i + 1]);
-          i += 2;
-          continue;
-        }
-      }
-      if (src[i] == '\n') {
-        int hard = 0;
-        if (i >= 2 && src[i - 1] == ' ' && src[i - 2] == ' ') {
-          if (tlen >= 2) { tlen -= 2; tbuf[tlen] = '\0'; }
-          hard = 1;
-        }
-        TBUF_FLUSH();
-        ADD_CHILD(n, NEW_NODE(hard ? 19 : 20, NULL, NULL, 0, node->start_line, node->end_line));
-        i++;
-        continue;
-      }
-      if (src[i] == '&') {
-        if (strncmp(src + i, "&amp;", 5) == 0) { TBUF_APPEND_CH('&'); i += 5; continue; }
-        if (strncmp(src + i, "&lt;", 4) == 0) { TBUF_APPEND_CH('<'); i += 4; continue; }
-        if (strncmp(src + i, "&gt;", 4) == 0) { TBUF_APPEND_CH('>'); i += 4; continue; }
-        if (strncmp(src + i, "&quot;", 6) == 0) { TBUF_APPEND_CH('"'); i += 6; continue; }
-        if (strncmp(src + i, "&apos;", 6) == 0) { TBUF_APPEND_CH('\''); i += 6; continue; }
-        if (i + 3 < slen && src[i + 1] == '#') {
-          size_t j = i + 2;
-          int base = 10;
-          if (j < slen && (src[j] == 'x' || src[j] == 'X')) { base = 16; j++; }
-          char numbuf[16];
-          size_t npos = 0;
-          while (j < slen && src[j] != ';' && npos + 1 < sizeof(numbuf)) numbuf[npos++] = src[j++];
-          if (j < slen && src[j] == ';' && npos > 0) {
-            numbuf[npos] = '\0';
-            long val = strtol(numbuf, NULL, base);
-            if (val > 0 && val < 128) {
-              TBUF_APPEND_CH((char)val);
-              i = j + 1;
-              continue;
-            }
-          }
-        }
-      }
-      if (src[i] == '`') {
-        size_t ticks = 1;
-        while (i + ticks < slen && src[i + ticks] == '`') ticks++;
-        size_t j = i + ticks;
-        int found = 0;
-        while (j + ticks <= slen) {
-          if (strncmp(src + j, src + i, ticks) == 0) { found = 1; break; }
-          j++;
-        }
-        if (found) {
-          TBUF_FLUSH();
-          char *code = malloc((j - (i + ticks)) + 1);
-          size_t out = 0;
-          for (size_t k = i + ticks; k < j; k++) code[out++] = (src[k] == '\n') ? ' ' : src[k];
-          code[out] = '\0';
-          ADD_CHILD(n, NEW_NODE(14, code, NULL, 0, node->start_line, node->end_line));
-          free(code);
-          i = j + ticks;
-          continue;
-        }
-      }
-      if (src[i] == '$') {
-        char nxt = (i + 1 < slen) ? src[i + 1] : '\0';
-        char prv = (i > 0) ? src[i - 1] : '\0';
-        bool opener = nxt != '\0'
-                      && nxt != ' ' && nxt != '\t' && nxt != '\n'
-                      && !(nxt >= '0' && nxt <= '9')
-                      && prv != '\\';
-        if (opener) {
-          size_t j = i + 1;
-          int found = 0;
-          while (j < slen) {
-            if (src[j] == '\\' && j + 1 < slen) { j += 2; continue; }
-            if (src[j] == '\n') break;
-            if (src[j] == '$' && j > i + 1) {
-              char pj = src[j - 1];
-              if (pj != ' ' && pj != '\t' && pj != '\n') { found = 1; break; }
-            }
-            j++;
-          }
-          if (found) {
-            TBUF_FLUSH();
-            size_t bl = j - (i + 1);
-            char *inner = malloc(bl + 1);
-            memcpy(inner, src + i + 1, bl);
-            inner[bl] = '\0';
-            ADD_CHILD(n, NEW_NODE(23, inner, NULL, 0, node->start_line, node->end_line));
-            free(inner);
-            i = j + 1;
-            continue;
-          }
-        }
-      }
-      if (src[i] == '~' && i + 1 < slen && src[i + 1] == '~') {
-        size_t j = i + 2;
-        int found = 0;
-        while (j + 1 < slen) {
-          if (src[j] == '~' && src[j + 1] == '~') { found = 1; break; }
-          j++;
-        }
-        if (found) {
-          TBUF_FLUSH();
-          char *inner = malloc((j - (i + 2)) + 1);
-          memcpy(inner, src + i + 2, j - (i + 2));
-          inner[j - (i + 2)] = '\0';
-          int64_t strike = NEW_NODE(17, NULL, NULL, 0, node->start_line, node->end_line);
-          if (inner[0] != '\0') ADD_CHILD(strike, NEW_NODE(11, inner, NULL, 0, node->start_line, node->end_line));
-          ADD_CHILD(n, strike);
-          free(inner);
-          i = j + 2;
-          continue;
-        }
-      }
-      if ((src[i] == '*' || src[i] == '_') && i + 1 < slen && src[i + 1] == src[i]) {
-        char delim = src[i];
-        size_t j = i + 2;
-        int found = 0;
-        while (j + 1 < slen) {
-          if (src[j] == delim && src[j + 1] == delim) { found = 1; break; }
-          j++;
-        }
-        if (found) {
-          TBUF_FLUSH();
-          char *inner = malloc((j - (i + 2)) + 1);
-          memcpy(inner, src + i + 2, j - (i + 2));
-          inner[j - (i + 2)] = '\0';
-          int64_t strong = NEW_NODE(13, NULL, NULL, 0, node->start_line, node->end_line);
-          if (inner[0] != '\0') ADD_CHILD(strong, NEW_NODE(11, inner, NULL, 0, node->start_line, node->end_line));
-          ADD_CHILD(n, strong);
-          free(inner);
-          i = j + 2;
-          continue;
-        }
-      }
-      if (src[i] == '*' || src[i] == '_') {
-        char delim = src[i];
-        size_t j = i + 1;
-        int found = 0;
-        while (j < slen) {
-          if (src[j] == delim) { found = 1; break; }
-          j++;
-        }
-        if (found) {
-          TBUF_FLUSH();
-          char *inner = malloc((j - (i + 1)) + 1);
-          memcpy(inner, src + i + 1, j - (i + 1));
-          inner[j - (i + 1)] = '\0';
-          int64_t emph = NEW_NODE(12, NULL, NULL, 0, node->start_line, node->end_line);
-          if (inner[0] != '\0') ADD_CHILD(emph, NEW_NODE(11, inner, NULL, 0, node->start_line, node->end_line));
-          ADD_CHILD(n, emph);
-          free(inner);
-          i = j + 1;
-          continue;
-        }
-      }
-      if (src[i] == '!' && i + 1 < slen && src[i + 1] == '[') {
-        size_t close = i + 2;
-        while (close < slen && src[close] != ']') close++;
-        if (close + 1 < slen && src[close] == ']' && src[close + 1] == '(') {
-          size_t pend = close + 2;
-          while (pend < slen && src[pend] != ')') pend++;
-          if (pend < slen) {
-            size_t split = close + 2;
-            while (split < pend && src[split] != ' ') split++;
-            char *alt = malloc((close - (i + 2)) + 1);
-            memcpy(alt, src + i + 2, close - (i + 2));
-            alt[close - (i + 2)] = '\0';
-            char *dest = malloc((split - (close + 2)) + 1);
-            memcpy(dest, src + close + 2, split - (close + 2));
-            dest[split - (close + 2)] = '\0';
-            char *title = strdup("");
-            if (split < pend) {
-              size_t ts = split;
-              while (ts < pend && src[ts] == ' ') ts++;
-              if (ts < pend && (src[ts] == '"' || src[ts] == '\'')) {
-                char q = src[ts++];
-                size_t te = ts;
-                while (te < pend && src[te] != q) te++;
-                free(title);
-                title = malloc((te - ts) + 1);
-                memcpy(title, src + ts, te - ts);
-                title[te - ts] = '\0';
-              }
-            }
-            TBUF_FLUSH();
-            int64_t img = NEW_NODE(16, title, dest, 0, node->start_line, node->end_line);
-            if (alt[0] != '\0') ADD_CHILD(img, NEW_NODE(11, alt, NULL, 0, node->start_line, node->end_line));
-            ADD_CHILD(n, img);
-            free(alt);
-            free(dest);
-            free(title);
-            i = pend + 1;
-            continue;
-          }
-        }
-      }
-      if (src[i] == '[') {
-        size_t close = i + 1;
-        while (close < slen && src[close] != ']') close++;
-        if (close + 1 < slen && src[close] == ']' && src[close + 1] == '(') {
-          size_t pend = close + 2;
-          while (pend < slen && src[pend] != ')') pend++;
-          if (pend < slen) {
-            size_t split = close + 2;
-            while (split < pend && src[split] != ' ') split++;
-            char *label = malloc((close - (i + 1)) + 1);
-            memcpy(label, src + i + 1, close - (i + 1));
-            label[close - (i + 1)] = '\0';
-            char *dest = malloc((split - (close + 2)) + 1);
-            memcpy(dest, src + close + 2, split - (close + 2));
-            dest[split - (close + 2)] = '\0';
-            char *title = strdup("");
-            if (split < pend) {
-              size_t ts = split;
-              while (ts < pend && src[ts] == ' ') ts++;
-              if (ts < pend && (src[ts] == '"' || src[ts] == '\'')) {
-                char q = src[ts++];
-                size_t te = ts;
-                while (te < pend && src[te] != q) te++;
-                free(title);
-                title = malloc((te - ts) + 1);
-                memcpy(title, src + ts, te - ts);
-                title[te - ts] = '\0';
-              }
-            }
-            TBUF_FLUSH();
-            int64_t link = NEW_NODE(15, title, dest, 0, node->start_line, node->end_line);
-            if (label[0] != '\0') ADD_CHILD(link, NEW_NODE(11, label, NULL, 0, node->start_line, node->end_line));
-            ADD_CHILD(n, link);
-            free(label);
-            free(dest);
-            free(title);
-            i = pend + 1;
-            continue;
-          }
-        }
-      }
-      if (src[i] == '<') {
-        size_t close = i + 1;
-        while (close < slen && src[close] != '>') close++;
-        if (close < slen) {
-          size_t inner_len = close - (i + 1);
-          char *inner = malloc(inner_len + 1);
-          memcpy(inner, src + i + 1, inner_len);
-          inner[inner_len] = '\0';
-          if (strchr(inner, ' ') == NULL) {
-            if (strncmp(inner, "http://", 7) == 0 || strncmp(inner, "https://", 8) == 0) {
-              TBUF_FLUSH();
-              ADD_CHILD(n, NEW_NODE(18, inner, inner, 0, node->start_line, node->end_line));
-              free(inner);
-              i = close + 1;
-              continue;
-            }
-            if (strchr(inner, '@') != NULL) {
-              size_t href_len = inner_len + 8;
-              char *href = malloc(href_len);
-              snprintf(href, href_len, "mailto:%s", inner);
-              TBUF_FLUSH();
-              ADD_CHILD(n, NEW_NODE(18, inner, href, 0, node->start_line, node->end_line));
-              free(inner);
-              free(href);
-              i = close + 1;
-              continue;
-            }
-          }
-          free(inner);
-        }
-      }
-      TBUF_APPEND_CH(src[i]);
-      i++;
-    }
-    TBUF_FLUSH();
-    free(tbuf);
-    #undef NEW_NODE
-    #undef ADD_CHILD
-    #undef TBUF_INIT
-    #undef TBUF_APPEND_CH
-    #undef TBUF_APPEND_BYTES
-    #undef TBUF_FLUSH
-    ```)
-
-  (defn __md-upgrade-gfm-node [n : int] #fx{Unsafe} : void
-    ```c
-    typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
-                     int64_t *children; int child_count; int child_cap; int64_t kids; } MdNode;
-    #define NEW_NODE(K,T,I,M,S,E) ({ \
-      MdNode *nn = malloc(sizeof(*nn)); \
-      nn->kind = (K); \
-      nn->text = (T) ? strdup(T) : NULL; \
-      nn->info = (I) ? strdup(I) : NULL; \
-      nn->meta = (M); \
-      nn->start_line = (S); \
-      nn->end_line = (E); \
-      nn->children = NULL; \
-      nn->child_count = 0; \
-      nn->child_cap = 0; \
-      nn->kids = 0; \
-      (int64_t)(intptr_t)nn; \
-    })
-    #define ADD_CHILD(P,C) do { \
-      MdNode *pp = (MdNode*)(intptr_t)(P); \
-      if (pp->child_count >= pp->child_cap) { \
-        pp->child_cap = pp->child_cap ? pp->child_cap * 2 : 4; \
-        pp->children = realloc(pp->children, (size_t)pp->child_cap * sizeof(int64_t)); \
-      } \
-      pp->children[pp->child_count++] = (C); \
-      /* Any structural change invalidates the cached children spine. */ \
-      { typedef struct { int64_t head; int64_t tail; } KidsCons; \
-        KidsCons *kc = (KidsCons *)(intptr_t)pp->kids; \
-        while (kc) { KidsCons *nx = (KidsCons *)(intptr_t)kc->tail; free(kc); kc = nx; } \
-        pp->kids = 0; } \
-    } while (0)
-    MdNode *node = (MdNode*)(intptr_t)n;
-    if (!node) return;
-
-    if (node->kind == 5 && node->child_count > 0) {
-      MdNode *first = (MdNode*)(intptr_t)node->children[0];
-      if (first && first->kind == 2 && first->text) {
-        const char *src = first->text;
-        size_t skip = 0;
-        int task_state = 0;
-        if ((strncmp(src, "[ ] ", 4) == 0) || (strncmp(src, "[ ]\t", 4) == 0)) {
-          skip = 4;
-          task_state = 1;
-        } else if ((strncmp(src, "[x] ", 4) == 0) || (strncmp(src, "[x]\t", 4) == 0) ||
-                   (strncmp(src, "[X] ", 4) == 0) || (strncmp(src, "[X]\t", 4) == 0)) {
-          skip = 4;
-          task_state = 2;
-        }
-        if (task_state != 0) {
-          char *trimmed = strdup(src + skip);
-          free(first->text);
-          first->text = trimmed;
-          node->meta = task_state;
-        }
-      }
-    }
-
-    if (node->kind == 2 && node->text && node->child_count == 0) {
-      const char *src = node->text;
-      if (strchr(src, '\n') != NULL && strchr(src, '|') != NULL) {
-        int line_count = 1;
-        for (const char *p = src; *p; p++) if (*p == '\n') line_count++;
-        if (line_count >= 2) {
-          char **lines = malloc((size_t)line_count * sizeof(char *));
-          int idx = 0;
-          const char *cur = src, *start = src;
-          while (*cur) {
-            if (*cur == '\n') {
-              size_t len = (size_t)(cur - start);
-              lines[idx] = malloc(len + 1);
-              memcpy(lines[idx], start, len);
-              lines[idx][len] = '\0';
-              idx++;
-              cur++;
-              start = cur;
-            } else {
-              cur++;
-            }
-          }
-          size_t last_len = (size_t)(cur - start);
-          lines[idx] = malloc(last_len + 1);
-          memcpy(lines[idx], start, last_len);
-          lines[idx][last_len] = '\0';
-          idx++;
-
-          char *header_line = lines[0];
-          char *align_line = lines[1];
-          int header_start = 0, header_end = (int)strlen(header_line);
-          while (header_start < header_end && (header_line[header_start] == ' ' || header_line[header_start] == '\t')) header_start++;
-          while (header_end > header_start && (header_line[header_end - 1] == ' ' || header_line[header_end - 1] == '\t')) header_end--;
-          int align_start = 0, align_end = (int)strlen(align_line);
-          while (align_start < align_end && (align_line[align_start] == ' ' || align_line[align_start] == '\t')) align_start++;
-          while (align_end > align_start && (align_line[align_end - 1] == ' ' || align_line[align_end - 1] == '\t')) align_end--;
-          bool maybe_table = header_start < header_end && align_start < align_end &&
-                             strchr(header_line + header_start, '|') != NULL &&
-                             strchr(align_line + align_start, '|') != NULL;
-          int header_count = 0;
-          char **header_cells = NULL;
-          int *aligns = NULL;
-          if (maybe_table) {
-            if (header_line[header_start] == '|') header_start++;
-            if (header_end > header_start && header_line[header_end - 1] == '|') header_end--;
-            header_count = 1;
-            for (int i = header_start; i < header_end; i++) if (header_line[i] == '|') header_count++;
-            header_cells = malloc((size_t)header_count * sizeof(char *));
-            int cell_idx = 0;
-            int seg_start = header_start;
-            for (int i = header_start; i <= header_end; i++) {
-              if (i == header_end || header_line[i] == '|') {
-                int a = seg_start, b = i;
-                while (a < b && (header_line[a] == ' ' || header_line[a] == '\t')) a++;
-                while (b > a && (header_line[b - 1] == ' ' || header_line[b - 1] == '\t')) b--;
-                header_cells[cell_idx] = malloc((size_t)(b - a) + 1);
-                memcpy(header_cells[cell_idx], header_line + a, (size_t)(b - a));
-                header_cells[cell_idx][b - a] = '\0';
-                cell_idx++;
-                seg_start = i + 1;
-              }
-            }
-
-            if (align_line[align_start] == '|') align_start++;
-            if (align_end > align_start && align_line[align_end - 1] == '|') align_end--;
-            int align_count = 1;
-            for (int i = align_start; i < align_end; i++) if (align_line[i] == '|') align_count++;
-            if (align_count != header_count) {
-              maybe_table = false;
-            } else {
-              aligns = malloc((size_t)header_count * sizeof(int));
-              int cell_idx2 = 0;
-              int seg_start2 = align_start;
-              for (int i = align_start; i <= align_end && maybe_table; i++) {
-                if (i == align_end || align_line[i] == '|') {
-                  int a = seg_start2, b = i;
-                  while (a < b && (align_line[a] == ' ' || align_line[a] == '\t')) a++;
-                  while (b > a && (align_line[b - 1] == ' ' || align_line[b - 1] == '\t')) b--;
-                  int left = 0, right = 0;
-                  if (a < b && align_line[a] == ':') { left = 1; a++; }
-                  if (b > a && align_line[b - 1] == ':') { right = 1; b--; }
-                  int dash_count = 0;
-                  for (int k = a; k < b; k++) {
-                    if (align_line[k] == '-') dash_count++;
-                    else { maybe_table = false; break; }
-                  }
-                  if (dash_count < 3) maybe_table = false;
-                  if (maybe_table) {
-                    aligns[cell_idx2++] = left ? (right ? 2 : 1) : (right ? 3 : 0);
-                  }
-                  seg_start2 = i + 1;
-                }
-              }
-            }
-          }
-
-          if (maybe_table) {
-            for (int line_idx = 2; line_idx < line_count && maybe_table; line_idx++) {
-              char *row_line = lines[line_idx];
-              int row_start = 0, row_end = (int)strlen(row_line);
-              while (row_start < row_end && (row_line[row_start] == ' ' || row_line[row_start] == '\t')) row_start++;
-              while (row_end > row_start && (row_line[row_end - 1] == ' ' || row_line[row_end - 1] == '\t')) row_end--;
-              if (row_start == row_end) { maybe_table = false; break; }
-              if (row_line[row_start] == '|') row_start++;
-              if (row_end > row_start && row_line[row_end - 1] == '|') row_end--;
-              int row_count = 1;
-              for (int i = row_start; i < row_end; i++) if (row_line[i] == '|') row_count++;
-              if (row_count != header_count) maybe_table = false;
-            }
-          }
-
-          if (maybe_table) {
-            free(node->text);
-            node->text = NULL;
-            node->kind = 8;
-            node->meta = header_count;
-            int64_t header_row = NEW_NODE(9, NULL, NULL, 1, node->start_line, node->start_line);
-            for (int i = 0; i < header_count; i++) {
-              ADD_CHILD(header_row, NEW_NODE(10, header_cells[i], NULL, aligns[i], node->start_line, node->start_line));
-            }
-            ADD_CHILD(n, header_row);
-
-            for (int line_idx = 2; line_idx < line_count; line_idx++) {
-              char *row_line = lines[line_idx];
-              int row_start = 0, row_end = (int)strlen(row_line);
-              while (row_start < row_end && (row_line[row_start] == ' ' || row_line[row_start] == '\t')) row_start++;
-              while (row_end > row_start && (row_line[row_end - 1] == ' ' || row_line[row_end - 1] == '\t')) row_end--;
-              if (row_line[row_start] == '|') row_start++;
-              if (row_end > row_start && row_line[row_end - 1] == '|') row_end--;
-              int64_t row = NEW_NODE(9, NULL, NULL, 0, node->start_line + line_idx, node->start_line + line_idx);
-              int seg_start = row_start;
-              int cell_idx = 0;
-              for (int i = row_start; i <= row_end; i++) {
-                if (i == row_end || row_line[i] == '|') {
-                  int a = seg_start, b = i;
-                  while (a < b && (row_line[a] == ' ' || row_line[a] == '\t')) a++;
-                  while (b > a && (row_line[b - 1] == ' ' || row_line[b - 1] == '\t')) b--;
-                  char *cell = malloc((size_t)(b - a) + 1);
-                  memcpy(cell, row_line + a, (size_t)(b - a));
-                  cell[b - a] = '\0';
-                  ADD_CHILD(row, NEW_NODE(10, cell, NULL, aligns[cell_idx], node->start_line + line_idx, node->start_line + line_idx));
-                  free(cell);
-                  cell_idx++;
-                  seg_start = i + 1;
-                }
-              }
-              ADD_CHILD(n, row);
-            }
-          }
-
-          if (aligns) free(aligns);
-          if (header_cells) {
-            for (int i = 0; i < header_count; i++) free(header_cells[i]);
-            free(header_cells);
-          }
-          for (int i = 0; i < line_count; i++) free(lines[i]);
-          free(lines);
-        }
-      }
-    }
-    #undef NEW_NODE
-    #undef ADD_CHILD
-    ```)
-
-  (defn __md-upgrade-gfm-list [nodes : int] #fx{Unsafe} : void
-    (if (list-nil? nodes)
-      (__md-void)
-      (do
-        (__md-upgrade-gfm (head nodes))
-        (__md-upgrade-gfm-list (tail nodes)))))
-
-  (defn __md-upgrade-gfm [n : int] #fx{Unsafe} : void
-    (do
-      (__md-upgrade-gfm-node n)
-      (let [tag (md-node-tag n)]
-        (if (or (= tag (md-tag-document))
-                (or (= tag (md-tag-blockquote))
-                    (or (= tag (md-tag-list))
-                        (or (= tag (md-tag-list-item))
-                            (or (= tag (md-tag-table))
-                                (= tag (md-tag-table-row)))))))
-          (__md-upgrade-gfm-list (md-node-children n))
-          (__md-void)))))
-
-  (defn __md-annotate-inline-list [nodes : int] #fx{Unsafe} : void
-    (if (list-nil? nodes)
-      (__md-void)
-      (do
-        (__md-annotate-inlines (head nodes))
-        (__md-annotate-inline-list (tail nodes)))))
-
-  (defn __md-annotate-inlines [n : int] #fx{Unsafe} : void
-    (let [tag (md-node-tag n)]
-      (if (or (= tag (md-tag-heading))
-              (or (= tag (md-tag-paragraph))
-                  (= tag (md-tag-table-cell))))
-        (__md-inline-fill n)
-        (if (or (= tag (md-tag-document))
-                (or (= tag (md-tag-blockquote))
-                    (or (= tag (md-tag-list))
-                        (or (= tag (md-tag-list-item))
-                            (or (= tag (md-tag-table))
-                                (= tag (md-tag-table-row)))))))
-          (__md-annotate-inline-list (md-node-children n))
-          (__md-void)))))
-
-  ;;; md-parse -- parse a markdown string into a block-level AST.
+  ;;; md-emit -- a node's Markdown source.
   ;;;
-  ;;; Parameters:
-  ;;;   source -- markdown text
-  ;;;
-  ;;; Returns:
-  ;;;   A document node whose children hold NB0 block nodes.
-  ;;;
-  ;;; Example:
-  ;;;   (md-parse "# Title")
-  ;;;
-  ;;; Since: NB0
-  (defn __md-parse-blocks [source : cstr] #fx{Unsafe} : int
-    ```c
-    typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
-                     int64_t *children; int child_count; int child_cap; int64_t kids; } MdNode;
-    typedef struct { char *text; int line_no; } MdLine;
-    #define NEW_NODE(K,T,I,M,S,E) ({ \
-      MdNode *n = malloc(sizeof(*n)); \
-      n->kind = (K); \
-      n->text = (T) ? strdup(T) : NULL; \
-      n->info = (I) ? strdup(I) : NULL; \
-      n->meta = (M); \
-      n->start_line = (S); \
-      n->end_line = (E); \
-      n->children = NULL; \
-      n->child_count = 0; \
-      n->child_cap = 0; \
-      n->kids = 0; \
-      (int64_t)(intptr_t)n; \
-    })
-    #define ADD_CHILD(P,C) do { \
-      MdNode *p = (MdNode*)(intptr_t)(P); \
-      if (p->child_count >= p->child_cap) { \
-        p->child_cap = p->child_cap ? p->child_cap * 2 : 4; \
-        p->children = realloc(p->children, (size_t)p->child_cap * sizeof(int64_t)); \
-      } \
-      p->children[p->child_count++] = (C); \
-      /* Any structural change invalidates the cached children spine. */ \
-      { typedef struct { int64_t head; int64_t tail; } KidsCons; \
-        KidsCons *kc = (KidsCons *)(intptr_t)p->kids; \
-        while (kc) { KidsCons *nx = (KidsCons *)(intptr_t)kc->tail; free(kc); kc = nx; } \
-        p->kids = 0; } \
-    } while (0)
-    #define BUF_INIT() size_t buf_len = 0, buf_cap = 64; char *buf = malloc(buf_cap); buf[0] = '\0'
-    #define BUF_APPEND_BYTES(PTR,LEN) do { \
-      size_t need = buf_len + (size_t)(LEN) + 1; \
-      while (need > buf_cap) { buf_cap *= 2; buf = realloc(buf, buf_cap); } \
-      memcpy(buf + buf_len, (PTR), (size_t)(LEN)); \
-      buf_len += (size_t)(LEN); \
-      buf[buf_len] = '\0'; \
-    } while (0)
-    #define BUF_APPEND_STR(S) BUF_APPEND_BYTES((S), strlen(S))
-    #define BUF_APPEND_CH(CH) do { \
-      if (buf_len + 2 > buf_cap) { buf_cap *= 2; buf = realloc(buf, buf_cap); } \
-      buf[buf_len++] = (char)(CH); \
-      buf[buf_len] = '\0'; \
-    } while (0)
-    const char *src = source ? (const char *)(intptr_t)source : "";
-    int64_t doc = NEW_NODE(0, NULL, NULL, 0, 1, 1);
-
-    MdLine *lines = NULL;
-    int line_count = 0, line_cap = 0;
-    const char *cur = src, *start = src;
-    int line_no = 1;
-    while (*cur) {
-      if (*cur == '\n') {
-        size_t len = (size_t)(cur - start);
-        char *copy = malloc(len + 1);
-        memcpy(copy, start, len);
-        copy[len] = '\0';
-        if (line_count >= line_cap) {
-          line_cap = line_cap ? line_cap * 2 : 16;
-          lines = realloc(lines, (size_t)line_cap * sizeof(*lines));
-        }
-        lines[line_count].text = copy;
-        lines[line_count].line_no = line_no++;
-        line_count++;
-        cur++;
-        start = cur;
-      } else {
-        cur++;
-      }
-    }
-    if (cur != start || (*src == '\0')) {
-      size_t len = (size_t)(cur - start);
-      if (!(len == 0 && *src == '\0')) {
-        char *copy = malloc(len + 1);
-        memcpy(copy, start, len);
-        copy[len] = '\0';
-        if (line_count >= line_cap) {
-          line_cap = line_cap ? line_cap * 2 : 16;
-          lines = realloc(lines, (size_t)line_cap * sizeof(*lines));
-        }
-        lines[line_count].text = copy;
-        lines[line_count].line_no = line_no++;
-        line_count++;
-      }
-    }
-    if (line_count == 0) {
-      free(lines);
-      return doc;
-    }
-
-    int i = 0;
-    while (i < line_count) {
-      char *line = lines[i].text;
-      int len = (int)strlen(line);
-      int pos = 0;
-      while (pos < len && (line[pos] == ' ' || line[pos] == '\t')) pos++;
-      bool is_blank = true;
-      for (int k = 0; k < len; k++) {
-        if (!(line[k] == ' ' || line[k] == '\t')) { is_blank = false; break; }
-      }
-      if (is_blank) { i++; continue; }
-
-      /* thematic break */
-      {
-        int p = 0, indent = 0;
-        while (p < len && indent < 3 && line[p] == ' ') { p++; indent++; }
-        char mark = 0;
-        int count = 0;
-        bool ok = true;
-        for (int k = p; k < len; k++) {
-          char ch = line[k];
-          if (ch == ' ' || ch == '\t') continue;
-          if (mark == 0 && (ch == '-' || ch == '*' || ch == '_')) { mark = ch; count = 1; continue; }
-          if (ch == mark) { count++; continue; }
-          ok = false; break;
-        }
-        if (ok && mark != 0 && count >= 3) {
-          ADD_CHILD(doc, NEW_NODE(7, NULL, NULL, 0, lines[i].line_no, lines[i].line_no));
-          i++;
-          continue;
-        }
-      }
-
-      /* math block ($$ ... $$) */
-      {
-        int p = 0, indent = 0;
-        while (p < len && indent < 3 && line[p] == ' ') { p++; indent++; }
-        if (p + 1 < len && line[p] == '$' && line[p + 1] == '$') {
-          int after = p + 2;
-          /* one-line form: $$ body $$ on a single line */
-          int close_pos = -1;
-          for (int k = after; k + 1 < len; k++) {
-            if (line[k] == '\\' && k + 1 < len) { k++; continue; }
-            if (line[k] == '$' && line[k + 1] == '$') {
-              int t = k + 2;
-              while (t < len && (line[t] == ' ' || line[t] == '\t')) t++;
-              if (t == len) { close_pos = k; break; }
-            }
-          }
-          if (close_pos >= 0) {
-            int bs = after;
-            while (bs < close_pos && (line[bs] == ' ' || line[bs] == '\t')) bs++;
-            int be = close_pos;
-            while (be > bs && (line[be - 1] == ' ' || line[be - 1] == '\t')) be--;
-            char *body = malloc((size_t)(be - bs) + 1);
-            memcpy(body, line + bs, (size_t)(be - bs));
-            body[be - bs] = '\0';
-            ADD_CHILD(doc, NEW_NODE(22, body, NULL, 0, lines[i].line_no, lines[i].line_no));
-            free(body);
-            i++;
-            continue;
-          }
-          /* multi-line: opener line is $$ optionally followed by whitespace only */
-          int tail_p = after;
-          while (tail_p < len && (line[tail_p] == ' ' || line[tail_p] == '\t')) tail_p++;
-          if (tail_p == len) {
-            BUF_INIT();
-            int j = i + 1;
-            int end_line = lines[i].line_no;
-            bool first_body_line = true;
-            bool closed = false;
-            while (j < line_count) {
-              char *cand = lines[j].text;
-              int clen = (int)strlen(cand);
-              int cp = 0, cindent = 0;
-              while (cp < clen && cindent < 3 && cand[cp] == ' ') { cp++; cindent++; }
-              if (cp + 1 < clen && cand[cp] == '$' && cand[cp + 1] == '$') {
-                int ct = cp + 2;
-                while (ct < clen && (cand[ct] == ' ' || cand[ct] == '\t')) ct++;
-                if (ct == clen) { end_line = lines[j].line_no; j++; closed = true; break; }
-              }
-              if (!first_body_line) BUF_APPEND_CH('\n');
-              BUF_APPEND_STR(cand);
-              end_line = lines[j].line_no;
-              first_body_line = false;
-              j++;
-            }
-            if (closed) {
-              ADD_CHILD(doc, NEW_NODE(22, buf, NULL, 0, lines[i].line_no, end_line));
-              free(buf);
-              i = j;
-              continue;
-            }
-            /* unterminated: graceful degradation, fall through to paragraph */
-            free(buf);
-          }
-        }
-      }
-
-      /* fenced code block */
-      {
-        int p = 0, indent = 0;
-        while (p < len && indent < 3 && line[p] == ' ') { p++; indent++; }
-        if (p + 2 < len && (line[p] == '`' || line[p] == '~') &&
-            line[p + 1] == line[p] && line[p + 2] == line[p]) {
-          char fence_ch = line[p];
-          int fence_len = 3;
-          while (p + fence_len < len && line[p + fence_len] == fence_ch) fence_len++;
-          int info_start = p + fence_len;
-          while (info_start < len && (line[info_start] == ' ' || line[info_start] == '\t')) info_start++;
-          int info_end = len;
-          while (info_end > info_start && (line[info_end - 1] == ' ' || line[info_end - 1] == '\t')) info_end--;
-          char *info = malloc((size_t)(info_end - info_start) + 1);
-          memcpy(info, line + info_start, (size_t)(info_end - info_start));
-          info[info_end - info_start] = '\0';
-
-          BUF_INIT();
-          int j = i + 1;
-          int end_line = lines[i].line_no;
-          bool first_body_line = true;
-          while (j < line_count) {
-            char *cand = lines[j].text;
-            int clen = (int)strlen(cand);
-            int cp = 0, cindent = 0;
-            while (cp < clen && cindent < 3 && cand[cp] == ' ') { cp++; cindent++; }
-            int ccount = 0;
-            while (cp + ccount < clen && cand[cp + ccount] == fence_ch) ccount++;
-            bool closer = ccount >= fence_len;
-            if (closer) {
-              int tail_pos = cp + ccount;
-              while (tail_pos < clen && (cand[tail_pos] == ' ' || cand[tail_pos] == '\t')) tail_pos++;
-              if (tail_pos != clen) closer = false;
-            }
-            if (closer) { end_line = lines[j].line_no; j++; break; }
-            if (!first_body_line) BUF_APPEND_CH('\n');
-            BUF_APPEND_STR(cand);
-            end_line = lines[j].line_no;
-            first_body_line = false;
-            j++;
-          }
-          ADD_CHILD(doc, NEW_NODE(6, buf, info, 0, lines[i].line_no, end_line));
-          free(info);
-          free(buf);
-          i = j;
-          continue;
-        }
-      }
-
-      /* indented code block */
-      {
-        int spaces = 0;
-        while (spaces < len && line[spaces] == ' ') spaces++;
-        if (spaces >= 4 || (len > 0 && line[0] == '\t')) {
-          BUF_INIT();
-          int j = i;
-          int end_line = lines[i].line_no;
-          while (j < line_count) {
-            char *cand = lines[j].text;
-            int clen = (int)strlen(cand);
-            bool blank = true;
-            for (int k = 0; k < clen; k++) {
-              if (!(cand[k] == ' ' || cand[k] == '\t')) { blank = false; break; }
-            }
-            int cut = 0;
-            while (cut < clen && cut < 4 && cand[cut] == ' ') cut++;
-            if (!(blank || cut >= 4 || (clen > 0 && cand[0] == '\t'))) break;
-            if (blank) {
-              /* preserve blank lines inside indented blocks */
-            } else if (clen > 0 && cand[0] == '\t') {
-              BUF_APPEND_STR(cand + 1);
-            } else {
-              BUF_APPEND_STR(cand + 4);
-            }
-            if (j + 1 < line_count) BUF_APPEND_CH('\n');
-            end_line = lines[j].line_no;
-            j++;
-          }
-          ADD_CHILD(doc, NEW_NODE(6, buf, "", 0, lines[i].line_no, end_line));
-          free(buf);
-          i = j;
-          continue;
-        }
-      }
-
-      /* blockquote */
-      {
-        int p = 0, indent = 0;
-        while (p < len && indent < 3 && line[p] == ' ') { p++; indent++; }
-        if (p < len && line[p] == '>') {
-          int64_t quote = NEW_NODE(3, NULL, NULL, 0, lines[i].line_no, lines[i].line_no);
-          BUF_INIT();
-          int j = i;
-          int end_line = lines[i].line_no;
-          bool first_quote_line = true;
-          while (j < line_count) {
-            char *cand = lines[j].text;
-            int clen = (int)strlen(cand);
-            int cp = 0, cindent = 0;
-            while (cp < clen && cindent < 3 && cand[cp] == ' ') { cp++; cindent++; }
-            bool blank = true;
-            for (int k = 0; k < clen; k++) {
-              if (!(cand[k] == ' ' || cand[k] == '\t')) { blank = false; break; }
-            }
-            if (blank) break;
-            if (!(cp < clen && cand[cp] == '>')) break;
-            if (!blank) {
-              cp++;
-              if (cp < clen && cand[cp] == ' ') cp++;
-              if (!first_quote_line) BUF_APPEND_CH('\n');
-              BUF_APPEND_STR(cand + cp);
-            }
-            end_line = lines[j].line_no;
-            first_quote_line = false;
-            j++;
-          }
-          if (buf[0] != '\0') {
-            ADD_CHILD(quote, NEW_NODE(2, buf, NULL, 0, lines[i].line_no, end_line));
-          }
-          ((MdNode*)(intptr_t)quote)->end_line = end_line;
-          ADD_CHILD(doc, quote);
-          free(buf);
-          i = j;
-          continue;
-        }
-      }
-
-      /* list */
-      {
-        int p = 0, indent = 0;
-        while (p < len && indent < 3 && line[p] == ' ') { p++; indent++; }
-        bool bullet = false, ordered = false;
-        int start_num = 0, marker_len = 0;
-        char marker_ch = 0;
-        if (p + 1 < len && (line[p] == '-' || line[p] == '+' || line[p] == '*') &&
-            (line[p + 1] == ' ' || line[p + 1] == '\t')) {
-          bullet = true;
-          marker_ch = line[p];
-          marker_len = 2;
-        } else {
-          int q = p;
-          while (q < len && line[q] >= '0' && line[q] <= '9') q++;
-          if (q > p && q + 1 < len && (line[q] == '.' || line[q] == ')') &&
-              (line[q + 1] == ' ' || line[q + 1] == '\t')) {
-            ordered = true;
-            marker_ch = line[q];
-            marker_len = (q - p) + 2;
-            start_num = atoi(line + p);
-          }
-        }
-        if (bullet || ordered) {
-          char list_info[2] = { bullet ? marker_ch : marker_ch, '\0' };
-          int64_t list = NEW_NODE(4, NULL, list_info, ordered ? start_num : 0, lines[i].line_no, lines[i].line_no);
-          int j = i;
-          int end_line = lines[i].line_no;
-          while (j < line_count) {
-            char *item_line = lines[j].text;
-            int ilen = (int)strlen(item_line);
-            int ip = 0, iindent = 0;
-            while (ip < ilen && iindent < 3 && item_line[ip] == ' ') { ip++; iindent++; }
-            bool same = false;
-            int content_start = ip;
-            int current_num = 0;
-            if (bullet) {
-              if (ip + 1 < ilen && item_line[ip] == marker_ch &&
-                  (item_line[ip + 1] == ' ' || item_line[ip + 1] == '\t')) {
-                same = true;
-                content_start = ip + 2;
-              }
-            } else {
-              int q = ip;
-              while (q < ilen && item_line[q] >= '0' && item_line[q] <= '9') q++;
-              if (q > ip && q + 1 < ilen && item_line[q] == marker_ch &&
-                  (item_line[q + 1] == ' ' || item_line[q + 1] == '\t')) {
-                same = true;
-                content_start = q + 2;
-                current_num = atoi(item_line + ip);
-              }
-            }
-            if (!same) break;
-            while (content_start < ilen && (item_line[content_start] == ' ' || item_line[content_start] == '\t')) content_start++;
-            int64_t item = NEW_NODE(5, NULL, NULL, 0, lines[j].line_no, lines[j].line_no);
-            BUF_INIT();
-            BUF_APPEND_STR(item_line + content_start);
-            int k = j + 1;
-            int item_end = lines[j].line_no;
-            while (k < line_count) {
-              char *next = lines[k].text;
-              int nlen = (int)strlen(next);
-              bool next_blank = true;
-              for (int m = 0; m < nlen; m++) {
-                if (!(next[m] == ' ' || next[m] == '\t')) { next_blank = false; break; }
-              }
-              int np = 0, nindent = 0;
-              while (np < nlen && nindent < 3 && next[np] == ' ') { np++; nindent++; }
-              bool next_marker = false;
-              if (bullet) {
-                next_marker = (np + 1 < nlen && next[np] == marker_ch &&
-                               (next[np + 1] == ' ' || next[np + 1] == '\t'));
-              } else {
-                int q = np;
-                while (q < nlen && next[q] >= '0' && next[q] <= '9') q++;
-                next_marker = (q > np && q + 1 < nlen && next[q] == marker_ch &&
-                               (next[q + 1] == ' ' || next[q + 1] == '\t'));
-              }
-              if (next_marker) break;
-              if (next_blank) { break; }
-              BUF_APPEND_CH('\n');
-              if (nlen >= marker_len) BUF_APPEND_STR(next + marker_len);
-              else BUF_APPEND_STR(next);
-              item_end = lines[k].line_no;
-              k++;
-            }
-            if (buf[0] != '\0') ADD_CHILD(item, NEW_NODE(2, buf, NULL, 0, lines[j].line_no, item_end));
-            ((MdNode*)(intptr_t)item)->end_line = item_end;
-            ADD_CHILD(list, item);
-            free(buf);
-            end_line = item_end;
-            j = k;
-            while (j < line_count) {
-              bool blank = true;
-              int blen = (int)strlen(lines[j].text);
-              for (int m = 0; m < blen; m++) {
-                if (!(lines[j].text[m] == ' ' || lines[j].text[m] == '\t')) { blank = false; break; }
-              }
-              if (!blank) break;
-              j++;
-              end_line = lines[j - 1].line_no;
-            }
-          }
-          ((MdNode*)(intptr_t)list)->end_line = end_line;
-          if (ordered && ((MdNode*)(intptr_t)list)->meta == 0) {
-            ((MdNode*)(intptr_t)list)->meta = start_num;
-          }
-          ADD_CHILD(doc, list);
-          i = j;
-          continue;
-        }
-      }
-
-      /* headings */
-      {
-        int p = 0, indent = 0;
-        while (p < len && indent < 3 && line[p] == ' ') { p++; indent++; }
-        if (p < len && line[p] == '#') {
-          int level = 0;
-          while (p + level < len && line[p + level] == '#') level++;
-          if (level >= 1 && level <= 6 && (p + level == len || line[p + level] == ' ' || line[p + level] == '\t')) {
-            int text_start = p + level;
-            while (text_start < len && (line[text_start] == ' ' || line[text_start] == '\t')) text_start++;
-            int text_end = len;
-            while (text_end > text_start && (line[text_end - 1] == ' ' || line[text_end - 1] == '\t')) text_end--;
-            while (text_end > text_start && line[text_end - 1] == '#') text_end--;
-            while (text_end > text_start && (line[text_end - 1] == ' ' || line[text_end - 1] == '\t')) text_end--;
-            char *text = malloc((size_t)(text_end - text_start) + 1);
-            memcpy(text, line + text_start, (size_t)(text_end - text_start));
-            text[text_end - text_start] = '\0';
-            ADD_CHILD(doc, NEW_NODE(1, text, NULL, level, lines[i].line_no, lines[i].line_no));
-            free(text);
-            i++;
-            continue;
-          }
-        }
-      }
-
-      /* setext heading */
-      if (i + 1 < line_count) {
-        char *next = lines[i + 1].text;
-        int nlen = (int)strlen(next);
-        int np = 0, nindent = 0;
-        while (np < nlen && nindent < 3 && next[np] == ' ') { np++; nindent++; }
-        char mark = 0;
-        int run = 0;
-        while (np + run < nlen && (next[np + run] == '=' || next[np + run] == '-')) {
-          if (mark == 0) mark = next[np + run];
-          if (next[np + run] != mark) break;
-          run++;
-        }
-        bool setext = run > 0;
-        int rest = np + run;
-        while (rest < nlen && (next[rest] == ' ' || next[rest] == '\t')) rest++;
-        if (rest != nlen) setext = false;
-        if (setext) {
-          ADD_CHILD(doc, NEW_NODE(1, line + pos, NULL, (mark == '=') ? 1 : 2,
-                                  lines[i].line_no, lines[i + 1].line_no));
-          i += 2;
-          continue;
-        }
-      }
-
-      /* paragraph */
-      {
-        BUF_INIT();
-        int j = i;
-        int end_line = lines[i].line_no;
-        while (j < line_count) {
-          char *cand = lines[j].text;
-          int clen = (int)strlen(cand);
-          bool blank = true;
-          for (int k = 0; k < clen; k++) {
-            if (!(cand[k] == ' ' || cand[k] == '\t')) { blank = false; break; }
-          }
-          if (blank) break;
-          if (j > i) {
-            int p = 0, indent = 0;
-            while (p < clen && indent < 3 && cand[p] == ' ') { p++; indent++; }
-            bool special = false;
-            if (p + 2 < clen && ((cand[p] == '`' && cand[p + 1] == '`' && cand[p + 2] == '`') ||
-                                 (cand[p] == '~' && cand[p + 1] == '~' && cand[p + 2] == '~'))) special = true;
-            if (p < clen && cand[p] == '>') special = true;
-            if (p < clen && cand[p] == '#') special = true;
-            if (p + 1 < clen && cand[p] == '$' && cand[p + 1] == '$') special = true;
-            if (special) break;
-          }
-          if (buf[0] != '\0') BUF_APPEND_CH('\n');
-          BUF_APPEND_STR(cand);
-          end_line = lines[j].line_no;
-          j++;
-          if (j < line_count && j == i + 1) {
-            char *maybe = lines[j].text;
-            int mlen = (int)strlen(maybe);
-            int mp = 0, mindent = 0;
-            while (mp < mlen && mindent < 3 && maybe[mp] == ' ') { mp++; mindent++; }
-            if (mp < mlen && (maybe[mp] == '=' || maybe[mp] == '-')) break;
-          }
-        }
-        ADD_CHILD(doc, NEW_NODE(2, buf, NULL, 0, lines[i].line_no, end_line));
-        free(buf);
-        i = j;
-      }
-    }
-
-    if (((MdNode*)(intptr_t)doc)->child_count > 0) {
-      ((MdNode*)(intptr_t)doc)->end_line =
-        ((MdNode*)(intptr_t)((MdNode*)(intptr_t)doc)->children[((MdNode*)(intptr_t)doc)->child_count - 1])->end_line;
-    }
-    for (int k = 0; k < line_count; k++) free(lines[k].text);
-    free(lines);
-    #undef NEW_NODE
-    #undef ADD_CHILD
-    #undef BUF_INIT
-    #undef BUF_APPEND_BYTES
-    #undef BUF_APPEND_STR
-    #undef BUF_APPEND_CH
-    return doc;
-    ```)
-
-  (defn md-parse [source : cstr] #fx{Unsafe} : int
-    (let [doc (__md-parse-blocks source)]
-      (do
-        (__md-upgrade-gfm doc)
-        (__md-annotate-inlines doc)
-        doc)))
-
-;;; __cat-owned -- concat two OWNED strings, releasing both.
-  (defn __cat-owned [a : cstr b : cstr] #fx{Unsafe} : cstr
-    ```c
-    const char *sa = a ? (const char *)(intptr_t)a : "";
-    const char *sb = b ? (const char *)(intptr_t)b : "";
-    size_t la = strlen(sa), lb = strlen(sb);
-    char *out = malloc(la + lb + 1);
-    memcpy(out, sa, la);
-    memcpy(out + la, sb, lb);
-    out[la + lb] = '\0';
-    if (a) free((void *)(intptr_t)a);
-    if (b) free((void *)(intptr_t)b);
-    return out;
-    ```)
-
-;;; __own -- an owned copy of a borrowed string.
-  (defn __own [s : cstr] #fx{Unsafe} : cstr
-    ```c
-    const char *p = s ? (const char *)(intptr_t)s : "";
-    return strdup(p);
-    ```)
-
-  ;;; __emit-nodes-with-sep -- emit each node, joined by `sep`.
-  ;;;
-  ;;; Every intermediate is owned and consumed by __cat-owned; the nested
-  ;;; __str-concat chain this replaces dropped both the emitted block and the
-  ;;; inner concat at every level.
-  (defn __emit-nodes-with-sep [nodes : int sep : cstr] #fx{Unsafe} : int
-    (if (list-nil? nodes)
-      (__cstr-as-int (__own ""))
-      (let [cur (__emit-node-int (head nodes))]
-        (if (list-nil? (tail nodes))
-          cur
-          (__cstr-as-int
-            (__cat-owned (__int-as-cstr cur)
-                         (__cat-owned (__own sep)
-                                      (__int-as-cstr (__emit-nodes-with-sep (tail nodes) sep)))))))))
-
-  (defn __emit-list-items [items : int ordered : bool start : int marker : cstr idx : int] #fx{Unsafe} : int
-    (if (list-nil? items)
-      (__cstr-as-int (__own ""))
-      (let [item (head items)
-            body (__int-as-cstr (__emit-nodes-with-sep (md-node-children item) "\n\n"))
-            checkbox (if (= (md-node-meta item) 1)
-                      "[ ] "
-                      (if (= (md-node-meta item) 2)
-                        "[x] "
-                        ""))
-            full-body (__cat-owned (__own checkbox) body)
-            prefix (if ordered
-                     (__cat-owned (__int->cstr (+ start idx)) (__cat-owned (__own marker) (__own " ")))
-                     (__cat-owned (__own marker) (__own " ")))
-            ;; __format-list-item borrows both operands, so they are released
-            ;; here rather than consumed.
-            rendered (__format-list-item prefix full-body)]
-        (__cstr-free prefix)
-        (__cstr-free full-body)
-        (if (list-nil? (tail items))
-          (__cstr-as-int rendered)
-          (__cstr-as-int
-            (__cat-owned rendered
-                         (__cat-owned (__own "\n") (__int-as-cstr (__emit-list-items (tail items) ordered start marker (+ idx 1))))))))))
-
-  (defn __table-align-mark [align : int] : cstr
-    (if (= align 1)
-      ":---"
-      (if (= align 2)
-        ":---:"
-        (if (= align 3)
-          "---:"
-          "---"))))
-
-  (defn __emit-table-row-cells [cells : int] #fx{Unsafe} : int
-    (if (list-nil? cells)
-      (__cstr-as-int (__own ""))
-      (let [cell-text (__own (md-node-text (head cells)))]
-        (if (list-nil? (tail cells))
-          (__cstr-as-int cell-text)
-          (__cstr-as-int
-            (__cat-owned cell-text
-                         (__cat-owned (__own " | ") (__int-as-cstr (__emit-table-row-cells (tail cells))))))))))
-
-  (defn __emit-table-align-cells [cells : int] #fx{Unsafe} : int
-    (if (list-nil? cells)
-      (__cstr-as-int (__own ""))
-      (let [cell-mark (__own (__table-align-mark (md-node-meta (head cells))))]
-        (if (list-nil? (tail cells))
-          (__cstr-as-int cell-mark)
-          (__cstr-as-int
-            (__cat-owned cell-mark
-                         (__cat-owned (__own " | ") (__int-as-cstr (__emit-table-align-cells (tail cells))))))))))
-
-  (defn __emit-table-row [row : int] #fx{Unsafe} : int
-    (__cstr-as-int
-      (__cat-owned (__own "| ")
-                   (__cat-owned (__int-as-cstr (__emit-table-row-cells (md-node-children row))) (__own " |")))))
-
-  (defn __emit-table-body-rows [rows : int] #fx{Unsafe} : int
-    (if (list-nil? rows)
-      (__cstr-as-int (__own ""))
-      (let [rendered (__emit-table-row (head rows))]
-        (if (list-nil? (tail rows))
-          rendered
-          (__cstr-as-int
-            (__cat-owned (__int-as-cstr rendered)
-                         (__cat-owned (__own "\n") (__int-as-cstr (__emit-table-body-rows (tail rows))))))))))
-
-  (defn __emit-table-node [n : int] #fx{Unsafe} : int
-    (let [rows (md-node-children n)
-          header (head rows)
-          body (tail rows)
-          align-row (__cstr-as-int
-                     (__cat-owned (__own "| ")
-                                  (__cat-owned (__int-as-cstr (__emit-table-align-cells (md-node-children header))) (__own " |"))))]
-      (if (list-nil? body)
-        (__cstr-as-int
-          (__cat-owned (__int-as-cstr (__emit-table-row header))
-                       (__cat-owned (__own "\n") (__int-as-cstr align-row))))
-        (__cstr-as-int
-          (__cat-owned (__int-as-cstr (__emit-table-row header))
-                       (__cat-owned (__own "\n")
-                                    (__cat-owned (__int-as-cstr align-row)
-                                                 (__cat-owned (__own "\n") (__int-as-cstr (__emit-table-body-rows body))))))))))
-
-  (defn __emit-node-int [n : int] #fx{Unsafe} : int
-    (let [tag (md-node-tag n)]
-      (if (= tag (md-tag-document))
-        (__emit-nodes-with-sep (md-node-children n) "\n\n")
-        (if (= tag (md-tag-heading))
-          (__cstr-as-int
-            (__cat-owned (__repeat-char 35 (md-node-meta n))
-                         (__cat-owned (__own " ") (__own (md-node-text n)))))
-          (if (= tag (md-tag-paragraph))
-            (__cstr-as-int (__own (md-node-text n)))
-            (if (= tag (md-tag-blockquote))
-              (__cstr-as-int
-                (__prefix-lines "> " (__int-as-cstr (__emit-nodes-with-sep (md-node-children n) "\n\n"))))
-              (if (= tag (md-tag-list))
-                (__emit-list-items (md-node-children n)
-                                  (> (md-node-meta n) 0)
-                                  (md-node-meta n)
-                                  (md-node-info n)
-                                  0)
-                (if (= tag (md-tag-table))
-                  (__emit-table-node n)
-                  (if (= tag (md-tag-list-item))
-                  (__emit-nodes-with-sep (md-node-children n) "\n\n")
-                    (if (= tag (md-tag-code-block))
-                    (__cstr-as-int
-                     (__cat-owned (__own "```")
-                                  (__cat-owned (__own (md-node-info n))
-                                               (__cat-owned (__own "\n")
-                                                            (__cat-owned (__own (md-node-text n))
-                                                                         (__own "\n```"))))))
-                      (if (= tag (md-tag-thematic-break))
-                       (__cstr-as-int (__own "---"))
-                       (if (= tag (md-tag-math-block))
-                         (__cstr-as-int
-                           (__cat-owned (__own "$$\n")
-                                        (__cat-owned (__own (md-node-text n)) (__own "\n$$"))))
-                         (if (= tag (md-tag-math-inline))
-                           (__cstr-as-int
-                             (__cat-owned (__own "$") (__cat-owned (__own (md-node-text n)) (__own "$"))))
-                           (__cstr-as-int (__own "")))))))))))))))
-
-  ;;; md-emit -- serialize a parsed NB0 AST back to normalized markdown.
+  ;;; A block's is the lines it spans, as written.  The document's is its
+  ;;; top-level blocks', with one blank line between each two, as notebook
+  ;;; files are written.  An inline node has none.
   ;;;
   ;;; Parameters:
   ;;;   n -- node handle
   ;;;
   ;;; Returns:
-  ;;;   Markdown source string.
+  ;;;   A fresh string, owned by the caller.
   ;;;
   ;;; Example:
-  ;;;   (md-emit (md-parse "# Title"))
+  ;;;   (md-emit (md-parse "# Title"))  ; => "# Title"
   ;;;
   ;;; Since: NB0
   (defn md-emit [n : int] #fx{Unsafe} : cstr
-    (__int-as-cstr (__emit-node-int n)))
-
-  (defn __html-escape-math [s : cstr] #fx{Unsafe} : cstr
     ```c
-    const char *src = s ? (const char *)(intptr_t)s : "";
-    size_t len = strlen(src), cap = len * 5 + 1;
-    char *out = malloc(cap);
-    size_t j = 0;
-    for (size_t i = 0; i < len; i++) {
-      const char *rep = NULL;
-      switch (src[i]) {
-        case '&': rep = "&amp;"; break;
-        case '<': rep = "&lt;"; break;
-        case '>': rep = "&gt;"; break;
-        default: break;
-      }
-      if (rep) {
-        size_t rl = strlen(rep);
-        memcpy(out + j, rep, rl);
-        j += rl;
-      } else {
-        out[j++] = src[i];
-      }
-    }
-    out[j] = '\0';
-    return out;
+    typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
+    MdNode *node = (MdNode*)(intptr_t)n;
+    return strdup(node && node->md ? node->md : "");
     ```)
 
-  (defn __html-escape [s : cstr] #fx{Unsafe} : cstr
-    ```c
-    const char *src = s ? (const char *)(intptr_t)s : "";
-    size_t len = strlen(src), cap = len * 6 + 1;
-    char *out = malloc(cap);
-    size_t j = 0;
-    for (size_t i = 0; i < len; i++) {
-      const char *rep = NULL;
-      switch (src[i]) {
-        case '&': rep = "&amp;"; break;
-        case '<': rep = "&lt;"; break;
-        case '>': rep = "&gt;"; break;
-        case '"': rep = "&quot;"; break;
-        default: break;
-      }
-      if (rep) {
-        size_t rl = strlen(rep);
-        memcpy(out + j, rep, rl);
-        j += rl;
-      } else {
-        out[j++] = src[i];
-      }
-    }
-    out[j] = '\0';
-    return out;
-    ```)
-
-  (defn __emit-inline-plain-list [nodes : int] #fx{Unsafe} : int
-    (if (list-nil? nodes)
-      (__cstr-as-int (__own ""))
-      (__cstr-as-int
-        (__cat-owned (__int-as-cstr (__emit-inline-plain-node-int (head nodes)))
-                     (__int-as-cstr (__emit-inline-plain-list (tail nodes)))))))
-
-  (defn __emit-inline-html-list [nodes : int] #fx{Unsafe} : int
-    (if (list-nil? nodes)
-      (__cstr-as-int (__own ""))
-      (__cstr-as-int
-        (__cat-owned (__int-as-cstr (__emit-inline-html-node-int (head nodes)))
-                     (__int-as-cstr (__emit-inline-html-list (tail nodes)))))))
-
-  (defn __emit-block-html-list [nodes : int] #fx{Unsafe} : int
-    (if (list-nil? nodes)
-      (__cstr-as-int (__own ""))
-      (let [cur (__emit-block-html-node-int (head nodes))]
-        (if (list-nil? (tail nodes))
-          cur
-          (__cstr-as-int
-            (__cat-owned (__int-as-cstr cur)
-                         (__cat-owned (__own "\n")
-                                      (__int-as-cstr (__emit-block-html-list (tail nodes))))))))))
-
-  (defn __emit-inline-plain-node-int [n : int] #fx{Unsafe} : int
-    (let [tag (md-node-tag n)]
-      (if (= tag (md-tag-text))
-        (__cstr-as-int (__own (md-node-text n)))
-        (if (= tag (md-tag-code-span))
-          (__cstr-as-int (__own (md-node-text n)))
-          (if (= tag (md-tag-link))
-            (__emit-inline-plain-list (md-node-children n))
-            (if (= tag (md-tag-image))
-              (__emit-inline-plain-list (md-node-children n))
-              (if (= tag (md-tag-autolink))
-                (__cstr-as-int (__own (md-node-text n)))
-                (if (or (= tag (md-tag-emph))
-                        (or (= tag (md-tag-strong))
-                            (= tag (md-tag-strikethrough))))
-                  (__emit-inline-plain-list (md-node-children n))
-                  (if (= tag (md-tag-hard-break))
-                    (__cstr-as-int (__own "\n"))
-                    (if (= tag (md-tag-soft-break))
-                      (__cstr-as-int (__own "\n"))
-                      (__cstr-as-int (__own ""))))))))))))
-
-  (defn __emit-link-html-int [n : int] #fx{Unsafe} : int
-    (let [title-attr (if (__cstr-eq? (md-node-text n) "")
-                       (__own ">")
-                       (__cat-owned (__own " title=\"") (__cat-owned (__html-escape (md-node-text n)) (__own "\">"))))]
-      (__cstr-as-int
-        (__cat-owned (__own "<a href=\"") (__cat-owned (__html-escape (md-node-info n))
-          (__cat-owned (__own "\"") (__cat-owned title-attr
-            (__cat-owned (__int-as-cstr (__emit-inline-html-list (md-node-children n))) (__own "</a>")))))))))
-
-  (defn __emit-image-html-int [n : int] #fx{Unsafe} : int
-    (let [title-tail (if (__cstr-eq? (md-node-text n) "")
-                       (__own " />")
-                       (__cat-owned (__own " title=\"") (__cat-owned (__html-escape (md-node-text n)) (__own "\" />"))))
-          ;; __html-escape borrows, so the plain-text alt it escapes is a
-          ;; separate allocation that has to be released once escaped.
-          alt-plain (__int-as-cstr (__emit-inline-plain-list (md-node-children n)))
-          alt (__html-escape alt-plain)]
-      (__cstr-free alt-plain)
-      (__cstr-as-int
-        (__cat-owned (__own "<img src=\"") (__cat-owned (__html-escape (md-node-info n))
-          (__cat-owned (__own "\" alt=\"") (__cat-owned alt
-            (__cat-owned (__own "\"") title-tail))))))))
-
-  ;; Every operand below is owned -- __html-escape, __html-escape-math and the
-  ;; emit helpers all allocate, and the literals go through __own -- so
-  ;; __cat-owned can consume them.  The __str-concat chains this replaces
-  ;; dropped one intermediate per link.
-  (defn __emit-inline-html-node-int [n : int] #fx{Unsafe} : int
-    (let [tag (md-node-tag n)]
-      (if (= tag (md-tag-text))
-        (__cstr-as-int (__html-escape (md-node-text n)))
-        (if (= tag (md-tag-emph))
-          (__cstr-as-int
-            (__cat-owned (__own "<em>") (__cat-owned (__int-as-cstr (__emit-inline-html-list (md-node-children n))) (__own "</em>"))))
-          (if (= tag (md-tag-strong))
-            (__cstr-as-int
-              (__cat-owned (__own "<strong>") (__cat-owned (__int-as-cstr (__emit-inline-html-list (md-node-children n))) (__own "</strong>"))))
-            (if (= tag (md-tag-strikethrough))
-              (__cstr-as-int
-                (__cat-owned (__own "<del>") (__cat-owned (__int-as-cstr (__emit-inline-html-list (md-node-children n))) (__own "</del>"))))
-            (if (= tag (md-tag-code-span))
-              (__cstr-as-int
-                (__cat-owned (__own "<code>") (__cat-owned (__html-escape (md-node-text n)) (__own "</code>"))))
-              (if (= tag (md-tag-link))
-                (__emit-link-html-int n)
-                (if (= tag (md-tag-image))
-                  (__emit-image-html-int n)
-                  (if (= tag (md-tag-autolink))
-                    (__cstr-as-int
-                      (__cat-owned (__own "<a href=\"") (__cat-owned (__html-escape (md-node-info n))
-                        (__cat-owned (__own "\">") (__cat-owned (__html-escape (md-node-text n)) (__own "</a>"))))))
-                    (if (= tag (md-tag-hard-break))
-                      (__cstr-as-int (__own "<br />\n"))
-                      (if (= tag (md-tag-soft-break))
-                        (__cstr-as-int (__own "\n"))
-                        (if (= tag (md-tag-math-inline))
-                          (__cstr-as-int
-                            (__cat-owned (__own "<span class=\"math inline\">$")
-                              (__cat-owned (__html-escape-math (md-node-text n)) (__own "$</span>"))))
-                          (__cstr-as-int (__own "")))))))))))))))
-
-  (defn __table-align-attr [align : int] : cstr
-    (if (= align 1)
-      " align=\"left\""
-      (if (= align 2)
-        " align=\"center\""
-        (if (= align 3)
-          " align=\"right\""
-          ""))))
-
-  (defn __emit-table-cells-html [cells : int header? : bool] #fx{Unsafe} : int
-    (if (list-nil? cells)
-      (__cstr-as-int (__own ""))
-      (let [cell (head cells)
-            tag-name (if header? "th" "td")
-            body (if (list-nil? (md-node-children cell))
-                   (__html-escape (md-node-text cell))
-                   (__int-as-cstr (__emit-inline-html-list (md-node-children cell))))
-            rendered (__cat-owned (__own "<")
-                                  (__cat-owned (__own tag-name)
-                                               (__cat-owned (__own (__table-align-attr (md-node-meta cell)))
-                                                            (__cat-owned (__own ">")
-                                                                         (__cat-owned body
-                                                                                      (__cat-owned (__own "</")
-                                                                                                   (__cat-owned (__own tag-name) (__own ">"))))))))]
-        (if (list-nil? (tail cells))
-          (__cstr-as-int rendered)
-          (__cstr-as-int
-            (__cat-owned rendered (__int-as-cstr (__emit-table-cells-html (tail cells) header?))))))))
-
-  (defn __emit-table-row-html [row : int header? : bool] #fx{Unsafe} : int
-    (__cstr-as-int
-      (__cat-owned (__own "<tr>")
-                   (__cat-owned (__int-as-cstr (__emit-table-cells-html (md-node-children row) header?)) (__own "</tr>")))))
-
-  (defn __emit-table-body-html [rows : int] #fx{Unsafe} : int
-    (if (list-nil? rows)
-      (__cstr-as-int (__own ""))
-      (let [rendered (__emit-table-row-html (head rows) false)]
-        (if (list-nil? (tail rows))
-          rendered
-          (__cstr-as-int
-            (__cat-owned (__int-as-cstr rendered)
-                         (__cat-owned (__own "\n") (__int-as-cstr (__emit-table-body-html (tail rows))))))))))
-
-  (defn __emit-table-html-int [n : int] #fx{Unsafe} : int
-    (let [rows (md-node-children n)
-          header (head rows)
-          body (tail rows)
-          header-html (__emit-table-row-html header true)]
-      (if (list-nil? body)
-        (__cstr-as-int
-          (__cat-owned (__own "<table>\n<thead>\n")
-                       (__cat-owned (__int-as-cstr header-html) (__own "\n</thead>\n</table>"))))
-        (__cstr-as-int
-          (__cat-owned (__own "<table>\n<thead>\n")
-                       (__cat-owned (__int-as-cstr header-html)
-                                    (__cat-owned (__own "\n</thead>\n<tbody>\n")
-                                                 (__cat-owned (__int-as-cstr (__emit-table-body-html body))
-                                                              (__own "\n</tbody>\n</table>")))))))))
-
-  ;; `lvl` is used twice, so it is copied rather than consumed and released
-  ;; once at the end.
-  (defn __emit-heading-html-int [n : int] #fx{Unsafe} : int
-    (let [lvl (__int->cstr (md-node-meta n))
-          out (__cat-owned (__own "<h")
-                (__cat-owned (__own lvl)
-                  (__cat-owned (__own ">")
-                    (__cat-owned (__int-as-cstr (__emit-inline-html-list (md-node-children n)))
-                      (__cat-owned (__own "</h") (__cat-owned (__own lvl) (__own ">")))))))]
-      (do
-        (__cstr-free lvl)
-        (__cstr-as-int out))))
-
-;;; __cstr-free -- release an owned string.  Safe on 0.
-  (defn __cstr-free [s : cstr] #fx{Unsafe} : void
-    ```c
-    void *p = (void *)(intptr_t)s;
-    if (p) free(p);
-    ```)
-
-  ;; As with the inline emitter: every operand is owned, literals included
-  ;; (via __own), so __cat-owned can consume them.  The nested __str-concat
-  ;; chains this replaces dropped an intermediate at every link.
-  (defn __emit-block-html-node-int [n : int] #fx{Unsafe} : int
-    (let [tag (md-node-tag n)]
-      (if (= tag (md-tag-document))
-        (__emit-block-html-list (md-node-children n))
-        (if (= tag (md-tag-heading))
-          (__emit-heading-html-int n)
-          (if (= tag (md-tag-paragraph))
-            (__cstr-as-int
-              (__cat-owned (__own "<p>") (__cat-owned (__int-as-cstr (__emit-inline-html-list (md-node-children n))) (__own "</p>"))))
-            (if (= tag (md-tag-blockquote))
-              (__cstr-as-int
-                (__cat-owned (__own "<blockquote>\n") (__cat-owned (__int-as-cstr (__emit-block-html-list (md-node-children n))) (__own "\n</blockquote>"))))
-              (if (= tag (md-tag-list))
-                (if (> (md-node-meta n) 0)
-                  (__cstr-as-int
-                    (__cat-owned
-                      (if (= (md-node-meta n) 1)
-                        (__own "<ol>")
-                        (__cat-owned (__own "<ol start=\"") (__cat-owned (__int->cstr (md-node-meta n)) (__own "\">"))))
-                      (__cat-owned (__int-as-cstr (__emit-block-html-list (md-node-children n))) (__own "</ol>"))))
-                  (__cstr-as-int
-                    (__cat-owned (__own "<ul>") (__cat-owned (__int-as-cstr (__emit-block-html-list (md-node-children n))) (__own "</ul>")))))
-                (if (= tag (md-tag-list-item))
-                  (__cstr-as-int
-                    (__cat-owned (__own "<li>")
-                                 (__cat-owned
-                                   (if (= (md-node-meta n) 1)
-                                     (__own "<input type=\"checkbox\" disabled=\"\" /> ")
-                                     (if (= (md-node-meta n) 2)
-                                       (__own "<input type=\"checkbox\" checked=\"\" disabled=\"\" /> ")
-                                       (__own "")))
-                                   (__cat-owned (__int-as-cstr (__emit-block-html-list (md-node-children n))) (__own "</li>")))))
-                  (if (= tag (md-tag-table))
-                    (__emit-table-html-int n)
-                    (if (= tag (md-tag-code-block))
-                    (__cstr-as-int
-                      (__cat-owned (__own "<pre><code")
-                                   (__cat-owned
-                                     (if (__cstr-eq? (md-node-info n) "")
-                                       (__own ">")
-                                       (__cat-owned (__own " class=\"language-") (__cat-owned (__html-escape (md-node-info n)) (__own "\">"))))
-                                     (__cat-owned (__html-escape (md-node-text n)) (__own "</code></pre>")))))
-                    (if (= tag (md-tag-thematic-break))
-                      (__cstr-as-int (__own "<hr />"))
-                      (if (= tag (md-tag-math-block))
-                        (__cstr-as-int
-                          (__cat-owned (__own "<span class=\"math display\">$$")
-                            (__cat-owned (__html-escape-math (md-node-text n)) (__own "$$</span>"))))
-                        (__cstr-as-int (__own ""))))))))))))))
-
+  ;;; md-emit-html -- a node's HTML, as tur/markdown renders it.
+  ;;;
+  ;;; A block's is its HTML where it stands in the document, and the
+  ;;; document's is all of it, either without the final line feed.  Math is a
+  ;;; <span class="math inline"> or "math display" for KaTeX; raw HTML passes
+  ;;; GitHub's tag filter.  An inline node has none.
+  ;;;
+  ;;; Parameters:
+  ;;;   n -- node handle
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh string, owned by the caller.
+  ;;;
+  ;;; Example:
+  ;;;   (md-emit-html (md-parse "# Title"))  ; => "<h1>Title</h1>"
+  ;;;
+  ;;; Since: NB0
   (defn md-emit-html [n : int] #fx{Unsafe} : cstr
-    (__int-as-cstr (__emit-block-html-node-int n)))
+    ```c
+    typedef struct { int kind; char *text; char *info; int meta; int start_line; int end_line;
+                     int64_t *children; int child_count; int child_cap; int64_t kids;
+                     char *md; char *html; } MdNode;
+    MdNode *node = (MdNode*)(intptr_t)n;
+    return strdup(node && node->html ? node->html : "");
+    ```)
 
+;; ---------------------------------------------------------------------
+;; Building the tree from tur/markdown
+;; ---------------------------------------------------------------------
+
+;;; __md-opts -- what a notebook's Markdown is: CommonMark, the GFM extensions and math.
+  (defn __md-opts [] : MdOpts (MdOpts true true true true true))
+
+;;; __md-html-opts -- how it renders: raw HTML through GitHub's tag filter, headings without ids.
+  (defn __md-html-opts [] : MdHtmlOpts (MdHtmlOpts (MdRawTagFilter) (MdNoIds)))
+
+;;; __md-text-of -- the String in o, or a fresh empty one for (none).
+  (defn __md-text-of [o : (Option String)] : String
+    (match o
+      (Some s)
+      s
+      (None)
+      (string/from-cstr "")))
+
+;;; __md-chomp -- s without one final line feed, as a fresh String; s is released.
+  (defn __md-chomp [s : String] : String
+    (let [n (string/len s)
+          e (if (and (> n 0) (= (string/byte-at s (- n 1)) 10)) (- n 1) n)
+          t (string/substring s 0 e)]
+      (do (string/release s) t)))
+
+;;; __md-lines-text -- lines first..last (1-based, inclusive) of lines, joined by line feeds.
+  (defn __md-lines-text [lines : (Vec String) first : int last : int] : String
+    (let [b      (builder/new)
+          ^mut i first]
+      (do
+        (while (and (<= i last) (<= i (vec-len lines)))
+          (do
+            (when (> i first) (builder/push-byte! b 10))
+            (builder/push-string! b (vec-get lines (- i 1)))
+            (set! i (+ i 1))))
+        (builder/finish b))))
+
+;;; __md-new -- a node record for kind with String text and info, both released.
+  (defn __md-new [kind : int
+                  text : String
+                  info : String
+                  meta : int
+                  start : int
+                  end : int] #fx{Unsafe} : int
+    (let [n (__md-node-new kind (string/to-cstr text) (string/to-cstr info) meta start end)]
+      (do (string/release text) (string/release info) n)))
+
+;;; __md-set-md-string! -- set node's Markdown source from s, releasing s.
+  (defn __md-set-md-string! [node : int s : String] #fx{Unsafe} : void
+    (do (__md-set-md! node (string/to-cstr s)) (string/release s)))
+
+;;; __md-set-html-string! -- set node's HTML from s without its final line feed, releasing s.
+  (defn __md-set-html-string! [node : int s : String] #fx{Unsafe} : void
+    (let [t (__md-chomp s)] (do (__md-set-html! node (string/to-cstr t)) (string/release t))))
+
+;;; __md-inline-tag -- the md-tag-* of inline kind k.
+  (defn __md-inline-tag [k : MdInline] : int
+    (match k
+      (MdText)
+      (md-tag-text)
+      (MdCode)
+      (md-tag-code-span)
+      (MdEmph)
+      (md-tag-emph)
+      (MdStrong)
+      (md-tag-strong)
+      (MdLink)
+      (md-tag-link)
+      (MdImage)
+      (md-tag-image)
+      (MdHtmlInline)
+      (md-tag-html-inline)
+      (MdSoftBreak)
+      (md-tag-soft-break)
+      (MdHardBreak)
+      (md-tag-hard-break)
+      (MdStrikethrough)
+      (md-tag-strikethrough)
+      (MdMath display)
+      (if display (md-tag-math-block) (md-tag-math-inline))))
+
+;;; __md-inline-node -- a node for inline id of d, and its children, on lines start..end.
+  (defn __md-inline-node [d : MdDoc id : MdInlineId start : int end : int] #fx{Unsafe} : int
+    (let [k      (markdown/inline d id)
+          link?  (match k (MdLink) true (MdImage) true _ false)
+          text   (if link?
+                   (__md-text-of (markdown/link-title d id))
+                   (__md-text-of (markdown/inline-text d id)))
+          info   (__md-text-of (markdown/link-dest d id))
+          node   (__md-new (__md-inline-tag k) text info 0 start end)
+          kids   (markdown/inline-children d id)
+          ^mut i 0]
+      (do
+        (while (< i (vec-len kids))
+          (do
+            (__md-add-child! node (__md-inline-node d (vec-get kids i) start end))
+            (set! i (+ i 1))))
+        (vec-free kids)
+        node)))
+
+;;; __md-align-meta -- a table cell's alignment as md-node-meta has it.
+  (defn __md-align-meta [a : MdAlign] : int
+    (match a
+      (MdAlignNone)
+      0
+      (MdAlignLeft)
+      1
+      (MdAlignCenter)
+      2
+      (MdAlignRight)
+      3))
+
+;;; __md-task-meta -- a list item's task box as md-node-meta has it.
+  (defn __md-task-meta [t : MdTask] : int
+    (match t
+      (MdNotTask)
+      0
+      (MdUnchecked)
+      1
+      (MdChecked)
+      2))
+
+;;; __md-block-tag -- the md-tag-* of block kind b.
+  (defn __md-block-tag [b : MdBlock] : int
+    (match b
+      (MdDocument)
+      (md-tag-document)
+      (MdBlockQuote)
+      (md-tag-blockquote)
+      (MdList o s t)
+      (md-tag-list)
+      (MdItem k)
+      (md-tag-list-item)
+      (MdParagraph)
+      (md-tag-paragraph)
+      (MdHeading l)
+      (md-tag-heading)
+      (MdThematicBreak)
+      (md-tag-thematic-break)
+      (MdCodeBlock f)
+      (md-tag-code-block)
+      (MdHtmlBlock)
+      (md-tag-html-block)
+      (MdTable c)
+      (md-tag-table)
+      (MdTableRow h)
+      (md-tag-table-row)
+      (MdTableCell a)
+      (md-tag-table-cell)
+      (MdMathBlock)
+      (md-tag-math-block)))
+
+;;; __md-block-meta -- block kind b's md-node-meta.
+  (defn __md-block-meta [b : MdBlock] : int
+    (match b
+      (MdHeading l)
+      l
+      (MdList o s t)
+      (if o s 0)
+      (MdItem k)
+      (__md-task-meta k)
+      (MdTableRow h)
+      (if h 1 0)
+      (MdTableCell a)
+      (__md-align-meta a)
+      _
+      0))
+
+;;; __md-block-text -- block id's md-node-text: a code block's or formula's body loses its final line feed.
+  (defn __md-block-text [d : MdDoc id : MdBlockId b : MdBlock] : String
+    (let [t (__md-text-of (markdown/block-text d id))]
+      (match b
+        (MdCodeBlock f)
+        (__md-chomp t)
+        (MdMathBlock)
+        (__md-chomp t)
+        _
+        t)))
+
+;;; __md-block-info -- block id's md-node-info: a code block's info string or a list's marker.
+  (defn __md-block-info [d : MdDoc id : MdBlockId] : String
+    (match (markdown/list-marker d id)
+      (Some c)
+      (char->string c)
+      (None)
+      (__md-text-of (markdown/code-info d id))))
+
+;;; __md-block-node -- a node for block id of d and everything in it, with its Markdown source from lines.
+  (defn __md-block-node [d : MdDoc id : MdBlockId lines : (Vec String)] #fx{Unsafe} : int
+    (let [b      (markdown/block d id)
+          span   (markdown/block-lines d id)
+          start  (pair-fst span)
+          end    (pair-snd span)
+          node   (__md-new (__md-block-tag b)
+                   (__md-block-text d id b)
+                   (__md-block-info d id)
+                   (__md-block-meta b)
+                   start
+                   end)
+          kids   (markdown/children d id)
+          ins    (markdown/inlines d id)
+          ^mut i 0
+          ^mut j 0]
+      (do
+        (while (< i (vec-len kids))
+          (do
+            (__md-add-child! node (__md-block-node d (vec-get kids i) lines))
+            (set! i (+ i 1))))
+        (while (< j (vec-len ins))
+          (do
+            (__md-add-child! node (__md-inline-node d (vec-get ins j) start end))
+            (set! j (+ j 1))))
+        (vec-free kids)
+        (vec-free ins)
+        (__md-set-md-string! node (__md-lines-text lines start end))
+        (__md-set-html-string! node (markdown/render-block-html d id (__md-html-opts)))
+        node)))
+
+;;; __md-blank-lines? -- are lines first..last (1-based, inclusive) all blank?
+  (defn __md-blank-lines? [lines : (Vec String) first : int last : int] : bool
+    (let [^mut i     first
+          ^mut blank true]
+      (do
+        (while (and blank (<= i last) (<= i (vec-len lines)))
+          (let [s      (vec-get lines (- i 1))
+                ^mut k 0]
+            (do
+              (while (< k (string/len s))
+                (do
+                  (let [c (string/byte-at s k)]
+                    (when (not (or (= c 32) (= c 9))) (set! blank false)))
+                  (set! k (+ k 1))))
+              (set! i (+ i 1)))))
+        blank)))
+
+;;; __md-trim-blank -- first..last narrowed past the blank lines at either end, as (pair first last); first > last when all are blank.
+  (defn __md-trim-blank [lines : (Vec String) first0 : int last0 : int] : (Pair int int)
+    (let [^mut a first0
+          ^mut z last0]
+      (do
+        (while (and (<= a z) (__md-blank-lines? lines a a)) (set! a (+ a 1)))
+        (while (and (<= a z) (__md-blank-lines? lines z z)) (set! z (- z 1)))
+        (pair a z))))
+
+;;; __md-gap-node! -- when lines first..last hold more than blank lines (link reference definitions), add a paragraph node holding them, with no HTML, to doc; first..last as given.
+  (defn __md-gap-node! [doc : int lines : (Vec String) first : int last : int] #fx{Unsafe} : void
+    (let [r (__md-trim-blank lines first last)
+          a (pair-fst r)
+          z (pair-snd r)]
+      (when (<= a z)
+        (let [t (__md-lines-text lines a z)
+              n (__md-node-new (md-tag-paragraph) (string/to-cstr t) "" 0 a z)]
+          (do
+            (__md-set-md! n (string/to-cstr t))
+            (string/release t)
+            (__md-add-child! doc n))))))
+
+;;; __md-head -- the head of a cons cell.
+  (defn __md-head [lst : int] #fx{Unsafe} : int
+    ```c
+    struct { int64_t head; int64_t tail; } *cell = (void*)(intptr_t)lst;
+    return cell ? cell->head : 0;
+    ```)
+
+;;; __md-tail -- the tail of a cons cell.
+  (defn __md-tail [lst : int] #fx{Unsafe} : int
+    ```c
+    struct { int64_t head; int64_t tail; } *cell = (void*)(intptr_t)lst;
+    return cell ? cell->tail : 0;
+    ```)
+
+;;; __md-free-cstr -- free a malloc'd string.
+  (defn __md-free-cstr [s : cstr] #fx{Unsafe} : void
+    ```c
+    free((void *)(intptr_t)s);
+    ```)
+
+;;; __md-doc-md -- the document's Markdown: its top-level nodes' sources, a blank line between each two.
+  (defn __md-doc-md [doc : int] #fx{Unsafe} : String
+    (let [b          (builder/new)
+          ^mut kids  (md-node-children doc)
+          ^mut first true]
+      (do
+        (while (not (= kids 0))
+          (let [s (md-emit (__md-head kids))]
+            (do
+              (when (not first) (builder/push-cstr! b "\n\n"))
+              (builder/push-cstr! b s)
+              (__md-free-cstr s)
+              (set! first false)
+              (set! kids (__md-tail kids)))))
+        (builder/finish b))))
+
+  ;;; md-parse -- parse a notebook's Markdown into a node tree.
+  ;;;
+  ;;; Parameters:
+  ;;;   source -- the Markdown text (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A document node owning its whole subtree; free it with md-node-free.
+  ;;;
+  ;;; Example:
+  ;;;   (md-parse "# Title\n\nParagraph.")
+  ;;;
+  ;;; Since: NB0
+  (defn md-parse [source : cstr] #fx{Unsafe} : int
+    (let [src       (string/from-cstr source)
+          lines     (string/lines src)
+          d         (markdown/parse src (__md-opts))
+          tops      (markdown/children d (markdown/root d))
+          doc       (__md-node-new (md-tag-document) "" "" 0 1 (vec-len lines))
+          ^mut i    0
+          ^mut next 1]
+      (do
+        (while (< i (vec-len tops))
+          (let [id   (vec-get tops i)
+                span (markdown/block-lines d id)]
+            (do
+              (__md-gap-node! doc lines next (- (pair-fst span) 1))
+              (__md-add-child! doc (__md-block-node d id lines))
+              (set! next (+ (pair-snd span) 1))
+              (set! i (+ i 1)))))
+        (__md-gap-node! doc lines next (vec-len lines))
+        (__md-set-md-string! doc (__md-doc-md doc))
+        (__md-drop-kids-cache doc)
+        (__md-set-html-string! doc (markdown/render-html d (__md-html-opts)))
+        (vec-free tops)
+        (markdown/doc-free d)
+        (string/release-all lines)
+        (string/release src)
+        doc)))
 ) ;; end defmodule notebook/cmark
