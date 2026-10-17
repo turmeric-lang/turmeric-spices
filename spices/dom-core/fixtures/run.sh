@@ -27,6 +27,13 @@ TESTS=(edit_test writer_test)
 CFLAGS=(-std=c11 -g -O1 -Wall -Wextra -Werror -I c)
 SAN=(-fsanitize=address,undefined -fno-sanitize-recover=all)
 
+# Leak checking where LeakSanitizer exists.  Apple's ASan has none, and
+# detect_leaks=1 makes it abort at startup ("not supported on this platform").
+RUN_ASAN="${ASAN_OPTIONS:-}"
+if [ "$(uname -s)" = Linux ]; then
+  RUN_ASAN="detect_leaks=1${RUN_ASAN:+:$RUN_ASAN}"
+fi
+
 echo "1..${#TESTS[@]}"
 fails=0
 i=0
@@ -46,7 +53,7 @@ for t in "${TESTS[@]}"; do
     fi
     san="unsanitized"
   fi
-  if ASAN_OPTIONS="detect_leaks=1:${ASAN_OPTIONS:-}" "$OUT/$t" "$OUT" > "$OUT/run.log" 2>&1; then
+  if ASAN_OPTIONS="$RUN_ASAN" "$OUT/$t" "$OUT" > "$OUT/run.log" 2>&1; then
     echo "ok $i - $t ($san) $(tail -1 "$OUT/run.log")"
   else
     echo "not ok $i - $t ($san)"
