@@ -4,6 +4,10 @@ clean:
     rm -f *__*.c *__*.h *.so *.manifest event.c event.h tur.lock .DS_Store
 
 # Render markdown guides under docs/guides/ to HTML (served at /guides/).
+# The Markdown goes through tur/markdown (tools/mdrender.py, a copy of
+# turmeric's), so this needs a tur: $TUR, vendor/tur/ from
+# scripts/install-tur.sh, or one on PATH -- one whose stdlib has
+# markdown/heading-html (turmeric main, or a release made after it).
 guides:
     python3 tools/genguides.py docs/guides/ --out docs/html/guides/
 
