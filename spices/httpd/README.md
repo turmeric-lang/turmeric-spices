@@ -236,9 +236,10 @@ as it runs, so size the pool for the sessions you expect.
 
 ## Status
 
-Requires turmeric with stdlib httpd's connection upgrade and per-server
-limits (tourist-on-stdlib-httpd-plan H1) -- the first release after v0.64.0,
-or main. See
+Requires turmeric v0.64.1 or later (`:tur-version ">=0.64.1"`), the first
+release with stdlib httpd's connection upgrade and per-server limits
+([tourist-on-stdlib-httpd-plan](https://github.com/turmeric-lang/turmeric/blob/main/docs/archive/tourist-on-stdlib-httpd-plan.md)
+H1). See
 [`docs/archive/history/tur-httpd-plan.md`](https://github.com/turmeric-lang/turmeric/blob/main/docs/archive/history/tur-httpd-plan.md) in the
 turmeric repo for the full roadmap.
 
