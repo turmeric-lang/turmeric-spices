@@ -1,40 +1,395 @@
 ;; plot/interval.tur -- filled interval renderers.
+;;
+;; Each kind is a struct with a `Renderer` instance; the constructors box it as
+;; an `AnyRenderer`. The region between the two curves is filled with `fill`
+;; and outlined with `style`.
 
 (defmodule plot/interval
-  (export function-interval lines-interval parametric-interval polar-interval)
+  (export function-interval lines-interval parametric-interval polar-interval
+          FunctionIntervalR LinesIntervalR ParametricIntervalR PolarIntervalR)
 
-  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds])
+  (import plot/core  :refer [BBox bbox-empty-box bbox-union any-renderer DrawCtx
+                             __bbox-of-points])
+  (import plot/style :refer [LineStyle FillStyle])
+  (import plot/data  :refer [Point Cells __points->cells __free-cells])
 
-  ;;; __nan -- quiet NaN sentinel for "auto y bound" on function-interval.
-  ;;; Inline-C avoids the runtime div-by-zero trap on `(/ 0.0 0.0)`.
-  (defn __nan [] : float
-    ```c return 0.0 / 0.0; ```)
+  ;;; FunctionIntervalR -- the band between y = f1(x) and y = f2(x).
+  (defstruct FunctionIntervalR :copy [f1 : (fn [float] float)  f2 : (fn [float] float)
+                                      x-min : float  x-max : float  samples : int
+                                      fill : FillStyle  style : LineStyle  label : cstr])
+
+  ;;; LinesIntervalR -- the band between two point lists: it runs along
+  ;;; `lower`'s points and back along `upper`'s y values at the same x.
+  (defstruct LinesIntervalR :copy [lower : (Vec Point)  upper : (Vec Point)
+                                   fill : FillStyle  style : LineStyle  label : cstr])
+
+  ;;; ParametricIntervalR -- the band between two parametric curves, Points f(t).
+  (defstruct ParametricIntervalR :copy [f1 : (fn [float] Point)  f2 : (fn [float] Point)
+                                        t-min : float  t-max : float  samples : int
+                                        fill : FillStyle  style : LineStyle  label : cstr])
+
+  ;;; PolarIntervalR -- the band between two polar curves radius = f(theta).
+  (defstruct PolarIntervalR :copy [f1 : (fn [float] float)  f2 : (fn [float] float)
+                                   theta-min : float  theta-max : float  samples : int
+                                   fill : FillStyle  style : LineStyle  label : cstr])
+
+  ;;; __draw-lines-interval -- fill (then outline) the band between two lowered point lists.
+  (defn __draw-lines-interval [ctx : DrawCtx  lower : Cells  upper : Cells  fill : FillStyle  style : LineStyle] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    #include <stdlib.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_close_path(void* canvas);
+    extern void plutovg_canvas_fill_preserve(void* canvas);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_fill_style(void *, int64_t);
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+      bool started = false;
+      int count = 0;
+      for (Cons *p = (Cons *)(intptr_t)lower; p; p = (Cons *)(intptr_t)p->tail) count++;
+      double *xs = (double *)malloc(sizeof(double) * count);
+      double *ya = (double *)malloc(sizeof(double) * count);
+      double *yb = (double *)malloc(sizeof(double) * count);
+      int idx = 0;
+      for (Cons *p = (Cons *)(intptr_t)lower, *q = (Cons *)(intptr_t)upper; p && q && idx < count; p = (Cons *)(intptr_t)p->tail, q = (Cons *)(intptr_t)q->tail, idx++) {
+        Cons *pa = (Cons *)(intptr_t)p->head; Cons *pb = (Cons *)(intptr_t)q->head;
+        xs[idx] = BITS_DBL(pa->head); ya[idx] = BITS_DBL(pa->tail); yb[idx] = BITS_DBL(pb->tail);
+      }
+      for (int i = 0; i < idx; i++) {
+        double vx, vy; MAP_POINT(xs[i], ya[i], &vx, &vy);
+        if (!started) { plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy); started = true; }
+        else plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
+      }
+      for (int i = idx - 1; i >= 0; i--) {
+        double vx, vy; MAP_POINT(xs[i], yb[i], &vx, &vy);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
+      }
+      free(xs); free(ya); free(yb);
+      plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+      /* fill_preserve: the outline strokes the same path (fill clears it). */
+      plutovg_canvas_fill_preserve((plutovg_canvas_t *)(intptr_t)canvas);
+      SET_LINE_STYLE(style, ((int *)0));
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef SET_FILL_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-curve-interval -- fill (then outline) the band between two sampled
+  ;;; curves: `mode` 40 y = f(x), 42 Points f(t), 43 radii f(theta). The
+  ;;; three interval kinds' draws share it; pinned for their inline C. `fill`
+  ;;; and `style` arrive as words because a C caller declares this prototype
+  ;;; itself, and the C type an opaque lowers to is the compiler's choice.
+  (defn (export-as "plot_draw_curve_interval")
+        __draw-curve-interval [ctx : ptr<void>  mode : int  f1 : int  f2 : int
+                               t-lo : float  t-hi : float  samples : int
+                               fill : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    #include <stdlib.h>
+    extern double cos(double);
+    extern double sin(double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_close_path(void* canvas);
+    extern void plutovg_canvas_fill_preserve(void* canvas);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_fill_style(void *, int64_t);
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    extern void plot_eval_point(int64_t, double, void *, void *);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+      int n = (int)samples; if (n < 32) n = 32;
+      bool started = false;
+      double *xs = (double *)malloc(sizeof(double) * n);
+      double *ya = (double *)malloc(sizeof(double) * n);
+      double *yb = (double *)malloc(sizeof(double) * n);
+      for (int i = 0; i < n; i++) {
+        double t = t_lo + (t_hi - t_lo) * ((double)i / (double)(n - 1));
+        if (mode == 40) {
+          xs[i] = t;
+          ya[i] = TUR_APPLY1_T(double, double, f1, t);
+          yb[i] = TUR_APPLY1_T(double, double, f2, t);
+        } else if (mode == 42) {
+          double pax = 0.0, pay = 0.0, pbx = 0.0, pby = 0.0;
+          plot_eval_point(f1, t, &pax, &pay);
+          plot_eval_point(f2, t, &pbx, &pby);
+          (void)pbx;
+          xs[i] = pax; ya[i] = pay; yb[i] = pby;
+        } else {
+          double ra = TUR_APPLY1_T(double, double, f1, t);
+          double rb = TUR_APPLY1_T(double, double, f2, t);
+          xs[i] = ra * cos(t); ya[i] = ra * sin(t); yb[i] = rb * sin(t);
+        }
+      }
+      for (int i = 0; i < n; i++) {
+        double vx, vy; MAP_POINT(xs[i], ya[i], &vx, &vy);
+        if (!started) { plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy); started = true; }
+        else plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
+      }
+      for (int i = n - 1; i >= 0; i--) {
+        double vx, vy;
+        if (mode == 43) {
+          double x2 = TUR_APPLY1_T(double, double, f2, t_lo + (t_hi - t_lo) * ((double)i / (double)(n - 1))) * cos(t_lo + (t_hi - t_lo) * ((double)i / (double)(n - 1)));
+          MAP_POINT(x2, yb[i], &vx, &vy);
+        } else MAP_POINT(xs[i], yb[i], &vx, &vy);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
+      }
+      free(xs); free(ya); free(yb);
+      plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+      /* fill_preserve: the outline strokes the same path (fill clears it). */
+      plutovg_canvas_fill_preserve((plutovg_canvas_t *)(intptr_t)canvas);
+      SET_LINE_STYLE(style, ((int *)0));
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef SET_FILL_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-function-interval -- the function-interval band, through __draw-curve-interval.
+  (defn __draw-function-interval [ctx : DrawCtx  ^fat f1 : (fn [float] float)  ^fat f2 : (fn [float] float)
+                  x-min : float  x-max : float  samples : int  fill : FillStyle  style : LineStyle] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_draw_curve_interval(void *, int64_t, int64_t, int64_t, double, double,
+                                         int64_t, int64_t, int64_t);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      plot_draw_curve_interval(dc, 40, f1, f2, x_min, x_max, samples,
+                               (int64_t)(intptr_t)fill, (int64_t)(intptr_t)style);
+    } while (0);
+    ```)
+
+  ;;; __draw-parametric-interval -- the parametric-interval band, through __draw-curve-interval.
+  (defn __draw-parametric-interval [ctx : DrawCtx  ^fat f1 : (fn [float] Point)  ^fat f2 : (fn [float] Point)
+                  t-min : float  t-max : float  samples : int  fill : FillStyle  style : LineStyle] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_draw_curve_interval(void *, int64_t, int64_t, int64_t, double, double,
+                                         int64_t, int64_t, int64_t);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      plot_draw_curve_interval(dc, 42, f1, f2, t_min, t_max, samples,
+                               (int64_t)(intptr_t)fill, (int64_t)(intptr_t)style);
+    } while (0);
+    ```)
+
+  ;;; __draw-polar-interval -- the polar-interval band, through __draw-curve-interval.
+  (defn __draw-polar-interval [ctx : DrawCtx  ^fat f1 : (fn [float] float)  ^fat f2 : (fn [float] float)
+                  theta-min : float  theta-max : float  samples : int  fill : FillStyle  style : LineStyle] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_draw_curve_interval(void *, int64_t, int64_t, int64_t, double, double,
+                                         int64_t, int64_t, int64_t);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      plot_draw_curve_interval(dc, 43, f1, f2, theta_min, theta_max, samples,
+                               (int64_t)(intptr_t)fill, (int64_t)(intptr_t)style);
+    } while (0);
+    ```)
+
+  ;; Bounds: a sampled band's extent is unknown until it is sampled, so it
+  ;; constrains nothing; the lines band spans both point lists.
+  (definstance Renderer [FunctionIntervalR]
+    (bounds [r] (bbox-empty-box))
+    (draw [r ctx] (__draw-function-interval ctx (.f1 r) (.f2 r) (.x-min r) (.x-max r)
+                                            (.samples r) (.fill r) (.style r)))
+    (legend-label [r] (.label r)))
+
+  (definstance Renderer [LinesIntervalR]
+    (bounds [r] (bbox-union (__bbox-of-points (.lower r)) (__bbox-of-points (.upper r))))
+    (draw [r ctx]
+      (let [lo (__points->cells (.lower r))
+            hi (__points->cells (.upper r))]
+        (__draw-lines-interval ctx lo hi (.fill r) (.style r))
+        (__free-cells lo 1)
+        (__free-cells hi 1)))
+    (legend-label [r] (.label r)))
+
+  (definstance Renderer [ParametricIntervalR]
+    (bounds [r] (bbox-empty-box))
+    (draw [r ctx] (__draw-parametric-interval ctx (.f1 r) (.f2 r) (.t-min r) (.t-max r)
+                                              (.samples r) (.fill r) (.style r)))
+    (legend-label [r] (.label r)))
+
+  (definstance Renderer [PolarIntervalR]
+    (bounds [r] (bbox-empty-box))
+    (draw [r ctx] (__draw-polar-interval ctx (.f1 r) (.f2 r) (.theta-min r) (.theta-max r)
+                                         (.samples r) (.fill r) (.style r)))
+    (legend-label [r] (.label r)))
 
   ;;; function-interval -- shade between f1(x) and f2(x).
-  (defn function-interval [f1 f2 x-min : float x-max : float samples : int fill : int style : int label : cstr] : int
-    (__renderer-bounds
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 40 fill style f1 f2 0 0 0 label "")
-                           x-min x-max 0.0 0.0 0.0 0.0)
-        samples 0 0 0)
-      x-min x-max (__nan) (__nan)))
+  ;;;
+  ;;; Parameters:
+  ;;;   f1      -- the lower curve, a (fn [float] float)
+  ;;;   f2      -- the upper curve, a (fn [float] float)
+  ;;;   x-min   -- start of the sampled domain
+  ;;;   x-max   -- end of the sampled domain
+  ;;;   samples -- sample count (at least 32 are drawn)
+  ;;;   fill    -- the FillStyle of the band
+  ;;;   style   -- the LineStyle of its outline
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A FunctionIntervalR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (function-interval lo hi -1.0 1.0 96 (default-fill-style) (default-line-style) "band")
+  (defn function-interval [^fat f1 : (fn [float] float)  ^fat f2 : (fn [float] float)
+                           x-min : float  x-max : float  samples : int
+                           fill : FillStyle  style : LineStyle  label : cstr] : AnyRenderer
+    (any-renderer (make-struct FunctionIntervalR f1 f2 x-min x-max samples fill style label)))
 
   ;;; lines-interval -- shade between two sampled line lists.
-  (defn lines-interval [vs1 : int vs2 : int fill : int style : int label : cstr] : int
-    (__make-renderer 41 fill style vs1 vs2 0 0 0 label ""))
+  ;;;
+  ;;; Parameters:
+  ;;;   vs1   -- the points along one edge
+  ;;;   vs2   -- the points along the other, same x order (their y is used)
+  ;;;   fill  -- the FillStyle of the band
+  ;;;   style -- the LineStyle of its outline
+  ;;;   label -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A LinesIntervalR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (lines-interval lo-pts hi-pts (default-fill-style) (default-line-style) "ci")
+  (defn lines-interval [vs1 : (Vec Point)  vs2 : (Vec Point)  fill : FillStyle  style : LineStyle  label : cstr] : AnyRenderer
+    (any-renderer (make-struct LinesIntervalR vs1 vs2 fill style label)))
 
   ;;; parametric-interval -- shade between two parametric curves.
-  (defn parametric-interval [f1 f2 t-min : float t-max : float samples : int fill : int style : int label : cstr] : int
-    (__renderer-ints
-      (__renderer-floats (__make-renderer 42 fill style f1 f2 0 0 0 label "")
-                         t-min t-max 0.0 0.0 0.0 0.0)
-      samples 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   f1      -- one edge, a (fn [float] Point)
+  ;;;   f2      -- the other edge, likewise
+  ;;;   t-min   -- start of the parameter range
+  ;;;   t-max   -- end of the parameter range
+  ;;;   samples -- sample count (at least 32 are drawn)
+  ;;;   fill    -- the FillStyle of the band
+  ;;;   style   -- the LineStyle of its outline
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A ParametricIntervalR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (parametric-interval inner outer 0.0 1.0 72 (default-fill-style) (default-line-style) "")
+  (defn parametric-interval [^fat f1 : (fn [float] Point)  ^fat f2 : (fn [float] Point)
+                             t-min : float  t-max : float  samples : int
+                             fill : FillStyle  style : LineStyle  label : cstr] : AnyRenderer
+    (any-renderer (make-struct ParametricIntervalR f1 f2 t-min t-max samples fill style label)))
 
   ;;; polar-interval -- shade between two polar curves.
-  (defn polar-interval [f1 f2 theta-min : float theta-max : float samples : int fill : int style : int label : cstr] : int
-    (__renderer-ints
-      (__renderer-floats (__make-renderer 43 fill style f1 f2 0 0 0 label "")
-                         theta-min theta-max 0.0 0.0 0.0 0.0)
-      samples 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   f1        -- the inner radius, a (fn [float] float) of theta
+  ;;;   f2        -- the outer radius, likewise
+  ;;;   theta-min -- start of the angle range, in radians
+  ;;;   theta-max -- end of the angle range, in radians
+  ;;;   samples   -- sample count (at least 32 are drawn)
+  ;;;   fill      -- the FillStyle of the band
+  ;;;   style     -- the LineStyle of its outline
+  ;;;   label     -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A PolarIntervalR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (polar-interval r-in r-out 0.0 3.14 72 (default-fill-style) (default-line-style) "")
+  (defn polar-interval [^fat f1 : (fn [float] float)  ^fat f2 : (fn [float] float)
+                        theta-min : float  theta-max : float  samples : int
+                        fill : FillStyle  style : LineStyle  label : cstr] : AnyRenderer
+    (any-renderer (make-struct PolarIntervalR f1 f2 theta-min theta-max samples fill style label)))
 
 ) ;; end defmodule plot/interval

@@ -1,24 +1,400 @@
 ;; plot/area.tur -- filled rectangles and histogram renderers.
+;;
+;; Each kind is a struct with a `Renderer` instance; the constructors box it as
+;; an `AnyRenderer`.
 
 (defmodule plot/area
-  (export rectangles area-histogram discrete-histogram stacked-histogram)
+  (export rectangles area-histogram discrete-histogram stacked-histogram
+          RectanglesR AreaHistogramR DiscreteHistogramR StackedHistogramR)
 
-  (import plot/core :refer [__make-renderer __renderer-ints])
+  (import plot/core  :refer [BBox any-renderer DrawCtx
+                             __bbox-of-rects __bbox-of-bars __bbox-of-groups])
+  (import plot/style :refer [FillStyle])
+  (import plot/data  :refer [Rect Bar Group Cells
+                             __rects->cells __bars->cells __groups->cells
+                             __free-cells __free-groups])
 
-  ;;; rectangles -- draw filled rectangles from nested cons quads.
-  (defn rectangles [rects : int fill : int label : cstr] : int
-    (__make-renderer 50 fill 0 rects 0 0 0 0 label ""))
+  ;;; RectanglesR -- rectangles in one fill.
+  (defstruct RectanglesR :copy [rects : (Vec Rect)  fill : FillStyle  label : cstr])
+
+  ;;; AreaHistogramR -- pre-bucketed bars, each a Rect taking the next style
+  ;;; of `fills` (the default fill past its end).
+  (defstruct AreaHistogramR :copy [bars : (Vec Rect)  fills : (Vec FillStyle)  label : cstr])
+
+  ;;; DiscreteHistogramR -- one Bar per category slot 0, 1, 2, ...;
+  ;;; `horizontal` lays them along the y axis.
+  (defstruct DiscreteHistogramR :copy [bars : (Vec Bar)  fill : FillStyle  horizontal : bool  label : cstr])
+
+  ;;; StackedHistogramR -- one Group per category slot, a stack of its values,
+  ;;; layer i filled with the i-th style of `fills` in every group; `labels`
+  ;;; names the stack layers, one legend row each.
+  (defstruct StackedHistogramR :copy [groups : (Vec Group)  fills : (Vec FillStyle)  labels : (Vec cstr)
+                                      horizontal : bool])
+
+  ;;; __draw-rects -- fill each (x0 . (x1 . (y0 . y1))) quad with `fill`.
+  (defn __draw-rects [ctx : DrawCtx  rects : Cells  fill : FillStyle] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double fabs(double);
+    extern double fmin(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_fill(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_fill_style(void *, int64_t);
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      /* One fill for every rectangle: an auto color resolves once. */
+      SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+      for (Cons *p = (Cons *)(intptr_t)rects; p; p = (Cons *)(intptr_t)p->tail) {
+        Cons *a = (Cons *)(intptr_t)p->head;
+        double x0 = BITS_DBL(a->head);
+        Cons *b = (Cons *)(intptr_t)a->tail;
+        double x1 = BITS_DBL(b->head);
+        Cons *c = (Cons *)(intptr_t)b->tail;
+        double y0 = BITS_DBL(c->head);
+        double y1 = BITS_DBL(c->tail);
+        double vx0, vy0, vx1, vy1; MAP_POINT(x0, y0, &vx0, &vy0); MAP_POINT(x1, y1, &vx1, &vy1);
+        plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)fmin(vx0, vx1), (float)fmin(vy0, vy1), (float)fabs(vx1 - vx0), (float)fabs(vy1 - vy0));
+        plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+      }
+    } while (0);
+    #undef SET_FILL_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-area-hist -- fill each (x0 . (x1 . (y0 . y1))) bar with the next
+  ;;; style of `fills`, then the default fill once they run out.
+  (defn __draw-area-hist [ctx : DrawCtx  bars : Cells  fills : (Vec FillStyle)] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double fabs(double);
+    extern double fmin(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_fill(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_fill_style(void *, int64_t);
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    typedef struct { int64_t *data; size_t len; size_t cap; } FillVec;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      FillVec *fv = (FillVec *)(intptr_t)fills;
+      size_t fi = 0;
+      for (Cons *p = (Cons *)(intptr_t)bars; p; p = (Cons *)(intptr_t)p->tail) {
+        int64_t fill = (fv && fi < fv->len) ? fv->data[fi] : 0;
+        SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+        Cons *a = (Cons *)(intptr_t)p->head;
+        double x0 = BITS_DBL(a->head);
+        Cons *b = (Cons *)(intptr_t)a->tail;
+        double x1 = BITS_DBL(b->head);
+        Cons *c = (Cons *)(intptr_t)b->tail;
+        double y0 = BITS_DBL(c->head);
+        double y1 = BITS_DBL(c->tail);
+        double vx0, vy0, vx1, vy1; MAP_POINT(x0, y0, &vx0, &vy0); MAP_POINT(x1, y1, &vx1, &vy1);
+        plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)fmin(vx0, vx1), (float)fmin(vy0, vy1), (float)fabs(vx1 - vx0), (float)fabs(vy1 - vy0));
+        plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+        fi++;
+      }
+    } while (0);
+    #undef SET_FILL_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-discrete-hist -- fill a 0.8-wide bar per (label . height) at slots
+  ;;; 0, 1, 2, ...; along the y axis when `horizontal`.
+  (defn __draw-discrete-hist [ctx : DrawCtx  bars : Cells  fill : FillStyle  horizontal : bool] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double fabs(double);
+    extern double fmin(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_fill(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_fill_style(void *, int64_t);
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      /* One fill for every bar: an auto color resolves once. */
+      SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+      int idx = 0;
+      for (Cons *p = (Cons *)(intptr_t)bars; p; p = (Cons *)(intptr_t)p->tail, idx++) {
+        double x0 = idx, x1 = idx + 0.8;
+        Cons *bar = (Cons *)(intptr_t)p->head;
+        double h = BITS_DBL(bar->tail);
+        double vx0, vy0, vx1, vy1;
+        if (horizontal) { MAP_POINT(0.0, x0, &vx0, &vy0); MAP_POINT(h, x1, &vx1, &vy1); }
+        else { MAP_POINT(x0, 0.0, &vx0, &vy0); MAP_POINT(x1, h, &vx1, &vy1); }
+        plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)vx0, (float)fmin(vy0, vy1), (float)(vx1 - vx0), (float)fabs(vy1 - vy0));
+        plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+      }
+    } while (0);
+    #undef SET_FILL_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-stacked-hist -- fill each (label . values) slot as a stack, each
+  ;;; layer taking the next style of `fills` (the default fill past the end).
+  (defn __draw-stacked-hist [ctx : DrawCtx  groups : Cells  fills : (Vec FillStyle)  horizontal : bool] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double fabs(double);
+    extern double fmin(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_fill(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_fill_style(void *, int64_t);
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_series(void *, int64_t);
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    typedef struct { int64_t *data; size_t len; size_t cap; } FillVec;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    FillVec *fv = (FillVec *)(intptr_t)fills;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      /* Layer by layer, so each layer's fill -- an auto color included --
+         resolves once and colors that layer in every group; layer k is the
+         renderer's series k, its legend row's swatch. */
+      int nlayers = 0;
+      for (Cons *p = (Cons *)(intptr_t)groups; p; p = (Cons *)(intptr_t)p->tail) {
+        Cons *grp = (Cons *)(intptr_t)p->head;
+        int c = 0;
+        for (Cons *v = (Cons *)(intptr_t)grp->tail; v; v = (Cons *)(intptr_t)v->tail) c++;
+        if (c > nlayers) nlayers = c;
+      }
+      for (int k = 0; k < nlayers; k++) {
+        int64_t fill = (fv && (size_t)k < fv->len) ? fv->data[k] : 0;
+        plot_ctx_series(dc, k);
+        SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+        int idx = 0;
+        for (Cons *p = (Cons *)(intptr_t)groups; p; p = (Cons *)(intptr_t)p->tail, idx++) {
+          double x0 = idx, x1 = idx + 0.8;
+          Cons *grp = (Cons *)(intptr_t)p->head;
+          double acc = 0.0;
+          Cons *vals = (Cons *)(intptr_t)grp->tail;
+          for (int j = 0; vals && j < k; j++) {
+            acc += BITS_DBL(vals->head);
+            vals = (Cons *)(intptr_t)vals->tail;
+          }
+          if (!vals) continue;
+          double h = BITS_DBL(vals->head);
+          double vx0, vy0, vx1, vy1;
+          if (horizontal) { MAP_POINT(acc, x0, &vx0, &vy0); MAP_POINT(acc + h, x1, &vx1, &vy1); }
+          else { MAP_POINT(x0, acc, &vx0, &vy0); MAP_POINT(x1, acc + h, &vx1, &vy1); }
+          plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)vx0, (float)fmin(vy0, vy1), (float)(vx1 - vx0), (float)fabs(vy1 - vy0));
+          plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+        }
+      }
+    } while (0);
+    #undef SET_FILL_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __bar-labels -- the tick labels of `bars[i..n)` pushed onto `out`.
+  (defn __bar-labels [bars : (Vec Bar)  i : int  n : int  out : (Vec cstr)] : (Vec cstr)
+    (if (>= i n) out
+      (do (vec-push! out (.label (vec-get bars i)))
+          (__bar-labels bars (+ i 1) n out))))
+
+  ;;; __copy-labels -- `labels[i..n)` pushed onto `out`.
+  (defn __copy-labels [labels : (Vec cstr)  i : int  n : int  out : (Vec cstr)] : (Vec cstr)
+    (if (>= i n) out
+      (do (vec-push! out (vec-get labels i))
+          (__copy-labels labels (+ i 1) n out))))
+
+  ;;; __group-labels -- the tick labels of `groups[i..n)` pushed onto `out`.
+  (defn __group-labels [groups : (Vec Group)  i : int  n : int  out : (Vec cstr)] : (Vec cstr)
+    (if (>= i n) out
+      (do (vec-push! out (.label (vec-get groups i)))
+          (__group-labels groups (+ i 1) n out))))
+
+  ;; The categorical kinds lay the x axis out as categories, labelled by their
+  ;; bars' (or groups') labels.
+  (definstance Renderer [RectanglesR]
+    (bounds [r] (__bbox-of-rects (.rects r)))
+    (draw [r ctx]
+      (let [cells (__rects->cells (.rects r))]
+        (__draw-rects ctx cells (.fill r))
+        (__free-cells cells 3)))
+    (legend-label [r] (.label r)))
+
+  (definstance Renderer [AreaHistogramR]
+    (bounds [r] (__bbox-of-rects (.bars r)))
+    (draw [r ctx]
+      (let [cells (__rects->cells (.bars r))]
+        (__draw-area-hist ctx cells (.fills r))
+        (__free-cells cells 3)))
+    (legend-label [r] (.label r)))
+
+  (definstance Renderer [DiscreteHistogramR]
+    (bounds [r] (__bbox-of-bars (.bars r) (.horizontal r)))
+    (draw [r ctx]
+      (let [cells (__bars->cells (.bars r))]
+        (__draw-discrete-hist ctx cells (.fill r) (.horizontal r))
+        (__free-cells cells 1)))
+    (legend-label [r] (.label r))
+    (categorical? [r] true)
+    (categories-on-y? [r] (.horizontal r))
+    (category-labels [r]
+      (__bar-labels (.bars r) 0 (vec-len (.bars r)) (:: (vec-new) (Vec cstr)))))
+
+  (definstance Renderer [StackedHistogramR]
+    (bounds [r] (__bbox-of-groups (.groups r) (.horizontal r)))
+    (draw [r ctx]
+      (let [cells (__groups->cells (.groups r))]
+        (__draw-stacked-hist ctx cells (.fills r) (.horizontal r))
+        (__free-groups cells)))
+    (legend-labels [r]
+      (__copy-labels (.labels r) 0 (vec-len (.labels r)) (:: (vec-new) (Vec cstr))))
+    (categorical? [r] true)
+    (categories-on-y? [r] (.horizontal r))
+    (category-labels [r]
+      (__group-labels (.groups r) 0 (vec-len (.groups r)) (:: (vec-new) (Vec cstr)))))
+
+  ;;; rectangles -- draw filled rectangles.
+  ;;;
+  ;;; Parameters:
+  ;;;   rects -- the rectangles
+  ;;;   fill  -- the FillStyle of the rectangles
+  ;;;   label -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A RectanglesR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (rectangles (vec-of (Rect 0.0 1.0 0.0 2.0)) (default-fill-style) "boxes")
+  (defn rectangles [rects : (Vec Rect)  fill : FillStyle  label : cstr] : AnyRenderer
+    (any-renderer (make-struct RectanglesR rects fill label)))
 
   ;;; area-histogram -- draw pre-bucketed bars with cycling fills.
-  (defn area-histogram [bars : int fill-styles : int label : cstr] : int
-    (__make-renderer 51 0 0 bars fill-styles 0 0 0 label ""))
+  ;;;
+  ;;; Parameters:
+  ;;;   bars        -- the bars, each a Rect
+  ;;;   fill-styles -- the FillStyle of each bar, in order (the default past the end)
+  ;;;   label       -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   An AreaHistogramR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (area-histogram buckets (vec-of (fill-style 0 0.5 -1 0.0) (fill-style 1 0.5 -1 0.0)) "hist")
+  (defn area-histogram [bars : (Vec Rect)  fill-styles : (Vec FillStyle)  label : cstr] : AnyRenderer
+    (any-renderer (make-struct AreaHistogramR bars fill-styles label)))
 
   ;;; discrete-histogram -- categorical bar chart.
-  (defn discrete-histogram [bars : int fill : int invert : int label : cstr] : int
-    (__renderer-ints (__make-renderer 52 fill 0 bars bars 0 0 0 label "") invert 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   bars       -- one Bar per category
+  ;;;   fill       -- the FillStyle of the bars
+  ;;;   horizontal -- true to lay the bars along the y axis
+  ;;;   label      -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A DiscreteHistogramR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (discrete-histogram (vec-of (Bar "a" 3.0) (Bar "b" 5.0)) (default-fill-style) false "counts")
+  (defn discrete-histogram [bars : (Vec Bar)  fill : FillStyle  horizontal : bool  label : cstr] : AnyRenderer
+    (any-renderer (make-struct DiscreteHistogramR bars fill horizontal label)))
 
   ;;; stacked-histogram -- stacked categorical bars.
-  (defn stacked-histogram [groups : int fills : int labels : int invert : int] : int
-    (__renderer-ints (__make-renderer 53 0 0 groups groups fills labels 0 "" "") invert 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   groups     -- one Group per category
+  ;;;   fills      -- the FillStyle of each stack layer (the default past the end)
+  ;;;   labels     -- the layer names, listed in the legend
+  ;;;   horizontal -- true to lay the stacks along the y axis
+  ;;;
+  ;;; Returns:
+  ;;;   A StackedHistogramR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (stacked-histogram (vec-of (Group "Q1" (vec-of 1.0 0.5)) (Group "Q2" (vec-of 1.25 0.75)))
+  ;;;                      (vec-of (default-fill-style) (default-fill-style))
+  ;;;                      (vec-of "base" "extra") false)
+  (defn stacked-histogram [groups : (Vec Group)  fills : (Vec FillStyle)  labels : (Vec cstr)
+                           horizontal : bool] : AnyRenderer
+    (any-renderer (make-struct StackedHistogramR groups fills labels horizontal)))
 
 ) ;; end defmodule plot/area

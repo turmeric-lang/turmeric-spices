@@ -1,38 +1,22 @@
-;; tests/plot/any_renderer_test.tur -- P3 of the plot Renderer typeclass plan.
+;; tests/plot/any_renderer_test.tur -- the `AnyRenderer` existential box.
 ;;
-;; Proves the `AnyRenderer` existential box: a single `Vec` holds renderers of
-;; different kinds (LinesR / PointsR / LabelR), and `renderers-bbox` unions
-;; their `bounds` by dispatching through each element's *packed* Renderer
-;; dictionary -- not a runtime `kind` switch. This is the heterogeneous
-;; dispatch the plan's P3 needed, unblocked by turmeric's witness-indirected
-;; `open` (PRs #452 / #456 / #458).
+;; A single `Vec` holds renderers of different kinds (LinesR / PointsR / LabelR
+;; / Decoration), and `renderers-bbox` unions their `bounds` by dispatching
+;; through each element's *packed* Renderer dictionary -- not a runtime `kind`
+;; switch. The public constructors return AnyRenderer, so a plain `vec-of`
+;; over them is such a Vec.
 
 (defmodule plot/tests/any_renderer
   (import plot/core  :refer [BBox bbox-empty?
-                             lines-r points-r label-r
                              any-renderer renderers-bbox bbox-union bbox-empty-box])
-  (import plot/style :refer [default-line-style])
+  (import plot/line  :refer [LinesR lines])
+  (import plot/point :refer [PointsR points])
+  (import plot/decor :refer [LabelR axes point-label])
+  (import plot/style :refer [default-line-style default-point-style])
+  (import plot/data  :refer [Point])
   (import test/assert :refer [assert-true])
   (import test/suite  :refer [describe it])
   (import test/runner :refer [run-all-status])
-
-  (defn xy-pair [x : float y : float] : int
-    ```c
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    Cons *p = malloc(sizeof(*p));
-    union { double d; int64_t i; } ux, uy;
-    ux.d = x; uy.d = y;
-    p->head = ux.i; p->tail = uy.i;
-    return (int64_t)(intptr_t)p;
-    ```)
-
-  (defn t-cons [v : int n : int] : int
-    ```c
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    Cons *c = malloc(sizeof(*c));
-    c->head = v; c->tail = n;
-    return (int64_t)(intptr_t)c;
-    ```)
 
   (defn close? [a : float b : float] : bool
     ```c
@@ -42,10 +26,8 @@
     ```)
 
   ;; LinesR over points (-2,-1), (-1,0.5), (1,1.5) -> box x:[-2,1] y:[-1,1.5].
-  (defn sample-points [] : int
-    (t-cons (xy-pair -2.0 -1.0)
-      (t-cons (xy-pair -1.0 0.5)
-        (t-cons (xy-pair 1.0 1.5) 0))))
+  (defn sample-points [] : (Vec Point)
+    (vec-of (Point -2.0 -1.0) (Point -1.0 0.5) (Point 1.0 1.5)))
 
   (defn bbox-eq? [bb : BBox  x0 : float x1 : float y0 : float y1 : float] : bool
     (and (assert-true (not (bbox-empty? bb)))
@@ -56,11 +38,11 @@
 
   ;; Build a heterogeneous Vec of boxed renderers. The element type must be
   ;; ascribed -- vec-new/vec-push! do not infer it from the pushes.
-  (defn mixed-vec [] : (Vec (exists [a] [(Renderer a)] a))
-    (let [rs (:: (vec-new) (Vec (exists [a] [(Renderer a)] a)))]
-      (vec-push! rs (any-renderer (lines-r  (sample-points) (default-line-style) "")))
-      (vec-push! rs (any-renderer (points-r (sample-points) (default-line-style) "")))
-      (vec-push! rs (any-renderer (label-r  3.0 4.0 "hi" (default-line-style))))
+  (defn mixed-vec [] : (Vec AnyRenderer)
+    (let [rs (:: (vec-new) (Vec AnyRenderer))]
+      (vec-push! rs (any-renderer (make-struct LinesR  (sample-points) (default-line-style) "")))
+      (vec-push! rs (any-renderer (make-struct PointsR (sample-points) (default-line-style) "")))
+      (vec-push! rs (any-renderer (make-struct LabelR  3.0 4.0 "hi" (default-line-style))))
       rs))
 
   ;; The union of the three kinds' boxes:
@@ -71,11 +53,24 @@
   (defn heterogeneous-union [] : bool
     (bbox-eq? (renderers-bbox (mixed-vec)) -2.0 3.0 -1.0 4.0))
 
+  ;; The same Vec built from the public constructors, which box for you; the
+  ;; axes decoration contributes nothing.
+  (defn constructor-vec-union [] : bool
+    (bbox-eq? (renderers-bbox (vec-of (axes)
+                                      (lines (sample-points) (default-line-style) "")
+                                      (points (sample-points) (default-point-style) "")
+                                      (point-label 3.0 4.0 "hi" 0)))
+              -2.0 3.0 -1.0 4.0))
+
+  ;; Nothing constrains the extent -> an empty box.
+  (defn decorations-only-empty [] : bool
+    (assert-true (bbox-empty? (renderers-bbox (vec-of (axes))))))
+
   ;; A single-element vec recovers exactly that renderer's bounds (sanity that
   ;; the fold seeds from the empty box correctly).
   (defn single-element [] : bool
-    (let [rs (:: (vec-new) (Vec (exists [a] [(Renderer a)] a)))]
-      (vec-push! rs (any-renderer (label-r 3.0 4.0 "hi" (default-line-style))))
+    (let [rs (:: (vec-new) (Vec AnyRenderer))]
+      (vec-push! rs (any-renderer (make-struct LabelR 3.0 4.0 "hi" (default-line-style))))
       (bbox-eq? (renderers-bbox rs) 3.0 3.0 4.0 4.0)))
 
   ;; bbox-union treats an empty box as the identity.
@@ -87,6 +82,8 @@
   (defn main [] : int
     (describe "plot/core AnyRenderer -- heterogeneous existential dispatch"
       (it "renderers-bbox unions bounds across mixed kinds" (heterogeneous-union))
+      (it "a vec-of over the constructors is a (Vec AnyRenderer)" (constructor-vec-union))
+      (it "decorations alone leave the extent empty" (decorations-only-empty))
       (it "single-element vec recovers that renderer's bounds" (single-element))
       (it "bbox-union: empty box is the identity" (empty-is-identity)))
     (run-all-status)))

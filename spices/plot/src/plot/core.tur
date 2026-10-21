@@ -8,19 +8,34 @@
           ;; tests/plot/backend_test.tur fail on "symbol 'SurfaceBackend' is
           ;; private to module 'plot/core'".
           CanvasBackend SurfaceBackend PngBackend
-          __make-renderer __renderer-floats __renderer-ints __renderer-bounds
+          ;; any-renderer boxes a value as the AnyRenderer every public
+          ;; constructor returns. (The `Renderer` class, its methods and the
+          ;; `AnyRenderer` alias are global, as every class and alias is;
+          ;; they are not exported by name.)
+          any-renderer
+          ;; what a kind's `draw` method draws through
+          DrawCtx FrameMarks no-frame-marks frame-marks-union
+          ;; `legend-labels`' default body, compiled in each instance's module
+          __one-label
           __surface-create __surface-destroy __surface-write-png
           __canvas-create __canvas-destroy
           __plot-sample-adaptive
-          BBox renderer-bbox bbox-empty? bbox-from-raw
-          LinesR PointsR LabelR lines-r points-r label-r
-          any-renderer renderers-bbox bbox-union bbox-empty-box
-          anyrenderers->legacy plot-anyrenderers __surfaces-equal?
+          BBox renderer-bbox renderers-bbox bbox-empty? bbox-from-raw
+          __bbox-of-points __bbox-of-error-bars __bbox-of-arrows __bbox-of-rects
+          __bbox-of-bars __bbox-of-groups
+          bbox-union bbox-empty-box point-bbox hint-bbox
+          __point-list-bbox __error-bars-bbox __arrows-bbox __rects-bbox
+          __discrete-hist-bbox __stacked-hist-bbox
+          plot-anyrenderers __surfaces-equal?
           __ok? __ok-val __err-val
           __surface-width __surface-height __surface-pixel-byte
           __pixel-is-background? __count-non-background)
 
-  (import plot/style :refer [plot-opts-width plot-opts-height])
+  (import plot/style :refer [PlotOpts plot-opts-width plot-opts-height])
+  (import plot/data  :refer [Point ErrorBar Arrow Rect Bar Group Cells
+                             __points->cells __error-bars->cells __arrows->cells __rects->cells
+                             __bars->cells __groups->cells __labels->cells
+                             __free-cells __free-groups])
 
   ;; Result helpers: route through the typed preamble builders /
   ;; inspectors (tur_ok_int / tur_err_int / tur_is_ok / tur_ok_value /
@@ -58,110 +73,6 @@
   (defn __err-val [r : ptr<void>] : int
     ```c
     return r != 0 ? tur_err_value((int64_t)(intptr_t)r) : 0;
-    ```)
-
-  ;;; __make-renderer -- allocate the generic opaque renderer handle used by all plot modules.
-  (defn __make-renderer [kind : int
-                         style1 : int style2 : int
-                         data1 : int data2 : int data3 : int data4 : int data5 : int
-                         label : cstr text : cstr] : int
-    ```c
-    #include <stdlib.h>
-    #include <stdint.h>
-    #include <string.h>
-    typedef struct __plot_renderer {
-      int64_t kind;
-      int64_t style1, style2;
-      int64_t data1, data2, data3, data4, data5;
-      double f1, f2, f3, f4, f5, f6;
-      int64_t i1, i2, i3, i4;
-      char *label;
-      char *text;
-      double x_min, x_max, y_min, y_max;
-    } PlotRenderer;
-    PlotRenderer *r = (PlotRenderer *)malloc(sizeof(*r));
-    const char *src_label = (const char *)(intptr_t)label;
-    const char *src_text = (const char *)(intptr_t)text;
-    if (!r) return 0;
-    r->kind = kind;
-    r->style1 = style1; r->style2 = style2;
-    r->data1 = data1; r->data2 = data2; r->data3 = data3; r->data4 = data4; r->data5 = data5;
-    r->f1 = 0.0; r->f2 = 0.0; r->f3 = 0.0; r->f4 = 0.0; r->f5 = 0.0; r->f6 = 0.0;
-    r->i1 = 0; r->i2 = 0; r->i3 = 0; r->i4 = 0;
-    if (src_label) {
-      size_t len = strlen(src_label);
-      r->label = (char *)malloc(len + 1);
-      if (r->label) memcpy(r->label, src_label, len + 1);
-    } else {
-      r->label = NULL;
-    }
-    if (src_text) {
-      size_t len = strlen(src_text);
-      r->text = (char *)malloc(len + 1);
-      if (r->text) memcpy(r->text, src_text, len + 1);
-    } else {
-      r->text = NULL;
-    }
-    r->x_min = 0.0 / 0.0; r->x_max = 0.0 / 0.0; r->y_min = 0.0 / 0.0; r->y_max = 0.0 / 0.0;
-    return (int64_t)(intptr_t)r;
-    ```)
-
-  ;;; __renderer-floats -- attach the six generic float payload slots to a renderer.
-  (defn __renderer-floats [renderer : int
-                           f1 : float f2 : float f3 : float f4 : float f5 : float f6 : float] : int
-    ```c
-    typedef struct __plot_renderer {
-      int64_t kind;
-      int64_t style1, style2;
-      int64_t data1, data2, data3, data4, data5;
-      double f1, f2, f3, f4, f5, f6;
-      int64_t i1, i2, i3, i4;
-      char *label;
-      char *text;
-      double x_min, x_max, y_min, y_max;
-    } PlotRenderer;
-    PlotRenderer *r = (PlotRenderer *)(intptr_t)renderer;
-    if (!r) return 0;
-    r->f1 = f1; r->f2 = f2; r->f3 = f3; r->f4 = f4; r->f5 = f5; r->f6 = f6;
-    return renderer;
-    ```)
-
-  ;;; __renderer-ints -- attach the four generic integer payload slots to a renderer.
-  (defn __renderer-ints [renderer : int i1 : int i2 : int i3 : int i4 : int] : int
-    ```c
-    typedef struct __plot_renderer {
-      int64_t kind;
-      int64_t style1, style2;
-      int64_t data1, data2, data3, data4, data5;
-      double f1, f2, f3, f4, f5, f6;
-      int64_t i1, i2, i3, i4;
-      char *label;
-      char *text;
-      double x_min, x_max, y_min, y_max;
-    } PlotRenderer;
-    PlotRenderer *r = (PlotRenderer *)(intptr_t)renderer;
-    if (!r) return 0;
-    r->i1 = i1; r->i2 = i2; r->i3 = i3; r->i4 = i4;
-    return renderer;
-    ```)
-
-  ;;; __renderer-bounds -- attach explicit bounds hints to a renderer.
-  (defn __renderer-bounds [renderer : int x-min : float x-max : float y-min : float y-max : float] : int
-    ```c
-    typedef struct __plot_renderer {
-      int64_t kind;
-      int64_t style1, style2;
-      int64_t data1, data2, data3, data4, data5;
-      double f1, f2, f3, f4, f5, f6;
-      int64_t i1, i2, i3, i4;
-      char *label;
-      char *text;
-      double x_min, x_max, y_min, y_max;
-    } PlotRenderer;
-    PlotRenderer *r = (PlotRenderer *)(intptr_t)renderer;
-    if (!r) return 0;
-    r->x_min = x_min; r->x_max = x_max; r->y_min = y_min; r->y_max = y_max;
-    return renderer;
     ```)
 
   ;;; __surface-create -- allocate a new plutovg surface.
@@ -343,39 +254,36 @@
 
   ;;; __plot-sample-adaptive -- adaptive subdivision sampler for sampled-line renderers.
   ;;;
-  ;;; Walks the parameter interval `[r->f1, r->f2]` in `initial-samples`
+  ;;; Walks the parameter interval `[t-lo, t-hi]` in `initial-samples`
   ;;; uniform pieces and bisects each piece when the angle between adjacent
   ;;; screen-space segments exceeds the subdivision threshold, up to a fixed
   ;;; recursion cap. NaN evaluations break the active sub-path so curves with
   ;;; vertical asymptotes (e.g. tan, 1/x) render as separate strokes.
   ;;;
-  ;;; Strokes the resulting polyline onto canvas. The caller is responsible for
-  ;;; installing the line style (color / width / dash / alpha) before invoking.
-  ;;; Supports renderer kinds RK_FUNCTION (21), RK_PARAMETRIC (22),
-  ;;; RK_POLAR (23), and RK_INVERSE (24); other kinds are a no-op.
+  ;;; Strokes the resulting polyline onto the context's canvas, mapped through
+  ;;; its data bounds and viewport. The caller is responsible for installing
+  ;;; the line style (color / width / dash / alpha) before invoking. `mode`
+  ;;; says how to evaluate the curve: 21 y = f(x), 22 the Point f(t) (through
+  ;;; `plot_eval_point`), 23 radius = f(theta), 24 x = f(y); any other mode is
+  ;;; a no-op.
   ;;;
   ;;; Parameters:
-  ;;;   renderer        -- PlotRenderer* (treat as opaque int64_t handle)
-  ;;;   canvas          -- plutovg canvas handle
-  ;;;   bx-min/bx-max   -- data-space x bounds
-  ;;;   by-min/by-max   -- data-space y bounds
-  ;;;   left/top        -- viewport top-left in canvas pixels
-  ;;;   plot-w/plot-h   -- viewport size in pixels
+  ;;;   ctx             -- the plot's draw context (a DrawCtx, as a pointer)
+  ;;;   mode            -- the curve's evaluation, as above
+  ;;;   curve           -- the curve: a closure handle of the mode's fn type
+  ;;;   t-lo / t-hi     -- the parameter interval
   ;;;   initial-samples -- baseline uniform sample count (clamped to >= 2)
   ;;;
   ;;; Since: plot-v0.1.0
   ;;;
   ;;; Pinned to the stable C symbol `plot_sample_adaptive` via `export-as` so
-  ;;; the inline-C call site in `plot-into-canvas` below can name it directly.
+  ;;; the inline-C curve draws in plot/line can name it directly.
   ;;; Without the pin, turmeric's injective identifier mangler encodes this
   ;;; `__`-prefixed, kebab-cased name as `..._un_unplot_hysample_hyadaptive`,
   ;;; which the hand-written C call could not track across mangling changes.
   (defn (export-as "plot_sample_adaptive")
-        __plot-sample-adaptive [renderer : int canvas : int
-                                bx-min : float bx-max : float
-                                by-min : float by-max : float
-                                left : int top : int
-                                plot-w : int plot-h : int
+        __plot-sample-adaptive [ctx : ptr<void>  mode : int  curve : int
+                                t-lo : float  t-hi : float
                                 initial-samples : int] : void
     ```c
     extern double cos(double);
@@ -389,31 +297,31 @@
     extern void plutovg_canvas_stroke(void* canvas);
     #endif
 
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    typedef struct __plot_renderer {
-      int64_t kind;
-      int64_t style1, style2;
-      int64_t data1, data2, data3, data4, data5;
-      double f1, f2, f3, f4, f5, f6;
-      int64_t i1, i2, i3, i4;
-      char *label;
-      char *text;
-      double x_min, x_max, y_min, y_max;
-    } PlotRenderer;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
 
-    #define ADAPTIVE_BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
     #define ADAPTIVE_ISNAN(v) ((v) != (v))
 
     enum { RK_FUNCTION_K = 21, RK_PARAMETRIC_K = 22, RK_POLAR_K = 23, RK_INVERSE_K = 24 };
 
-    PlotRenderer *r = (PlotRenderer *)(intptr_t)renderer;
-    void *cv = (void *)(intptr_t)canvas;
-    if (!r || !cv) return;
-    if (r->kind != RK_FUNCTION_K && r->kind != RK_INVERSE_K
-        && r->kind != RK_PARAMETRIC_K && r->kind != RK_POLAR_K) return;
+    extern void plot_eval_point(int64_t, double, void *, void *);
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    if (!dc || !dc->canvas) return;
+    void *cv = dc->canvas;
+    if (mode != RK_FUNCTION_K && mode != RK_INVERSE_K
+        && mode != RK_PARAMETRIC_K && mode != RK_POLAR_K) return;
+    double bx_min = dc->bx_min, bx_max = dc->bx_max, by_min = dc->by_min, by_max = dc->by_max;
+    int64_t left = dc->left, top = dc->top, plot_w = dc->plot_w, plot_h = dc->plot_h;
 
     int n = (int)initial_samples; if (n < 2) n = 2;
-    double t_min = r->f1, t_max = r->f2;
+    double t_min = t_lo, t_max = t_hi;
     if (!(t_max > t_min)) return;
     double inv_w = (bx_max > bx_min) ? 1.0 / (bx_max - bx_min) : 1.0;
     double inv_h = (by_max > by_min) ? 1.0 / (by_max - by_min) : 1.0;
@@ -429,14 +337,12 @@
     #define EVAL_AT(T, OUT) do { \
       double __t = (T); \
       double __x = 0.0, __y = 0.0; \
-      if (r->kind == RK_FUNCTION_K) { __x = __t; __y = ((double(*)(double))(intptr_t)r->data1)(__t); } \
-      else if (r->kind == RK_INVERSE_K) { __y = __t; __x = ((double(*)(double))(intptr_t)r->data1)(__t); } \
-      else if (r->kind == RK_PARAMETRIC_K) { \
-        Cons *__pair = (Cons *)(intptr_t)((int64_t(*)(double))(intptr_t)r->data1)(__t); \
-        if (__pair) { __x = ADAPTIVE_BITS_DBL(__pair->head); __y = ADAPTIVE_BITS_DBL(__pair->tail); } \
-        else { __x = __y = 0.0/0.0; } \
+      if (mode == RK_FUNCTION_K) { __x = __t; __y = TUR_APPLY1_T(double, double, curve, __t); } \
+      else if (mode == RK_INVERSE_K) { __y = __t; __x = TUR_APPLY1_T(double, double, curve, __t); } \
+      else if (mode == RK_PARAMETRIC_K) { \
+        plot_eval_point(curve, __t, &__x, &__y); \
       } else { \
-        double __radius = ((double(*)(double))(intptr_t)r->data1)(__t); \
+        double __radius = TUR_APPLY1_T(double, double, curve, __t); \
         __x = __radius * cos(__t); __y = __radius * sin(__t); \
       } \
       (OUT).t = __t; \
@@ -519,9 +425,32 @@
 
     #undef EVAL_AT
     #undef EMIT
-    #undef ADAPTIVE_BITS_DBL
     #undef ADAPTIVE_ISNAN
     ```)
+
+  ;;; __store-f64 -- internal: write a double through a C out-pointer.
+  (defn __store-f64 [p : ptr<void>  v : float] : void
+    ```c *(double *)p = v; ```)
+
+  ;;; __eval-point -- evaluate a curve callback for C: write f(t)'s x and y
+  ;;; through `x-out` / `y-out` (double *). Pinned as `plot_eval_point` so the
+  ;;; sampler and the parametric bands can call a Point-returning closure
+  ;;; without naming the struct's C type.
+  (defn (export-as "plot_eval_point")
+        __eval-point [^fat f : (fn [float] Point)  t : float  x-out : ptr<void>  y-out : ptr<void>] : void
+    (let [p (f t)]
+      (__store-f64 x-out (.x p))
+      (__store-f64 y-out (.y p))))
+
+  ;;; __eval-vector -- evaluate a vector-field callback for C: write f(x, y)'s
+  ;;; components through `dx-out` / `dy-out` (double *). Pinned as
+  ;;; `plot_eval_vector`.
+  (defn (export-as "plot_eval_vector")
+        __eval-vector [^fat f : (fn [float float] Point)  x : float  y : float
+                       dx-out : ptr<void>  dy-out : ptr<void>] : void
+    (let [p (f x y)]
+      (__store-f64 dx-out (.x p))
+      (__store-f64 dy-out (.y p))))
 
   ;;; data->viewport -- map data coordinates to viewport coordinates.
   (defn data->viewport [x : float y : float bx-min : float bx-max : float
@@ -555,176 +484,14 @@
     return (int64_t)(intptr_t)p;
     ```)
 
-  ;;; __renderer-bbox -- compute a single renderer's data-space bounding box.
-  ;;;
-  ;;; P0 de-monolith of the plot Renderer typeclass plan: this is the former
-  ;;; per-kind bounds-union `switch` lifted verbatim out of `plot-into-canvas`
-  ;;; into a standalone, independently-callable function. Each renderer kind
-  ;;; unions its own points into a local box; `plot-into-canvas` now folds the
-  ;;; returned box corners instead of inlining ~80 lines of per-kind C.
-  ;;;
-  ;;; Returns a malloc'd carrier `{ double x0, x1, y0, y1; int valid; }` (an
-  ;;; int64 handle). `valid == 0` means the renderer contributed no finite
-  ;;; point, so callers must skip it. The caller owns the buffer and frees it.
-  ;;;
-  ;;; Folding box corners is identical to unioning the underlying points:
-  ;;; min/max over all points == min/max over per-renderer box corners, so the
-  ;;; resolved plot bounds (and therefore every pixel) are unchanged.
-  ;;;
-  ;;; Pinned to the stable C symbol `plot_renderer_bbox` via `export-as` so the
-  ;;; inline-C fold site in `plot-into-canvas` can name it directly, mirroring
-  ;;; the `plot_sample_adaptive` pin above.
-  (defn (export-as "plot_renderer_bbox") __renderer-bbox [renderer : int] : ptr<void>
-    ```c
-    #include <stdlib.h>
-    #include <stdint.h>
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    typedef struct __plot_renderer {
-      int64_t kind;
-      int64_t style1, style2;
-      int64_t data1, data2, data3, data4, data5;
-      double f1, f2, f3, f4, f5, f6;
-      int64_t i1, i2, i3, i4;
-      char *label;
-      char *text;
-      double x_min, x_max, y_min, y_max;
-    } PlotRenderer;
-    typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
-
-    enum {
-      RK_HRULE = 7, RK_VRULE = 8, RK_LABEL = 9,
-      RK_LINES = 20, RK_FUNCTION = 21, RK_PARAMETRIC = 22, RK_POLAR = 23, RK_INVERSE = 24, RK_DENSITY = 25,
-      RK_POINTS = 30, RK_ERROR_BARS = 31, RK_VECTOR_FIELD = 32, RK_ARROWS = 33,
-      RK_FUNCTION_INTERVAL = 40, RK_LINES_INTERVAL = 41, RK_PARAM_INTERVAL = 42, RK_POLAR_INTERVAL = 43,
-      RK_RECTANGLES = 50, RK_AREA_HIST = 51, RK_DISCRETE_HIST = 52, RK_STACKED_HIST = 53,
-      RK_ISOLINE = 60, RK_CONTOURS = 61, RK_CONTOUR_INTERVALS = 62, RK_COLOR_FIELD = 63
-    };
-
-    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
-    #define ISNAN(v) ((v) != (v))
-
-    RBBox *out = (RBBox *)malloc(sizeof(*out));
-    double lx0 = 0.0, lx1 = 0.0, ly0 = 0.0, ly1 = 0.0;
-    int lvalid = 0;
-    #define UNION_POINT(X, Y) do { \
-      double __ux = (X), __uy = (Y); \
-      if (!ISNAN(__ux) && !ISNAN(__uy)) { \
-        if (!lvalid) { lx0 = lx1 = __ux; ly0 = ly1 = __uy; lvalid = 1; } \
-        else { \
-          if (__ux < lx0) lx0 = __ux; \
-          if (__ux > lx1) lx1 = __ux; \
-          if (__uy < ly0) ly0 = __uy; \
-          if (__uy > ly1) ly1 = __uy; \
-        } \
-      } \
-    } while (0)
-    #define UNION_LIST_POINTS(LST) do { \
-      for (Cons *__p = (Cons *)(intptr_t)(LST); __p; __p = (Cons *)(intptr_t)__p->tail) { \
-        Cons *__pt = (Cons *)(intptr_t)__p->head; \
-        if (!__pt) continue; \
-        UNION_POINT(BITS_DBL(__pt->head), BITS_DBL(__pt->tail)); \
-      } \
-    } while (0)
-
-    PlotRenderer *r = (PlotRenderer *)(intptr_t)renderer;
-    if (!r) { out->x0 = out->x1 = out->y0 = out->y1 = 0.0; out->valid = 0; return (void *)(intptr_t)out; }
-
-    switch ((int)r->kind) {
-      case RK_LINES:
-      case RK_POINTS:
-      case RK_ARROWS:
-        UNION_LIST_POINTS(r->data1);
-        break;
-      case RK_ERROR_BARS: {
-        for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail) {
-          Cons *a = (Cons *)(intptr_t)p->head;
-          if (!a) continue;
-          double x = BITS_DBL(a->head);
-          Cons *b = (Cons *)(intptr_t)a->tail;
-          if (!b) continue;
-          double y = BITS_DBL(b->head);
-          double h = BITS_DBL(b->tail);
-          if (r->i1) { UNION_POINT(x - h, y); UNION_POINT(x + h, y); }
-          else { UNION_POINT(x, y - h); UNION_POINT(x, y + h); }
-        }
-      } break;
-      case RK_HRULE: UNION_POINT(0.0, r->f1); break;
-      case RK_VRULE: UNION_POINT(r->f1, 0.0); break;
-      case RK_LABEL: UNION_POINT(r->f1, r->f2); break;
-      case RK_RECTANGLES:
-      case RK_AREA_HIST: {
-        for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail) {
-          Cons *a = (Cons *)(intptr_t)p->head;
-          if (!a) continue;
-          double x0 = BITS_DBL(a->head);
-          Cons *b = (Cons *)(intptr_t)a->tail;
-          double x1 = BITS_DBL(b->head);
-          Cons *c = (Cons *)(intptr_t)b->tail;
-          double y0 = BITS_DBL(c->head);
-          double y1 = BITS_DBL(c->tail);
-          UNION_POINT(x0, y0);
-          UNION_POINT(x1, y1);
-        }
-      } break;
-      case RK_DISCRETE_HIST: {
-        int idx = 0;
-        for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail, idx++) {
-          Cons *bar = (Cons *)(intptr_t)p->head;
-          if (!bar) continue;
-          double h = BITS_DBL(bar->tail);
-          if (r->i1) { UNION_POINT(0.0, idx); UNION_POINT(h, idx + 0.8); }
-          else { UNION_POINT(idx, 0.0); UNION_POINT(idx + 0.8, h); }
-        }
-      } break;
-      case RK_STACKED_HIST: {
-        int idx = 0;
-        for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail, idx++) {
-          Cons *grp = (Cons *)(intptr_t)p->head;
-          double sum = 0.0;
-          for (Cons *vals = (Cons *)(intptr_t)grp->tail; vals; vals = (Cons *)(intptr_t)vals->tail)
-            sum += BITS_DBL(vals->head);
-          if (r->i1) { UNION_POINT(0.0, idx); UNION_POINT(sum, idx + 0.8); }
-          else { UNION_POINT(idx, 0.0); UNION_POINT(idx + 0.8, sum); }
-        }
-      } break;
-      case RK_FUNCTION:
-      case RK_INVERSE:
-      case RK_DENSITY:
-      case RK_PARAMETRIC:
-      case RK_POLAR:
-      case RK_FUNCTION_INTERVAL:
-      case RK_PARAM_INTERVAL:
-      case RK_POLAR_INTERVAL:
-      case RK_ISOLINE:
-      case RK_CONTOURS:
-      case RK_CONTOUR_INTERVALS:
-      case RK_COLOR_FIELD:
-      case RK_VECTOR_FIELD:
-        if (!ISNAN(r->x_min) && !ISNAN(r->x_max) && !ISNAN(r->y_min) && !ISNAN(r->y_max)) {
-          UNION_POINT(r->x_min, r->y_min);
-          UNION_POINT(r->x_max, r->y_max);
-        }
-        break;
-      case RK_LINES_INTERVAL: UNION_LIST_POINTS(r->data1); UNION_LIST_POINTS(r->data2); break;
-      default: break;
-    }
-
-    out->x0 = lx0; out->x1 = lx1; out->y0 = ly0; out->y1 = ly1; out->valid = lvalid;
-    return (void *)(intptr_t)out;
-    #undef UNION_POINT
-    #undef UNION_LIST_POINTS
-    #undef BITS_DBL
-    #undef ISNAN
-    ```)
-
-  ;;; BBox -- an axis-aligned data-space bounding box: the typed result of the
-  ;;; bounds pass (P1 of the plot Renderer typeclass plan, the shape the future
-  ;;; `Renderer` `bounds` method returns). An empty box -- a renderer that
-  ;;; contributed no finite point -- is represented with `x-min` = NaN; use
-  ;;; `bbox-empty?` to test for it.
+  ;;; BBox -- an axis-aligned data-space bounding box: what a renderer's
+  ;;; `bounds` method returns and what the plot's data extent is folded from.
+  ;;; An empty box -- a renderer that contributed no finite point -- is
+  ;;; represented with `x-min` = NaN; use `bbox-empty?` to test for it.
   (defstruct BBox :copy [x-min : float  x-max : float  y-min : float  y-max : float])
 
-  ;; Raw-carrier accessors over __renderer-bbox's { x0,x1,y0,y1; valid } buffer.
+  ;; Raw-carrier accessors over the { x0,x1,y0,y1; valid } buffer the C bounds
+  ;; helpers below return.
   (defn __rbb-valid? [b : ptr<void>] : bool
     ```c return ((struct { double x0,x1,y0,y1; int valid; } *)b)->valid != 0; ```)
   (defn __rbb-get [b : ptr<void> which : int] : float
@@ -741,9 +508,9 @@
     (let [lo (.x-min bb)] (not (= lo lo))))
 
   ;;; bbox-from-raw -- pack the raw { x0,x1,y0,y1; valid } carrier (as produced
-  ;;; by __renderer-bbox / __point-list-bbox) into a typed BBox with make-struct
-  ;;; (so no struct-by-value crosses the inline-C boundary), freeing the
-  ;;; carrier. An invalid carrier becomes an empty box (x-min = NaN).
+  ;;; by the `__*-bbox` helpers) into a typed BBox with make-struct (so no
+  ;;; struct-by-value crosses the inline-C boundary), freeing the carrier. An
+  ;;; invalid carrier becomes an empty box (x-min = NaN).
   ;;;
   ;;; Defined ahead of its callers on purpose: a `defn` whose return type is an
   ;;; aggregate must be elaborated before the call site, or the caller sees the
@@ -757,35 +524,52 @@
             box (make-struct BBox n n n n)]
         (do (__rbb-free b) box))))
 
-  ;;; renderer-bbox -- a renderer's data-space bounding box as a typed BBox.
-  ;;;
-  ;;; The Turmeric-level wrapper over the P0 `__renderer-bbox` extraction: it
-  ;;; reads the raw carrier and packs a `BBox` (building it with `make-struct`,
-  ;;; so no struct-by-value crosses the inline-C boundary). A renderer with no
-  ;;; finite points yields an empty box (`bbox-empty?` true). This is the value
-  ;;; the forthcoming `Renderer` typeclass's `bounds` method will hand back.
-  (defn renderer-bbox [renderer : int] : BBox
-    (bbox-from-raw (__renderer-bbox renderer)))
+  ;;; bbox-empty-box -- the identity element for `bbox-union`: an empty BBox
+  ;;; (x-min = NaN), matching `bbox-empty?`.
+  (defn bbox-empty-box [] : BBox
+    (let [n (__rbb-nan)] (make-struct BBox n n n n)))
 
-  ;; ===========================================================================
-  ;; Renderer typeclass -- U2 renderer-kind collapse, P2.
+  ;;; bbox-union -- the smallest box covering both inputs; an empty box is the
+  ;;; identity (so folding from `bbox-empty-box` recovers the first non-empty).
   ;;
-  ;; The dispatch axis plot's plan targets is the renderer *kind*: the central
-  ;; ~30-arm switch that interprets the generic data1..5 / f1..6 / i1..4 slot
-  ;; bag differently per kind. P2 replaces "one int `kind` tag drives a switch"
-  ;; with "each kind is a struct carrying its real typed payload + a `Renderer`
-  ;; instance". This slice establishes the class and the `bounds` method over
-  ;; the first per-kind structs, computing the data extent from named fields and
-  ;; verified against the legacy slot-bag bounds. The `render` method (delegating
-  ;; to the extracted draw pass) and the existential box that lets a heterogeneous
-  ;; renderer Vec dispatch through the class land with P3/P4.
-  ;; ===========================================================================
+  ;; On a tie the left box's coordinate is kept, as the draw pass's own union
+  ;; once kept the first point it saw.
+  (defn bbox-union [a : BBox  b : BBox] : BBox
+    (if (bbox-empty? a) b
+      (if (bbox-empty? b) a
+        (make-struct BBox
+          (if (< (.x-min b) (.x-min a)) (.x-min b) (.x-min a))
+          (if (> (.x-max b) (.x-max a)) (.x-max b) (.x-max a))
+          (if (< (.y-min b) (.y-min a)) (.y-min b) (.y-min a))
+          (if (> (.y-max b) (.y-max a)) (.y-max b) (.y-max a))))))
+
+  ;;; point-bbox -- the degenerate box of one data point; empty when either
+  ;;; coordinate is NaN (a NaN point contributes nothing to the extent).
+  (defn point-bbox [x : float  y : float] : BBox
+    (if (or (not (= x x)) (not (= y y)))
+      (bbox-empty-box)
+      (make-struct BBox x x y y)))
+
+  ;;; hint-bbox -- the box spanned by the corners (x0, y0) and (x1, y1) of an
+  ;;; explicit domain, as the sampled-grid kinds (contours, vector fields)
+  ;;; declare. Empty unless all four are finite numbers.
+  (defn hint-bbox [x0 : float  x1 : float  y0 : float  y1 : float] : BBox
+    (if (or (not (= x0 x0)) (not (= x1 x1)) (not (= y0 y0)) (not (= y1 y1)))
+      (bbox-empty-box)
+      (make-struct BBox (if (< x1 x0) x1 x0) (if (> x1 x0) x1 x0)
+                        (if (< y1 y0) y1 y0) (if (> y1 y0) y1 y0))))
+
+  ;; ---------------------------------------------------------------------------
+  ;; Bounds of the lowered payloads. Each helper walks one payload shape's
+  ;; Cells (see plot/data) and returns the raw { x0,x1,y0,y1; valid } carrier
+  ;; (`bbox-from-raw` packs it); NaN points are skipped. These were the arms of the draw pass's old
+  ;; per-kind bounds `switch`, moved verbatim -- a kind's `bounds` method now
+  ;; picks its helper by type instead of by a `kind` tag.
+  ;; ---------------------------------------------------------------------------
 
   ;;; __point-list-bbox -- bounding box of a cons-list of (cons x y) points: the
-  ;;; bounds rule shared by the lines / points / arrows kinds. Same raw-carrier
-  ;;; shape as __renderer-bbox; NaN coordinates are skipped, an empty list is an
-  ;;; invalid (empty) box.
-  (defn (export-as "plot_point_list_bbox") __point-list-bbox [points : int] : ptr<void>
+  ;;; rule shared by the lines / points / lines-interval kinds.
+  (defn (export-as "plot_point_list_bbox") __point-list-bbox [points : Cells] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -811,148 +595,799 @@
     #undef ISNAN
     ```)
 
-  ;;; Renderer -- typeclass collapsing the per-kind renderer dispatch. Each kind
-  ;;; is a struct carrying its real typed fields; `bounds` computes the data
-  ;;; extent from those fields and `to-legacy` lowers the struct to the slot-bag
-  ;;; `int` handle the C draw pass still consumes. Lives beside its instances so
-  ;;; the orphan-instance check is satisfied (same as ansi Color / json Encode).
+  ;;; __error-bars-bbox -- bounding box of a cons-list of (x . (y . h)) error
+  ;;; bars: each bar spans y +/- h, or x +/- h when `horizontal`.
+  (defn __error-bars-bbox [bars : Cells  horizontal : bool] : ptr<void>
+    ```c
+    #include <stdlib.h>
+    #include <stdint.h>
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    #define ISNAN(v) ((v) != (v))
+    RBBox *out = (RBBox *)malloc(sizeof(*out));
+    double lx0 = 0.0, lx1 = 0.0, ly0 = 0.0, ly1 = 0.0;
+    int lvalid = 0;
+    #define UNION_POINT(X, Y) do { \
+      double __ux = (X), __uy = (Y); \
+      if (!ISNAN(__ux) && !ISNAN(__uy)) { \
+        if (!lvalid) { lx0 = lx1 = __ux; ly0 = ly1 = __uy; lvalid = 1; } \
+        else { \
+          if (__ux < lx0) lx0 = __ux; \
+          if (__ux > lx1) lx1 = __ux; \
+          if (__uy < ly0) ly0 = __uy; \
+          if (__uy > ly1) ly1 = __uy; \
+        } \
+      } \
+    } while (0)
+    for (Cons *p = (Cons *)(intptr_t)bars; p; p = (Cons *)(intptr_t)p->tail) {
+      Cons *a = (Cons *)(intptr_t)p->head;
+      if (!a) continue;
+      double x = BITS_DBL(a->head);
+      Cons *b = (Cons *)(intptr_t)a->tail;
+      if (!b) continue;
+      double y = BITS_DBL(b->head);
+      double h = BITS_DBL(b->tail);
+      if (horizontal) { UNION_POINT(x - h, y); UNION_POINT(x + h, y); }
+      else { UNION_POINT(x, y - h); UNION_POINT(x, y + h); }
+    }
+    out->x0 = lx0; out->x1 = lx1; out->y0 = ly0; out->y1 = ly1; out->valid = lvalid;
+    return (void *)(intptr_t)out;
+    #undef UNION_POINT
+    #undef BITS_DBL
+    #undef ISNAN
+    ```)
+
+  ;;; __arrows-bbox -- bounding box of a cons-list of (x1 . (y1 . (x2 . y2)))
+  ;;; arrow segments: both endpoints of every arrow.
+  ;;
+  ;; The draw pass used to bound arrows with the point-list rule, reading each
+  ;; arrow's second cell -- a pointer -- as its y coordinate, so the plot's
+  ;; y range came out of the heap layout and changed from run to run.
+  (defn __arrows-bbox [arrows : Cells] : ptr<void>
+    ```c
+    #include <stdlib.h>
+    #include <stdint.h>
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    #define ISNAN(v) ((v) != (v))
+    RBBox *out = (RBBox *)malloc(sizeof(*out));
+    double lx0 = 0.0, lx1 = 0.0, ly0 = 0.0, ly1 = 0.0;
+    int lvalid = 0;
+    #define UNION_POINT(X, Y) do { \
+      double __ux = (X), __uy = (Y); \
+      if (!ISNAN(__ux) && !ISNAN(__uy)) { \
+        if (!lvalid) { lx0 = lx1 = __ux; ly0 = ly1 = __uy; lvalid = 1; } \
+        else { \
+          if (__ux < lx0) lx0 = __ux; \
+          if (__ux > lx1) lx1 = __ux; \
+          if (__uy < ly0) ly0 = __uy; \
+          if (__uy > ly1) ly1 = __uy; \
+        } \
+      } \
+    } while (0)
+    for (Cons *p = (Cons *)(intptr_t)arrows; p; p = (Cons *)(intptr_t)p->tail) {
+      Cons *a = (Cons *)(intptr_t)p->head;
+      if (!a) continue;
+      Cons *b = (Cons *)(intptr_t)a->tail;
+      if (!b) continue;
+      Cons *c = (Cons *)(intptr_t)b->tail;
+      if (!c) continue;
+      UNION_POINT(BITS_DBL(a->head), BITS_DBL(b->head));
+      UNION_POINT(BITS_DBL(c->head), BITS_DBL(c->tail));
+    }
+    out->x0 = lx0; out->x1 = lx1; out->y0 = ly0; out->y1 = ly1; out->valid = lvalid;
+    return (void *)(intptr_t)out;
+    #undef UNION_POINT
+    #undef BITS_DBL
+    #undef ISNAN
+    ```)
+
+  ;;; __rects-bbox -- bounding box of a cons-list of (x0 . (x1 . (y0 . y1)))
+  ;;; rectangles: the rectangles / area-histogram rule.
+  (defn __rects-bbox [rects : Cells] : ptr<void>
+    ```c
+    #include <stdlib.h>
+    #include <stdint.h>
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    #define ISNAN(v) ((v) != (v))
+    RBBox *out = (RBBox *)malloc(sizeof(*out));
+    double lx0 = 0.0, lx1 = 0.0, ly0 = 0.0, ly1 = 0.0;
+    int lvalid = 0;
+    #define UNION_POINT(X, Y) do { \
+      double __ux = (X), __uy = (Y); \
+      if (!ISNAN(__ux) && !ISNAN(__uy)) { \
+        if (!lvalid) { lx0 = lx1 = __ux; ly0 = ly1 = __uy; lvalid = 1; } \
+        else { \
+          if (__ux < lx0) lx0 = __ux; \
+          if (__ux > lx1) lx1 = __ux; \
+          if (__uy < ly0) ly0 = __uy; \
+          if (__uy > ly1) ly1 = __uy; \
+        } \
+      } \
+    } while (0)
+    for (Cons *p = (Cons *)(intptr_t)rects; p; p = (Cons *)(intptr_t)p->tail) {
+      Cons *a = (Cons *)(intptr_t)p->head;
+      if (!a) continue;
+      double x0 = BITS_DBL(a->head);
+      Cons *b = (Cons *)(intptr_t)a->tail;
+      double x1 = BITS_DBL(b->head);
+      Cons *c = (Cons *)(intptr_t)b->tail;
+      double y0 = BITS_DBL(c->head);
+      double y1 = BITS_DBL(c->tail);
+      UNION_POINT(x0, y0);
+      UNION_POINT(x1, y1);
+    }
+    out->x0 = lx0; out->x1 = lx1; out->y0 = ly0; out->y1 = ly1; out->valid = lvalid;
+    return (void *)(intptr_t)out;
+    #undef UNION_POINT
+    #undef BITS_DBL
+    #undef ISNAN
+    ```)
+
+  ;;; __discrete-hist-bbox -- bounding box of a cons-list of (label . height)
+  ;;; bars laid out at category slots 0, 1, 2, ... (each 0.8 wide), rotated
+  ;;; onto the y axis when `horizontal`.
+  (defn __discrete-hist-bbox [bars : Cells  horizontal : bool] : ptr<void>
+    ```c
+    #include <stdlib.h>
+    #include <stdint.h>
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    #define ISNAN(v) ((v) != (v))
+    RBBox *out = (RBBox *)malloc(sizeof(*out));
+    double lx0 = 0.0, lx1 = 0.0, ly0 = 0.0, ly1 = 0.0;
+    int lvalid = 0;
+    #define UNION_POINT(X, Y) do { \
+      double __ux = (X), __uy = (Y); \
+      if (!ISNAN(__ux) && !ISNAN(__uy)) { \
+        if (!lvalid) { lx0 = lx1 = __ux; ly0 = ly1 = __uy; lvalid = 1; } \
+        else { \
+          if (__ux < lx0) lx0 = __ux; \
+          if (__ux > lx1) lx1 = __ux; \
+          if (__uy < ly0) ly0 = __uy; \
+          if (__uy > ly1) ly1 = __uy; \
+        } \
+      } \
+    } while (0)
+    int idx = 0;
+    for (Cons *p = (Cons *)(intptr_t)bars; p; p = (Cons *)(intptr_t)p->tail, idx++) {
+      Cons *bar = (Cons *)(intptr_t)p->head;
+      if (!bar) continue;
+      double h = BITS_DBL(bar->tail);
+      if (horizontal) { UNION_POINT(0.0, idx); UNION_POINT(h, idx + 0.8); }
+      else { UNION_POINT(idx, 0.0); UNION_POINT(idx + 0.8, h); }
+    }
+    out->x0 = lx0; out->x1 = lx1; out->y0 = ly0; out->y1 = ly1; out->valid = lvalid;
+    return (void *)(intptr_t)out;
+    #undef UNION_POINT
+    #undef BITS_DBL
+    #undef ISNAN
+    ```)
+
+  ;;; __stacked-hist-bbox -- bounding box of a cons-list of (label . values)
+  ;;; groups: each slot is as tall as the sum of its stacked values.
+  (defn __stacked-hist-bbox [groups : Cells  horizontal : bool] : ptr<void>
+    ```c
+    #include <stdlib.h>
+    #include <stdint.h>
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    #define ISNAN(v) ((v) != (v))
+    RBBox *out = (RBBox *)malloc(sizeof(*out));
+    double lx0 = 0.0, lx1 = 0.0, ly0 = 0.0, ly1 = 0.0;
+    int lvalid = 0;
+    #define UNION_POINT(X, Y) do { \
+      double __ux = (X), __uy = (Y); \
+      if (!ISNAN(__ux) && !ISNAN(__uy)) { \
+        if (!lvalid) { lx0 = lx1 = __ux; ly0 = ly1 = __uy; lvalid = 1; } \
+        else { \
+          if (__ux < lx0) lx0 = __ux; \
+          if (__ux > lx1) lx1 = __ux; \
+          if (__uy < ly0) ly0 = __uy; \
+          if (__uy > ly1) ly1 = __uy; \
+        } \
+      } \
+    } while (0)
+    int idx = 0;
+    for (Cons *p = (Cons *)(intptr_t)groups; p; p = (Cons *)(intptr_t)p->tail, idx++) {
+      Cons *grp = (Cons *)(intptr_t)p->head;
+      double sum = 0.0;
+      for (Cons *vals = (Cons *)(intptr_t)grp->tail; vals; vals = (Cons *)(intptr_t)vals->tail)
+        sum += BITS_DBL(vals->head);
+      if (horizontal) { UNION_POINT(0.0, idx); UNION_POINT(sum, idx + 0.8); }
+      else { UNION_POINT(idx, 0.0); UNION_POINT(idx + 0.8, sum); }
+    }
+    out->x0 = lx0; out->x1 = lx1; out->y0 = ly0; out->y1 = ly1; out->valid = lvalid;
+    return (void *)(intptr_t)out;
+    #undef UNION_POINT
+    #undef BITS_DBL
+    #undef ISNAN
+    ```)
+
+  ;; The typed payloads' bounds: lower the Vec to Cells, run the shape's
+  ;; helper above, free the Cells.
+
+  ;;; __bbox-of-points -- the box of a (Vec Point), NaN points skipped.
+  (defn __bbox-of-points [v : (Vec Point)] : BBox
+    (let [cells (__points->cells v)
+          bb    (bbox-from-raw (__point-list-bbox cells))]
+      (__free-cells cells 1)
+      bb))
+
+  ;;; __bbox-of-error-bars -- the box spanning every bar's y +/- err (x +/- err
+  ;;; when `horizontal`).
+  (defn __bbox-of-error-bars [v : (Vec ErrorBar)  horizontal : bool] : BBox
+    (let [cells (__error-bars->cells v)
+          bb    (bbox-from-raw (__error-bars-bbox cells horizontal))]
+      (__free-cells cells 2)
+      bb))
+
+  ;;; __bbox-of-arrows -- the box spanning both ends of every arrow.
+  (defn __bbox-of-arrows [v : (Vec Arrow)] : BBox
+    (let [cells (__arrows->cells v)
+          bb    (bbox-from-raw (__arrows-bbox cells))]
+      (__free-cells cells 3)
+      bb))
+
+  ;;; __bbox-of-rects -- the box spanning every rectangle.
+  (defn __bbox-of-rects [v : (Vec Rect)] : BBox
+    (let [cells (__rects->cells v)
+          bb    (bbox-from-raw (__rects-bbox cells))]
+      (__free-cells cells 3)
+      bb))
+
+  ;;; __bbox-of-bars -- the box of a discrete histogram's category slots.
+  (defn __bbox-of-bars [v : (Vec Bar)  horizontal : bool] : BBox
+    (let [cells (__bars->cells v)
+          bb    (bbox-from-raw (__discrete-hist-bbox cells horizontal))]
+      (__free-cells cells 1)
+      bb))
+
+  ;;; __bbox-of-groups -- the box of a stacked histogram's category slots.
+  (defn __bbox-of-groups [v : (Vec Group)  horizontal : bool] : BBox
+    (let [cells (__groups->cells v)
+          bb    (bbox-from-raw (__stacked-hist-bbox cells horizontal))]
+      (__free-groups cells)
+      bb))
+
+  ;; ===========================================================================
+  ;; Renderer typeclass -- U2 renderer-kind collapse.
+  ;;
+  ;; Each renderer kind is its own type carrying its real fields (the types
+  ;; live beside their constructors: LinesR and FunctionR in plot/line,
+  ;; PointsR in plot/point, the Decoration sum type in plot/decor, ...), with
+  ;; one `Renderer` instance per kind. The public constructors box their value
+  ;; as an `AnyRenderer`, so a heterogeneous `(vec-of (axes) (lines ...))`
+  ;; type-checks and every element still dispatches through its own instance.
+  ;;
+  ;; A plot is laid out over the union of the renderers' `bounds`, with the
+  ;; axes and grids their `frame-marks` ask for and the category ticks of the
+  ;; first `categorical?` renderer; then each renderer's `draw` paints it,
+  ;; in order, and the legend lists every non-empty `legend-label`.
+  ;; ===========================================================================
+
+  ;;; DrawCtx -- one plot's draw context: the canvas, the resolved data bounds,
+  ;;; the viewport rectangle, the loaded font, and the auto-color cursor the
+  ;;; renderers advance as they take default colors. Created by the frame
+  ;;; pass, threaded through every `draw`, released after the legend.
+  (defopaque DrawCtx :ptr<void>)
+
+  ;;; FrameMarks -- the axis lines and tick grids a renderer asks the frame for.
+  (defstruct FrameMarks :copy [x-axis : bool  y-axis : bool  x-grid : bool  y-grid : bool])
+
+  ;;; no-frame-marks -- FrameMarks asking for nothing; what most renderers want.
+  (defn no-frame-marks [] : FrameMarks
+    (make-struct FrameMarks false false false false))
+
+  ;;; frame-marks-union -- the marks either side asks for.
+  (defn frame-marks-union [a : FrameMarks  b : FrameMarks] : FrameMarks
+    (make-struct FrameMarks (or (.x-axis a) (.x-axis b)) (or (.y-axis a) (.y-axis b))
+                            (or (.x-grid a) (.x-grid b)) (or (.y-grid a) (.y-grid b))))
+
+  ;;; __nonempty? -- is `s` a non-empty string?
+  (defn __nonempty? [s : cstr] : bool
+    ```c
+    return s && s[0];
+    ```)
+
+  ;;; __one-label -- a fresh Vec holding `label`, or empty for "".
+  (defn __one-label [label : cstr] : (Vec cstr)
+    (let [v (:: (vec-new) (Vec cstr))]
+      (when (__nonempty? label) (vec-push! v label))
+      v))
+
+  ;;; Renderer -- the class every plot renderer kind implements.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- a renderer kind (LinesR, FunctionR, Decoration, ...)
+  ;;;
+  ;;; Methods:
+  ;;;   bounds       -- the data-space extent the renderer needs on screen;
+  ;;;                   empty (see `bbox-empty?`) when it constrains nothing,
+  ;;;                   as a sampled curve or an axis does
+  ;;;   draw         -- paint the renderer through the plot's DrawCtx
+  ;;;   legend-label -- its legend entry; "" (the default) for none
+  ;;;   legend-labels -- its legend entries, one row each, fresh (the caller
+  ;;;                   frees the Vec); by default `legend-label`, or none
+  ;;;                   when that is "". Row k's swatch is the style the
+  ;;;                   renderer drew its series k with (`__ctx-series`)
+  ;;;   frame-marks  -- the axes / grids it asks the frame for; none by default
+  ;;;   categorical? -- whether it lays an axis out as categories; false
+  ;;;                   by default
+  ;;;   categories-on-y? -- whether a categorical renderer's categories run
+  ;;;                   along the y axis (a horizontal histogram) rather
+  ;;;                   than x; false by default
+  ;;;   category-labels -- a categorical renderer's tick labels, fresh (the
+  ;;;                   caller frees the Vec); empty by default
+  ;;;
+  ;;; Example:
+  ;;;   (bounds (make-struct LinesR pts (default-line-style) "l"))
+  ;;;
+  ;;; Since: plot-v0.4.0
   (defclass Renderer [a]
-    (bounds [r] : BBox)
-    (to-legacy [r] : int))
+    (bounds [r : a] : BBox)
+    (draw [r : a  ctx : DrawCtx] : void)
+    (legend-label [r : a] : cstr "")
+    (legend-labels [r : a] : (Vec cstr) (__one-label (legend-label r)))
+    (frame-marks [r : a] : FrameMarks (no-frame-marks))
+    (categorical? [r : a] : bool false)
+    (categories-on-y? [r : a] : bool false)
+    (category-labels [r : a] : (Vec cstr) (:: (vec-new) (Vec cstr))))
 
-  ;;; LinesR / PointsR -- a polyline / scatter over an explicit (cons x y) list.
-  ;;; PointsR is nominally distinct from LinesR though their payloads match, so
-  ;;; the two can never be silently swapped (the slot-bag `kind` tag could be).
-  (defstruct LinesR  :copy [points : int  style : int  label : cstr])
-  (defstruct PointsR :copy [points : int  style : int  label : cstr])
-  ;;; LabelR -- a text label anchored at one (x, y) data point.
-  (defstruct LabelR  :copy [x : float  y : float  text : cstr  style : int])
-
-  (defn lines-r  [points : int  style : int  label : cstr] : LinesR
-    (make-struct LinesR points style label))
-  (defn points-r [points : int  style : int  label : cstr] : PointsR
-    (make-struct PointsR points style label))
-  (defn label-r  [x : float  y : float  text : cstr  style : int] : LabelR
-    (make-struct LabelR x y text style))
-
-  ;; to-legacy rebuilds the exact slot-bag handle the legacy constructor emits
-  ;; (`lines` -> RK_LINES 20, `points` -> RK_POINTS 30, `point-label-styled`
-  ;; -> RK_LABEL 9), so routing a typed renderer through the existing draw pass
-  ;; is pixel-identical to the legacy path.
-  (definstance Renderer [LinesR]
-    (bounds [r] (bbox-from-raw (__point-list-bbox (.points r))))
-    (to-legacy [r] (__make-renderer 20 (.style r) 0 (.points r) 0 0 0 0 (.label r) "")))
-  (definstance Renderer [PointsR]
-    (bounds [r] (bbox-from-raw (__point-list-bbox (.points r))))
-    (to-legacy [r] (__make-renderer 30 (.style r) 0 (.points r) 0 0 0 0 (.label r) "")))
-  (definstance Renderer [LabelR]
-    (bounds [r] (make-struct BBox (.x r) (.x r) (.y r) (.y r)))
-    (to-legacy [r]
-      (__renderer-bounds
-        (__renderer-floats
-          (__make-renderer 9 (.style r) 0 0 0 0 0 0 "" (.text r))
-          (.x r) (.y r) 0.0 0.0 0.0 0.0)
-        (.x r) (.x r) (.y r) (.y r))))
-
-  ;; ===========================================================================
-  ;; AnyRenderer -- existential box for heterogeneous renderer vecs (P3).
-  ;;
-  ;; A `(Vec (exists [a] [(Renderer a)] a))` holds renderers of different kinds
-  ;; (LinesR, PointsR, LabelR, ...) behind one element type; `bounds`/`render`
-  ;; dispatch through each element's *packed* Renderer dictionary instead of a
-  ;; runtime `kind` switch. This needs witness-indirected `open` dispatch, which
-  ;; landed in turmeric main (PRs #452 open-dispatch, #456 vec-get type
-  ;; preservation, #458 by-value struct payload pack).
-  ;;
-  ;; The `bounds`/`to-legacy` folds below are local `letrec` closures that
-  ;; capture the existential `rs` and dereference it via `open` inside the lifted
-  ;; closure body. turmeric main fixed the self-recursive carrier typing (both
-  ;; `defn` and `letrec`) and fresh `vec-new` argument unification, and #464
-  ;; closed the last gap (W3): a captured binding referenced inside
-  ;; `open`/`pack`/`dispatch` is now collected into the closure's capture set and
-  ;; resolves to its env slot instead of mis-emitting an undeclared C name. So
-  ;; the folds no longer need to be hoisted to top-level `defn`s that thread `rs`
-  ;; as an explicit parameter.
-  ;; (Callers building a heterogeneous `(Vec (exists ...))` literal still ascribe
-  ;; the element type at construction -- see the `mixed-vec` helper in the
-  ;; any_renderer test -- because the existential element is not back-inferred
-  ;; from the pushes; that is a separate, narrower case from the `(Vec int)` one.)
-  ;; ===========================================================================
+  ;;; AnyRenderer -- a value of any `Renderer` kind, boxed with its instance.
+  ;;; Every public constructor (`lines`, `function`, `axes`, ...) returns one,
+  ;;; and `plot` / `plot-write-png` / `render` take a `(Vec AnyRenderer)`.
+  (defalias AnyRenderer (exists [a] [(Renderer a)] a))
 
   ;;; any-renderer -- box a value whose type has a `Renderer` instance as an
-  ;;; `AnyRenderer` existential. The `(exists ...)` form must appear literally
-  ;;; at the pack site, so this is a macro (same reason as stdlib `showable`).
+  ;;; `AnyRenderer`. The `(exists ...)` form must appear literally at the pack
+  ;;; site, so this is a macro (same reason as stdlib `showable`).
   ;;;
-  ;;;   (any-renderer (lines-r pts style ""))  ;; => packed AnyRenderer
+  ;;; Parameters:
+  ;;;   x -- a renderer struct (LinesR, FunctionR, ...)
+  ;;;
+  ;;; Returns:
+  ;;;   The value boxed with its `Renderer` instance, as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (any-renderer (make-struct LinesR pts (default-line-style) ""))
   (defmacro any-renderer [x] (list pack x (list exists [a] [(list Renderer a)] a)))
 
-  ;;; bbox-empty-box -- the identity element for `bbox-union`: an empty BBox
-  ;;; (x-min = NaN), matching `bbox-empty?`.
-  (defn bbox-empty-box [] : BBox
-    (let [n (__rbb-nan)] (make-struct BBox n n n n)))
-
-  ;;; bbox-union -- the smallest box covering both inputs; an empty box is the
-  ;;; identity (so folding from `bbox-empty-box` recovers the first non-empty).
-  ;;
-  ;; An empty input returns the other box directly. (A multi-field `:copy`
-  ;; struct is passed by pointer; returning such a parameter by value used to
-  ;; mis-emit in C as 'incompatible types ... BBox from const BBox *' -- that
-  ;; codegen bug is fixed in turmeric main, so the param can be returned as-is
-  ;; instead of being rebuilt field-by-field.)
-  (defn bbox-union [a : BBox  b : BBox] : BBox
-    (if (bbox-empty? a) b
-      (if (bbox-empty? b) a
-        (make-struct BBox
-          (if (< (.x-min a) (.x-min b)) (.x-min a) (.x-min b))
-          (if (> (.x-max a) (.x-max b)) (.x-max a) (.x-max b))
-          (if (< (.y-min a) (.y-min b)) (.y-min a) (.y-min b))
-          (if (> (.y-max a) (.y-max b)) (.y-max a) (.y-max b))))))
-
-  ;;; renderers-bbox -- data-space bounding box of a heterogeneous renderer Vec,
-  ;;; unioning each element's `bounds` through the `AnyRenderer` existential.
-  ;;; The P3 payoff: the union is driven by coherent typeclass dispatch, not the
-  ;;; legacy ~30-arm `kind` switch in `__renderer-bbox`.
+  ;;; renderer-bbox -- the data-space bounding box of one renderer.
   ;;;
-  ;;; The fold is a local `letrec` closure that captures the existential `rs` and
-  ;;; `open`s each element under a fresh abstract type, dispatching `bounds`
-  ;;; through the packed witness; the per-element box is unioned into a `BBox`
-  ;;; accumulator seeded from `bbox-empty-box` (the union identity). The captured
-  ;;; `rs`/`open` form is correct since turmeric #464 (W3).
-  (defn renderers-bbox [rs : (Vec (exists [a] [(Renderer a)] a))] : BBox
-    (let [n (vec-len rs)]
-      (letrec [go (fn [i : int  acc : BBox] : BBox
-                    (if (>= i n) acc
-                      (go (+ i 1)
-                          (bbox-union acc (open (vec-get rs i) [a v] (bounds v))))))]
-        (go 0 (bbox-empty-box)))))
-
-  ;;; anyrenderers->legacy -- materialise a (Vec AnyRenderer) as the legacy
-  ;;; (Vec int) of slot-bag handles the C draw pass consumes. Each element's
-  ;;; lowering dispatches through its packed Renderer dictionary (`to-legacy`).
+  ;;; Parameters:
+  ;;;   r -- any renderer, as a constructor returns it
   ;;;
-  ;;; A local `letrec` closure folds the Vec: it captures the existential `rs`
-  ;;; and the legacy `out` accumulator, `open`s each element, and pushes the
-  ;;; lowered handle in place. The seed `out` is a bare `(vec-new)` (turmeric
-  ;;; unifies its element tyvar against the `(Vec int)` result, W2), and the
-  ;;; captured-`rs` `open` body emits correctly since #464 (W3).
-  (defn anyrenderers->legacy [rs : (Vec (exists [a] [(Renderer a)] a))] : (Vec int)
-    (let [n   (vec-len rs)
-          out (vec-new)]
-      (letrec [go (fn [i : int] : (Vec int)
-                    (if (>= i n) out
-                      (let [h (open (vec-get rs i) [a v] (to-legacy v))]
-                        (do (vec-push! out h)
-                            (go (+ i 1))))))]
-        (go 0))))
+  ;;; Returns:
+  ;;;   Its `bounds`; an empty box (`bbox-empty?`) when it constrains nothing.
+  ;;;
+  ;;; Example:
+  ;;;   (renderer-bbox (lines pts (default-line-style) ""))
+  (defn renderer-bbox [r : AnyRenderer] : BBox
+    (open r [a v] (bounds v)))
 
-  ;;; plot-anyrenderers -- render a heterogeneous (Vec AnyRenderer) to a new
-  ;;; surface (returns the same :ptr<void> result envelope as `plot`). Each
-  ;;; renderer is lowered through the `Renderer` typeclass (`to-legacy`) and the
-  ;;; result handed to the existing draw pipeline -- so pixel output is identical
-  ;;; to building the same renderers with the legacy constructors and calling
-  ;;; `plot`, but the input is the typed, type-safe `AnyRenderer` vec.
-  (defn plot-anyrenderers [rs : (Vec (exists [a] [(Renderer a)] a)) opts : int] : ptr<void>
-    (plot (:: (anyrenderers->legacy rs) :int) opts))
+  ;; The folds below are top-level recursive defns rather than local `letrec`
+  ;; closures: the compiler mallocs a letrec closure's env and, for a struct
+  ;; argument, a box per call, and frees neither -- a leak on every `plot`.
+  ;; A top-level defn passes `acc` by value and allocates nothing.
+
+  ;;; __bbox-fold -- union the `bounds` of rs[i..n) into acc.
+  (defn __bbox-fold [rs : (Vec AnyRenderer)  i : int  n : int  acc : BBox] : BBox
+    (if (>= i n) acc
+      (__bbox-fold rs (+ i 1) n
+                   (bbox-union acc (open (vec-get rs i) [a v] (bounds v))))))
+
+  ;;; renderers-bbox -- the data-space bounding box of a renderer Vec: the
+  ;;; union of every element's `bounds`, each dispatched through the instance
+  ;;; its `AnyRenderer` carries. This is the extent the plot is laid out over
+  ;;; before padding and before `plot-opts` overrides.
+  ;;;
+  ;;; Parameters:
+  ;;;   rs -- the renderers
+  ;;;
+  ;;; Returns:
+  ;;;   The union of their bounds; empty when none constrains the extent.
+  ;;;
+  ;;; Example:
+  ;;;   (renderers-bbox (vec-of (axes) (lines pts (default-line-style) "")))
+  (defn renderers-bbox [rs : (Vec AnyRenderer)] : BBox
+    (__bbox-fold rs 0 (vec-len rs) (bbox-empty-box)))
+
+  ;; ---------------------------------------------------------------------------
+  ;; Shared drawing helpers. Every kind's `draw` is inline C over a DrawCtx;
+  ;; these are the pieces they share -- resolving a style handle onto the
+  ;; canvas (taking the next auto color when the style says -1) and mapping a
+  ;; data point into the viewport. Pinned to stable C symbols via `export-as`
+  ;; so the per-kind inline C (in this module and the others) can call them.
+  ;; ---------------------------------------------------------------------------
+
+  ;;; __ctx-line-style -- install a line-style handle's color, alpha and width.
+  (defn (export-as "plot_ctx_line_style") __ctx-line-style [ctx : ptr<void>  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    extern void plutovg_canvas_set_line_width(void* canvas, float line_width);
+    extern void plutovg_canvas_set_dash_array(void* canvas, const float* dashes, int ndashes);
+    #endif
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void *plot_ctx_swatch(void *);
+    typedef struct { int64_t color; double width; int64_t dash; double alpha; } LineStyle;
+    static const double palette[8][3] = {
+      {31.0/255.0, 119.0/255.0, 180.0/255.0},
+      {214.0/255.0, 39.0/255.0, 40.0/255.0},
+      {44.0/255.0, 160.0/255.0, 44.0/255.0},
+      {255.0/255.0, 127.0/255.0, 14.0/255.0},
+      {148.0/255.0, 103.0/255.0, 189.0/255.0},
+      {140.0/255.0, 86.0/255.0, 75.0/255.0},
+      {227.0/255.0, 119.0/255.0, 194.0/255.0},
+      {127.0/255.0, 127.0/255.0, 127.0/255.0}
+    };
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    void *canvas = dc->canvas;
+    LineStyle *__ls = (LineStyle *)(intptr_t)(style);
+    int __color = __ls ? (int)__ls->color : -1;
+    if (__color < 0) __color = (int)((dc->auto_color++) % 8);
+    __color %= 8; if (__color < 0) __color += 8;
+    double __alpha = (__ls && __ls->alpha > 0.0) ? __ls->alpha : 1.0;
+    double __width = (__ls && __ls->width > 0.0) ? __ls->width : 1.5;
+    plutovg_canvas_set_rgba((plutovg_canvas_t *)canvas,
+                            (float)palette[__color][0], (float)palette[__color][1],
+                            (float)palette[__color][2], (float)__alpha);
+    plutovg_canvas_set_line_width((plutovg_canvas_t *)canvas, (float)__width);
+    plutovg_canvas_set_dash_array((plutovg_canvas_t *)canvas, NULL, 0);
+    /* The first line style a series draws with is its legend swatch's. */
+    PlotSwatch *sw = (PlotSwatch *)plot_ctx_swatch(dc);
+    if (sw && !sw->has_line) {
+      sw->has_line = 1; sw->line_color = __color;
+      sw->line_alpha = __alpha; sw->line_width = __width;
+    }
+    ```)
+
+  ;;; __ctx-fill-style -- install a fill-style handle's color and alpha.
+  (defn (export-as "plot_ctx_fill_style") __ctx-fill-style [ctx : ptr<void>  style : int] : void
+    ```c
+    #include <stdint.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    #endif
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void *plot_ctx_swatch(void *);
+    typedef struct { int64_t color; double alpha; int64_t line_color; double line_width; } FillStyle;
+    static const double palette[8][3] = {
+      {31.0/255.0, 119.0/255.0, 180.0/255.0},
+      {214.0/255.0, 39.0/255.0, 40.0/255.0},
+      {44.0/255.0, 160.0/255.0, 44.0/255.0},
+      {255.0/255.0, 127.0/255.0, 14.0/255.0},
+      {148.0/255.0, 103.0/255.0, 189.0/255.0},
+      {140.0/255.0, 86.0/255.0, 75.0/255.0},
+      {227.0/255.0, 119.0/255.0, 194.0/255.0},
+      {127.0/255.0, 127.0/255.0, 127.0/255.0}
+    };
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    FillStyle *__fs = (FillStyle *)(intptr_t)(style);
+    int __color = __fs ? (int)__fs->color : -1;
+    if (__color < 0) __color = (int)((dc->auto_color++) % 8);
+    __color %= 8; if (__color < 0) __color += 8;
+    double __alpha = (__fs && __fs->alpha > 0.0) ? __fs->alpha : 0.5;
+    plutovg_canvas_set_rgba((plutovg_canvas_t *)dc->canvas,
+                            (float)palette[__color][0], (float)palette[__color][1],
+                            (float)palette[__color][2], (float)__alpha);
+    /* The first fill a series draws with is its legend swatch's. */
+    PlotSwatch *sw = (PlotSwatch *)plot_ctx_swatch(dc);
+    if (sw && !sw->has_fill) {
+      sw->has_fill = 1; sw->fill_color = __color; sw->fill_alpha = __alpha;
+    }
+    ```)
+
+  ;;; __ctx-point-style -- resolve a point-style handle's stroke and fill palette
+  ;;; indices into `stroke-out` / `fill-out` (int *).
+  ;;;
+  ;;; Each of the three style helpers also records the first style of its kind
+  ;;; the renderer now drawing (`__ctx-drawing`) resolves -- auto colors
+  ;;; included -- as that renderer's legend swatch.
+  (defn (export-as "plot_ctx_point_style")
+        __ctx-point-style [ctx : ptr<void>  style : int  stroke-out : ptr<void>  fill-out : ptr<void>] : void
+    ```c
+    #include <stdint.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void *plot_ctx_swatch(void *);
+    typedef struct { int64_t color; int64_t fill_color; int64_t sym; double size; double alpha; } PointStyle;
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    PointStyle *__ps = (PointStyle *)(intptr_t)(style);
+    int __stroke = __ps ? (int)__ps->color : -1;
+    if (__stroke < 0) __stroke = (int)((dc->auto_color++) % 8);
+    __stroke %= 8; if (__stroke < 0) __stroke += 8;
+    int __fill = (__ps && __ps->fill_color >= 0) ? (int)(__ps->fill_color % 8) : __stroke;
+    if (stroke_out) *(int *)stroke_out = __stroke;
+    if (fill_out) *(int *)fill_out = __fill;
+    /* The first point style a series draws with is its legend swatch's. */
+    PlotSwatch *sw = (PlotSwatch *)plot_ctx_swatch(dc);
+    if (sw && !sw->has_point) {
+      sw->has_point = 1; sw->point_stroke = __stroke; sw->point_fill = __fill;
+      sw->point_sym = __ps ? __ps->sym : 0;
+      sw->point_size = (__ps && __ps->size > 0.0) ? __ps->size : 6.0;
+      sw->point_alpha = (__ps && __ps->alpha > 0.0) ? __ps->alpha : 1.0;
+    }
+    ```)
+
+  ;;; __ctx-note-fill -- record palette color `color` at `alpha` as the
+  ;;; drawing renderer's fill swatch, for a draw that fills without a
+  ;;; FillStyle (the contour bands). Draws nothing.
+  (defn (export-as "plot_ctx_note_fill")
+        __ctx-note-fill [ctx : ptr<void>  color : int  alpha : float] : void
+    ```c
+    #include <stdint.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void *plot_ctx_swatch(void *);
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    PlotSwatch *sw = (PlotSwatch *)plot_ctx_swatch(dc);
+    if (sw && !sw->has_fill) {
+      int c = (int)(color % 8); if (c < 0) c += 8;
+      sw->has_fill = 1; sw->fill_color = c; sw->fill_alpha = alpha;
+    }
+    ```)
+
+  ;;; __ctx-marker -- draw one point marker centered on viewport pixel
+  ;;; (vx, vy): symbol `sym` (0 circle, 1 square, 2 triangle, 3 cross,
+  ;;; 4 plus, 5 diamond) of width `size`, filled with palette color `fill` and
+  ;;; outlined with `stroke`, both at `alpha`. `points` draws each point with
+  ;;; it, and the legend its swatch.
+  (defn (export-as "plot_ctx_marker")
+        __ctx-marker [ctx : ptr<void>  vx : float  vy : float  stroke : int  fill : int
+                      sym : int  size : float  alpha : float] : void
+    ```c
+    #include <stdint.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    extern void plutovg_canvas_set_line_width(void* canvas, float line_width);
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_circle(void* canvas, float cx, float cy, float r);
+    extern void plutovg_canvas_close_path(void* canvas);
+    extern void plutovg_canvas_fill(void* canvas);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    static const double palette[8][3] = {
+      {31.0/255.0, 119.0/255.0, 180.0/255.0},
+      {214.0/255.0, 39.0/255.0, 40.0/255.0},
+      {44.0/255.0, 160.0/255.0, 44.0/255.0},
+      {255.0/255.0, 127.0/255.0, 14.0/255.0},
+      {148.0/255.0, 103.0/255.0, 189.0/255.0},
+      {140.0/255.0, 86.0/255.0, 75.0/255.0},
+      {227.0/255.0, 119.0/255.0, 194.0/255.0},
+      {127.0/255.0, 127.0/255.0, 127.0/255.0}
+    };
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    int s8 = (int)(stroke % 8); if (s8 < 0) s8 += 8;
+    int f8 = (int)(fill % 8); if (f8 < 0) f8 += 8;
+    plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas,
+                            (float)palette[f8][0], (float)palette[f8][1],
+                            (float)palette[f8][2], (float)alpha);
+    switch ((int)sym) {
+      case 1: plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy - size / 2), (float)size, (float)size); break;
+      case 2:
+        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy + size / 2));
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy + size / 2));
+        plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+        break;
+      case 5:
+        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)vy);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy + size / 2));
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)vy);
+        plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+        break;
+      default: plutovg_canvas_circle((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy, (float)(size / 2)); break;
+    }
+    plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+    plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas,
+                            (float)palette[s8][0], (float)palette[s8][1],
+                            (float)palette[s8][2], (float)alpha);
+    plutovg_canvas_set_line_width((plutovg_canvas_t *)(intptr_t)canvas, 1.0f);
+    if (sym == 3) {
+      plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy - size / 2));
+      plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy + size / 2));
+      plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy + size / 2));
+      plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy - size / 2));
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } else if (sym == 4) {
+      plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)vy);
+      plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)vy);
+      plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+      plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy + size / 2));
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } else {
+      switch ((int)sym) {
+        case 1: plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy - size / 2), (float)size, (float)size); break;
+        case 2:
+          plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy + size / 2));
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy + size / 2));
+          plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+          break;
+        case 5:
+          plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)vy);
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy + size / 2));
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)vy);
+          plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+          break;
+        default: plutovg_canvas_circle((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy, (float)(size / 2)); break;
+      }
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    }
+    ```)
+
+  ;;; __ctx-map -- map the data point (x, y) into viewport pixels, written to
+  ;;; `vx-out` / `vy-out` (double *).
+  (defn (export-as "plot_ctx_map")
+        __ctx-map [ctx : ptr<void>  x : float  y : float  vx-out : ptr<void>  vy-out : ptr<void>] : void
+    ```c
+    #include <stdint.h>
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    double __tx = ((x) - dc->bx_min) / (dc->bx_max - dc->bx_min);
+    double __ty = ((y) - dc->by_min) / (dc->by_max - dc->by_min);
+    *(double *)vx_out = (double)dc->left + __tx * (double)dc->plot_w;
+    *(double *)vy_out = (double)dc->bottom - __ty * (double)dc->plot_h;
+    ```)
+
+  ;; ---------------------------------------------------------------------------
+  ;; The folds a plot makes over its renderers, each a top-level recursive
+  ;; defn (a `letrec` closure leaked its env and a struct box per call). Every
+  ;; element is opened and the method dispatched through its own instance.
+  ;; ---------------------------------------------------------------------------
+
+  ;;; __marks-fold -- union the `frame-marks` of rs[i..n) into acc.
+  (defn __marks-fold [rs : (Vec AnyRenderer)  i : int  n : int  acc : FrameMarks] : FrameMarks
+    (if (>= i n) acc
+      (__marks-fold rs (+ i 1) n
+                    (frame-marks-union acc (open (vec-get rs i) [a v] (frame-marks v))))))
+
+  ;;; __first-categorical -- the index of the first `categorical?` renderer of
+  ;;; rs[i..n), or -1.
+  (defn __first-categorical [rs : (Vec AnyRenderer)  i : int  n : int] : int
+    (if (>= i n) -1
+      (if (open (vec-get rs i) [a v] (categorical? v))
+        i
+        (__first-categorical rs (+ i 1) n))))
+
+  ;;; __draw-fold -- `draw` each of rs[i..n), in order, telling the DrawCtx
+  ;;; which one is drawing so its legend swatch is recorded.
+  (defn __draw-fold [rs : (Vec AnyRenderer)  ctx : DrawCtx  i : int  n : int] : int
+    (if (>= i n)
+      (do (__ctx-drawing ctx -1) n)
+      (do (__ctx-drawing ctx i)
+          (open (vec-get rs i) [a v] (draw v ctx))
+          (__draw-fold rs ctx (+ i 1) n))))
+
+  ;;; __legend-rows -- renderer i's legend rows for labels[k..m); `row` is
+  ;;; the next row's index, and the result the one after the last drawn.
+  (defn __legend-rows [ctx : DrawCtx  i : int  labels : (Vec cstr)  k : int  m : int  row : int] : int
+    (if (>= k m) row
+      (__legend-rows ctx i labels (+ k 1) m
+                     (if (__legend-row ctx row i k (vec-get labels k))
+                       (+ row 1)
+                       row))))
+
+  ;;; __legend-fold -- the legend rows of rs[i..n), each renderer's
+  ;;; `legend-labels` in order; `row` is the next row's index.
+  (defn __legend-fold [rs : (Vec AnyRenderer)  ctx : DrawCtx  i : int  n : int  row : int] : int
+    (if (>= i n) row
+      (let [labels (open (vec-get rs i) [a v] (legend-labels v))
+            next   (__legend-rows ctx i labels 0 (vec-len labels) row)]
+        (vec-free labels)
+        (__legend-fold rs ctx (+ i 1) n next))))
+
+  ;;; __null-ptr? -- is this a null pointer?
+  (defn __null-ptr? [p : ptr<void>] : bool
+    ```c return p == NULL; ```)
+
+  ;;; plot-anyrenderers -- deprecated: `plot` takes a (Vec AnyRenderer) itself
+  ;;; now. Kept for one release; call `plot`.
+  (defn plot-anyrenderers [rs : (Vec AnyRenderer) opts : PlotOpts] : ptr<void>
+    (plot rs opts))
 
   ;;; __surfaces-equal? -- true when two plutovg surfaces have identical
   ;;; dimensions and pixel bytes. Used to assert that the typed `AnyRenderer`
@@ -982,28 +1417,17 @@
     return true;
     ```)
 
-  ;;; plot-into-canvas -- render into an existing canvas and viewport.
-  ;;;
-  ;;; renderers is a Vec[Renderer] (built with vec-of or vec-new/vec-push!),
-  ;;; not a cons list. Internal renderer payload data (e.g. lists of point
-  ;;; pairs inside each renderer) is still cons-shaped -- only the top-level
-  ;;; sequence of renderers is a Vec.
-  ;;; __draw-renderers -- draw the renderer Vec into `canvas` at the already-
-  ;;; resolved data bounds and viewport rect. P0 de-monolith of the plot
-  ;;; Renderer plan: the former per-kind draw `switch`, its clip bracket, and the
-  ;;; style / auto-color / MAP_POINT machinery are lifted verbatim out of the
-  ;;; ~900-line plot-into-canvas body into this standalone, independently-callable
-  ;;; function. plot-into-canvas now computes bounds/axes/labels and delegates the
-  ;;; data rendering here. Pure code movement -- pixel output is byte-identical.
-  ;;;
-  ;;; Pinned to the stable C symbol `plot_draw_renderers` via `export-as` so
-  ;;; plot-into-canvas's inline-C can name it across mangling (same idiom as
-  ;;; `plot_sample_adaptive` / `plot_renderer_bbox`).
-  (defn (export-as "plot_draw_renderers")
-        __draw-renderers [canvas : int  renderers : int
-                          bx-min : float  bx-max : float  by-min : float  by-max : float
-                          left : int  right : int  top : int  bottom : int
-                          plot-w : int  plot-h : int  font-ok : int] : void
+  ;;; __plot-frame -- lay out and paint one plot's frame: background, border,
+  ;;; ticks, grid, axes, title and axis labels, over the data extent the caller
+  ;;; folded from the renderers' `bounds` (all NaN when nothing constrains it),
+  ;;; the marks they asked for, and the category labels as ((label . 0) ...)
+  ;;; Cells. Returns the DrawCtx (as a
+  ;;; pointer) the renderers then draw through, or NULL when the viewport is
+  ;;; too small to hold a plot.
+  (defn __plot-frame [canvas : int  opts : PlotOpts  px : int  py : int  pw : int  ph : int
+                      data-x-min : float  data-x-max : float  data-y-min : float  data-y-max : float
+                      mark-x-axis : bool  mark-y-axis : bool  mark-x-grid : bool  mark-y-grid : bool
+                      has-categories : bool  categories-on-y : bool  category-cells : Cells] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -1055,25 +1479,29 @@
     #endif
 
     typedef struct { int64_t head; int64_t tail; } Cons;
-    #define RETURN_ERR(CODE) do { \
-      return (void *)(intptr_t)tur_err_int((CODE)); \
-    } while (0)
-    #define RETURN_OK(VALUE) do { \
-      return (void *)(intptr_t)tur_ok_int((VALUE)); \
-    } while (0)
-    typedef struct __plot_renderer {
-      int64_t kind;
-      int64_t style1, style2;
-      int64_t data1, data2, data3, data4, data5;
-      double f1, f2, f3, f4, f5, f6;
-      int64_t i1, i2, i3, i4;
-      char *label;
-      char *text;
-      double x_min, x_max, y_min, y_max;
-    } PlotRenderer;
-    typedef struct { int64_t color; double width; int64_t dash; double alpha; } LineStyle;
-    typedef struct { int64_t color; int64_t fill_color; int64_t sym; double size; double alpha; } PointStyle;
-    typedef struct { int64_t color; double alpha; int64_t line_color; double line_width; } FillStyle;
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
+    } PlotDrawCtx;
     typedef struct {
       int64_t width; int64_t height;
       char *title; char *x_label; char *y_label;
@@ -1081,617 +1509,24 @@
       int64_t legend_pos;
     } PlotOpts;
 
-    enum {
-      RK_X_AXIS = 1, RK_Y_AXIS = 2, RK_AXES = 3,
-      RK_X_TICKS = 4, RK_Y_TICKS = 5, RK_GRID = 6,
-      RK_HRULE = 7, RK_VRULE = 8, RK_LABEL = 9,
-      RK_LINES = 20, RK_FUNCTION = 21, RK_PARAMETRIC = 22, RK_POLAR = 23, RK_INVERSE = 24, RK_DENSITY = 25,
-      RK_POINTS = 30, RK_ERROR_BARS = 31, RK_VECTOR_FIELD = 32, RK_ARROWS = 33,
-      RK_FUNCTION_INTERVAL = 40, RK_LINES_INTERVAL = 41, RK_PARAM_INTERVAL = 42, RK_POLAR_INTERVAL = 43,
-      RK_RECTANGLES = 50, RK_AREA_HIST = 51, RK_DISCRETE_HIST = 52, RK_STACKED_HIST = 53,
-      RK_ISOLINE = 60, RK_CONTOURS = 61, RK_CONTOUR_INTERVALS = 62, RK_COLOR_FIELD = 63
-    };
 
-    static const double palette[8][3] = {
-      {31.0/255.0, 119.0/255.0, 180.0/255.0},
-      {214.0/255.0, 39.0/255.0, 40.0/255.0},
-      {44.0/255.0, 160.0/255.0, 44.0/255.0},
-      {255.0/255.0, 127.0/255.0, 14.0/255.0},
-      {148.0/255.0, 103.0/255.0, 189.0/255.0},
-      {140.0/255.0, 86.0/255.0, 75.0/255.0},
-      {227.0/255.0, 119.0/255.0, 194.0/255.0},
-      {127.0/255.0, 127.0/255.0, 127.0/255.0}
-    };
-
-    #define DBL_BITS(v) (((union { double d; int64_t i; }){.d=(v)}).i)
-    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
-    #define ISNAN(v) ((v) != (v))
-    typedef struct { int64_t *data; size_t len; size_t cap; } RendVec;
-    int auto_color = 0;
-    #define NEXT_AUTO() ((auto_color++) % 8)
-    #define SET_LINE_STYLE(HANDLE, RESOLVED_COLOR) do { \
-      LineStyle *__ls = (LineStyle *)(intptr_t)(HANDLE); \
-      int *__resolved_color = (RESOLVED_COLOR); \
-      int __color = __ls ? (int)__ls->color : -1; \
-      if (__color < 0) __color = NEXT_AUTO(); \
-      __color %= 8; if (__color < 0) __color += 8; \
-      double __alpha = (__ls && __ls->alpha > 0.0) ? __ls->alpha : 1.0; \
-      double __width = (__ls && __ls->width > 0.0) ? __ls->width : 1.5; \
-      plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas, \
-                              (float)palette[__color][0], (float)palette[__color][1], \
-                              (float)palette[__color][2], (float)__alpha); \
-      plutovg_canvas_set_line_width((plutovg_canvas_t *)(intptr_t)canvas, (float)__width); \
-      if (__resolved_color) *__resolved_color = __color; \
-      plutovg_canvas_set_dash_array((plutovg_canvas_t *)(intptr_t)canvas, NULL, 0); \
-    } while (0)
-    #define SET_FILL_STYLE(HANDLE, RESOLVED_FILL, RESOLVED_LINE) do { \
-      FillStyle *__fs = (FillStyle *)(intptr_t)(HANDLE); \
-      int *__resolved_fill = (RESOLVED_FILL); \
-      int *__resolved_line = (RESOLVED_LINE); \
-      int __color = __fs ? (int)__fs->color : -1; \
-      if (__color < 0) __color = NEXT_AUTO(); \
-      __color %= 8; if (__color < 0) __color += 8; \
-      int __lcolor = (__fs && __fs->line_color >= 0) ? (int)__fs->line_color : __color; \
-      double __alpha = (__fs && __fs->alpha > 0.0) ? __fs->alpha : 0.5; \
-      if (__resolved_fill) *__resolved_fill = __color; \
-      if (__resolved_line) *__resolved_line = __lcolor; \
-      plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas, \
-                              (float)palette[__color][0], (float)palette[__color][1], \
-                              (float)palette[__color][2], (float)__alpha); \
-    } while (0)
-    #define SET_POINT_STYLE(HANDLE, RESOLVED_STROKE, RESOLVED_FILL) do { \
-      PointStyle *__ps = (PointStyle *)(intptr_t)(HANDLE); \
-      int *__resolved_stroke = (RESOLVED_STROKE); \
-      int *__resolved_fill = (RESOLVED_FILL); \
-      int __stroke = __ps ? (int)__ps->color : -1; \
-      if (__stroke < 0) __stroke = NEXT_AUTO(); \
-      __stroke %= 8; if (__stroke < 0) __stroke += 8; \
-      int __fill = (__ps && __ps->fill_color >= 0) ? (int)__ps->fill_color : __stroke; \
-      if (__resolved_stroke) *__resolved_stroke = __stroke; \
-      if (__resolved_fill) *__resolved_fill = __fill; \
-    } while (0)
-    #define MAP_POINT(X, Y, VX, VY) do { \
-      double __tx = ((X) - bx_min) / (bx_max - bx_min); \
-      double __ty = ((Y) - by_min) / (by_max - by_min); \
-      *(VX) = (double)left + __tx * (double)plot_w; \
-      *(VY) = (double)bottom - __ty * (double)plot_h; \
-    } while (0)
-
-    plutovg_canvas_save((plutovg_canvas_t *)(intptr_t)canvas);
-    plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)left, (float)top, (float)plot_w, (float)plot_h);
-    plutovg_canvas_clip((plutovg_canvas_t *)(intptr_t)canvas);
-
-    {
-      RendVec *__rvec2 = (RendVec *)(intptr_t)renderers;
-      size_t __rlen2 = __rvec2 ? __rvec2->len : 0;
-      for (size_t __ri2 = 0; __ri2 < __rlen2; __ri2++) {
-      PlotRenderer *r = (PlotRenderer *)(intptr_t)__rvec2->data[__ri2];
-      if (!r) continue;
-      switch ((int)r->kind) {
-        case RK_HRULE:
-        case RK_VRULE: {
-          SET_LINE_STYLE(r->style1, ((int *)0));
-          if (r->kind == RK_HRULE) {
-            double __tmpx = 0.0, vy = 0.0; MAP_POINT(bx_min, r->f1, &__tmpx, &vy);
-            plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)left, (float)vy);
-            plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)right, (float)vy);
-          } else {
-            double vx = 0.0, __tmpy = 0.0; MAP_POINT(r->f1, by_min, &vx, &__tmpy);
-            plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)top);
-            plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)bottom);
-          }
-          plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
-        } break;
-        case RK_LABEL: {
-          if (font_ok && r->text) {
-            int stroke = 0;
-            SET_LINE_STYLE(r->style1, &stroke);
-            double vx, vy; MAP_POINT(r->f1, r->f2, &vx, &vy);
-            plutovg_canvas_fill_text((plutovg_canvas_t *)(intptr_t)canvas, r->text, (int)strlen(r->text),
-                                     PLUTOVG_TEXT_ENCODING_UTF8, (float)(vx + 4.0), (float)(vy - 4.0));
-          }
-        } break;
-        case RK_LINES: {
-          SET_LINE_STYLE(r->style1, ((int *)0));
-          bool have = false; double px0 = 0.0, py0 = 0.0;
-          for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail) {
-            Cons *pt = (Cons *)(intptr_t)p->head;
-            if (!pt) continue;
-            double x = BITS_DBL(pt->head), y = BITS_DBL(pt->tail);
-            if (ISNAN(x) || ISNAN(y)) { have = false; continue; }
-            double vx, vy; MAP_POINT(x, y, &vx, &vy);
-            if (!have) plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
-            else plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
-            px0 = vx; py0 = vy; have = true;
-          }
-          if (have) plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
-        } break;
-        case RK_FUNCTION:
-        case RK_INVERSE:
-        case RK_DENSITY:
-        case RK_PARAMETRIC:
-        case RK_POLAR: {
-          SET_LINE_STYLE(r->style1, ((int *)0));
-          int n = (int)r->i1; if (n < 32) n = 32;
-          if (r->kind == RK_DENSITY) {
-            bool started = false;
-            double xs[2048]; int m = 0;
-            double mean = 0.0, sd = 0.0;
-            for (Cons *p = (Cons *)(intptr_t)r->data1; p && m < 2048; p = (Cons *)(intptr_t)p->tail) {
-              xs[m++] = BITS_DBL(p->head);
-              mean += xs[m - 1];
-            }
-            if (m == 0) break;
-            mean /= (double)m;
-            for (int i = 0; i < m; i++) { double d = xs[i] - mean; sd += d * d; }
-            sd = sqrt(sd / (double)(m > 1 ? m - 1 : 1));
-            double bw = r->f1 > 0.0 ? r->f1 : (1.06 * sd * pow((double)m, -0.2));
-            if (!(bw > 0.0)) bw = 1.0;
-            for (int i = 0; i < n; i++) {
-              double x = bx_min + (bx_max - bx_min) * ((double)i / (double)(n - 1));
-              double sum = 0.0;
-              for (int j = 0; j < m; j++) {
-                double u = (x - xs[j]) / bw;
-                sum += exp(-0.5 * u * u);
-              }
-              double y = sum / ((double)m * bw * sqrt(2.0 * 3.14159265358979323846));
-              double vx, vy; MAP_POINT(x, y, &vx, &vy);
-              if (!started) { plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy); started = true; }
-              else plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
-            }
-            if (started) plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
-          } else {
-            extern void plot_sample_adaptive(
-              int64_t renderer, int64_t canvas,
-              double bx_min, double bx_max, double by_min, double by_max,
-              int64_t left, int64_t top, int64_t plot_w, int64_t plot_h,
-              int64_t initial_samples);
-            plot_sample_adaptive(
-              (int64_t)(intptr_t)r, canvas,
-              bx_min, bx_max, by_min, by_max,
-              left, top, plot_w, plot_h, n);
-          }
-        } break;
-        case RK_POINTS: {
-          PointStyle *ps = (PointStyle *)(intptr_t)r->style1;
-          int stroke, fill;
-          SET_POINT_STYLE(r->style1, &stroke, &fill);
-          double size = (ps && ps->size > 0.0) ? ps->size : 6.0;
-          double alpha = (ps && ps->alpha > 0.0) ? ps->alpha : 1.0;
-          for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail) {
-            Cons *pt = (Cons *)(intptr_t)p->head;
-            if (!pt) continue;
-            double x = BITS_DBL(pt->head), y = BITS_DBL(pt->tail);
-            double vx, vy; MAP_POINT(x, y, &vx, &vy);
-            plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas,
-                                    (float)palette[fill][0], (float)palette[fill][1],
-                                    (float)palette[fill][2], (float)alpha);
-            switch (ps ? (int)ps->sym : 0) {
-              case 1: plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy - size / 2), (float)size, (float)size); break;
-              case 2:
-                plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
-                plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy + size / 2));
-                plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy + size / 2));
-                plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
-                break;
-              case 5:
-                plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
-                plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)vy);
-                plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy + size / 2));
-                plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)vy);
-                plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
-                break;
-              default: plutovg_canvas_circle((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy, (float)(size / 2)); break;
-            }
-            plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
-            plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas,
-                                    (float)palette[stroke][0], (float)palette[stroke][1],
-                                    (float)palette[stroke][2], (float)alpha);
-            plutovg_canvas_set_line_width((plutovg_canvas_t *)(intptr_t)canvas, 1.0f);
-            if (ps && ps->sym == 3) {
-              plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy - size / 2));
-              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy + size / 2));
-              plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy + size / 2));
-              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy - size / 2));
-              plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
-            } else if (ps && ps->sym == 4) {
-              plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)vy);
-              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)vy);
-              plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
-              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy + size / 2));
-              plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
-            } else {
-              switch (ps ? (int)ps->sym : 0) {
-                case 1: plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy - size / 2), (float)size, (float)size); break;
-                case 2:
-                  plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
-                  plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy + size / 2));
-                  plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy + size / 2));
-                  plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
-                  break;
-                case 5:
-                  plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
-                  plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)vy);
-                  plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy + size / 2));
-                  plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)vy);
-                  plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
-                  break;
-                default: plutovg_canvas_circle((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy, (float)(size / 2)); break;
-              }
-              plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
-            }
-          }
-        } break;
-        case RK_ERROR_BARS: {
-          SET_LINE_STYLE(r->style1, ((int *)0));
-          for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail) {
-            Cons *a = (Cons *)(intptr_t)p->head;
-            if (!a) continue;
-            double x = BITS_DBL(a->head);
-            Cons *b = (Cons *)(intptr_t)a->tail;
-            double y = BITS_DBL(b->head);
-            double h = BITS_DBL(b->tail);
-            if (r->i1) {
-              double vxa, vya, vxb, vyb; MAP_POINT(x - h, y, &vxa, &vya); MAP_POINT(x + h, y, &vxb, &vyb);
-              plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vxa, (float)vya);
-              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vxb, (float)vyb);
-            } else {
-              double vxa, vya, vxb, vyb; MAP_POINT(x, y - h, &vxa, &vya); MAP_POINT(x, y + h, &vxb, &vyb);
-              plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vxa, (float)vya);
-              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vxb, (float)vyb);
-            }
-          }
-          plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
-        } break;
-        case RK_ARROWS:
-        case RK_VECTOR_FIELD: {
-          SET_LINE_STYLE(r->style1, ((int *)0));
-          if (r->kind == RK_ARROWS) {
-            for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail) {
-              Cons *a = (Cons *)(intptr_t)p->head;
-              double x1 = BITS_DBL(a->head);
-              Cons *b = (Cons *)(intptr_t)a->tail;
-              double y1 = BITS_DBL(b->head);
-              Cons *c = (Cons *)(intptr_t)b->tail;
-              double x2 = BITS_DBL(c->head);
-              double y2 = BITS_DBL(c->tail);
-              double vx1, vy1, vx2, vy2; MAP_POINT(x1, y1, &vx1, &vy1); MAP_POINT(x2, y2, &vx2, &vy2);
-              plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx1, (float)vy1);
-              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx2, (float)vy2);
-              double ang = atan2(vy2 - vy1, vx2 - vx1);
-              double ah = 6.0;
-              plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx2, (float)vy2);
-              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx2 - ah * cos(ang - 0.45)), (float)(vy2 - ah * sin(ang - 0.45)));
-              plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx2, (float)vy2);
-              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx2 - ah * cos(ang + 0.45)), (float)(vy2 - ah * sin(ang + 0.45)));
-            }
-          } else {
-            int samples = (int)r->i1; if (samples < 2) samples = 2;
-            for (int iy = 0; iy < samples; iy++) for (int ix = 0; ix < samples; ix++) {
-              double x = r->f1 + (r->f2 - r->f1) * ((double)ix / (double)(samples - 1));
-              double y = r->f3 + (r->f4 - r->f3) * ((double)iy / (double)(samples - 1));
-              Cons *pair = (Cons *)(intptr_t)((int64_t(*)(double,double))(intptr_t)r->data1)(x, y);
-              double dx = BITS_DBL(pair->head), dy = BITS_DBL(pair->tail);
-              if (r->i2 == 1) {
-                double len = sqrt(dx * dx + dy * dy);
-                if (len > 1e-12) { dx /= len; dy /= len; }
-              }
-              double scale = (r->i2 == 2) ? 0.15 : 0.10;
-              double x2 = x + dx * (r->f2 - r->f1) * scale;
-              double y2 = y + dy * (r->f4 - r->f3) * scale;
-              double vx1, vy1, vx2, vy2; MAP_POINT(x, y, &vx1, &vy1); MAP_POINT(x2, y2, &vx2, &vy2);
-              plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx1, (float)vy1);
-              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx2, (float)vy2);
-            }
-          }
-          plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
-        } break;
-        case RK_FUNCTION_INTERVAL:
-        case RK_PARAM_INTERVAL:
-        case RK_POLAR_INTERVAL:
-        case RK_LINES_INTERVAL: {
-          SET_FILL_STYLE(r->style1, ((int *)0), ((int *)0));
-          int n = (int)r->i1; if (n < 32) n = 32;
-          bool started = false;
-          if (r->kind == RK_LINES_INTERVAL) {
-            int count = 0;
-            for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail) count++;
-            double *xs = (double *)malloc(sizeof(double) * count);
-            double *ya = (double *)malloc(sizeof(double) * count);
-            double *yb = (double *)malloc(sizeof(double) * count);
-            int idx = 0;
-            for (Cons *p = (Cons *)(intptr_t)r->data1, *q = (Cons *)(intptr_t)r->data2; p && q && idx < count; p = (Cons *)(intptr_t)p->tail, q = (Cons *)(intptr_t)q->tail, idx++) {
-              Cons *pa = (Cons *)(intptr_t)p->head; Cons *pb = (Cons *)(intptr_t)q->head;
-              xs[idx] = BITS_DBL(pa->head); ya[idx] = BITS_DBL(pa->tail); yb[idx] = BITS_DBL(pb->tail);
-            }
-            for (int i = 0; i < idx; i++) {
-              double vx, vy; MAP_POINT(xs[i], ya[i], &vx, &vy);
-              if (!started) { plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy); started = true; }
-              else plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
-            }
-            for (int i = idx - 1; i >= 0; i--) {
-              double vx, vy; MAP_POINT(xs[i], yb[i], &vx, &vy);
-              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
-            }
-            free(xs); free(ya); free(yb);
-          } else {
-            double *xs = (double *)malloc(sizeof(double) * n);
-            double *ya = (double *)malloc(sizeof(double) * n);
-            double *yb = (double *)malloc(sizeof(double) * n);
-            for (int i = 0; i < n; i++) {
-              double t = r->f1 + (r->f2 - r->f1) * ((double)i / (double)(n - 1));
-              if (r->kind == RK_FUNCTION_INTERVAL) {
-                xs[i] = t;
-                ya[i] = ((double(*)(double))(intptr_t)r->data1)(t);
-                yb[i] = ((double(*)(double))(intptr_t)r->data2)(t);
-              } else if (r->kind == RK_PARAM_INTERVAL) {
-                Cons *pa = (Cons *)(intptr_t)((int64_t(*)(double))(intptr_t)r->data1)(t);
-                Cons *pb = (Cons *)(intptr_t)((int64_t(*)(double))(intptr_t)r->data2)(t);
-                xs[i] = BITS_DBL(pa->head); ya[i] = BITS_DBL(pa->tail); yb[i] = BITS_DBL(pb->tail);
-              } else {
-                double ra = ((double(*)(double))(intptr_t)r->data1)(t);
-                double rb = ((double(*)(double))(intptr_t)r->data2)(t);
-                xs[i] = ra * cos(t); ya[i] = ra * sin(t); yb[i] = rb * sin(t);
-              }
-            }
-            for (int i = 0; i < n; i++) {
-              double vx, vy; MAP_POINT(xs[i], ya[i], &vx, &vy);
-              if (!started) { plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy); started = true; }
-              else plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
-            }
-            for (int i = n - 1; i >= 0; i--) {
-              double vx, vy;
-              if (r->kind == RK_POLAR_INTERVAL) {
-                double x2 = ((double(*)(double))(intptr_t)r->data2)(r->f1 + (r->f2 - r->f1) * ((double)i / (double)(n - 1))) * cos(r->f1 + (r->f2 - r->f1) * ((double)i / (double)(n - 1)));
-                MAP_POINT(x2, yb[i], &vx, &vy);
-              } else MAP_POINT(xs[i], yb[i], &vx, &vy);
-              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
-            }
-            free(xs); free(ya); free(yb);
-          }
-          plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
-          plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
-          SET_LINE_STYLE(r->style2, ((int *)0));
-          plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
-        } break;
-        case RK_RECTANGLES:
-        case RK_AREA_HIST:
-        case RK_DISCRETE_HIST:
-        case RK_STACKED_HIST: {
-          if (r->kind == RK_DISCRETE_HIST || r->kind == RK_STACKED_HIST) {
-            int idx = 0, fill_idx = 0;
-            for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail, idx++) {
-              double x0 = idx, x1 = idx + 0.8;
-              if (r->kind == RK_DISCRETE_HIST) {
-                Cons *bar = (Cons *)(intptr_t)p->head;
-                double h = BITS_DBL(bar->tail);
-                SET_FILL_STYLE(r->style1, ((int *)0), ((int *)0));
-                double vx0, vy0, vx1, vy1;
-                if (r->i1) { MAP_POINT(0.0, x0, &vx0, &vy0); MAP_POINT(h, x1, &vx1, &vy1); }
-                else { MAP_POINT(x0, 0.0, &vx0, &vy0); MAP_POINT(x1, h, &vx1, &vy1); }
-                plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)vx0, (float)fmin(vy0, vy1), (float)(vx1 - vx0), (float)fabs(vy1 - vy0));
-                plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
-              } else {
-                Cons *grp = (Cons *)(intptr_t)p->head;
-                double acc = 0.0;
-                Cons *vals = (Cons *)(intptr_t)grp->tail;
-                Cons *fills = (Cons *)(intptr_t)r->data3;
-                while (vals) {
-                  int64_t fill = fills ? fills->head : r->style1;
-                  SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
-                  double h = BITS_DBL(vals->head);
-                  double vx0, vy0, vx1, vy1;
-                  if (r->i1) { MAP_POINT(acc, x0, &vx0, &vy0); MAP_POINT(acc + h, x1, &vx1, &vy1); }
-                  else { MAP_POINT(x0, acc, &vx0, &vy0); MAP_POINT(x1, acc + h, &vx1, &vy1); }
-                  plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)vx0, (float)fmin(vy0, vy1), (float)(vx1 - vx0), (float)fabs(vy1 - vy0));
-                  plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
-                  acc += h;
-                  vals = (Cons *)(intptr_t)vals->tail;
-                  fills = fills ? (Cons *)(intptr_t)fills->tail : NULL;
-                }
-              }
-            }
-          } else {
-            Cons *fills = (Cons *)(intptr_t)r->data2;
-            for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail) {
-              int64_t fill = (r->kind == RK_AREA_HIST) ? (fills ? fills->head : r->style1) : r->style1;
-              SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
-              Cons *a = (Cons *)(intptr_t)p->head;
-              double x0 = BITS_DBL(a->head);
-              Cons *b = (Cons *)(intptr_t)a->tail;
-              double x1 = BITS_DBL(b->head);
-              Cons *c = (Cons *)(intptr_t)b->tail;
-              double y0 = BITS_DBL(c->head);
-              double y1 = BITS_DBL(c->tail);
-              double vx0, vy0, vx1, vy1; MAP_POINT(x0, y0, &vx0, &vy0); MAP_POINT(x1, y1, &vx1, &vy1);
-              plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)fmin(vx0, vx1), (float)fmin(vy0, vy1), (float)fabs(vx1 - vx0), (float)fabs(vy1 - vy0));
-              plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
-              fills = fills ? (Cons *)(intptr_t)fills->tail : NULL;
-            }
-          }
-        } break;
-        case RK_COLOR_FIELD:
-        case RK_CONTOUR_INTERVALS: {
-          int samples = (int)r->i1; if (samples < 8) samples = 8;
-          Cons *fills = (Cons *)(intptr_t)r->style1;
-          for (int iy = 0; iy < samples - 1; iy++) for (int ix = 0; ix < samples - 1; ix++) {
-            double x0 = r->f1 + (r->f2 - r->f1) * ((double)ix / (double)(samples - 1));
-            double x1 = r->f1 + (r->f2 - r->f1) * ((double)(ix + 1) / (double)(samples - 1));
-            double y0 = r->f3 + (r->f4 - r->f3) * ((double)iy / (double)(samples - 1));
-            double y1 = r->f3 + (r->f4 - r->f3) * ((double)(iy + 1) / (double)(samples - 1));
-            double v = ((double(*)(double,double))(intptr_t)r->data1)((x0 + x1) * 0.5, (y0 + y1) * 0.5);
-            int color = 0;
-            double alpha = (r->kind == RK_COLOR_FIELD) ? r->f5 : 0.55;
-            if (r->kind == RK_COLOR_FIELD) {
-              color = ((int(*)(double,double))(intptr_t)r->data1)((x0 + x1) * 0.5, (y0 + y1) * 0.5);
-              color %= 8; if (color < 0) color += 8;
-            } else {
-              int bands = (int)r->i2 + 1;
-              double t = (v - r->f5) / (r->f6 - r->f5);
-              if (!(t == t)) t = 0.0;
-              if (t < 0.0) t = 0.0; if (t > 0.999) t = 0.999;
-              int band = (int)floor(t * bands);
-              Cons *fs = (Cons *)(intptr_t)r->style1;
-              for (int bi = 0; bi < band && fs; bi++) fs = (Cons *)(intptr_t)fs->tail;
-              FillStyle *fill = (FillStyle *)(intptr_t)(fs ? fs->head : 0);
-              color = fill ? (int)fill->color : band % 8;
-              if (color < 0) color = band % 8;
-            }
-            double vx0, vy0, vx1, vy1; MAP_POINT(x0, y0, &vx0, &vy0); MAP_POINT(x1, y1, &vx1, &vy1);
-            plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas, (float)palette[color][0], (float)palette[color][1], (float)palette[color][2], (float)alpha);
-            plutovg_canvas_fill_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)fmin(vx0, vx1), (float)fmin(vy0, vy1), (float)fabs(vx1 - vx0), (float)fabs(vy1 - vy0));
-          }
-        } break;
-        case RK_ISOLINE:
-        case RK_CONTOURS: {
-          SET_LINE_STYLE(r->style1, ((int *)0));
-          int samples = (int)r->i1; if (samples < 8) samples = 8;
-          int nlevels = (r->kind == RK_CONTOURS) ? (int)r->i2 : 1;
-          for (int li = 0; li < nlevels; li++) {
-            double level = (r->kind == RK_ISOLINE) ? r->f5 : (r->f5 + (r->f6 - r->f5) * ((double)(li + 1) / (double)(nlevels + 1)));
-            for (int iy = 0; iy < samples - 1; iy++) for (int ix = 0; ix < samples - 1; ix++) {
-              double x0 = r->f1 + (r->f2 - r->f1) * ((double)ix / (double)(samples - 1));
-              double x1 = r->f1 + (r->f2 - r->f1) * ((double)(ix + 1) / (double)(samples - 1));
-              double y0 = r->f3 + (r->f4 - r->f3) * ((double)iy / (double)(samples - 1));
-              double y1 = r->f3 + (r->f4 - r->f3) * ((double)(iy + 1) / (double)(samples - 1));
-              double v00 = ((double(*)(double,double))(intptr_t)r->data1)(x0, y0) - level;
-              double v10 = ((double(*)(double,double))(intptr_t)r->data1)(x1, y0) - level;
-              double v01 = ((double(*)(double,double))(intptr_t)r->data1)(x0, y1) - level;
-              double v11 = ((double(*)(double,double))(intptr_t)r->data1)(x1, y1) - level;
-              double ptsx[4], ptsy[4]; int pc = 0;
-              if ((v00 <= 0 && v10 > 0) || (v00 > 0 && v10 <= 0)) { double t = v00 / (v00 - v10); ptsx[pc] = x0 + (x1 - x0) * t; ptsy[pc++] = y0; }
-              if ((v10 <= 0 && v11 > 0) || (v10 > 0 && v11 <= 0)) { double t = v10 / (v10 - v11); ptsx[pc] = x1; ptsy[pc++] = y0 + (y1 - y0) * t; }
-              if ((v11 <= 0 && v01 > 0) || (v11 > 0 && v01 <= 0)) { double t = v11 / (v11 - v01); ptsx[pc] = x1 + (x0 - x1) * t; ptsy[pc++] = y1; }
-              if ((v01 <= 0 && v00 > 0) || (v01 > 0 && v00 <= 0)) { double t = v01 / (v01 - v00); ptsx[pc] = x0; ptsy[pc++] = y1 + (y0 - y1) * t; }
-              if (pc >= 2) {
-                double vx0, vy0, vx1, vy1; MAP_POINT(ptsx[0], ptsy[0], &vx0, &vy0); MAP_POINT(ptsx[1], ptsy[1], &vx1, &vy1);
-                plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx0, (float)vy0);
-                plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx1, (float)vy1);
-              }
-            }
-          }
-          plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
-        } break;
-        default: break;
-      }
-      }
-    }
-
-    plutovg_canvas_restore((plutovg_canvas_t *)(intptr_t)canvas);
-    ```)
-
-  (defn plot-into-canvas [canvas : int renderers : int opts : int
-                          px : int py : int pw : int ph : int] : ptr<void>
-    ```c
-    #include <stdlib.h>
-    #include <stdint.h>
-    #include <stdbool.h>
-    #include <string.h>
-    #include <stdio.h>
-    #include <float.h>
-    #include <unistd.h>
-    extern double floor(double);
-    extern double ceil(double);
-    extern double log10(double);
-    extern double pow(double, double);
-    extern double sqrt(double);
-    extern double cos(double);
-    extern double sin(double);
-    extern double atan2(double, double);
-    extern double exp(double);
-    extern double fabs(double);
-    extern double fmin(double, double);
-    /* Stand-ins for <plutovg.h>, for a build without it on the include
-       path; with it (a project build hoists it) these would conflict. */
-    #ifndef PLUTOVG_H
-    typedef void plutovg_surface_t;
-    typedef void plutovg_canvas_t;
-    typedef void plutovg_font_face_t;
-    typedef int plutovg_text_encoding_t;
-    #define PLUTOVG_TEXT_ENCODING_UTF8 1
-    extern void plutovg_surface_destroy(void* surface);
-    extern void* plutovg_font_face_load_from_file(const char* filename, int ttcindex);
-    extern void plutovg_font_face_destroy(void* face);
-    extern void plutovg_canvas_save(void* canvas);
-    extern void plutovg_canvas_restore(void* canvas);
-    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
-    extern void plutovg_canvas_set_font_face(void* canvas, void* face);
-    extern void plutovg_canvas_set_font_size(void* canvas, float size);
-    extern void plutovg_canvas_set_line_width(void* canvas, float line_width);
-    extern void plutovg_canvas_set_dash_array(void* canvas, const float* dashes, int ndashes);
-    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
-    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
-    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
-    extern void plutovg_canvas_circle(void* canvas, float cx, float cy, float r);
-    extern void plutovg_canvas_close_path(void* canvas);
-    extern void plutovg_canvas_fill(void* canvas);
-    extern void plutovg_canvas_stroke(void* canvas);
-    extern void plutovg_canvas_clip(void* canvas);
-    extern void plutovg_canvas_fill_rect(void* canvas, float x, float y, float w, float h);
-    extern float plutovg_canvas_fill_text(void* canvas, const void* text, int length,
-                                          int encoding, float x, float y);
-    #endif
-
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    #define RETURN_ERR(CODE) do { \
-      return (void *)(intptr_t)tur_err_int((CODE)); \
-    } while (0)
-    #define RETURN_OK(VALUE) do { \
-      return (void *)(intptr_t)tur_ok_int((VALUE)); \
-    } while (0)
-    typedef struct __plot_renderer {
-      int64_t kind;
-      int64_t style1, style2;
-      int64_t data1, data2, data3, data4, data5;
-      double f1, f2, f3, f4, f5, f6;
-      int64_t i1, i2, i3, i4;
-      char *label;
-      char *text;
-      double x_min, x_max, y_min, y_max;
-    } PlotRenderer;
-    typedef struct { int64_t color; double width; int64_t dash; double alpha; } LineStyle;
-    typedef struct { int64_t color; int64_t fill_color; int64_t sym; double size; double alpha; } PointStyle;
-    typedef struct { int64_t color; double alpha; int64_t line_color; double line_width; } FillStyle;
-    typedef struct {
-      int64_t width; int64_t height;
-      char *title; char *x_label; char *y_label;
-      double x_min, x_max, y_min, y_max;
-      int64_t legend_pos;
-    } PlotOpts;
-
-    enum {
-      RK_X_AXIS = 1, RK_Y_AXIS = 2, RK_AXES = 3,
-      RK_X_TICKS = 4, RK_Y_TICKS = 5, RK_GRID = 6,
-      RK_HRULE = 7, RK_VRULE = 8, RK_LABEL = 9,
-      RK_LINES = 20, RK_FUNCTION = 21, RK_PARAMETRIC = 22, RK_POLAR = 23, RK_INVERSE = 24, RK_DENSITY = 25,
-      RK_POINTS = 30, RK_ERROR_BARS = 31, RK_VECTOR_FIELD = 32, RK_ARROWS = 33,
-      RK_FUNCTION_INTERVAL = 40, RK_LINES_INTERVAL = 41, RK_PARAM_INTERVAL = 42, RK_POLAR_INTERVAL = 43,
-      RK_RECTANGLES = 50, RK_AREA_HIST = 51, RK_DISCRETE_HIST = 52, RK_STACKED_HIST = 53,
-      RK_ISOLINE = 60, RK_CONTOURS = 61, RK_CONTOUR_INTERVALS = 62, RK_COLOR_FIELD = 63
-    };
-
-    static const double palette[8][3] = {
-      {31.0/255.0, 119.0/255.0, 180.0/255.0},
-      {214.0/255.0, 39.0/255.0, 40.0/255.0},
-      {44.0/255.0, 160.0/255.0, 44.0/255.0},
-      {255.0/255.0, 127.0/255.0, 14.0/255.0},
-      {148.0/255.0, 103.0/255.0, 189.0/255.0},
-      {140.0/255.0, 86.0/255.0, 75.0/255.0},
-      {227.0/255.0, 119.0/255.0, 194.0/255.0},
-      {127.0/255.0, 127.0/255.0, 127.0/255.0}
-    };
-
-    #define DBL_BITS(v) (((union { double d; int64_t i; }){.d=(v)}).i)
-    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
     #define ISNAN(v) ((v) != (v))
 
     double bx_min = 0.0, bx_max = 1.0, by_min = 0.0, by_max = 1.0;
     bool have_bounds = false;
-    bool want_x_axis = false, want_y_axis = false, want_grid_x = false, want_grid_y = false;
-    int64_t categorical = 0;
-    int64_t categories = 0;
+    /* What the renderers ask of the frame, folded by the caller through the
+       Renderer typeclass (`frame-marks`, `categorical?`, `categories-on-y?`,
+       `category-labels`). Categories label the x axis, or the y axis for a
+       horizontal histogram; the other axis keeps numeric ticks. */
+    bool want_x_axis = mark_x_axis, want_y_axis = mark_y_axis;
+    bool want_grid_x = mark_x_grid, want_grid_y = mark_y_grid;
+    bool cat_x = has_categories && !categories_on_y;
+    bool cat_y = has_categories && categories_on_y;
+    int64_t categories = (int64_t)(intptr_t)category_cells;
     PlotOpts *po = (PlotOpts *)(intptr_t)opts;
-    int legend_pos = po && po->legend_pos ? (int)po->legend_pos : 1;
+    /* `legend-pos` 0 is no legend, as plot-opts documents; only a missing
+       PlotOpts falls back to the top right. */
+    int legend_pos = po ? (int)po->legend_pos : 1;
     int font_ok = 0;
     plutovg_font_face_t *font = NULL;
     const char *font_candidates[] = {
@@ -1725,44 +1560,12 @@
         } \
       } \
     } while (0)
-    #define UNION_LIST_POINTS(LST) do { \
-      for (Cons *__p = (Cons *)(intptr_t)(LST); __p; __p = (Cons *)(intptr_t)__p->tail) { \
-        Cons *__pt = (Cons *)(intptr_t)__p->head; \
-        if (!__pt) continue; \
-        UNION_POINT(BITS_DBL(__pt->head), BITS_DBL(__pt->tail)); \
-      } \
-    } while (0)
 
-    typedef struct { int64_t *data; size_t len; size_t cap; } RendVec;
-    RendVec *__rvec = (RendVec *)(intptr_t)renderers;
-    size_t __rlen = __rvec ? __rvec->len : 0;
-    for (size_t __ri = 0; __ri < __rlen; __ri++) {
-      PlotRenderer *r = (PlotRenderer *)(intptr_t)__rvec->data[__ri];
-      if (!r) continue;
-      if (r->kind == RK_X_AXIS || r->kind == RK_AXES) want_x_axis = true;
-      if (r->kind == RK_Y_AXIS || r->kind == RK_AXES) want_y_axis = true;
-      if (r->kind == RK_X_TICKS || r->kind == RK_GRID) want_grid_x = true;
-      if (r->kind == RK_Y_TICKS || r->kind == RK_GRID) want_grid_y = true;
-      if ((r->kind == RK_DISCRETE_HIST || r->kind == RK_STACKED_HIST) && !categorical) {
-        categorical = 1;
-        categories = r->data2;
-      }
-      /* P0: the per-kind bounds-union switch now lives in __renderer-bbox
-         (pinned C symbol plot_renderer_bbox). Fold its box corners here --
-         identical to unioning the underlying points. */
-      {
-        extern void *plot_renderer_bbox(int64_t renderer);
-        typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
-        RBBox *bb = (RBBox *)plot_renderer_bbox((int64_t)(intptr_t)r);
-        if (bb) {
-          if (bb->valid) {
-            UNION_POINT(bb->x0, bb->y0);
-            UNION_POINT(bb->x1, bb->y1);
-          }
-          free(bb);
-        }
-      }
-    }
+    /* The data extent: the union of every renderer's `bounds`, folded by the
+       caller through the Renderer typeclass. An empty box is all NaN, which
+       UNION_POINT skips. */
+    UNION_POINT(data_x_min, data_y_min);
+    UNION_POINT(data_x_max, data_y_max);
 
     if (!have_bounds) { bx_min = 0.0; bx_max = 1.0; by_min = 0.0; by_max = 1.0; }
     if (po) {
@@ -1783,10 +1586,13 @@
     int left = px + 64;
     int right = px + pw - 24;
     int top = py + ((po && po->title) ? 44 : 24);
-    int bottom = py + ph - ((po && (po->x_label || categorical)) ? 58 : 44);
+    int bottom = py + ph - ((po && (po->x_label || cat_x)) ? 58 : 44);
     int plot_w = right - left;
     int plot_h = bottom - top;
-    if (plot_w < 32 || plot_h < 32) RETURN_ERR(1);
+    if (plot_w < 32 || plot_h < 32) {
+      if (font) plutovg_font_face_destroy(font);
+      return NULL;
+    }
 
     plutovg_canvas_save((plutovg_canvas_t *)(intptr_t)canvas);
     plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas, 1.0f, 1.0f, 1.0f, 1.0f);
@@ -1813,12 +1619,13 @@
     char xbuf[32][64], ybuf[32][64];
     int x_count = 0, y_count = 0;
 
-    if (categorical) {
+    /* Category ticks sit at slot centers, idx + 0.4. Each cell holds a
+       bar (label . height) or a group (label . values), as the draw loop
+       reads them; the label is that pair's head, not the pair -- printing
+       the pair's address as text drew garbage. */
+    if (cat_x) {
       int idx = 0;
       for (Cons *p = (Cons *)(intptr_t)categories; p && idx < 32; p = (Cons *)(intptr_t)p->tail, idx++) {
-        /* Each cell holds a bar (label . height) or a group (label . values),
-           as the draw loop reads them; the label is that pair's head, not the
-           pair -- printing the pair's address as text drew garbage. */
         Cons *bar = (Cons *)(intptr_t)p->head;
         x_ticks[idx] = (double)idx + 0.4;
         x_labels[idx] = bar ? (const char *)(intptr_t)bar->head : "";
@@ -1840,7 +1647,15 @@
         x_count++;
       }
     }
-    {
+    if (cat_y) {
+      int idx = 0;
+      for (Cons *p = (Cons *)(intptr_t)categories; p && idx < 32; p = (Cons *)(intptr_t)p->tail, idx++) {
+        Cons *bar = (Cons *)(intptr_t)p->head;
+        y_ticks[idx] = (double)idx + 0.4;
+        y_labels[idx] = bar ? (const char *)(intptr_t)bar->head : "";
+      }
+      y_count = idx;
+    } else {
       double span = by_max - by_min;
       double raw = span / (double)(tick_n - 1);
       double mag = pow(10.0, floor(log10(raw)));
@@ -1932,43 +1747,632 @@
       }
     }
 
-    /* P0: the per-kind draw switch + clip bracket now live in __draw-renderers
-       (pinned C symbol plot_draw_renderers). Delegate the data rendering. */
-    {
-      extern void plot_draw_renderers(int64_t, int64_t, double, double, double, double,
-                                      int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
-      plot_draw_renderers(canvas, renderers, bx_min, bx_max, by_min, by_max,
-                          left, right, top, bottom, plot_w, plot_h, font_ok);
+    /* The frame is drawn. Hand the layout to the renderers' `draw` methods
+       and the legend; `__ctx-finish` restores the canvas state saved above
+       and releases the layout and the font. */
+    PlotDrawCtx *dc = (PlotDrawCtx *)malloc(sizeof(*dc));
+    if (!dc) {
+      plutovg_canvas_restore((plutovg_canvas_t *)(intptr_t)canvas);
+      if (font) plutovg_font_face_destroy(font);
+      return NULL;
     }
-
-    if (font_ok && legend_pos != 0) {
-      double lx = (legend_pos == 2 || legend_pos == 4) ? left + 12.0 : right - 120.0;
-      double ly = (legend_pos == 3 || legend_pos == 4) ? bottom - 16.0 : top + 16.0;
-      plutovg_canvas_set_font_face((plutovg_canvas_t *)(intptr_t)canvas, font);
-      plutovg_canvas_set_font_size((plutovg_canvas_t *)(intptr_t)canvas, 12.0f);
-      int row = 0;
-      RendVec *__rvec3 = (RendVec *)(intptr_t)renderers;
-      size_t __rlen3 = __rvec3 ? __rvec3->len : 0;
-      for (size_t __ri3 = 0; __ri3 < __rlen3; __ri3++) {
-        PlotRenderer *r = (PlotRenderer *)(intptr_t)__rvec3->data[__ri3];
-        if (!r || !r->label || !r->label[0]) continue;
-        double y = ly + row * 16.0;
-        int color = row % 8;
-        plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas,
-                                (float)palette[color][0], (float)palette[color][1],
-                                (float)palette[color][2], 1.0f);
-        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)lx, (float)y);
-        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(lx + 12.0), (float)y);
-        plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
-        plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas, 0.15f, 0.15f, 0.15f, 1.0f);
-        plutovg_canvas_fill_text((plutovg_canvas_t *)(intptr_t)canvas, r->label, (int)strlen(r->label),
-                                 PLUTOVG_TEXT_ENCODING_UTF8, (float)(lx + 18.0), (float)(y + 4.0));
-        row++;
-      }
-    }
-    if (font) plutovg_font_face_destroy(font);
-    RETURN_OK(0);
+    dc->canvas = (void *)(intptr_t)canvas;
+    dc->bx_min = bx_min; dc->bx_max = bx_max; dc->by_min = by_min; dc->by_max = by_max;
+    dc->left = left; dc->right = right; dc->top = top; dc->bottom = bottom;
+    dc->plot_w = plot_w; dc->plot_h = plot_h;
+    dc->font_ok = font_ok;
+    dc->font = (void *)font;
+    dc->legend_pos = legend_pos;
+    dc->auto_color = 0;
+    dc->swatches = NULL;
+    dc->n_swatches = 0;
+    dc->cur_swatch = -1;
+    dc->cur_series = 0;
+    dc->legend_x = 0.0;
+    dc->legend_y = 0.0;
+    return dc;
+    #undef UNION_POINT
+    #undef ISNAN
     ```)
+
+  ;;; __ctx-track-renderers -- give the DrawCtx legend swatches for each of
+  ;;; `n` renderers, one per series each draws, filled in as they draw (see
+  ;;; `__ctx-drawing` and `__ctx-series`).
+  (defn __ctx-track-renderers [ctx : DrawCtx  n : int] : void
+    ```c
+    #include <stdint.h>
+    #include <stdlib.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    if (n <= 0 || dc->swatches) return;
+    dc->swatches = (PlotSeries *)calloc((size_t)n, sizeof(PlotSeries));
+    dc->n_swatches = dc->swatches ? n : 0;
+    ```)
+
+  ;;; __ctx-drawing -- say which renderer (its index in the plot's Vec) is about
+  ;;; to draw, so the style helpers record its swatch; -1 for none. It starts
+  ;;; on series 0.
+  (defn __ctx-drawing [ctx : DrawCtx  i : int] : void
+    ```c
+    #include <stdint.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    dc->cur_swatch = i;
+    dc->cur_series = 0;
+    ```)
+
+  ;;; __ctx-series -- say the drawing renderer now draws its series `k` (a
+  ;;; stacked histogram's layer k): the style helpers record into that
+  ;;; series' swatch, which is its k-th legend row's.
+  (defn (export-as "plot_ctx_series") __ctx-series [ctx : ptr<void>  k : int] : void
+    ```c
+    #include <stdint.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    dc->cur_series = k < 0 ? 0 : k;
+    ```)
+
+  ;;; __ctx-swatch -- the swatch of the drawing renderer's current series,
+  ;;; added (empty) on first use; NULL when no renderer is drawing.
+  (defn (export-as "plot_ctx_swatch") __ctx-swatch [ctx : ptr<void>] : ptr<void>
+    ```c
+    #include <stdint.h>
+    #include <stdlib.h>
+    #include <string.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    if (!dc->swatches || dc->cur_swatch < 0 || dc->cur_swatch >= dc->n_swatches) return NULL;
+    PlotSeries *se = &dc->swatches[dc->cur_swatch];
+    int64_t k = dc->cur_series;
+    if (k >= se->n) {
+      PlotSwatch *items = (PlotSwatch *)realloc(se->items, (size_t)(k + 1) * sizeof(PlotSwatch));
+      if (!items) return NULL;
+      memset(items + se->n, 0, (size_t)(k + 1 - se->n) * sizeof(PlotSwatch));
+      se->items = items;
+      se->n = k + 1;
+    }
+    return &se->items[k];
+    ```)
+
+  ;;; __ctx-swatch-at -- renderer `i`'s series `k` swatch, or NULL when it
+  ;;; recorded none.
+  (defn (export-as "plot_ctx_swatch_at") __ctx-swatch-at [ctx : ptr<void>  i : int  k : int] : ptr<void>
+    ```c
+    #include <stdint.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    if (!dc->swatches || i < 0 || i >= dc->n_swatches) return NULL;
+    PlotSeries *se = &dc->swatches[i];
+    if (k < 0 || k >= se->n) return NULL;
+    return &se->items[k];
+    ```)
+
+  ;;; __ctx-clip-begin -- clip drawing to the viewport, as the renderers draw.
+  (defn __ctx-clip-begin [ctx : DrawCtx] : void
+    ```c
+    #include <stdint.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_save(void* canvas);
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_clip(void* canvas);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    plutovg_canvas_save((plutovg_canvas_t *)dc->canvas);
+    plutovg_canvas_rect((plutovg_canvas_t *)dc->canvas, (float)dc->left, (float)dc->top,
+                        (float)dc->plot_w, (float)dc->plot_h);
+    plutovg_canvas_clip((plutovg_canvas_t *)dc->canvas);
+    ```)
+
+  ;;; __ctx-clip-end -- lift the viewport clip.
+  (defn __ctx-clip-end [ctx : DrawCtx] : void
+    ```c
+    #include <stdint.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_restore(void* canvas);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    plutovg_canvas_restore((plutovg_canvas_t *)dc->canvas);
+    ```)
+
+  ;;; __legend-begin -- select the legend font, when there is a legend to draw.
+  (defn __legend-begin [ctx : DrawCtx] : void
+    ```c
+    #include <stdint.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_set_font_face(void* canvas, void* face);
+    extern void plutovg_canvas_set_font_size(void* canvas, float size);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    if (!(dc->font_ok && dc->legend_pos != 0)) return;
+    plutovg_canvas_set_font_face((plutovg_canvas_t *)dc->canvas, dc->font);
+    plutovg_canvas_set_font_size((plutovg_canvas_t *)dc->canvas, 12.0f);
+    ```)
+
+  ;;; __ctx-text-width -- the advance width of `text` in the legend's font, in
+  ;;; pixels; 0 with no font. Call after `__legend-begin` has set the font.
+  (defn __ctx-text-width [ctx : DrawCtx  text : cstr] : float
+    ```c
+    #include <stdint.h>
+    #include <string.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    typedef struct { float x, y, w, h; } plutovg_rect_t;
+    #define PLUTOVG_TEXT_ENCODING_UTF8 1
+    extern float plutovg_canvas_text_extents(void* canvas, const void* text, int length,
+                                             int encoding, plutovg_rect_t* extents);
+    #endif
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    if (!dc->font_ok || !text || !text[0]) return 0.0;
+    plutovg_rect_t r;
+    return (double)plutovg_canvas_text_extents((plutovg_canvas_t *)dc->canvas, text, (int)strlen(text),
+                                               PLUTOVG_TEXT_ENCODING_UTF8, &r);
+    ```)
+
+  ;;; LegendSize -- how many legend rows a plot has, and its widest label.
+  (defstruct LegendSize :copy [rows : int  width : float])
+
+  ;;; __legend-size-rows -- `acc` grown by the non-empty labels[k..m).
+  (defn __legend-size-rows [ctx : DrawCtx  labels : (Vec cstr)  k : int  m : int
+                            acc : LegendSize] : LegendSize
+    (if (>= k m) acc
+      (let [label (vec-get labels k)
+            w     (__ctx-text-width ctx label)]
+        (__legend-size-rows ctx labels (+ k 1) m
+                            (if (__nonempty? label)
+                              (LegendSize (+ (.rows acc) 1) (if (> w (.width acc)) w (.width acc)))
+                              acc)))))
+
+  ;;; __legend-size -- the legend rows of rs[i..n) and their widest label,
+  ;;; folded into `acc`; the same rows `__legend-fold` draws.
+  (defn __legend-size [rs : (Vec AnyRenderer)  ctx : DrawCtx  i : int  n : int
+                       acc : LegendSize] : LegendSize
+    (if (>= i n) acc
+      (let [labels (open (vec-get rs i) [a v] (legend-labels v))
+            next   (__legend-size-rows ctx labels 0 (vec-len labels) acc)]
+        (vec-free labels)
+        (__legend-size rs ctx (+ i 1) n next))))
+
+  ;;; __legend-box -- lay the legend out for `rows` rows whose widest label is
+  ;;; `width` pixels, and draw its backing: a translucent white box with a
+  ;;; light border, so the rows read over whatever the plot drew there. A
+  ;;; right-hand legend moves left to keep a long label inside the plot, and
+  ;;; a bottom one stacks upward from the bottom edge.
+  (defn __legend-box [ctx : DrawCtx  rows : int  width : float] : void
+    ```c
+    #include <stdint.h>
+    #include <stdbool.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    extern void plutovg_canvas_set_line_width(void* canvas, float line_width);
+    extern void plutovg_canvas_round_rect(void* canvas, float x, float y, float w, float h, float rx, float ry);
+    extern void plutovg_canvas_fill_preserve(void* canvas);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int pos = (int)dc->legend_pos;
+    bool left_side = (pos == 2 || pos == 4);
+    double w = 18.0 + width;              /* swatch, gap, label */
+    double lx = left_side ? dc->left + 12.0 : dc->right - 120.0;
+    if (!left_side && lx + w > dc->right - 12.0) lx = dc->right - 12.0 - w;
+    if (lx < dc->left + 12.0) lx = dc->left + 12.0;
+    double y0 = (pos == 3 || pos == 4) ? dc->bottom - 16.0 - (rows > 0 ? rows - 1 : 0) * 16.0
+                                       : dc->top + 16.0;
+    dc->legend_x = lx;
+    dc->legend_y = y0;
+    if (!(dc->font_ok && pos != 0) || rows <= 0) return;
+    plutovg_canvas_t *cv = (plutovg_canvas_t *)dc->canvas;
+    plutovg_canvas_round_rect(cv, (float)(lx - 6.0), (float)(y0 - 10.0),
+                              (float)(w + 12.0), (float)((rows - 1) * 16.0 + 20.0), 3.0f, 3.0f);
+    plutovg_canvas_set_rgba(cv, 1.0f, 1.0f, 1.0f, 0.85f);
+    plutovg_canvas_fill_preserve(cv);
+    plutovg_canvas_set_rgba(cv, 0.75f, 0.75f, 0.75f, 1.0f);
+    plutovg_canvas_set_line_width(cv, 1.0f);
+    plutovg_canvas_stroke(cv);
+    ```)
+
+  ;;; __legend-row -- draw legend row `row`: the swatch of renderer `index`'s
+  ;;; series `series`, and `label`. The swatch is what that series drew with -- its point marker,
+  ;;; else its fill as a box (edged top and bottom in its line style, as an
+  ;;; interval band is), else a stroke of its line style; a renderer that
+  ;;; recorded no style gets none. Returns false, drawing nothing, for an
+  ;;; empty label or when there is no legend (no font, or `legend-pos` 0).
+  (defn __legend-row [ctx : DrawCtx  row : int  index : int  series : int  label : cstr] : bool
+    ```c
+    #include <stdint.h>
+    #include <string.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    #define PLUTOVG_TEXT_ENCODING_UTF8 1
+    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    extern void plutovg_canvas_set_line_width(void* canvas, float line_width);
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_fill(void* canvas);
+    extern void plutovg_canvas_stroke(void* canvas);
+    extern float plutovg_canvas_fill_text(void* canvas, const void* text, int length,
+                                          int encoding, float x, float y);
+    #endif
+    extern void plot_ctx_marker(void *, double, double, int64_t, int64_t, int64_t, double, double);
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
+    } PlotDrawCtx;
+    extern void *plot_ctx_swatch_at(void *, int64_t, int64_t);
+    static const double palette[8][3] = {
+      {31.0/255.0, 119.0/255.0, 180.0/255.0},
+      {214.0/255.0, 39.0/255.0, 40.0/255.0},
+      {44.0/255.0, 160.0/255.0, 44.0/255.0},
+      {255.0/255.0, 127.0/255.0, 14.0/255.0},
+      {148.0/255.0, 103.0/255.0, 189.0/255.0},
+      {140.0/255.0, 86.0/255.0, 75.0/255.0},
+      {227.0/255.0, 119.0/255.0, 194.0/255.0},
+      {127.0/255.0, 127.0/255.0, 127.0/255.0}
+    };
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    int legend_pos = (int)dc->legend_pos;
+    if (!(dc->font_ok && legend_pos != 0)) return false;
+    if (!label || !label[0]) return false;
+    /* Where `__legend-box` laid the legend out: row 0 at legend_y. */
+    double lx = dc->legend_x;
+    double y = dc->legend_y + row * 16.0;
+    PlotSwatch *sw = (PlotSwatch *)plot_ctx_swatch_at(dc, index, series);
+    plutovg_canvas_t *cv = (plutovg_canvas_t *)(intptr_t)canvas;
+    if (sw && sw->has_point) {
+      double size = sw->point_size > 10.0 ? 10.0 : sw->point_size;
+      plot_ctx_marker(dc, lx + 6.0, y, sw->point_stroke, sw->point_fill,
+                      sw->point_sym, size, sw->point_alpha);
+    } else if (sw && sw->has_fill) {
+      int c = (int)sw->fill_color;
+      plutovg_canvas_set_rgba(cv, (float)palette[c][0], (float)palette[c][1],
+                              (float)palette[c][2], (float)sw->fill_alpha);
+      plutovg_canvas_rect(cv, (float)lx, (float)(y - 4.0), 12.0f, 8.0f);
+      plutovg_canvas_fill(cv);
+      if (sw->has_line) {
+        int lc = (int)sw->line_color;
+        double w = sw->line_width > 3.0 ? 3.0 : sw->line_width;
+        plutovg_canvas_set_rgba(cv, (float)palette[lc][0], (float)palette[lc][1],
+                                (float)palette[lc][2], (float)sw->line_alpha);
+        plutovg_canvas_set_line_width(cv, (float)w);
+        plutovg_canvas_move_to(cv, (float)lx, (float)(y - 4.0));
+        plutovg_canvas_line_to(cv, (float)(lx + 12.0), (float)(y - 4.0));
+        plutovg_canvas_move_to(cv, (float)lx, (float)(y + 4.0));
+        plutovg_canvas_line_to(cv, (float)(lx + 12.0), (float)(y + 4.0));
+        plutovg_canvas_stroke(cv);
+      }
+    } else if (sw && sw->has_line) {
+      int lc = (int)sw->line_color;
+      double w = sw->line_width > 4.0 ? 4.0 : sw->line_width;
+      plutovg_canvas_set_rgba(cv, (float)palette[lc][0], (float)palette[lc][1],
+                              (float)palette[lc][2], (float)sw->line_alpha);
+      plutovg_canvas_set_line_width(cv, (float)w);
+      plutovg_canvas_move_to(cv, (float)lx, (float)y);
+      plutovg_canvas_line_to(cv, (float)(lx + 12.0), (float)y);
+      plutovg_canvas_stroke(cv);
+    }
+    plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas, 0.15f, 0.15f, 0.15f, 1.0f);
+    plutovg_canvas_fill_text((plutovg_canvas_t *)(intptr_t)canvas, label, (int)strlen(label),
+                             PLUTOVG_TEXT_ENCODING_UTF8, (float)(lx + 18.0), (float)(y + 4.0));
+    return true;
+    ```)
+
+  ;;; __ctx-finish -- hand the canvas back in the state the frame found it
+  ;;; (undoing its save), then release a DrawCtx, its swatches and its font.
+  (defn __ctx-finish [ctx : DrawCtx] : void
+    ```c
+    #include <stdint.h>
+    #include <stdlib.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    extern void plutovg_font_face_destroy(void* face);
+    extern void plutovg_canvas_restore(void* canvas);
+    #endif
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    if (!dc) return;
+    plutovg_canvas_restore(dc->canvas);
+    if (dc->font) plutovg_font_face_destroy(dc->font);
+    for (int64_t i = 0; i < dc->n_swatches; i++) free(dc->swatches[i].items);
+    free(dc->swatches);
+    free(dc);
+    ```)
+
+  ;;; plot-into-canvas -- render renderers into an existing canvas and viewport.
+  ;;;
+  ;;; The data extent is the union of the renderers' `bounds` (padded 5%, and
+  ;;; overridden per side by `opts`); the frame draws the axes and grids their
+  ;;; `frame-marks` ask for, with category ticks from the first
+  ;;; `categorical?` renderer's `category-labels`; then each renderer's `draw`
+  ;;; paints it, in order, clipped to the viewport, and the legend lists their
+  ;;; `legend-label`s.
+  ;;;
+  ;;; Parameters:
+  ;;;   canvas    -- the plutovg canvas to draw into
+  ;;;   renderers -- the renderers, as the constructors return them
+  ;;;   opts      -- the plot's PlotOpts
+  ;;;   px py     -- the viewport's top-left corner, in canvas pixels
+  ;;;   pw ph     -- the viewport's size, in canvas pixels
+  ;;;
+  ;;; Returns:
+  ;;;   ok 0, or err 1 when the viewport is too small to hold a plot.
+  ;;;
+  ;;; Example:
+  ;;;   (plot-into-canvas canvas (vec-of (axes) (lines pts ls "")) opts 0 0 600 450)
+  (defn plot-into-canvas [canvas : int  renderers : (Vec AnyRenderer)  opts : PlotOpts
+                          px : int  py : int  pw : int  ph : int] : ptr<void>
+    (let [n      (vec-len renderers)
+          bb     (renderers-bbox renderers)
+          marks  (__marks-fold renderers 0 n (no-frame-marks))
+          ci     (__first-categorical renderers 0 n)
+          on-y   (if (>= ci 0)
+                   (open (vec-get renderers ci) [a v] (categories-on-y? v))
+                   false)
+          labels (if (>= ci 0)
+                   (open (vec-get renderers ci) [a v] (category-labels v))
+                   (:: (vec-new) (Vec cstr)))
+          cells  (__labels->cells labels)
+          raw    (__plot-frame canvas opts px py pw ph
+                               (.x-min bb) (.x-max bb) (.y-min bb) (.y-max bb)
+                               (.x-axis marks) (.y-axis marks) (.x-grid marks) (.y-grid marks)
+                               (>= ci 0) on-y cells)]
+      ;; The frame has drawn the category ticks; their cells and labels go.
+      (__free-cells cells 1)
+      (vec-free labels)
+      (if (__null-ptr? raw)
+        (__err 1)
+        (let [ctx (:: raw DrawCtx)]
+          (__ctx-track-renderers ctx n)
+          (__ctx-clip-begin ctx)
+          (__draw-fold renderers ctx 0 n)
+          (__ctx-clip-end ctx)
+          (__legend-begin ctx)
+          (let [size (__legend-size renderers ctx 0 n (LegendSize 0 0.0))]
+            (__legend-box ctx (.rows size) (.width size)))
+          (__legend-fold renderers ctx 0 n 0)
+          (__ctx-finish ctx)
+          (__ok 0)))))
 
   ;; ---------------------------------------------------------------------------
   ;; Backend -- the output target a plot renders to (U2 typeclass collapse).
@@ -1980,17 +2384,17 @@
   ;; the destination and a new sink (e.g. a notebook-inline backend) becomes a
   ;; new instance rather than a new top-level function.
   ;;
-  ;; Named `Backend`, not the uplift plan's "Renderer": this spice already calls
-  ;; every drawable element a "renderer" (the `renderers` Vec), so a `Renderer`
-  ;; typeclass sitting next to a `renderers` parameter would be needlessly
-  ;; confusing. The concept the plan means is the output backend.
+  ;; Named `Backend`, not the uplift plan's "Renderer": in this spice a
+  ;; "renderer" is a drawable element (the `renderers` Vec), and `Renderer` is
+  ;; the class those elements implement. The concept the plan means here is
+  ;; the output backend.
   ;;
   ;; `render-to` returns the same :ptr<void> result envelope the legacy
   ;; entrypoints did: ok-val carries the new surface handle for SurfaceBackend,
   ;; 0 for the canvas/PNG sinks; err-val carries the failure code.
   ;; ---------------------------------------------------------------------------
   (defclass Backend [b]
-    (render-to [self : b  renderers : int  opts : int] : ptr<void>))
+    (render-to [self : b  renderers : (Vec AnyRenderer)  opts : PlotOpts] : ptr<void>))
 
   ;; CanvasBackend -- draw into an existing canvas at the given viewport.
   (defstruct CanvasBackend [canvas : int  px : int  py : int  pw : int  ph : int])
@@ -2055,27 +2459,27 @@
   ;;; Example:
   ;;;   (render (make-struct PngBackend "out.png") rs opts)
   ;;;   (render (make-struct SurfaceBackend 0 0)   rs opts)
-  (defn render [^Backend B b : B  renderers : int  opts : int] : ptr<void>
+  (defn render [^Backend B b : B  renderers : (Vec AnyRenderer)  opts : PlotOpts] : ptr<void>
     (render-to b renderers opts))
 
-  ;;; plot -- render a Vec[Renderer] to a new surface and return it.
+  ;;; plot -- render renderers to a new surface and return it.
   ;;;
-  ;;; renderers is a Vec[Renderer] (build with vec-of, or vec-new + vec-push!).
-  ;;; This used to be a cons list (:int with terminating 0) prior to 0.2.0.
+  ;;; renderers is a (Vec AnyRenderer): build it with vec-of over the
+  ;;; constructors, or vec-new + vec-push!. (It was a (Vec int) of slot-bag
+  ;;; handles through 0.4.0, and a cons list before 0.2.0.)
   ;;;
   ;;; Thin wrapper over the `Backend` dispatch (the `SurfaceBackend` instance);
   ;;; equivalent to `(render-to (make-struct SurfaceBackend 0 0) renderers opts)`.
-  (defn plot [renderers : int opts : int] : ptr<void>
+  (defn plot [renderers : (Vec AnyRenderer) opts : PlotOpts] : ptr<void>
     (render-to (make-struct SurfaceBackend 0 0) renderers opts))
 
-  ;;; plot-write-png -- render a Vec[Renderer] and write it to a PNG file.
+  ;;; plot-write-png -- render renderers and write them to a PNG file.
   ;;;
-  ;;; renderers is a Vec[Renderer] (build with vec-of, or vec-new + vec-push!).
-  ;;; This used to be a cons list (:int with terminating 0) prior to 0.2.0.
+  ;;; renderers is a (Vec AnyRenderer), as for `plot`.
   ;;;
   ;;; Thin wrapper over the `Backend` dispatch (the `PngBackend` instance);
   ;;; equivalent to `(render-to (make-struct PngBackend path) renderers opts)`.
-  (defn plot-write-png [renderers : int opts : int path : cstr] : ptr<void>
+  (defn plot-write-png [renderers : (Vec AnyRenderer) opts : PlotOpts path : cstr] : ptr<void>
     (render-to (make-struct PngBackend path) renderers opts))
 
 ) ;; end defmodule plot/core

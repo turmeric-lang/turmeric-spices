@@ -1,48 +1,375 @@
 ;; plot/contour.tur -- contour and color-field renderers.
+;;
+;; Each kind is a struct with a `Renderer` instance; the constructors box it as
+;; an `AnyRenderer`. Every kind here samples f(x, y) on a samples x samples grid
+;; over its domain, and the domain is the extent it contributes to the plot.
 
 (defmodule plot/contour
-  (export isoline contours contour-intervals color-field)
+  (export isoline contours contour-intervals color-field
+          IsolineR ContoursR ContourIntervalsR ColorFieldR)
 
-  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds])
+  (import plot/core  :refer [BBox hint-bbox any-renderer DrawCtx])
+  (import plot/style :refer [LineStyle FillStyle])
+
+  ;;; IsolineR -- the single contour f(x, y) = level.
+  (defstruct IsolineR :copy [f : (fn [float float] float)
+                             x-min : float  x-max : float  y-min : float  y-max : float
+                             samples : int  level : float  style : LineStyle  label : cstr])
+
+  ;;; ContoursR -- `levels` contours in one style, spaced evenly through the
+  ;;; range f takes on the sampled grid.
+  (defstruct ContoursR :copy [f : (fn [float float] float)
+                              x-min : float  x-max : float  y-min : float  y-max : float
+                              samples : int  levels : int  style : LineStyle  label : cstr])
+
+  ;;; ContourIntervalsR -- f(x, y) over [0, 1] split into `bands` + 1 filled
+  ;;; bands, band i taking the i-th style of `fills`.
+  (defstruct ContourIntervalsR :copy [f : (fn [float float] float)
+                                      x-min : float  x-max : float  y-min : float  y-max : float
+                                      samples : int  bands : int  fills : (Vec FillStyle)  label : cstr])
+
+  ;;; ColorFieldR -- each grid cell filled with palette color f(x, y), at `alpha`.
+  (defstruct ColorFieldR :copy [f : (fn [float float] int)
+                                x-min : float  x-max : float  y-min : float  y-max : float
+                                samples : int  alpha : float])
+
+  ;;; __draw-color-field -- fill each grid cell with palette color f(cell center).
+  (defn __draw-color-field [ctx : DrawCtx  ^fat f : (fn [float float] int)
+                          x-min : float  x-max : float  y-min : float  y-max : float
+                          grid : int  cell-alpha : float] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double fabs(double);
+    extern double fmin(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    extern void plutovg_canvas_fill_rect(void* canvas, float x, float y, float w, float h);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    static const double palette[8][3] = {
+      {31.0/255.0, 119.0/255.0, 180.0/255.0},
+      {214.0/255.0, 39.0/255.0, 40.0/255.0},
+      {44.0/255.0, 160.0/255.0, 44.0/255.0},
+      {255.0/255.0, 127.0/255.0, 14.0/255.0},
+      {148.0/255.0, 103.0/255.0, 189.0/255.0},
+      {140.0/255.0, 86.0/255.0, 75.0/255.0},
+      {227.0/255.0, 119.0/255.0, 194.0/255.0},
+      {127.0/255.0, 127.0/255.0, 127.0/255.0}
+    };
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      int samples = (int)grid; if (samples < 8) samples = 8;
+      for (int iy = 0; iy < samples - 1; iy++) for (int ix = 0; ix < samples - 1; ix++) {
+        double x0 = x_min + (x_max - x_min) * ((double)ix / (double)(samples - 1));
+        double x1 = x_min + (x_max - x_min) * ((double)(ix + 1) / (double)(samples - 1));
+        double y0 = y_min + (y_max - y_min) * ((double)iy / (double)(samples - 1));
+        double y1 = y_min + (y_max - y_min) * ((double)(iy + 1) / (double)(samples - 1));
+        int color = 0;
+        double alpha = cell_alpha;
+        color = (int)TUR_APPLY2_T(int64_t, double, double, f, (x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        color %= 8; if (color < 0) color += 8;
+        double vx0, vy0, vx1, vy1; MAP_POINT(x0, y0, &vx0, &vy0); MAP_POINT(x1, y1, &vx1, &vy1);
+        plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas, (float)palette[color][0], (float)palette[color][1], (float)palette[color][2], (float)alpha);
+        plutovg_canvas_fill_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)fmin(vx0, vx1), (float)fmin(vy0, vy1), (float)fabs(vx1 - vx0), (float)fabs(vy1 - vy0));
+      }
+    } while (0);
+    #undef MAP_POINT
+    ```)
+
+  ;;; __draw-contour-bands -- fill each grid cell with the fill of the band (of
+  ;;; levels + 1 over [0, 1]) its center's f value falls in: band i takes the
+  ;;; i-th style of `fills`, or a palette color past the end.
+  (defn __draw-contour-bands [ctx : DrawCtx  ^fat f : (fn [float float] float)
+                            x-min : float  x-max : float  y-min : float  y-max : float
+                            grid : int  levels : int  fills : (Vec FillStyle)] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double floor(double);
+    extern double fabs(double);
+    extern double fmin(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    extern void plutovg_canvas_fill_rect(void* canvas, float x, float y, float w, float h);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { int64_t color; double alpha; int64_t line_color; double line_width; } FillStyle;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    static const double palette[8][3] = {
+      {31.0/255.0, 119.0/255.0, 180.0/255.0},
+      {214.0/255.0, 39.0/255.0, 40.0/255.0},
+      {44.0/255.0, 160.0/255.0, 44.0/255.0},
+      {255.0/255.0, 127.0/255.0, 14.0/255.0},
+      {148.0/255.0, 103.0/255.0, 189.0/255.0},
+      {140.0/255.0, 86.0/255.0, 75.0/255.0},
+      {227.0/255.0, 119.0/255.0, 194.0/255.0},
+      {127.0/255.0, 127.0/255.0, 127.0/255.0}
+    };
+    typedef struct { int64_t *data; size_t len; size_t cap; } FillVec;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    extern void plot_ctx_note_fill(void *, int64_t, double);
+    FillVec *fv = (FillVec *)(intptr_t)fills;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      /* The legend swatch: band 0's fill, as the loop below colors it. */
+      FillStyle *fill0 = (FillStyle *)(intptr_t)((fv && fv->len > 0) ? fv->data[0] : 0);
+      plot_ctx_note_fill(dc, (fill0 && fill0->color >= 0) ? fill0->color : 0, 0.55);
+      int samples = (int)grid; if (samples < 8) samples = 8;
+      for (int iy = 0; iy < samples - 1; iy++) for (int ix = 0; ix < samples - 1; ix++) {
+        double x0 = x_min + (x_max - x_min) * ((double)ix / (double)(samples - 1));
+        double x1 = x_min + (x_max - x_min) * ((double)(ix + 1) / (double)(samples - 1));
+        double y0 = y_min + (y_max - y_min) * ((double)iy / (double)(samples - 1));
+        double y1 = y_min + (y_max - y_min) * ((double)(iy + 1) / (double)(samples - 1));
+        double v = TUR_APPLY2_T(double, double, double, f, (x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        int color = 0;
+        double alpha = 0.55;
+        int bands = (int)levels + 1;
+        double lo = 0.0, hi = 1.0;
+        double t = (v - lo) / (hi - lo);
+        if (!(t == t)) t = 0.0;
+        if (t < 0.0) t = 0.0; if (t > 0.999) t = 0.999;
+        int band = (int)floor(t * bands);
+        FillStyle *fill = (FillStyle *)(intptr_t)((fv && (size_t)band < fv->len) ? fv->data[band] : 0);
+        color = fill ? (int)(fill->color % 8) : band % 8;
+        if (color < 0) color = band % 8;
+        double vx0, vy0, vx1, vy1; MAP_POINT(x0, y0, &vx0, &vy0); MAP_POINT(x1, y1, &vx1, &vy1);
+        plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas, (float)palette[color][0], (float)palette[color][1], (float)palette[color][2], (float)alpha);
+        plutovg_canvas_fill_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)fmin(vx0, vx1), (float)fmin(vy0, vy1), (float)fabs(vx1 - vx0), (float)fabs(vy1 - vy0));
+      }
+    } while (0);
+    #undef MAP_POINT
+    ```)
+
+  ;;; __draw-contour-lines -- stroke the f(x, y) = level contours by marching
+  ;;; squares: the one at `level` when `single`, else `levels` of them spaced
+  ;;; evenly inside the range f takes on the grid -- level i of n at
+  ;;; lo + (hi - lo) * (i + 1) / (n + 1), so neither extreme is drawn.
+  (defn __draw-contour-lines [ctx : DrawCtx  ^fat f : (fn [float float] float)
+                            x-min : float  x-max : float  y-min : float  y-max : float
+                            grid : int  levels : int  single : bool
+                            level : float  style : LineStyle] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      int samples = (int)grid; if (samples < 8) samples = 8;
+      int nlevels = single ? 1 : (int)levels;
+      /* The levels' range: f's extremes over the grid points the squares
+         below sample, NaN and infinities left out. A field with no finite
+         value draws nothing. */
+      double lo = level, hi = level;
+      if (!single) {
+        int seen = 0;
+        for (int iy = 0; iy < samples; iy++) for (int ix = 0; ix < samples; ix++) {
+          double x = x_min + (x_max - x_min) * ((double)ix / (double)(samples - 1));
+          double y = y_min + (y_max - y_min) * ((double)iy / (double)(samples - 1));
+          double v = TUR_APPLY2_T(double, double, double, f, x, y);
+          if (!(v == v) || v - v != 0.0) continue;
+          if (!seen || v < lo) lo = v;
+          if (!seen || v > hi) hi = v;
+          seen = 1;
+        }
+        if (!seen) nlevels = 0;
+      }
+      for (int li = 0; li < nlevels; li++) {
+        double lv = single ? level : (lo + (hi - lo) * ((double)(li + 1) / (double)(nlevels + 1)));
+        for (int iy = 0; iy < samples - 1; iy++) for (int ix = 0; ix < samples - 1; ix++) {
+          double x0 = x_min + (x_max - x_min) * ((double)ix / (double)(samples - 1));
+          double x1 = x_min + (x_max - x_min) * ((double)(ix + 1) / (double)(samples - 1));
+          double y0 = y_min + (y_max - y_min) * ((double)iy / (double)(samples - 1));
+          double y1 = y_min + (y_max - y_min) * ((double)(iy + 1) / (double)(samples - 1));
+          double v00 = TUR_APPLY2_T(double, double, double, f, x0, y0) - lv;
+          double v10 = TUR_APPLY2_T(double, double, double, f, x1, y0) - lv;
+          double v01 = TUR_APPLY2_T(double, double, double, f, x0, y1) - lv;
+          double v11 = TUR_APPLY2_T(double, double, double, f, x1, y1) - lv;
+          double ptsx[4], ptsy[4]; int pc = 0;
+          if ((v00 <= 0 && v10 > 0) || (v00 > 0 && v10 <= 0)) { double t = v00 / (v00 - v10); ptsx[pc] = x0 + (x1 - x0) * t; ptsy[pc++] = y0; }
+          if ((v10 <= 0 && v11 > 0) || (v10 > 0 && v11 <= 0)) { double t = v10 / (v10 - v11); ptsx[pc] = x1; ptsy[pc++] = y0 + (y1 - y0) * t; }
+          if ((v11 <= 0 && v01 > 0) || (v11 > 0 && v01 <= 0)) { double t = v11 / (v11 - v01); ptsx[pc] = x1 + (x0 - x1) * t; ptsy[pc++] = y1; }
+          if ((v01 <= 0 && v00 > 0) || (v01 > 0 && v00 <= 0)) { double t = v01 / (v01 - v00); ptsx[pc] = x0; ptsy[pc++] = y1 + (y0 - y1) * t; }
+          if (pc >= 2) {
+            double vx0, vy0, vx1, vy1; MAP_POINT(ptsx[0], ptsy[0], &vx0, &vy0); MAP_POINT(ptsx[1], ptsy[1], &vx1, &vy1);
+            plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx0, (float)vy0);
+            plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx1, (float)vy1);
+          }
+        }
+      }
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    ```)
+
+  (definstance Renderer [IsolineR]
+    (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
+    (draw [r ctx] (__draw-contour-lines ctx (.f r) (.x-min r) (.x-max r) (.y-min r) (.y-max r)
+                                        (.samples r) 1 true (.level r) (.style r)))
+    (legend-label [r] (.label r)))
+
+  (definstance Renderer [ContoursR]
+    (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
+    (draw [r ctx] (__draw-contour-lines ctx (.f r) (.x-min r) (.x-max r) (.y-min r) (.y-max r)
+                                        (.samples r) (.levels r) false 0.0 (.style r)))
+    (legend-label [r] (.label r)))
+
+  (definstance Renderer [ContourIntervalsR]
+    (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
+    (draw [r ctx] (__draw-contour-bands ctx (.f r) (.x-min r) (.x-max r) (.y-min r) (.y-max r)
+                                        (.samples r) (.bands r) (.fills r)))
+    (legend-label [r] (.label r)))
+
+  (definstance Renderer [ColorFieldR]
+    (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
+    (draw [r ctx] (__draw-color-field ctx (.f r) (.x-min r) (.x-max r) (.y-min r) (.y-max r)
+                                      (.samples r) (.alpha r))))
 
   ;;; isoline -- draw a single f(x,y)=level contour.
-  (defn isoline [f x-min : float x-max : float y-min : float y-max : float
-                 samples : int level : float style : int label : cstr] : int
-    (__renderer-bounds
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 60 style 0 f 0 0 0 0 label "")
-                           x-min x-max y-min y-max level level)
-        samples 0 0 0)
-      x-min x-max y-min y-max))
+  ;;;
+  ;;; Parameters:
+  ;;;   f       -- the field, a (fn [float float] float)
+  ;;;   x-min   -- left edge of the sampled domain
+  ;;;   x-max   -- right edge of the sampled domain
+  ;;;   y-min   -- bottom edge of the sampled domain
+  ;;;   y-max   -- top edge of the sampled domain
+  ;;;   samples -- grid points per axis (at least 8)
+  ;;;   level   -- the contour value
+  ;;;   style   -- the LineStyle to stroke with
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   An IsolineR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (isoline saddle -2.0 2.0 -2.0 2.0 32 0.0 (default-line-style) "zero")
+  (defn isoline [^fat f : (fn [float float] float)
+                 x-min : float  x-max : float  y-min : float  y-max : float
+                 samples : int  level : float  style : LineStyle  label : cstr] : AnyRenderer
+    (any-renderer (make-struct IsolineR f x-min x-max y-min y-max samples level style label)))
 
-  ;;; contours -- draw multiple automatically spaced contour levels.
-  (defn contours [f x-min : float x-max : float y-min : float y-max : float
-                  samples : int n : int styles : int label : cstr] : int
-    (__renderer-bounds
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 61 styles 0 f 0 0 0 0 label "")
-                           x-min x-max y-min y-max 0.0 0.0)
-        samples n 0 0)
-      x-min x-max y-min y-max))
+  ;;; contours -- draw n contour levels spaced evenly through f's range.
+  ;;;
+  ;;; The range is f's minimum and maximum over the samples x samples grid;
+  ;;; level i of n sits at min + (max - min) * (i + 1) / (n + 1), so the
+  ;;; extremes themselves (single points, usually) are not drawn.
+  ;;;
+  ;;; Parameters:
+  ;;;   f       -- the field, a (fn [float float] float)
+  ;;;   x-min   -- left edge of the sampled domain
+  ;;;   x-max   -- right edge of the sampled domain
+  ;;;   y-min   -- bottom edge of the sampled domain
+  ;;;   y-max   -- top edge of the sampled domain
+  ;;;   samples -- grid points per axis (at least 8)
+  ;;;   n       -- number of levels
+  ;;;   style   -- the LineStyle of every level
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A ContoursR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (contours saddle -2.0 2.0 -2.0 2.0 32 4 (default-line-style) "levels")
+  (defn contours [^fat f : (fn [float float] float)
+                  x-min : float  x-max : float  y-min : float  y-max : float
+                  samples : int  n : int  style : LineStyle  label : cstr] : AnyRenderer
+    (any-renderer (make-struct ContoursR f x-min x-max y-min y-max samples n style label)))
 
   ;;; contour-intervals -- fill contour bands using sampled cells.
-  (defn contour-intervals [f x-min : float x-max : float y-min : float y-max : float
-                           samples : int n : int fills : int label : cstr] : int
-    (__renderer-bounds
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 62 fills 0 f 0 0 0 0 label "")
-                           x-min x-max y-min y-max 0.0 1.0)
-        samples n 0 0)
-      x-min x-max y-min y-max))
+  ;;;
+  ;;; Parameters:
+  ;;;   f       -- the field, a (fn [float float] float), banded over [0, 1]
+  ;;;   x-min   -- left edge of the sampled domain
+  ;;;   x-max   -- right edge of the sampled domain
+  ;;;   y-min   -- bottom edge of the sampled domain
+  ;;;   y-max   -- top edge of the sampled domain
+  ;;;   samples -- grid points per axis (at least 8)
+  ;;;   n       -- number of band boundaries (n + 1 bands)
+  ;;;   fills   -- the FillStyle of each band, in order
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A ContourIntervalsR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (contour-intervals saddle -2.0 2.0 -2.0 2.0 32 3 (vec-of lo mid hi) "bands")
+  (defn contour-intervals [^fat f : (fn [float float] float)
+                           x-min : float  x-max : float  y-min : float  y-max : float
+                           samples : int  n : int  fills : (Vec FillStyle)  label : cstr] : AnyRenderer
+    (any-renderer (make-struct ContourIntervalsR f x-min x-max y-min y-max samples n fills label)))
 
   ;;; color-field -- color sampled cells by f(x,y)->color-idx.
-  (defn color-field [f x-min : float x-max : float y-min : float y-max : float
-                     samples : int alpha : float] : int
-    (__renderer-bounds
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 63 0 0 f 0 0 0 0 "" "")
-                           x-min x-max y-min y-max alpha 0.0)
-        samples 0 0 0)
-      x-min x-max y-min y-max))
+  ;;;
+  ;;; Parameters:
+  ;;;   f       -- the coloring, a (fn [float float] int) returning a palette index
+  ;;;   x-min   -- left edge of the sampled domain
+  ;;;   x-max   -- right edge of the sampled domain
+  ;;;   y-min   -- bottom edge of the sampled domain
+  ;;;   y-max   -- top edge of the sampled domain
+  ;;;   samples -- grid points per axis (at least 8)
+  ;;;   alpha   -- cell opacity
+  ;;;
+  ;;; Returns:
+  ;;;   A ColorFieldR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (color-field quadrant -2.0 2.0 -2.0 2.0 32 0.35)
+  (defn color-field [^fat f : (fn [float float] int)
+                     x-min : float  x-max : float  y-min : float  y-max : float
+                     samples : int  alpha : float] : AnyRenderer
+    (any-renderer (make-struct ColorFieldR f x-min x-max y-min y-max samples alpha)))
 
 ) ;; end defmodule plot/contour

@@ -2,8 +2,82 @@
 
 ## Unreleased
 
+### Changed (breaking)
+
+- Every renderer kind is its own type with a `Renderer` instance
+  (plot Renderer typeclass plan, P4): `LinesR`, `FunctionR`, `ParametricR`,
+  `PolarR`, `InverseR`, `DensityR` (plot/line); `PointsR`, `ErrorBarsR`,
+  `VectorFieldR`, `ArrowsR` (plot/point); `FunctionIntervalR`,
+  `LinesIntervalR`, `ParametricIntervalR`, `PolarIntervalR` (plot/interval);
+  `RectanglesR`, `AreaHistogramR`, `DiscreteHistogramR`, `StackedHistogramR`
+  (plot/area); `IsolineR`, `ContoursR`, `ContourIntervalsR`, `ColorFieldR`
+  (plot/contour); and in plot/decor the `Decoration` sum type (`XAxis`,
+  `YAxis`, `Axes`, `XTickLines`, `YTickLines`, `TickGrid`) plus `HRuleR`,
+  `VRuleR` and `LabelR`. Each carries its own named, typed fields instead of
+  the shared `data1..5` / `f1..6` / `i1..4` slot bag.
+- Every public constructor returns an `AnyRenderer` -- the renderer boxed
+  with its instance, `(exists [a] [(Renderer a)] a)` -- instead of an `int`
+  handle, and `plot`, `plot-write-png`, `plot-into-canvas`, `render` and
+  `Backend`'s `render-to` take a `(Vec AnyRenderer)`. A `vec-of` over the
+  constructors needs no change; a Vec annotated `(Vec int)` now says
+  `(Vec AnyRenderer)`, and one built with `vec-new` is ascribed
+  `(:: (vec-new) (Vec AnyRenderer))`.
+- Curve callbacks are function values of a declared type: `function`,
+  `polar` and `inverse` take a `(fn [float] float)`, `parametric` a
+  `(fn [float] Point)`, `vector-field` a
+  `(fn [float float] Point)`, the contour kinds a `(fn [float float] float)`
+  and `color-field` a `(fn [float float] int)`, and the interval kinds two
+  of their curve's type. A `fn` literal -- capturing or not -- works where a
+  named `defn` did, and a callback of the wrong type is a compile error
+  rather than a crash. The draw pass calls them through the closure ABI
+  (`TUR_APPLY1_T` / `TUR_APPLY2_T`).
+- The plot's data extent is the union of the renderers' `bounds`, dispatched
+  through each one's instance. The draw pass's per-kind bounds `switch`
+  (`__renderer-bbox`, C symbol `plot_renderer_bbox`) is gone, and
+  `renderer-bbox` takes an `AnyRenderer`.
+- Drawing is a `Renderer` method too: `draw [r ctx : DrawCtx]` paints one
+  renderer through the plot's draw context, and six methods with defaults
+  -- `legend-label`, `legend-labels`, `frame-marks`, `categorical?`,
+  `categories-on-y?` and `category-labels` -- tell the frame what to add.
+  `legend-labels` lists a renderer's legend rows (by default its one
+  `legend-label`); `stacked-histogram` overrides it with its layer names. The monolithic draw `switch` (`__draw-renderers`, C symbol
+  `plot_draw_renderers`) is split into one inline-C draw per kind, beside
+  its type, and the frame worker into the frame pass (`__plot-frame`), the
+  draws and the legend. The slot-bag renderer (`__make-renderer`,
+  `__renderer-floats` / `-ints` / `-bounds`, `to-legacy`,
+  `anyrenderers->legacy`) is gone. `__plot-sample-adaptive` takes the
+  `DrawCtx` and the curve instead of a slot-bag handle.
+- Styles and options are types, not `:int` handles: `line-style`,
+  `point-style`, `fill-style` and `plot-opts` (and their `default-*`) return
+  a `LineStyle`, `PointStyle`, `FillStyle` and `PlotOpts`, and every
+  constructor and entry point takes the kind it draws with. A style of the
+  wrong kind, or a `0` meaning "no style", is now a compile error -- pass
+  `(default-line-style)` and so on. The style lists of `area-histogram`,
+  `stacked-histogram` and `contour-intervals` are `(Vec FillStyle)` rather
+  than cons lists of handles (`(vec-of fill1 fill2)`), and `contours`' style
+  parameter is named `style` (it was always one style).
+- Renderer data is typed records instead of cons lists of double bits. A
+  new module, `plot/data`, defines `Point`, `Rect`, `ErrorBar`, `Arrow`,
+  `Bar` and `Group`, and the constructors take a Vec of them: `lines`,
+  `points` and `lines-interval` a `(Vec Point)`, `error-bars` a
+  `(Vec ErrorBar)`, `arrows` a `(Vec Arrow)`, `rectangles` and
+  `area-histogram` a `(Vec Rect)`, `discrete-histogram` a `(Vec Bar)`,
+  `stacked-histogram` a `(Vec Group)` (and its layer names a `(Vec cstr)`),
+  `density` a `(Vec float)`. `parametric` and `parametric-interval` take a
+  `(fn [float] Point)` and `vector-field` a `(fn [float float] Point)`.
+  Handing a renderer the wrong record is a compile error; the inline-C cons
+  builders callers used to write are no longer needed.
+- `error-bars`, `discrete-histogram` and `stacked-histogram` take
+  `horizontal : bool` where they took an `invert : int`.
+- `lines-r`, `points-r` and `label-r` are removed (build the struct with
+  `make-struct`), and `plot-anyrenderers` is deprecated: `plot` takes the
+  same argument.
+
 ### Added
 
+- The legend sits on a translucent white box with a light border, so its
+  rows read over whatever the plot drew beneath them. The box is sized to
+  its rows and widest label.
 - `Backend` typeclass in `plot/core` (U2 typeclass collapse): the three
   output sinks now share one `render-to` method with one instance each --
   `CanvasBackend` (draw into an existing canvas + viewport),
@@ -14,13 +88,67 @@
   remain as thin wrappers that route through `render-to`, so existing
   call sites are unchanged.
 - `render` in `plot/core`: a single entry point generic over `Backend`
-  (`(defn render [^Backend B b : B  renderers : int  opts : int] ...)`),
+  (`(defn render [^Backend B b : B  renderers : (Vec AnyRenderer)  opts : int] ...)`),
   so plot-building code can dispatch to any sink without knowing the
   concrete backend type -- the "plot DSL becomes generic in Backend"
   the uplift plan called for.
 
+- `errors/run.sh` and five compile-fail fixtures: a type with no `Renderer`
+  instance cannot be boxed, `plot` rejects a `(Vec int)` of handles, a
+  `FillStyle` where a `LineStyle` is due is rejected, `Rect`s where `Point`s
+  are due are rejected, and so is a callback of the wrong function type.
+
 ### Fixed
 
+- `contours` drew all `n` of its levels at 0: it stored 0.0 for both ends of
+  the range the levels are spaced through, so the contours coincided. The
+  levels now span the range f takes on the sampled grid -- level i of n at
+  min + (max - min) * (i + 1) / (n + 1) -- and a field with no finite value
+  draws none.
+- `stacked-histogram`'s layer names never reached the legend; each layer now
+  has a row, swatched in that layer's fill. And a layer took a new auto color
+  in every group (an auto fill resolved per stacked cell), so one layer was
+  blue in the first group and red in the next: each layer now resolves its
+  fill once. `discrete-histogram` and `rectangles` had the same per-bar
+  resolution, so an auto-colored histogram's bars cycled through the
+  palette; their bars now share their one fill.
+- A horizontal `discrete-histogram` or `stacked-histogram` labelled its
+  categories along the x axis, where the values run, so the labels sat
+  under the wrong ticks; they label the y axis now, and the x axis keeps
+  numeric ticks.
+- `legend-pos` 0 drew the legend at the top right instead of leaving it
+  out, as `plot-opts` documents: the frame treated 0 like a missing value.
+- A bottom legend (`legend-pos` 3 or 4) put its first row 16 pixels above
+  the plot's bottom edge and grew downward, out of the plot; it now stacks
+  upward so its last row sits there. A right-hand legend with a label too
+  long for its 120-pixel slot ran off the plot's right edge; it moves left
+  to fit.
+- A legend row's swatch was a line in palette color `row % 8`, whatever its
+  renderer drew with, so it mismatched any renderer with a named color, or
+  after an unlabelled renderer took an auto color. Each renderer now records
+  the styles it resolves as it draws, and its row shows them: a stroke of its
+  line style, a box of its fill (edged top and bottom in the outline's style
+  for an interval band), or its point marker.
+- The interval kinds never drew their outline: the band's path was filled
+  with `plutovg_canvas_fill`, which clears it, so the outline `LineStyle`
+  stroked nothing. The band is now outlined in that style, as documented.
+- A point style's `fill-color`, or a `contour-intervals` fill's color, of 8
+  or more read past the 8-entry palette; both wrap now, as every other color
+  does.
+- Every plot left one saved state on its canvas: the frame
+  `plutovg_canvas_save`d with no matching `restore`. A canvas handed to
+  `plot-into-canvas` / `CanvasBackend` now comes back with the caller's line
+  width, font, color and clip as it went in.
+- `arrows` bounds read each arrow's second cons cell -- a pointer -- as the y
+  coordinate, so an arrows plot's y range came out of the heap layout and
+  changed from run to run. `ArrowsR`'s `bounds` spans both endpoints of each
+  arrow.
+- The slot-bag handle each constructor allocated was never freed; there is
+  no handle now, only the typed renderer. A parametric or vector-field
+  callback no longer allocates a cons cell per sample (it returns a `Point`
+  by value).
+- A viewport too small for a plot (`plot-into-canvas` err 1) leaked the
+  font the frame had loaded.
 - `plot/core`'s hand-written `<plutovg.h>` stand-ins (prototypes, typedefs,
   `PLUTOVG_TEXT_ENCODING_UTF8`) are guarded by the header's own `PLUTOVG_H`.
   A project build (`tur build --shared --bundle-deps`, the image `tur repl`

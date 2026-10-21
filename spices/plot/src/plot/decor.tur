@@ -1,71 +1,338 @@
 ;; plot/decor.tur -- decorative renderer constructors.
+;;
+;; Each kind is a type with a `Renderer` instance; the constructors box it as
+;; an `AnyRenderer`. The axes and tick grids carry no payload, so they are the
+;; constructors of one sum type, `Decoration`.
 
 (defmodule plot/decor
   (export x-axis y-axis axes
           x-tick-lines y-tick-lines tick-grid
           hrule hrule-styled vrule vrule-styled
-          point-label point-label-styled)
+          point-label point-label-styled
+          Decoration XAxis YAxis Axes XTickLines YTickLines TickGrid
+          HRuleR VRuleR LabelR)
 
-  (import plot/core  :refer [__make-renderer __renderer-floats __renderer-bounds])
-  (import plot/style :refer [default-line-style])
+  (import plot/core  :refer [BBox bbox-empty-box point-bbox any-renderer
+                             DrawCtx FrameMarks no-frame-marks])
+  (import plot/style :refer [LineStyle default-line-style])
 
-  ;;; __nan -- quiet NaN sentinel for "auto" bounds.
-  ;;; Inline-C avoids the runtime div-by-zero trap on `(/ 0.0 0.0)`.
-  (defn __nan [] : float
-    ```c return 0.0 / 0.0; ```)
+  ;;; Decoration -- an axis line or a set of tick grid lines, drawn by the plot
+  ;;; frame at the data extent the other renderers establish.
+  (defdata Decoration :copy
+    (XAxis) (YAxis) (Axes) (XTickLines) (YTickLines) (TickGrid))
+
+  ;;; HRuleR -- a horizontal reference line at data y.
+  (defstruct HRuleR :copy [y : float  style : LineStyle])
+
+  ;;; VRuleR -- a vertical reference line at data x.
+  (defstruct VRuleR :copy [x : float  style : LineStyle])
+
+  ;;; LabelR -- a text label anchored at one (x, y) data point.
+  (defstruct LabelR :copy [x : float  y : float  text : cstr  style : LineStyle])
+
+  ;;; __draw-hrule -- stroke a horizontal rule at data y across the viewport.
+  (defn __draw-hrule [ctx : DrawCtx  y : float  style : LineStyle] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    double bx_min = dc->bx_min;
+    int64_t left = dc->left;
+    int64_t right = dc->right;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      double __tmpx = 0.0, vy = 0.0; MAP_POINT(bx_min, y, &__tmpx, &vy);
+      plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)left, (float)vy);
+      plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)right, (float)vy);
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    ```)
+
+  ;;; __draw-vrule -- stroke a vertical rule at data x across the viewport.
+  (defn __draw-vrule [ctx : DrawCtx  x : float  style : LineStyle] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    double by_min = dc->by_min;
+    int64_t top = dc->top;
+    int64_t bottom = dc->bottom;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      double vx = 0.0, __tmpy = 0.0; MAP_POINT(x, by_min, &vx, &__tmpy);
+      plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)top);
+      plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)bottom);
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    ```)
+
+  ;;; __draw-label -- fill `text` just above-right of the data point (x, y);
+  ;;; nothing (and no auto color taken) when no font loaded.
+  (defn __draw-label [ctx : DrawCtx  x : float  y : float  text : cstr  style : LineStyle] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    #include <string.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    #define PLUTOVG_TEXT_ENCODING_UTF8 1
+    extern float plutovg_canvas_fill_text(void* canvas, const void* text, int length,
+                                          int encoding, float x, float y);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    int64_t font_ok = dc->font_ok;
+    do {
+      if (font_ok && text) {
+        int stroke = 0; (void)stroke;
+        SET_LINE_STYLE(style, &stroke);
+        double vx, vy; MAP_POINT(x, y, &vx, &vy);
+        plutovg_canvas_fill_text((plutovg_canvas_t *)(intptr_t)canvas, text, (int)strlen(text),
+                                 PLUTOVG_TEXT_ENCODING_UTF8, (float)(vx + 4.0), (float)(vy - 4.0));
+      }
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    ```)
+
+  ;;; __decoration-marks -- the axis line or tick grid a Decoration asks for.
+  (defn __decoration-marks [d : Decoration] : FrameMarks
+    (match d
+      (XAxis)      (make-struct FrameMarks true  false false false)
+      (YAxis)      (make-struct FrameMarks false true  false false)
+      (Axes)       (make-struct FrameMarks true  true  false false)
+      (XTickLines) (make-struct FrameMarks false false true  false)
+      (YTickLines) (make-struct FrameMarks false false false true)
+      (TickGrid)   (make-struct FrameMarks false false true  true)))
+
+  ;; Bounds: a decoration constrains nothing, and draws nothing itself -- the
+  ;; frame draws the axes and grids its `frame-marks` ask for. A rule pins its
+  ;; one coordinate (and 0 on the other axis); a label pins its anchor.
+  (definstance Renderer [Decoration]
+    (bounds [r] (bbox-empty-box))
+    (draw [r ctx] nil)
+    (frame-marks [r] (__decoration-marks r)))
+
+  (definstance Renderer [HRuleR]
+    (bounds [r] (point-bbox 0.0 (.y r)))
+    (draw [r ctx] (__draw-hrule ctx (.y r) (.style r))))
+
+  (definstance Renderer [VRuleR]
+    (bounds [r] (point-bbox (.x r) 0.0))
+    (draw [r ctx] (__draw-vrule ctx (.x r) (.style r))))
+
+  (definstance Renderer [LabelR]
+    (bounds [r] (point-bbox (.x r) (.y r)))
+    (draw [r ctx] (__draw-label ctx (.x r) (.y r) (.text r) (.style r))))
 
   ;;; x-axis -- horizontal axis at y=0.
-  (defn x-axis [] : int
-    (__make-renderer 1 0 0 0 0 0 0 0 "" ""))
+  ;;;
+  ;;; Returns:
+  ;;;   The XAxis decoration, boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (plot (vec-of (x-axis) (lines pts ls "")) opts)
+  (defn x-axis [] : AnyRenderer (any-renderer (XAxis)))
 
   ;;; y-axis -- vertical axis at x=0.
-  (defn y-axis [] : int
-    (__make-renderer 2 0 0 0 0 0 0 0 "" ""))
+  ;;;
+  ;;; Returns:
+  ;;;   The YAxis decoration, boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (plot (vec-of (y-axis) (lines pts ls "")) opts)
+  (defn y-axis [] : AnyRenderer (any-renderer (YAxis)))
 
   ;;; axes -- both x-axis and y-axis.
-  (defn axes [] : int
-    (__make-renderer 3 0 0 0 0 0 0 0 "" ""))
+  ;;;
+  ;;; Returns:
+  ;;;   The Axes decoration, boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (plot (vec-of (axes) (lines pts ls "")) opts)
+  (defn axes [] : AnyRenderer (any-renderer (Axes)))
 
   ;;; x-tick-lines -- vertical grid lines at x ticks.
-  (defn x-tick-lines [] : int
-    (__make-renderer 4 0 0 0 0 0 0 0 "" ""))
+  ;;;
+  ;;; Returns:
+  ;;;   The XTickLines decoration, boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (plot (vec-of (x-tick-lines) (lines pts ls "")) opts)
+  (defn x-tick-lines [] : AnyRenderer (any-renderer (XTickLines)))
 
   ;;; y-tick-lines -- horizontal grid lines at y ticks.
-  (defn y-tick-lines [] : int
-    (__make-renderer 5 0 0 0 0 0 0 0 "" ""))
+  ;;;
+  ;;; Returns:
+  ;;;   The YTickLines decoration, boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (plot (vec-of (y-tick-lines) (lines pts ls "")) opts)
+  (defn y-tick-lines [] : AnyRenderer (any-renderer (YTickLines)))
 
   ;;; tick-grid -- both x and y tick lines.
-  (defn tick-grid [] : int
-    (__make-renderer 6 0 0 0 0 0 0 0 "" ""))
+  ;;;
+  ;;; Returns:
+  ;;;   The TickGrid decoration, boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (plot (vec-of (tick-grid) (axes) (lines pts ls "")) opts)
+  (defn tick-grid [] : AnyRenderer (any-renderer (TickGrid)))
 
   ;;; hrule-styled -- horizontal reference line with explicit style.
-  (defn hrule-styled [y : float style : int] : int
-    (let [r (__make-renderer 7 style 0 0 0 0 0 0 "" "")]
-      (__renderer-bounds (__renderer-floats r y 0.0 0.0 0.0 0.0 0.0) (__nan) (__nan) y y)))
+  ;;;
+  ;;; Parameters:
+  ;;;   y     -- the line's data y
+  ;;;   style -- the LineStyle to stroke with
+  ;;;
+  ;;; Returns:
+  ;;;   An HRuleR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (hrule-styled 0.5 (line-style 1 2.0 (dash-dash) 1.0))
+  (defn hrule-styled [y : float  style : LineStyle] : AnyRenderer
+    (any-renderer (make-struct HRuleR y style)))
 
   ;;; hrule -- horizontal reference line.
-  (defn hrule [y : float] : int
+  ;;;
+  ;;; Parameters:
+  ;;;   y -- the line's data y
+  ;;;
+  ;;; Returns:
+  ;;;   An HRuleR in the default line style, boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (hrule 0.5)
+  (defn hrule [y : float] : AnyRenderer
     (hrule-styled y (default-line-style)))
 
   ;;; vrule-styled -- vertical reference line with explicit style.
-  (defn vrule-styled [x : float style : int] : int
-    (let [r (__make-renderer 8 style 0 0 0 0 0 0 "" "")]
-      (__renderer-bounds (__renderer-floats r x 0.0 0.0 0.0 0.0 0.0) x x (__nan) (__nan))))
+  ;;;
+  ;;; Parameters:
+  ;;;   x     -- the line's data x
+  ;;;   style -- the LineStyle to stroke with
+  ;;;
+  ;;; Returns:
+  ;;;   A VRuleR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (vrule-styled 1.0 (line-style 2 1.0 (dash-dot) 1.0))
+  (defn vrule-styled [x : float  style : LineStyle] : AnyRenderer
+    (any-renderer (make-struct VRuleR x style)))
 
   ;;; vrule -- vertical reference line.
-  (defn vrule [x : float] : int
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- the line's data x
+  ;;;
+  ;;; Returns:
+  ;;;   A VRuleR in the default line style, boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (vrule 1.0)
+  (defn vrule [x : float] : AnyRenderer
     (vrule-styled x (default-line-style)))
 
   ;;; point-label-styled -- styled label text anchored to a data point.
-  (defn point-label-styled [x : float y : float text : cstr anchor : int style : int] : int
-    (__renderer-bounds
-      (__renderer-floats
-        (__make-renderer 9 style 0 0 0 0 0 0 "" text)
-        x y 0.0 0.0 0.0 0.0)
-      x x y y))
+  ;;;
+  ;;; The text is drawn just above and right of the anchor; `anchor` is
+  ;;; accepted for compatibility and not yet used.
+  ;;;
+  ;;; Parameters:
+  ;;;   x      -- the anchor's data x
+  ;;;   y      -- the anchor's data y
+  ;;;   text   -- the label text
+  ;;;   anchor -- reserved
+  ;;;   style  -- a LineStyle (its color colors the text)
+  ;;;
+  ;;; Returns:
+  ;;;   A LabelR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (point-label-styled 1.0 1.0 "peak" 0 (default-line-style))
+  (defn point-label-styled [x : float  y : float  text : cstr  anchor : int  style : LineStyle] : AnyRenderer
+    (any-renderer (make-struct LabelR x y text style)))
 
   ;;; point-label -- label text anchored to a data point.
-  (defn point-label [x : float y : float text : cstr anchor : int] : int
+  ;;;
+  ;;; Parameters:
+  ;;;   x      -- the anchor's data x
+  ;;;   y      -- the anchor's data y
+  ;;;   text   -- the label text
+  ;;;   anchor -- reserved
+  ;;;
+  ;;; Returns:
+  ;;;   A LabelR in the default line style, boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (point-label 1.0 1.0 "peak" 0)
+  (defn point-label [x : float  y : float  text : cstr  anchor : int] : AnyRenderer
     (point-label-styled x y text anchor (default-line-style)))
 
 ) ;; end defmodule plot/decor

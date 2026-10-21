@@ -25,8 +25,10 @@ plots into a larger image.
 
 ## Quick start
 
-The sampled-curve renderers take a typed C-callable: define your function
-with `defn` rather than passing an untyped `fn` literal.
+Each renderer constructor (`function`, `lines`, `axes`, ...) returns an
+`AnyRenderer`, and `plot-write-png` takes a `(Vec AnyRenderer)`, so a `vec-of`
+over them mixes kinds freely. A sampled curve's callback is a typed function
+value -- a `defn`, or a `fn` literal that may capture.
 
 ```turmeric
 (import plot/core  :refer [plot-write-png])
@@ -72,6 +74,44 @@ plot-write-png
 segments in high-curvature regions and around NaN boundaries up to a fixed
 depth, so smooth curves stay cheap and sharp turns get extra samples
 without forcing every caller to crank the count globally.
+
+## Data
+
+A renderer's data is a Vec of records from `plot/data` -- `Point`, `Rect`,
+`ErrorBar`, `Arrow`, `Bar` and `Group` -- built with their constructors:
+
+```turmeric no-check
+(import plot/data :refer [Point])
+(lines (vec-of (Point 0.0 0.0) (Point 1.0 2.0) (Point 2.0 1.5))
+       (default-line-style) "data")
+```
+
+## Renderers are typed
+
+Every renderer kind is its own type -- `FunctionR`, `LinesR`, `PointsR`,
+`ContoursR`, the `Decoration` sum type for axes and grids, and so on -- with
+named fields and an instance of the `Renderer` class:
+
+```turmeric no-check
+(defclass Renderer [a]
+  (bounds [r : a] : BBox)                      ;; the data extent it needs on screen
+  (draw [r : a  ctx : DrawCtx] : void)         ;; paint it through the plot's context
+  (legend-label [r : a] : cstr "")             ;; its legend entry, if any
+  (legend-labels [r : a] : (Vec cstr) ...)     ;; its legend rows; by default the one above
+  (frame-marks [r : a] : FrameMarks (no-frame-marks))  ;; axes / grids for the frame
+  (categorical? [r : a] : bool false)          ;; lays an axis out as categories?
+  (categories-on-y? [r : a] : bool false)      ;; ... along y rather than x?
+  (category-labels [r : a] : (Vec cstr) (:: (vec-new) (Vec cstr))))  ;; their labels
+```
+
+The plot's extent is the union of its renderers' `bounds`; the frame draws
+the axes and grids their `frame-marks` ask for; then each one's `draw` paints
+it, in order, and the legend lists their `legend-labels`, each swatched in
+the style that row's series was drawn with. A constructor
+boxes its struct with that instance as an `AnyRenderer`, which is what
+lets one Vec hold every kind. Passing anything else to `plot` -- a value with
+no `Renderer` instance, or a callback of the wrong function type -- is a
+compile error, not a mis-rendered chart.
 
 ## See also
 

@@ -2,31 +2,16 @@
 
 (defmodule plot/tests/interval
   (import plot/core     :refer [plot plot-write-png
-                                __ok? __ok-val __surface-destroy
+                                __ok? __ok-val __surface-destroy __surfaces-equal?
                                 __pixel-is-background? __count-non-background])
   (import plot/interval :refer [function-interval lines-interval parametric-interval polar-interval])
   (import plot/decor    :refer [axes])
-  (import plot/style    :refer [default-fill-style default-line-style default-plot-opts])
+  (import plot/style    :refer [FillStyle LineStyle PlotOpts plot-opts line-style
+                                default-fill-style default-line-style default-plot-opts])
+  (import plot/data     :refer [Point])
   (import test/assert   :refer [assert-ok assert-true])
   (import test/suite    :refer [describe it])
   (import test/runner   :refer [run-all-status])
-
-  ;; Local pair constructor (shadows stdlib `pair`).
-  (defn xy-pair [x : float y : float] : int
-    ```c
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    Cons *p = malloc(sizeof(*p));
-    union { double d; int64_t i; } ux, uy; ux.d = x; uy.d = y;
-    p->head = ux.i; p->tail = uy.i; return (int64_t)(intptr_t)p;
-    ```)
-
-  (defn t-cons [v : int n : int] : int
-    ```c
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    Cons *c = malloc(sizeof(*c));
-    c->head = v; c->tail = n;
-    return (int64_t)(intptr_t)c;
-    ```)
 
   (defn file-size [path : cstr] : int
     ```c
@@ -38,19 +23,19 @@
 
   (defn >i [a : int b : int] : bool ```c return (int)a > (int)b; ```)
 
-  ;; Curve callbacks (renderer wants typed function pointers, not `fn` literals).
+  ;; Curve callbacks: any value of the callback's fn type -- a defn here.
   (defn iv-lo [x : float] : float ```c return (double)x * (double)x; ```)
   (defn iv-hi [x : float] : float ```c return (double)x * (double)x + 0.5; ```)
-  (defn iv-plo [t : float] : int (xy-pair t (* 0.5 t)))
-  (defn iv-phi [t : float] : int (xy-pair t (+ (* 0.5 t) 0.3)))
+  (defn iv-plo [t : float] : Point (Point t (* 0.5 t)))
+  (defn iv-phi [t : float] : Point (Point t (+ (* 0.5 t) 0.3)))
   (defn iv-rlo [t : float] : float ```c return 0.4; ```)
   (defn iv-rhi [t : float] : float ```c return 0.8; ```)
 
-  (defn interval-renderers [fill : int line : int] : (Vec int)
+  (defn interval-renderers [fill : FillStyle  line : LineStyle] : (Vec AnyRenderer)
     (vec-of (axes)
             (function-interval iv-lo iv-hi -1.5 1.5 96 fill line "fi")
-            (lines-interval (t-cons (xy-pair -1.0 -0.5) (t-cons (xy-pair 0.0 0.0) (t-cons (xy-pair 1.0 0.5) 0)))
-                            (t-cons (xy-pair -1.0 0.2) (t-cons (xy-pair 0.0 0.7) (t-cons (xy-pair 1.0 1.1) 0)))
+            (lines-interval (vec-of (Point -1.0 -0.5) (Point 0.0 0.0) (Point 1.0 0.5))
+                            (vec-of (Point -1.0 0.2) (Point 0.0 0.7) (Point 1.0 1.1))
                             fill line "li")
             (parametric-interval iv-plo iv-phi -1.0 1.0 72 fill line "pi")
             (polar-interval iv-rlo iv-rhi -1.0 1.0 72 fill line "po")))
@@ -76,10 +61,47 @@
                (assert-true (>i ink 100))))
         (assert-true false))))
 
+  ;; A fixed frame, so the two pictures compared below share one.
+  (defn fixed-opts [] : PlotOpts
+    (plot-opts 400 300 "" "" "" -2.0 2.0 -1.0 4.0 0))
+
+  (defn same-pixels? [a : (Vec AnyRenderer)  b : (Vec AnyRenderer)] : bool
+    (let [r1 (plot a (fixed-opts))
+          r2 (plot b (fixed-opts))]
+      (if (and (__ok? r1) (__ok? r2))
+        (let [s1 (__ok-val r1)
+              s2 (__ok-val r2)
+              eq (__surfaces-equal? s1 s2)]
+          (__surface-destroy s1)
+          (__surface-destroy s2)
+          eq)
+        false)))
+
+  ;; The band's outline is drawn in its LineStyle: two bands that differ only
+  ;; in the outline's color are different pictures, for every interval kind.
+  (defn outline-is-drawn [] : bool
+    (let [fill (default-fill-style)
+          red  (line-style 1 2.0 0 1.0)
+          blue (line-style 0 2.0 0 1.0)]
+      (and (assert-true (not (same-pixels? (vec-of (function-interval iv-lo iv-hi -1.5 1.5 96 fill red ""))
+                                           (vec-of (function-interval iv-lo iv-hi -1.5 1.5 96 fill blue "")))))
+           (assert-true (not (same-pixels? (vec-of (lines-interval (vec-of (Point -1.0 -0.5) (Point 1.0 0.5))
+                                                                   (vec-of (Point -1.0 0.2) (Point 1.0 1.1))
+                                                                   fill red ""))
+                                           (vec-of (lines-interval (vec-of (Point -1.0 -0.5) (Point 1.0 0.5))
+                                                                   (vec-of (Point -1.0 0.2) (Point 1.0 1.1))
+                                                                   fill blue "")))))
+           (assert-true (not (same-pixels? (vec-of (parametric-interval iv-plo iv-phi -1.0 1.0 72 fill red ""))
+                                           (vec-of (parametric-interval iv-plo iv-phi -1.0 1.0 72 fill blue "")))))
+           (assert-true (not (same-pixels? (vec-of (polar-interval iv-rlo iv-rhi -1.0 1.0 72 fill red ""))
+                                           (vec-of (polar-interval iv-rlo iv-rhi -1.0 1.0 72 fill blue ""))))))))
+
   (defn main [] : int
     (describe "plot/interval"
       (it "renders interval fills"
         (write-interval-png-ok))
       (it "produces non-background ink in the interior"
-        (pixel-sanity-interval)))
+        (pixel-sanity-interval))
+      (it "outlines the band in its line style"
+        (outline-is-drawn)))
     (run-all-status)))

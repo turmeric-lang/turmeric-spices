@@ -79,6 +79,7 @@ visible in the TUI and in HTML export.
 (import plot/line    :refer [lines])
 (import plot/decor   :refer [axes tick-grid])
 (import plot/style   :refer [default-line-style default-point-style default-plot-opts])
+(import plot/data    :refer [Point])
 (import notebook/image :refer [image-hook-record-path])
 
 ;; Extract x and y columns from the frame
@@ -86,29 +87,25 @@ visible in the TUI and in HTML export.
 (def y-col (frame-column df "y"))
 (def n (column-length x-col))
 
-;; Build a list of (x, y) pairs for the scatter plot
-(load "stdlib/bits.tur")
+;; Build the scatter plot's Points from the two columns
 (load "stdlib/math.tur")
 
-;; One (x, y) point: a cons cell of the two floats' bits.
-(defn xy [x :float y :float] : int (cons (float->bits x) (float->bits y)))
-(defn lst [v : int n : int] : int (cons v n))
-
-(defn build-pairs [i : int acc : int] : int
+(defn build-points [i : int out : (Vec Point)] : (Vec Point)
   (if (>= i n)
-    acc
-    (build-pairs (+ i 1)
-      ;; x was read as int64 (the CSV writes 1, 2, ...), y as float64
-      (lst (xy (int->float (column-int64-at x-col i))
-               (column-float64-at y-col i)) acc))))
+    out
+    (do (vec-push! out
+                   ;; x was read as int64 (the CSV writes 1, 2, ...), y as float64
+                   (Point (int->float (column-int64-at x-col i))
+                          (column-float64-at y-col i)))
+        (build-points (+ i 1) out))))
 
-(def scatter-data (build-pairs 0 0))
+(def scatter-data (build-points 0 (:: (vec-new) (Vec Point))))
 
 ;; Fitted line: y = intercept + slope * x, intercept ~ 0.05, slope ~ 2.00.
 ;; A straight line needs only its two end points.
 (defn fit-line [x :float] :float
   (+ 0.05 (* 2.00 x)))
-(def fit-data (lst (xy 0.0 (fit-line 0.0)) (lst (xy 10.0 (fit-line 10.0)) 0)))
+(def fit-data (vec-of (Point 0.0 (fit-line 0.0)) (Point 10.0 (fit-line 10.0))))
 
 (plot-write-png
   (vec-of (tick-grid)

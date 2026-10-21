@@ -1,30 +1,358 @@
 ;; plot/point.tur -- point-like renderers.
+;;
+;; Each kind is a struct with a `Renderer` instance; the constructors box it as
+;; an `AnyRenderer`.
 
 (defmodule plot/point
-  (export points error-bars vector-field arrows)
+  (export points error-bars vector-field arrows
+          PointsR ErrorBarsR VectorFieldR ArrowsR)
 
-  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds])
+  (import plot/core  :refer [BBox hint-bbox any-renderer DrawCtx
+                             __bbox-of-points __bbox-of-error-bars __bbox-of-arrows])
+  (import plot/style :refer [LineStyle PointStyle])
+  (import plot/data  :refer [Point ErrorBar Arrow Cells
+                             __points->cells __error-bars->cells __arrows->cells __free-cells])
+
+  ;;; PointsR -- a scatter of its points.
+  ;;; Nominally distinct from LinesR though the payloads match, so the two can
+  ;;; never be swapped silently (the slot-bag `kind` tag could be).
+  (defstruct PointsR :copy [points : (Vec Point)  style : PointStyle  label : cstr])
+
+  ;;; ErrorBarsR -- error bars spanning y +/- err, or x +/- err when
+  ;;; `horizontal`.
+  (defstruct ErrorBarsR :copy [bars : (Vec ErrorBar)  style : LineStyle  horizontal : bool  label : cstr])
+
+  ;;; VectorFieldR -- the direction f(x, y) (a Point: dx, dy) drawn on a samples x samples grid
+  ;;; over the domain. `scale-mode` 0 draws the raw vector, 1 a unit vector,
+  ;;; 2 the raw vector at a larger scale.
+  (defstruct VectorFieldR :copy [f : (fn [float float] Point)
+                                 x-min : float  x-max : float  y-min : float  y-max : float
+                                 samples : int  scale-mode : int  style : LineStyle  label : cstr])
+
+  ;;; ArrowsR -- explicit arrows.
+  (defstruct ArrowsR :copy [arrows : (Vec Arrow)  style : LineStyle  label : cstr])
+
+  ;;; __draw-points -- fill and outline a marker at each lowered point.
+  (defn __draw-points [ctx : DrawCtx  points : Cells  style : PointStyle] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { int64_t color; int64_t fill_color; int64_t sym; double size; double alpha; } PointStyle;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_point_style(void *, int64_t, void *, void *);
+    #define SET_POINT_STYLE(H, S, F) plot_ctx_point_style(dc, (int64_t)(intptr_t)(H), (S), (F))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    extern void plot_ctx_marker(void *, double, double, int64_t, int64_t, int64_t, double, double);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    do {
+      PointStyle *ps = (PointStyle *)(intptr_t)style;
+      int stroke, fill;
+      SET_POINT_STYLE(style, &stroke, &fill);
+      double size = (ps && ps->size > 0.0) ? ps->size : 6.0;
+      double alpha = (ps && ps->alpha > 0.0) ? ps->alpha : 1.0;
+      for (Cons *p = (Cons *)(intptr_t)points; p; p = (Cons *)(intptr_t)p->tail) {
+        Cons *pt = (Cons *)(intptr_t)p->head;
+        if (!pt) continue;
+        double x = BITS_DBL(pt->head), y = BITS_DBL(pt->tail);
+        double vx, vy; MAP_POINT(x, y, &vx, &vy);
+        plot_ctx_marker(dc, vx, vy, stroke, fill, ps ? ps->sym : 0, size, alpha);
+      }
+    } while (0);
+    #undef SET_POINT_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-error-bars -- stroke each lowered (x . (y . h)) bar, x +/- h when `horizontal`.
+  (defn __draw-error-bars [ctx : DrawCtx  bars : Cells  style : LineStyle  horizontal : bool] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      for (Cons *p = (Cons *)(intptr_t)bars; p; p = (Cons *)(intptr_t)p->tail) {
+        Cons *a = (Cons *)(intptr_t)p->head;
+        if (!a) continue;
+        double x = BITS_DBL(a->head);
+        Cons *b = (Cons *)(intptr_t)a->tail;
+        double y = BITS_DBL(b->head);
+        double h = BITS_DBL(b->tail);
+        if (horizontal) {
+          double vxa, vya, vxb, vyb; MAP_POINT(x - h, y, &vxa, &vya); MAP_POINT(x + h, y, &vxb, &vyb);
+          plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vxa, (float)vya);
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vxb, (float)vyb);
+        } else {
+          double vxa, vya, vxb, vyb; MAP_POINT(x, y - h, &vxa, &vya); MAP_POINT(x, y + h, &vxb, &vyb);
+          plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vxa, (float)vya);
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vxb, (float)vyb);
+        }
+      }
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-arrows -- stroke each lowered (x1 . (y1 . (x2 . y2))) segment with a head.
+  (defn __draw-arrows [ctx : DrawCtx  arrows : Cells  style : LineStyle] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double cos(double);
+    extern double sin(double);
+    extern double atan2(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      for (Cons *p = (Cons *)(intptr_t)arrows; p; p = (Cons *)(intptr_t)p->tail) {
+        Cons *a = (Cons *)(intptr_t)p->head;
+        double x1 = BITS_DBL(a->head);
+        Cons *b = (Cons *)(intptr_t)a->tail;
+        double y1 = BITS_DBL(b->head);
+        Cons *c = (Cons *)(intptr_t)b->tail;
+        double x2 = BITS_DBL(c->head);
+        double y2 = BITS_DBL(c->tail);
+        double vx1, vy1, vx2, vy2; MAP_POINT(x1, y1, &vx1, &vy1); MAP_POINT(x2, y2, &vx2, &vy2);
+        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx1, (float)vy1);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx2, (float)vy2);
+        double ang = atan2(vy2 - vy1, vx2 - vx1);
+        double ah = 6.0;
+        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx2, (float)vy2);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx2 - ah * cos(ang - 0.45)), (float)(vy2 - ah * sin(ang - 0.45)));
+        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx2, (float)vy2);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx2 - ah * cos(ang + 0.45)), (float)(vy2 - ah * sin(ang + 0.45)));
+      }
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-vector-field -- stroke the direction f(x, y) on a grid x grid lattice.
+  (defn __draw-vector-field [ctx : DrawCtx  ^fat f : (fn [float float] Point)
+                           x-min : float  x-max : float  y-min : float  y-max : float
+                           grid : int  scale-mode : int  style : LineStyle] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double sqrt(double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    extern void plot_eval_vector(int64_t, double, double, void *, void *);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      int samples = (int)grid; if (samples < 2) samples = 2;
+      for (int iy = 0; iy < samples; iy++) for (int ix = 0; ix < samples; ix++) {
+        double x = x_min + (x_max - x_min) * ((double)ix / (double)(samples - 1));
+        double y = y_min + (y_max - y_min) * ((double)iy / (double)(samples - 1));
+        double dx = 0.0, dy = 0.0;
+        plot_eval_vector(f, x, y, &dx, &dy);
+        if (scale_mode == 1) {
+          double len = sqrt(dx * dx + dy * dy);
+          if (len > 1e-12) { dx /= len; dy /= len; }
+        }
+        double scale = (scale_mode == 2) ? 0.15 : 0.10;
+        double x2 = x + dx * (x_max - x_min) * scale;
+        double y2 = y + dy * (y_max - y_min) * scale;
+        double vx1, vy1, vx2, vy2; MAP_POINT(x, y, &vx1, &vy1); MAP_POINT(x2, y2, &vx2, &vy2);
+        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx1, (float)vy1);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx2, (float)vy2);
+      }
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  (definstance Renderer [PointsR]
+    (bounds [r] (__bbox-of-points (.points r)))
+    (draw [r ctx]
+      (let [cells (__points->cells (.points r))]
+        (__draw-points ctx cells (.style r))
+        (__free-cells cells 1)))
+    (legend-label [r] (.label r)))
+
+  (definstance Renderer [ErrorBarsR]
+    (bounds [r] (__bbox-of-error-bars (.bars r) (.horizontal r)))
+    (draw [r ctx]
+      (let [cells (__error-bars->cells (.bars r))]
+        (__draw-error-bars ctx cells (.style r) (.horizontal r))
+        (__free-cells cells 2)))
+    (legend-label [r] (.label r)))
+
+  (definstance Renderer [VectorFieldR]
+    (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
+    (draw [r ctx] (__draw-vector-field ctx (.f r) (.x-min r) (.x-max r) (.y-min r) (.y-max r)
+                                       (.samples r) (.scale-mode r) (.style r)))
+    (legend-label [r] (.label r)))
+
+  (definstance Renderer [ArrowsR]
+    (bounds [r] (__bbox-of-arrows (.arrows r)))
+    (draw [r ctx]
+      (let [cells (__arrows->cells (.arrows r))]
+        (__draw-arrows ctx cells (.style r))
+        (__free-cells cells 3)))
+    (legend-label [r] (.label r)))
 
   ;;; points -- scatter plot renderer.
-  (defn points [vs : int style : int label : cstr] : int
-    (__make-renderer 30 style 0 vs 0 0 0 0 label ""))
+  ;;;
+  ;;; Parameters:
+  ;;;   vs    -- the points
+  ;;;   style -- the PointStyle of the markers
+  ;;;   label -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A PointsR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (points (vec-of (Point 1.0 2.0) (Point 2.0 3.5)) (default-point-style) "samples")
+  (defn points [vs : (Vec Point)  style : PointStyle  label : cstr] : AnyRenderer
+    (any-renderer (make-struct PointsR vs style label)))
 
   ;;; error-bars -- vertical or horizontal error bars.
-  (defn error-bars [bars : int style : int invert : int label : cstr] : int
-    (__renderer-ints (__make-renderer 31 style 0 bars 0 0 0 0 label "") invert 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   bars       -- the error bars
+  ;;;   style      -- the LineStyle to stroke with
+  ;;;   horizontal -- true for x +/- err, false for y +/- err
+  ;;;   label      -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   An ErrorBarsR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (error-bars (vec-of (ErrorBar 1.0 2.0 0.25)) (default-line-style) false "err")
+  (defn error-bars [bars : (Vec ErrorBar)  style : LineStyle  horizontal : bool  label : cstr] : AnyRenderer
+    (any-renderer (make-struct ErrorBarsR bars style horizontal label)))
 
-  ;;; vector-field -- sample f(x,y)->(cons dx dy) over a grid.
-  (defn vector-field [f x-min : float x-max : float y-min : float y-max : float
-                      samples : int scale-mode : int style : int label : cstr] : int
-    (__renderer-bounds
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 32 style 0 f 0 0 0 0 label "")
-                           x-min x-max y-min y-max 0.0 0.0)
-        samples scale-mode 0 0)
-      x-min x-max y-min y-max))
+  ;;; vector-field -- draw the direction f(x, y) at each point of a grid.
+  ;;;
+  ;;; Parameters:
+  ;;;   f          -- the field, a (fn [float float] Point) giving (dx, dy)
+  ;;;   x-min      -- left edge of the sampled domain
+  ;;;   x-max      -- right edge of the sampled domain
+  ;;;   y-min      -- bottom edge of the sampled domain
+  ;;;   y-max      -- top edge of the sampled domain
+  ;;;   samples    -- grid points per axis
+  ;;;   scale-mode -- 0 raw, 1 normalised, 2 raw at a larger scale
+  ;;;   style      -- the LineStyle to stroke with
+  ;;;   label      -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A VectorFieldR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (vector-field (fn [x : float y : float] : Point (Point (- 0.0 y) x))
+  ;;;                 -1.0 1.0 -1.0 1.0 8 1 (default-line-style) "field")
+  (defn vector-field [^fat f : (fn [float float] Point)
+                      x-min : float  x-max : float  y-min : float  y-max : float
+                      samples : int  scale-mode : int  style : LineStyle  label : cstr] : AnyRenderer
+    (any-renderer (make-struct VectorFieldR f x-min x-max y-min y-max
+                                            samples scale-mode style label)))
 
   ;;; arrows -- explicit arrow segments.
-  (defn arrows [arrow-list : int style : int label : cstr] : int
-    (__make-renderer 33 style 0 arrow-list 0 0 0 0 label ""))
+  ;;;
+  ;;; Parameters:
+  ;;;   arrow-list -- the arrows
+  ;;;   style      -- the LineStyle to stroke with
+  ;;;   label      -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   An ArrowsR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (arrows (vec-of (Arrow 0.0 0.0 1.0 1.0)) (default-line-style) "moves")
+  (defn arrows [arrow-list : (Vec Arrow)  style : LineStyle  label : cstr] : AnyRenderer
+    (any-renderer (make-struct ArrowsR arrow-list style label)))
 
 ) ;; end defmodule plot/point
