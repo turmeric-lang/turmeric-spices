@@ -98,7 +98,11 @@ min + (max - min) * (i + 1) / (n + 1)); `isoline` draws one level you name;
 
 ## 6. Multiple renderers and legend
 
-Pass labels on data renderers and set `legend-pos` in `plot-opts`.
+Pass labels on data renderers and set `legend-pos` in `plot-opts`. Each
+labelled renderer gets a row whose swatch is what it drew with: a stroke of
+its line style, a box of its fill (edged in its outline's style for an
+interval band), or its point marker -- auto colors included, so a swatch
+always matches its series.
 
 ## 7. Styles
 

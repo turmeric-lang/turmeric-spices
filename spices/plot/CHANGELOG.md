@@ -100,6 +100,18 @@
   levels now span the range f takes on the sampled grid -- level i of n at
   min + (max - min) * (i + 1) / (n + 1) -- and a field with no finite value
   draws none.
+- A legend row's swatch was a line in palette color `row % 8`, whatever its
+  renderer drew with, so it mismatched any renderer with a named color, or
+  after an unlabelled renderer took an auto color. Each renderer now records
+  the styles it resolves as it draws, and its row shows them: a stroke of its
+  line style, a box of its fill (edged top and bottom in the outline's style
+  for an interval band), or its point marker.
+- The interval kinds never drew their outline: the band's path was filled
+  with `plutovg_canvas_fill`, which clears it, so the outline `LineStyle`
+  stroked nothing. The band is now outlined in that style, as documented.
+- A point style's `fill-color`, or a `contour-intervals` fill's color, of 8
+  or more read past the 8-entry palette; both wrap now, as every other color
+  does.
 - Every plot left one saved state on its canvas: the frame
   `plutovg_canvas_save`d with no matching `restore`. A canvas handed to
   `plot-into-canvas` / `CanvasBackend` now comes back with the caller's line

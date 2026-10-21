@@ -997,6 +997,14 @@
     extern void plutovg_canvas_set_line_width(void* canvas, float line_width);
     extern void plutovg_canvas_set_dash_array(void* canvas, const float* dashes, int ndashes);
     #endif
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
     typedef struct PlotDrawCtx {
       void *canvas;
       double bx_min, bx_max, by_min, by_max;
@@ -1005,6 +1013,9 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
+      PlotSwatch *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
     } PlotDrawCtx;
     typedef struct { int64_t color; double width; int64_t dash; double alpha; } LineStyle;
     static const double palette[8][3] = {
@@ -1030,6 +1041,14 @@
                             (float)palette[__color][2], (float)__alpha);
     plutovg_canvas_set_line_width((plutovg_canvas_t *)canvas, (float)__width);
     plutovg_canvas_set_dash_array((plutovg_canvas_t *)canvas, NULL, 0);
+    /* The first line style a renderer draws with is its legend swatch's. */
+    if (dc->swatches && dc->cur_swatch >= 0 && dc->cur_swatch < dc->n_swatches) {
+      PlotSwatch *sw = &dc->swatches[dc->cur_swatch];
+      if (!sw->has_line) {
+        sw->has_line = 1; sw->line_color = __color;
+        sw->line_alpha = __alpha; sw->line_width = __width;
+      }
+    }
     ```)
 
   ;;; __ctx-fill-style -- install a fill-style handle's color and alpha.
@@ -1042,6 +1061,14 @@
     typedef void plutovg_canvas_t;
     extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
     #endif
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
     typedef struct PlotDrawCtx {
       void *canvas;
       double bx_min, bx_max, by_min, by_max;
@@ -1050,6 +1077,9 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
+      PlotSwatch *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
     } PlotDrawCtx;
     typedef struct { int64_t color; double alpha; int64_t line_color; double line_width; } FillStyle;
     static const double palette[8][3] = {
@@ -1071,14 +1101,127 @@
     plutovg_canvas_set_rgba((plutovg_canvas_t *)dc->canvas,
                             (float)palette[__color][0], (float)palette[__color][1],
                             (float)palette[__color][2], (float)__alpha);
+    /* The first fill a renderer draws with is its legend swatch's. */
+    if (dc->swatches && dc->cur_swatch >= 0 && dc->cur_swatch < dc->n_swatches) {
+      PlotSwatch *sw = &dc->swatches[dc->cur_swatch];
+      if (!sw->has_fill) {
+        sw->has_fill = 1; sw->fill_color = __color; sw->fill_alpha = __alpha;
+      }
+    }
     ```)
 
   ;;; __ctx-point-style -- resolve a point-style handle's stroke and fill palette
   ;;; indices into `stroke-out` / `fill-out` (int *).
+  ;;;
+  ;;; Each of the three style helpers also records the first style of its kind
+  ;;; the renderer now drawing (`__ctx-drawing`) resolves -- auto colors
+  ;;; included -- as that renderer's legend swatch.
   (defn (export-as "plot_ctx_point_style")
         __ctx-point-style [ctx : ptr<void>  style : int  stroke-out : ptr<void>  fill-out : ptr<void>] : void
     ```c
     #include <stdint.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSwatch *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+    } PlotDrawCtx;
+    typedef struct { int64_t color; int64_t fill_color; int64_t sym; double size; double alpha; } PointStyle;
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    PointStyle *__ps = (PointStyle *)(intptr_t)(style);
+    int __stroke = __ps ? (int)__ps->color : -1;
+    if (__stroke < 0) __stroke = (int)((dc->auto_color++) % 8);
+    __stroke %= 8; if (__stroke < 0) __stroke += 8;
+    int __fill = (__ps && __ps->fill_color >= 0) ? (int)(__ps->fill_color % 8) : __stroke;
+    if (stroke_out) *(int *)stroke_out = __stroke;
+    if (fill_out) *(int *)fill_out = __fill;
+    /* The first point style a renderer draws with is its legend swatch's. */
+    if (dc->swatches && dc->cur_swatch >= 0 && dc->cur_swatch < dc->n_swatches) {
+      PlotSwatch *sw = &dc->swatches[dc->cur_swatch];
+      if (!sw->has_point) {
+        sw->has_point = 1; sw->point_stroke = __stroke; sw->point_fill = __fill;
+        sw->point_sym = __ps ? __ps->sym : 0;
+        sw->point_size = (__ps && __ps->size > 0.0) ? __ps->size : 6.0;
+        sw->point_alpha = (__ps && __ps->alpha > 0.0) ? __ps->alpha : 1.0;
+      }
+    }
+    ```)
+
+  ;;; __ctx-note-fill -- record palette color `color` at `alpha` as the
+  ;;; drawing renderer's fill swatch, for a draw that fills without a
+  ;;; FillStyle (the contour bands). Draws nothing.
+  (defn (export-as "plot_ctx_note_fill")
+        __ctx-note-fill [ctx : ptr<void>  color : int  alpha : float] : void
+    ```c
+    #include <stdint.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSwatch *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    if (dc->swatches && dc->cur_swatch >= 0 && dc->cur_swatch < dc->n_swatches) {
+      PlotSwatch *sw = &dc->swatches[dc->cur_swatch];
+      if (!sw->has_fill) {
+        int c = (int)(color % 8); if (c < 0) c += 8;
+        sw->has_fill = 1; sw->fill_color = c; sw->fill_alpha = alpha;
+      }
+    }
+    ```)
+
+  ;;; __ctx-marker -- draw one point marker centered on viewport pixel
+  ;;; (vx, vy): symbol `sym` (0 circle, 1 square, 2 triangle, 3 cross,
+  ;;; 4 plus, 5 diamond) of width `size`, filled with palette color `fill` and
+  ;;; outlined with `stroke`, both at `alpha`. `points` draws each point with
+  ;;; it, and the legend its swatch.
+  (defn (export-as "plot_ctx_marker")
+        __ctx-marker [ctx : ptr<void>  vx : float  vy : float  stroke : int  fill : int
+                      sym : int  size : float  alpha : float] : void
+    ```c
+    #include <stdint.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    extern void plutovg_canvas_set_line_width(void* canvas, float line_width);
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_circle(void* canvas, float cx, float cy, float r);
+    extern void plutovg_canvas_close_path(void* canvas);
+    extern void plutovg_canvas_fill(void* canvas);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
     typedef struct PlotDrawCtx {
       void *canvas;
       double bx_min, bx_max, by_min, by_max;
@@ -1088,15 +1231,77 @@
       int64_t legend_pos;
       int64_t auto_color;
     } PlotDrawCtx;
-    typedef struct { int64_t color; int64_t fill_color; int64_t sym; double size; double alpha; } PointStyle;
+    static const double palette[8][3] = {
+      {31.0/255.0, 119.0/255.0, 180.0/255.0},
+      {214.0/255.0, 39.0/255.0, 40.0/255.0},
+      {44.0/255.0, 160.0/255.0, 44.0/255.0},
+      {255.0/255.0, 127.0/255.0, 14.0/255.0},
+      {148.0/255.0, 103.0/255.0, 189.0/255.0},
+      {140.0/255.0, 86.0/255.0, 75.0/255.0},
+      {227.0/255.0, 119.0/255.0, 194.0/255.0},
+      {127.0/255.0, 127.0/255.0, 127.0/255.0}
+    };
     PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
-    PointStyle *__ps = (PointStyle *)(intptr_t)(style);
-    int __stroke = __ps ? (int)__ps->color : -1;
-    if (__stroke < 0) __stroke = (int)((dc->auto_color++) % 8);
-    __stroke %= 8; if (__stroke < 0) __stroke += 8;
-    int __fill = (__ps && __ps->fill_color >= 0) ? (int)__ps->fill_color : __stroke;
-    if (stroke_out) *(int *)stroke_out = __stroke;
-    if (fill_out) *(int *)fill_out = __fill;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    int s8 = (int)(stroke % 8); if (s8 < 0) s8 += 8;
+    int f8 = (int)(fill % 8); if (f8 < 0) f8 += 8;
+    plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas,
+                            (float)palette[f8][0], (float)palette[f8][1],
+                            (float)palette[f8][2], (float)alpha);
+    switch ((int)sym) {
+      case 1: plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy - size / 2), (float)size, (float)size); break;
+      case 2:
+        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy + size / 2));
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy + size / 2));
+        plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+        break;
+      case 5:
+        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)vy);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy + size / 2));
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)vy);
+        plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+        break;
+      default: plutovg_canvas_circle((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy, (float)(size / 2)); break;
+    }
+    plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+    plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas,
+                            (float)palette[s8][0], (float)palette[s8][1],
+                            (float)palette[s8][2], (float)alpha);
+    plutovg_canvas_set_line_width((plutovg_canvas_t *)(intptr_t)canvas, 1.0f);
+    if (sym == 3) {
+      plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy - size / 2));
+      plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy + size / 2));
+      plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy + size / 2));
+      plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy - size / 2));
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } else if (sym == 4) {
+      plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)vy);
+      plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)vy);
+      plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+      plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy + size / 2));
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } else {
+      switch ((int)sym) {
+        case 1: plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy - size / 2), (float)size, (float)size); break;
+        case 2:
+          plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy + size / 2));
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy + size / 2));
+          plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+          break;
+        case 5:
+          plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)vy);
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy + size / 2));
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)vy);
+          plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+          break;
+        default: plutovg_canvas_circle((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy, (float)(size / 2)); break;
+      }
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    }
     ```)
 
   ;;; __ctx-map -- map the data point (x, y) into viewport pixels, written to
@@ -1141,10 +1346,13 @@
         i
         (__first-categorical rs (+ i 1) n))))
 
-  ;;; __draw-fold -- `draw` each of rs[i..n), in order.
+  ;;; __draw-fold -- `draw` each of rs[i..n), in order, telling the DrawCtx
+  ;;; which one is drawing so its legend swatch is recorded.
   (defn __draw-fold [rs : (Vec AnyRenderer)  ctx : DrawCtx  i : int  n : int] : int
-    (if (>= i n) n
-      (do (open (vec-get rs i) [a v] (draw v ctx))
+    (if (>= i n)
+      (do (__ctx-drawing ctx -1) n)
+      (do (__ctx-drawing ctx i)
+          (open (vec-get rs i) [a v] (draw v ctx))
           (__draw-fold rs ctx (+ i 1) n))))
 
   ;;; __legend-fold -- one legend row for each of rs[i..n) with a label;
@@ -1152,7 +1360,7 @@
   (defn __legend-fold [rs : (Vec AnyRenderer)  ctx : DrawCtx  i : int  n : int  row : int] : int
     (if (>= i n) row
       (__legend-fold rs ctx (+ i 1) n
-                     (if (__legend-row ctx row (open (vec-get rs i) [a v] (legend-label v)))
+                     (if (__legend-row ctx row i (open (vec-get rs i) [a v] (legend-label v)))
                        (+ row 1)
                        row))))
 
@@ -1255,6 +1463,14 @@
     #endif
 
     typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
     typedef struct PlotDrawCtx {
       void *canvas;
       double bx_min, bx_max, by_min, by_max;
@@ -1263,6 +1479,9 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
+      PlotSwatch *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
     } PlotDrawCtx;
     typedef struct {
       int64_t width; int64_t height;
@@ -1512,9 +1731,73 @@
     dc->font = (void *)font;
     dc->legend_pos = legend_pos;
     dc->auto_color = 0;
+    dc->swatches = NULL;
+    dc->n_swatches = 0;
+    dc->cur_swatch = -1;
     return dc;
     #undef UNION_POINT
     #undef ISNAN
+    ```)
+
+  ;;; __ctx-track-renderers -- give the DrawCtx a legend swatch for each of
+  ;;; `n` renderers, filled in as they draw (see `__ctx-drawing`).
+  (defn __ctx-track-renderers [ctx : DrawCtx  n : int] : void
+    ```c
+    #include <stdint.h>
+    #include <stdlib.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSwatch *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    if (n <= 0 || dc->swatches) return;
+    dc->swatches = (PlotSwatch *)calloc((size_t)n, sizeof(PlotSwatch));
+    dc->n_swatches = dc->swatches ? n : 0;
+    ```)
+
+  ;;; __ctx-drawing -- say which renderer (its index in the plot's Vec) is about
+  ;;; to draw, so the style helpers record its swatch; -1 for none.
+  (defn __ctx-drawing [ctx : DrawCtx  i : int] : void
+    ```c
+    #include <stdint.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSwatch *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    dc->cur_swatch = i;
     ```)
 
   ;;; __ctx-clip-begin -- clip drawing to the viewport, as the renderers draw.
@@ -1594,10 +1877,13 @@
     plutovg_canvas_set_font_size((plutovg_canvas_t *)dc->canvas, 12.0f);
     ```)
 
-  ;;; __legend-row -- draw legend row `row` (a palette swatch and `label`).
-  ;;; Returns false, drawing nothing, for an empty label or when there is no
-  ;;; legend (no font, or `legend-pos` 0).
-  (defn __legend-row [ctx : DrawCtx  row : int  label : cstr] : bool
+  ;;; __legend-row -- draw legend row `row`: renderer `index`'s swatch and
+  ;;; `label`. The swatch is what the renderer drew with -- its point marker,
+  ;;; else its fill as a box (edged top and bottom in its line style, as an
+  ;;; interval band is), else a stroke of its line style; a renderer that
+  ;;; recorded no style gets none. Returns false, drawing nothing, for an
+  ;;; empty label or when there is no legend (no font, or `legend-pos` 0).
+  (defn __legend-row [ctx : DrawCtx  row : int  index : int  label : cstr] : bool
     ```c
     #include <stdint.h>
     #include <string.h>
@@ -1607,12 +1893,24 @@
     typedef void plutovg_canvas_t;
     #define PLUTOVG_TEXT_ENCODING_UTF8 1
     extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    extern void plutovg_canvas_set_line_width(void* canvas, float line_width);
     extern void plutovg_canvas_move_to(void* canvas, float x, float y);
     extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_fill(void* canvas);
     extern void plutovg_canvas_stroke(void* canvas);
     extern float plutovg_canvas_fill_text(void* canvas, const void* text, int length,
                                           int encoding, float x, float y);
     #endif
+    extern void plot_ctx_marker(void *, double, double, int64_t, int64_t, int64_t, double, double);
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
     typedef struct PlotDrawCtx {
       void *canvas;
       double bx_min, bx_max, by_min, by_max;
@@ -1621,6 +1919,9 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
+      PlotSwatch *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
     } PlotDrawCtx;
     static const double palette[8][3] = {
       {31.0/255.0, 119.0/255.0, 180.0/255.0},
@@ -1640,13 +1941,41 @@
     double lx = (legend_pos == 2 || legend_pos == 4) ? dc->left + 12.0 : dc->right - 120.0;
     double ly = (legend_pos == 3 || legend_pos == 4) ? dc->bottom - 16.0 : dc->top + 16.0;
     double y = ly + row * 16.0;
-    int color = row % 8;
-    plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas,
-                            (float)palette[color][0], (float)palette[color][1],
-                            (float)palette[color][2], 1.0f);
-    plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)lx, (float)y);
-    plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(lx + 12.0), (float)y);
-    plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    PlotSwatch *sw = (dc->swatches && index >= 0 && index < dc->n_swatches)
+                     ? &dc->swatches[index] : NULL;
+    plutovg_canvas_t *cv = (plutovg_canvas_t *)(intptr_t)canvas;
+    if (sw && sw->has_point) {
+      double size = sw->point_size > 10.0 ? 10.0 : sw->point_size;
+      plot_ctx_marker(dc, lx + 6.0, y, sw->point_stroke, sw->point_fill,
+                      sw->point_sym, size, sw->point_alpha);
+    } else if (sw && sw->has_fill) {
+      int c = (int)sw->fill_color;
+      plutovg_canvas_set_rgba(cv, (float)palette[c][0], (float)palette[c][1],
+                              (float)palette[c][2], (float)sw->fill_alpha);
+      plutovg_canvas_rect(cv, (float)lx, (float)(y - 4.0), 12.0f, 8.0f);
+      plutovg_canvas_fill(cv);
+      if (sw->has_line) {
+        int lc = (int)sw->line_color;
+        double w = sw->line_width > 3.0 ? 3.0 : sw->line_width;
+        plutovg_canvas_set_rgba(cv, (float)palette[lc][0], (float)palette[lc][1],
+                                (float)palette[lc][2], (float)sw->line_alpha);
+        plutovg_canvas_set_line_width(cv, (float)w);
+        plutovg_canvas_move_to(cv, (float)lx, (float)(y - 4.0));
+        plutovg_canvas_line_to(cv, (float)(lx + 12.0), (float)(y - 4.0));
+        plutovg_canvas_move_to(cv, (float)lx, (float)(y + 4.0));
+        plutovg_canvas_line_to(cv, (float)(lx + 12.0), (float)(y + 4.0));
+        plutovg_canvas_stroke(cv);
+      }
+    } else if (sw && sw->has_line) {
+      int lc = (int)sw->line_color;
+      double w = sw->line_width > 4.0 ? 4.0 : sw->line_width;
+      plutovg_canvas_set_rgba(cv, (float)palette[lc][0], (float)palette[lc][1],
+                              (float)palette[lc][2], (float)sw->line_alpha);
+      plutovg_canvas_set_line_width(cv, (float)w);
+      plutovg_canvas_move_to(cv, (float)lx, (float)y);
+      plutovg_canvas_line_to(cv, (float)(lx + 12.0), (float)y);
+      plutovg_canvas_stroke(cv);
+    }
     plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas, 0.15f, 0.15f, 0.15f, 1.0f);
     plutovg_canvas_fill_text((plutovg_canvas_t *)(intptr_t)canvas, label, (int)strlen(label),
                              PLUTOVG_TEXT_ENCODING_UTF8, (float)(lx + 18.0), (float)(y + 4.0));
@@ -1654,7 +1983,7 @@
     ```)
 
   ;;; __ctx-finish -- hand the canvas back in the state the frame found it
-  ;;; (undoing its save), then release a DrawCtx and the font it holds.
+  ;;; (undoing its save), then release a DrawCtx, its swatches and its font.
   (defn __ctx-finish [ctx : DrawCtx] : void
     ```c
     #include <stdint.h>
@@ -1665,6 +1994,14 @@
     extern void plutovg_font_face_destroy(void* face);
     extern void plutovg_canvas_restore(void* canvas);
     #endif
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
     typedef struct PlotDrawCtx {
       void *canvas;
       double bx_min, bx_max, by_min, by_max;
@@ -1673,11 +2010,15 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
+      PlotSwatch *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
     } PlotDrawCtx;
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     if (!dc) return;
     plutovg_canvas_restore(dc->canvas);
     if (dc->font) plutovg_font_face_destroy(dc->font);
+    free(dc->swatches);
     free(dc);
     ```)
 
@@ -1722,6 +2063,7 @@
       (if (__null-ptr? raw)
         (__err 1)
         (let [ctx (:: raw DrawCtx)]
+          (__ctx-track-renderers ctx n)
           (__ctx-clip-begin ctx)
           (__draw-fold renderers ctx 0 n)
           (__ctx-clip-end ctx)
