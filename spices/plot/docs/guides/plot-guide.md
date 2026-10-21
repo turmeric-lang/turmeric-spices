@@ -71,7 +71,9 @@ Use `function-interval` to fill between two functions.
 ## 4. Histogram
 
 Use `discrete-histogram` for categorical bars and `stacked-histogram` for
-stacked series. The x axis is labelled with the bars' (or groups') labels.
+stacked series. The x axis is labelled with the bars' (or groups') labels --
+the y axis when `horizontal` is true. Each stack layer takes one fill, in
+every group, and the legend lists the layer names, one row per layer.
 
 ```turmeric no-check
 (import plot/data :refer [Bar Group])
@@ -149,9 +151,10 @@ Each type's `bounds` is the data extent it needs; the plot is laid out over
 the union of them (padded 5%, then overridden side by side by `plot-opts`).
 The frame draws the axis lines and tick grids that the renderers'
 `frame-marks` ask for (only the `Decoration`s ask), and labels the x axis
-with the `category-labels` of the first `categorical?` renderer; then every
-renderer's `draw` paints it, in Vec order, clipped to the viewport, and the
-legend lists each non-empty `legend-label`.
+(the y axis when it is `categories-on-y?`) with the `category-labels` of the
+first `categorical?` renderer; then every renderer's `draw` paints it, in Vec
+order, clipped to the viewport, and the legend lists every renderer's
+`legend-labels` -- by default its one non-empty `legend-label`.
 Point lists span their points, grid kinds (`contours`, `vector-field`, ...)
 their declared domain, and a sampled curve or a decoration constrains
 nothing. `renderer-bbox` and `renderers-bbox` in `plot/core` report it:

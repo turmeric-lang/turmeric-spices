@@ -26,8 +26,8 @@
   (defstruct DiscreteHistogramR :copy [bars : (Vec Bar)  fill : FillStyle  horizontal : bool  label : cstr])
 
   ;;; StackedHistogramR -- one Group per category slot, a stack of its values,
-  ;;; layer i filled with the i-th style of `fills`; `labels` names the stack
-  ;;; layers.
+  ;;; layer i filled with the i-th style of `fills` in every group; `labels`
+  ;;; names the stack layers, one legend row each.
   (defstruct StackedHistogramR :copy [groups : (Vec Group)  fills : (Vec FillStyle)  labels : (Vec cstr)
                                       horizontal : bool])
 
@@ -64,8 +64,9 @@
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     int64_t canvas = (int64_t)(intptr_t)dc->canvas;
     do {
+      /* One fill for every rectangle: an auto color resolves once. */
+      SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
       for (Cons *p = (Cons *)(intptr_t)rects; p; p = (Cons *)(intptr_t)p->tail) {
-        SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
         Cons *a = (Cons *)(intptr_t)p->head;
         double x0 = BITS_DBL(a->head);
         Cons *b = (Cons *)(intptr_t)a->tail;
@@ -175,12 +176,13 @@
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     int64_t canvas = (int64_t)(intptr_t)dc->canvas;
     do {
-      int idx = 0, fill_idx = 0; (void)fill_idx;
+      /* One fill for every bar: an auto color resolves once. */
+      SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+      int idx = 0;
       for (Cons *p = (Cons *)(intptr_t)bars; p; p = (Cons *)(intptr_t)p->tail, idx++) {
         double x0 = idx, x1 = idx + 0.8;
         Cons *bar = (Cons *)(intptr_t)p->head;
         double h = BITS_DBL(bar->tail);
-        SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
         double vx0, vy0, vx1, vy1;
         if (horizontal) { MAP_POINT(0.0, x0, &vx0, &vy0); MAP_POINT(h, x1, &vx1, &vy1); }
         else { MAP_POINT(x0, 0.0, &vx0, &vy0); MAP_POINT(x1, h, &vx1, &vy1); }
@@ -222,6 +224,7 @@
     #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
     extern void plot_ctx_fill_style(void *, int64_t);
     #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_series(void *, int64_t);
     extern void plot_ctx_map(void *, double, double, void *, void *);
     #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
     typedef struct { int64_t *data; size_t len; size_t cap; } FillVec;
@@ -229,25 +232,37 @@
     FillVec *fv = (FillVec *)(intptr_t)fills;
     int64_t canvas = (int64_t)(intptr_t)dc->canvas;
     do {
-      int idx = 0, fill_idx = 0; (void)fill_idx;
-      for (Cons *p = (Cons *)(intptr_t)groups; p; p = (Cons *)(intptr_t)p->tail, idx++) {
-        double x0 = idx, x1 = idx + 0.8;
+      /* Layer by layer, so each layer's fill -- an auto color included --
+         resolves once and colors that layer in every group; layer k is the
+         renderer's series k, its legend row's swatch. */
+      int nlayers = 0;
+      for (Cons *p = (Cons *)(intptr_t)groups; p; p = (Cons *)(intptr_t)p->tail) {
         Cons *grp = (Cons *)(intptr_t)p->head;
-        double acc = 0.0;
-        Cons *vals = (Cons *)(intptr_t)grp->tail;
-        size_t fi = 0;
-        while (vals) {
-          int64_t fill = (fv && fi < fv->len) ? fv->data[fi] : 0;
-          SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+        int c = 0;
+        for (Cons *v = (Cons *)(intptr_t)grp->tail; v; v = (Cons *)(intptr_t)v->tail) c++;
+        if (c > nlayers) nlayers = c;
+      }
+      for (int k = 0; k < nlayers; k++) {
+        int64_t fill = (fv && (size_t)k < fv->len) ? fv->data[k] : 0;
+        plot_ctx_series(dc, k);
+        SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+        int idx = 0;
+        for (Cons *p = (Cons *)(intptr_t)groups; p; p = (Cons *)(intptr_t)p->tail, idx++) {
+          double x0 = idx, x1 = idx + 0.8;
+          Cons *grp = (Cons *)(intptr_t)p->head;
+          double acc = 0.0;
+          Cons *vals = (Cons *)(intptr_t)grp->tail;
+          for (int j = 0; vals && j < k; j++) {
+            acc += BITS_DBL(vals->head);
+            vals = (Cons *)(intptr_t)vals->tail;
+          }
+          if (!vals) continue;
           double h = BITS_DBL(vals->head);
           double vx0, vy0, vx1, vy1;
           if (horizontal) { MAP_POINT(acc, x0, &vx0, &vy0); MAP_POINT(acc + h, x1, &vx1, &vy1); }
           else { MAP_POINT(x0, acc, &vx0, &vy0); MAP_POINT(x1, acc + h, &vx1, &vy1); }
           plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)vx0, (float)fmin(vy0, vy1), (float)(vx1 - vx0), (float)fabs(vy1 - vy0));
           plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
-          acc += h;
-          vals = (Cons *)(intptr_t)vals->tail;
-          fi++;
         }
       }
     } while (0);
@@ -261,6 +276,12 @@
     (if (>= i n) out
       (do (vec-push! out (.label (vec-get bars i)))
           (__bar-labels bars (+ i 1) n out))))
+
+  ;;; __copy-labels -- `labels[i..n)` pushed onto `out`.
+  (defn __copy-labels [labels : (Vec cstr)  i : int  n : int  out : (Vec cstr)] : (Vec cstr)
+    (if (>= i n) out
+      (do (vec-push! out (vec-get labels i))
+          (__copy-labels labels (+ i 1) n out))))
 
   ;;; __group-labels -- the tick labels of `groups[i..n)` pushed onto `out`.
   (defn __group-labels [groups : (Vec Group)  i : int  n : int  out : (Vec cstr)] : (Vec cstr)
@@ -294,6 +315,7 @@
         (__free-cells cells 1)))
     (legend-label [r] (.label r))
     (categorical? [r] true)
+    (categories-on-y? [r] (.horizontal r))
     (category-labels [r]
       (__bar-labels (.bars r) 0 (vec-len (.bars r)) (:: (vec-new) (Vec cstr)))))
 
@@ -303,7 +325,10 @@
       (let [cells (__groups->cells (.groups r))]
         (__draw-stacked-hist ctx cells (.fills r) (.horizontal r))
         (__free-groups cells)))
+    (legend-labels [r]
+      (__copy-labels (.labels r) 0 (vec-len (.labels r)) (:: (vec-new) (Vec cstr))))
     (categorical? [r] true)
+    (categories-on-y? [r] (.horizontal r))
     (category-labels [r]
       (__group-labels (.groups r) 0 (vec-len (.groups r)) (:: (vec-new) (Vec cstr)))))
 
@@ -358,7 +383,7 @@
   ;;; Parameters:
   ;;;   groups     -- one Group per category
   ;;;   fills      -- the FillStyle of each stack layer (the default past the end)
-  ;;;   labels     -- the layer names
+  ;;;   labels     -- the layer names, listed in the legend
   ;;;   horizontal -- true to lay the stacks along the y axis
   ;;;
   ;;; Returns:

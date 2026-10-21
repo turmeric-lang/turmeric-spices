@@ -97,14 +97,17 @@ named fields and an instance of the `Renderer` class:
   (bounds [r : a] : BBox)                      ;; the data extent it needs on screen
   (draw [r : a  ctx : DrawCtx] : void)         ;; paint it through the plot's context
   (legend-label [r : a] : cstr "")             ;; its legend entry, if any
+  (legend-labels [r : a] : (Vec cstr) ...)     ;; its legend rows; by default the one above
   (frame-marks [r : a] : FrameMarks (no-frame-marks))  ;; axes / grids for the frame
-  (categorical? [r : a] : bool false)          ;; lays the x axis out as categories?
+  (categorical? [r : a] : bool false)          ;; lays an axis out as categories?
+  (categories-on-y? [r : a] : bool false)      ;; ... along y rather than x?
   (category-labels [r : a] : (Vec cstr) (:: (vec-new) (Vec cstr))))  ;; their labels
 ```
 
 The plot's extent is the union of its renderers' `bounds`; the frame draws
 the axes and grids their `frame-marks` ask for; then each one's `draw` paints
-it, in order, and the legend lists their labels. A constructor
+it, in order, and the legend lists their `legend-labels`, each swatched in
+the style that row's series was drawn with. A constructor
 boxes its struct with that instance as an `AnyRenderer`, which is what
 lets one Vec hold every kind. Passing anything else to `plot` -- a value with
 no `Renderer` instance, or a callback of the wrong function type -- is a

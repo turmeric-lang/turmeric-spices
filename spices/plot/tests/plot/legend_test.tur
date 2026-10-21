@@ -14,10 +14,10 @@
                                 __surface-pixel-byte __count-non-background])
   (import plot/line     :refer [lines])
   (import plot/point    :refer [points])
-  (import plot/area     :refer [rectangles])
+  (import plot/area     :refer [rectangles stacked-histogram])
   (import plot/interval :refer [function-interval])
   (import plot/style    :refer [PlotOpts plot-opts line-style point-style fill-style])
-  (import plot/data     :refer [Point Rect])
+  (import plot/data     :refer [Point Rect Group])
   (import test/assert   :refer [assert-true])
   (import test/suite    :refer [describe it])
   (import test/runner   :refer [run-all-status])
@@ -32,21 +32,33 @@
     return d >= -8 && d <= 8;
     ```)
 
-  ;; Is pixel (x, y) of rs's picture the opaque color (r, g, b)? With no
-  ;; legend text drawn (no font), say so and answer true.
-  (defn pixel-is? [rs : (Vec AnyRenderer)  x : int  y : int  r : int  g : int  b : int] : bool
-    (let [rr (plot rs (opts))]
+  ;; Does this machine draw legends at all? Only when the frame finds a font:
+  ;; a one-line plot labelled "probe" then has text beside row 0's swatch.
+  (defn legend-drawn? [] : bool
+    (let [rr (plot (vec-of (lines (vec-of (Point -1.0 -0.5) (Point 1.0 -0.5))
+                                  (line-style -1 1.0 0 1.0) "probe"))
+                   (opts))]
       (if (__ok? rr)
         (let [s     (__ok-val rr)
-              text? (> (__count-non-background s 274 50 330 68) 0)
-              ok    (or (not text?)
-                        (and (near? (__surface-pixel-byte s x y 2) r)
-                             (near? (__surface-pixel-byte s x y 1) g)
-                             (near? (__surface-pixel-byte s x y 0) b)))]
-          (when (not text?) (println "# no font found: the legend is not drawn"))
+              text? (> (__count-non-background s 274 50 330 68) 0)]
           (__surface-destroy s)
-          ok)
+          text?)
         false)))
+
+  ;; Is pixel (x, y) of rs's picture the opaque color (r, g, b)? With no
+  ;; legend on this machine (no font), say so and answer true.
+  (defn pixel-is? [rs : (Vec AnyRenderer)  x : int  y : int  r : int  g : int  b : int] : bool
+    (if (not (legend-drawn?))
+      (do (println "# no font found: the legend is not drawn") true)
+      (let [rr (plot rs (opts))]
+        (if (__ok? rr)
+          (let [s  (__ok-val rr)
+                ok (and (near? (__surface-pixel-byte s x y 2) r)
+                        (near? (__surface-pixel-byte s x y 1) g)
+                        (near? (__surface-pixel-byte s x y 0) b))]
+            (__surface-destroy s)
+            ok)
+          false))))
 
   ;; Data well below the legend, so only the swatch is at its pixels.
   (defn low-line [y : float] : (Vec Point)
@@ -85,10 +97,21 @@
       (and (assert-true (pixel-is? rs 262 60 31 119 180))
            (assert-true (pixel-is? rs 262 56 214 39 40)))))
 
+  ;; A stacked histogram lists each layer, row k (16 pixels down per row)
+  ;; swatched in layer k's fill: palette 0 (blue), then palette 3 (orange).
+  (defn layer-rows [] : bool
+    (let [rs (vec-of (stacked-histogram (vec-of (Group "Q1" (vec-of 0.5 0.25))
+                                                (Group "Q2" (vec-of 0.25 0.5)))
+                                        (vec-of (fill-style 0 1.0 -1 0.0) (fill-style 3 1.0 -1 0.0))
+                                        (vec-of "base" "top") false))]
+      (and (assert-true (pixel-is? rs 262 60 31 119 180))
+           (assert-true (pixel-is? rs 262 76 255 127 14)))))
+
   (defn main [] : int
     (describe "plot legend swatches"
       (it "a swatch takes the auto color its renderer drew with" (auto-color-swatch))
       (it "a fill's swatch is a box of its color"                (fill-swatch))
       (it "a point renderer's swatch is its marker"              (point-swatch))
-      (it "a band's swatch is its fill edged in its outline"     (band-swatch)))
+      (it "a band's swatch is its fill edged in its outline"     (band-swatch))
+      (it "a stacked histogram has a row per layer"              (layer-rows)))
     (run-all-status)))

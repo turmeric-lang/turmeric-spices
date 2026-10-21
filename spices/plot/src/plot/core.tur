@@ -15,6 +15,8 @@
           any-renderer
           ;; what a kind's `draw` method draws through
           DrawCtx FrameMarks no-frame-marks frame-marks-union
+          ;; `legend-labels`' default body, compiled in each instance's module
+          __one-label
           __surface-create __surface-destroy __surface-write-png
           __canvas-create __canvas-destroy
           __plot-sample-adaptive
@@ -888,6 +890,18 @@
     (make-struct FrameMarks (or (.x-axis a) (.x-axis b)) (or (.y-axis a) (.y-axis b))
                             (or (.x-grid a) (.x-grid b)) (or (.y-grid a) (.y-grid b))))
 
+  ;;; __nonempty? -- is `s` a non-empty string?
+  (defn __nonempty? [s : cstr] : bool
+    ```c
+    return s && s[0];
+    ```)
+
+  ;;; __one-label -- a fresh Vec holding `label`, or empty for "".
+  (defn __one-label [label : cstr] : (Vec cstr)
+    (let [v (:: (vec-new) (Vec cstr))]
+      (when (__nonempty? label) (vec-push! v label))
+      v))
+
   ;;; Renderer -- the class every plot renderer kind implements.
   ;;;
   ;;; Parameters:
@@ -899,10 +913,17 @@
   ;;;                   as a sampled curve or an axis does
   ;;;   draw         -- paint the renderer through the plot's DrawCtx
   ;;;   legend-label -- its legend entry; "" (the default) for none
+  ;;;   legend-labels -- its legend entries, one row each, fresh (the caller
+  ;;;                   frees the Vec); by default `legend-label`, or none
+  ;;;                   when that is "". Row k's swatch is the style the
+  ;;;                   renderer drew its series k with (`__ctx-series`)
   ;;;   frame-marks  -- the axes / grids it asks the frame for; none by default
-  ;;;   categorical? -- whether it lays the x axis out as categories; false
+  ;;;   categorical? -- whether it lays an axis out as categories; false
   ;;;                   by default
-  ;;;   category-labels -- a categorical renderer's x tick labels, fresh (the
+  ;;;   categories-on-y? -- whether a categorical renderer's categories run
+  ;;;                   along the y axis (a horizontal histogram) rather
+  ;;;                   than x; false by default
+  ;;;   category-labels -- a categorical renderer's tick labels, fresh (the
   ;;;                   caller frees the Vec); empty by default
   ;;;
   ;;; Example:
@@ -913,8 +934,10 @@
     (bounds [r : a] : BBox)
     (draw [r : a  ctx : DrawCtx] : void)
     (legend-label [r : a] : cstr "")
+    (legend-labels [r : a] : (Vec cstr) (__one-label (legend-label r)))
     (frame-marks [r : a] : FrameMarks (no-frame-marks))
     (categorical? [r : a] : bool false)
+    (categories-on-y? [r : a] : bool false)
     (category-labels [r : a] : (Vec cstr) (:: (vec-new) (Vec cstr))))
 
   ;;; AnyRenderer -- a value of any `Renderer` kind, boxed with its instance.
@@ -1013,10 +1036,8 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
-      PlotSwatch *swatches;
-      int64_t n_swatches;
-      int64_t cur_swatch;
     } PlotDrawCtx;
+    extern void *plot_ctx_swatch(void *);
     typedef struct { int64_t color; double width; int64_t dash; double alpha; } LineStyle;
     static const double palette[8][3] = {
       {31.0/255.0, 119.0/255.0, 180.0/255.0},
@@ -1041,13 +1062,11 @@
                             (float)palette[__color][2], (float)__alpha);
     plutovg_canvas_set_line_width((plutovg_canvas_t *)canvas, (float)__width);
     plutovg_canvas_set_dash_array((plutovg_canvas_t *)canvas, NULL, 0);
-    /* The first line style a renderer draws with is its legend swatch's. */
-    if (dc->swatches && dc->cur_swatch >= 0 && dc->cur_swatch < dc->n_swatches) {
-      PlotSwatch *sw = &dc->swatches[dc->cur_swatch];
-      if (!sw->has_line) {
-        sw->has_line = 1; sw->line_color = __color;
-        sw->line_alpha = __alpha; sw->line_width = __width;
-      }
+    /* The first line style a series draws with is its legend swatch's. */
+    PlotSwatch *sw = (PlotSwatch *)plot_ctx_swatch(dc);
+    if (sw && !sw->has_line) {
+      sw->has_line = 1; sw->line_color = __color;
+      sw->line_alpha = __alpha; sw->line_width = __width;
     }
     ```)
 
@@ -1077,10 +1096,8 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
-      PlotSwatch *swatches;
-      int64_t n_swatches;
-      int64_t cur_swatch;
     } PlotDrawCtx;
+    extern void *plot_ctx_swatch(void *);
     typedef struct { int64_t color; double alpha; int64_t line_color; double line_width; } FillStyle;
     static const double palette[8][3] = {
       {31.0/255.0, 119.0/255.0, 180.0/255.0},
@@ -1101,12 +1118,10 @@
     plutovg_canvas_set_rgba((plutovg_canvas_t *)dc->canvas,
                             (float)palette[__color][0], (float)palette[__color][1],
                             (float)palette[__color][2], (float)__alpha);
-    /* The first fill a renderer draws with is its legend swatch's. */
-    if (dc->swatches && dc->cur_swatch >= 0 && dc->cur_swatch < dc->n_swatches) {
-      PlotSwatch *sw = &dc->swatches[dc->cur_swatch];
-      if (!sw->has_fill) {
-        sw->has_fill = 1; sw->fill_color = __color; sw->fill_alpha = __alpha;
-      }
+    /* The first fill a series draws with is its legend swatch's. */
+    PlotSwatch *sw = (PlotSwatch *)plot_ctx_swatch(dc);
+    if (sw && !sw->has_fill) {
+      sw->has_fill = 1; sw->fill_color = __color; sw->fill_alpha = __alpha;
     }
     ```)
 
@@ -1136,10 +1151,8 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
-      PlotSwatch *swatches;
-      int64_t n_swatches;
-      int64_t cur_swatch;
     } PlotDrawCtx;
+    extern void *plot_ctx_swatch(void *);
     typedef struct { int64_t color; int64_t fill_color; int64_t sym; double size; double alpha; } PointStyle;
     PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
     PointStyle *__ps = (PointStyle *)(intptr_t)(style);
@@ -1149,15 +1162,13 @@
     int __fill = (__ps && __ps->fill_color >= 0) ? (int)(__ps->fill_color % 8) : __stroke;
     if (stroke_out) *(int *)stroke_out = __stroke;
     if (fill_out) *(int *)fill_out = __fill;
-    /* The first point style a renderer draws with is its legend swatch's. */
-    if (dc->swatches && dc->cur_swatch >= 0 && dc->cur_swatch < dc->n_swatches) {
-      PlotSwatch *sw = &dc->swatches[dc->cur_swatch];
-      if (!sw->has_point) {
-        sw->has_point = 1; sw->point_stroke = __stroke; sw->point_fill = __fill;
-        sw->point_sym = __ps ? __ps->sym : 0;
-        sw->point_size = (__ps && __ps->size > 0.0) ? __ps->size : 6.0;
-        sw->point_alpha = (__ps && __ps->alpha > 0.0) ? __ps->alpha : 1.0;
-      }
+    /* The first point style a series draws with is its legend swatch's. */
+    PlotSwatch *sw = (PlotSwatch *)plot_ctx_swatch(dc);
+    if (sw && !sw->has_point) {
+      sw->has_point = 1; sw->point_stroke = __stroke; sw->point_fill = __fill;
+      sw->point_sym = __ps ? __ps->sym : 0;
+      sw->point_size = (__ps && __ps->size > 0.0) ? __ps->size : 6.0;
+      sw->point_alpha = (__ps && __ps->alpha > 0.0) ? __ps->alpha : 1.0;
     }
     ```)
 
@@ -1184,17 +1195,13 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
-      PlotSwatch *swatches;
-      int64_t n_swatches;
-      int64_t cur_swatch;
     } PlotDrawCtx;
+    extern void *plot_ctx_swatch(void *);
     PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
-    if (dc->swatches && dc->cur_swatch >= 0 && dc->cur_swatch < dc->n_swatches) {
-      PlotSwatch *sw = &dc->swatches[dc->cur_swatch];
-      if (!sw->has_fill) {
-        int c = (int)(color % 8); if (c < 0) c += 8;
-        sw->has_fill = 1; sw->fill_color = c; sw->fill_alpha = alpha;
-      }
+    PlotSwatch *sw = (PlotSwatch *)plot_ctx_swatch(dc);
+    if (sw && !sw->has_fill) {
+      int c = (int)(color % 8); if (c < 0) c += 8;
+      sw->has_fill = 1; sw->fill_color = c; sw->fill_alpha = alpha;
     }
     ```)
 
@@ -1355,14 +1362,23 @@
           (open (vec-get rs i) [a v] (draw v ctx))
           (__draw-fold rs ctx (+ i 1) n))))
 
-  ;;; __legend-fold -- one legend row for each of rs[i..n) with a label;
-  ;;; `row` is the next row's index.
-  (defn __legend-fold [rs : (Vec AnyRenderer)  ctx : DrawCtx  i : int  n : int  row : int] : int
-    (if (>= i n) row
-      (__legend-fold rs ctx (+ i 1) n
-                     (if (__legend-row ctx row i (open (vec-get rs i) [a v] (legend-label v)))
+  ;;; __legend-rows -- renderer i's legend rows for labels[k..m); `row` is
+  ;;; the next row's index, and the result the one after the last drawn.
+  (defn __legend-rows [ctx : DrawCtx  i : int  labels : (Vec cstr)  k : int  m : int  row : int] : int
+    (if (>= k m) row
+      (__legend-rows ctx i labels (+ k 1) m
+                     (if (__legend-row ctx row i k (vec-get labels k))
                        (+ row 1)
                        row))))
+
+  ;;; __legend-fold -- the legend rows of rs[i..n), each renderer's
+  ;;; `legend-labels` in order; `row` is the next row's index.
+  (defn __legend-fold [rs : (Vec AnyRenderer)  ctx : DrawCtx  i : int  n : int  row : int] : int
+    (if (>= i n) row
+      (let [labels (open (vec-get rs i) [a v] (legend-labels v))
+            next   (__legend-rows ctx i labels 0 (vec-len labels) row)]
+        (vec-free labels)
+        (__legend-fold rs ctx (+ i 1) n next))))
 
   ;;; __null-ptr? -- is this a null pointer?
   (defn __null-ptr? [p : ptr<void>] : bool
@@ -1411,7 +1427,7 @@
   (defn __plot-frame [canvas : int  opts : PlotOpts  px : int  py : int  pw : int  ph : int
                       data-x-min : float  data-x-max : float  data-y-min : float  data-y-max : float
                       mark-x-axis : bool  mark-y-axis : bool  mark-x-grid : bool  mark-y-grid : bool
-                      has-categories : bool  category-cells : Cells] : ptr<void>
+                      has-categories : bool  categories-on-y : bool  category-cells : Cells] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -1471,6 +1487,7 @@
       int64_t has_point, point_stroke, point_fill, point_sym;
       double point_size, point_alpha;
     } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
     typedef struct PlotDrawCtx {
       void *canvas;
       double bx_min, bx_max, by_min, by_max;
@@ -1479,9 +1496,10 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
-      PlotSwatch *swatches;
+      PlotSeries *swatches;
       int64_t n_swatches;
       int64_t cur_swatch;
+      int64_t cur_series;
     } PlotDrawCtx;
     typedef struct {
       int64_t width; int64_t height;
@@ -1496,10 +1514,13 @@
     double bx_min = 0.0, bx_max = 1.0, by_min = 0.0, by_max = 1.0;
     bool have_bounds = false;
     /* What the renderers ask of the frame, folded by the caller through the
-       Renderer typeclass (`frame-marks`, `categorical?`, `category-labels`). */
+       Renderer typeclass (`frame-marks`, `categorical?`, `categories-on-y?`,
+       `category-labels`). Categories label the x axis, or the y axis for a
+       horizontal histogram; the other axis keeps numeric ticks. */
     bool want_x_axis = mark_x_axis, want_y_axis = mark_y_axis;
     bool want_grid_x = mark_x_grid, want_grid_y = mark_y_grid;
-    int64_t categorical = has_categories ? 1 : 0;
+    bool cat_x = has_categories && !categories_on_y;
+    bool cat_y = has_categories && categories_on_y;
     int64_t categories = (int64_t)(intptr_t)category_cells;
     PlotOpts *po = (PlotOpts *)(intptr_t)opts;
     int legend_pos = po && po->legend_pos ? (int)po->legend_pos : 1;
@@ -1562,7 +1583,7 @@
     int left = px + 64;
     int right = px + pw - 24;
     int top = py + ((po && po->title) ? 44 : 24);
-    int bottom = py + ph - ((po && (po->x_label || categorical)) ? 58 : 44);
+    int bottom = py + ph - ((po && (po->x_label || cat_x)) ? 58 : 44);
     int plot_w = right - left;
     int plot_h = bottom - top;
     if (plot_w < 32 || plot_h < 32) {
@@ -1595,12 +1616,13 @@
     char xbuf[32][64], ybuf[32][64];
     int x_count = 0, y_count = 0;
 
-    if (categorical) {
+    /* Category ticks sit at slot centers, idx + 0.4. Each cell holds a
+       bar (label . height) or a group (label . values), as the draw loop
+       reads them; the label is that pair's head, not the pair -- printing
+       the pair's address as text drew garbage. */
+    if (cat_x) {
       int idx = 0;
       for (Cons *p = (Cons *)(intptr_t)categories; p && idx < 32; p = (Cons *)(intptr_t)p->tail, idx++) {
-        /* Each cell holds a bar (label . height) or a group (label . values),
-           as the draw loop reads them; the label is that pair's head, not the
-           pair -- printing the pair's address as text drew garbage. */
         Cons *bar = (Cons *)(intptr_t)p->head;
         x_ticks[idx] = (double)idx + 0.4;
         x_labels[idx] = bar ? (const char *)(intptr_t)bar->head : "";
@@ -1622,7 +1644,15 @@
         x_count++;
       }
     }
-    {
+    if (cat_y) {
+      int idx = 0;
+      for (Cons *p = (Cons *)(intptr_t)categories; p && idx < 32; p = (Cons *)(intptr_t)p->tail, idx++) {
+        Cons *bar = (Cons *)(intptr_t)p->head;
+        y_ticks[idx] = (double)idx + 0.4;
+        y_labels[idx] = bar ? (const char *)(intptr_t)bar->head : "";
+      }
+      y_count = idx;
+    } else {
       double span = by_max - by_min;
       double raw = span / (double)(tick_n - 1);
       double mag = pow(10.0, floor(log10(raw)));
@@ -1734,13 +1764,15 @@
     dc->swatches = NULL;
     dc->n_swatches = 0;
     dc->cur_swatch = -1;
+    dc->cur_series = 0;
     return dc;
     #undef UNION_POINT
     #undef ISNAN
     ```)
 
-  ;;; __ctx-track-renderers -- give the DrawCtx a legend swatch for each of
-  ;;; `n` renderers, filled in as they draw (see `__ctx-drawing`).
+  ;;; __ctx-track-renderers -- give the DrawCtx legend swatches for each of
+  ;;; `n` renderers, one per series each draws, filled in as they draw (see
+  ;;; `__ctx-drawing` and `__ctx-series`).
   (defn __ctx-track-renderers [ctx : DrawCtx  n : int] : void
     ```c
     #include <stdint.h>
@@ -1753,6 +1785,7 @@
       int64_t has_point, point_stroke, point_fill, point_sym;
       double point_size, point_alpha;
     } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
     typedef struct PlotDrawCtx {
       void *canvas;
       double bx_min, bx_max, by_min, by_max;
@@ -1761,18 +1794,20 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
-      PlotSwatch *swatches;
+      PlotSeries *swatches;
       int64_t n_swatches;
       int64_t cur_swatch;
+      int64_t cur_series;
     } PlotDrawCtx;
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     if (n <= 0 || dc->swatches) return;
-    dc->swatches = (PlotSwatch *)calloc((size_t)n, sizeof(PlotSwatch));
+    dc->swatches = (PlotSeries *)calloc((size_t)n, sizeof(PlotSeries));
     dc->n_swatches = dc->swatches ? n : 0;
     ```)
 
   ;;; __ctx-drawing -- say which renderer (its index in the plot's Vec) is about
-  ;;; to draw, so the style helpers record its swatch; -1 for none.
+  ;;; to draw, so the style helpers record its swatch; -1 for none. It starts
+  ;;; on series 0.
   (defn __ctx-drawing [ctx : DrawCtx  i : int] : void
     ```c
     #include <stdint.h>
@@ -1784,6 +1819,7 @@
       int64_t has_point, point_stroke, point_fill, point_sym;
       double point_size, point_alpha;
     } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
     typedef struct PlotDrawCtx {
       void *canvas;
       double bx_min, bx_max, by_min, by_max;
@@ -1792,12 +1828,123 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
-      PlotSwatch *swatches;
+      PlotSeries *swatches;
       int64_t n_swatches;
       int64_t cur_swatch;
+      int64_t cur_series;
     } PlotDrawCtx;
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     dc->cur_swatch = i;
+    dc->cur_series = 0;
+    ```)
+
+  ;;; __ctx-series -- say the drawing renderer now draws its series `k` (a
+  ;;; stacked histogram's layer k): the style helpers record into that
+  ;;; series' swatch, which is its k-th legend row's.
+  (defn (export-as "plot_ctx_series") __ctx-series [ctx : ptr<void>  k : int] : void
+    ```c
+    #include <stdint.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    dc->cur_series = k < 0 ? 0 : k;
+    ```)
+
+  ;;; __ctx-swatch -- the swatch of the drawing renderer's current series,
+  ;;; added (empty) on first use; NULL when no renderer is drawing.
+  (defn (export-as "plot_ctx_swatch") __ctx-swatch [ctx : ptr<void>] : ptr<void>
+    ```c
+    #include <stdint.h>
+    #include <stdlib.h>
+    #include <string.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    if (!dc->swatches || dc->cur_swatch < 0 || dc->cur_swatch >= dc->n_swatches) return NULL;
+    PlotSeries *se = &dc->swatches[dc->cur_swatch];
+    int64_t k = dc->cur_series;
+    if (k >= se->n) {
+      PlotSwatch *items = (PlotSwatch *)realloc(se->items, (size_t)(k + 1) * sizeof(PlotSwatch));
+      if (!items) return NULL;
+      memset(items + se->n, 0, (size_t)(k + 1 - se->n) * sizeof(PlotSwatch));
+      se->items = items;
+      se->n = k + 1;
+    }
+    return &se->items[k];
+    ```)
+
+  ;;; __ctx-swatch-at -- renderer `i`'s series `k` swatch, or NULL when it
+  ;;; recorded none.
+  (defn (export-as "plot_ctx_swatch_at") __ctx-swatch-at [ctx : ptr<void>  i : int  k : int] : ptr<void>
+    ```c
+    #include <stdint.h>
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
+    if (!dc->swatches || i < 0 || i >= dc->n_swatches) return NULL;
+    PlotSeries *se = &dc->swatches[i];
+    if (k < 0 || k >= se->n) return NULL;
+    return &se->items[k];
     ```)
 
   ;;; __ctx-clip-begin -- clip drawing to the viewport, as the renderers draw.
@@ -1877,13 +2024,13 @@
     plutovg_canvas_set_font_size((plutovg_canvas_t *)dc->canvas, 12.0f);
     ```)
 
-  ;;; __legend-row -- draw legend row `row`: renderer `index`'s swatch and
-  ;;; `label`. The swatch is what the renderer drew with -- its point marker,
+  ;;; __legend-row -- draw legend row `row`: the swatch of renderer `index`'s
+  ;;; series `series`, and `label`. The swatch is what that series drew with -- its point marker,
   ;;; else its fill as a box (edged top and bottom in its line style, as an
   ;;; interval band is), else a stroke of its line style; a renderer that
   ;;; recorded no style gets none. Returns false, drawing nothing, for an
   ;;; empty label or when there is no legend (no font, or `legend-pos` 0).
-  (defn __legend-row [ctx : DrawCtx  row : int  index : int  label : cstr] : bool
+  (defn __legend-row [ctx : DrawCtx  row : int  index : int  series : int  label : cstr] : bool
     ```c
     #include <stdint.h>
     #include <string.h>
@@ -1919,10 +2066,8 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
-      PlotSwatch *swatches;
-      int64_t n_swatches;
-      int64_t cur_swatch;
     } PlotDrawCtx;
+    extern void *plot_ctx_swatch_at(void *, int64_t, int64_t);
     static const double palette[8][3] = {
       {31.0/255.0, 119.0/255.0, 180.0/255.0},
       {214.0/255.0, 39.0/255.0, 40.0/255.0},
@@ -1941,8 +2086,7 @@
     double lx = (legend_pos == 2 || legend_pos == 4) ? dc->left + 12.0 : dc->right - 120.0;
     double ly = (legend_pos == 3 || legend_pos == 4) ? dc->bottom - 16.0 : dc->top + 16.0;
     double y = ly + row * 16.0;
-    PlotSwatch *sw = (dc->swatches && index >= 0 && index < dc->n_swatches)
-                     ? &dc->swatches[index] : NULL;
+    PlotSwatch *sw = (PlotSwatch *)plot_ctx_swatch_at(dc, index, series);
     plutovg_canvas_t *cv = (plutovg_canvas_t *)(intptr_t)canvas;
     if (sw && sw->has_point) {
       double size = sw->point_size > 10.0 ? 10.0 : sw->point_size;
@@ -2002,6 +2146,7 @@
       int64_t has_point, point_stroke, point_fill, point_sym;
       double point_size, point_alpha;
     } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
     typedef struct PlotDrawCtx {
       void *canvas;
       double bx_min, bx_max, by_min, by_max;
@@ -2010,14 +2155,16 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
-      PlotSwatch *swatches;
+      PlotSeries *swatches;
       int64_t n_swatches;
       int64_t cur_swatch;
+      int64_t cur_series;
     } PlotDrawCtx;
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     if (!dc) return;
     plutovg_canvas_restore(dc->canvas);
     if (dc->font) plutovg_font_face_destroy(dc->font);
+    for (int64_t i = 0; i < dc->n_swatches; i++) free(dc->swatches[i].items);
     free(dc->swatches);
     free(dc);
     ```)
@@ -2049,6 +2196,9 @@
           bb     (renderers-bbox renderers)
           marks  (__marks-fold renderers 0 n (no-frame-marks))
           ci     (__first-categorical renderers 0 n)
+          on-y   (if (>= ci 0)
+                   (open (vec-get renderers ci) [a v] (categories-on-y? v))
+                   false)
           labels (if (>= ci 0)
                    (open (vec-get renderers ci) [a v] (category-labels v))
                    (:: (vec-new) (Vec cstr)))
@@ -2056,7 +2206,7 @@
           raw    (__plot-frame canvas opts px py pw ph
                                (.x-min bb) (.x-max bb) (.y-min bb) (.y-max bb)
                                (.x-axis marks) (.y-axis marks) (.x-grid marks) (.y-grid marks)
-                               (>= ci 0) cells)]
+                               (>= ci 0) on-y cells)]
       ;; The frame has drawn the category ticks; their cells and labels go.
       (__free-cells cells 1)
       (vec-free labels)

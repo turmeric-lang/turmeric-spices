@@ -36,9 +36,11 @@
   (`__renderer-bbox`, C symbol `plot_renderer_bbox`) is gone, and
   `renderer-bbox` takes an `AnyRenderer`.
 - Drawing is a `Renderer` method too: `draw [r ctx : DrawCtx]` paints one
-  renderer through the plot's draw context, and four methods with defaults
-  -- `legend-label`, `frame-marks`, `categorical?` and `category-labels` --
-  tell the frame what to add. The monolithic draw `switch` (`__draw-renderers`, C symbol
+  renderer through the plot's draw context, and six methods with defaults
+  -- `legend-label`, `legend-labels`, `frame-marks`, `categorical?`,
+  `categories-on-y?` and `category-labels` -- tell the frame what to add.
+  `legend-labels` lists a renderer's legend rows (by default its one
+  `legend-label`); `stacked-histogram` overrides it with its layer names. The monolithic draw `switch` (`__draw-renderers`, C symbol
   `plot_draw_renderers`) is split into one inline-C draw per kind, beside
   its type, and the frame worker into the frame pass (`__plot-frame`), the
   draws and the legend. The slot-bag renderer (`__make-renderer`,
@@ -100,6 +102,17 @@
   levels now span the range f takes on the sampled grid -- level i of n at
   min + (max - min) * (i + 1) / (n + 1) -- and a field with no finite value
   draws none.
+- `stacked-histogram`'s layer names never reached the legend; each layer now
+  has a row, swatched in that layer's fill. And a layer took a new auto color
+  in every group (an auto fill resolved per stacked cell), so one layer was
+  blue in the first group and red in the next: each layer now resolves its
+  fill once. `discrete-histogram` and `rectangles` had the same per-bar
+  resolution, so an auto-colored histogram's bars cycled through the
+  palette; their bars now share their one fill.
+- A horizontal `discrete-histogram` or `stacked-histogram` labelled its
+  categories along the x axis, where the values run, so the labels sat
+  under the wrong ticks; they label the y axis now, and the x axis keeps
+  numeric ticks.
 - A legend row's swatch was a line in palette color `row % 8`, whatever its
   renderer drew with, so it mismatched any renderer with a named color, or
   after an unlabelled renderer took an auto color. Each renderer now records
