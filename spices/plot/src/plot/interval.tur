@@ -8,21 +8,23 @@
   (export function-interval lines-interval parametric-interval polar-interval
           FunctionIntervalR LinesIntervalR ParametricIntervalR PolarIntervalR)
 
-  (import plot/core  :refer [BBox bbox-from-raw bbox-empty-box bbox-union any-renderer
-                             DrawCtx __point-list-bbox])
+  (import plot/core  :refer [BBox bbox-empty-box bbox-union any-renderer DrawCtx
+                             __bbox-of-points])
   (import plot/style :refer [LineStyle FillStyle])
+  (import plot/data  :refer [Point Cells __points->cells __free-cells])
 
   ;;; FunctionIntervalR -- the band between y = f1(x) and y = f2(x).
   (defstruct FunctionIntervalR :copy [f1 : (fn [float] float)  f2 : (fn [float] float)
                                       x-min : float  x-max : float  samples : int
                                       fill : FillStyle  style : LineStyle  label : cstr])
 
-  ;;; LinesIntervalR -- the band between two point lists sharing x coordinates.
-  (defstruct LinesIntervalR :copy [lower : int  upper : int
+  ;;; LinesIntervalR -- the band between two point lists: it runs along
+  ;;; `lower`'s points and back along `upper`'s y values at the same x.
+  (defstruct LinesIntervalR :copy [lower : (Vec Point)  upper : (Vec Point)
                                    fill : FillStyle  style : LineStyle  label : cstr])
 
-  ;;; ParametricIntervalR -- the band between two parametric curves f(t) = (cons x y).
-  (defstruct ParametricIntervalR :copy [f1 : (fn [float] int)  f2 : (fn [float] int)
+  ;;; ParametricIntervalR -- the band between two parametric curves, Points f(t).
+  (defstruct ParametricIntervalR :copy [f1 : (fn [float] Point)  f2 : (fn [float] Point)
                                         t-min : float  t-max : float  samples : int
                                         fill : FillStyle  style : LineStyle  label : cstr])
 
@@ -31,8 +33,8 @@
                                    theta-min : float  theta-max : float  samples : int
                                    fill : FillStyle  style : LineStyle  label : cstr])
 
-  ;;; __draw-lines-interval -- fill (then outline) the band between two point lists.
-  (defn __draw-lines-interval [ctx : DrawCtx  lower : int  upper : int  fill : FillStyle  style : LineStyle] : void
+  ;;; __draw-lines-interval -- fill (then outline) the band between two lowered point lists.
+  (defn __draw-lines-interval [ctx : DrawCtx  lower : Cells  upper : Cells  fill : FillStyle  style : LineStyle] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -102,7 +104,7 @@
     ```)
 
   ;;; __draw-curve-interval -- fill (then outline) the band between two sampled
-  ;;; curves: `mode` 40 y = f(x), 42 points f(t), 43 radii f(theta). The
+  ;;; curves: `mode` 40 y = f(x), 42 Points f(t), 43 radii f(theta). The
   ;;; three interval kinds' draws share it; pinned for their inline C. `fill`
   ;;; and `style` arrive as words because a C caller declares this prototype
   ;;; itself, and the C type an opaque lowers to is the compiler's choice.
@@ -144,6 +146,7 @@
     #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
     extern void plot_ctx_map(void *, double, double, void *, void *);
     #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    extern void plot_eval_point(int64_t, double, void *, void *);
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     int64_t canvas = (int64_t)(intptr_t)dc->canvas;
     do {
@@ -160,9 +163,11 @@
           ya[i] = TUR_APPLY1_T(double, double, f1, t);
           yb[i] = TUR_APPLY1_T(double, double, f2, t);
         } else if (mode == 42) {
-          Cons *pa = (Cons *)(intptr_t)TUR_APPLY1_T(int64_t, double, f1, t);
-          Cons *pb = (Cons *)(intptr_t)TUR_APPLY1_T(int64_t, double, f2, t);
-          xs[i] = BITS_DBL(pa->head); ya[i] = BITS_DBL(pa->tail); yb[i] = BITS_DBL(pb->tail);
+          double pax = 0.0, pay = 0.0, pbx = 0.0, pby = 0.0;
+          plot_eval_point(f1, t, &pax, &pay);
+          plot_eval_point(f2, t, &pbx, &pby);
+          (void)pbx;
+          xs[i] = pax; ya[i] = pay; yb[i] = pby;
         } else {
           double ra = TUR_APPLY1_T(double, double, f1, t);
           double rb = TUR_APPLY1_T(double, double, f2, t);
@@ -221,7 +226,7 @@
     ```)
 
   ;;; __draw-parametric-interval -- the parametric-interval band, through __draw-curve-interval.
-  (defn __draw-parametric-interval [ctx : DrawCtx  ^fat f1 : (fn [float] int)  ^fat f2 : (fn [float] int)
+  (defn __draw-parametric-interval [ctx : DrawCtx  ^fat f1 : (fn [float] Point)  ^fat f2 : (fn [float] Point)
                   t-min : float  t-max : float  samples : int  fill : FillStyle  style : LineStyle] : void
     ```c
     #include <stddef.h>
@@ -281,9 +286,13 @@
     (legend-label [r] (.label r)))
 
   (definstance Renderer [LinesIntervalR]
-    (bounds [r] (bbox-union (bbox-from-raw (__point-list-bbox (.lower r)))
-                            (bbox-from-raw (__point-list-bbox (.upper r)))))
-    (draw [r ctx] (__draw-lines-interval ctx (.lower r) (.upper r) (.fill r) (.style r)))
+    (bounds [r] (bbox-union (__bbox-of-points (.lower r)) (__bbox-of-points (.upper r))))
+    (draw [r ctx]
+      (let [lo (__points->cells (.lower r))
+            hi (__points->cells (.upper r))]
+        (__draw-lines-interval ctx lo hi (.fill r) (.style r))
+        (__free-cells lo 1)
+        (__free-cells hi 1)))
     (legend-label [r] (.label r)))
 
   (definstance Renderer [ParametricIntervalR]
@@ -323,8 +332,8 @@
   ;;; lines-interval -- shade between two sampled line lists.
   ;;;
   ;;; Parameters:
-  ;;;   vs1   -- cons list of (cons x y) points on one edge
-  ;;;   vs2   -- cons list of (cons x y) points on the other, same x order
+  ;;;   vs1   -- the points along one edge
+  ;;;   vs2   -- the points along the other, same x order (their y is used)
   ;;;   fill  -- the FillStyle of the band
   ;;;   style -- the LineStyle of its outline
   ;;;   label -- legend text ("" for none)
@@ -334,13 +343,13 @@
   ;;;
   ;;; Example:
   ;;;   (lines-interval lo-pts hi-pts (default-fill-style) (default-line-style) "ci")
-  (defn lines-interval [vs1 : int  vs2 : int  fill : FillStyle  style : LineStyle  label : cstr] : AnyRenderer
+  (defn lines-interval [vs1 : (Vec Point)  vs2 : (Vec Point)  fill : FillStyle  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct LinesIntervalR vs1 vs2 fill style label)))
 
   ;;; parametric-interval -- shade between two parametric curves.
   ;;;
   ;;; Parameters:
-  ;;;   f1      -- one edge, a (fn [float] int) returning a (cons x y) point
+  ;;;   f1      -- one edge, a (fn [float] Point)
   ;;;   f2      -- the other edge, likewise
   ;;;   t-min   -- start of the parameter range
   ;;;   t-max   -- end of the parameter range
@@ -354,7 +363,7 @@
   ;;;
   ;;; Example:
   ;;;   (parametric-interval inner outer 0.0 1.0 72 (default-fill-style) (default-line-style) "")
-  (defn parametric-interval [^fat f1 : (fn [float] int)  ^fat f2 : (fn [float] int)
+  (defn parametric-interval [^fat f1 : (fn [float] Point)  ^fat f2 : (fn [float] Point)
                              t-min : float  t-max : float  samples : int
                              fill : FillStyle  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct ParametricIntervalR f1 f2 t-min t-max samples fill style label)))

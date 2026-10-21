@@ -19,6 +19,8 @@
           __canvas-create __canvas-destroy
           __plot-sample-adaptive
           BBox renderer-bbox renderers-bbox bbox-empty? bbox-from-raw
+          __bbox-of-points __bbox-of-error-bars __bbox-of-arrows __bbox-of-rects
+          __bbox-of-bars __bbox-of-groups
           bbox-union bbox-empty-box point-bbox hint-bbox
           __point-list-bbox __error-bars-bbox __arrows-bbox __rects-bbox
           __discrete-hist-bbox __stacked-hist-bbox
@@ -28,6 +30,10 @@
           __pixel-is-background? __count-non-background)
 
   (import plot/style :refer [PlotOpts plot-opts-width plot-opts-height])
+  (import plot/data  :refer [Point ErrorBar Arrow Rect Bar Group Cells
+                             __points->cells __error-bars->cells __arrows->cells __rects->cells
+                             __bars->cells __groups->cells __labels->cells
+                             __free-cells __free-groups])
 
   ;; Result helpers: route through the typed preamble builders /
   ;; inspectors (tur_ok_int / tur_err_int / tur_is_ok / tur_ok_value /
@@ -255,8 +261,9 @@
   ;;; Strokes the resulting polyline onto the context's canvas, mapped through
   ;;; its data bounds and viewport. The caller is responsible for installing
   ;;; the line style (color / width / dash / alpha) before invoking. `mode`
-  ;;; says how to evaluate the curve: 21 y = f(x), 22 (x, y) = f(t) as a cons
-  ;;; point, 23 radius = f(theta), 24 x = f(y); any other mode is a no-op.
+  ;;; says how to evaluate the curve: 21 y = f(x), 22 the Point f(t) (through
+  ;;; `plot_eval_point`), 23 radius = f(theta), 24 x = f(y); any other mode is
+  ;;; a no-op.
   ;;;
   ;;; Parameters:
   ;;;   ctx             -- the plot's draw context (a DrawCtx, as a pointer)
@@ -288,7 +295,6 @@
     extern void plutovg_canvas_stroke(void* canvas);
     #endif
 
-    typedef struct { int64_t head; int64_t tail; } Cons;
     typedef struct PlotDrawCtx {
       void *canvas;
       double bx_min, bx_max, by_min, by_max;
@@ -299,11 +305,11 @@
       int64_t auto_color;
     } PlotDrawCtx;
 
-    #define ADAPTIVE_BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
     #define ADAPTIVE_ISNAN(v) ((v) != (v))
 
     enum { RK_FUNCTION_K = 21, RK_PARAMETRIC_K = 22, RK_POLAR_K = 23, RK_INVERSE_K = 24 };
 
+    extern void plot_eval_point(int64_t, double, void *, void *);
     PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
     if (!dc || !dc->canvas) return;
     void *cv = dc->canvas;
@@ -332,9 +338,7 @@
       if (mode == RK_FUNCTION_K) { __x = __t; __y = TUR_APPLY1_T(double, double, curve, __t); } \
       else if (mode == RK_INVERSE_K) { __y = __t; __x = TUR_APPLY1_T(double, double, curve, __t); } \
       else if (mode == RK_PARAMETRIC_K) { \
-        Cons *__pair = (Cons *)(intptr_t)TUR_APPLY1_T(int64_t, double, curve, __t); \
-        if (__pair) { __x = ADAPTIVE_BITS_DBL(__pair->head); __y = ADAPTIVE_BITS_DBL(__pair->tail); } \
-        else { __x = __y = 0.0/0.0; } \
+        plot_eval_point(curve, __t, &__x, &__y); \
       } else { \
         double __radius = TUR_APPLY1_T(double, double, curve, __t); \
         __x = __radius * cos(__t); __y = __radius * sin(__t); \
@@ -419,9 +423,32 @@
 
     #undef EVAL_AT
     #undef EMIT
-    #undef ADAPTIVE_BITS_DBL
     #undef ADAPTIVE_ISNAN
     ```)
+
+  ;;; __store-f64 -- internal: write a double through a C out-pointer.
+  (defn __store-f64 [p : ptr<void>  v : float] : void
+    ```c *(double *)p = v; ```)
+
+  ;;; __eval-point -- evaluate a curve callback for C: write f(t)'s x and y
+  ;;; through `x-out` / `y-out` (double *). Pinned as `plot_eval_point` so the
+  ;;; sampler and the parametric bands can call a Point-returning closure
+  ;;; without naming the struct's C type.
+  (defn (export-as "plot_eval_point")
+        __eval-point [^fat f : (fn [float] Point)  t : float  x-out : ptr<void>  y-out : ptr<void>] : void
+    (let [p (f t)]
+      (__store-f64 x-out (.x p))
+      (__store-f64 y-out (.y p))))
+
+  ;;; __eval-vector -- evaluate a vector-field callback for C: write f(x, y)'s
+  ;;; components through `dx-out` / `dy-out` (double *). Pinned as
+  ;;; `plot_eval_vector`.
+  (defn (export-as "plot_eval_vector")
+        __eval-vector [^fat f : (fn [float float] Point)  x : float  y : float
+                       dx-out : ptr<void>  dy-out : ptr<void>] : void
+    (let [p (f x y)]
+      (__store-f64 dx-out (.x p))
+      (__store-f64 dy-out (.y p))))
 
   ;;; data->viewport -- map data coordinates to viewport coordinates.
   (defn data->viewport [x : float y : float bx-min : float bx-max : float
@@ -531,16 +558,16 @@
                         (if (< y1 y0) y1 y0) (if (> y1 y0) y1 y0))))
 
   ;; ---------------------------------------------------------------------------
-  ;; Bounds of the cons-shaped payloads. Each helper walks one payload shape
-  ;; and returns the raw { x0,x1,y0,y1; valid } carrier (`bbox-from-raw` packs
-  ;; it); NaN points are skipped. These were the arms of the draw pass's old
+  ;; Bounds of the lowered payloads. Each helper walks one payload shape's
+  ;; Cells (see plot/data) and returns the raw { x0,x1,y0,y1; valid } carrier
+  ;; (`bbox-from-raw` packs it); NaN points are skipped. These were the arms of the draw pass's old
   ;; per-kind bounds `switch`, moved verbatim -- a kind's `bounds` method now
   ;; picks its helper by type instead of by a `kind` tag.
   ;; ---------------------------------------------------------------------------
 
   ;;; __point-list-bbox -- bounding box of a cons-list of (cons x y) points: the
   ;;; rule shared by the lines / points / lines-interval kinds.
-  (defn (export-as "plot_point_list_bbox") __point-list-bbox [points : int] : ptr<void>
+  (defn (export-as "plot_point_list_bbox") __point-list-bbox [points : Cells] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -568,7 +595,7 @@
 
   ;;; __error-bars-bbox -- bounding box of a cons-list of (x . (y . h)) error
   ;;; bars: each bar spans y +/- h, or x +/- h when `horizontal`.
-  (defn __error-bars-bbox [bars : int  horizontal : bool] : ptr<void>
+  (defn __error-bars-bbox [bars : Cells  horizontal : bool] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -615,7 +642,7 @@
   ;; The draw pass used to bound arrows with the point-list rule, reading each
   ;; arrow's second cell -- a pointer -- as its y coordinate, so the plot's
   ;; y range came out of the heap layout and changed from run to run.
-  (defn __arrows-bbox [arrows : int] : ptr<void>
+  (defn __arrows-bbox [arrows : Cells] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -657,7 +684,7 @@
 
   ;;; __rects-bbox -- bounding box of a cons-list of (x0 . (x1 . (y0 . y1)))
   ;;; rectangles: the rectangles / area-histogram rule.
-  (defn __rects-bbox [rects : int] : ptr<void>
+  (defn __rects-bbox [rects : Cells] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -702,7 +729,7 @@
   ;;; __discrete-hist-bbox -- bounding box of a cons-list of (label . height)
   ;;; bars laid out at category slots 0, 1, 2, ... (each 0.8 wide), rotated
   ;;; onto the y axis when `horizontal`.
-  (defn __discrete-hist-bbox [bars : int  horizontal : bool] : ptr<void>
+  (defn __discrete-hist-bbox [bars : Cells  horizontal : bool] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -742,7 +769,7 @@
 
   ;;; __stacked-hist-bbox -- bounding box of a cons-list of (label . values)
   ;;; groups: each slot is as tall as the sum of its stacked values.
-  (defn __stacked-hist-bbox [groups : int  horizontal : bool] : ptr<void>
+  (defn __stacked-hist-bbox [groups : Cells  horizontal : bool] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -781,6 +808,52 @@
     #undef ISNAN
     ```)
 
+  ;; The typed payloads' bounds: lower the Vec to Cells, run the shape's
+  ;; helper above, free the Cells.
+
+  ;;; __bbox-of-points -- the box of a (Vec Point), NaN points skipped.
+  (defn __bbox-of-points [v : (Vec Point)] : BBox
+    (let [cells (__points->cells v)
+          bb    (bbox-from-raw (__point-list-bbox cells))]
+      (__free-cells cells 1)
+      bb))
+
+  ;;; __bbox-of-error-bars -- the box spanning every bar's y +/- err (x +/- err
+  ;;; when `horizontal`).
+  (defn __bbox-of-error-bars [v : (Vec ErrorBar)  horizontal : bool] : BBox
+    (let [cells (__error-bars->cells v)
+          bb    (bbox-from-raw (__error-bars-bbox cells horizontal))]
+      (__free-cells cells 2)
+      bb))
+
+  ;;; __bbox-of-arrows -- the box spanning both ends of every arrow.
+  (defn __bbox-of-arrows [v : (Vec Arrow)] : BBox
+    (let [cells (__arrows->cells v)
+          bb    (bbox-from-raw (__arrows-bbox cells))]
+      (__free-cells cells 3)
+      bb))
+
+  ;;; __bbox-of-rects -- the box spanning every rectangle.
+  (defn __bbox-of-rects [v : (Vec Rect)] : BBox
+    (let [cells (__rects->cells v)
+          bb    (bbox-from-raw (__rects-bbox cells))]
+      (__free-cells cells 3)
+      bb))
+
+  ;;; __bbox-of-bars -- the box of a discrete histogram's category slots.
+  (defn __bbox-of-bars [v : (Vec Bar)  horizontal : bool] : BBox
+    (let [cells (__bars->cells v)
+          bb    (bbox-from-raw (__discrete-hist-bbox cells horizontal))]
+      (__free-cells cells 1)
+      bb))
+
+  ;;; __bbox-of-groups -- the box of a stacked histogram's category slots.
+  (defn __bbox-of-groups [v : (Vec Group)  horizontal : bool] : BBox
+    (let [cells (__groups->cells v)
+          bb    (bbox-from-raw (__stacked-hist-bbox cells horizontal))]
+      (__free-groups cells)
+      bb))
+
   ;; ===========================================================================
   ;; Renderer typeclass -- U2 renderer-kind collapse.
   ;;
@@ -793,7 +866,7 @@
   ;;
   ;; A plot is laid out over the union of the renderers' `bounds`, with the
   ;; axes and grids their `frame-marks` ask for and the category ticks of the
-  ;; first renderer with `categories`; then each renderer's `draw` paints it,
+  ;; first `categorical?` renderer; then each renderer's `draw` paints it,
   ;; in order, and the legend lists every non-empty `legend-label`.
   ;; ===========================================================================
 
@@ -827,8 +900,10 @@
   ;;;   draw         -- paint the renderer through the plot's DrawCtx
   ;;;   legend-label -- its legend entry; "" (the default) for none
   ;;;   frame-marks  -- the axes / grids it asks the frame for; none by default
-  ;;;   categories   -- a cons list of (label . _) cells naming the x
-  ;;;                   categories, for a categorical renderer; none by default
+  ;;;   categorical? -- whether it lays the x axis out as categories; false
+  ;;;                   by default
+  ;;;   category-labels -- a categorical renderer's x tick labels, fresh (the
+  ;;;                   caller frees the Vec); empty by default
   ;;;
   ;;; Example:
   ;;;   (bounds (make-struct LinesR pts (default-line-style) "l"))
@@ -839,7 +914,8 @@
     (draw [r : a  ctx : DrawCtx] : void)
     (legend-label [r : a] : cstr "")
     (frame-marks [r : a] : FrameMarks (no-frame-marks))
-    (categories [r : a] : (Option int) (none)))
+    (categorical? [r : a] : bool false)
+    (category-labels [r : a] : (Vec cstr) (:: (vec-new) (Vec cstr))))
 
   ;;; AnyRenderer -- a value of any `Renderer` kind, boxed with its instance.
   ;;; Every public constructor (`lines`, `function`, `axes`, ...) returns one,
@@ -1057,11 +1133,13 @@
       (__marks-fold rs (+ i 1) n
                     (frame-marks-union acc (open (vec-get rs i) [a v] (frame-marks v))))))
 
-  ;;; __first-categories -- the `categories` of the first of rs[i..n) that has any.
-  (defn __first-categories [rs : (Vec AnyRenderer)  i : int  n : int] : (Option int)
-    (if (>= i n) (none)
-      (let [c (open (vec-get rs i) [a v] (categories v))]
-        (if (some? c) c (__first-categories rs (+ i 1) n)))))
+  ;;; __first-categorical -- the index of the first `categorical?` renderer of
+  ;;; rs[i..n), or -1.
+  (defn __first-categorical [rs : (Vec AnyRenderer)  i : int  n : int] : int
+    (if (>= i n) -1
+      (if (open (vec-get rs i) [a v] (categorical? v))
+        i
+        (__first-categorical rs (+ i 1) n))))
 
   ;;; __draw-fold -- `draw` each of rs[i..n), in order.
   (defn __draw-fold [rs : (Vec AnyRenderer)  ctx : DrawCtx  i : int  n : int] : int
@@ -1117,14 +1195,15 @@
 
   ;;; __plot-frame -- lay out and paint one plot's frame: background, border,
   ;;; ticks, grid, axes, title and axis labels, over the data extent the caller
-  ;;; folded from the renderers' `bounds` (all NaN when nothing constrains it)
-  ;;; and the marks and categories they asked for. Returns the DrawCtx (as a
+  ;;; folded from the renderers' `bounds` (all NaN when nothing constrains it),
+  ;;; the marks they asked for, and the category labels as ((label . 0) ...)
+  ;;; Cells. Returns the DrawCtx (as a
   ;;; pointer) the renderers then draw through, or NULL when the viewport is
   ;;; too small to hold a plot.
   (defn __plot-frame [canvas : int  opts : PlotOpts  px : int  py : int  pw : int  ph : int
                       data-x-min : float  data-x-max : float  data-y-min : float  data-y-max : float
                       mark-x-axis : bool  mark-y-axis : bool  mark-x-grid : bool  mark-y-grid : bool
-                      has-categories : bool  category-list : int] : ptr<void>
+                      has-categories : bool  category-cells : Cells] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -1198,11 +1277,11 @@
     double bx_min = 0.0, bx_max = 1.0, by_min = 0.0, by_max = 1.0;
     bool have_bounds = false;
     /* What the renderers ask of the frame, folded by the caller through the
-       Renderer typeclass (`frame-marks`, `categories`). */
+       Renderer typeclass (`frame-marks`, `categorical?`, `category-labels`). */
     bool want_x_axis = mark_x_axis, want_y_axis = mark_y_axis;
     bool want_grid_x = mark_x_grid, want_grid_y = mark_y_grid;
     int64_t categorical = has_categories ? 1 : 0;
-    int64_t categories = category_list;
+    int64_t categories = (int64_t)(intptr_t)category_cells;
     PlotOpts *po = (PlotOpts *)(intptr_t)opts;
     int legend_pos = po && po->legend_pos ? (int)po->legend_pos : 1;
     int font_ok = 0;
@@ -1601,8 +1680,10 @@
   ;;;
   ;;; The data extent is the union of the renderers' `bounds` (padded 5%, and
   ;;; overridden per side by `opts`); the frame draws the axes and grids their
-  ;;; `frame-marks` ask for; then each renderer's `draw` paints it, in order,
-  ;;; clipped to the viewport, and the legend lists their `legend-label`s.
+  ;;; `frame-marks` ask for, with category ticks from the first
+  ;;; `categorical?` renderer's `category-labels`; then each renderer's `draw`
+  ;;; paints it, in order, clipped to the viewport, and the legend lists their
+  ;;; `legend-label`s.
   ;;;
   ;;; Parameters:
   ;;;   canvas    -- the plutovg canvas to draw into
@@ -1618,14 +1699,21 @@
   ;;;   (plot-into-canvas canvas (vec-of (axes) (lines pts ls "")) opts 0 0 600 450)
   (defn plot-into-canvas [canvas : int  renderers : (Vec AnyRenderer)  opts : PlotOpts
                           px : int  py : int  pw : int  ph : int] : ptr<void>
-    (let [n     (vec-len renderers)
-          bb    (renderers-bbox renderers)
-          marks (__marks-fold renderers 0 n (no-frame-marks))
-          cats  (__first-categories renderers 0 n)
-          raw   (__plot-frame canvas opts px py pw ph
-                              (.x-min bb) (.x-max bb) (.y-min bb) (.y-max bb)
-                              (.x-axis marks) (.y-axis marks) (.x-grid marks) (.y-grid marks)
-                              (some? cats) (unwrap-or cats 0))]
+    (let [n      (vec-len renderers)
+          bb     (renderers-bbox renderers)
+          marks  (__marks-fold renderers 0 n (no-frame-marks))
+          ci     (__first-categorical renderers 0 n)
+          labels (if (>= ci 0)
+                   (open (vec-get renderers ci) [a v] (category-labels v))
+                   (:: (vec-new) (Vec cstr)))
+          cells  (__labels->cells labels)
+          raw    (__plot-frame canvas opts px py pw ph
+                               (.x-min bb) (.x-max bb) (.y-min bb) (.y-max bb)
+                               (.x-axis marks) (.y-axis marks) (.x-grid marks) (.y-grid marks)
+                               (>= ci 0) cells)]
+      ;; The frame has drawn the category ticks; their cells and labels go.
+      (__free-cells cells 1)
+      (vec-free labels)
       (if (__null-ptr? raw)
         (__err 1)
         (let [ctx (:: raw DrawCtx)]

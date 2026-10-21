@@ -10,8 +10,8 @@
 #
 # What they guard: a renderer is typed. Only a type with a `Renderer`
 # instance boxes as an AnyRenderer, `plot` takes nothing else, a style must
-# be the kind of style the renderer draws with, and a curve callback must
-# have the kind's function type.
+# be the kind of style the renderer draws with, data must be the kind's
+# record type, and a curve callback must have the kind's function type.
 #
 # scripts/run-shard.sh runs this as the spice's "errors" stage.
 #
@@ -84,6 +84,10 @@ expect_reject int-handle-vec.tur TUR-E0001 \
 expect_reject wrong-style-kind.tur TUR-E0001 \
   "function 'lines' arg 2: expected LineStyle, got FillStyle" \
   'lines rejects a FillStyle where its LineStyle is due'
+
+expect_reject wrong-data-record.tur TUR-E0001 \
+  "function 'lines' arg 1: expected (Vec Point), got (Vec Rect)" \
+  'lines rejects rectangles where its points are due'
 
 expect_reject wrong-callback-type.tur TUR-E0001 \
   "function 'function' arg 1: expected a function of type (fn [float] : float), got (fn [int] : int)" \

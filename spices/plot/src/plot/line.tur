@@ -14,19 +14,19 @@
   (export function lines parametric polar inverse density
           LinesR FunctionR ParametricR PolarR InverseR DensityR)
 
-  (import plot/core  :refer [BBox bbox-from-raw bbox-empty-box __point-list-bbox any-renderer
-                             DrawCtx])
+  (import plot/core  :refer [BBox bbox-empty-box __bbox-of-points any-renderer DrawCtx])
   (import plot/style :refer [LineStyle])
+  (import plot/data  :refer [Point Cells __points->cells __values->cells __free-cells])
 
-  ;;; LinesR -- a polyline through a cons list of (cons x y) points.
-  (defstruct LinesR :copy [points : int  style : LineStyle  label : cstr])
+  ;;; LinesR -- a polyline through its points, in order.
+  (defstruct LinesR :copy [points : (Vec Point)  style : LineStyle  label : cstr])
 
   ;;; FunctionR -- y = f(x), sampled over [x-min, x-max].
   (defstruct FunctionR :copy [f : (fn [float] float)  x-min : float  x-max : float
                               samples : int  style : LineStyle  label : cstr])
 
-  ;;; ParametricR -- the point f(t) = (cons x y), sampled over [t-min, t-max].
-  (defstruct ParametricR :copy [f : (fn [float] int)  t-min : float  t-max : float
+  ;;; ParametricR -- the point f(t), sampled over [t-min, t-max].
+  (defstruct ParametricR :copy [f : (fn [float] Point)  t-min : float  t-max : float
                                 samples : int  style : LineStyle  label : cstr])
 
   ;;; PolarR -- radius = f(theta), sampled over [theta-min, theta-max].
@@ -37,17 +37,17 @@
   (defstruct InverseR :copy [f : (fn [float] float)  y-min : float  y-max : float
                              samples : int  style : LineStyle  label : cstr])
 
-  ;;; DensityR -- a Gaussian kernel density estimate of a cons list of samples;
-  ;;; a `bandwidth` of 0 picks Silverman's rule.
-  (defstruct DensityR :copy [values : int  bandwidth : float  samples : int
+  ;;; DensityR -- a Gaussian kernel density estimate of its sample values; a
+  ;;; `bandwidth` of 0 picks Silverman's rule.
+  (defstruct DensityR :copy [values : (Vec float)  bandwidth : float  samples : int
                              style : LineStyle  label : cstr])
 
   ;; Drawing: a polyline is stroked as given (broken at NaN); the sampled
   ;; curves go through plot/core's adaptive sampler; a density is its kernel
   ;; estimate evaluated across the plot's x extent.
 
-  ;;; __draw-lines -- stroke a polyline through (cons x y) points, breaking at NaN.
-  (defn __draw-lines [ctx : DrawCtx  points : int  style : LineStyle] : void
+  ;;; __draw-lines -- stroke a polyline through lowered points, breaking at NaN.
+  (defn __draw-lines [ctx : DrawCtx  points : Cells  style : LineStyle] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -128,8 +128,8 @@
     #undef SET_LINE_STYLE
     ```)
 
-  ;;; __draw-parametric -- stroke the point f(t) = (cons x y) through the adaptive sampler.
-  (defn __draw-parametric [ctx : DrawCtx  ^fat f : (fn [float] int)  t-min : float  t-max : float
+  ;;; __draw-parametric -- stroke the Point f(t) through the adaptive sampler.
+  (defn __draw-parametric [ctx : DrawCtx  ^fat f : (fn [float] Point)  t-min : float  t-max : float
                   samples : int  style : LineStyle] : void
     ```c
     #include <stddef.h>
@@ -216,7 +216,7 @@
     ```)
 
   ;;; __draw-density -- stroke a Gaussian KDE of `values` across the x extent.
-  (defn __draw-density [ctx : DrawCtx  values : int  bandwidth : float
+  (defn __draw-density [ctx : DrawCtx  values : Cells  bandwidth : float
                       samples : int  style : LineStyle] : void
     ```c
     #include <stddef.h>
@@ -292,8 +292,11 @@
   ;; those constrain nothing -- they are drawn over the extent the other
   ;; renderers (or `plot-opts`) establish.
   (definstance Renderer [LinesR]
-    (bounds [r] (bbox-from-raw (__point-list-bbox (.points r))))
-    (draw [r ctx] (__draw-lines ctx (.points r) (.style r)))
+    (bounds [r] (__bbox-of-points (.points r)))
+    (draw [r ctx]
+      (let [cells (__points->cells (.points r))]
+        (__draw-lines ctx cells (.style r))
+        (__free-cells cells 1)))
     (legend-label [r] (.label r)))
 
   (definstance Renderer [FunctionR]
@@ -318,7 +321,10 @@
 
   (definstance Renderer [DensityR]
     (bounds [r] (bbox-empty-box))
-    (draw [r ctx] (__draw-density ctx (.values r) (.bandwidth r) (.samples r) (.style r)))
+    (draw [r ctx]
+      (let [cells (__values->cells (.values r))]
+        (__draw-density ctx cells (.bandwidth r) (.samples r) (.style r))
+        (__free-cells cells 0)))
     (legend-label [r] (.label r)))
 
   ;;; function -- sample y=f(x) over [x-min, x-max].
@@ -344,13 +350,13 @@
                   samples : int  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct FunctionR f x-min x-max samples style label)))
 
-  ;;; lines -- draw a polyline through a cons list of (cons x y) points.
+  ;;; lines -- draw a polyline through `vs`, in order.
   ;;;
   ;;; Pre-sampled input; the renderer plots the points as given and breaks the
-  ;;; polyline on NaN coordinates so callers can encode explicit gaps.
+  ;;; polyline at a point with a NaN coordinate so callers can encode gaps.
   ;;;
   ;;; Parameters:
-  ;;;   vs    -- cons list of (cons x y) points (coordinates as double bits)
+  ;;;   vs    -- the points
   ;;;   style -- the LineStyle to stroke with
   ;;;   label -- legend text ("" for none)
   ;;;
@@ -358,17 +364,17 @@
   ;;;   A LinesR boxed as an AnyRenderer.
   ;;;
   ;;; Example:
-  ;;;   (lines pts (default-line-style) "data")
-  (defn lines [vs : int  style : LineStyle  label : cstr] : AnyRenderer
+  ;;;   (lines (vec-of (Point 0.0 0.0) (Point 1.0 2.0)) (default-line-style) "data")
+  (defn lines [vs : (Vec Point)  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct LinesR vs style label)))
 
-  ;;; parametric -- sample f(t) -> (cons x y).
+  ;;; parametric -- sample the Point f(t).
   ;;;
   ;;; `samples` is the uniform baseline; segments are adaptively subdivided
   ;;; when they turn sharply or cross NaN boundaries.
   ;;;
   ;;; Parameters:
-  ;;;   f       -- the curve, a (fn [float] int) returning a (cons x y) point
+  ;;;   f       -- the curve, a (fn [float] Point)
   ;;;   t-min   -- start of the parameter range
   ;;;   t-max   -- end of the parameter range
   ;;;   samples -- uniform baseline sample count
@@ -379,8 +385,9 @@
   ;;;   A ParametricR boxed as an AnyRenderer.
   ;;;
   ;;; Example:
-  ;;;   (parametric circle-point 0.0 6.283 128 (default-line-style) "circle")
-  (defn parametric [^fat f : (fn [float] int)  t-min : float  t-max : float
+  ;;;   (parametric (fn [t : float] : Point (Point (cos t) (sin t))) 0.0 6.283 128
+  ;;;               (default-line-style) "circle")
+  (defn parametric [^fat f : (fn [float] Point)  t-min : float  t-max : float
                     samples : int  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct ParametricR f t-min t-max samples style label)))
 
@@ -428,10 +435,10 @@
                  samples : int  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct InverseR f y-min y-max samples style label)))
 
-  ;;; density -- kernel density estimate from a cons list of samples.
+  ;;; density -- kernel density estimate of a sample.
   ;;;
   ;;; Parameters:
-  ;;;   vs        -- cons list of sample values (as double bits)
+  ;;;   vs        -- the sample values
   ;;;   bandwidth -- kernel bandwidth; 0.0 picks Silverman's rule
   ;;;   samples   -- number of points the estimate is drawn through
   ;;;   style     -- the LineStyle to stroke with
@@ -441,8 +448,8 @@
   ;;;   A DensityR boxed as an AnyRenderer.
   ;;;
   ;;; Example:
-  ;;;   (density xs 0.0 128 (default-line-style) "kde")
-  (defn density [vs : int  bandwidth : float  samples : int  style : LineStyle  label : cstr] : AnyRenderer
+  ;;;   (density (vec-of 0.5 1.25 1.5 2.75) 0.0 128 (default-line-style) "kde")
+  (defn density [vs : (Vec float)  bandwidth : float  samples : int  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct DensityR vs bandwidth samples style label)))
 
 ) ;; end defmodule plot/line

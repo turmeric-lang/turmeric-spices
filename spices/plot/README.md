@@ -75,6 +75,17 @@ segments in high-curvature regions and around NaN boundaries up to a fixed
 depth, so smooth curves stay cheap and sharp turns get extra samples
 without forcing every caller to crank the count globally.
 
+## Data
+
+A renderer's data is a Vec of records from `plot/data` -- `Point`, `Rect`,
+`ErrorBar`, `Arrow`, `Bar` and `Group` -- built with their constructors:
+
+```turmeric no-check
+(import plot/data :refer [Point])
+(lines (vec-of (Point 0.0 0.0) (Point 1.0 2.0) (Point 2.0 1.5))
+       (default-line-style) "data")
+```
+
 ## Renderers are typed
 
 Every renderer kind is its own type -- `FunctionR`, `LinesR`, `PointsR`,
@@ -83,11 +94,12 @@ named fields and an instance of the `Renderer` class:
 
 ```turmeric no-check
 (defclass Renderer [a]
-  (bounds [r] : BBox)                          ;; the data extent it needs on screen
-  (draw [r ctx : DrawCtx] : void)              ;; paint it through the plot's context
-  (legend-label [r] : cstr "")                 ;; its legend entry, if any
-  (frame-marks [r] : FrameMarks (no-frame-marks)) ;; axes / grids it asks the frame for
-  (categories [r] : (Option int) (none)))      ;; category tick labels, if categorical
+  (bounds [r : a] : BBox)                      ;; the data extent it needs on screen
+  (draw [r : a  ctx : DrawCtx] : void)         ;; paint it through the plot's context
+  (legend-label [r : a] : cstr "")             ;; its legend entry, if any
+  (frame-marks [r : a] : FrameMarks (no-frame-marks))  ;; axes / grids for the frame
+  (categorical? [r : a] : bool false)          ;; lays the x axis out as categories?
+  (category-labels [r : a] : (Vec cstr) (:: (vec-new) (Vec cstr))))  ;; their labels
 ```
 
 The plot's extent is the union of its renderers' `bounds`; the frame draws

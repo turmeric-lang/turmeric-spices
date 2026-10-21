@@ -4,9 +4,8 @@
 ;;
 ;; It puts no type annotation on a renderer value, so the same source builds
 ;; against plot before and after a change to how renderers are represented
-;; (it builds against plot from the typed style handles on: fill lists are
-;; Vecs). Build it on both checkouts, run each in its own directory, and diff
-;; the PNGs byte for byte:
+;; (it builds against plot from the typed data records on). Build it on both
+;; checkouts, run each in its own directory, and diff the PNGs byte for byte:
 ;;
 ;;   tur build spices/plot/tools/render-all-kinds.tur -o /tmp/before/render
 ;;   (cd /tmp/before && mkdir -p png && ./render)
@@ -26,90 +25,28 @@
   (import plot/decor    :refer [x-axis y-axis axes x-tick-lines y-tick-lines tick-grid
                                 hrule hrule-styled vrule vrule-styled
                                 point-label point-label-styled])
+  (import plot/data     :refer [Point Rect ErrorBar Arrow Bar Group])
   (import plot/style    :refer [FillStyle LineStyle PlotOpts line-style point-style fill-style plot-opts
                                 default-line-style default-point-style default-fill-style
                                 default-plot-opts])
 
   (defn nan [] : float ```c return 0.0 / 0.0; ```)
 
-  (defn xy-pair [x : float y : float] : int
-    ```c
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    Cons *p = malloc(sizeof(*p));
-    union { double d; int64_t i; } ux, uy; ux.d = x; uy.d = y;
-    p->head = ux.i; p->tail = uy.i; return (int64_t)(intptr_t)p;
-    ```)
-  (defn t-cons [v : int n : int] : int
-    ```c
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    Cons *c = malloc(sizeof(*c));
-    c->head = v; c->tail = n;
-    return (int64_t)(intptr_t)c;
-    ```)
-  (defn f-cons [x : float n : int] : int
-    ```c
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    union { double d; int64_t i; } u; u.d = x;
-    Cons *c = malloc(sizeof(*c));
-    c->head = u.i; c->tail = n;
-    return (int64_t)(intptr_t)c;
-    ```)
-  (defn s-cons [s : cstr n : int] : int
-    ```c
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    Cons *c = malloc(sizeof(*c));
-    c->head = (int64_t)(intptr_t)s; c->tail = n;
-    return (int64_t)(intptr_t)c;
-    ```)
-  (defn triple [a : float b : float c : float] : int
-    ```c
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    union { double d; int64_t i; } ua, ub, uc; ua.d = a; ub.d = b; uc.d = c;
-    Cons *c2 = malloc(sizeof(*c2)); Cons *c1 = malloc(sizeof(*c1));
-    c2->head = ub.i; c2->tail = uc.i;
-    c1->head = ua.i; c1->tail = (int64_t)(intptr_t)c2;
-    return (int64_t)(intptr_t)c1;
-    ```)
-  (defn quad [a : float b : float c : float d : float] : int
-    ```c
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    union { double d; int64_t i; } ua, ub, uc, ud; ua.d = a; ub.d = b; uc.d = c; ud.d = d;
-    Cons *c3 = malloc(sizeof(*c3)); Cons *c2 = malloc(sizeof(*c2)); Cons *c1 = malloc(sizeof(*c1));
-    c3->head = uc.i; c3->tail = ud.i;
-    c2->head = ub.i; c2->tail = (int64_t)(intptr_t)c3;
-    c1->head = ua.i; c1->tail = (int64_t)(intptr_t)c2;
-    return (int64_t)(intptr_t)c1;
-    ```)
-  (defn cat [label : cstr height : float] : int
-    ```c
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    union { double d; int64_t i; } uh; uh.d = height;
-    Cons *p = malloc(sizeof(*p));
-    p->head = (int64_t)(intptr_t)label; p->tail = uh.i;
-    return (int64_t)(intptr_t)p;
-    ```)
-  (defn group [label : cstr vals : int] : int (s-cons label vals))
-  (defn bits [x : float] : int
-    ```c union { double d; int64_t i; } u; u.d = x; return u.i; ```)
-
   ;; callbacks
   (defn sq [x : float] : float (* x x))
   (defn sq-hi [x : float] : float (+ (* x x) 0.5))
-  (defn half [t : float] : int (xy-pair t (* 0.5 t)))
-  (defn half-hi [t : float] : int (xy-pair t (+ (* 0.5 t) 0.3)))
+  (defn half [t : float] : Point (Point t (* 0.5 t)))
+  (defn half-hi [t : float] : Point (Point t (+ (* 0.5 t) 0.3)))
   (defn radius [t : float] : float (+ 0.4 (* 0.1 (* t t))))
   (defn r-lo [t : float] : float 0.4)
   (defn r-hi [t : float] : float 0.8)
   (defn recip [x : float] : float (/ 1.0 x))
-  (defn vf [x : float y : float] : int (xy-pair (* -1.0 y) x))
+  (defn vf [x : float y : float] : Point (Point (* -1.0 y) x))
   (defn saddle [x : float y : float] : float (- (* x x) (* y y)))
   (defn colorize [x : float y : float] : int (if (> (+ x y) 0.0) 1 0))
 
-  (defn pts [] : int
-    (t-cons (xy-pair -2.0 -1.0)
-      (t-cons (xy-pair -1.0 0.5)
-        (t-cons (xy-pair (nan) 0.0)
-          (t-cons (xy-pair 1.0 1.5) 0)))))
+  (defn pts [] : (Vec Point)
+    (vec-of (Point -2.0 -1.0) (Point -1.0 0.5) (Point (nan) 0.0) (Point 1.0 1.5)))
 
   (defn styled [] : LineStyle (line-style 2 2.5 1 0.8))
   (defn fancy-opts [] : PlotOpts
@@ -139,9 +76,9 @@
       (plot-write-png (vec-of (axes) (polar radius -3.0 3.0 96 ls "r")) (default-plot-opts) "png/polar.png")
       (plot-write-png (vec-of (axes) (inverse sq -1.0 1.0 96 ls "i")) (default-plot-opts) "png/inverse.png")
       (plot-write-png (vec-of (axes)
-                              (density (f-cons 0.0 (f-cons 1.0 (f-cons 1.1 (f-cons 1.2 (f-cons 2.0 0)))))
+                              (density (vec-of 0.0 1.0 1.1 1.2 2.0)
                                        0.0 64 ls "d")
-                              (density (f-cons 0.5 (f-cons 1.5 0)) 0.3 64 (styled) "d2"))
+                              (density (vec-of 0.5 1.5) 0.3 64 (styled) "d2"))
                       (default-plot-opts) "png/density.png")
       (plot-write-png (vec-of (axes) (points (pts) ps "pts")
                               (points (pts) (point-style 1 2 1 9.0 0.6) "sq")
@@ -151,42 +88,40 @@
                               (points (pts) (point-style 6 7 2 8.0 0.0) "t"))
                       (default-plot-opts) "png/points.png")
       (plot-write-png (vec-of (axes)
-                              (error-bars (t-cons (triple 0.5 0.5 0.25) (t-cons (triple 1.2 1.0 0.2) 0)) ls 0 "v")
-                              (error-bars (t-cons (triple 0.5 0.5 0.25) (t-cons (triple 1.2 1.0 0.2) 0)) ls 1 "h"))
+                              (error-bars (vec-of (ErrorBar 0.5 0.5 0.25) (ErrorBar 1.2 1.0 0.2)) ls false "v")
+                              (error-bars (vec-of (ErrorBar 0.5 0.5 0.25) (ErrorBar 1.2 1.0 0.2)) ls true "h"))
                       (default-plot-opts) "png/error-bars.png")
       (plot-write-png (vec-of (axes) (vector-field vf -1.0 1.0 -1.0 1.0 8 0 ls "vf0"))
                       (default-plot-opts) "png/vector-field0.png")
       (plot-write-png (vec-of (axes) (vector-field vf -1.0 1.0 -1.0 1.0 8 1 ls "vf1")
                               (vector-field vf -0.5 0.5 -0.5 0.5 5 2 (styled) "vf2"))
                       (default-plot-opts) "png/vector-field12.png")
-      (plot-write-png (vec-of (axes) (arrows (t-cons (quad -0.5 -0.5 0.5 0.5) (t-cons (quad 0.0 1.0 1.0 0.2) 0)) ls "arr"))
+      (plot-write-png (vec-of (axes) (arrows (vec-of (Arrow -0.5 -0.5 0.5 0.5) (Arrow 0.0 1.0 1.0 0.2)) ls "arr"))
                       (default-plot-opts) "png/arrows.png")
       (plot-write-png (vec-of (axes) (function-interval sq sq-hi -1.5 1.5 96 fs ls "fi"))
                       (default-plot-opts) "png/function-interval.png")
       (plot-write-png (vec-of (axes)
-                              (lines-interval (t-cons (xy-pair -1.0 -0.5) (t-cons (xy-pair 0.0 0.0) (t-cons (xy-pair 1.0 0.5) 0)))
-                                              (t-cons (xy-pair -1.0 0.2) (t-cons (xy-pair 0.0 0.7) (t-cons (xy-pair 1.0 1.1) 0)))
+                              (lines-interval (vec-of (Point -1.0 -0.5) (Point 0.0 0.0) (Point 1.0 0.5))
+                                              (vec-of (Point -1.0 0.2) (Point 0.0 0.7) (Point 1.0 1.1))
                                               (fill-style 4 0.3 2 1.5) (styled) "li"))
                       (default-plot-opts) "png/lines-interval.png")
       (plot-write-png (vec-of (axes) (parametric-interval half half-hi -1.0 1.0 72 fs ls "pi"))
                       (default-plot-opts) "png/parametric-interval.png")
       (plot-write-png (vec-of (axes) (polar-interval r-lo r-hi -1.0 1.0 72 fs ls "po"))
                       (default-plot-opts) "png/polar-interval.png")
-      (plot-write-png (vec-of (rectangles (t-cons (quad -1.0 -0.5 0.0 1.0) (t-cons (quad 0.2 0.9 0.0 0.6) 0)) fs "rects"))
+      (plot-write-png (vec-of (rectangles (vec-of (Rect -1.0 -0.5 0.0 1.0) (Rect 0.2 0.9 0.0 0.6)) fs "rects"))
                       (default-plot-opts) "png/rectangles.png")
-      (plot-write-png (vec-of (area-histogram (t-cons (quad 0.0 0.5 0.0 1.0) (t-cons (quad 0.6 1.1 0.0 1.4) 0)) fills "ah"))
+      (plot-write-png (vec-of (area-histogram (vec-of (Rect 0.0 0.5 0.0 1.0) (Rect 0.6 1.1 0.0 1.4)) fills "ah"))
                       (default-plot-opts) "png/area-histogram.png")
-      (plot-write-png (vec-of (discrete-histogram (t-cons (cat "A" 1.0) (t-cons (cat "B" 1.4) (t-cons (cat "C" 0.7) 0))) fs 0 "dh"))
+      (plot-write-png (vec-of (discrete-histogram (vec-of (Bar "A" 1.0) (Bar "B" 1.4) (Bar "C" 0.7)) fs false "dh"))
                       (default-plot-opts) "png/discrete-histogram.png")
-      (plot-write-png (vec-of (discrete-histogram (t-cons (cat "A" 1.0) (t-cons (cat "B" 1.4) (t-cons (cat "C" 0.7) 0))) fs 1 "dhi"))
+      (plot-write-png (vec-of (discrete-histogram (vec-of (Bar "A" 1.0) (Bar "B" 1.4) (Bar "C" 0.7)) fs true "dhi"))
                       (default-plot-opts) "png/discrete-histogram-inv.png")
-      (plot-write-png (vec-of (stacked-histogram (t-cons (group "Q1" (t-cons (bits 1.0) (t-cons (bits 0.8) 0)))
-                                                         (t-cons (group "Q2" (t-cons (bits 1.2) (t-cons (bits 0.5) 0))) 0))
-                                                 fills (s-cons "one" (s-cons "two" 0)) 0))
+      (plot-write-png (vec-of (stacked-histogram (vec-of (Group "Q1" (vec-of 1.0 0.8)) (Group "Q2" (vec-of 1.2 0.5)))
+                                                 fills (vec-of "one" "two") false))
                       (default-plot-opts) "png/stacked-histogram.png")
-      (plot-write-png (vec-of (stacked-histogram (t-cons (group "Q1" (t-cons (bits 1.0) (t-cons (bits 0.8) 0)))
-                                                         (t-cons (group "Q2" (t-cons (bits 1.2) (t-cons (bits 0.5) 0))) 0))
-                                                 (:: (vec-new) (Vec FillStyle)) (s-cons "one" (s-cons "two" 0)) 1))
+      (plot-write-png (vec-of (stacked-histogram (vec-of (Group "Q1" (vec-of 1.0 0.8)) (Group "Q2" (vec-of 1.2 0.5)))
+                                                 (:: (vec-new) (Vec FillStyle)) (vec-of "one" "two") true))
                       (default-plot-opts) "png/stacked-histogram-inv.png")
       (plot-write-png (vec-of (isoline saddle -2.0 2.0 -2.0 2.0 32 0.5 ls "iso"))
                       (default-plot-opts) "png/isoline.png")
@@ -208,7 +143,7 @@
                               (vector-field vf -1.0 1.0 -1.0 1.0 8 1 ls "vf1"))
                       (fancy-opts) "png/mixed.png")
       (plot-write-png (vec-of (axes)
-                              (discrete-histogram (t-cons (cat "A" 1.0) (t-cons (cat "B" 1.4) (t-cons (cat "C" 0.7) 0))) fs 0 "dh")
+                              (discrete-histogram (vec-of (Bar "A" 1.0) (Bar "B" 1.4) (Bar "C" 0.7)) fs false "dh")
                               (hrule 1.2))
                       (fancy-opts) "png/categorical-mixed.png")
       0)))

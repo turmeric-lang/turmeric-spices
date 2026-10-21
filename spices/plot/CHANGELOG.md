@@ -24,8 +24,8 @@
   `(:: (vec-new) (Vec AnyRenderer))`.
 - Curve callbacks are function values of a declared type: `function`,
   `polar` and `inverse` take a `(fn [float] float)`, `parametric` a
-  `(fn [float] int)` returning a point, `vector-field` a
-  `(fn [float float] int)`, the contour kinds a `(fn [float float] float)`
+  `(fn [float] Point)`, `vector-field` a
+  `(fn [float float] Point)`, the contour kinds a `(fn [float float] float)`
   and `color-field` a `(fn [float float] int)`, and the interval kinds two
   of their curve's type. A `fn` literal -- capturing or not -- works where a
   named `defn` did, and a callback of the wrong type is a compile error
@@ -36,9 +36,9 @@
   (`__renderer-bbox`, C symbol `plot_renderer_bbox`) is gone, and
   `renderer-bbox` takes an `AnyRenderer`.
 - Drawing is a `Renderer` method too: `draw [r ctx : DrawCtx]` paints one
-  renderer through the plot's draw context, and three methods with defaults
-  -- `legend-label`, `frame-marks` and `categories` -- tell the frame what to
-  add. The monolithic draw `switch` (`__draw-renderers`, C symbol
+  renderer through the plot's draw context, and four methods with defaults
+  -- `legend-label`, `frame-marks`, `categorical?` and `category-labels` --
+  tell the frame what to add. The monolithic draw `switch` (`__draw-renderers`, C symbol
   `plot_draw_renderers`) is split into one inline-C draw per kind, beside
   its type, and the frame worker into the frame pass (`__plot-frame`), the
   draws and the legend. The slot-bag renderer (`__make-renderer`,
@@ -54,6 +54,19 @@
   `stacked-histogram` and `contour-intervals` are `(Vec FillStyle)` rather
   than cons lists of handles (`(vec-of fill1 fill2)`), and `contours`' style
   parameter is named `style` (it was always one style).
+- Renderer data is typed records instead of cons lists of double bits. A
+  new module, `plot/data`, defines `Point`, `Rect`, `ErrorBar`, `Arrow`,
+  `Bar` and `Group`, and the constructors take a Vec of them: `lines`,
+  `points` and `lines-interval` a `(Vec Point)`, `error-bars` a
+  `(Vec ErrorBar)`, `arrows` a `(Vec Arrow)`, `rectangles` and
+  `area-histogram` a `(Vec Rect)`, `discrete-histogram` a `(Vec Bar)`,
+  `stacked-histogram` a `(Vec Group)` (and its layer names a `(Vec cstr)`),
+  `density` a `(Vec float)`. `parametric` and `parametric-interval` take a
+  `(fn [float] Point)` and `vector-field` a `(fn [float float] Point)`.
+  Handing a renderer the wrong record is a compile error; the inline-C cons
+  builders callers used to write are no longer needed.
+- `error-bars`, `discrete-histogram` and `stacked-histogram` take
+  `horizontal : bool` where they took an `invert : int`.
 - `lines-r`, `points-r` and `label-r` are removed (build the struct with
   `make-struct`), and `plot-anyrenderers` is deprecated: `plot` takes the
   same argument.
@@ -75,10 +88,10 @@
   concrete backend type -- the "plot DSL becomes generic in Backend"
   the uplift plan called for.
 
-- `errors/run.sh` and four compile-fail fixtures: a type with no `Renderer`
+- `errors/run.sh` and five compile-fail fixtures: a type with no `Renderer`
   instance cannot be boxed, `plot` rejects a `(Vec int)` of handles, a
-  `FillStyle` where a `LineStyle` is due is rejected, and so is a callback of
-  the wrong function type.
+  `FillStyle` where a `LineStyle` is due is rejected, `Rect`s where `Point`s
+  are due are rejected, and so is a callback of the wrong function type.
 
 ### Fixed
 
@@ -87,7 +100,9 @@
   changed from run to run. `ArrowsR`'s `bounds` spans both endpoints of each
   arrow.
 - The slot-bag handle each constructor allocated was never freed; there is
-  no handle now, only the typed renderer.
+  no handle now, only the typed renderer. A parametric or vector-field
+  callback no longer allocates a cons cell per sample (it returns a `Point`
+  by value).
 - A viewport too small for a plot (`plot-into-canvas` err 1) leaked the
   font the frame had loaded.
 - `plot/core`'s hand-written `<plutovg.h>` stand-ins (prototypes, typedefs,
