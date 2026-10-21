@@ -95,6 +95,15 @@
 
 ### Fixed
 
+- `contours` drew all `n` of its levels at 0: it stored 0.0 for both ends of
+  the range the levels are spaced through, so the contours coincided. The
+  levels now span the range f takes on the sampled grid -- level i of n at
+  min + (max - min) * (i + 1) / (n + 1) -- and a field with no finite value
+  draws none.
+- Every plot left one saved state on its canvas: the frame
+  `plutovg_canvas_save`d with no matching `restore`. A canvas handed to
+  `plot-into-canvas` / `CanvasBackend` now comes back with the caller's line
+  width, font, color and clip as it went in.
 - `arrows` bounds read each arrow's second cons cell -- a pointer -- as the y
   coordinate, so an arrows plot's y range came out of the heap layout and
   changed from run to run. `ArrowsR`'s `bounds` spans both endpoints of each

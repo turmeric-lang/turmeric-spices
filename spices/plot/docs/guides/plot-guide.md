@@ -91,7 +91,10 @@ draws arbitrary ones.
 ## 5. Contour plot
 
 Use `contours`, `contour-intervals`, and `color-field` together for sampled
-scalar fields.
+scalar fields. `contours` spaces its `n` levels evenly through the range f
+takes on the `samples` x `samples` grid, leaving out the extremes (level i at
+min + (max - min) * (i + 1) / (n + 1)); `isoline` draws one level you name;
+`contour-intervals` bands f over [0, 1].
 
 ## 6. Multiple renderers and legend
 

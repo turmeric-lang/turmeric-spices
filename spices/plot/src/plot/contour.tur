@@ -16,12 +16,8 @@
                              x-min : float  x-max : float  y-min : float  y-max : float
                              samples : int  level : float  style : LineStyle  label : cstr])
 
-  ;;; ContoursR -- `levels` contours in one style.
-  ;;
-  ;; The draw pass spaces the levels through the range it reads from f5 / f6,
-  ;; and this kind has always stored 0.0 in both, so every level is 0 and the
-  ;; `levels` contours coincide. Kept as-is so the migration stays
-  ;; pixel-identical; giving the levels a real range is a separate change.
+  ;;; ContoursR -- `levels` contours in one style, spaced evenly through the
+  ;;; range f takes on the sampled grid.
   (defstruct ContoursR :copy [f : (fn [float float] float)
                               x-min : float  x-max : float  y-min : float  y-max : float
                               samples : int  levels : int  style : LineStyle  label : cstr])
@@ -171,12 +167,13 @@
     ```)
 
   ;;; __draw-contour-lines -- stroke the f(x, y) = level contours by marching
-  ;;; squares: one at `level-lo` when `single`, else `levels` spaced through
-  ;;; (level-lo, level-hi).
+  ;;; squares: the one at `level` when `single`, else `levels` of them spaced
+  ;;; evenly inside the range f takes on the grid -- level i of n at
+  ;;; lo + (hi - lo) * (i + 1) / (n + 1), so neither extreme is drawn.
   (defn __draw-contour-lines [ctx : DrawCtx  ^fat f : (fn [float float] float)
                             x-min : float  x-max : float  y-min : float  y-max : float
                             grid : int  levels : int  single : bool
-                            level-lo : float  level-hi : float  style : LineStyle] : void
+                            level : float  style : LineStyle] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -208,17 +205,34 @@
       SET_LINE_STYLE(style, ((int *)0));
       int samples = (int)grid; if (samples < 8) samples = 8;
       int nlevels = single ? 1 : (int)levels;
+      /* The levels' range: f's extremes over the grid points the squares
+         below sample, NaN and infinities left out. A field with no finite
+         value draws nothing. */
+      double lo = level, hi = level;
+      if (!single) {
+        int seen = 0;
+        for (int iy = 0; iy < samples; iy++) for (int ix = 0; ix < samples; ix++) {
+          double x = x_min + (x_max - x_min) * ((double)ix / (double)(samples - 1));
+          double y = y_min + (y_max - y_min) * ((double)iy / (double)(samples - 1));
+          double v = TUR_APPLY2_T(double, double, double, f, x, y);
+          if (!(v == v) || v - v != 0.0) continue;
+          if (!seen || v < lo) lo = v;
+          if (!seen || v > hi) hi = v;
+          seen = 1;
+        }
+        if (!seen) nlevels = 0;
+      }
       for (int li = 0; li < nlevels; li++) {
-        double level = single ? level_lo : (level_lo + (level_hi - level_lo) * ((double)(li + 1) / (double)(nlevels + 1)));
+        double lv = single ? level : (lo + (hi - lo) * ((double)(li + 1) / (double)(nlevels + 1)));
         for (int iy = 0; iy < samples - 1; iy++) for (int ix = 0; ix < samples - 1; ix++) {
           double x0 = x_min + (x_max - x_min) * ((double)ix / (double)(samples - 1));
           double x1 = x_min + (x_max - x_min) * ((double)(ix + 1) / (double)(samples - 1));
           double y0 = y_min + (y_max - y_min) * ((double)iy / (double)(samples - 1));
           double y1 = y_min + (y_max - y_min) * ((double)(iy + 1) / (double)(samples - 1));
-          double v00 = TUR_APPLY2_T(double, double, double, f, x0, y0) - level;
-          double v10 = TUR_APPLY2_T(double, double, double, f, x1, y0) - level;
-          double v01 = TUR_APPLY2_T(double, double, double, f, x0, y1) - level;
-          double v11 = TUR_APPLY2_T(double, double, double, f, x1, y1) - level;
+          double v00 = TUR_APPLY2_T(double, double, double, f, x0, y0) - lv;
+          double v10 = TUR_APPLY2_T(double, double, double, f, x1, y0) - lv;
+          double v01 = TUR_APPLY2_T(double, double, double, f, x0, y1) - lv;
+          double v11 = TUR_APPLY2_T(double, double, double, f, x1, y1) - lv;
           double ptsx[4], ptsy[4]; int pc = 0;
           if ((v00 <= 0 && v10 > 0) || (v00 > 0 && v10 <= 0)) { double t = v00 / (v00 - v10); ptsx[pc] = x0 + (x1 - x0) * t; ptsy[pc++] = y0; }
           if ((v10 <= 0 && v11 > 0) || (v10 > 0 && v11 <= 0)) { double t = v10 / (v10 - v11); ptsx[pc] = x1; ptsy[pc++] = y0 + (y1 - y0) * t; }
@@ -240,13 +254,13 @@
   (definstance Renderer [IsolineR]
     (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
     (draw [r ctx] (__draw-contour-lines ctx (.f r) (.x-min r) (.x-max r) (.y-min r) (.y-max r)
-                                        (.samples r) 1 true (.level r) (.level r) (.style r)))
+                                        (.samples r) 1 true (.level r) (.style r)))
     (legend-label [r] (.label r)))
 
   (definstance Renderer [ContoursR]
     (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
     (draw [r ctx] (__draw-contour-lines ctx (.f r) (.x-min r) (.x-max r) (.y-min r) (.y-max r)
-                                        (.samples r) (.levels r) false 0.0 0.0 (.style r)))
+                                        (.samples r) (.levels r) false 0.0 (.style r)))
     (legend-label [r] (.label r)))
 
   (definstance Renderer [ContourIntervalsR]
@@ -283,7 +297,11 @@
                  samples : int  level : float  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct IsolineR f x-min x-max y-min y-max samples level style label)))
 
-  ;;; contours -- draw multiple automatically spaced contour levels.
+  ;;; contours -- draw n contour levels spaced evenly through f's range.
+  ;;;
+  ;;; The range is f's minimum and maximum over the samples x samples grid;
+  ;;; level i of n sits at min + (max - min) * (i + 1) / (n + 1), so the
+  ;;; extremes themselves (single points, usually) are not drawn.
   ;;;
   ;;; Parameters:
   ;;;   f       -- the field, a (fn [float float] float)
