@@ -75,6 +75,9 @@
 
 ### Added
 
+- The legend sits on a translucent white box with a light border, so its
+  rows read over whatever the plot drew beneath them. The box is sized to
+  its rows and widest label.
 - `Backend` typeclass in `plot/core` (U2 typeclass collapse): the three
   output sinks now share one `render-to` method with one instance each --
   `CanvasBackend` (draw into an existing canvas + viewport),
@@ -113,6 +116,13 @@
   categories along the x axis, where the values run, so the labels sat
   under the wrong ticks; they label the y axis now, and the x axis keeps
   numeric ticks.
+- `legend-pos` 0 drew the legend at the top right instead of leaving it
+  out, as `plot-opts` documents: the frame treated 0 like a missing value.
+- A bottom legend (`legend-pos` 3 or 4) put its first row 16 pixels above
+  the plot's bottom edge and grew downward, out of the plot; it now stacks
+  upward so its last row sits there. A right-hand legend with a label too
+  long for its 120-pixel slot ran off the plot's right edge; it moves left
+  to fit.
 - A legend row's swatch was a line in palette color `row % 8`, whatever its
   renderer drew with, so it mismatched any renderer with a named color, or
   after an unlabelled renderer took an auto color. Each renderer now records
