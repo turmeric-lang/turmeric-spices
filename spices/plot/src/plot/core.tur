@@ -1500,6 +1500,7 @@
       int64_t n_swatches;
       int64_t cur_swatch;
       int64_t cur_series;
+      double legend_x, legend_y;
     } PlotDrawCtx;
     typedef struct {
       int64_t width; int64_t height;
@@ -1765,6 +1766,8 @@
     dc->n_swatches = 0;
     dc->cur_swatch = -1;
     dc->cur_series = 0;
+    dc->legend_x = 0.0;
+    dc->legend_y = 0.0;
     return dc;
     #undef UNION_POINT
     #undef ISNAN
@@ -1798,6 +1801,7 @@
       int64_t n_swatches;
       int64_t cur_swatch;
       int64_t cur_series;
+      double legend_x, legend_y;
     } PlotDrawCtx;
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     if (n <= 0 || dc->swatches) return;
@@ -1832,6 +1836,7 @@
       int64_t n_swatches;
       int64_t cur_swatch;
       int64_t cur_series;
+      double legend_x, legend_y;
     } PlotDrawCtx;
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     dc->cur_swatch = i;
@@ -1865,6 +1870,7 @@
       int64_t n_swatches;
       int64_t cur_swatch;
       int64_t cur_series;
+      double legend_x, legend_y;
     } PlotDrawCtx;
     PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
     dc->cur_series = k < 0 ? 0 : k;
@@ -1898,6 +1904,7 @@
       int64_t n_swatches;
       int64_t cur_swatch;
       int64_t cur_series;
+      double legend_x, legend_y;
     } PlotDrawCtx;
     PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
     if (!dc->swatches || dc->cur_swatch < 0 || dc->cur_swatch >= dc->n_swatches) return NULL;
@@ -1939,6 +1946,7 @@
       int64_t n_swatches;
       int64_t cur_swatch;
       int64_t cur_series;
+      double legend_x, legend_y;
     } PlotDrawCtx;
     PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
     if (!dc->swatches || i < 0 || i >= dc->n_swatches) return NULL;
@@ -2024,6 +2032,139 @@
     plutovg_canvas_set_font_size((plutovg_canvas_t *)dc->canvas, 12.0f);
     ```)
 
+  ;;; __ctx-text-width -- the advance width of `text` in the legend's font, in
+  ;;; pixels; 0 with no font. Call after `__legend-begin` has set the font.
+  (defn __ctx-text-width [ctx : DrawCtx  text : cstr] : float
+    ```c
+    #include <stdint.h>
+    #include <string.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    typedef struct { float x, y, w, h; } plutovg_rect_t;
+    #define PLUTOVG_TEXT_ENCODING_UTF8 1
+    extern float plutovg_canvas_text_extents(void* canvas, const void* text, int length,
+                                             int encoding, plutovg_rect_t* extents);
+    #endif
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    if (!dc->font_ok || !text || !text[0]) return 0.0;
+    plutovg_rect_t r;
+    return (double)plutovg_canvas_text_extents((plutovg_canvas_t *)dc->canvas, text, (int)strlen(text),
+                                               PLUTOVG_TEXT_ENCODING_UTF8, &r);
+    ```)
+
+  ;;; LegendSize -- how many legend rows a plot has, and its widest label.
+  (defstruct LegendSize :copy [rows : int  width : float])
+
+  ;;; __legend-size-rows -- `acc` grown by the non-empty labels[k..m).
+  (defn __legend-size-rows [ctx : DrawCtx  labels : (Vec cstr)  k : int  m : int
+                            acc : LegendSize] : LegendSize
+    (if (>= k m) acc
+      (let [label (vec-get labels k)
+            w     (__ctx-text-width ctx label)]
+        (__legend-size-rows ctx labels (+ k 1) m
+                            (if (__nonempty? label)
+                              (LegendSize (+ (.rows acc) 1) (if (> w (.width acc)) w (.width acc)))
+                              acc)))))
+
+  ;;; __legend-size -- the legend rows of rs[i..n) and their widest label,
+  ;;; folded into `acc`; the same rows `__legend-fold` draws.
+  (defn __legend-size [rs : (Vec AnyRenderer)  ctx : DrawCtx  i : int  n : int
+                       acc : LegendSize] : LegendSize
+    (if (>= i n) acc
+      (let [labels (open (vec-get rs i) [a v] (legend-labels v))
+            next   (__legend-size-rows ctx labels 0 (vec-len labels) acc)]
+        (vec-free labels)
+        (__legend-size rs ctx (+ i 1) n next))))
+
+  ;;; __legend-box -- lay the legend out for `rows` rows whose widest label is
+  ;;; `width` pixels, and draw its backing: a translucent white box with a
+  ;;; light border, so the rows read over whatever the plot drew there. A
+  ;;; right-hand legend moves left to keep a long label inside the plot, and
+  ;;; a bottom one stacks upward from the bottom edge.
+  (defn __legend-box [ctx : DrawCtx  rows : int  width : float] : void
+    ```c
+    #include <stdint.h>
+    #include <stdbool.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    extern void plutovg_canvas_set_line_width(void* canvas, float line_width);
+    extern void plutovg_canvas_round_rect(void* canvas, float x, float y, float w, float h, float rx, float ry);
+    extern void plutovg_canvas_fill_preserve(void* canvas);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct PlotSwatch {
+      int64_t has_line, line_color;
+      double line_alpha, line_width;
+      int64_t has_fill, fill_color;
+      double fill_alpha;
+      int64_t has_point, point_stroke, point_fill, point_sym;
+      double point_size, point_alpha;
+    } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
+    } PlotDrawCtx;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int pos = (int)dc->legend_pos;
+    bool left_side = (pos == 2 || pos == 4);
+    double w = 18.0 + width;              /* swatch, gap, label */
+    double lx = left_side ? dc->left + 12.0 : dc->right - 120.0;
+    if (!left_side && lx + w > dc->right - 12.0) lx = dc->right - 12.0 - w;
+    if (lx < dc->left + 12.0) lx = dc->left + 12.0;
+    double y0 = (pos == 3 || pos == 4) ? dc->bottom - 16.0 - (rows > 0 ? rows - 1 : 0) * 16.0
+                                       : dc->top + 16.0;
+    dc->legend_x = lx;
+    dc->legend_y = y0;
+    if (!(dc->font_ok && pos != 0) || rows <= 0) return;
+    plutovg_canvas_t *cv = (plutovg_canvas_t *)dc->canvas;
+    plutovg_canvas_round_rect(cv, (float)(lx - 6.0), (float)(y0 - 10.0),
+                              (float)(w + 12.0), (float)((rows - 1) * 16.0 + 20.0), 3.0f, 3.0f);
+    plutovg_canvas_set_rgba(cv, 1.0f, 1.0f, 1.0f, 0.85f);
+    plutovg_canvas_fill_preserve(cv);
+    plutovg_canvas_set_rgba(cv, 0.75f, 0.75f, 0.75f, 1.0f);
+    plutovg_canvas_set_line_width(cv, 1.0f);
+    plutovg_canvas_stroke(cv);
+    ```)
+
   ;;; __legend-row -- draw legend row `row`: the swatch of renderer `index`'s
   ;;; series `series`, and `label`. The swatch is what that series drew with -- its point marker,
   ;;; else its fill as a box (edged top and bottom in its line style, as an
@@ -2058,6 +2199,7 @@
       int64_t has_point, point_stroke, point_fill, point_sym;
       double point_size, point_alpha;
     } PlotSwatch;
+    typedef struct PlotSeries { PlotSwatch *items; int64_t n; } PlotSeries;
     typedef struct PlotDrawCtx {
       void *canvas;
       double bx_min, bx_max, by_min, by_max;
@@ -2066,6 +2208,11 @@
       void *font;
       int64_t legend_pos;
       int64_t auto_color;
+      PlotSeries *swatches;
+      int64_t n_swatches;
+      int64_t cur_swatch;
+      int64_t cur_series;
+      double legend_x, legend_y;
     } PlotDrawCtx;
     extern void *plot_ctx_swatch_at(void *, int64_t, int64_t);
     static const double palette[8][3] = {
@@ -2083,9 +2230,9 @@
     int legend_pos = (int)dc->legend_pos;
     if (!(dc->font_ok && legend_pos != 0)) return false;
     if (!label || !label[0]) return false;
-    double lx = (legend_pos == 2 || legend_pos == 4) ? dc->left + 12.0 : dc->right - 120.0;
-    double ly = (legend_pos == 3 || legend_pos == 4) ? dc->bottom - 16.0 : dc->top + 16.0;
-    double y = ly + row * 16.0;
+    /* Where `__legend-box` laid the legend out: row 0 at legend_y. */
+    double lx = dc->legend_x;
+    double y = dc->legend_y + row * 16.0;
     PlotSwatch *sw = (PlotSwatch *)plot_ctx_swatch_at(dc, index, series);
     plutovg_canvas_t *cv = (plutovg_canvas_t *)(intptr_t)canvas;
     if (sw && sw->has_point) {
@@ -2159,6 +2306,7 @@
       int64_t n_swatches;
       int64_t cur_swatch;
       int64_t cur_series;
+      double legend_x, legend_y;
     } PlotDrawCtx;
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     if (!dc) return;
@@ -2218,6 +2366,8 @@
           (__draw-fold renderers ctx 0 n)
           (__ctx-clip-end ctx)
           (__legend-begin ctx)
+          (let [size (__legend-size renderers ctx 0 n (LegendSize 0 0.0))]
+            (__legend-box ctx (.rows size) (.width size)))
           (__legend-fold renderers ctx 0 n 0)
           (__ctx-finish ctx)
           (__ok 0)))))
