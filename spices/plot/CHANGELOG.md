@@ -45,6 +45,15 @@
   `__renderer-floats` / `-ints` / `-bounds`, `to-legacy`,
   `anyrenderers->legacy`) is gone. `__plot-sample-adaptive` takes the
   `DrawCtx` and the curve instead of a slot-bag handle.
+- Styles and options are types, not `:int` handles: `line-style`,
+  `point-style`, `fill-style` and `plot-opts` (and their `default-*`) return
+  a `LineStyle`, `PointStyle`, `FillStyle` and `PlotOpts`, and every
+  constructor and entry point takes the kind it draws with. A style of the
+  wrong kind, or a `0` meaning "no style", is now a compile error -- pass
+  `(default-line-style)` and so on. The style lists of `area-histogram`,
+  `stacked-histogram` and `contour-intervals` are `(Vec FillStyle)` rather
+  than cons lists of handles (`(vec-of fill1 fill2)`), and `contours`' style
+  parameter is named `style` (it was always one style).
 - `lines-r`, `points-r` and `label-r` are removed (build the struct with
   `make-struct`), and `plot-anyrenderers` is deprecated: `plot` takes the
   same argument.
@@ -66,9 +75,10 @@
   concrete backend type -- the "plot DSL becomes generic in Backend"
   the uplift plan called for.
 
-- `errors/run.sh` and three compile-fail fixtures: a type with no `Renderer`
-  instance cannot be boxed, `plot` rejects a `(Vec int)` of handles, and a
-  callback of the wrong function type is rejected.
+- `errors/run.sh` and four compile-fail fixtures: a type with no `Renderer`
+  instance cannot be boxed, `plot` rejects a `(Vec int)` of handles, a
+  `FillStyle` where a `LineStyle` is due is rejected, and so is a callback of
+  the wrong function type.
 
 ### Fixed
 

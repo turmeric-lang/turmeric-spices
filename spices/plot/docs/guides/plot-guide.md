@@ -65,7 +65,22 @@ scalar fields.
 
 Pass labels on data renderers and set `legend-pos` in `plot-opts`.
 
-## 7. Renderer types
+## 7. Styles
+
+`line-style`, `point-style` and `fill-style` build a `LineStyle`,
+`PointStyle` and `FillStyle`; `plot-opts` builds the `PlotOpts` every entry
+point takes. Each renderer takes the kind of style it draws with -- `lines`
+a `LineStyle`, `points` a `PointStyle`, the interval kinds a `FillStyle`
+for the band and a `LineStyle` for its outline -- so handing one the wrong
+kind is a compile error. A color of `-1` takes the next palette color
+automatically. The renderers that cycle through several fills take them as a
+Vec:
+
+```turmeric no-check
+(area-histogram bars (vec-of (fill-style 0 0.5 -1 0.0) (fill-style 1 0.5 -1 0.0)) "hist")
+```
+
+## 8. Renderer types
 
 Every constructor returns an `AnyRenderer`: its own renderer struct boxed
 with the struct's `Renderer` instance. `plot`, `plot-write-png`,

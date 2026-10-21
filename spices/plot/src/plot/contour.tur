@@ -8,12 +8,13 @@
   (export isoline contours contour-intervals color-field
           IsolineR ContoursR ContourIntervalsR ColorFieldR)
 
-  (import plot/core :refer [BBox hint-bbox any-renderer DrawCtx])
+  (import plot/core  :refer [BBox hint-bbox any-renderer DrawCtx])
+  (import plot/style :refer [LineStyle FillStyle])
 
   ;;; IsolineR -- the single contour f(x, y) = level.
   (defstruct IsolineR :copy [f : (fn [float float] float)
                              x-min : float  x-max : float  y-min : float  y-max : float
-                             samples : int  level : float  style : int  label : cstr])
+                             samples : int  level : float  style : LineStyle  label : cstr])
 
   ;;; ContoursR -- `levels` contours in one style.
   ;;
@@ -23,13 +24,13 @@
   ;; pixel-identical; giving the levels a real range is a separate change.
   (defstruct ContoursR :copy [f : (fn [float float] float)
                               x-min : float  x-max : float  y-min : float  y-max : float
-                              samples : int  levels : int  style : int  label : cstr])
+                              samples : int  levels : int  style : LineStyle  label : cstr])
 
   ;;; ContourIntervalsR -- f(x, y) over [0, 1] split into `bands` + 1 filled
-  ;;; bands, each taking the next fill-style from the `fills` cons list.
+  ;;; bands, band i taking the i-th style of `fills`.
   (defstruct ContourIntervalsR :copy [f : (fn [float float] float)
                                       x-min : float  x-max : float  y-min : float  y-max : float
-                                      samples : int  bands : int  fills : int  label : cstr])
+                                      samples : int  bands : int  fills : (Vec FillStyle)  label : cstr])
 
   ;;; ColorFieldR -- each grid cell filled with palette color f(x, y), at `alpha`.
   (defstruct ColorFieldR :copy [f : (fn [float float] int)
@@ -96,10 +97,11 @@
     ```)
 
   ;;; __draw-contour-bands -- fill each grid cell with the fill of the band (of
-  ;;; levels + 1 over [0, 1]) its center's f value falls in.
+  ;;; levels + 1 over [0, 1]) its center's f value falls in: band i takes the
+  ;;; i-th style of `fills`, or a palette color past the end.
   (defn __draw-contour-bands [ctx : DrawCtx  ^fat f : (fn [float float] float)
                             x-min : float  x-max : float  y-min : float  y-max : float
-                            grid : int  levels : int  fills : int] : void
+                            grid : int  levels : int  fills : (Vec FillStyle)] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -137,7 +139,9 @@
       {227.0/255.0, 119.0/255.0, 194.0/255.0},
       {127.0/255.0, 127.0/255.0, 127.0/255.0}
     };
+    typedef struct { int64_t *data; size_t len; size_t cap; } FillVec;
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    FillVec *fv = (FillVec *)(intptr_t)fills;
     int64_t canvas = (int64_t)(intptr_t)dc->canvas;
     do {
       int samples = (int)grid; if (samples < 8) samples = 8;
@@ -155,9 +159,7 @@
         if (!(t == t)) t = 0.0;
         if (t < 0.0) t = 0.0; if (t > 0.999) t = 0.999;
         int band = (int)floor(t * bands);
-        Cons *fs = (Cons *)(intptr_t)fills;
-        for (int bi = 0; bi < band && fs; bi++) fs = (Cons *)(intptr_t)fs->tail;
-        FillStyle *fill = (FillStyle *)(intptr_t)(fs ? fs->head : 0);
+        FillStyle *fill = (FillStyle *)(intptr_t)((fv && (size_t)band < fv->len) ? fv->data[band] : 0);
         color = fill ? (int)fill->color : band % 8;
         if (color < 0) color = band % 8;
         double vx0, vy0, vx1, vy1; MAP_POINT(x0, y0, &vx0, &vy0); MAP_POINT(x1, y1, &vx1, &vy1);
@@ -174,7 +176,7 @@
   (defn __draw-contour-lines [ctx : DrawCtx  ^fat f : (fn [float float] float)
                             x-min : float  x-max : float  y-min : float  y-max : float
                             grid : int  levels : int  single : bool
-                            level-lo : float  level-hi : float  style : int] : void
+                            level-lo : float  level-hi : float  style : LineStyle] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -197,7 +199,7 @@
       int64_t auto_color;
     } PlotDrawCtx;
     extern void plot_ctx_line_style(void *, int64_t);
-    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (int64_t)(intptr_t)(H))
     extern void plot_ctx_map(void *, double, double, void *, void *);
     #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
@@ -268,7 +270,7 @@
   ;;;   y-max   -- top edge of the sampled domain
   ;;;   samples -- grid points per axis (at least 8)
   ;;;   level   -- the contour value
-  ;;;   style   -- a line-style handle
+  ;;;   style   -- the LineStyle to stroke with
   ;;;   label   -- legend text ("" for none)
   ;;;
   ;;; Returns:
@@ -278,7 +280,7 @@
   ;;;   (isoline saddle -2.0 2.0 -2.0 2.0 32 0.0 (default-line-style) "zero")
   (defn isoline [^fat f : (fn [float float] float)
                  x-min : float  x-max : float  y-min : float  y-max : float
-                 samples : int  level : float  style : int  label : cstr] : AnyRenderer
+                 samples : int  level : float  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct IsolineR f x-min x-max y-min y-max samples level style label)))
 
   ;;; contours -- draw multiple automatically spaced contour levels.
@@ -291,7 +293,7 @@
   ;;;   y-max   -- top edge of the sampled domain
   ;;;   samples -- grid points per axis (at least 8)
   ;;;   n       -- number of levels
-  ;;;   styles  -- a line-style handle for every level
+  ;;;   style   -- the LineStyle of every level
   ;;;   label   -- legend text ("" for none)
   ;;;
   ;;; Returns:
@@ -301,8 +303,8 @@
   ;;;   (contours saddle -2.0 2.0 -2.0 2.0 32 4 (default-line-style) "levels")
   (defn contours [^fat f : (fn [float float] float)
                   x-min : float  x-max : float  y-min : float  y-max : float
-                  samples : int  n : int  styles : int  label : cstr] : AnyRenderer
-    (any-renderer (make-struct ContoursR f x-min x-max y-min y-max samples n styles label)))
+                  samples : int  n : int  style : LineStyle  label : cstr] : AnyRenderer
+    (any-renderer (make-struct ContoursR f x-min x-max y-min y-max samples n style label)))
 
   ;;; contour-intervals -- fill contour bands using sampled cells.
   ;;;
@@ -314,17 +316,17 @@
   ;;;   y-max   -- top edge of the sampled domain
   ;;;   samples -- grid points per axis (at least 8)
   ;;;   n       -- number of band boundaries (n + 1 bands)
-  ;;;   fills   -- cons list of fill-style handles, one per band
+  ;;;   fills   -- the FillStyle of each band, in order
   ;;;   label   -- legend text ("" for none)
   ;;;
   ;;; Returns:
   ;;;   A ContourIntervalsR boxed as an AnyRenderer.
   ;;;
   ;;; Example:
-  ;;;   (contour-intervals saddle -2.0 2.0 -2.0 2.0 32 3 fills "bands")
+  ;;;   (contour-intervals saddle -2.0 2.0 -2.0 2.0 32 3 (vec-of lo mid hi) "bands")
   (defn contour-intervals [^fat f : (fn [float float] float)
                            x-min : float  x-max : float  y-min : float  y-max : float
-                           samples : int  n : int  fills : int  label : cstr] : AnyRenderer
+                           samples : int  n : int  fills : (Vec FillStyle)  label : cstr] : AnyRenderer
     (any-renderer (make-struct ContourIntervalsR f x-min x-max y-min y-max samples n fills label)))
 
   ;;; color-field -- color sampled cells by f(x,y)->color-idx.

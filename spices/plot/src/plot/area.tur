@@ -7,28 +7,28 @@
   (export rectangles area-histogram discrete-histogram stacked-histogram
           RectanglesR AreaHistogramR DiscreteHistogramR StackedHistogramR)
 
-  (import plot/core :refer [BBox bbox-from-raw any-renderer DrawCtx
-                            __rects-bbox __discrete-hist-bbox __stacked-hist-bbox])
+  (import plot/core  :refer [BBox bbox-from-raw any-renderer DrawCtx
+                             __rects-bbox __discrete-hist-bbox __stacked-hist-bbox])
+  (import plot/style :refer [FillStyle])
 
   ;;; RectanglesR -- a cons list of (x0 . (x1 . (y0 . y1))) rectangles in one fill.
-  (defstruct RectanglesR :copy [rects : int  fill : int  label : cstr])
+  (defstruct RectanglesR :copy [rects : int  fill : FillStyle  label : cstr])
 
   ;;; AreaHistogramR -- pre-bucketed (x0 . (x1 . (y0 . y1))) bars, each taking the
-  ;;; next fill-style from the `fills` cons list.
-  (defstruct AreaHistogramR :copy [bars : int  fills : int  label : cstr])
+  ;;; next style of `fills` (the default fill past its end).
+  (defstruct AreaHistogramR :copy [bars : int  fills : (Vec FillStyle)  label : cstr])
 
   ;;; DiscreteHistogramR -- a cons list of (label . height) bars at category
   ;;; slots 0, 1, 2, ...; `horizontal` lays them along the y axis.
-  (defstruct DiscreteHistogramR :copy [bars : int  fill : int  horizontal : bool  label : cstr])
+  (defstruct DiscreteHistogramR :copy [bars : int  fill : FillStyle  horizontal : bool  label : cstr])
 
   ;;; StackedHistogramR -- a cons list of (label . values) groups, each slot a
-  ;;; stack of its values filled from the `fills` cons list; `labels` names the
-  ;;; stack layers.
-  (defstruct StackedHistogramR :copy [groups : int  fills : int  labels : int  horizontal : bool])
+  ;;; stack of its values, layer i filled with the i-th style of `fills`;
+  ;;; `labels` names the stack layers.
+  (defstruct StackedHistogramR :copy [groups : int  fills : (Vec FillStyle)  labels : int  horizontal : bool])
 
-  ;;; __draw-rects -- fill each (x0 . (x1 . (y0 . y1))) quad, taking the next fill
-  ;;; from `fill-list` while it lasts and `default-fill` after.
-  (defn __draw-rects [ctx : DrawCtx  rects : int  fill-list : int  default-fill : int] : void
+  ;;; __draw-rects -- fill each (x0 . (x1 . (y0 . y1))) quad with `fill`.
+  (defn __draw-rects [ctx : DrawCtx  rects : int  fill : FillStyle] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -54,15 +54,13 @@
     } PlotDrawCtx;
     #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
     extern void plot_ctx_fill_style(void *, int64_t);
-    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (H))
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
     extern void plot_ctx_map(void *, double, double, void *, void *);
     #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     int64_t canvas = (int64_t)(intptr_t)dc->canvas;
     do {
-      Cons *fills = (Cons *)(intptr_t)fill_list;
       for (Cons *p = (Cons *)(intptr_t)rects; p; p = (Cons *)(intptr_t)p->tail) {
-        int64_t fill = fills ? fills->head : default_fill;
         SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
         Cons *a = (Cons *)(intptr_t)p->head;
         double x0 = BITS_DBL(a->head);
@@ -74,7 +72,6 @@
         double vx0, vy0, vx1, vy1; MAP_POINT(x0, y0, &vx0, &vy0); MAP_POINT(x1, y1, &vx1, &vy1);
         plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)fmin(vx0, vx1), (float)fmin(vy0, vy1), (float)fabs(vx1 - vx0), (float)fabs(vy1 - vy0));
         plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
-        fills = fills ? (Cons *)(intptr_t)fills->tail : NULL;
       }
     } while (0);
     #undef SET_FILL_STYLE
@@ -82,9 +79,9 @@
     #undef BITS_DBL
     ```)
 
-  ;;; __draw-discrete-hist -- fill a 0.8-wide bar per (label . height) at slots
-  ;;; 0, 1, 2, ...; along the y axis when `horizontal`.
-  (defn __draw-discrete-hist [ctx : DrawCtx  bars : int  fill : int  horizontal : bool] : void
+  ;;; __draw-area-hist -- fill each (x0 . (x1 . (y0 . y1))) bar with the next
+  ;;; style of `fills`, then the default fill once they run out.
+  (defn __draw-area-hist [ctx : DrawCtx  bars : int  fills : (Vec FillStyle)] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -110,7 +107,65 @@
     } PlotDrawCtx;
     #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
     extern void plot_ctx_fill_style(void *, int64_t);
-    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (H))
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    typedef struct { int64_t *data; size_t len; size_t cap; } FillVec;
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      FillVec *fv = (FillVec *)(intptr_t)fills;
+      size_t fi = 0;
+      for (Cons *p = (Cons *)(intptr_t)bars; p; p = (Cons *)(intptr_t)p->tail) {
+        int64_t fill = (fv && fi < fv->len) ? fv->data[fi] : 0;
+        SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+        Cons *a = (Cons *)(intptr_t)p->head;
+        double x0 = BITS_DBL(a->head);
+        Cons *b = (Cons *)(intptr_t)a->tail;
+        double x1 = BITS_DBL(b->head);
+        Cons *c = (Cons *)(intptr_t)b->tail;
+        double y0 = BITS_DBL(c->head);
+        double y1 = BITS_DBL(c->tail);
+        double vx0, vy0, vx1, vy1; MAP_POINT(x0, y0, &vx0, &vy0); MAP_POINT(x1, y1, &vx1, &vy1);
+        plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)fmin(vx0, vx1), (float)fmin(vy0, vy1), (float)fabs(vx1 - vx0), (float)fabs(vy1 - vy0));
+        plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+        fi++;
+      }
+    } while (0);
+    #undef SET_FILL_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-discrete-hist -- fill a 0.8-wide bar per (label . height) at slots
+  ;;; 0, 1, 2, ...; along the y axis when `horizontal`.
+  (defn __draw-discrete-hist [ctx : DrawCtx  bars : int  fill : FillStyle  horizontal : bool] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double fabs(double);
+    extern double fmin(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_fill(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_fill_style(void *, int64_t);
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
     extern void plot_ctx_map(void *, double, double, void *, void *);
     #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
@@ -134,9 +189,9 @@
     #undef BITS_DBL
     ```)
 
-  ;;; __draw-stacked-hist -- fill each (label . values) slot as a stack, each value
-  ;;; taking the next fill from `fill-list`.
-  (defn __draw-stacked-hist [ctx : DrawCtx  groups : int  fill-list : int  horizontal : bool] : void
+  ;;; __draw-stacked-hist -- fill each (label . values) slot as a stack, each
+  ;;; layer taking the next style of `fills` (the default fill past the end).
+  (defn __draw-stacked-hist [ctx : DrawCtx  groups : int  fills : (Vec FillStyle)  horizontal : bool] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -162,10 +217,12 @@
     } PlotDrawCtx;
     #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
     extern void plot_ctx_fill_style(void *, int64_t);
-    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (H))
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
     extern void plot_ctx_map(void *, double, double, void *, void *);
     #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    typedef struct { int64_t *data; size_t len; size_t cap; } FillVec;
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    FillVec *fv = (FillVec *)(intptr_t)fills;
     int64_t canvas = (int64_t)(intptr_t)dc->canvas;
     do {
       int idx = 0, fill_idx = 0; (void)fill_idx;
@@ -174,9 +231,9 @@
         Cons *grp = (Cons *)(intptr_t)p->head;
         double acc = 0.0;
         Cons *vals = (Cons *)(intptr_t)grp->tail;
-        Cons *fills = (Cons *)(intptr_t)fill_list;
+        size_t fi = 0;
         while (vals) {
-          int64_t fill = fills ? fills->head : 0;
+          int64_t fill = (fv && fi < fv->len) ? fv->data[fi] : 0;
           SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
           double h = BITS_DBL(vals->head);
           double vx0, vy0, vx1, vy1;
@@ -186,7 +243,7 @@
           plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
           acc += h;
           vals = (Cons *)(intptr_t)vals->tail;
-          fills = fills ? (Cons *)(intptr_t)fills->tail : NULL;
+          fi++;
         }
       }
     } while (0);
@@ -199,12 +256,12 @@
   ;; renderer's bars (or groups) label the category ticks.
   (definstance Renderer [RectanglesR]
     (bounds [r] (bbox-from-raw (__rects-bbox (.rects r))))
-    (draw [r ctx] (__draw-rects ctx (.rects r) 0 (.fill r)))
+    (draw [r ctx] (__draw-rects ctx (.rects r) (.fill r)))
     (legend-label [r] (.label r)))
 
   (definstance Renderer [AreaHistogramR]
     (bounds [r] (bbox-from-raw (__rects-bbox (.bars r))))
-    (draw [r ctx] (__draw-rects ctx (.bars r) (.fills r) 0))
+    (draw [r ctx] (__draw-area-hist ctx (.bars r) (.fills r)))
     (legend-label [r] (.label r)))
 
   (definstance Renderer [DiscreteHistogramR]
@@ -222,7 +279,7 @@
   ;;;
   ;;; Parameters:
   ;;;   rects -- cons list of (x0 . (x1 . (y0 . y1))) quads (as double bits)
-  ;;;   fill  -- a fill-style handle
+  ;;;   fill  -- the FillStyle of the rectangles
   ;;;   label -- legend text ("" for none)
   ;;;
   ;;; Returns:
@@ -230,29 +287,29 @@
   ;;;
   ;;; Example:
   ;;;   (rectangles quads (default-fill-style) "boxes")
-  (defn rectangles [rects : int  fill : int  label : cstr] : AnyRenderer
+  (defn rectangles [rects : int  fill : FillStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct RectanglesR rects fill label)))
 
   ;;; area-histogram -- draw pre-bucketed bars with cycling fills.
   ;;;
   ;;; Parameters:
   ;;;   bars        -- cons list of (x0 . (x1 . (y0 . y1))) bars (as double bits)
-  ;;;   fill-styles -- cons list of fill-style handles, one per bar
+  ;;;   fill-styles -- the FillStyle of each bar, in order (the default past the end)
   ;;;   label       -- legend text ("" for none)
   ;;;
   ;;; Returns:
   ;;;   An AreaHistogramR boxed as an AnyRenderer.
   ;;;
   ;;; Example:
-  ;;;   (area-histogram buckets fills "hist")
-  (defn area-histogram [bars : int  fill-styles : int  label : cstr] : AnyRenderer
+  ;;;   (area-histogram buckets (vec-of (fill-style 0 0.5 -1 0.0) (fill-style 1 0.5 -1 0.0)) "hist")
+  (defn area-histogram [bars : int  fill-styles : (Vec FillStyle)  label : cstr] : AnyRenderer
     (any-renderer (make-struct AreaHistogramR bars fill-styles label)))
 
   ;;; discrete-histogram -- categorical bar chart.
   ;;;
   ;;; Parameters:
   ;;;   bars   -- cons list of (label . height) bars (label a cstr, height as double bits)
-  ;;;   fill   -- a fill-style handle
+  ;;;   fill   -- the FillStyle of the bars
   ;;;   invert -- non-zero for horizontal bars
   ;;;   label  -- legend text ("" for none)
   ;;;
@@ -261,14 +318,14 @@
   ;;;
   ;;; Example:
   ;;;   (discrete-histogram bars (default-fill-style) 0 "counts")
-  (defn discrete-histogram [bars : int  fill : int  invert : int  label : cstr] : AnyRenderer
+  (defn discrete-histogram [bars : int  fill : FillStyle  invert : int  label : cstr] : AnyRenderer
     (any-renderer (make-struct DiscreteHistogramR bars fill (not (= invert 0)) label)))
 
   ;;; stacked-histogram -- stacked categorical bars.
   ;;;
   ;;; Parameters:
   ;;;   groups -- cons list of (label . values) groups (values a cons list of double bits)
-  ;;;   fills  -- cons list of fill-style handles, one per stack layer (0 for the default)
+  ;;;   fills  -- the FillStyle of each stack layer (the default past the end)
   ;;;   labels -- cons list of layer names
   ;;;   invert -- non-zero for horizontal bars
   ;;;
@@ -276,8 +333,8 @@
   ;;;   A StackedHistogramR boxed as an AnyRenderer.
   ;;;
   ;;; Example:
-  ;;;   (stacked-histogram quarters fills layer-names 0)
-  (defn stacked-histogram [groups : int  fills : int  labels : int  invert : int] : AnyRenderer
+  ;;;   (stacked-histogram quarters (vec-of (default-fill-style) (default-fill-style)) layer-names 0)
+  (defn stacked-histogram [groups : int  fills : (Vec FillStyle)  labels : int  invert : int] : AnyRenderer
     (any-renderer (make-struct StackedHistogramR groups fills labels (not (= invert 0)))))
 
 ) ;; end defmodule plot/area

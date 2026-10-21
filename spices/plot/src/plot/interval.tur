@@ -8,30 +8,31 @@
   (export function-interval lines-interval parametric-interval polar-interval
           FunctionIntervalR LinesIntervalR ParametricIntervalR PolarIntervalR)
 
-  (import plot/core :refer [BBox bbox-from-raw bbox-empty-box bbox-union any-renderer
-                            DrawCtx __point-list-bbox])
+  (import plot/core  :refer [BBox bbox-from-raw bbox-empty-box bbox-union any-renderer
+                             DrawCtx __point-list-bbox])
+  (import plot/style :refer [LineStyle FillStyle])
 
   ;;; FunctionIntervalR -- the band between y = f1(x) and y = f2(x).
   (defstruct FunctionIntervalR :copy [f1 : (fn [float] float)  f2 : (fn [float] float)
                                       x-min : float  x-max : float  samples : int
-                                      fill : int  style : int  label : cstr])
+                                      fill : FillStyle  style : LineStyle  label : cstr])
 
   ;;; LinesIntervalR -- the band between two point lists sharing x coordinates.
   (defstruct LinesIntervalR :copy [lower : int  upper : int
-                                   fill : int  style : int  label : cstr])
+                                   fill : FillStyle  style : LineStyle  label : cstr])
 
   ;;; ParametricIntervalR -- the band between two parametric curves f(t) = (cons x y).
   (defstruct ParametricIntervalR :copy [f1 : (fn [float] int)  f2 : (fn [float] int)
                                         t-min : float  t-max : float  samples : int
-                                        fill : int  style : int  label : cstr])
+                                        fill : FillStyle  style : LineStyle  label : cstr])
 
   ;;; PolarIntervalR -- the band between two polar curves radius = f(theta).
   (defstruct PolarIntervalR :copy [f1 : (fn [float] float)  f2 : (fn [float] float)
                                    theta-min : float  theta-max : float  samples : int
-                                   fill : int  style : int  label : cstr])
+                                   fill : FillStyle  style : LineStyle  label : cstr])
 
   ;;; __draw-lines-interval -- fill (then outline) the band between two point lists.
-  (defn __draw-lines-interval [ctx : DrawCtx  lower : int  upper : int  fill : int  style : int] : void
+  (defn __draw-lines-interval [ctx : DrawCtx  lower : int  upper : int  fill : FillStyle  style : LineStyle] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -59,9 +60,9 @@
     } PlotDrawCtx;
     #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
     extern void plot_ctx_line_style(void *, int64_t);
-    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (int64_t)(intptr_t)(H))
     extern void plot_ctx_fill_style(void *, int64_t);
-    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (H))
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
     extern void plot_ctx_map(void *, double, double, void *, void *);
     #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
@@ -102,7 +103,9 @@
 
   ;;; __draw-curve-interval -- fill (then outline) the band between two sampled
   ;;; curves: `mode` 40 y = f(x), 42 points f(t), 43 radii f(theta). The
-  ;;; three interval kinds' draws share it; pinned for their inline C.
+  ;;; three interval kinds' draws share it; pinned for their inline C. `fill`
+  ;;; and `style` arrive as words because a C caller declares this prototype
+  ;;; itself, and the C type an opaque lowers to is the compiler's choice.
   (defn (export-as "plot_draw_curve_interval")
         __draw-curve-interval [ctx : ptr<void>  mode : int  f1 : int  f2 : int
                                t-lo : float  t-hi : float  samples : int
@@ -136,9 +139,9 @@
     } PlotDrawCtx;
     #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
     extern void plot_ctx_line_style(void *, int64_t);
-    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (int64_t)(intptr_t)(H))
     extern void plot_ctx_fill_style(void *, int64_t);
-    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (H))
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (int64_t)(intptr_t)(H))
     extern void plot_ctx_map(void *, double, double, void *, void *);
     #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
@@ -193,7 +196,7 @@
 
   ;;; __draw-function-interval -- the function-interval band, through __draw-curve-interval.
   (defn __draw-function-interval [ctx : DrawCtx  ^fat f1 : (fn [float] float)  ^fat f2 : (fn [float] float)
-                  x-min : float  x-max : float  samples : int  fill : int  style : int] : void
+                  x-min : float  x-max : float  samples : int  fill : FillStyle  style : LineStyle] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -212,13 +215,14 @@
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     int64_t canvas = (int64_t)(intptr_t)dc->canvas;
     do {
-      plot_draw_curve_interval(dc, 40, f1, f2, x_min, x_max, samples, fill, style);
+      plot_draw_curve_interval(dc, 40, f1, f2, x_min, x_max, samples,
+                               (int64_t)(intptr_t)fill, (int64_t)(intptr_t)style);
     } while (0);
     ```)
 
   ;;; __draw-parametric-interval -- the parametric-interval band, through __draw-curve-interval.
   (defn __draw-parametric-interval [ctx : DrawCtx  ^fat f1 : (fn [float] int)  ^fat f2 : (fn [float] int)
-                  t-min : float  t-max : float  samples : int  fill : int  style : int] : void
+                  t-min : float  t-max : float  samples : int  fill : FillStyle  style : LineStyle] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -237,13 +241,14 @@
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     int64_t canvas = (int64_t)(intptr_t)dc->canvas;
     do {
-      plot_draw_curve_interval(dc, 42, f1, f2, t_min, t_max, samples, fill, style);
+      plot_draw_curve_interval(dc, 42, f1, f2, t_min, t_max, samples,
+                               (int64_t)(intptr_t)fill, (int64_t)(intptr_t)style);
     } while (0);
     ```)
 
   ;;; __draw-polar-interval -- the polar-interval band, through __draw-curve-interval.
   (defn __draw-polar-interval [ctx : DrawCtx  ^fat f1 : (fn [float] float)  ^fat f2 : (fn [float] float)
-                  theta-min : float  theta-max : float  samples : int  fill : int  style : int] : void
+                  theta-min : float  theta-max : float  samples : int  fill : FillStyle  style : LineStyle] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -262,7 +267,8 @@
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     int64_t canvas = (int64_t)(intptr_t)dc->canvas;
     do {
-      plot_draw_curve_interval(dc, 43, f1, f2, theta_min, theta_max, samples, fill, style);
+      plot_draw_curve_interval(dc, 43, f1, f2, theta_min, theta_max, samples,
+                               (int64_t)(intptr_t)fill, (int64_t)(intptr_t)style);
     } while (0);
     ```)
 
@@ -300,8 +306,8 @@
   ;;;   x-min   -- start of the sampled domain
   ;;;   x-max   -- end of the sampled domain
   ;;;   samples -- sample count (at least 32 are drawn)
-  ;;;   fill    -- a fill-style handle for the band
-  ;;;   style   -- a line-style handle for its outline
+  ;;;   fill    -- the FillStyle of the band
+  ;;;   style   -- the LineStyle of its outline
   ;;;   label   -- legend text ("" for none)
   ;;;
   ;;; Returns:
@@ -311,7 +317,7 @@
   ;;;   (function-interval lo hi -1.0 1.0 96 (default-fill-style) (default-line-style) "band")
   (defn function-interval [^fat f1 : (fn [float] float)  ^fat f2 : (fn [float] float)
                            x-min : float  x-max : float  samples : int
-                           fill : int  style : int  label : cstr] : AnyRenderer
+                           fill : FillStyle  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct FunctionIntervalR f1 f2 x-min x-max samples fill style label)))
 
   ;;; lines-interval -- shade between two sampled line lists.
@@ -319,8 +325,8 @@
   ;;; Parameters:
   ;;;   vs1   -- cons list of (cons x y) points on one edge
   ;;;   vs2   -- cons list of (cons x y) points on the other, same x order
-  ;;;   fill  -- a fill-style handle for the band
-  ;;;   style -- a line-style handle for its outline
+  ;;;   fill  -- the FillStyle of the band
+  ;;;   style -- the LineStyle of its outline
   ;;;   label -- legend text ("" for none)
   ;;;
   ;;; Returns:
@@ -328,7 +334,7 @@
   ;;;
   ;;; Example:
   ;;;   (lines-interval lo-pts hi-pts (default-fill-style) (default-line-style) "ci")
-  (defn lines-interval [vs1 : int  vs2 : int  fill : int  style : int  label : cstr] : AnyRenderer
+  (defn lines-interval [vs1 : int  vs2 : int  fill : FillStyle  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct LinesIntervalR vs1 vs2 fill style label)))
 
   ;;; parametric-interval -- shade between two parametric curves.
@@ -339,8 +345,8 @@
   ;;;   t-min   -- start of the parameter range
   ;;;   t-max   -- end of the parameter range
   ;;;   samples -- sample count (at least 32 are drawn)
-  ;;;   fill    -- a fill-style handle for the band
-  ;;;   style   -- a line-style handle for its outline
+  ;;;   fill    -- the FillStyle of the band
+  ;;;   style   -- the LineStyle of its outline
   ;;;   label   -- legend text ("" for none)
   ;;;
   ;;; Returns:
@@ -350,7 +356,7 @@
   ;;;   (parametric-interval inner outer 0.0 1.0 72 (default-fill-style) (default-line-style) "")
   (defn parametric-interval [^fat f1 : (fn [float] int)  ^fat f2 : (fn [float] int)
                              t-min : float  t-max : float  samples : int
-                             fill : int  style : int  label : cstr] : AnyRenderer
+                             fill : FillStyle  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct ParametricIntervalR f1 f2 t-min t-max samples fill style label)))
 
   ;;; polar-interval -- shade between two polar curves.
@@ -361,8 +367,8 @@
   ;;;   theta-min -- start of the angle range, in radians
   ;;;   theta-max -- end of the angle range, in radians
   ;;;   samples   -- sample count (at least 32 are drawn)
-  ;;;   fill      -- a fill-style handle for the band
-  ;;;   style     -- a line-style handle for its outline
+  ;;;   fill      -- the FillStyle of the band
+  ;;;   style     -- the LineStyle of its outline
   ;;;   label     -- legend text ("" for none)
   ;;;
   ;;; Returns:
@@ -372,7 +378,7 @@
   ;;;   (polar-interval r-in r-out 0.0 3.14 72 (default-fill-style) (default-line-style) "")
   (defn polar-interval [^fat f1 : (fn [float] float)  ^fat f2 : (fn [float] float)
                         theta-min : float  theta-max : float  samples : int
-                        fill : int  style : int  label : cstr] : AnyRenderer
+                        fill : FillStyle  style : LineStyle  label : cstr] : AnyRenderer
     (any-renderer (make-struct PolarIntervalR f1 f2 theta-min theta-max samples fill style label)))
 
 ) ;; end defmodule plot/interval
