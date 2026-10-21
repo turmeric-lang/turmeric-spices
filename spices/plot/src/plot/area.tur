@@ -1,24 +1,115 @@
 ;; plot/area.tur -- filled rectangles and histogram renderers.
+;;
+;; Each kind is a struct with a `Renderer` instance; the constructors box it as
+;; an `AnyRenderer`.
 
 (defmodule plot/area
-  (export rectangles area-histogram discrete-histogram stacked-histogram)
+  (export rectangles area-histogram discrete-histogram stacked-histogram
+          RectanglesR AreaHistogramR DiscreteHistogramR StackedHistogramR)
 
-  (import plot/core :refer [__make-renderer __renderer-ints])
+  (import plot/core :refer [__make-renderer __renderer-ints
+                            BBox bbox-from-raw any-renderer
+                            __rects-bbox __discrete-hist-bbox __stacked-hist-bbox])
+
+  ;;; RectanglesR -- a cons list of (x0 . (x1 . (y0 . y1))) rectangles in one fill.
+  (defstruct RectanglesR :copy [rects : int  fill : int  label : cstr])
+
+  ;;; AreaHistogramR -- pre-bucketed (x0 . (x1 . (y0 . y1))) bars, each taking the
+  ;;; next fill-style from the `fills` cons list.
+  (defstruct AreaHistogramR :copy [bars : int  fills : int  label : cstr])
+
+  ;;; DiscreteHistogramR -- a cons list of (label . height) bars at category
+  ;;; slots 0, 1, 2, ...; `horizontal` lays them along the y axis.
+  (defstruct DiscreteHistogramR :copy [bars : int  fill : int  horizontal : bool  label : cstr])
+
+  ;;; StackedHistogramR -- a cons list of (label . values) groups, each slot a
+  ;;; stack of its values filled from the `fills` cons list; `labels` names the
+  ;;; stack layers.
+  (defstruct StackedHistogramR :copy [groups : int  fills : int  labels : int  horizontal : bool])
+
+  ;; to-legacy: RK_RECTANGLES 50, RK_AREA_HIST 51, RK_DISCRETE_HIST 52,
+  ;; RK_STACKED_HIST 53. The categorical kinds carry their bars a second time
+  ;; in data2, where the frame reads its category tick labels from.
+  (definstance Renderer [RectanglesR]
+    (bounds [r] (bbox-from-raw (__rects-bbox (.rects r))))
+    (to-legacy [r] (__make-renderer 50 (.fill r) 0 (.rects r) 0 0 0 0 (.label r) "")))
+
+  (definstance Renderer [AreaHistogramR]
+    (bounds [r] (bbox-from-raw (__rects-bbox (.bars r))))
+    (to-legacy [r] (__make-renderer 51 0 0 (.bars r) (.fills r) 0 0 0 (.label r) "")))
+
+  (definstance Renderer [DiscreteHistogramR]
+    (bounds [r] (bbox-from-raw (__discrete-hist-bbox (.bars r) (.horizontal r))))
+    (to-legacy [r]
+      (__renderer-ints (__make-renderer 52 (.fill r) 0 (.bars r) (.bars r) 0 0 0 (.label r) "")
+                       (if (.horizontal r) 1 0) 0 0 0)))
+
+  (definstance Renderer [StackedHistogramR]
+    (bounds [r] (bbox-from-raw (__stacked-hist-bbox (.groups r) (.horizontal r))))
+    (to-legacy [r]
+      (__renderer-ints (__make-renderer 53 0 0 (.groups r) (.groups r) (.fills r) (.labels r) 0 "" "")
+                       (if (.horizontal r) 1 0) 0 0 0)))
 
   ;;; rectangles -- draw filled rectangles from nested cons quads.
-  (defn rectangles [rects : int fill : int label : cstr] : int
-    (__make-renderer 50 fill 0 rects 0 0 0 0 label ""))
+  ;;;
+  ;;; Parameters:
+  ;;;   rects -- cons list of (x0 . (x1 . (y0 . y1))) quads (as double bits)
+  ;;;   fill  -- a fill-style handle
+  ;;;   label -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A RectanglesR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (rectangles quads (default-fill-style) "boxes")
+  (defn rectangles [rects : int  fill : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct RectanglesR rects fill label)))
 
   ;;; area-histogram -- draw pre-bucketed bars with cycling fills.
-  (defn area-histogram [bars : int fill-styles : int label : cstr] : int
-    (__make-renderer 51 0 0 bars fill-styles 0 0 0 label ""))
+  ;;;
+  ;;; Parameters:
+  ;;;   bars        -- cons list of (x0 . (x1 . (y0 . y1))) bars (as double bits)
+  ;;;   fill-styles -- cons list of fill-style handles, one per bar
+  ;;;   label       -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   An AreaHistogramR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (area-histogram buckets fills "hist")
+  (defn area-histogram [bars : int  fill-styles : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct AreaHistogramR bars fill-styles label)))
 
   ;;; discrete-histogram -- categorical bar chart.
-  (defn discrete-histogram [bars : int fill : int invert : int label : cstr] : int
-    (__renderer-ints (__make-renderer 52 fill 0 bars bars 0 0 0 label "") invert 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   bars   -- cons list of (label . height) bars (label a cstr, height as double bits)
+  ;;;   fill   -- a fill-style handle
+  ;;;   invert -- non-zero for horizontal bars
+  ;;;   label  -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A DiscreteHistogramR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (discrete-histogram bars (default-fill-style) 0 "counts")
+  (defn discrete-histogram [bars : int  fill : int  invert : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct DiscreteHistogramR bars fill (not (= invert 0)) label)))
 
   ;;; stacked-histogram -- stacked categorical bars.
-  (defn stacked-histogram [groups : int fills : int labels : int invert : int] : int
-    (__renderer-ints (__make-renderer 53 0 0 groups groups fills labels 0 "" "") invert 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   groups -- cons list of (label . values) groups (values a cons list of double bits)
+  ;;;   fills  -- cons list of fill-style handles, one per stack layer (0 for the default)
+  ;;;   labels -- cons list of layer names
+  ;;;   invert -- non-zero for horizontal bars
+  ;;;
+  ;;; Returns:
+  ;;;   A StackedHistogramR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (stacked-histogram quarters fills layer-names 0)
+  (defn stacked-histogram [groups : int  fills : int  labels : int  invert : int] : AnyRenderer
+    (any-renderer (make-struct StackedHistogramR groups fills labels (not (= invert 0)))))
 
 ) ;; end defmodule plot/area

@@ -5,67 +5,223 @@
 ;; baseline, and segments are bisected (up to depth 6) when adjacent
 ;; screen-space sub-segments turn sharply or cross a NaN/non-NaN boundary.
 ;; `lines` draws the caller's polyline as-is and retains NaN-as-gap behavior.
+;;
+;; Each kind is a struct with a `Renderer` instance; the constructors box it as
+;; an `AnyRenderer`. A curve callback is any function value of the declared
+;; type -- a named `defn` or a `fn` literal, capturing or not.
 
 (defmodule plot/line
-  (export function lines parametric polar inverse density)
+  (export function lines parametric polar inverse density
+          LinesR FunctionR ParametricR PolarR InverseR DensityR)
 
-  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds])
+  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds
+                            BBox bbox-from-raw bbox-empty-box __point-list-bbox any-renderer])
 
   ;;; __nan -- quiet NaN sentinel for "auto y bound" on function-style renderers.
   ;;; Inline-C avoids the runtime div-by-zero trap on `(/ 0.0 0.0)`.
   (defn __nan [] : float
     ```c return 0.0 / 0.0; ```)
 
+  ;;; LinesR -- a polyline through a cons list of (cons x y) points.
+  (defstruct LinesR :copy [points : int  style : int  label : cstr])
+
+  ;;; FunctionR -- y = f(x), sampled over [x-min, x-max].
+  (defstruct FunctionR :copy [f : (fn [float] float)  x-min : float  x-max : float
+                              samples : int  style : int  label : cstr])
+
+  ;;; ParametricR -- the point f(t) = (cons x y), sampled over [t-min, t-max].
+  (defstruct ParametricR :copy [f : (fn [float] int)  t-min : float  t-max : float
+                                samples : int  style : int  label : cstr])
+
+  ;;; PolarR -- radius = f(theta), sampled over [theta-min, theta-max].
+  (defstruct PolarR :copy [f : (fn [float] float)  theta-min : float  theta-max : float
+                           samples : int  style : int  label : cstr])
+
+  ;;; InverseR -- x = f(y), sampled over [y-min, y-max].
+  (defstruct InverseR :copy [f : (fn [float] float)  y-min : float  y-max : float
+                             samples : int  style : int  label : cstr])
+
+  ;;; DensityR -- a Gaussian kernel density estimate of a cons list of samples;
+  ;;; a `bandwidth` of 0 picks Silverman's rule.
+  (defstruct DensityR :copy [values : int  bandwidth : float  samples : int
+                             style : int  label : cstr])
+
+  ;; Bounds: a polyline spans its points. A sampled curve's y extent is not
+  ;; known until it is sampled, and a density's x range is the plot's own, so
+  ;; those constrain nothing -- they are drawn over the extent the other
+  ;; renderers (or `plot-opts`) establish.
+  ;;
+  ;; to-legacy builds the slot-bag handle the draw pass reads: RK_LINES 20,
+  ;; RK_FUNCTION 21, RK_PARAMETRIC 22, RK_POLAR 23, RK_INVERSE 24,
+  ;; RK_DENSITY 25. A callback crosses as its closure handle.
+  (definstance Renderer [LinesR]
+    (bounds [r] (bbox-from-raw (__point-list-bbox (.points r))))
+    (to-legacy [r] (__make-renderer 20 (.style r) 0 (.points r) 0 0 0 0 (.label r) "")))
+
+  (definstance Renderer [FunctionR]
+    (bounds [r] (bbox-empty-box))
+    (to-legacy [r]
+      (__renderer-bounds
+        (__renderer-ints
+          (__renderer-floats (__make-renderer 21 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
+                             (.x-min r) (.x-max r) 0.0 0.0 0.0 0.0)
+          (.samples r) 0 0 0)
+        (.x-min r) (.x-max r) (__nan) (__nan))))
+
+  (definstance Renderer [ParametricR]
+    (bounds [r] (bbox-empty-box))
+    (to-legacy [r]
+      (__renderer-ints
+        (__renderer-floats (__make-renderer 22 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
+                           (.t-min r) (.t-max r) 0.0 0.0 0.0 0.0)
+        (.samples r) 0 0 0)))
+
+  (definstance Renderer [PolarR]
+    (bounds [r] (bbox-empty-box))
+    (to-legacy [r]
+      (__renderer-ints
+        (__renderer-floats (__make-renderer 23 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
+                           (.theta-min r) (.theta-max r) 0.0 0.0 0.0 0.0)
+        (.samples r) 0 0 0)))
+
+  (definstance Renderer [InverseR]
+    (bounds [r] (bbox-empty-box))
+    (to-legacy [r]
+      (__renderer-ints
+        (__renderer-floats (__make-renderer 24 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
+                           (.y-min r) (.y-max r) 0.0 0.0 0.0 0.0)
+        (.samples r) 0 0 0)))
+
+  (definstance Renderer [DensityR]
+    (bounds [r] (bbox-empty-box))
+    (to-legacy [r]
+      (__renderer-ints
+        (__renderer-floats (__make-renderer 25 (.style r) 0 (.values r) 0 0 0 0 (.label r) "")
+                           (.bandwidth r) 0.0 0.0 0.0 0.0 0.0)
+        (.samples r) 0 0 0)))
+
   ;;; function -- sample y=f(x) over [x-min, x-max].
+  ;;;
   ;;; `samples` is the uniform baseline count; the renderer subdivides further
   ;;; in high-curvature regions and around NaN boundaries via plot/core's
-  ;;; adaptive sampler.
-  (defn function [f x-min : float x-max : float samples : int style : int label : cstr] : int
-    (__renderer-bounds
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 21 style 0 f 0 0 0 0 label "")
-                           x-min x-max 0.0 0.0 0.0 0.0)
-        samples 0 0 0)
-      x-min x-max (__nan) (__nan)))
+  ;;; adaptive sampler. The curve contributes no bounds of its own.
+  ;;;
+  ;;; Parameters:
+  ;;;   f       -- the curve, a (fn [float] float): a defn or a fn literal
+  ;;;   x-min   -- start of the sampled domain
+  ;;;   x-max   -- end of the sampled domain
+  ;;;   samples -- uniform baseline sample count
+  ;;;   style   -- a line-style handle
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A FunctionR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (function (fn [x : float] : float (* x x)) -2.0 2.0 96 (default-line-style) "x^2")
+  (defn function [^fat f : (fn [float] float)  x-min : float  x-max : float
+                  samples : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct FunctionR f x-min x-max samples style label)))
 
   ;;; lines -- draw a polyline through a cons list of (cons x y) points.
+  ;;;
   ;;; Pre-sampled input; the renderer plots the points as given and breaks the
   ;;; polyline on NaN coordinates so callers can encode explicit gaps.
-  (defn lines [vs : int style : int label : cstr] : int
-    (__make-renderer 20 style 0 vs 0 0 0 0 label ""))
+  ;;;
+  ;;; Parameters:
+  ;;;   vs    -- cons list of (cons x y) points (coordinates as double bits)
+  ;;;   style -- a line-style handle
+  ;;;   label -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A LinesR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (lines pts (default-line-style) "data")
+  (defn lines [vs : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct LinesR vs style label)))
 
   ;;; parametric -- sample f(t) -> (cons x y).
+  ;;;
   ;;; `samples` is the uniform baseline; segments are adaptively subdivided
   ;;; when they turn sharply or cross NaN boundaries.
-  (defn parametric [f t-min : float t-max : float samples : int style : int label : cstr] : int
-    (__renderer-ints
-      (__renderer-floats (__make-renderer 22 style 0 f 0 0 0 0 label "")
-                         t-min t-max 0.0 0.0 0.0 0.0)
-      samples 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   f       -- the curve, a (fn [float] int) returning a (cons x y) point
+  ;;;   t-min   -- start of the parameter range
+  ;;;   t-max   -- end of the parameter range
+  ;;;   samples -- uniform baseline sample count
+  ;;;   style   -- a line-style handle
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A ParametricR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (parametric circle-point 0.0 6.283 128 (default-line-style) "circle")
+  (defn parametric [^fat f : (fn [float] int)  t-min : float  t-max : float
+                    samples : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct ParametricR f t-min t-max samples style label)))
 
   ;;; polar -- sample radius=f(theta).
+  ;;;
   ;;; `samples` is the uniform baseline; segments are adaptively subdivided in
   ;;; high-curvature regions.
-  (defn polar [f theta-min : float theta-max : float samples : int style : int label : cstr] : int
-    (__renderer-ints
-      (__renderer-floats (__make-renderer 23 style 0 f 0 0 0 0 label "")
-                         theta-min theta-max 0.0 0.0 0.0 0.0)
-      samples 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   f         -- the radius, a (fn [float] float) of theta
+  ;;;   theta-min -- start of the angle range, in radians
+  ;;;   theta-max -- end of the angle range, in radians
+  ;;;   samples   -- uniform baseline sample count
+  ;;;   style     -- a line-style handle
+  ;;;   label     -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A PolarR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (polar (fn [t : float] : float 1.0) 0.0 6.283 96 (default-line-style) "r=1")
+  (defn polar [^fat f : (fn [float] float)  theta-min : float  theta-max : float
+               samples : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct PolarR f theta-min theta-max samples style label)))
 
   ;;; inverse -- sample x=f(y) over [y-min, y-max].
+  ;;;
   ;;; `samples` is the uniform baseline; segments are adaptively subdivided
   ;;; when they turn sharply or cross NaN boundaries (e.g. log-domain edges).
-  (defn inverse [f y-min : float y-max : float samples : int style : int label : cstr] : int
-    (__renderer-ints
-      (__renderer-floats (__make-renderer 24 style 0 f 0 0 0 0 label "")
-                         y-min y-max 0.0 0.0 0.0 0.0)
-      samples 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   f       -- the curve, a (fn [float] float) of y
+  ;;;   y-min   -- start of the sampled range
+  ;;;   y-max   -- end of the sampled range
+  ;;;   samples -- uniform baseline sample count
+  ;;;   style   -- a line-style handle
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   An InverseR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (inverse (fn [y : float] : float (* y y)) -1.0 1.0 96 (default-line-style) "x=y^2")
+  (defn inverse [^fat f : (fn [float] float)  y-min : float  y-max : float
+                 samples : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct InverseR f y-min y-max samples style label)))
 
   ;;; density -- kernel density estimate from a cons list of samples.
-  (defn density [vs : int bandwidth : float samples : int style : int label : cstr] : int
-    (__renderer-ints
-      (__renderer-floats (__make-renderer 25 style 0 vs 0 0 0 0 label "")
-                         bandwidth 0.0 0.0 0.0 0.0 0.0)
-      samples 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   vs        -- cons list of sample values (as double bits)
+  ;;;   bandwidth -- kernel bandwidth; 0.0 picks Silverman's rule
+  ;;;   samples   -- number of points the estimate is drawn through
+  ;;;   style     -- a line-style handle
+  ;;;   label     -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A DensityR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (density xs 0.0 128 (default-line-style) "kde")
+  (defn density [vs : int  bandwidth : float  samples : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct DensityR vs bandwidth samples style label)))
 
 ) ;; end defmodule plot/line

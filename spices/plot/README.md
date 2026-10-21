@@ -25,8 +25,10 @@ plots into a larger image.
 
 ## Quick start
 
-The sampled-curve renderers take a typed C-callable: define your function
-with `defn` rather than passing an untyped `fn` literal.
+Each renderer constructor (`function`, `lines`, `axes`, ...) returns an
+`AnyRenderer`, and `plot-write-png` takes a `(Vec AnyRenderer)`, so a `vec-of`
+over them mixes kinds freely. A sampled curve's callback is a typed function
+value -- a `defn`, or a `fn` literal that may capture.
 
 ```turmeric
 (import plot/core  :refer [plot-write-png])
@@ -72,6 +74,24 @@ plot-write-png
 segments in high-curvature regions and around NaN boundaries up to a fixed
 depth, so smooth curves stay cheap and sharp turns get extra samples
 without forcing every caller to crank the count globally.
+
+## Renderers are typed
+
+Every renderer kind is its own type -- `FunctionR`, `LinesR`, `PointsR`,
+`ContoursR`, the `Decoration` sum type for axes and grids, and so on -- with
+named fields and an instance of the `Renderer` class:
+
+```turmeric no-check
+(defclass Renderer [a]
+  (bounds [r] : BBox)       ;; the data extent the renderer needs on screen
+  (to-legacy [r] : int))    ;; lowering for the C draw pass (internal)
+```
+
+The plot's extent is the union of its renderers' `bounds`. A constructor
+boxes its struct with that instance as an `AnyRenderer`, which is what
+lets one Vec hold every kind. Passing anything else to `plot` -- a value with
+no `Renderer` instance, or a callback of the wrong function type -- is a
+compile error, not a mis-rendered chart.
 
 ## See also
 

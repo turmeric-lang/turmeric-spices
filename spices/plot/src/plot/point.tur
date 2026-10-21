@@ -1,30 +1,128 @@
 ;; plot/point.tur -- point-like renderers.
+;;
+;; Each kind is a struct with a `Renderer` instance; the constructors box it as
+;; an `AnyRenderer`.
 
 (defmodule plot/point
-  (export points error-bars vector-field arrows)
+  (export points error-bars vector-field arrows
+          PointsR ErrorBarsR VectorFieldR ArrowsR)
 
-  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds])
+  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds
+                            BBox bbox-from-raw hint-bbox any-renderer
+                            __point-list-bbox __error-bars-bbox __arrows-bbox])
+
+  ;;; PointsR -- a scatter of a cons list of (cons x y) points.
+  ;;; Nominally distinct from LinesR though the payloads match, so the two can
+  ;;; never be swapped silently (the slot-bag `kind` tag could be).
+  (defstruct PointsR :copy [points : int  style : int  label : cstr])
+
+  ;;; ErrorBarsR -- a cons list of (x . (y . h)) bars spanning y +/- h, or
+  ;;; x +/- h when `horizontal`.
+  (defstruct ErrorBarsR :copy [bars : int  style : int  horizontal : bool  label : cstr])
+
+  ;;; VectorFieldR -- f(x, y) = (cons dx dy) drawn on a samples x samples grid
+  ;;; over the domain. `scale-mode` 0 draws the raw vector, 1 a unit vector,
+  ;;; 2 the raw vector at a larger scale.
+  (defstruct VectorFieldR :copy [f : (fn [float float] int)
+                                 x-min : float  x-max : float  y-min : float  y-max : float
+                                 samples : int  scale-mode : int  style : int  label : cstr])
+
+  ;;; ArrowsR -- a cons list of (x1 . (y1 . (x2 . y2))) arrow segments.
+  (defstruct ArrowsR :copy [arrows : int  style : int  label : cstr])
+
+  ;; to-legacy: RK_POINTS 30, RK_ERROR_BARS 31, RK_VECTOR_FIELD 32, RK_ARROWS 33.
+  (definstance Renderer [PointsR]
+    (bounds [r] (bbox-from-raw (__point-list-bbox (.points r))))
+    (to-legacy [r] (__make-renderer 30 (.style r) 0 (.points r) 0 0 0 0 (.label r) "")))
+
+  (definstance Renderer [ErrorBarsR]
+    (bounds [r] (bbox-from-raw (__error-bars-bbox (.bars r) (.horizontal r))))
+    (to-legacy [r]
+      (__renderer-ints (__make-renderer 31 (.style r) 0 (.bars r) 0 0 0 0 (.label r) "")
+                       (if (.horizontal r) 1 0) 0 0 0)))
+
+  (definstance Renderer [VectorFieldR]
+    (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
+    (to-legacy [r]
+      (__renderer-bounds
+        (__renderer-ints
+          (__renderer-floats (__make-renderer 32 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
+                             (.x-min r) (.x-max r) (.y-min r) (.y-max r) 0.0 0.0)
+          (.samples r) (.scale-mode r) 0 0)
+        (.x-min r) (.x-max r) (.y-min r) (.y-max r))))
+
+  (definstance Renderer [ArrowsR]
+    (bounds [r] (bbox-from-raw (__arrows-bbox (.arrows r))))
+    (to-legacy [r] (__make-renderer 33 (.style r) 0 (.arrows r) 0 0 0 0 (.label r) "")))
 
   ;;; points -- scatter plot renderer.
-  (defn points [vs : int style : int label : cstr] : int
-    (__make-renderer 30 style 0 vs 0 0 0 0 label ""))
+  ;;;
+  ;;; Parameters:
+  ;;;   vs    -- cons list of (cons x y) points (coordinates as double bits)
+  ;;;   style -- a point-style handle
+  ;;;   label -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A PointsR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (points pts (default-point-style) "samples")
+  (defn points [vs : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct PointsR vs style label)))
 
   ;;; error-bars -- vertical or horizontal error bars.
-  (defn error-bars [bars : int style : int invert : int label : cstr] : int
-    (__renderer-ints (__make-renderer 31 style 0 bars 0 0 0 0 label "") invert 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   bars   -- cons list of (x . (y . h)) triples (as double bits)
+  ;;;   style  -- a line-style handle
+  ;;;   invert -- non-zero for horizontal bars (x +/- h)
+  ;;;   label  -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   An ErrorBarsR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (error-bars bars (default-line-style) 0 "err")
+  (defn error-bars [bars : int  style : int  invert : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct ErrorBarsR bars style (not (= invert 0)) label)))
 
   ;;; vector-field -- sample f(x,y)->(cons dx dy) over a grid.
-  (defn vector-field [f x-min : float x-max : float y-min : float y-max : float
-                      samples : int scale-mode : int style : int label : cstr] : int
-    (__renderer-bounds
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 32 style 0 f 0 0 0 0 label "")
-                           x-min x-max y-min y-max 0.0 0.0)
-        samples scale-mode 0 0)
-      x-min x-max y-min y-max))
+  ;;;
+  ;;; Parameters:
+  ;;;   f          -- the field, a (fn [float float] int) returning (cons dx dy)
+  ;;;   x-min      -- left edge of the sampled domain
+  ;;;   x-max      -- right edge of the sampled domain
+  ;;;   y-min      -- bottom edge of the sampled domain
+  ;;;   y-max      -- top edge of the sampled domain
+  ;;;   samples    -- grid points per axis
+  ;;;   scale-mode -- 0 raw, 1 normalised, 2 raw at a larger scale
+  ;;;   style      -- a line-style handle
+  ;;;   label      -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A VectorFieldR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (vector-field rotate -1.0 1.0 -1.0 1.0 8 1 (default-line-style) "field")
+  (defn vector-field [^fat f : (fn [float float] int)
+                      x-min : float  x-max : float  y-min : float  y-max : float
+                      samples : int  scale-mode : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct VectorFieldR f x-min x-max y-min y-max
+                                            samples scale-mode style label)))
 
   ;;; arrows -- explicit arrow segments.
-  (defn arrows [arrow-list : int style : int label : cstr] : int
-    (__make-renderer 33 style 0 arrow-list 0 0 0 0 label ""))
+  ;;;
+  ;;; Parameters:
+  ;;;   arrow-list -- cons list of (x1 . (y1 . (x2 . y2))) segments (as double bits)
+  ;;;   style      -- a line-style handle
+  ;;;   label      -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   An ArrowsR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (arrows segs (default-line-style) "moves")
+  (defn arrows [arrow-list : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct ArrowsR arrow-list style label)))
 
 ) ;; end defmodule plot/point

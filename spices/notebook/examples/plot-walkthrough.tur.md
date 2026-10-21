@@ -10,13 +10,13 @@ inline (TUI, HTML, or markdown render).
 ## Function plot
 
 Plot y = x^2 over [-2, 2]. The `function` renderer takes a typed callback
-(`defn` with `:float` argument and return), a domain, a sample count, a
-line style, and a label.
+(a `(fn [float] float)`), a domain, a sample count, a line style, and a
+label.
 
-> This cell is not evaluated (`eval=false`): `function` takes its callback
-> as an untyped parameter, so a cell's `defn` -- an interpreter closure --
-> reaches plot's compiled code as an `:int` with no C function behind it.
-> The cell runs as written in a compiled program.
+> This cell is not evaluated (`eval=false`): `function` calls its callback
+> from plot's compiled code, and a cell's `defn` is an interpreter closure
+> that compiled code cannot call. The cell runs as written in a compiled
+> program.
 
 ```turmeric {eval=false}
 (import plot/core  :refer [plot-write-png])

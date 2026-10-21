@@ -1,48 +1,172 @@
 ;; plot/contour.tur -- contour and color-field renderers.
+;;
+;; Each kind is a struct with a `Renderer` instance; the constructors box it as
+;; an `AnyRenderer`. Every kind here samples f(x, y) on a samples x samples grid
+;; over its domain, and the domain is the extent it contributes to the plot.
 
 (defmodule plot/contour
-  (export isoline contours contour-intervals color-field)
+  (export isoline contours contour-intervals color-field
+          IsolineR ContoursR ContourIntervalsR ColorFieldR)
 
-  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds])
+  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds
+                            BBox hint-bbox any-renderer])
+
+  ;;; IsolineR -- the single contour f(x, y) = level.
+  (defstruct IsolineR :copy [f : (fn [float float] float)
+                             x-min : float  x-max : float  y-min : float  y-max : float
+                             samples : int  level : float  style : int  label : cstr])
+
+  ;;; ContoursR -- `levels` contours in one style.
+  ;;
+  ;; The draw pass spaces the levels through the range it reads from f5 / f6,
+  ;; and this kind has always stored 0.0 in both, so every level is 0 and the
+  ;; `levels` contours coincide. Kept as-is so the migration stays
+  ;; pixel-identical; giving the levels a real range is a separate change.
+  (defstruct ContoursR :copy [f : (fn [float float] float)
+                              x-min : float  x-max : float  y-min : float  y-max : float
+                              samples : int  levels : int  style : int  label : cstr])
+
+  ;;; ContourIntervalsR -- f(x, y) over [0, 1] split into `bands` + 1 filled
+  ;;; bands, each taking the next fill-style from the `fills` cons list.
+  (defstruct ContourIntervalsR :copy [f : (fn [float float] float)
+                                      x-min : float  x-max : float  y-min : float  y-max : float
+                                      samples : int  bands : int  fills : int  label : cstr])
+
+  ;;; ColorFieldR -- each grid cell filled with palette color f(x, y), at `alpha`.
+  (defstruct ColorFieldR :copy [f : (fn [float float] int)
+                                x-min : float  x-max : float  y-min : float  y-max : float
+                                samples : int  alpha : float])
+
+  ;; to-legacy: RK_ISOLINE 60, RK_CONTOURS 61, RK_CONTOUR_INTERVALS 62,
+  ;; RK_COLOR_FIELD 63.
+  (definstance Renderer [IsolineR]
+    (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
+    (to-legacy [r]
+      (__renderer-bounds
+        (__renderer-ints
+          (__renderer-floats (__make-renderer 60 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
+                             (.x-min r) (.x-max r) (.y-min r) (.y-max r) (.level r) (.level r))
+          (.samples r) 0 0 0)
+        (.x-min r) (.x-max r) (.y-min r) (.y-max r))))
+
+  (definstance Renderer [ContoursR]
+    (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
+    (to-legacy [r]
+      (__renderer-bounds
+        (__renderer-ints
+          (__renderer-floats (__make-renderer 61 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
+                             (.x-min r) (.x-max r) (.y-min r) (.y-max r) 0.0 0.0)
+          (.samples r) (.levels r) 0 0)
+        (.x-min r) (.x-max r) (.y-min r) (.y-max r))))
+
+  (definstance Renderer [ContourIntervalsR]
+    (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
+    (to-legacy [r]
+      (__renderer-bounds
+        (__renderer-ints
+          (__renderer-floats (__make-renderer 62 (.fills r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
+                             (.x-min r) (.x-max r) (.y-min r) (.y-max r) 0.0 1.0)
+          (.samples r) (.bands r) 0 0)
+        (.x-min r) (.x-max r) (.y-min r) (.y-max r))))
+
+  (definstance Renderer [ColorFieldR]
+    (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
+    (to-legacy [r]
+      (__renderer-bounds
+        (__renderer-ints
+          (__renderer-floats (__make-renderer 63 0 0 (:: (.f r) :int) 0 0 0 0 "" "")
+                             (.x-min r) (.x-max r) (.y-min r) (.y-max r) (.alpha r) 0.0)
+          (.samples r) 0 0 0)
+        (.x-min r) (.x-max r) (.y-min r) (.y-max r))))
 
   ;;; isoline -- draw a single f(x,y)=level contour.
-  (defn isoline [f x-min : float x-max : float y-min : float y-max : float
-                 samples : int level : float style : int label : cstr] : int
-    (__renderer-bounds
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 60 style 0 f 0 0 0 0 label "")
-                           x-min x-max y-min y-max level level)
-        samples 0 0 0)
-      x-min x-max y-min y-max))
+  ;;;
+  ;;; Parameters:
+  ;;;   f       -- the field, a (fn [float float] float)
+  ;;;   x-min   -- left edge of the sampled domain
+  ;;;   x-max   -- right edge of the sampled domain
+  ;;;   y-min   -- bottom edge of the sampled domain
+  ;;;   y-max   -- top edge of the sampled domain
+  ;;;   samples -- grid points per axis (at least 8)
+  ;;;   level   -- the contour value
+  ;;;   style   -- a line-style handle
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   An IsolineR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (isoline saddle -2.0 2.0 -2.0 2.0 32 0.0 (default-line-style) "zero")
+  (defn isoline [^fat f : (fn [float float] float)
+                 x-min : float  x-max : float  y-min : float  y-max : float
+                 samples : int  level : float  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct IsolineR f x-min x-max y-min y-max samples level style label)))
 
   ;;; contours -- draw multiple automatically spaced contour levels.
-  (defn contours [f x-min : float x-max : float y-min : float y-max : float
-                  samples : int n : int styles : int label : cstr] : int
-    (__renderer-bounds
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 61 styles 0 f 0 0 0 0 label "")
-                           x-min x-max y-min y-max 0.0 0.0)
-        samples n 0 0)
-      x-min x-max y-min y-max))
+  ;;;
+  ;;; Parameters:
+  ;;;   f       -- the field, a (fn [float float] float)
+  ;;;   x-min   -- left edge of the sampled domain
+  ;;;   x-max   -- right edge of the sampled domain
+  ;;;   y-min   -- bottom edge of the sampled domain
+  ;;;   y-max   -- top edge of the sampled domain
+  ;;;   samples -- grid points per axis (at least 8)
+  ;;;   n       -- number of levels
+  ;;;   styles  -- a line-style handle for every level
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A ContoursR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (contours saddle -2.0 2.0 -2.0 2.0 32 4 (default-line-style) "levels")
+  (defn contours [^fat f : (fn [float float] float)
+                  x-min : float  x-max : float  y-min : float  y-max : float
+                  samples : int  n : int  styles : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct ContoursR f x-min x-max y-min y-max samples n styles label)))
 
   ;;; contour-intervals -- fill contour bands using sampled cells.
-  (defn contour-intervals [f x-min : float x-max : float y-min : float y-max : float
-                           samples : int n : int fills : int label : cstr] : int
-    (__renderer-bounds
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 62 fills 0 f 0 0 0 0 label "")
-                           x-min x-max y-min y-max 0.0 1.0)
-        samples n 0 0)
-      x-min x-max y-min y-max))
+  ;;;
+  ;;; Parameters:
+  ;;;   f       -- the field, a (fn [float float] float), banded over [0, 1]
+  ;;;   x-min   -- left edge of the sampled domain
+  ;;;   x-max   -- right edge of the sampled domain
+  ;;;   y-min   -- bottom edge of the sampled domain
+  ;;;   y-max   -- top edge of the sampled domain
+  ;;;   samples -- grid points per axis (at least 8)
+  ;;;   n       -- number of band boundaries (n + 1 bands)
+  ;;;   fills   -- cons list of fill-style handles, one per band
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A ContourIntervalsR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (contour-intervals saddle -2.0 2.0 -2.0 2.0 32 3 fills "bands")
+  (defn contour-intervals [^fat f : (fn [float float] float)
+                           x-min : float  x-max : float  y-min : float  y-max : float
+                           samples : int  n : int  fills : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct ContourIntervalsR f x-min x-max y-min y-max samples n fills label)))
 
   ;;; color-field -- color sampled cells by f(x,y)->color-idx.
-  (defn color-field [f x-min : float x-max : float y-min : float y-max : float
-                     samples : int alpha : float] : int
-    (__renderer-bounds
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 63 0 0 f 0 0 0 0 "" "")
-                           x-min x-max y-min y-max alpha 0.0)
-        samples 0 0 0)
-      x-min x-max y-min y-max))
+  ;;;
+  ;;; Parameters:
+  ;;;   f       -- the coloring, a (fn [float float] int) returning a palette index
+  ;;;   x-min   -- left edge of the sampled domain
+  ;;;   x-max   -- right edge of the sampled domain
+  ;;;   y-min   -- bottom edge of the sampled domain
+  ;;;   y-max   -- top edge of the sampled domain
+  ;;;   samples -- grid points per axis (at least 8)
+  ;;;   alpha   -- cell opacity
+  ;;;
+  ;;; Returns:
+  ;;;   A ColorFieldR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (color-field quadrant -2.0 2.0 -2.0 2.0 32 0.35)
+  (defn color-field [^fat f : (fn [float float] int)
+                     x-min : float  x-max : float  y-min : float  y-max : float
+                     samples : int  alpha : float] : AnyRenderer
+    (any-renderer (make-struct ColorFieldR f x-min x-max y-min y-max samples alpha)))
 
 ) ;; end defmodule plot/contour

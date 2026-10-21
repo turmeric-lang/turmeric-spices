@@ -1,19 +1,22 @@
-;; tests/plot/renderer_test.tur -- P2 of the plot Renderer typeclass plan.
+;; tests/plot/renderer_test.tur -- the Renderer typeclass's `bounds`, per kind.
 ;;
-;; The `Renderer` typeclass collapses the per-kind renderer dispatch: each kind
-;; is a struct (LinesR / PointsR / LabelR) carrying its real typed payload, and
-;; `bounds` computes the data extent from named fields. These tests prove the
-;; method dispatches on the per-kind struct type and that a typed LinesR reports
-;; exactly the same box as the legacy slot-bag `lines` renderer.
+;; Every renderer kind is its own type (LinesR, FunctionR, Decoration, ...)
+;; with a `Renderer` instance. These tests call `bounds` on each kind's value
+;; directly -- static dispatch on the struct type, no AnyRenderer box -- and
+;; pin the box it reports: the data extent the plot is laid out over.
 
 (defmodule plot/tests/renderer
-  (import plot/core  :refer [renderer-bbox bbox-empty? BBox
-                             lines-r points-r label-r])
-  (import plot/line  :refer [lines])
-  (import plot/style :refer [default-line-style])
-  (import test/assert :refer [assert-true])
-  (import test/suite  :refer [describe it])
-  (import test/runner :refer [run-all-status])
+  (import plot/core     :refer [bbox-empty? BBox])
+  (import plot/line     :refer [LinesR FunctionR ParametricR PolarR InverseR DensityR])
+  (import plot/point    :refer [PointsR ErrorBarsR VectorFieldR ArrowsR])
+  (import plot/interval :refer [FunctionIntervalR LinesIntervalR ParametricIntervalR PolarIntervalR])
+  (import plot/area     :refer [RectanglesR AreaHistogramR DiscreteHistogramR StackedHistogramR])
+  (import plot/contour  :refer [IsolineR ContoursR ContourIntervalsR ColorFieldR])
+  (import plot/decor    :refer [Decoration XAxis TickGrid HRuleR VRuleR LabelR])
+  (import plot/style    :refer [default-line-style default-fill-style])
+  (import test/assert   :refer [assert-true])
+  (import test/suite    :refer [describe it])
+  (import test/runner   :refer [run-all-status])
 
   ;; A point is a cons of the two coordinate doubles' bit patterns; a point
   ;; list is a cons-list of those pairs terminated by 0 (mirrors line_test).
@@ -35,6 +38,49 @@
     return (int64_t)(intptr_t)c;
     ```)
 
+  (defn triple [a : float b : float c : float] : int
+    ```c
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    union { double d; int64_t i; } ua, ub, uc; ua.d = a; ub.d = b; uc.d = c;
+    Cons *c2 = malloc(sizeof(*c2)); Cons *c1 = malloc(sizeof(*c1));
+    c2->head = ub.i; c2->tail = uc.i;
+    c1->head = ua.i; c1->tail = (int64_t)(intptr_t)c2;
+    return (int64_t)(intptr_t)c1;
+    ```)
+
+  (defn quad [a : float b : float c : float d : float] : int
+    ```c
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    union { double d; int64_t i; } ua, ub, uc, ud; ua.d = a; ub.d = b; uc.d = c; ud.d = d;
+    Cons *c3 = malloc(sizeof(*c3)); Cons *c2 = malloc(sizeof(*c2)); Cons *c1 = malloc(sizeof(*c1));
+    c3->head = uc.i; c3->tail = ud.i;
+    c2->head = ub.i; c2->tail = (int64_t)(intptr_t)c3;
+    c1->head = ua.i; c1->tail = (int64_t)(intptr_t)c2;
+    return (int64_t)(intptr_t)c1;
+    ```)
+
+  (defn cat [label : cstr height : float] : int
+    ```c
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    union { double d; int64_t i; } uh; uh.d = height;
+    Cons *p = malloc(sizeof(*p));
+    p->head = (int64_t)(intptr_t)label; p->tail = uh.i;
+    return (int64_t)(intptr_t)p;
+    ```)
+
+  (defn group [label : cstr vals : int] : int
+    ```c
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    Cons *p = malloc(sizeof(*p));
+    p->head = (int64_t)(intptr_t)label; p->tail = vals;
+    return (int64_t)(intptr_t)p;
+    ```)
+
+  (defn bits [x : float] : int
+    ```c union { double d; int64_t i; } u; u.d = x; return u.i; ```)
+
+  (defn nan [] : float ```c return 0.0 / 0.0; ```)
+
   (defn close? [a : float b : float] : bool
     ```c
     double d = (double)a - (double)b;
@@ -42,11 +88,19 @@
     return d < 1e-9;
     ```)
 
-  ;; Points (-2,-1), (-1,0.5), (1,1.5) -> box x:[-2,1] y:[-1,1.5].
+  (defn sq [x : float] : float (* x x))
+  (defn half [t : float] : int (xy-pair t (* 0.5 t)))
+  (defn saddle [x : float y : float] : float (- (* x x) (* y y)))
+  (defn spin [x : float y : float] : int (xy-pair (* -1.0 y) x))
+  (defn quadrant [x : float y : float] : int (if (> x 0.0) 1 0))
+
+  ;; Points (-2,-1), (-1,0.5), (NaN,0), (1,1.5) -> box x:[-2,1] y:[-1,1.5];
+  ;; the NaN point is a gap and contributes nothing.
   (defn sample-points [] : int
     (t-cons (xy-pair -2.0 -1.0)
       (t-cons (xy-pair -1.0 0.5)
-        (t-cons (xy-pair 1.0 1.5) 0))))
+        (t-cons (xy-pair (nan) 0.0)
+          (t-cons (xy-pair 1.0 1.5) 0)))))
 
   (defn bbox-eq? [bb : BBox  x0 : float x1 : float y0 : float y1 : float] : bool
     (and (assert-true (not (bbox-empty? bb)))
@@ -55,34 +109,128 @@
          (assert-true (close? y0 (.y-min bb)))
          (assert-true (close? y1 (.y-max bb)))))
 
-  ;; `bounds` on a LinesR computes the box from its typed `points` field.
-  (defn lines-r-bounds [] : bool
-    (bbox-eq? (bounds (lines-r (sample-points) (default-line-style) ""))
+  (defn empty? [bb : BBox] : bool (assert-true (bbox-empty? bb)))
+
+  ;; --- point-list kinds ------------------------------------------------------
+
+  (defn lines-bounds [] : bool
+    (bbox-eq? (bounds (make-struct LinesR (sample-points) (default-line-style) ""))
               -2.0 1.0 -1.0 1.5))
 
-  ;; PointsR is a distinct kind/type but shares the point-list bounds rule.
-  (defn points-r-bounds [] : bool
-    (bbox-eq? (bounds (points-r (sample-points) (default-line-style) ""))
+  ;; PointsR is a distinct type from LinesR but shares the point-list rule.
+  (defn points-bounds [] : bool
+    (bbox-eq? (bounds (make-struct PointsR (sample-points) (default-line-style) ""))
               -2.0 1.0 -1.0 1.5))
 
-  ;; LabelR's bounds is the single anchor point.
-  (defn label-r-bounds [] : bool
-    (bbox-eq? (bounds (label-r 3.0 4.0 "hi" (default-line-style)))
-              3.0 3.0 4.0 4.0))
+  ;; The band spans both edges: lower y in [-1, 0], upper y in [0.5, 2].
+  (defn lines-interval-bounds [] : bool
+    (bbox-eq? (bounds (make-struct LinesIntervalR
+                                   (t-cons (xy-pair -1.0 -1.0) (t-cons (xy-pair 1.0 0.0) 0))
+                                   (t-cons (xy-pair -1.0 0.5) (t-cons (xy-pair 1.0 2.0) 0))
+                                   (default-fill-style) (default-line-style) ""))
+              -1.0 1.0 -1.0 2.0))
 
-  ;; The typed LinesR must agree with the legacy slot-bag `lines` renderer.
-  (defn matches-legacy [] : bool
-    (let [typed  (bounds (lines-r (sample-points) (default-line-style) ""))
-          legacy (renderer-bbox (lines (sample-points) (default-line-style) ""))]
-      (and (assert-true (close? (.x-min typed) (.x-min legacy)))
-           (assert-true (close? (.x-max typed) (.x-max legacy)))
-           (assert-true (close? (.y-min typed) (.y-min legacy)))
-           (assert-true (close? (.y-max typed) (.y-max legacy))))))
+  ;; --- payload-shape kinds ---------------------------------------------------
+
+  ;; (x . (y . h)) bars: vertical spans y +/- h, horizontal spans x +/- h.
+  (defn error-bars-bounds [] : bool
+    (let [bars (t-cons (triple 0.5 0.5 0.25) (t-cons (triple 1.0 2.0 0.5) 0))]
+      (and (bbox-eq? (bounds (make-struct ErrorBarsR bars (default-line-style) false ""))
+                     0.5 1.0 0.25 2.5)
+           (bbox-eq? (bounds (make-struct ErrorBarsR bars (default-line-style) true ""))
+                     0.25 1.5 0.5 2.0))))
+
+  ;; Both endpoints of every arrow -- not the arrow's second cons cell read as
+  ;; a coordinate, as the old bounds pass did.
+  (defn arrows-bounds [] : bool
+    (bbox-eq? (bounds (make-struct ArrowsR
+                                   (t-cons (quad -0.5 -0.5 0.5 0.5) (t-cons (quad 0.0 1.0 1.0 0.2) 0))
+                                   (default-line-style) ""))
+              -0.5 1.0 -0.5 1.0))
+
+  (defn rects-bounds [] : bool
+    (let [rects (t-cons (quad -1.0 -0.5 0.0 1.0) (t-cons (quad 0.2 0.9 0.0 0.6) 0))]
+      (and (bbox-eq? (bounds (make-struct RectanglesR rects (default-fill-style) ""))
+                     -1.0 0.9 0.0 1.0)
+           (bbox-eq? (bounds (make-struct AreaHistogramR rects 0 ""))
+                     -1.0 0.9 0.0 1.0))))
+
+  ;; Three bars at slots 0, 1, 2 (each 0.8 wide), tallest 1.4.
+  (defn discrete-hist-bounds [] : bool
+    (let [bars (t-cons (cat "A" 1.0) (t-cons (cat "B" 1.4) (t-cons (cat "C" 0.7) 0)))]
+      (and (bbox-eq? (bounds (make-struct DiscreteHistogramR bars (default-fill-style) false ""))
+                     0.0 2.8 0.0 1.4)
+           (bbox-eq? (bounds (make-struct DiscreteHistogramR bars (default-fill-style) true ""))
+                     0.0 1.4 0.0 2.8))))
+
+  ;; Two stacks, 1.0 + 0.8 and 1.2 + 0.5: the taller sums to 1.8.
+  (defn stacked-hist-bounds [] : bool
+    (let [groups (t-cons (group "Q1" (t-cons (bits 1.0) (t-cons (bits 0.8) 0)))
+                   (t-cons (group "Q2" (t-cons (bits 1.2) (t-cons (bits 0.5) 0))) 0))]
+      (and (bbox-eq? (bounds (make-struct StackedHistogramR groups 0 0 false))
+                     0.0 1.8 0.0 1.8)
+           (bbox-eq? (bounds (make-struct StackedHistogramR groups 0 0 true))
+                     0.0 1.8 0.0 1.8))))
+
+  ;; --- domain kinds: the declared domain is the extent ------------------------
+
+  (defn grid-kinds-bounds [] : bool
+    (and (bbox-eq? (bounds (make-struct IsolineR saddle -2.0 1.0 -3.0 4.0 16 0.5 (default-line-style) ""))
+                   -2.0 1.0 -3.0 4.0)
+         (bbox-eq? (bounds (make-struct ContoursR saddle -2.0 1.0 -3.0 4.0 16 3 (default-line-style) ""))
+                   -2.0 1.0 -3.0 4.0)
+         (bbox-eq? (bounds (make-struct ContourIntervalsR saddle -2.0 1.0 -3.0 4.0 16 3 0 ""))
+                   -2.0 1.0 -3.0 4.0)
+         (bbox-eq? (bounds (make-struct ColorFieldR quadrant -2.0 1.0 -3.0 4.0 16 0.5))
+                   -2.0 1.0 -3.0 4.0)
+         ;; a reversed domain still yields an ordered box
+         (bbox-eq? (bounds (make-struct VectorFieldR spin 1.0 -2.0 4.0 -3.0 8 0 (default-line-style) ""))
+                   -2.0 1.0 -3.0 4.0)))
+
+  ;; A domain with a NaN edge constrains nothing.
+  (defn nan-domain-is-empty [] : bool
+    (empty? (bounds (make-struct IsolineR saddle (nan) 1.0 -3.0 4.0 16 0.5 (default-line-style) ""))))
+
+  ;; --- kinds that constrain nothing -------------------------------------------
+
+  ;; A sampled curve's extent is unknown until it is drawn, a decoration is
+  ;; drawn at whatever extent the rest establish.
+  (defn unconstrained-kinds [] : bool
+    (and (empty? (bounds (make-struct FunctionR sq -2.0 2.0 64 (default-line-style) "")))
+         (empty? (bounds (make-struct ParametricR half -1.0 1.0 64 (default-line-style) "")))
+         (empty? (bounds (make-struct PolarR sq 0.0 3.0 64 (default-line-style) "")))
+         (empty? (bounds (make-struct InverseR sq -1.0 1.0 64 (default-line-style) "")))
+         (empty? (bounds (make-struct DensityR (t-cons (bits 1.0) 0) 0.0 64 (default-line-style) "")))
+         (empty? (bounds (make-struct FunctionIntervalR sq sq -1.0 1.0 64
+                                      (default-fill-style) (default-line-style) "")))
+         (empty? (bounds (make-struct ParametricIntervalR half half -1.0 1.0 64
+                                      (default-fill-style) (default-line-style) "")))
+         (empty? (bounds (make-struct PolarIntervalR sq sq 0.0 1.0 64
+                                      (default-fill-style) (default-line-style) "")))
+         (empty? (bounds (XAxis)))
+         (empty? (bounds (TickGrid)))))
+
+  ;; --- point kinds --------------------------------------------------------------
+
+  ;; A rule pins its coordinate and 0 on the other axis; a label its anchor.
+  (defn point-kinds [] : bool
+    (and (bbox-eq? (bounds (make-struct HRuleR 2.5 (default-line-style))) 0.0 0.0 2.5 2.5)
+         (bbox-eq? (bounds (make-struct VRuleR -1.5 (default-line-style))) -1.5 -1.5 0.0 0.0)
+         (bbox-eq? (bounds (make-struct LabelR 3.0 4.0 "hi" (default-line-style))) 3.0 3.0 4.0 4.0)
+         (empty? (bounds (make-struct LabelR 3.0 (nan) "nan" (default-line-style))))))
 
   (defn main [] : int
-    (describe "plot/core Renderer typeclass -- bounds"
-      (it "LinesR bounds from typed points field"  (lines-r-bounds))
-      (it "PointsR bounds (distinct kind, shared rule)" (points-r-bounds))
-      (it "LabelR bounds is the anchor point"       (label-r-bounds))
-      (it "typed LinesR matches legacy lines bounds" (matches-legacy)))
+    (describe "plot Renderer typeclass -- bounds per kind"
+      (it "LinesR spans its points, skipping NaN gaps" (lines-bounds))
+      (it "PointsR (distinct type, same rule)"         (points-bounds))
+      (it "LinesIntervalR spans both edges"            (lines-interval-bounds))
+      (it "ErrorBarsR spans each bar, either way"      (error-bars-bounds))
+      (it "ArrowsR spans both endpoints of each arrow" (arrows-bounds))
+      (it "RectanglesR / AreaHistogramR span their quads" (rects-bounds))
+      (it "DiscreteHistogramR spans its slots"         (discrete-hist-bounds))
+      (it "StackedHistogramR spans its stack sums"     (stacked-hist-bounds))
+      (it "grid kinds report their declared domain"    (grid-kinds-bounds))
+      (it "a NaN domain edge constrains nothing"       (nan-domain-is-empty))
+      (it "curves, bands and decorations constrain nothing" (unconstrained-kinds))
+      (it "rules and labels pin one point"             (point-kinds)))
     (run-all-status)))

@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### Changed (breaking)
+
+- Every renderer kind is its own type with a `Renderer` instance
+  (plot Renderer typeclass plan, P4): `LinesR`, `FunctionR`, `ParametricR`,
+  `PolarR`, `InverseR`, `DensityR` (plot/line); `PointsR`, `ErrorBarsR`,
+  `VectorFieldR`, `ArrowsR` (plot/point); `FunctionIntervalR`,
+  `LinesIntervalR`, `ParametricIntervalR`, `PolarIntervalR` (plot/interval);
+  `RectanglesR`, `AreaHistogramR`, `DiscreteHistogramR`, `StackedHistogramR`
+  (plot/area); `IsolineR`, `ContoursR`, `ContourIntervalsR`, `ColorFieldR`
+  (plot/contour); and in plot/decor the `Decoration` sum type (`XAxis`,
+  `YAxis`, `Axes`, `XTickLines`, `YTickLines`, `TickGrid`) plus `HRuleR`,
+  `VRuleR` and `LabelR`. Each carries its own named, typed fields instead of
+  the shared `data1..5` / `f1..6` / `i1..4` slot bag.
+- Every public constructor returns an `AnyRenderer` -- the renderer boxed
+  with its instance, `(exists [a] [(Renderer a)] a)` -- instead of an `int`
+  handle, and `plot`, `plot-write-png`, `plot-into-canvas`, `render` and
+  `Backend`'s `render-to` take a `(Vec AnyRenderer)`. A `vec-of` over the
+  constructors needs no change; a Vec annotated `(Vec int)` now says
+  `(Vec AnyRenderer)`, and one built with `vec-new` is ascribed
+  `(:: (vec-new) (Vec AnyRenderer))`.
+- Curve callbacks are function values of a declared type: `function`,
+  `polar` and `inverse` take a `(fn [float] float)`, `parametric` a
+  `(fn [float] int)` returning a point, `vector-field` a
+  `(fn [float float] int)`, the contour kinds a `(fn [float float] float)`
+  and `color-field` a `(fn [float float] int)`, and the interval kinds two
+  of their curve's type. A `fn` literal -- capturing or not -- works where a
+  named `defn` did, and a callback of the wrong type is a compile error
+  rather than a crash. The draw pass calls them through the closure ABI
+  (`TUR_APPLY1_T` / `TUR_APPLY2_T`).
+- The plot's data extent is the union of the renderers' `bounds`, dispatched
+  through each one's instance. The draw pass's per-kind bounds `switch`
+  (`__renderer-bbox`, C symbol `plot_renderer_bbox`) is gone, and
+  `renderer-bbox` takes an `AnyRenderer`.
+- `lines-r`, `points-r` and `label-r` are removed (build the struct with
+  `make-struct`), and `plot-anyrenderers` is deprecated: `plot` takes the
+  same argument.
+
 ### Added
 
 - `Backend` typeclass in `plot/core` (U2 typeclass collapse): the three
@@ -14,13 +51,24 @@
   remain as thin wrappers that route through `render-to`, so existing
   call sites are unchanged.
 - `render` in `plot/core`: a single entry point generic over `Backend`
-  (`(defn render [^Backend B b : B  renderers : int  opts : int] ...)`),
+  (`(defn render [^Backend B b : B  renderers : (Vec AnyRenderer)  opts : int] ...)`),
   so plot-building code can dispatch to any sink without knowing the
   concrete backend type -- the "plot DSL becomes generic in Backend"
   the uplift plan called for.
 
+- `errors/run.sh` and three compile-fail fixtures: a type with no `Renderer`
+  instance cannot be boxed, `plot` rejects a `(Vec int)` of handles, and a
+  callback of the wrong function type is rejected.
+
 ### Fixed
 
+- `arrows` bounds read each arrow's second cons cell -- a pointer -- as the y
+  coordinate, so an arrows plot's y range came out of the heap layout and
+  changed from run to run. `ArrowsR`'s `bounds` spans both endpoints of each
+  arrow.
+- The slot-bag handle each constructor allocated was never freed. Handles
+  now live only for one draw: `plot-into-canvas` lowers the renderers,
+  draws, and frees them.
 - `plot/core`'s hand-written `<plutovg.h>` stand-ins (prototypes, typedefs,
   `PLUTOVG_TEXT_ENCODING_UTF8`) are guarded by the header's own `PLUTOVG_H`.
   A project build (`tur build --shared --bundle-deps`, the image `tur repl`

@@ -1,0 +1,87 @@
+;; tests/plot/callback_test.tur -- curve callbacks are typed function values.
+;;
+;; The sampled renderers take their curve as a `(fn [float] float)` (or the
+;; kind's own fn type) and the draw pass calls it through the closure ABI, so a
+;; capturing `fn` literal works exactly like a named defn. Rendering is also
+;; non-destructive: lowering a (Vec AnyRenderer) for the draw pass leaves the
+;; renderers -- and the closures they hold -- intact for the next render.
+
+(defmodule plot/tests/callback
+  (import plot/core     :refer [plot __surfaces-equal? __ok? __ok-val __surface-destroy])
+  (import plot/line     :refer [function polar])
+  (import plot/interval :refer [function-interval])
+  (import plot/contour  :refer [isoline])
+  (import plot/decor    :refer [axes])
+  (import plot/style    :refer [plot-opts default-line-style default-fill-style])
+  (import test/assert   :refer [assert-true])
+  (import test/suite    :refer [describe it])
+  (import test/runner   :refer [run-all-status])
+
+  (defn nan [] : float ```c return 0.0 / 0.0; ```)
+
+  (defn sq [x : float] : float (* x x))
+  (defn sq-plus [x : float] : float (+ (* x x) 0.5))
+  (defn saddle [x : float y : float] : float (- (* x x) (* y y)))
+
+  ;; A fixed extent, so a curve (which constrains nothing) has a frame to draw in.
+  (defn opts [] : int
+    (plot-opts 400 300 "" "" "" -2.0 2.0 -1.0 4.0 0))
+
+  ;; Render rs, then hand both surfaces to `check` and free them.
+  (defn same-pixels? [a : (Vec AnyRenderer)  b : (Vec AnyRenderer)] : bool
+    (let [r1 (plot a (opts))
+          r2 (plot b (opts))]
+      (if (and (__ok? r1) (__ok? r2))
+        (let [s1 (__ok-val r1)
+              s2 (__ok-val r2)
+              eq (__surfaces-equal? s1 s2)]
+          (__surface-destroy s1)
+          (__surface-destroy s2)
+          eq)
+        false)))
+
+  ;; A capturing fn literal draws what the named defn draws.
+  (defn lambda-matches-defn [] : bool
+    (let [k  1.0
+          ls (default-line-style)]
+      (assert-true
+        (same-pixels? (vec-of (axes) (function sq -2.0 2.0 96 ls ""))
+                      (vec-of (axes) (function (fn [x : float] : float (* k (* x x)))
+                                               -2.0 2.0 96 ls ""))))))
+
+  ;; ... for the two-curve and two-argument callbacks too.
+  (defn lambdas-for-every-shape [] : bool
+    (let [lift 0.5
+          fs   (default-fill-style)
+          ls   (default-line-style)]
+      (and (assert-true
+             (same-pixels? (vec-of (function-interval sq sq-plus -1.5 1.5 64 fs ls ""))
+                           (vec-of (function-interval (fn [x : float] : float (* x x))
+                                                      (fn [x : float] : float (+ (* x x) lift))
+                                                      -1.5 1.5 64 fs ls ""))))
+           (assert-true
+             (same-pixels? (vec-of (isoline saddle -2.0 2.0 -1.0 4.0 24 0.5 ls ""))
+                           (vec-of (isoline (fn [x : float y : float] : float (- (* x x) (* y y)))
+                                            -2.0 2.0 -1.0 4.0 24 0.5 ls "")))))))
+
+  ;; The callback is really called: the curve changes the picture.
+  (defn curve-draws-ink [] : bool
+    (assert-true
+      (not (same-pixels? (vec-of (axes))
+                         (vec-of (axes) (polar (fn [t : float] : float 1.5)
+                                               0.0 6.28 64 (default-line-style) ""))))))
+
+  ;; Rendering the same Vec twice gives the same picture.
+  (defn rerender-is-stable [] : bool
+    (let [rs (vec-of (axes)
+                     (function (fn [x : float] : float (* x x)) -2.0 2.0 96 (default-line-style) "f")
+                     (isoline saddle -2.0 2.0 -1.0 4.0 24 0.5 (default-line-style) "iso"))]
+      (assert-true (same-pixels? rs rs))))
+
+  (defn main [] : int
+    (describe "plot callbacks"
+      (it "a capturing fn literal draws what the named defn draws" (lambda-matches-defn))
+      (it "fn literals work for interval and grid callbacks"       (lambdas-for-every-shape))
+      (it "the curve callback is called"                           (curve-draws-ink))
+      (it "rendering the same renderers twice is stable"           (rerender-is-stable)))
+    (run-all-status)))

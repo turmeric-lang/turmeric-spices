@@ -1,40 +1,162 @@
 ;; plot/interval.tur -- filled interval renderers.
+;;
+;; Each kind is a struct with a `Renderer` instance; the constructors box it as
+;; an `AnyRenderer`. The region between the two curves is filled with `fill`
+;; and outlined with `style`.
 
 (defmodule plot/interval
-  (export function-interval lines-interval parametric-interval polar-interval)
+  (export function-interval lines-interval parametric-interval polar-interval
+          FunctionIntervalR LinesIntervalR ParametricIntervalR PolarIntervalR)
 
-  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds])
+  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds
+                            BBox bbox-from-raw bbox-empty-box bbox-union any-renderer
+                            __point-list-bbox])
 
   ;;; __nan -- quiet NaN sentinel for "auto y bound" on function-interval.
   ;;; Inline-C avoids the runtime div-by-zero trap on `(/ 0.0 0.0)`.
   (defn __nan [] : float
     ```c return 0.0 / 0.0; ```)
 
-  ;;; function-interval -- shade between f1(x) and f2(x).
-  (defn function-interval [f1 f2 x-min : float x-max : float samples : int fill : int style : int label : cstr] : int
-    (__renderer-bounds
+  ;;; FunctionIntervalR -- the band between y = f1(x) and y = f2(x).
+  (defstruct FunctionIntervalR :copy [f1 : (fn [float] float)  f2 : (fn [float] float)
+                                      x-min : float  x-max : float  samples : int
+                                      fill : int  style : int  label : cstr])
+
+  ;;; LinesIntervalR -- the band between two point lists sharing x coordinates.
+  (defstruct LinesIntervalR :copy [lower : int  upper : int
+                                   fill : int  style : int  label : cstr])
+
+  ;;; ParametricIntervalR -- the band between two parametric curves f(t) = (cons x y).
+  (defstruct ParametricIntervalR :copy [f1 : (fn [float] int)  f2 : (fn [float] int)
+                                        t-min : float  t-max : float  samples : int
+                                        fill : int  style : int  label : cstr])
+
+  ;;; PolarIntervalR -- the band between two polar curves radius = f(theta).
+  (defstruct PolarIntervalR :copy [f1 : (fn [float] float)  f2 : (fn [float] float)
+                                   theta-min : float  theta-max : float  samples : int
+                                   fill : int  style : int  label : cstr])
+
+  ;; Bounds: a sampled band's extent is unknown until it is sampled, so it
+  ;; constrains nothing; the lines band spans both point lists.
+  ;;
+  ;; to-legacy: RK_FUNCTION_INTERVAL 40, RK_LINES_INTERVAL 41,
+  ;; RK_PARAM_INTERVAL 42, RK_POLAR_INTERVAL 43.
+  (definstance Renderer [FunctionIntervalR]
+    (bounds [r] (bbox-empty-box))
+    (to-legacy [r]
+      (__renderer-bounds
+        (__renderer-ints
+          (__renderer-floats (__make-renderer 40 (.fill r) (.style r)
+                                              (:: (.f1 r) :int) (:: (.f2 r) :int) 0 0 0 (.label r) "")
+                             (.x-min r) (.x-max r) 0.0 0.0 0.0 0.0)
+          (.samples r) 0 0 0)
+        (.x-min r) (.x-max r) (__nan) (__nan))))
+
+  (definstance Renderer [LinesIntervalR]
+    (bounds [r] (bbox-union (bbox-from-raw (__point-list-bbox (.lower r)))
+                            (bbox-from-raw (__point-list-bbox (.upper r)))))
+    (to-legacy [r]
+      (__make-renderer 41 (.fill r) (.style r) (.lower r) (.upper r) 0 0 0 (.label r) "")))
+
+  (definstance Renderer [ParametricIntervalR]
+    (bounds [r] (bbox-empty-box))
+    (to-legacy [r]
       (__renderer-ints
-        (__renderer-floats (__make-renderer 40 fill style f1 f2 0 0 0 label "")
-                           x-min x-max 0.0 0.0 0.0 0.0)
-        samples 0 0 0)
-      x-min x-max (__nan) (__nan)))
+        (__renderer-floats (__make-renderer 42 (.fill r) (.style r)
+                                            (:: (.f1 r) :int) (:: (.f2 r) :int) 0 0 0 (.label r) "")
+                           (.t-min r) (.t-max r) 0.0 0.0 0.0 0.0)
+        (.samples r) 0 0 0)))
+
+  (definstance Renderer [PolarIntervalR]
+    (bounds [r] (bbox-empty-box))
+    (to-legacy [r]
+      (__renderer-ints
+        (__renderer-floats (__make-renderer 43 (.fill r) (.style r)
+                                            (:: (.f1 r) :int) (:: (.f2 r) :int) 0 0 0 (.label r) "")
+                           (.theta-min r) (.theta-max r) 0.0 0.0 0.0 0.0)
+        (.samples r) 0 0 0)))
+
+  ;;; function-interval -- shade between f1(x) and f2(x).
+  ;;;
+  ;;; Parameters:
+  ;;;   f1      -- the lower curve, a (fn [float] float)
+  ;;;   f2      -- the upper curve, a (fn [float] float)
+  ;;;   x-min   -- start of the sampled domain
+  ;;;   x-max   -- end of the sampled domain
+  ;;;   samples -- sample count (at least 32 are drawn)
+  ;;;   fill    -- a fill-style handle for the band
+  ;;;   style   -- a line-style handle for its outline
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A FunctionIntervalR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (function-interval lo hi -1.0 1.0 96 (default-fill-style) (default-line-style) "band")
+  (defn function-interval [^fat f1 : (fn [float] float)  ^fat f2 : (fn [float] float)
+                           x-min : float  x-max : float  samples : int
+                           fill : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct FunctionIntervalR f1 f2 x-min x-max samples fill style label)))
 
   ;;; lines-interval -- shade between two sampled line lists.
-  (defn lines-interval [vs1 : int vs2 : int fill : int style : int label : cstr] : int
-    (__make-renderer 41 fill style vs1 vs2 0 0 0 label ""))
+  ;;;
+  ;;; Parameters:
+  ;;;   vs1   -- cons list of (cons x y) points on one edge
+  ;;;   vs2   -- cons list of (cons x y) points on the other, same x order
+  ;;;   fill  -- a fill-style handle for the band
+  ;;;   style -- a line-style handle for its outline
+  ;;;   label -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A LinesIntervalR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (lines-interval lo-pts hi-pts (default-fill-style) (default-line-style) "ci")
+  (defn lines-interval [vs1 : int  vs2 : int  fill : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct LinesIntervalR vs1 vs2 fill style label)))
 
   ;;; parametric-interval -- shade between two parametric curves.
-  (defn parametric-interval [f1 f2 t-min : float t-max : float samples : int fill : int style : int label : cstr] : int
-    (__renderer-ints
-      (__renderer-floats (__make-renderer 42 fill style f1 f2 0 0 0 label "")
-                         t-min t-max 0.0 0.0 0.0 0.0)
-      samples 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   f1      -- one edge, a (fn [float] int) returning a (cons x y) point
+  ;;;   f2      -- the other edge, likewise
+  ;;;   t-min   -- start of the parameter range
+  ;;;   t-max   -- end of the parameter range
+  ;;;   samples -- sample count (at least 32 are drawn)
+  ;;;   fill    -- a fill-style handle for the band
+  ;;;   style   -- a line-style handle for its outline
+  ;;;   label   -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A ParametricIntervalR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (parametric-interval inner outer 0.0 1.0 72 (default-fill-style) (default-line-style) "")
+  (defn parametric-interval [^fat f1 : (fn [float] int)  ^fat f2 : (fn [float] int)
+                             t-min : float  t-max : float  samples : int
+                             fill : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct ParametricIntervalR f1 f2 t-min t-max samples fill style label)))
 
   ;;; polar-interval -- shade between two polar curves.
-  (defn polar-interval [f1 f2 theta-min : float theta-max : float samples : int fill : int style : int label : cstr] : int
-    (__renderer-ints
-      (__renderer-floats (__make-renderer 43 fill style f1 f2 0 0 0 label "")
-                         theta-min theta-max 0.0 0.0 0.0 0.0)
-      samples 0 0 0))
+  ;;;
+  ;;; Parameters:
+  ;;;   f1        -- the inner radius, a (fn [float] float) of theta
+  ;;;   f2        -- the outer radius, likewise
+  ;;;   theta-min -- start of the angle range, in radians
+  ;;;   theta-max -- end of the angle range, in radians
+  ;;;   samples   -- sample count (at least 32 are drawn)
+  ;;;   fill      -- a fill-style handle for the band
+  ;;;   style     -- a line-style handle for its outline
+  ;;;   label     -- legend text ("" for none)
+  ;;;
+  ;;; Returns:
+  ;;;   A PolarIntervalR boxed as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (polar-interval r-in r-out 0.0 3.14 72 (default-fill-style) (default-line-style) "")
+  (defn polar-interval [^fat f1 : (fn [float] float)  ^fat f2 : (fn [float] float)
+                        theta-min : float  theta-max : float  samples : int
+                        fill : int  style : int  label : cstr] : AnyRenderer
+    (any-renderer (make-struct PolarIntervalR f1 f2 theta-min theta-max samples fill style label)))
 
 ) ;; end defmodule plot/interval

@@ -8,13 +8,19 @@
           ;; tests/plot/backend_test.tur fail on "symbol 'SurfaceBackend' is
           ;; private to module 'plot/core'".
           CanvasBackend SurfaceBackend PngBackend
+          ;; AnyRenderer: the boxed form every public constructor returns.
+          ;; (The `Renderer` class and its `bounds` / `to-legacy` methods are
+          ;; global, as every class is; they are not exported by name.)
+          any-renderer
+          ;; slot-bag helpers that each kind's `to-legacy` lowers through
           __make-renderer __renderer-floats __renderer-ints __renderer-bounds
           __surface-create __surface-destroy __surface-write-png
           __canvas-create __canvas-destroy
           __plot-sample-adaptive
-          BBox renderer-bbox bbox-empty? bbox-from-raw
-          LinesR PointsR LabelR lines-r points-r label-r
-          any-renderer renderers-bbox bbox-union bbox-empty-box
+          BBox renderer-bbox renderers-bbox bbox-empty? bbox-from-raw
+          bbox-union bbox-empty-box point-bbox hint-bbox
+          __point-list-bbox __error-bars-bbox __arrows-bbox __rects-bbox
+          __discrete-hist-bbox __stacked-hist-bbox
           anyrenderers->legacy plot-anyrenderers __surfaces-equal?
           __ok? __ok-val __err-val
           __surface-width __surface-height __surface-pixel-byte
@@ -429,14 +435,14 @@
     #define EVAL_AT(T, OUT) do { \
       double __t = (T); \
       double __x = 0.0, __y = 0.0; \
-      if (r->kind == RK_FUNCTION_K) { __x = __t; __y = ((double(*)(double))(intptr_t)r->data1)(__t); } \
-      else if (r->kind == RK_INVERSE_K) { __y = __t; __x = ((double(*)(double))(intptr_t)r->data1)(__t); } \
+      if (r->kind == RK_FUNCTION_K) { __x = __t; __y = TUR_APPLY1_T(double, double, r->data1, __t); } \
+      else if (r->kind == RK_INVERSE_K) { __y = __t; __x = TUR_APPLY1_T(double, double, r->data1, __t); } \
       else if (r->kind == RK_PARAMETRIC_K) { \
-        Cons *__pair = (Cons *)(intptr_t)((int64_t(*)(double))(intptr_t)r->data1)(__t); \
+        Cons *__pair = (Cons *)(intptr_t)TUR_APPLY1_T(int64_t, double, r->data1, __t); \
         if (__pair) { __x = ADAPTIVE_BITS_DBL(__pair->head); __y = ADAPTIVE_BITS_DBL(__pair->tail); } \
         else { __x = __y = 0.0/0.0; } \
       } else { \
-        double __radius = ((double(*)(double))(intptr_t)r->data1)(__t); \
+        double __radius = TUR_APPLY1_T(double, double, r->data1, __t); \
         __x = __radius * cos(__t); __y = __radius * sin(__t); \
       } \
       (OUT).t = __t; \
@@ -555,176 +561,14 @@
     return (int64_t)(intptr_t)p;
     ```)
 
-  ;;; __renderer-bbox -- compute a single renderer's data-space bounding box.
-  ;;;
-  ;;; P0 de-monolith of the plot Renderer typeclass plan: this is the former
-  ;;; per-kind bounds-union `switch` lifted verbatim out of `plot-into-canvas`
-  ;;; into a standalone, independently-callable function. Each renderer kind
-  ;;; unions its own points into a local box; `plot-into-canvas` now folds the
-  ;;; returned box corners instead of inlining ~80 lines of per-kind C.
-  ;;;
-  ;;; Returns a malloc'd carrier `{ double x0, x1, y0, y1; int valid; }` (an
-  ;;; int64 handle). `valid == 0` means the renderer contributed no finite
-  ;;; point, so callers must skip it. The caller owns the buffer and frees it.
-  ;;;
-  ;;; Folding box corners is identical to unioning the underlying points:
-  ;;; min/max over all points == min/max over per-renderer box corners, so the
-  ;;; resolved plot bounds (and therefore every pixel) are unchanged.
-  ;;;
-  ;;; Pinned to the stable C symbol `plot_renderer_bbox` via `export-as` so the
-  ;;; inline-C fold site in `plot-into-canvas` can name it directly, mirroring
-  ;;; the `plot_sample_adaptive` pin above.
-  (defn (export-as "plot_renderer_bbox") __renderer-bbox [renderer : int] : ptr<void>
-    ```c
-    #include <stdlib.h>
-    #include <stdint.h>
-    typedef struct { int64_t head; int64_t tail; } Cons;
-    typedef struct __plot_renderer {
-      int64_t kind;
-      int64_t style1, style2;
-      int64_t data1, data2, data3, data4, data5;
-      double f1, f2, f3, f4, f5, f6;
-      int64_t i1, i2, i3, i4;
-      char *label;
-      char *text;
-      double x_min, x_max, y_min, y_max;
-    } PlotRenderer;
-    typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
-
-    enum {
-      RK_HRULE = 7, RK_VRULE = 8, RK_LABEL = 9,
-      RK_LINES = 20, RK_FUNCTION = 21, RK_PARAMETRIC = 22, RK_POLAR = 23, RK_INVERSE = 24, RK_DENSITY = 25,
-      RK_POINTS = 30, RK_ERROR_BARS = 31, RK_VECTOR_FIELD = 32, RK_ARROWS = 33,
-      RK_FUNCTION_INTERVAL = 40, RK_LINES_INTERVAL = 41, RK_PARAM_INTERVAL = 42, RK_POLAR_INTERVAL = 43,
-      RK_RECTANGLES = 50, RK_AREA_HIST = 51, RK_DISCRETE_HIST = 52, RK_STACKED_HIST = 53,
-      RK_ISOLINE = 60, RK_CONTOURS = 61, RK_CONTOUR_INTERVALS = 62, RK_COLOR_FIELD = 63
-    };
-
-    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
-    #define ISNAN(v) ((v) != (v))
-
-    RBBox *out = (RBBox *)malloc(sizeof(*out));
-    double lx0 = 0.0, lx1 = 0.0, ly0 = 0.0, ly1 = 0.0;
-    int lvalid = 0;
-    #define UNION_POINT(X, Y) do { \
-      double __ux = (X), __uy = (Y); \
-      if (!ISNAN(__ux) && !ISNAN(__uy)) { \
-        if (!lvalid) { lx0 = lx1 = __ux; ly0 = ly1 = __uy; lvalid = 1; } \
-        else { \
-          if (__ux < lx0) lx0 = __ux; \
-          if (__ux > lx1) lx1 = __ux; \
-          if (__uy < ly0) ly0 = __uy; \
-          if (__uy > ly1) ly1 = __uy; \
-        } \
-      } \
-    } while (0)
-    #define UNION_LIST_POINTS(LST) do { \
-      for (Cons *__p = (Cons *)(intptr_t)(LST); __p; __p = (Cons *)(intptr_t)__p->tail) { \
-        Cons *__pt = (Cons *)(intptr_t)__p->head; \
-        if (!__pt) continue; \
-        UNION_POINT(BITS_DBL(__pt->head), BITS_DBL(__pt->tail)); \
-      } \
-    } while (0)
-
-    PlotRenderer *r = (PlotRenderer *)(intptr_t)renderer;
-    if (!r) { out->x0 = out->x1 = out->y0 = out->y1 = 0.0; out->valid = 0; return (void *)(intptr_t)out; }
-
-    switch ((int)r->kind) {
-      case RK_LINES:
-      case RK_POINTS:
-      case RK_ARROWS:
-        UNION_LIST_POINTS(r->data1);
-        break;
-      case RK_ERROR_BARS: {
-        for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail) {
-          Cons *a = (Cons *)(intptr_t)p->head;
-          if (!a) continue;
-          double x = BITS_DBL(a->head);
-          Cons *b = (Cons *)(intptr_t)a->tail;
-          if (!b) continue;
-          double y = BITS_DBL(b->head);
-          double h = BITS_DBL(b->tail);
-          if (r->i1) { UNION_POINT(x - h, y); UNION_POINT(x + h, y); }
-          else { UNION_POINT(x, y - h); UNION_POINT(x, y + h); }
-        }
-      } break;
-      case RK_HRULE: UNION_POINT(0.0, r->f1); break;
-      case RK_VRULE: UNION_POINT(r->f1, 0.0); break;
-      case RK_LABEL: UNION_POINT(r->f1, r->f2); break;
-      case RK_RECTANGLES:
-      case RK_AREA_HIST: {
-        for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail) {
-          Cons *a = (Cons *)(intptr_t)p->head;
-          if (!a) continue;
-          double x0 = BITS_DBL(a->head);
-          Cons *b = (Cons *)(intptr_t)a->tail;
-          double x1 = BITS_DBL(b->head);
-          Cons *c = (Cons *)(intptr_t)b->tail;
-          double y0 = BITS_DBL(c->head);
-          double y1 = BITS_DBL(c->tail);
-          UNION_POINT(x0, y0);
-          UNION_POINT(x1, y1);
-        }
-      } break;
-      case RK_DISCRETE_HIST: {
-        int idx = 0;
-        for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail, idx++) {
-          Cons *bar = (Cons *)(intptr_t)p->head;
-          if (!bar) continue;
-          double h = BITS_DBL(bar->tail);
-          if (r->i1) { UNION_POINT(0.0, idx); UNION_POINT(h, idx + 0.8); }
-          else { UNION_POINT(idx, 0.0); UNION_POINT(idx + 0.8, h); }
-        }
-      } break;
-      case RK_STACKED_HIST: {
-        int idx = 0;
-        for (Cons *p = (Cons *)(intptr_t)r->data1; p; p = (Cons *)(intptr_t)p->tail, idx++) {
-          Cons *grp = (Cons *)(intptr_t)p->head;
-          double sum = 0.0;
-          for (Cons *vals = (Cons *)(intptr_t)grp->tail; vals; vals = (Cons *)(intptr_t)vals->tail)
-            sum += BITS_DBL(vals->head);
-          if (r->i1) { UNION_POINT(0.0, idx); UNION_POINT(sum, idx + 0.8); }
-          else { UNION_POINT(idx, 0.0); UNION_POINT(idx + 0.8, sum); }
-        }
-      } break;
-      case RK_FUNCTION:
-      case RK_INVERSE:
-      case RK_DENSITY:
-      case RK_PARAMETRIC:
-      case RK_POLAR:
-      case RK_FUNCTION_INTERVAL:
-      case RK_PARAM_INTERVAL:
-      case RK_POLAR_INTERVAL:
-      case RK_ISOLINE:
-      case RK_CONTOURS:
-      case RK_CONTOUR_INTERVALS:
-      case RK_COLOR_FIELD:
-      case RK_VECTOR_FIELD:
-        if (!ISNAN(r->x_min) && !ISNAN(r->x_max) && !ISNAN(r->y_min) && !ISNAN(r->y_max)) {
-          UNION_POINT(r->x_min, r->y_min);
-          UNION_POINT(r->x_max, r->y_max);
-        }
-        break;
-      case RK_LINES_INTERVAL: UNION_LIST_POINTS(r->data1); UNION_LIST_POINTS(r->data2); break;
-      default: break;
-    }
-
-    out->x0 = lx0; out->x1 = lx1; out->y0 = ly0; out->y1 = ly1; out->valid = lvalid;
-    return (void *)(intptr_t)out;
-    #undef UNION_POINT
-    #undef UNION_LIST_POINTS
-    #undef BITS_DBL
-    #undef ISNAN
-    ```)
-
-  ;;; BBox -- an axis-aligned data-space bounding box: the typed result of the
-  ;;; bounds pass (P1 of the plot Renderer typeclass plan, the shape the future
-  ;;; `Renderer` `bounds` method returns). An empty box -- a renderer that
-  ;;; contributed no finite point -- is represented with `x-min` = NaN; use
-  ;;; `bbox-empty?` to test for it.
+  ;;; BBox -- an axis-aligned data-space bounding box: what a renderer's
+  ;;; `bounds` method returns and what the plot's data extent is folded from.
+  ;;; An empty box -- a renderer that contributed no finite point -- is
+  ;;; represented with `x-min` = NaN; use `bbox-empty?` to test for it.
   (defstruct BBox :copy [x-min : float  x-max : float  y-min : float  y-max : float])
 
-  ;; Raw-carrier accessors over __renderer-bbox's { x0,x1,y0,y1; valid } buffer.
+  ;; Raw-carrier accessors over the { x0,x1,y0,y1; valid } buffer the C bounds
+  ;; helpers below return.
   (defn __rbb-valid? [b : ptr<void>] : bool
     ```c return ((struct { double x0,x1,y0,y1; int valid; } *)b)->valid != 0; ```)
   (defn __rbb-get [b : ptr<void> which : int] : float
@@ -741,9 +585,9 @@
     (let [lo (.x-min bb)] (not (= lo lo))))
 
   ;;; bbox-from-raw -- pack the raw { x0,x1,y0,y1; valid } carrier (as produced
-  ;;; by __renderer-bbox / __point-list-bbox) into a typed BBox with make-struct
-  ;;; (so no struct-by-value crosses the inline-C boundary), freeing the
-  ;;; carrier. An invalid carrier becomes an empty box (x-min = NaN).
+  ;;; by the `__*-bbox` helpers) into a typed BBox with make-struct (so no
+  ;;; struct-by-value crosses the inline-C boundary), freeing the carrier. An
+  ;;; invalid carrier becomes an empty box (x-min = NaN).
   ;;;
   ;;; Defined ahead of its callers on purpose: a `defn` whose return type is an
   ;;; aggregate must be elaborated before the call site, or the caller sees the
@@ -757,34 +601,51 @@
             box (make-struct BBox n n n n)]
         (do (__rbb-free b) box))))
 
-  ;;; renderer-bbox -- a renderer's data-space bounding box as a typed BBox.
-  ;;;
-  ;;; The Turmeric-level wrapper over the P0 `__renderer-bbox` extraction: it
-  ;;; reads the raw carrier and packs a `BBox` (building it with `make-struct`,
-  ;;; so no struct-by-value crosses the inline-C boundary). A renderer with no
-  ;;; finite points yields an empty box (`bbox-empty?` true). This is the value
-  ;;; the forthcoming `Renderer` typeclass's `bounds` method will hand back.
-  (defn renderer-bbox [renderer : int] : BBox
-    (bbox-from-raw (__renderer-bbox renderer)))
+  ;;; bbox-empty-box -- the identity element for `bbox-union`: an empty BBox
+  ;;; (x-min = NaN), matching `bbox-empty?`.
+  (defn bbox-empty-box [] : BBox
+    (let [n (__rbb-nan)] (make-struct BBox n n n n)))
 
-  ;; ===========================================================================
-  ;; Renderer typeclass -- U2 renderer-kind collapse, P2.
+  ;;; bbox-union -- the smallest box covering both inputs; an empty box is the
+  ;;; identity (so folding from `bbox-empty-box` recovers the first non-empty).
   ;;
-  ;; The dispatch axis plot's plan targets is the renderer *kind*: the central
-  ;; ~30-arm switch that interprets the generic data1..5 / f1..6 / i1..4 slot
-  ;; bag differently per kind. P2 replaces "one int `kind` tag drives a switch"
-  ;; with "each kind is a struct carrying its real typed payload + a `Renderer`
-  ;; instance". This slice establishes the class and the `bounds` method over
-  ;; the first per-kind structs, computing the data extent from named fields and
-  ;; verified against the legacy slot-bag bounds. The `render` method (delegating
-  ;; to the extracted draw pass) and the existential box that lets a heterogeneous
-  ;; renderer Vec dispatch through the class land with P3/P4.
-  ;; ===========================================================================
+  ;; On a tie the left box's coordinate is kept, as the draw pass's own union
+  ;; once kept the first point it saw.
+  (defn bbox-union [a : BBox  b : BBox] : BBox
+    (if (bbox-empty? a) b
+      (if (bbox-empty? b) a
+        (make-struct BBox
+          (if (< (.x-min b) (.x-min a)) (.x-min b) (.x-min a))
+          (if (> (.x-max b) (.x-max a)) (.x-max b) (.x-max a))
+          (if (< (.y-min b) (.y-min a)) (.y-min b) (.y-min a))
+          (if (> (.y-max b) (.y-max a)) (.y-max b) (.y-max a))))))
+
+  ;;; point-bbox -- the degenerate box of one data point; empty when either
+  ;;; coordinate is NaN (a NaN point contributes nothing to the extent).
+  (defn point-bbox [x : float  y : float] : BBox
+    (if (or (not (= x x)) (not (= y y)))
+      (bbox-empty-box)
+      (make-struct BBox x x y y)))
+
+  ;;; hint-bbox -- the box spanned by the corners (x0, y0) and (x1, y1) of an
+  ;;; explicit domain, as the sampled-grid kinds (contours, vector fields)
+  ;;; declare. Empty unless all four are finite numbers.
+  (defn hint-bbox [x0 : float  x1 : float  y0 : float  y1 : float] : BBox
+    (if (or (not (= x0 x0)) (not (= x1 x1)) (not (= y0 y0)) (not (= y1 y1)))
+      (bbox-empty-box)
+      (make-struct BBox (if (< x1 x0) x1 x0) (if (> x1 x0) x1 x0)
+                        (if (< y1 y0) y1 y0) (if (> y1 y0) y1 y0))))
+
+  ;; ---------------------------------------------------------------------------
+  ;; Bounds of the cons-shaped payloads. Each helper walks one payload shape
+  ;; and returns the raw { x0,x1,y0,y1; valid } carrier (`bbox-from-raw` packs
+  ;; it); NaN points are skipped. These were the arms of the draw pass's old
+  ;; per-kind bounds `switch`, moved verbatim -- a kind's `bounds` method now
+  ;; picks its helper by type instead of by a `kind` tag.
+  ;; ---------------------------------------------------------------------------
 
   ;;; __point-list-bbox -- bounding box of a cons-list of (cons x y) points: the
-  ;;; bounds rule shared by the lines / points / arrows kinds. Same raw-carrier
-  ;;; shape as __renderer-bbox; NaN coordinates are skipped, an empty list is an
-  ;;; invalid (empty) box.
+  ;;; rule shared by the lines / points / lines-interval kinds.
   (defn (export-as "plot_point_list_bbox") __point-list-bbox [points : int] : ptr<void>
     ```c
     #include <stdlib.h>
@@ -811,148 +672,360 @@
     #undef ISNAN
     ```)
 
-  ;;; Renderer -- typeclass collapsing the per-kind renderer dispatch. Each kind
-  ;;; is a struct carrying its real typed fields; `bounds` computes the data
-  ;;; extent from those fields and `to-legacy` lowers the struct to the slot-bag
-  ;;; `int` handle the C draw pass still consumes. Lives beside its instances so
-  ;;; the orphan-instance check is satisfied (same as ansi Color / json Encode).
+  ;;; __error-bars-bbox -- bounding box of a cons-list of (x . (y . h)) error
+  ;;; bars: each bar spans y +/- h, or x +/- h when `horizontal`.
+  (defn __error-bars-bbox [bars : int  horizontal : bool] : ptr<void>
+    ```c
+    #include <stdlib.h>
+    #include <stdint.h>
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    #define ISNAN(v) ((v) != (v))
+    RBBox *out = (RBBox *)malloc(sizeof(*out));
+    double lx0 = 0.0, lx1 = 0.0, ly0 = 0.0, ly1 = 0.0;
+    int lvalid = 0;
+    #define UNION_POINT(X, Y) do { \
+      double __ux = (X), __uy = (Y); \
+      if (!ISNAN(__ux) && !ISNAN(__uy)) { \
+        if (!lvalid) { lx0 = lx1 = __ux; ly0 = ly1 = __uy; lvalid = 1; } \
+        else { \
+          if (__ux < lx0) lx0 = __ux; \
+          if (__ux > lx1) lx1 = __ux; \
+          if (__uy < ly0) ly0 = __uy; \
+          if (__uy > ly1) ly1 = __uy; \
+        } \
+      } \
+    } while (0)
+    for (Cons *p = (Cons *)(intptr_t)bars; p; p = (Cons *)(intptr_t)p->tail) {
+      Cons *a = (Cons *)(intptr_t)p->head;
+      if (!a) continue;
+      double x = BITS_DBL(a->head);
+      Cons *b = (Cons *)(intptr_t)a->tail;
+      if (!b) continue;
+      double y = BITS_DBL(b->head);
+      double h = BITS_DBL(b->tail);
+      if (horizontal) { UNION_POINT(x - h, y); UNION_POINT(x + h, y); }
+      else { UNION_POINT(x, y - h); UNION_POINT(x, y + h); }
+    }
+    out->x0 = lx0; out->x1 = lx1; out->y0 = ly0; out->y1 = ly1; out->valid = lvalid;
+    return (void *)(intptr_t)out;
+    #undef UNION_POINT
+    #undef BITS_DBL
+    #undef ISNAN
+    ```)
+
+  ;;; __arrows-bbox -- bounding box of a cons-list of (x1 . (y1 . (x2 . y2)))
+  ;;; arrow segments: both endpoints of every arrow.
+  ;;
+  ;; The draw pass used to bound arrows with the point-list rule, reading each
+  ;; arrow's second cell -- a pointer -- as its y coordinate, so the plot's
+  ;; y range came out of the heap layout and changed from run to run.
+  (defn __arrows-bbox [arrows : int] : ptr<void>
+    ```c
+    #include <stdlib.h>
+    #include <stdint.h>
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    #define ISNAN(v) ((v) != (v))
+    RBBox *out = (RBBox *)malloc(sizeof(*out));
+    double lx0 = 0.0, lx1 = 0.0, ly0 = 0.0, ly1 = 0.0;
+    int lvalid = 0;
+    #define UNION_POINT(X, Y) do { \
+      double __ux = (X), __uy = (Y); \
+      if (!ISNAN(__ux) && !ISNAN(__uy)) { \
+        if (!lvalid) { lx0 = lx1 = __ux; ly0 = ly1 = __uy; lvalid = 1; } \
+        else { \
+          if (__ux < lx0) lx0 = __ux; \
+          if (__ux > lx1) lx1 = __ux; \
+          if (__uy < ly0) ly0 = __uy; \
+          if (__uy > ly1) ly1 = __uy; \
+        } \
+      } \
+    } while (0)
+    for (Cons *p = (Cons *)(intptr_t)arrows; p; p = (Cons *)(intptr_t)p->tail) {
+      Cons *a = (Cons *)(intptr_t)p->head;
+      if (!a) continue;
+      Cons *b = (Cons *)(intptr_t)a->tail;
+      if (!b) continue;
+      Cons *c = (Cons *)(intptr_t)b->tail;
+      if (!c) continue;
+      UNION_POINT(BITS_DBL(a->head), BITS_DBL(b->head));
+      UNION_POINT(BITS_DBL(c->head), BITS_DBL(c->tail));
+    }
+    out->x0 = lx0; out->x1 = lx1; out->y0 = ly0; out->y1 = ly1; out->valid = lvalid;
+    return (void *)(intptr_t)out;
+    #undef UNION_POINT
+    #undef BITS_DBL
+    #undef ISNAN
+    ```)
+
+  ;;; __rects-bbox -- bounding box of a cons-list of (x0 . (x1 . (y0 . y1)))
+  ;;; rectangles: the rectangles / area-histogram rule.
+  (defn __rects-bbox [rects : int] : ptr<void>
+    ```c
+    #include <stdlib.h>
+    #include <stdint.h>
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    #define ISNAN(v) ((v) != (v))
+    RBBox *out = (RBBox *)malloc(sizeof(*out));
+    double lx0 = 0.0, lx1 = 0.0, ly0 = 0.0, ly1 = 0.0;
+    int lvalid = 0;
+    #define UNION_POINT(X, Y) do { \
+      double __ux = (X), __uy = (Y); \
+      if (!ISNAN(__ux) && !ISNAN(__uy)) { \
+        if (!lvalid) { lx0 = lx1 = __ux; ly0 = ly1 = __uy; lvalid = 1; } \
+        else { \
+          if (__ux < lx0) lx0 = __ux; \
+          if (__ux > lx1) lx1 = __ux; \
+          if (__uy < ly0) ly0 = __uy; \
+          if (__uy > ly1) ly1 = __uy; \
+        } \
+      } \
+    } while (0)
+    for (Cons *p = (Cons *)(intptr_t)rects; p; p = (Cons *)(intptr_t)p->tail) {
+      Cons *a = (Cons *)(intptr_t)p->head;
+      if (!a) continue;
+      double x0 = BITS_DBL(a->head);
+      Cons *b = (Cons *)(intptr_t)a->tail;
+      double x1 = BITS_DBL(b->head);
+      Cons *c = (Cons *)(intptr_t)b->tail;
+      double y0 = BITS_DBL(c->head);
+      double y1 = BITS_DBL(c->tail);
+      UNION_POINT(x0, y0);
+      UNION_POINT(x1, y1);
+    }
+    out->x0 = lx0; out->x1 = lx1; out->y0 = ly0; out->y1 = ly1; out->valid = lvalid;
+    return (void *)(intptr_t)out;
+    #undef UNION_POINT
+    #undef BITS_DBL
+    #undef ISNAN
+    ```)
+
+  ;;; __discrete-hist-bbox -- bounding box of a cons-list of (label . height)
+  ;;; bars laid out at category slots 0, 1, 2, ... (each 0.8 wide), rotated
+  ;;; onto the y axis when `horizontal`.
+  (defn __discrete-hist-bbox [bars : int  horizontal : bool] : ptr<void>
+    ```c
+    #include <stdlib.h>
+    #include <stdint.h>
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    #define ISNAN(v) ((v) != (v))
+    RBBox *out = (RBBox *)malloc(sizeof(*out));
+    double lx0 = 0.0, lx1 = 0.0, ly0 = 0.0, ly1 = 0.0;
+    int lvalid = 0;
+    #define UNION_POINT(X, Y) do { \
+      double __ux = (X), __uy = (Y); \
+      if (!ISNAN(__ux) && !ISNAN(__uy)) { \
+        if (!lvalid) { lx0 = lx1 = __ux; ly0 = ly1 = __uy; lvalid = 1; } \
+        else { \
+          if (__ux < lx0) lx0 = __ux; \
+          if (__ux > lx1) lx1 = __ux; \
+          if (__uy < ly0) ly0 = __uy; \
+          if (__uy > ly1) ly1 = __uy; \
+        } \
+      } \
+    } while (0)
+    int idx = 0;
+    for (Cons *p = (Cons *)(intptr_t)bars; p; p = (Cons *)(intptr_t)p->tail, idx++) {
+      Cons *bar = (Cons *)(intptr_t)p->head;
+      if (!bar) continue;
+      double h = BITS_DBL(bar->tail);
+      if (horizontal) { UNION_POINT(0.0, idx); UNION_POINT(h, idx + 0.8); }
+      else { UNION_POINT(idx, 0.0); UNION_POINT(idx + 0.8, h); }
+    }
+    out->x0 = lx0; out->x1 = lx1; out->y0 = ly0; out->y1 = ly1; out->valid = lvalid;
+    return (void *)(intptr_t)out;
+    #undef UNION_POINT
+    #undef BITS_DBL
+    #undef ISNAN
+    ```)
+
+  ;;; __stacked-hist-bbox -- bounding box of a cons-list of (label . values)
+  ;;; groups: each slot is as tall as the sum of its stacked values.
+  (defn __stacked-hist-bbox [groups : int  horizontal : bool] : ptr<void>
+    ```c
+    #include <stdlib.h>
+    #include <stdint.h>
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    #define ISNAN(v) ((v) != (v))
+    RBBox *out = (RBBox *)malloc(sizeof(*out));
+    double lx0 = 0.0, lx1 = 0.0, ly0 = 0.0, ly1 = 0.0;
+    int lvalid = 0;
+    #define UNION_POINT(X, Y) do { \
+      double __ux = (X), __uy = (Y); \
+      if (!ISNAN(__ux) && !ISNAN(__uy)) { \
+        if (!lvalid) { lx0 = lx1 = __ux; ly0 = ly1 = __uy; lvalid = 1; } \
+        else { \
+          if (__ux < lx0) lx0 = __ux; \
+          if (__ux > lx1) lx1 = __ux; \
+          if (__uy < ly0) ly0 = __uy; \
+          if (__uy > ly1) ly1 = __uy; \
+        } \
+      } \
+    } while (0)
+    int idx = 0;
+    for (Cons *p = (Cons *)(intptr_t)groups; p; p = (Cons *)(intptr_t)p->tail, idx++) {
+      Cons *grp = (Cons *)(intptr_t)p->head;
+      double sum = 0.0;
+      for (Cons *vals = (Cons *)(intptr_t)grp->tail; vals; vals = (Cons *)(intptr_t)vals->tail)
+        sum += BITS_DBL(vals->head);
+      if (horizontal) { UNION_POINT(0.0, idx); UNION_POINT(sum, idx + 0.8); }
+      else { UNION_POINT(idx, 0.0); UNION_POINT(idx + 0.8, sum); }
+    }
+    out->x0 = lx0; out->x1 = lx1; out->y0 = ly0; out->y1 = ly1; out->valid = lvalid;
+    return (void *)(intptr_t)out;
+    #undef UNION_POINT
+    #undef BITS_DBL
+    #undef ISNAN
+    ```)
+
+  ;; ===========================================================================
+  ;; Renderer typeclass -- U2 renderer-kind collapse.
+  ;;
+  ;; Each renderer kind is its own type carrying its real fields (the structs
+  ;; live beside their constructors: LinesR and FunctionR in plot/line,
+  ;; PointsR in plot/point, the Decoration sum type in plot/decor, ...), with
+  ;; one `Renderer` instance per kind. The public constructors box their struct
+  ;; as an `AnyRenderer`, so a heterogeneous `(vec-of (axes) (lines ...))`
+  ;; type-checks and every element still dispatches through its own instance.
+  ;;
+  ;; `bounds` replaced the draw pass's per-kind bounds `switch`. `to-legacy`
+  ;; still lowers each struct to the slot-bag handle the C draw pass consumes;
+  ;; it goes away when the draw pass is split per kind (plot Renderer plan P4).
+  ;; ===========================================================================
+
+  ;;; Renderer -- the class every plot renderer kind implements.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- a renderer kind (LinesR, FunctionR, Decoration, ...)
+  ;;;
+  ;;; Methods:
+  ;;;   bounds    -- the data-space extent the renderer needs on screen; empty
+  ;;;                (see `bbox-empty?`) when it constrains nothing, as a
+  ;;;                sampled curve or an axis does
+  ;;;   to-legacy -- lower the renderer to the slot-bag handle the C draw pass
+  ;;;                reads; a fresh handle the caller frees
+  ;;;
+  ;;; Example:
+  ;;;   (bounds (make-struct LinesR pts (default-line-style) "l"))
+  ;;;
+  ;;; Since: plot-v0.4.0
   (defclass Renderer [a]
     (bounds [r] : BBox)
     (to-legacy [r] : int))
 
-  ;;; LinesR / PointsR -- a polyline / scatter over an explicit (cons x y) list.
-  ;;; PointsR is nominally distinct from LinesR though their payloads match, so
-  ;;; the two can never be silently swapped (the slot-bag `kind` tag could be).
-  (defstruct LinesR  :copy [points : int  style : int  label : cstr])
-  (defstruct PointsR :copy [points : int  style : int  label : cstr])
-  ;;; LabelR -- a text label anchored at one (x, y) data point.
-  (defstruct LabelR  :copy [x : float  y : float  text : cstr  style : int])
-
-  (defn lines-r  [points : int  style : int  label : cstr] : LinesR
-    (make-struct LinesR points style label))
-  (defn points-r [points : int  style : int  label : cstr] : PointsR
-    (make-struct PointsR points style label))
-  (defn label-r  [x : float  y : float  text : cstr  style : int] : LabelR
-    (make-struct LabelR x y text style))
-
-  ;; to-legacy rebuilds the exact slot-bag handle the legacy constructor emits
-  ;; (`lines` -> RK_LINES 20, `points` -> RK_POINTS 30, `point-label-styled`
-  ;; -> RK_LABEL 9), so routing a typed renderer through the existing draw pass
-  ;; is pixel-identical to the legacy path.
-  (definstance Renderer [LinesR]
-    (bounds [r] (bbox-from-raw (__point-list-bbox (.points r))))
-    (to-legacy [r] (__make-renderer 20 (.style r) 0 (.points r) 0 0 0 0 (.label r) "")))
-  (definstance Renderer [PointsR]
-    (bounds [r] (bbox-from-raw (__point-list-bbox (.points r))))
-    (to-legacy [r] (__make-renderer 30 (.style r) 0 (.points r) 0 0 0 0 (.label r) "")))
-  (definstance Renderer [LabelR]
-    (bounds [r] (make-struct BBox (.x r) (.x r) (.y r) (.y r)))
-    (to-legacy [r]
-      (__renderer-bounds
-        (__renderer-floats
-          (__make-renderer 9 (.style r) 0 0 0 0 0 0 "" (.text r))
-          (.x r) (.y r) 0.0 0.0 0.0 0.0)
-        (.x r) (.x r) (.y r) (.y r))))
-
-  ;; ===========================================================================
-  ;; AnyRenderer -- existential box for heterogeneous renderer vecs (P3).
-  ;;
-  ;; A `(Vec (exists [a] [(Renderer a)] a))` holds renderers of different kinds
-  ;; (LinesR, PointsR, LabelR, ...) behind one element type; `bounds`/`render`
-  ;; dispatch through each element's *packed* Renderer dictionary instead of a
-  ;; runtime `kind` switch. This needs witness-indirected `open` dispatch, which
-  ;; landed in turmeric main (PRs #452 open-dispatch, #456 vec-get type
-  ;; preservation, #458 by-value struct payload pack).
-  ;;
-  ;; The `bounds`/`to-legacy` folds below are local `letrec` closures that
-  ;; capture the existential `rs` and dereference it via `open` inside the lifted
-  ;; closure body. turmeric main fixed the self-recursive carrier typing (both
-  ;; `defn` and `letrec`) and fresh `vec-new` argument unification, and #464
-  ;; closed the last gap (W3): a captured binding referenced inside
-  ;; `open`/`pack`/`dispatch` is now collected into the closure's capture set and
-  ;; resolves to its env slot instead of mis-emitting an undeclared C name. So
-  ;; the folds no longer need to be hoisted to top-level `defn`s that thread `rs`
-  ;; as an explicit parameter.
-  ;; (Callers building a heterogeneous `(Vec (exists ...))` literal still ascribe
-  ;; the element type at construction -- see the `mixed-vec` helper in the
-  ;; any_renderer test -- because the existential element is not back-inferred
-  ;; from the pushes; that is a separate, narrower case from the `(Vec int)` one.)
-  ;; ===========================================================================
+  ;;; AnyRenderer -- a value of any `Renderer` kind, boxed with its instance.
+  ;;; Every public constructor (`lines`, `function`, `axes`, ...) returns one,
+  ;;; and `plot` / `plot-write-png` / `render` take a `(Vec AnyRenderer)`.
+  (defalias AnyRenderer (exists [a] [(Renderer a)] a))
 
   ;;; any-renderer -- box a value whose type has a `Renderer` instance as an
-  ;;; `AnyRenderer` existential. The `(exists ...)` form must appear literally
-  ;;; at the pack site, so this is a macro (same reason as stdlib `showable`).
+  ;;; `AnyRenderer`. The `(exists ...)` form must appear literally at the pack
+  ;;; site, so this is a macro (same reason as stdlib `showable`).
   ;;;
-  ;;;   (any-renderer (lines-r pts style ""))  ;; => packed AnyRenderer
+  ;;; Parameters:
+  ;;;   x -- a renderer struct (LinesR, FunctionR, ...)
+  ;;;
+  ;;; Returns:
+  ;;;   The value boxed with its `Renderer` instance, as an AnyRenderer.
+  ;;;
+  ;;; Example:
+  ;;;   (any-renderer (make-struct LinesR pts (default-line-style) ""))
   (defmacro any-renderer [x] (list pack x (list exists [a] [(list Renderer a)] a)))
 
-  ;;; bbox-empty-box -- the identity element for `bbox-union`: an empty BBox
-  ;;; (x-min = NaN), matching `bbox-empty?`.
-  (defn bbox-empty-box [] : BBox
-    (let [n (__rbb-nan)] (make-struct BBox n n n n)))
-
-  ;;; bbox-union -- the smallest box covering both inputs; an empty box is the
-  ;;; identity (so folding from `bbox-empty-box` recovers the first non-empty).
-  ;;
-  ;; An empty input returns the other box directly. (A multi-field `:copy`
-  ;; struct is passed by pointer; returning such a parameter by value used to
-  ;; mis-emit in C as 'incompatible types ... BBox from const BBox *' -- that
-  ;; codegen bug is fixed in turmeric main, so the param can be returned as-is
-  ;; instead of being rebuilt field-by-field.)
-  (defn bbox-union [a : BBox  b : BBox] : BBox
-    (if (bbox-empty? a) b
-      (if (bbox-empty? b) a
-        (make-struct BBox
-          (if (< (.x-min a) (.x-min b)) (.x-min a) (.x-min b))
-          (if (> (.x-max a) (.x-max b)) (.x-max a) (.x-max b))
-          (if (< (.y-min a) (.y-min b)) (.y-min a) (.y-min b))
-          (if (> (.y-max a) (.y-max b)) (.y-max a) (.y-max b))))))
-
-  ;;; renderers-bbox -- data-space bounding box of a heterogeneous renderer Vec,
-  ;;; unioning each element's `bounds` through the `AnyRenderer` existential.
-  ;;; The P3 payoff: the union is driven by coherent typeclass dispatch, not the
-  ;;; legacy ~30-arm `kind` switch in `__renderer-bbox`.
+  ;;; renderer-bbox -- the data-space bounding box of one renderer.
   ;;;
-  ;;; The fold is a local `letrec` closure that captures the existential `rs` and
-  ;;; `open`s each element under a fresh abstract type, dispatching `bounds`
-  ;;; through the packed witness; the per-element box is unioned into a `BBox`
-  ;;; accumulator seeded from `bbox-empty-box` (the union identity). The captured
-  ;;; `rs`/`open` form is correct since turmeric #464 (W3).
-  (defn renderers-bbox [rs : (Vec (exists [a] [(Renderer a)] a))] : BBox
-    (let [n (vec-len rs)]
-      (letrec [go (fn [i : int  acc : BBox] : BBox
-                    (if (>= i n) acc
-                      (go (+ i 1)
-                          (bbox-union acc (open (vec-get rs i) [a v] (bounds v))))))]
-        (go 0 (bbox-empty-box)))))
-
-  ;;; anyrenderers->legacy -- materialise a (Vec AnyRenderer) as the legacy
-  ;;; (Vec int) of slot-bag handles the C draw pass consumes. Each element's
-  ;;; lowering dispatches through its packed Renderer dictionary (`to-legacy`).
+  ;;; Parameters:
+  ;;;   r -- any renderer, as a constructor returns it
   ;;;
-  ;;; A local `letrec` closure folds the Vec: it captures the existential `rs`
-  ;;; and the legacy `out` accumulator, `open`s each element, and pushes the
-  ;;; lowered handle in place. The seed `out` is a bare `(vec-new)` (turmeric
-  ;;; unifies its element tyvar against the `(Vec int)` result, W2), and the
-  ;;; captured-`rs` `open` body emits correctly since #464 (W3).
-  (defn anyrenderers->legacy [rs : (Vec (exists [a] [(Renderer a)] a))] : (Vec int)
-    (let [n   (vec-len rs)
-          out (vec-new)]
-      (letrec [go (fn [i : int] : (Vec int)
-                    (if (>= i n) out
-                      (let [h (open (vec-get rs i) [a v] (to-legacy v))]
-                        (do (vec-push! out h)
-                            (go (+ i 1))))))]
-        (go 0))))
+  ;;; Returns:
+  ;;;   Its `bounds`; an empty box (`bbox-empty?`) when it constrains nothing.
+  ;;;
+  ;;; Example:
+  ;;;   (renderer-bbox (lines pts (default-line-style) ""))
+  (defn renderer-bbox [r : AnyRenderer] : BBox
+    (open r [a v] (bounds v)))
 
-  ;;; plot-anyrenderers -- render a heterogeneous (Vec AnyRenderer) to a new
-  ;;; surface (returns the same :ptr<void> result envelope as `plot`). Each
-  ;;; renderer is lowered through the `Renderer` typeclass (`to-legacy`) and the
-  ;;; result handed to the existing draw pipeline -- so pixel output is identical
-  ;;; to building the same renderers with the legacy constructors and calling
-  ;;; `plot`, but the input is the typed, type-safe `AnyRenderer` vec.
-  (defn plot-anyrenderers [rs : (Vec (exists [a] [(Renderer a)] a)) opts : int] : ptr<void>
-    (plot (:: (anyrenderers->legacy rs) :int) opts))
+  ;; The folds below are top-level recursive defns rather than local `letrec`
+  ;; closures: the compiler mallocs a letrec closure's env and, for a struct
+  ;; argument, a box per call, and frees neither -- a leak on every `plot`.
+  ;; A top-level defn passes `acc` by value and allocates nothing.
+
+  ;;; __bbox-fold -- union the `bounds` of rs[i..n) into acc.
+  (defn __bbox-fold [rs : (Vec AnyRenderer)  i : int  n : int  acc : BBox] : BBox
+    (if (>= i n) acc
+      (__bbox-fold rs (+ i 1) n
+                   (bbox-union acc (open (vec-get rs i) [a v] (bounds v))))))
+
+  ;;; renderers-bbox -- the data-space bounding box of a renderer Vec: the
+  ;;; union of every element's `bounds`, each dispatched through the instance
+  ;;; its `AnyRenderer` carries. This is the extent the plot is laid out over
+  ;;; before padding and before `plot-opts` overrides.
+  ;;;
+  ;;; Parameters:
+  ;;;   rs -- the renderers
+  ;;;
+  ;;; Returns:
+  ;;;   The union of their bounds; empty when none constrains the extent.
+  ;;;
+  ;;; Example:
+  ;;;   (renderers-bbox (vec-of (axes) (lines pts (default-line-style) "")))
+  (defn renderers-bbox [rs : (Vec AnyRenderer)] : BBox
+    (__bbox-fold rs 0 (vec-len rs) (bbox-empty-box)))
+
+  ;;; __lower-into -- push the `to-legacy` handle of each of rs[i..n) onto out.
+  (defn __lower-into [rs : (Vec AnyRenderer)  i : int  n : int  out : (Vec int)] : (Vec int)
+    (if (>= i n) out
+      (do (vec-push! out (open (vec-get rs i) [a v] (to-legacy v)))
+          (__lower-into rs (+ i 1) n out))))
+
+  ;;; anyrenderers->legacy -- lower a (Vec AnyRenderer) to the (Vec int) of
+  ;;; slot-bag handles the C draw pass consumes, one `to-legacy` per element.
+  ;;; The handles are fresh: release them with `__free-renderers`.
+  (defn anyrenderers->legacy [rs : (Vec AnyRenderer)] : (Vec int)
+    (__lower-into rs 0 (vec-len rs) (:: (vec-new) (Vec int))))
+
+  ;;; __free-renderers -- free each slot-bag handle in a lowered renderer Vec
+  ;;; (the handle and its copied label / text; the payload it points at belongs
+  ;;; to the typed renderer). The Vec itself is left to the caller.
+  (defn __free-renderers [handles : int] : void
+    ```c
+    #include <stdlib.h>
+    #include <stdint.h>
+    typedef struct __plot_renderer {
+      int64_t kind;
+      int64_t style1, style2;
+      int64_t data1, data2, data3, data4, data5;
+      double f1, f2, f3, f4, f5, f6;
+      int64_t i1, i2, i3, i4;
+      char *label;
+      char *text;
+      double x_min, x_max, y_min, y_max;
+    } PlotRenderer;
+    typedef struct { int64_t *data; size_t len; size_t cap; } RendVec;
+    RendVec *v = (RendVec *)(intptr_t)handles;
+    if (!v) return;
+    for (size_t i = 0; i < v->len; i++) {
+      PlotRenderer *r = (PlotRenderer *)(intptr_t)v->data[i];
+      if (!r) continue;
+      free(r->label);
+      free(r->text);
+      free(r);
+    }
+    ```)
+
+  ;;; plot-anyrenderers -- deprecated: `plot` takes a (Vec AnyRenderer) itself
+  ;;; now. Kept for one release; call `plot`.
+  (defn plot-anyrenderers [rs : (Vec AnyRenderer) opts : int] : ptr<void>
+    (plot rs opts))
 
   ;;; __surfaces-equal? -- true when two plutovg surfaces have identical
   ;;; dimensions and pixel bytes. Used to assert that the typed `AnyRenderer`
@@ -982,23 +1055,20 @@
     return true;
     ```)
 
-  ;;; plot-into-canvas -- render into an existing canvas and viewport.
-  ;;;
-  ;;; renderers is a Vec[Renderer] (built with vec-of or vec-new/vec-push!),
-  ;;; not a cons list. Internal renderer payload data (e.g. lists of point
-  ;;; pairs inside each renderer) is still cons-shaped -- only the top-level
-  ;;; sequence of renderers is a Vec.
   ;;; __draw-renderers -- draw the renderer Vec into `canvas` at the already-
   ;;; resolved data bounds and viewport rect. P0 de-monolith of the plot
   ;;; Renderer plan: the former per-kind draw `switch`, its clip bracket, and the
   ;;; style / auto-color / MAP_POINT machinery are lifted verbatim out of the
   ;;; ~900-line plot-into-canvas body into this standalone, independently-callable
-  ;;; function. plot-into-canvas now computes bounds/axes/labels and delegates the
-  ;;; data rendering here. Pure code movement -- pixel output is byte-identical.
+  ;;; function. The frame worker (`__plot-into-canvas-legacy`) lays out the
+  ;;; axes and labels and delegates the data rendering here. Pure code
+  ;;; movement -- pixel output is byte-identical. `renderers` is the lowered
+  ;;; slot-bag Vec; each callback slot holds a closure handle, called through
+  ;;; `TUR_APPLY1_T` / `TUR_APPLY2_T`.
   ;;;
   ;;; Pinned to the stable C symbol `plot_draw_renderers` via `export-as` so
-  ;;; plot-into-canvas's inline-C can name it across mangling (same idiom as
-  ;;; `plot_sample_adaptive` / `plot_renderer_bbox`).
+  ;;; the frame worker's inline-C can name it across mangling (same idiom as
+  ;;; `plot_sample_adaptive`).
   (defn (export-as "plot_draw_renderers")
         __draw-renderers [canvas : int  renderers : int
                           bx-min : float  bx-max : float  by-min : float  by-max : float
@@ -1370,7 +1440,7 @@
             for (int iy = 0; iy < samples; iy++) for (int ix = 0; ix < samples; ix++) {
               double x = r->f1 + (r->f2 - r->f1) * ((double)ix / (double)(samples - 1));
               double y = r->f3 + (r->f4 - r->f3) * ((double)iy / (double)(samples - 1));
-              Cons *pair = (Cons *)(intptr_t)((int64_t(*)(double,double))(intptr_t)r->data1)(x, y);
+              Cons *pair = (Cons *)(intptr_t)TUR_APPLY2_T(int64_t, double, double, r->data1, x, y);
               double dx = BITS_DBL(pair->head), dy = BITS_DBL(pair->tail);
               if (r->i2 == 1) {
                 double len = sqrt(dx * dx + dy * dy);
@@ -1422,15 +1492,15 @@
               double t = r->f1 + (r->f2 - r->f1) * ((double)i / (double)(n - 1));
               if (r->kind == RK_FUNCTION_INTERVAL) {
                 xs[i] = t;
-                ya[i] = ((double(*)(double))(intptr_t)r->data1)(t);
-                yb[i] = ((double(*)(double))(intptr_t)r->data2)(t);
+                ya[i] = TUR_APPLY1_T(double, double, r->data1, t);
+                yb[i] = TUR_APPLY1_T(double, double, r->data2, t);
               } else if (r->kind == RK_PARAM_INTERVAL) {
-                Cons *pa = (Cons *)(intptr_t)((int64_t(*)(double))(intptr_t)r->data1)(t);
-                Cons *pb = (Cons *)(intptr_t)((int64_t(*)(double))(intptr_t)r->data2)(t);
+                Cons *pa = (Cons *)(intptr_t)TUR_APPLY1_T(int64_t, double, r->data1, t);
+                Cons *pb = (Cons *)(intptr_t)TUR_APPLY1_T(int64_t, double, r->data2, t);
                 xs[i] = BITS_DBL(pa->head); ya[i] = BITS_DBL(pa->tail); yb[i] = BITS_DBL(pb->tail);
               } else {
-                double ra = ((double(*)(double))(intptr_t)r->data1)(t);
-                double rb = ((double(*)(double))(intptr_t)r->data2)(t);
+                double ra = TUR_APPLY1_T(double, double, r->data1, t);
+                double rb = TUR_APPLY1_T(double, double, r->data2, t);
                 xs[i] = ra * cos(t); ya[i] = ra * sin(t); yb[i] = rb * sin(t);
               }
             }
@@ -1442,7 +1512,7 @@
             for (int i = n - 1; i >= 0; i--) {
               double vx, vy;
               if (r->kind == RK_POLAR_INTERVAL) {
-                double x2 = ((double(*)(double))(intptr_t)r->data2)(r->f1 + (r->f2 - r->f1) * ((double)i / (double)(n - 1))) * cos(r->f1 + (r->f2 - r->f1) * ((double)i / (double)(n - 1)));
+                double x2 = TUR_APPLY1_T(double, double, r->data2, r->f1 + (r->f2 - r->f1) * ((double)i / (double)(n - 1))) * cos(r->f1 + (r->f2 - r->f1) * ((double)i / (double)(n - 1)));
                 MAP_POINT(x2, yb[i], &vx, &vy);
               } else MAP_POINT(xs[i], yb[i], &vx, &vy);
               plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
@@ -1519,11 +1589,14 @@
             double x1 = r->f1 + (r->f2 - r->f1) * ((double)(ix + 1) / (double)(samples - 1));
             double y0 = r->f3 + (r->f4 - r->f3) * ((double)iy / (double)(samples - 1));
             double y1 = r->f3 + (r->f4 - r->f3) * ((double)(iy + 1) / (double)(samples - 1));
-            double v = ((double(*)(double,double))(intptr_t)r->data1)((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+            /* color-field's callback returns a palette index, not a level: only
+               contour-intervals reads v. */
+            double v = (r->kind == RK_COLOR_FIELD) ? 0.0
+                       : TUR_APPLY2_T(double, double, double, r->data1, (x0 + x1) * 0.5, (y0 + y1) * 0.5);
             int color = 0;
             double alpha = (r->kind == RK_COLOR_FIELD) ? r->f5 : 0.55;
             if (r->kind == RK_COLOR_FIELD) {
-              color = ((int(*)(double,double))(intptr_t)r->data1)((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+              color = (int)TUR_APPLY2_T(int64_t, double, double, r->data1, (x0 + x1) * 0.5, (y0 + y1) * 0.5);
               color %= 8; if (color < 0) color += 8;
             } else {
               int bands = (int)r->i2 + 1;
@@ -1554,10 +1627,10 @@
               double x1 = r->f1 + (r->f2 - r->f1) * ((double)(ix + 1) / (double)(samples - 1));
               double y0 = r->f3 + (r->f4 - r->f3) * ((double)iy / (double)(samples - 1));
               double y1 = r->f3 + (r->f4 - r->f3) * ((double)(iy + 1) / (double)(samples - 1));
-              double v00 = ((double(*)(double,double))(intptr_t)r->data1)(x0, y0) - level;
-              double v10 = ((double(*)(double,double))(intptr_t)r->data1)(x1, y0) - level;
-              double v01 = ((double(*)(double,double))(intptr_t)r->data1)(x0, y1) - level;
-              double v11 = ((double(*)(double,double))(intptr_t)r->data1)(x1, y1) - level;
+              double v00 = TUR_APPLY2_T(double, double, double, r->data1, x0, y0) - level;
+              double v10 = TUR_APPLY2_T(double, double, double, r->data1, x1, y0) - level;
+              double v01 = TUR_APPLY2_T(double, double, double, r->data1, x0, y1) - level;
+              double v11 = TUR_APPLY2_T(double, double, double, r->data1, x1, y1) - level;
               double ptsx[4], ptsy[4]; int pc = 0;
               if ((v00 <= 0 && v10 > 0) || (v00 > 0 && v10 <= 0)) { double t = v00 / (v00 - v10); ptsx[pc] = x0 + (x1 - x0) * t; ptsy[pc++] = y0; }
               if ((v10 <= 0 && v11 > 0) || (v10 > 0 && v11 <= 0)) { double t = v10 / (v10 - v11); ptsx[pc] = x1; ptsy[pc++] = y0 + (y1 - y0) * t; }
@@ -1580,8 +1653,16 @@
     plutovg_canvas_restore((plutovg_canvas_t *)(intptr_t)canvas);
     ```)
 
-  (defn plot-into-canvas [canvas : int renderers : int opts : int
-                          px : int py : int pw : int ph : int] : ptr<void>
+  ;;; __plot-into-canvas-legacy -- the drawing worker: lay out the frame, axes,
+  ;;; ticks and labels over the data extent the caller resolved (`data-valid`
+  ;;; false when no renderer constrains it), draw the lowered slot-bag
+  ;;; `renderers` Vec into it, then the legend. `plot-into-canvas` is the typed
+  ;;; entry point; this is what it lowers to.
+  (defn __plot-into-canvas-legacy [canvas : int renderers : int opts : int
+                                   px : int py : int pw : int ph : int
+                                   data-valid : bool
+                                   data-x-min : float  data-x-max : float
+                                   data-y-min : float  data-y-max : float] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -1725,13 +1806,6 @@
         } \
       } \
     } while (0)
-    #define UNION_LIST_POINTS(LST) do { \
-      for (Cons *__p = (Cons *)(intptr_t)(LST); __p; __p = (Cons *)(intptr_t)__p->tail) { \
-        Cons *__pt = (Cons *)(intptr_t)__p->head; \
-        if (!__pt) continue; \
-        UNION_POINT(BITS_DBL(__pt->head), BITS_DBL(__pt->tail)); \
-      } \
-    } while (0)
 
     typedef struct { int64_t *data; size_t len; size_t cap; } RendVec;
     RendVec *__rvec = (RendVec *)(intptr_t)renderers;
@@ -1747,21 +1821,12 @@
         categorical = 1;
         categories = r->data2;
       }
-      /* P0: the per-kind bounds-union switch now lives in __renderer-bbox
-         (pinned C symbol plot_renderer_bbox). Fold its box corners here --
-         identical to unioning the underlying points. */
-      {
-        extern void *plot_renderer_bbox(int64_t renderer);
-        typedef struct { double x0, x1, y0, y1; int valid; } RBBox;
-        RBBox *bb = (RBBox *)plot_renderer_bbox((int64_t)(intptr_t)r);
-        if (bb) {
-          if (bb->valid) {
-            UNION_POINT(bb->x0, bb->y0);
-            UNION_POINT(bb->x1, bb->y1);
-          }
-          free(bb);
-        }
-      }
+    }
+    /* The data extent: the union of every renderer's `bounds`, folded by the
+       caller through the Renderer typeclass. */
+    if (data_valid) {
+      UNION_POINT(data_x_min, data_y_min);
+      UNION_POINT(data_x_max, data_y_max);
     }
 
     if (!have_bounds) { bx_min = 0.0; bx_max = 1.0; by_min = 0.0; by_max = 1.0; }
@@ -1970,6 +2035,35 @@
     RETURN_OK(0);
     ```)
 
+  ;;; plot-into-canvas -- render renderers into an existing canvas and viewport.
+  ;;;
+  ;;; The data extent is the union of the renderers' `bounds` (padded 5%, and
+  ;;; overridden per side by `opts`); each renderer is then lowered with
+  ;;; `to-legacy` for the C draw pass and the lowered handles freed after.
+  ;;;
+  ;;; Parameters:
+  ;;;   canvas    -- the plutovg canvas to draw into
+  ;;;   renderers -- the renderers, as the constructors return them
+  ;;;   opts      -- a plot-opts handle
+  ;;;   px py     -- the viewport's top-left corner, in canvas pixels
+  ;;;   pw ph     -- the viewport's size, in canvas pixels
+  ;;;
+  ;;; Returns:
+  ;;;   ok 0, or err 1 when the viewport is too small to hold a plot.
+  ;;;
+  ;;; Example:
+  ;;;   (plot-into-canvas canvas (vec-of (axes) (lines pts ls "")) opts 0 0 600 450)
+  (defn plot-into-canvas [canvas : int  renderers : (Vec AnyRenderer)  opts : int
+                          px : int  py : int  pw : int  ph : int] : ptr<void>
+    (let [bb     (renderers-bbox renderers)
+          legacy (anyrenderers->legacy renderers)
+          rr     (__plot-into-canvas-legacy canvas (:: legacy :int) opts px py pw ph
+                                            (not (bbox-empty? bb))
+                                            (.x-min bb) (.x-max bb) (.y-min bb) (.y-max bb))]
+      (__free-renderers (:: legacy :int))
+      (vec-free legacy)
+      rr))
+
   ;; ---------------------------------------------------------------------------
   ;; Backend -- the output target a plot renders to (U2 typeclass collapse).
   ;;
@@ -1980,17 +2074,17 @@
   ;; the destination and a new sink (e.g. a notebook-inline backend) becomes a
   ;; new instance rather than a new top-level function.
   ;;
-  ;; Named `Backend`, not the uplift plan's "Renderer": this spice already calls
-  ;; every drawable element a "renderer" (the `renderers` Vec), so a `Renderer`
-  ;; typeclass sitting next to a `renderers` parameter would be needlessly
-  ;; confusing. The concept the plan means is the output backend.
+  ;; Named `Backend`, not the uplift plan's "Renderer": in this spice a
+  ;; "renderer" is a drawable element (the `renderers` Vec), and `Renderer` is
+  ;; the class those elements implement. The concept the plan means here is
+  ;; the output backend.
   ;;
   ;; `render-to` returns the same :ptr<void> result envelope the legacy
   ;; entrypoints did: ok-val carries the new surface handle for SurfaceBackend,
   ;; 0 for the canvas/PNG sinks; err-val carries the failure code.
   ;; ---------------------------------------------------------------------------
   (defclass Backend [b]
-    (render-to [self : b  renderers : int  opts : int] : ptr<void>))
+    (render-to [self : b  renderers : (Vec AnyRenderer)  opts : int] : ptr<void>))
 
   ;; CanvasBackend -- draw into an existing canvas at the given viewport.
   (defstruct CanvasBackend [canvas : int  px : int  py : int  pw : int  ph : int])
@@ -2055,27 +2149,27 @@
   ;;; Example:
   ;;;   (render (make-struct PngBackend "out.png") rs opts)
   ;;;   (render (make-struct SurfaceBackend 0 0)   rs opts)
-  (defn render [^Backend B b : B  renderers : int  opts : int] : ptr<void>
+  (defn render [^Backend B b : B  renderers : (Vec AnyRenderer)  opts : int] : ptr<void>
     (render-to b renderers opts))
 
-  ;;; plot -- render a Vec[Renderer] to a new surface and return it.
+  ;;; plot -- render renderers to a new surface and return it.
   ;;;
-  ;;; renderers is a Vec[Renderer] (build with vec-of, or vec-new + vec-push!).
-  ;;; This used to be a cons list (:int with terminating 0) prior to 0.2.0.
+  ;;; renderers is a (Vec AnyRenderer): build it with vec-of over the
+  ;;; constructors, or vec-new + vec-push!. (It was a (Vec int) of slot-bag
+  ;;; handles through 0.4.0, and a cons list before 0.2.0.)
   ;;;
   ;;; Thin wrapper over the `Backend` dispatch (the `SurfaceBackend` instance);
   ;;; equivalent to `(render-to (make-struct SurfaceBackend 0 0) renderers opts)`.
-  (defn plot [renderers : int opts : int] : ptr<void>
+  (defn plot [renderers : (Vec AnyRenderer) opts : int] : ptr<void>
     (render-to (make-struct SurfaceBackend 0 0) renderers opts))
 
-  ;;; plot-write-png -- render a Vec[Renderer] and write it to a PNG file.
+  ;;; plot-write-png -- render renderers and write them to a PNG file.
   ;;;
-  ;;; renderers is a Vec[Renderer] (build with vec-of, or vec-new + vec-push!).
-  ;;; This used to be a cons list (:int with terminating 0) prior to 0.2.0.
+  ;;; renderers is a (Vec AnyRenderer), as for `plot`.
   ;;;
   ;;; Thin wrapper over the `Backend` dispatch (the `PngBackend` instance);
   ;;; equivalent to `(render-to (make-struct PngBackend path) renderers opts)`.
-  (defn plot-write-png [renderers : int opts : int path : cstr] : ptr<void>
+  (defn plot-write-png [renderers : (Vec AnyRenderer) opts : int path : cstr] : ptr<void>
     (render-to (make-struct PngBackend path) renderers opts))
 
 ) ;; end defmodule plot/core
