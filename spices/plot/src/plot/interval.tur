@@ -8,14 +8,8 @@
   (export function-interval lines-interval parametric-interval polar-interval
           FunctionIntervalR LinesIntervalR ParametricIntervalR PolarIntervalR)
 
-  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds
-                            BBox bbox-from-raw bbox-empty-box bbox-union any-renderer
-                            __point-list-bbox])
-
-  ;;; __nan -- quiet NaN sentinel for "auto y bound" on function-interval.
-  ;;; Inline-C avoids the runtime div-by-zero trap on `(/ 0.0 0.0)`.
-  (defn __nan [] : float
-    ```c return 0.0 / 0.0; ```)
+  (import plot/core :refer [BBox bbox-from-raw bbox-empty-box bbox-union any-renderer
+                            DrawCtx __point-list-bbox])
 
   ;;; FunctionIntervalR -- the band between y = f1(x) and y = f2(x).
   (defstruct FunctionIntervalR :copy [f1 : (fn [float] float)  f2 : (fn [float] float)
@@ -36,45 +30,267 @@
                                    theta-min : float  theta-max : float  samples : int
                                    fill : int  style : int  label : cstr])
 
+  ;;; __draw-lines-interval -- fill (then outline) the band between two point lists.
+  (defn __draw-lines-interval [ctx : DrawCtx  lower : int  upper : int  fill : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    #include <stdlib.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_close_path(void* canvas);
+    extern void plutovg_canvas_fill(void* canvas);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_ctx_fill_style(void *, int64_t);
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+      bool started = false;
+      int count = 0;
+      for (Cons *p = (Cons *)(intptr_t)lower; p; p = (Cons *)(intptr_t)p->tail) count++;
+      double *xs = (double *)malloc(sizeof(double) * count);
+      double *ya = (double *)malloc(sizeof(double) * count);
+      double *yb = (double *)malloc(sizeof(double) * count);
+      int idx = 0;
+      for (Cons *p = (Cons *)(intptr_t)lower, *q = (Cons *)(intptr_t)upper; p && q && idx < count; p = (Cons *)(intptr_t)p->tail, q = (Cons *)(intptr_t)q->tail, idx++) {
+        Cons *pa = (Cons *)(intptr_t)p->head; Cons *pb = (Cons *)(intptr_t)q->head;
+        xs[idx] = BITS_DBL(pa->head); ya[idx] = BITS_DBL(pa->tail); yb[idx] = BITS_DBL(pb->tail);
+      }
+      for (int i = 0; i < idx; i++) {
+        double vx, vy; MAP_POINT(xs[i], ya[i], &vx, &vy);
+        if (!started) { plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy); started = true; }
+        else plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
+      }
+      for (int i = idx - 1; i >= 0; i--) {
+        double vx, vy; MAP_POINT(xs[i], yb[i], &vx, &vy);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
+      }
+      free(xs); free(ya); free(yb);
+      plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+      plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+      SET_LINE_STYLE(style, ((int *)0));
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef SET_FILL_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-curve-interval -- fill (then outline) the band between two sampled
+  ;;; curves: `mode` 40 y = f(x), 42 points f(t), 43 radii f(theta). The
+  ;;; three interval kinds' draws share it; pinned for their inline C.
+  (defn (export-as "plot_draw_curve_interval")
+        __draw-curve-interval [ctx : ptr<void>  mode : int  f1 : int  f2 : int
+                               t-lo : float  t-hi : float  samples : int
+                               fill : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    #include <stdlib.h>
+    extern double cos(double);
+    extern double sin(double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_close_path(void* canvas);
+    extern void plutovg_canvas_fill(void* canvas);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_ctx_fill_style(void *, int64_t);
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+      int n = (int)samples; if (n < 32) n = 32;
+      bool started = false;
+      double *xs = (double *)malloc(sizeof(double) * n);
+      double *ya = (double *)malloc(sizeof(double) * n);
+      double *yb = (double *)malloc(sizeof(double) * n);
+      for (int i = 0; i < n; i++) {
+        double t = t_lo + (t_hi - t_lo) * ((double)i / (double)(n - 1));
+        if (mode == 40) {
+          xs[i] = t;
+          ya[i] = TUR_APPLY1_T(double, double, f1, t);
+          yb[i] = TUR_APPLY1_T(double, double, f2, t);
+        } else if (mode == 42) {
+          Cons *pa = (Cons *)(intptr_t)TUR_APPLY1_T(int64_t, double, f1, t);
+          Cons *pb = (Cons *)(intptr_t)TUR_APPLY1_T(int64_t, double, f2, t);
+          xs[i] = BITS_DBL(pa->head); ya[i] = BITS_DBL(pa->tail); yb[i] = BITS_DBL(pb->tail);
+        } else {
+          double ra = TUR_APPLY1_T(double, double, f1, t);
+          double rb = TUR_APPLY1_T(double, double, f2, t);
+          xs[i] = ra * cos(t); ya[i] = ra * sin(t); yb[i] = rb * sin(t);
+        }
+      }
+      for (int i = 0; i < n; i++) {
+        double vx, vy; MAP_POINT(xs[i], ya[i], &vx, &vy);
+        if (!started) { plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy); started = true; }
+        else plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
+      }
+      for (int i = n - 1; i >= 0; i--) {
+        double vx, vy;
+        if (mode == 43) {
+          double x2 = TUR_APPLY1_T(double, double, f2, t_lo + (t_hi - t_lo) * ((double)i / (double)(n - 1))) * cos(t_lo + (t_hi - t_lo) * ((double)i / (double)(n - 1)));
+          MAP_POINT(x2, yb[i], &vx, &vy);
+        } else MAP_POINT(xs[i], yb[i], &vx, &vy);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
+      }
+      free(xs); free(ya); free(yb);
+      plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+      plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+      SET_LINE_STYLE(style, ((int *)0));
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef SET_FILL_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-function-interval -- the function-interval band, through __draw-curve-interval.
+  (defn __draw-function-interval [ctx : DrawCtx  ^fat f1 : (fn [float] float)  ^fat f2 : (fn [float] float)
+                  x-min : float  x-max : float  samples : int  fill : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_draw_curve_interval(void *, int64_t, int64_t, int64_t, double, double,
+                                         int64_t, int64_t, int64_t);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      plot_draw_curve_interval(dc, 40, f1, f2, x_min, x_max, samples, fill, style);
+    } while (0);
+    ```)
+
+  ;;; __draw-parametric-interval -- the parametric-interval band, through __draw-curve-interval.
+  (defn __draw-parametric-interval [ctx : DrawCtx  ^fat f1 : (fn [float] int)  ^fat f2 : (fn [float] int)
+                  t-min : float  t-max : float  samples : int  fill : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_draw_curve_interval(void *, int64_t, int64_t, int64_t, double, double,
+                                         int64_t, int64_t, int64_t);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      plot_draw_curve_interval(dc, 42, f1, f2, t_min, t_max, samples, fill, style);
+    } while (0);
+    ```)
+
+  ;;; __draw-polar-interval -- the polar-interval band, through __draw-curve-interval.
+  (defn __draw-polar-interval [ctx : DrawCtx  ^fat f1 : (fn [float] float)  ^fat f2 : (fn [float] float)
+                  theta-min : float  theta-max : float  samples : int  fill : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_draw_curve_interval(void *, int64_t, int64_t, int64_t, double, double,
+                                         int64_t, int64_t, int64_t);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      plot_draw_curve_interval(dc, 43, f1, f2, theta_min, theta_max, samples, fill, style);
+    } while (0);
+    ```)
+
   ;; Bounds: a sampled band's extent is unknown until it is sampled, so it
   ;; constrains nothing; the lines band spans both point lists.
-  ;;
-  ;; to-legacy: RK_FUNCTION_INTERVAL 40, RK_LINES_INTERVAL 41,
-  ;; RK_PARAM_INTERVAL 42, RK_POLAR_INTERVAL 43.
   (definstance Renderer [FunctionIntervalR]
     (bounds [r] (bbox-empty-box))
-    (to-legacy [r]
-      (__renderer-bounds
-        (__renderer-ints
-          (__renderer-floats (__make-renderer 40 (.fill r) (.style r)
-                                              (:: (.f1 r) :int) (:: (.f2 r) :int) 0 0 0 (.label r) "")
-                             (.x-min r) (.x-max r) 0.0 0.0 0.0 0.0)
-          (.samples r) 0 0 0)
-        (.x-min r) (.x-max r) (__nan) (__nan))))
+    (draw [r ctx] (__draw-function-interval ctx (.f1 r) (.f2 r) (.x-min r) (.x-max r)
+                                            (.samples r) (.fill r) (.style r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [LinesIntervalR]
     (bounds [r] (bbox-union (bbox-from-raw (__point-list-bbox (.lower r)))
                             (bbox-from-raw (__point-list-bbox (.upper r)))))
-    (to-legacy [r]
-      (__make-renderer 41 (.fill r) (.style r) (.lower r) (.upper r) 0 0 0 (.label r) "")))
+    (draw [r ctx] (__draw-lines-interval ctx (.lower r) (.upper r) (.fill r) (.style r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [ParametricIntervalR]
     (bounds [r] (bbox-empty-box))
-    (to-legacy [r]
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 42 (.fill r) (.style r)
-                                            (:: (.f1 r) :int) (:: (.f2 r) :int) 0 0 0 (.label r) "")
-                           (.t-min r) (.t-max r) 0.0 0.0 0.0 0.0)
-        (.samples r) 0 0 0)))
+    (draw [r ctx] (__draw-parametric-interval ctx (.f1 r) (.f2 r) (.t-min r) (.t-max r)
+                                              (.samples r) (.fill r) (.style r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [PolarIntervalR]
     (bounds [r] (bbox-empty-box))
-    (to-legacy [r]
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 43 (.fill r) (.style r)
-                                            (:: (.f1 r) :int) (:: (.f2 r) :int) 0 0 0 (.label r) "")
-                           (.theta-min r) (.theta-max r) 0.0 0.0 0.0 0.0)
-        (.samples r) 0 0 0)))
+    (draw [r ctx] (__draw-polar-interval ctx (.f1 r) (.f2 r) (.theta-min r) (.theta-max r)
+                                         (.samples r) (.fill r) (.style r)))
+    (legend-label [r] (.label r)))
 
   ;;; function-interval -- shade between f1(x) and f2(x).
   ;;;

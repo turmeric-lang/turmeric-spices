@@ -93,6 +93,11 @@ infer it:
 
 Each type's `bounds` is the data extent it needs; the plot is laid out over
 the union of them (padded 5%, then overridden side by side by `plot-opts`).
+The frame draws the axis lines and tick grids that the renderers'
+`frame-marks` ask for (only the `Decoration`s ask), and labels the x axis
+with the `categories` of the first categorical renderer; then every
+renderer's `draw` paints it, in Vec order, clipped to the viewport, and the
+legend lists each non-empty `legend-label`.
 Point lists span their points, grid kinds (`contours`, `vector-field`, ...)
 their declared domain, and a sampled curve or a decoration constrains
 nothing. `renderer-bbox` and `renderers-bbox` in `plot/core` report it:

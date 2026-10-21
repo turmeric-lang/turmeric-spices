@@ -14,13 +14,8 @@
   (export function lines parametric polar inverse density
           LinesR FunctionR ParametricR PolarR InverseR DensityR)
 
-  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds
-                            BBox bbox-from-raw bbox-empty-box __point-list-bbox any-renderer])
-
-  ;;; __nan -- quiet NaN sentinel for "auto y bound" on function-style renderers.
-  ;;; Inline-C avoids the runtime div-by-zero trap on `(/ 0.0 0.0)`.
-  (defn __nan [] : float
-    ```c return 0.0 / 0.0; ```)
+  (import plot/core :refer [BBox bbox-from-raw bbox-empty-box __point-list-bbox any-renderer
+                            DrawCtx])
 
   ;;; LinesR -- a polyline through a cons list of (cons x y) points.
   (defstruct LinesR :copy [points : int  style : int  label : cstr])
@@ -46,59 +41,284 @@
   (defstruct DensityR :copy [values : int  bandwidth : float  samples : int
                              style : int  label : cstr])
 
+  ;; Drawing: a polyline is stroked as given (broken at NaN); the sampled
+  ;; curves go through plot/core's adaptive sampler; a density is its kernel
+  ;; estimate evaluated across the plot's x extent.
+
+  ;;; __draw-lines -- stroke a polyline through (cons x y) points, breaking at NaN.
+  (defn __draw-lines [ctx : DrawCtx  points : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    #define ISNAN(v) ((v) != (v))
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      bool have = false; double px0 = 0.0, py0 = 0.0; (void)px0; (void)py0;
+      for (Cons *p = (Cons *)(intptr_t)points; p; p = (Cons *)(intptr_t)p->tail) {
+        Cons *pt = (Cons *)(intptr_t)p->head;
+        if (!pt) continue;
+        double x = BITS_DBL(pt->head), y = BITS_DBL(pt->tail);
+        if (ISNAN(x) || ISNAN(y)) { have = false; continue; }
+        double vx, vy; MAP_POINT(x, y, &vx, &vy);
+        if (!have) plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
+        else plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
+        px0 = vx; py0 = vy; have = true;
+      }
+      if (have) plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    #undef ISNAN
+    ```)
+
+  ;;; __draw-function -- stroke y = f(x) through the adaptive sampler.
+  (defn __draw-function [ctx : DrawCtx  ^fat f : (fn [float] float)  x-min : float  x-max : float
+                  samples : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_sample_adaptive(void *, int64_t, int64_t, double, double, int64_t);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      int n = (int)samples; if (n < 32) n = 32;
+      plot_sample_adaptive(dc, 21, f, x_min, x_max, n);
+    } while (0);
+    #undef SET_LINE_STYLE
+    ```)
+
+  ;;; __draw-parametric -- stroke the point f(t) = (cons x y) through the adaptive sampler.
+  (defn __draw-parametric [ctx : DrawCtx  ^fat f : (fn [float] int)  t-min : float  t-max : float
+                  samples : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_sample_adaptive(void *, int64_t, int64_t, double, double, int64_t);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      int n = (int)samples; if (n < 32) n = 32;
+      plot_sample_adaptive(dc, 22, f, t_min, t_max, n);
+    } while (0);
+    #undef SET_LINE_STYLE
+    ```)
+
+  ;;; __draw-polar -- stroke radius = f(theta) through the adaptive sampler.
+  (defn __draw-polar [ctx : DrawCtx  ^fat f : (fn [float] float)  theta-min : float  theta-max : float
+                  samples : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_sample_adaptive(void *, int64_t, int64_t, double, double, int64_t);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      int n = (int)samples; if (n < 32) n = 32;
+      plot_sample_adaptive(dc, 23, f, theta_min, theta_max, n);
+    } while (0);
+    #undef SET_LINE_STYLE
+    ```)
+
+  ;;; __draw-inverse -- stroke x = f(y) through the adaptive sampler.
+  (defn __draw-inverse [ctx : DrawCtx  ^fat f : (fn [float] float)  y-min : float  y-max : float
+                  samples : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_sample_adaptive(void *, int64_t, int64_t, double, double, int64_t);
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      int n = (int)samples; if (n < 32) n = 32;
+      plot_sample_adaptive(dc, 24, f, y_min, y_max, n);
+    } while (0);
+    #undef SET_LINE_STYLE
+    ```)
+
+  ;;; __draw-density -- stroke a Gaussian KDE of `values` across the x extent.
+  (defn __draw-density [ctx : DrawCtx  values : int  bandwidth : float
+                      samples : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double sqrt(double);
+    extern double pow(double, double);
+    extern double exp(double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    double bx_min = dc->bx_min;
+    double bx_max = dc->bx_max;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      int n = (int)samples; if (n < 32) n = 32;
+      bool started = false;
+      double xs[2048]; int m = 0;
+      double mean = 0.0, sd = 0.0;
+      for (Cons *p = (Cons *)(intptr_t)values; p && m < 2048; p = (Cons *)(intptr_t)p->tail) {
+        xs[m++] = BITS_DBL(p->head);
+        mean += xs[m - 1];
+      }
+      if (m == 0) break;
+      mean /= (double)m;
+      for (int i = 0; i < m; i++) { double d = xs[i] - mean; sd += d * d; }
+      sd = sqrt(sd / (double)(m > 1 ? m - 1 : 1));
+      double bw = bandwidth > 0.0 ? bandwidth : (1.06 * sd * pow((double)m, -0.2));
+      if (!(bw > 0.0)) bw = 1.0;
+      for (int i = 0; i < n; i++) {
+        double x = bx_min + (bx_max - bx_min) * ((double)i / (double)(n - 1));
+        double sum = 0.0;
+        for (int j = 0; j < m; j++) {
+          double u = (x - xs[j]) / bw;
+          sum += exp(-0.5 * u * u);
+        }
+        double y = sum / ((double)m * bw * sqrt(2.0 * 3.14159265358979323846));
+        double vx, vy; MAP_POINT(x, y, &vx, &vy);
+        if (!started) { plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy); started = true; }
+        else plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy);
+      }
+      if (started) plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
   ;; Bounds: a polyline spans its points. A sampled curve's y extent is not
   ;; known until it is sampled, and a density's x range is the plot's own, so
   ;; those constrain nothing -- they are drawn over the extent the other
   ;; renderers (or `plot-opts`) establish.
-  ;;
-  ;; to-legacy builds the slot-bag handle the draw pass reads: RK_LINES 20,
-  ;; RK_FUNCTION 21, RK_PARAMETRIC 22, RK_POLAR 23, RK_INVERSE 24,
-  ;; RK_DENSITY 25. A callback crosses as its closure handle.
   (definstance Renderer [LinesR]
     (bounds [r] (bbox-from-raw (__point-list-bbox (.points r))))
-    (to-legacy [r] (__make-renderer 20 (.style r) 0 (.points r) 0 0 0 0 (.label r) "")))
+    (draw [r ctx] (__draw-lines ctx (.points r) (.style r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [FunctionR]
     (bounds [r] (bbox-empty-box))
-    (to-legacy [r]
-      (__renderer-bounds
-        (__renderer-ints
-          (__renderer-floats (__make-renderer 21 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
-                             (.x-min r) (.x-max r) 0.0 0.0 0.0 0.0)
-          (.samples r) 0 0 0)
-        (.x-min r) (.x-max r) (__nan) (__nan))))
+    (draw [r ctx] (__draw-function ctx (.f r) (.x-min r) (.x-max r) (.samples r) (.style r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [ParametricR]
     (bounds [r] (bbox-empty-box))
-    (to-legacy [r]
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 22 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
-                           (.t-min r) (.t-max r) 0.0 0.0 0.0 0.0)
-        (.samples r) 0 0 0)))
+    (draw [r ctx] (__draw-parametric ctx (.f r) (.t-min r) (.t-max r) (.samples r) (.style r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [PolarR]
     (bounds [r] (bbox-empty-box))
-    (to-legacy [r]
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 23 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
-                           (.theta-min r) (.theta-max r) 0.0 0.0 0.0 0.0)
-        (.samples r) 0 0 0)))
+    (draw [r ctx] (__draw-polar ctx (.f r) (.theta-min r) (.theta-max r) (.samples r) (.style r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [InverseR]
     (bounds [r] (bbox-empty-box))
-    (to-legacy [r]
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 24 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
-                           (.y-min r) (.y-max r) 0.0 0.0 0.0 0.0)
-        (.samples r) 0 0 0)))
+    (draw [r ctx] (__draw-inverse ctx (.f r) (.y-min r) (.y-max r) (.samples r) (.style r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [DensityR]
     (bounds [r] (bbox-empty-box))
-    (to-legacy [r]
-      (__renderer-ints
-        (__renderer-floats (__make-renderer 25 (.style r) 0 (.values r) 0 0 0 0 (.label r) "")
-                           (.bandwidth r) 0.0 0.0 0.0 0.0 0.0)
-        (.samples r) 0 0 0)))
+    (draw [r ctx] (__draw-density ctx (.values r) (.bandwidth r) (.samples r) (.style r)))
+    (legend-label [r] (.label r)))
 
   ;;; function -- sample y=f(x) over [x-min, x-max].
   ;;;

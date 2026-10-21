@@ -83,11 +83,16 @@ named fields and an instance of the `Renderer` class:
 
 ```turmeric no-check
 (defclass Renderer [a]
-  (bounds [r] : BBox)       ;; the data extent the renderer needs on screen
-  (to-legacy [r] : int))    ;; lowering for the C draw pass (internal)
+  (bounds [r] : BBox)                          ;; the data extent it needs on screen
+  (draw [r ctx : DrawCtx] : void)              ;; paint it through the plot's context
+  (legend-label [r] : cstr "")                 ;; its legend entry, if any
+  (frame-marks [r] : FrameMarks (no-frame-marks)) ;; axes / grids it asks the frame for
+  (categories [r] : (Option int) (none)))      ;; category tick labels, if categorical
 ```
 
-The plot's extent is the union of its renderers' `bounds`. A constructor
+The plot's extent is the union of its renderers' `bounds`; the frame draws
+the axes and grids their `frame-marks` ask for; then each one's `draw` paints
+it, in order, and the legend lists their labels. A constructor
 boxes its struct with that instance as an `AnyRenderer`, which is what
 lets one Vec hold every kind. Passing anything else to `plot` -- a value with
 no `Renderer` instance, or a callback of the wrong function type -- is a

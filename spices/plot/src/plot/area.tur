@@ -7,8 +7,7 @@
   (export rectangles area-histogram discrete-histogram stacked-histogram
           RectanglesR AreaHistogramR DiscreteHistogramR StackedHistogramR)
 
-  (import plot/core :refer [__make-renderer __renderer-ints
-                            BBox bbox-from-raw any-renderer
+  (import plot/core :refer [BBox bbox-from-raw any-renderer DrawCtx
                             __rects-bbox __discrete-hist-bbox __stacked-hist-bbox])
 
   ;;; RectanglesR -- a cons list of (x0 . (x1 . (y0 . y1))) rectangles in one fill.
@@ -27,28 +26,197 @@
   ;;; stack layers.
   (defstruct StackedHistogramR :copy [groups : int  fills : int  labels : int  horizontal : bool])
 
-  ;; to-legacy: RK_RECTANGLES 50, RK_AREA_HIST 51, RK_DISCRETE_HIST 52,
-  ;; RK_STACKED_HIST 53. The categorical kinds carry their bars a second time
-  ;; in data2, where the frame reads its category tick labels from.
+  ;;; __draw-rects -- fill each (x0 . (x1 . (y0 . y1))) quad, taking the next fill
+  ;;; from `fill-list` while it lasts and `default-fill` after.
+  (defn __draw-rects [ctx : DrawCtx  rects : int  fill-list : int  default-fill : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double fabs(double);
+    extern double fmin(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_fill(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_fill_style(void *, int64_t);
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      Cons *fills = (Cons *)(intptr_t)fill_list;
+      for (Cons *p = (Cons *)(intptr_t)rects; p; p = (Cons *)(intptr_t)p->tail) {
+        int64_t fill = fills ? fills->head : default_fill;
+        SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+        Cons *a = (Cons *)(intptr_t)p->head;
+        double x0 = BITS_DBL(a->head);
+        Cons *b = (Cons *)(intptr_t)a->tail;
+        double x1 = BITS_DBL(b->head);
+        Cons *c = (Cons *)(intptr_t)b->tail;
+        double y0 = BITS_DBL(c->head);
+        double y1 = BITS_DBL(c->tail);
+        double vx0, vy0, vx1, vy1; MAP_POINT(x0, y0, &vx0, &vy0); MAP_POINT(x1, y1, &vx1, &vy1);
+        plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)fmin(vx0, vx1), (float)fmin(vy0, vy1), (float)fabs(vx1 - vx0), (float)fabs(vy1 - vy0));
+        plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+        fills = fills ? (Cons *)(intptr_t)fills->tail : NULL;
+      }
+    } while (0);
+    #undef SET_FILL_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-discrete-hist -- fill a 0.8-wide bar per (label . height) at slots
+  ;;; 0, 1, 2, ...; along the y axis when `horizontal`.
+  (defn __draw-discrete-hist [ctx : DrawCtx  bars : int  fill : int  horizontal : bool] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double fabs(double);
+    extern double fmin(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_fill(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_fill_style(void *, int64_t);
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      int idx = 0, fill_idx = 0; (void)fill_idx;
+      for (Cons *p = (Cons *)(intptr_t)bars; p; p = (Cons *)(intptr_t)p->tail, idx++) {
+        double x0 = idx, x1 = idx + 0.8;
+        Cons *bar = (Cons *)(intptr_t)p->head;
+        double h = BITS_DBL(bar->tail);
+        SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+        double vx0, vy0, vx1, vy1;
+        if (horizontal) { MAP_POINT(0.0, x0, &vx0, &vy0); MAP_POINT(h, x1, &vx1, &vy1); }
+        else { MAP_POINT(x0, 0.0, &vx0, &vy0); MAP_POINT(x1, h, &vx1, &vy1); }
+        plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)vx0, (float)fmin(vy0, vy1), (float)(vx1 - vx0), (float)fabs(vy1 - vy0));
+        plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+      }
+    } while (0);
+    #undef SET_FILL_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-stacked-hist -- fill each (label . values) slot as a stack, each value
+  ;;; taking the next fill from `fill-list`.
+  (defn __draw-stacked-hist [ctx : DrawCtx  groups : int  fill-list : int  horizontal : bool] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double fabs(double);
+    extern double fmin(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_fill(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_fill_style(void *, int64_t);
+    #define SET_FILL_STYLE(H, F, L) plot_ctx_fill_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      int idx = 0, fill_idx = 0; (void)fill_idx;
+      for (Cons *p = (Cons *)(intptr_t)groups; p; p = (Cons *)(intptr_t)p->tail, idx++) {
+        double x0 = idx, x1 = idx + 0.8;
+        Cons *grp = (Cons *)(intptr_t)p->head;
+        double acc = 0.0;
+        Cons *vals = (Cons *)(intptr_t)grp->tail;
+        Cons *fills = (Cons *)(intptr_t)fill_list;
+        while (vals) {
+          int64_t fill = fills ? fills->head : 0;
+          SET_FILL_STYLE(fill, ((int *)0), ((int *)0));
+          double h = BITS_DBL(vals->head);
+          double vx0, vy0, vx1, vy1;
+          if (horizontal) { MAP_POINT(acc, x0, &vx0, &vy0); MAP_POINT(acc + h, x1, &vx1, &vy1); }
+          else { MAP_POINT(x0, acc, &vx0, &vy0); MAP_POINT(x1, acc + h, &vx1, &vy1); }
+          plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)vx0, (float)fmin(vy0, vy1), (float)(vx1 - vx0), (float)fabs(vy1 - vy0));
+          plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+          acc += h;
+          vals = (Cons *)(intptr_t)vals->tail;
+          fills = fills ? (Cons *)(intptr_t)fills->tail : NULL;
+        }
+      }
+    } while (0);
+    #undef SET_FILL_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;; The categorical kinds name the frame's x categories: the first such
+  ;; renderer's bars (or groups) label the category ticks.
   (definstance Renderer [RectanglesR]
     (bounds [r] (bbox-from-raw (__rects-bbox (.rects r))))
-    (to-legacy [r] (__make-renderer 50 (.fill r) 0 (.rects r) 0 0 0 0 (.label r) "")))
+    (draw [r ctx] (__draw-rects ctx (.rects r) 0 (.fill r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [AreaHistogramR]
     (bounds [r] (bbox-from-raw (__rects-bbox (.bars r))))
-    (to-legacy [r] (__make-renderer 51 0 0 (.bars r) (.fills r) 0 0 0 (.label r) "")))
+    (draw [r ctx] (__draw-rects ctx (.bars r) (.fills r) 0))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [DiscreteHistogramR]
     (bounds [r] (bbox-from-raw (__discrete-hist-bbox (.bars r) (.horizontal r))))
-    (to-legacy [r]
-      (__renderer-ints (__make-renderer 52 (.fill r) 0 (.bars r) (.bars r) 0 0 0 (.label r) "")
-                       (if (.horizontal r) 1 0) 0 0 0)))
+    (draw [r ctx] (__draw-discrete-hist ctx (.bars r) (.fill r) (.horizontal r)))
+    (legend-label [r] (.label r))
+    (categories [r] (some (.bars r))))
 
   (definstance Renderer [StackedHistogramR]
     (bounds [r] (bbox-from-raw (__stacked-hist-bbox (.groups r) (.horizontal r))))
-    (to-legacy [r]
-      (__renderer-ints (__make-renderer 53 0 0 (.groups r) (.groups r) (.fills r) (.labels r) 0 "" "")
-                       (if (.horizontal r) 1 0) 0 0 0)))
+    (draw [r ctx] (__draw-stacked-hist ctx (.groups r) (.fills r) (.horizontal r)))
+    (categories [r] (some (.groups r))))
 
   ;;; rectangles -- draw filled rectangles from nested cons quads.
   ;;;

@@ -7,8 +7,7 @@
   (export points error-bars vector-field arrows
           PointsR ErrorBarsR VectorFieldR ArrowsR)
 
-  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds
-                            BBox bbox-from-raw hint-bbox any-renderer
+  (import plot/core :refer [BBox bbox-from-raw hint-bbox any-renderer DrawCtx
                             __point-list-bbox __error-bars-bbox __arrows-bbox])
 
   ;;; PointsR -- a scatter of a cons list of (cons x y) points.
@@ -30,30 +29,327 @@
   ;;; ArrowsR -- a cons list of (x1 . (y1 . (x2 . y2))) arrow segments.
   (defstruct ArrowsR :copy [arrows : int  style : int  label : cstr])
 
-  ;; to-legacy: RK_POINTS 30, RK_ERROR_BARS 31, RK_VECTOR_FIELD 32, RK_ARROWS 33.
+  ;;; __draw-points -- fill and outline a marker at each (cons x y) point.
+  (defn __draw-points [ctx : DrawCtx  points : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    extern void plutovg_canvas_set_line_width(void* canvas, float line_width);
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_rect(void* canvas, float x, float y, float w, float h);
+    extern void plutovg_canvas_circle(void* canvas, float cx, float cy, float r);
+    extern void plutovg_canvas_close_path(void* canvas);
+    extern void plutovg_canvas_fill(void* canvas);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { int64_t color; int64_t fill_color; int64_t sym; double size; double alpha; } PointStyle;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_point_style(void *, int64_t, void *, void *);
+    #define SET_POINT_STYLE(H, S, F) plot_ctx_point_style(dc, (H), (S), (F))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    static const double palette[8][3] = {
+      {31.0/255.0, 119.0/255.0, 180.0/255.0},
+      {214.0/255.0, 39.0/255.0, 40.0/255.0},
+      {44.0/255.0, 160.0/255.0, 44.0/255.0},
+      {255.0/255.0, 127.0/255.0, 14.0/255.0},
+      {148.0/255.0, 103.0/255.0, 189.0/255.0},
+      {140.0/255.0, 86.0/255.0, 75.0/255.0},
+      {227.0/255.0, 119.0/255.0, 194.0/255.0},
+      {127.0/255.0, 127.0/255.0, 127.0/255.0}
+    };
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      PointStyle *ps = (PointStyle *)(intptr_t)style;
+      int stroke, fill;
+      SET_POINT_STYLE(style, &stroke, &fill);
+      double size = (ps && ps->size > 0.0) ? ps->size : 6.0;
+      double alpha = (ps && ps->alpha > 0.0) ? ps->alpha : 1.0;
+      for (Cons *p = (Cons *)(intptr_t)points; p; p = (Cons *)(intptr_t)p->tail) {
+        Cons *pt = (Cons *)(intptr_t)p->head;
+        if (!pt) continue;
+        double x = BITS_DBL(pt->head), y = BITS_DBL(pt->tail);
+        double vx, vy; MAP_POINT(x, y, &vx, &vy);
+        plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas,
+                                (float)palette[fill][0], (float)palette[fill][1],
+                                (float)palette[fill][2], (float)alpha);
+        switch (ps ? (int)ps->sym : 0) {
+          case 1: plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy - size / 2), (float)size, (float)size); break;
+          case 2:
+            plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+            plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy + size / 2));
+            plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy + size / 2));
+            plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+            break;
+          case 5:
+            plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+            plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)vy);
+            plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy + size / 2));
+            plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)vy);
+            plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+            break;
+          default: plutovg_canvas_circle((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy, (float)(size / 2)); break;
+        }
+        plutovg_canvas_fill((plutovg_canvas_t *)(intptr_t)canvas);
+        plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas,
+                                (float)palette[stroke][0], (float)palette[stroke][1],
+                                (float)palette[stroke][2], (float)alpha);
+        plutovg_canvas_set_line_width((plutovg_canvas_t *)(intptr_t)canvas, 1.0f);
+        if (ps && ps->sym == 3) {
+          plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy - size / 2));
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy + size / 2));
+          plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy + size / 2));
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy - size / 2));
+          plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+        } else if (ps && ps->sym == 4) {
+          plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)vy);
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)vy);
+          plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy + size / 2));
+          plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+        } else {
+          switch (ps ? (int)ps->sym : 0) {
+            case 1: plutovg_canvas_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy - size / 2), (float)size, (float)size); break;
+            case 2:
+              plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)(vy + size / 2));
+              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)(vy + size / 2));
+              plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+              break;
+            case 5:
+              plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy - size / 2));
+              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx + size / 2), (float)vy);
+              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)(vy + size / 2));
+              plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx - size / 2), (float)vy);
+              plutovg_canvas_close_path((plutovg_canvas_t *)(intptr_t)canvas);
+              break;
+            default: plutovg_canvas_circle((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)vy, (float)(size / 2)); break;
+          }
+          plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+        }
+      }
+    } while (0);
+    #undef SET_POINT_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-error-bars -- stroke each (x . (y . h)) bar, x +/- h when `horizontal`.
+  (defn __draw-error-bars [ctx : DrawCtx  bars : int  style : int  horizontal : bool] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      for (Cons *p = (Cons *)(intptr_t)bars; p; p = (Cons *)(intptr_t)p->tail) {
+        Cons *a = (Cons *)(intptr_t)p->head;
+        if (!a) continue;
+        double x = BITS_DBL(a->head);
+        Cons *b = (Cons *)(intptr_t)a->tail;
+        double y = BITS_DBL(b->head);
+        double h = BITS_DBL(b->tail);
+        if (horizontal) {
+          double vxa, vya, vxb, vyb; MAP_POINT(x - h, y, &vxa, &vya); MAP_POINT(x + h, y, &vxb, &vyb);
+          plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vxa, (float)vya);
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vxb, (float)vyb);
+        } else {
+          double vxa, vya, vxb, vyb; MAP_POINT(x, y - h, &vxa, &vya); MAP_POINT(x, y + h, &vxb, &vyb);
+          plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vxa, (float)vya);
+          plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vxb, (float)vyb);
+        }
+      }
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-arrows -- stroke each (x1 . (y1 . (x2 . y2))) segment with a head.
+  (defn __draw-arrows [ctx : DrawCtx  arrows : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double cos(double);
+    extern double sin(double);
+    extern double atan2(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      for (Cons *p = (Cons *)(intptr_t)arrows; p; p = (Cons *)(intptr_t)p->tail) {
+        Cons *a = (Cons *)(intptr_t)p->head;
+        double x1 = BITS_DBL(a->head);
+        Cons *b = (Cons *)(intptr_t)a->tail;
+        double y1 = BITS_DBL(b->head);
+        Cons *c = (Cons *)(intptr_t)b->tail;
+        double x2 = BITS_DBL(c->head);
+        double y2 = BITS_DBL(c->tail);
+        double vx1, vy1, vx2, vy2; MAP_POINT(x1, y1, &vx1, &vy1); MAP_POINT(x2, y2, &vx2, &vy2);
+        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx1, (float)vy1);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx2, (float)vy2);
+        double ang = atan2(vy2 - vy1, vx2 - vx1);
+        double ah = 6.0;
+        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx2, (float)vy2);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx2 - ah * cos(ang - 0.45)), (float)(vy2 - ah * sin(ang - 0.45)));
+        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx2, (float)vy2);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)(vx2 - ah * cos(ang + 0.45)), (float)(vy2 - ah * sin(ang + 0.45)));
+      }
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
+  ;;; __draw-vector-field -- stroke f(x, y) = (cons dx dy) on a grid x grid lattice.
+  (defn __draw-vector-field [ctx : DrawCtx  ^fat f : (fn [float float] int)
+                           x-min : float  x-max : float  y-min : float  y-max : float
+                           grid : int  scale-mode : int  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double sqrt(double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    #define BITS_DBL(v) (((union { double d; int64_t i; }){.i=(v)}).d)
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      int samples = (int)grid; if (samples < 2) samples = 2;
+      for (int iy = 0; iy < samples; iy++) for (int ix = 0; ix < samples; ix++) {
+        double x = x_min + (x_max - x_min) * ((double)ix / (double)(samples - 1));
+        double y = y_min + (y_max - y_min) * ((double)iy / (double)(samples - 1));
+        Cons *pair = (Cons *)(intptr_t)TUR_APPLY2_T(int64_t, double, double, f, x, y);
+        double dx = BITS_DBL(pair->head), dy = BITS_DBL(pair->tail);
+        if (scale_mode == 1) {
+          double len = sqrt(dx * dx + dy * dy);
+          if (len > 1e-12) { dx /= len; dy /= len; }
+        }
+        double scale = (scale_mode == 2) ? 0.15 : 0.10;
+        double x2 = x + dx * (x_max - x_min) * scale;
+        double y2 = y + dy * (y_max - y_min) * scale;
+        double vx1, vy1, vx2, vy2; MAP_POINT(x, y, &vx1, &vy1); MAP_POINT(x2, y2, &vx2, &vy2);
+        plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx1, (float)vy1);
+        plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx2, (float)vy2);
+      }
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    #undef BITS_DBL
+    ```)
+
   (definstance Renderer [PointsR]
     (bounds [r] (bbox-from-raw (__point-list-bbox (.points r))))
-    (to-legacy [r] (__make-renderer 30 (.style r) 0 (.points r) 0 0 0 0 (.label r) "")))
+    (draw [r ctx] (__draw-points ctx (.points r) (.style r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [ErrorBarsR]
     (bounds [r] (bbox-from-raw (__error-bars-bbox (.bars r) (.horizontal r))))
-    (to-legacy [r]
-      (__renderer-ints (__make-renderer 31 (.style r) 0 (.bars r) 0 0 0 0 (.label r) "")
-                       (if (.horizontal r) 1 0) 0 0 0)))
+    (draw [r ctx] (__draw-error-bars ctx (.bars r) (.style r) (.horizontal r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [VectorFieldR]
     (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
-    (to-legacy [r]
-      (__renderer-bounds
-        (__renderer-ints
-          (__renderer-floats (__make-renderer 32 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
-                             (.x-min r) (.x-max r) (.y-min r) (.y-max r) 0.0 0.0)
-          (.samples r) (.scale-mode r) 0 0)
-        (.x-min r) (.x-max r) (.y-min r) (.y-max r))))
+    (draw [r ctx] (__draw-vector-field ctx (.f r) (.x-min r) (.x-max r) (.y-min r) (.y-max r)
+                                       (.samples r) (.scale-mode r) (.style r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [ArrowsR]
     (bounds [r] (bbox-from-raw (__arrows-bbox (.arrows r))))
-    (to-legacy [r] (__make-renderer 33 (.style r) 0 (.arrows r) 0 0 0 0 (.label r) "")))
+    (draw [r ctx] (__draw-arrows ctx (.arrows r) (.style r)))
+    (legend-label [r] (.label r)))
 
   ;;; points -- scatter plot renderer.
   ;;;

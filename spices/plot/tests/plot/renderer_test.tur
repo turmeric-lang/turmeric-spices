@@ -1,18 +1,21 @@
-;; tests/plot/renderer_test.tur -- the Renderer typeclass's `bounds`, per kind.
+;; tests/plot/renderer_test.tur -- the Renderer typeclass, per kind.
 ;;
 ;; Every renderer kind is its own type (LinesR, FunctionR, Decoration, ...)
-;; with a `Renderer` instance. These tests call `bounds` on each kind's value
-;; directly -- static dispatch on the struct type, no AnyRenderer box -- and
-;; pin the box it reports: the data extent the plot is laid out over.
+;; with a `Renderer` instance. These tests call the methods on each kind's
+;; value directly -- static dispatch on the struct type, no AnyRenderer box:
+;; `bounds` (the data extent the plot is laid out over) for every kind, and
+;; what the frame asks of them -- `frame-marks`, `categories` and
+;; `legend-label`. `draw` is covered by the suites that render each kind.
 
 (defmodule plot/tests/renderer
-  (import plot/core     :refer [bbox-empty? BBox])
+  (import plot/core     :refer [bbox-empty? BBox FrameMarks])
   (import plot/line     :refer [LinesR FunctionR ParametricR PolarR InverseR DensityR])
   (import plot/point    :refer [PointsR ErrorBarsR VectorFieldR ArrowsR])
   (import plot/interval :refer [FunctionIntervalR LinesIntervalR ParametricIntervalR PolarIntervalR])
   (import plot/area     :refer [RectanglesR AreaHistogramR DiscreteHistogramR StackedHistogramR])
   (import plot/contour  :refer [IsolineR ContoursR ContourIntervalsR ColorFieldR])
-  (import plot/decor    :refer [Decoration XAxis TickGrid HRuleR VRuleR LabelR])
+  (import plot/decor    :refer [Decoration XAxis YAxis Axes XTickLines YTickLines TickGrid
+                                HRuleR VRuleR LabelR])
   (import plot/style    :refer [default-line-style default-fill-style])
   (import test/assert   :refer [assert-true])
   (import test/suite    :refer [describe it])
@@ -80,6 +83,12 @@
     ```c union { double d; int64_t i; } u; u.d = x; return u.i; ```)
 
   (defn nan [] : float ```c return 0.0 / 0.0; ```)
+
+  (defn same-text? [a : cstr  b : cstr] : bool
+    ```c
+    #include <string.h>
+    return a && b && strcmp(a, b) == 0;
+    ```)
 
   (defn close? [a : float b : float] : bool
     ```c
@@ -219,6 +228,54 @@
          (bbox-eq? (bounds (make-struct LabelR 3.0 4.0 "hi" (default-line-style))) 3.0 3.0 4.0 4.0)
          (empty? (bounds (make-struct LabelR 3.0 (nan) "nan" (default-line-style))))))
 
+  ;; --- what the frame asks of a renderer -------------------------------------
+
+  (defn marks-eq? [m : FrameMarks  xa : bool  ya : bool  xg : bool  yg : bool] : bool
+    (and (assert-true (= (.x-axis m) xa)) (assert-true (= (.y-axis m) ya))
+         (assert-true (= (.x-grid m) xg)) (assert-true (= (.y-grid m) yg))))
+
+  ;; Each decoration asks for its own axis line or grid; nothing else asks.
+  (defn decoration-marks [] : bool
+    (and (marks-eq? (frame-marks (XAxis))      true  false false false)
+         (marks-eq? (frame-marks (YAxis))      false true  false false)
+         (marks-eq? (frame-marks (Axes))       true  true  false false)
+         (marks-eq? (frame-marks (XTickLines)) false false true  false)
+         (marks-eq? (frame-marks (YTickLines)) false false false true)
+         (marks-eq? (frame-marks (TickGrid))   false false true  true)
+         (marks-eq? (frame-marks (make-struct LinesR (sample-points) (default-line-style) "l"))
+                    false false false false)))
+
+  ;; The categorical kinds name the frame's categories; others have none.
+  ;;
+  ;; Each result is ascribed: a class method declared `: (Option int)` and
+  ;; called on a concrete value is typed `(? ?)` otherwise -- turmeric
+  ;; docs/reported/option-method-result-untyped-at-static-call.md.
+  (defn histogram-categories [] : bool
+    (let [bars   (t-cons (cat "A" 1.0) 0)
+          groups (t-cons (group "Q1" (t-cons (bits 1.0) 0)) 0)]
+      (and (assert-true (= (unwrap-or (:: (categories (make-struct DiscreteHistogramR bars 0 false ""))
+                                          (Option int))
+                                      0)
+                           bars))
+           (assert-true (= (unwrap-or (:: (categories (make-struct StackedHistogramR groups 0 0 false))
+                                          (Option int))
+                                      0)
+                           groups))
+           (assert-true (none? (:: (categories (make-struct RectanglesR (t-cons (quad 0.0 1.0 0.0 1.0) 0)
+                                                            (default-fill-style) "r"))
+                                   (Option int))))
+           (assert-true (none? (:: (categories (XAxis)) (Option int)))))))
+
+  ;; A labelled kind lists its label; a label renderer's text is not a legend
+  ;; entry, and an axis has none.
+  (defn legend-labels [] : bool
+    (and (assert-true (same-text? (legend-label (make-struct LinesR (sample-points) (default-line-style) "data"))
+                                "data"))
+         (assert-true (same-text? (legend-label (make-struct FunctionR sq -1.0 1.0 32 (default-line-style) "f"))
+                                "f"))
+         (assert-true (same-text? (legend-label (make-struct LabelR 1.0 1.0 "note" (default-line-style))) ""))
+         (assert-true (same-text? (legend-label (Axes)) ""))))
+
   (defn main [] : int
     (describe "plot Renderer typeclass -- bounds per kind"
       (it "LinesR spans its points, skipping NaN gaps" (lines-bounds))
@@ -232,5 +289,8 @@
       (it "grid kinds report their declared domain"    (grid-kinds-bounds))
       (it "a NaN domain edge constrains nothing"       (nan-domain-is-empty))
       (it "curves, bands and decorations constrain nothing" (unconstrained-kinds))
-      (it "rules and labels pin one point"             (point-kinds)))
+      (it "rules and labels pin one point"             (point-kinds))
+      (it "decorations ask the frame for their axes / grids" (decoration-marks))
+      (it "histograms name the frame's categories"     (histogram-categories))
+      (it "legend-label: labelled kinds only"          (legend-labels)))
     (run-all-status)))

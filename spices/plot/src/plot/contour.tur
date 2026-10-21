@@ -8,8 +8,7 @@
   (export isoline contours contour-intervals color-field
           IsolineR ContoursR ContourIntervalsR ColorFieldR)
 
-  (import plot/core :refer [__make-renderer __renderer-floats __renderer-ints __renderer-bounds
-                            BBox hint-bbox any-renderer])
+  (import plot/core :refer [BBox hint-bbox any-renderer DrawCtx])
 
   ;;; IsolineR -- the single contour f(x, y) = level.
   (defstruct IsolineR :copy [f : (fn [float float] float)
@@ -37,47 +36,227 @@
                                 x-min : float  x-max : float  y-min : float  y-max : float
                                 samples : int  alpha : float])
 
-  ;; to-legacy: RK_ISOLINE 60, RK_CONTOURS 61, RK_CONTOUR_INTERVALS 62,
-  ;; RK_COLOR_FIELD 63.
+  ;;; __draw-color-field -- fill each grid cell with palette color f(cell center).
+  (defn __draw-color-field [ctx : DrawCtx  ^fat f : (fn [float float] int)
+                          x-min : float  x-max : float  y-min : float  y-max : float
+                          grid : int  cell-alpha : float] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double fabs(double);
+    extern double fmin(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    extern void plutovg_canvas_fill_rect(void* canvas, float x, float y, float w, float h);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    static const double palette[8][3] = {
+      {31.0/255.0, 119.0/255.0, 180.0/255.0},
+      {214.0/255.0, 39.0/255.0, 40.0/255.0},
+      {44.0/255.0, 160.0/255.0, 44.0/255.0},
+      {255.0/255.0, 127.0/255.0, 14.0/255.0},
+      {148.0/255.0, 103.0/255.0, 189.0/255.0},
+      {140.0/255.0, 86.0/255.0, 75.0/255.0},
+      {227.0/255.0, 119.0/255.0, 194.0/255.0},
+      {127.0/255.0, 127.0/255.0, 127.0/255.0}
+    };
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      int samples = (int)grid; if (samples < 8) samples = 8;
+      for (int iy = 0; iy < samples - 1; iy++) for (int ix = 0; ix < samples - 1; ix++) {
+        double x0 = x_min + (x_max - x_min) * ((double)ix / (double)(samples - 1));
+        double x1 = x_min + (x_max - x_min) * ((double)(ix + 1) / (double)(samples - 1));
+        double y0 = y_min + (y_max - y_min) * ((double)iy / (double)(samples - 1));
+        double y1 = y_min + (y_max - y_min) * ((double)(iy + 1) / (double)(samples - 1));
+        int color = 0;
+        double alpha = cell_alpha;
+        color = (int)TUR_APPLY2_T(int64_t, double, double, f, (x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        color %= 8; if (color < 0) color += 8;
+        double vx0, vy0, vx1, vy1; MAP_POINT(x0, y0, &vx0, &vy0); MAP_POINT(x1, y1, &vx1, &vy1);
+        plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas, (float)palette[color][0], (float)palette[color][1], (float)palette[color][2], (float)alpha);
+        plutovg_canvas_fill_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)fmin(vx0, vx1), (float)fmin(vy0, vy1), (float)fabs(vx1 - vx0), (float)fabs(vy1 - vy0));
+      }
+    } while (0);
+    #undef MAP_POINT
+    ```)
+
+  ;;; __draw-contour-bands -- fill each grid cell with the fill of the band (of
+  ;;; levels + 1 over [0, 1]) its center's f value falls in.
+  (defn __draw-contour-bands [ctx : DrawCtx  ^fat f : (fn [float float] float)
+                            x-min : float  x-max : float  y-min : float  y-max : float
+                            grid : int  levels : int  fills : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    extern double floor(double);
+    extern double fabs(double);
+    extern double fmin(double, double);
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_set_rgba(void* canvas, float r, float g, float b, float a);
+    extern void plutovg_canvas_fill_rect(void* canvas, float x, float y, float w, float h);
+    #endif
+    typedef struct { int64_t head; int64_t tail; } Cons;
+    typedef struct { int64_t color; double alpha; int64_t line_color; double line_width; } FillStyle;
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    static const double palette[8][3] = {
+      {31.0/255.0, 119.0/255.0, 180.0/255.0},
+      {214.0/255.0, 39.0/255.0, 40.0/255.0},
+      {44.0/255.0, 160.0/255.0, 44.0/255.0},
+      {255.0/255.0, 127.0/255.0, 14.0/255.0},
+      {148.0/255.0, 103.0/255.0, 189.0/255.0},
+      {140.0/255.0, 86.0/255.0, 75.0/255.0},
+      {227.0/255.0, 119.0/255.0, 194.0/255.0},
+      {127.0/255.0, 127.0/255.0, 127.0/255.0}
+    };
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      int samples = (int)grid; if (samples < 8) samples = 8;
+      for (int iy = 0; iy < samples - 1; iy++) for (int ix = 0; ix < samples - 1; ix++) {
+        double x0 = x_min + (x_max - x_min) * ((double)ix / (double)(samples - 1));
+        double x1 = x_min + (x_max - x_min) * ((double)(ix + 1) / (double)(samples - 1));
+        double y0 = y_min + (y_max - y_min) * ((double)iy / (double)(samples - 1));
+        double y1 = y_min + (y_max - y_min) * ((double)(iy + 1) / (double)(samples - 1));
+        double v = TUR_APPLY2_T(double, double, double, f, (x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        int color = 0;
+        double alpha = 0.55;
+        int bands = (int)levels + 1;
+        double lo = 0.0, hi = 1.0;
+        double t = (v - lo) / (hi - lo);
+        if (!(t == t)) t = 0.0;
+        if (t < 0.0) t = 0.0; if (t > 0.999) t = 0.999;
+        int band = (int)floor(t * bands);
+        Cons *fs = (Cons *)(intptr_t)fills;
+        for (int bi = 0; bi < band && fs; bi++) fs = (Cons *)(intptr_t)fs->tail;
+        FillStyle *fill = (FillStyle *)(intptr_t)(fs ? fs->head : 0);
+        color = fill ? (int)fill->color : band % 8;
+        if (color < 0) color = band % 8;
+        double vx0, vy0, vx1, vy1; MAP_POINT(x0, y0, &vx0, &vy0); MAP_POINT(x1, y1, &vx1, &vy1);
+        plutovg_canvas_set_rgba((plutovg_canvas_t *)(intptr_t)canvas, (float)palette[color][0], (float)palette[color][1], (float)palette[color][2], (float)alpha);
+        plutovg_canvas_fill_rect((plutovg_canvas_t *)(intptr_t)canvas, (float)fmin(vx0, vx1), (float)fmin(vy0, vy1), (float)fabs(vx1 - vx0), (float)fabs(vy1 - vy0));
+      }
+    } while (0);
+    #undef MAP_POINT
+    ```)
+
+  ;;; __draw-contour-lines -- stroke the f(x, y) = level contours by marching
+  ;;; squares: one at `level-lo` when `single`, else `levels` spaced through
+  ;;; (level-lo, level-hi).
+  (defn __draw-contour-lines [ctx : DrawCtx  ^fat f : (fn [float float] float)
+                            x-min : float  x-max : float  y-min : float  y-max : float
+                            grid : int  levels : int  single : bool
+                            level-lo : float  level-hi : float  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      int samples = (int)grid; if (samples < 8) samples = 8;
+      int nlevels = single ? 1 : (int)levels;
+      for (int li = 0; li < nlevels; li++) {
+        double level = single ? level_lo : (level_lo + (level_hi - level_lo) * ((double)(li + 1) / (double)(nlevels + 1)));
+        for (int iy = 0; iy < samples - 1; iy++) for (int ix = 0; ix < samples - 1; ix++) {
+          double x0 = x_min + (x_max - x_min) * ((double)ix / (double)(samples - 1));
+          double x1 = x_min + (x_max - x_min) * ((double)(ix + 1) / (double)(samples - 1));
+          double y0 = y_min + (y_max - y_min) * ((double)iy / (double)(samples - 1));
+          double y1 = y_min + (y_max - y_min) * ((double)(iy + 1) / (double)(samples - 1));
+          double v00 = TUR_APPLY2_T(double, double, double, f, x0, y0) - level;
+          double v10 = TUR_APPLY2_T(double, double, double, f, x1, y0) - level;
+          double v01 = TUR_APPLY2_T(double, double, double, f, x0, y1) - level;
+          double v11 = TUR_APPLY2_T(double, double, double, f, x1, y1) - level;
+          double ptsx[4], ptsy[4]; int pc = 0;
+          if ((v00 <= 0 && v10 > 0) || (v00 > 0 && v10 <= 0)) { double t = v00 / (v00 - v10); ptsx[pc] = x0 + (x1 - x0) * t; ptsy[pc++] = y0; }
+          if ((v10 <= 0 && v11 > 0) || (v10 > 0 && v11 <= 0)) { double t = v10 / (v10 - v11); ptsx[pc] = x1; ptsy[pc++] = y0 + (y1 - y0) * t; }
+          if ((v11 <= 0 && v01 > 0) || (v11 > 0 && v01 <= 0)) { double t = v11 / (v11 - v01); ptsx[pc] = x1 + (x0 - x1) * t; ptsy[pc++] = y1; }
+          if ((v01 <= 0 && v00 > 0) || (v01 > 0 && v00 <= 0)) { double t = v01 / (v01 - v00); ptsx[pc] = x0; ptsy[pc++] = y1 + (y0 - y1) * t; }
+          if (pc >= 2) {
+            double vx0, vy0, vx1, vy1; MAP_POINT(ptsx[0], ptsy[0], &vx0, &vy0); MAP_POINT(ptsx[1], ptsy[1], &vx1, &vy1);
+            plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx0, (float)vy0);
+            plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx1, (float)vy1);
+          }
+        }
+      }
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    ```)
+
   (definstance Renderer [IsolineR]
     (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
-    (to-legacy [r]
-      (__renderer-bounds
-        (__renderer-ints
-          (__renderer-floats (__make-renderer 60 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
-                             (.x-min r) (.x-max r) (.y-min r) (.y-max r) (.level r) (.level r))
-          (.samples r) 0 0 0)
-        (.x-min r) (.x-max r) (.y-min r) (.y-max r))))
+    (draw [r ctx] (__draw-contour-lines ctx (.f r) (.x-min r) (.x-max r) (.y-min r) (.y-max r)
+                                        (.samples r) 1 true (.level r) (.level r) (.style r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [ContoursR]
     (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
-    (to-legacy [r]
-      (__renderer-bounds
-        (__renderer-ints
-          (__renderer-floats (__make-renderer 61 (.style r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
-                             (.x-min r) (.x-max r) (.y-min r) (.y-max r) 0.0 0.0)
-          (.samples r) (.levels r) 0 0)
-        (.x-min r) (.x-max r) (.y-min r) (.y-max r))))
+    (draw [r ctx] (__draw-contour-lines ctx (.f r) (.x-min r) (.x-max r) (.y-min r) (.y-max r)
+                                        (.samples r) (.levels r) false 0.0 0.0 (.style r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [ContourIntervalsR]
     (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
-    (to-legacy [r]
-      (__renderer-bounds
-        (__renderer-ints
-          (__renderer-floats (__make-renderer 62 (.fills r) 0 (:: (.f r) :int) 0 0 0 0 (.label r) "")
-                             (.x-min r) (.x-max r) (.y-min r) (.y-max r) 0.0 1.0)
-          (.samples r) (.bands r) 0 0)
-        (.x-min r) (.x-max r) (.y-min r) (.y-max r))))
+    (draw [r ctx] (__draw-contour-bands ctx (.f r) (.x-min r) (.x-max r) (.y-min r) (.y-max r)
+                                        (.samples r) (.bands r) (.fills r)))
+    (legend-label [r] (.label r)))
 
   (definstance Renderer [ColorFieldR]
     (bounds [r] (hint-bbox (.x-min r) (.x-max r) (.y-min r) (.y-max r)))
-    (to-legacy [r]
-      (__renderer-bounds
-        (__renderer-ints
-          (__renderer-floats (__make-renderer 63 0 0 (:: (.f r) :int) 0 0 0 0 "" "")
-                             (.x-min r) (.x-max r) (.y-min r) (.y-max r) (.alpha r) 0.0)
-          (.samples r) 0 0 0)
-        (.x-min r) (.x-max r) (.y-min r) (.y-max r))))
+    (draw [r ctx] (__draw-color-field ctx (.f r) (.x-min r) (.x-max r) (.y-min r) (.y-max r)
+                                      (.samples r) (.alpha r))))
 
   ;;; isoline -- draw a single f(x,y)=level contour.
   ;;;

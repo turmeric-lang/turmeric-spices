@@ -35,6 +35,16 @@
   through each one's instance. The draw pass's per-kind bounds `switch`
   (`__renderer-bbox`, C symbol `plot_renderer_bbox`) is gone, and
   `renderer-bbox` takes an `AnyRenderer`.
+- Drawing is a `Renderer` method too: `draw [r ctx : DrawCtx]` paints one
+  renderer through the plot's draw context, and three methods with defaults
+  -- `legend-label`, `frame-marks` and `categories` -- tell the frame what to
+  add. The monolithic draw `switch` (`__draw-renderers`, C symbol
+  `plot_draw_renderers`) is split into one inline-C draw per kind, beside
+  its type, and the frame worker into the frame pass (`__plot-frame`), the
+  draws and the legend. The slot-bag renderer (`__make-renderer`,
+  `__renderer-floats` / `-ints` / `-bounds`, `to-legacy`,
+  `anyrenderers->legacy`) is gone. `__plot-sample-adaptive` takes the
+  `DrawCtx` and the curve instead of a slot-bag handle.
 - `lines-r`, `points-r` and `label-r` are removed (build the struct with
   `make-struct`), and `plot-anyrenderers` is deprecated: `plot` takes the
   same argument.
@@ -66,9 +76,10 @@
   coordinate, so an arrows plot's y range came out of the heap layout and
   changed from run to run. `ArrowsR`'s `bounds` spans both endpoints of each
   arrow.
-- The slot-bag handle each constructor allocated was never freed. Handles
-  now live only for one draw: `plot-into-canvas` lowers the renderers,
-  draws, and frees them.
+- The slot-bag handle each constructor allocated was never freed; there is
+  no handle now, only the typed renderer.
+- A viewport too small for a plot (`plot-into-canvas` err 1) leaked the
+  font the frame had loaded.
 - `plot/core`'s hand-written `<plutovg.h>` stand-ins (prototypes, typedefs,
   `PLUTOVG_TEXT_ENCODING_UTF8`) are guarded by the header's own `PLUTOVG_H`.
   A project build (`tur build --shared --bundle-deps`, the image `tur repl`

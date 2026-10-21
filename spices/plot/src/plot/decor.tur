@@ -12,14 +12,9 @@
           Decoration XAxis YAxis Axes XTickLines YTickLines TickGrid
           HRuleR VRuleR LabelR)
 
-  (import plot/core  :refer [__make-renderer __renderer-floats __renderer-bounds
-                             BBox bbox-empty-box point-bbox any-renderer])
+  (import plot/core  :refer [BBox bbox-empty-box point-bbox any-renderer
+                             DrawCtx FrameMarks no-frame-marks])
   (import plot/style :refer [default-line-style])
-
-  ;;; __nan -- quiet NaN sentinel for "auto" bounds.
-  ;;; Inline-C avoids the runtime div-by-zero trap on `(/ 0.0 0.0)`.
-  (defn __nan [] : float
-    ```c return 0.0 / 0.0; ```)
 
   ;;; Decoration -- an axis line or a set of tick grid lines, drawn by the plot
   ;;; frame at the data extent the other renderers establish.
@@ -35,48 +30,166 @@
   ;;; LabelR -- a text label anchored at one (x, y) data point.
   (defstruct LabelR :copy [x : float  y : float  text : cstr  style : int])
 
-  ;;; __decoration-kind -- the draw pass's kind number for a Decoration.
-  (defn __decoration-kind [d : Decoration] : int
-    (match d
-      (XAxis)      1
-      (YAxis)      2
-      (Axes)       3
-      (XTickLines) 4
-      (YTickLines) 5
-      (TickGrid)   6))
+  ;;; __draw-hrule -- stroke a horizontal rule at data y across the viewport.
+  (defn __draw-hrule [ctx : DrawCtx  y : float  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    double bx_min = dc->bx_min;
+    int64_t left = dc->left;
+    int64_t right = dc->right;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      double __tmpx = 0.0, vy = 0.0; MAP_POINT(bx_min, y, &__tmpx, &vy);
+      plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)left, (float)vy);
+      plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)right, (float)vy);
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    ```)
 
-  ;; Bounds: a decoration constrains nothing. A rule pins its one coordinate
-  ;; (and 0 on the other axis); a label pins its anchor.
-  ;;
-  ;; to-legacy: RK_X_AXIS 1 .. RK_GRID 6, RK_HRULE 7, RK_VRULE 8, RK_LABEL 9.
+  ;;; __draw-vrule -- stroke a vertical rule at data x across the viewport.
+  (defn __draw-vrule [ctx : DrawCtx  x : float  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    extern void plutovg_canvas_move_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_line_to(void* canvas, float x, float y);
+    extern void plutovg_canvas_stroke(void* canvas);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    double by_min = dc->by_min;
+    int64_t top = dc->top;
+    int64_t bottom = dc->bottom;
+    do {
+      SET_LINE_STYLE(style, ((int *)0));
+      double vx = 0.0, __tmpy = 0.0; MAP_POINT(x, by_min, &vx, &__tmpy);
+      plutovg_canvas_move_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)top);
+      plutovg_canvas_line_to((plutovg_canvas_t *)(intptr_t)canvas, (float)vx, (float)bottom);
+      plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    ```)
+
+  ;;; __draw-label -- fill `text` just above-right of the data point (x, y);
+  ;;; nothing (and no auto color taken) when no font loaded.
+  (defn __draw-label [ctx : DrawCtx  x : float  y : float  text : cstr  style : int] : void
+    ```c
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdbool.h>
+    #include <string.h>
+    /* Stand-ins for <plutovg.h>, for a build without it on the include
+       path; with it (a project build hoists it) these would conflict. */
+    #ifndef PLUTOVG_H
+    typedef void plutovg_canvas_t;
+    #define PLUTOVG_TEXT_ENCODING_UTF8 1
+    extern float plutovg_canvas_fill_text(void* canvas, const void* text, int length,
+                                          int encoding, float x, float y);
+    #endif
+    typedef struct PlotDrawCtx {
+      void *canvas;
+      double bx_min, bx_max, by_min, by_max;
+      int64_t left, right, top, bottom, plot_w, plot_h;
+      int64_t font_ok;
+      void *font;
+      int64_t legend_pos;
+      int64_t auto_color;
+    } PlotDrawCtx;
+    extern void plot_ctx_line_style(void *, int64_t);
+    #define SET_LINE_STYLE(H, R) plot_ctx_line_style(dc, (H))
+    extern void plot_ctx_map(void *, double, double, void *, void *);
+    #define MAP_POINT(X, Y, VX, VY) plot_ctx_map(dc, (X), (Y), (VX), (VY))
+    PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
+    int64_t canvas = (int64_t)(intptr_t)dc->canvas;
+    int64_t font_ok = dc->font_ok;
+    do {
+      if (font_ok && text) {
+        int stroke = 0; (void)stroke;
+        SET_LINE_STYLE(style, &stroke);
+        double vx, vy; MAP_POINT(x, y, &vx, &vy);
+        plutovg_canvas_fill_text((plutovg_canvas_t *)(intptr_t)canvas, text, (int)strlen(text),
+                                 PLUTOVG_TEXT_ENCODING_UTF8, (float)(vx + 4.0), (float)(vy - 4.0));
+      }
+    } while (0);
+    #undef SET_LINE_STYLE
+    #undef MAP_POINT
+    ```)
+
+  ;;; __decoration-marks -- the axis line or tick grid a Decoration asks for.
+  (defn __decoration-marks [d : Decoration] : FrameMarks
+    (match d
+      (XAxis)      (make-struct FrameMarks true  false false false)
+      (YAxis)      (make-struct FrameMarks false true  false false)
+      (Axes)       (make-struct FrameMarks true  true  false false)
+      (XTickLines) (make-struct FrameMarks false false true  false)
+      (YTickLines) (make-struct FrameMarks false false false true)
+      (TickGrid)   (make-struct FrameMarks false false true  true)))
+
+  ;; Bounds: a decoration constrains nothing, and draws nothing itself -- the
+  ;; frame draws the axes and grids its `frame-marks` ask for. A rule pins its
+  ;; one coordinate (and 0 on the other axis); a label pins its anchor.
   (definstance Renderer [Decoration]
     (bounds [r] (bbox-empty-box))
-    (to-legacy [r] (__make-renderer (__decoration-kind r) 0 0 0 0 0 0 0 "" "")))
+    (draw [r ctx] nil)
+    (frame-marks [r] (__decoration-marks r)))
 
   (definstance Renderer [HRuleR]
     (bounds [r] (point-bbox 0.0 (.y r)))
-    (to-legacy [r]
-      (__renderer-bounds
-        (__renderer-floats (__make-renderer 7 (.style r) 0 0 0 0 0 0 "" "")
-                           (.y r) 0.0 0.0 0.0 0.0 0.0)
-        (__nan) (__nan) (.y r) (.y r))))
+    (draw [r ctx] (__draw-hrule ctx (.y r) (.style r))))
 
   (definstance Renderer [VRuleR]
     (bounds [r] (point-bbox (.x r) 0.0))
-    (to-legacy [r]
-      (__renderer-bounds
-        (__renderer-floats (__make-renderer 8 (.style r) 0 0 0 0 0 0 "" "")
-                           (.x r) 0.0 0.0 0.0 0.0 0.0)
-        (.x r) (.x r) (__nan) (__nan))))
+    (draw [r ctx] (__draw-vrule ctx (.x r) (.style r))))
 
   (definstance Renderer [LabelR]
     (bounds [r] (point-bbox (.x r) (.y r)))
-    (to-legacy [r]
-      (__renderer-bounds
-        (__renderer-floats
-          (__make-renderer 9 (.style r) 0 0 0 0 0 0 "" (.text r))
-          (.x r) (.y r) 0.0 0.0 0.0 0.0)
-        (.x r) (.x r) (.y r) (.y r))))
+    (draw [r ctx] (__draw-label ctx (.x r) (.y r) (.text r) (.style r))))
 
   ;;; x-axis -- horizontal axis at y=0.
   ;;;
