@@ -1,0 +1,181 @@
+;;; lmdb/error -- LmdbError, and the mapping from LMDB's return codes to it.
+;;;
+;;; Every fallible operation in the spice returns `(Result T LmdbError)`.
+;;; Two of LMDB's codes are never errors here: `MDB_NOTFOUND` is `None` from a
+;;; get or a cursor move and `false` from a delete, and `MDB_KEYEXIST` is
+;;; `false` from `put-new!`. Everything else lands on one constructor below;
+;;; what LMDB does not distinguish usefully goes to `Io` with its code and
+;;; `mdb_strerror` text.
+;;;
+;;; The inline-C helpers in the other modules return LMDB's integer code and
+;;; nothing else; the Turmeric side builds the `Result`, through
+;;; `lmdb-error-of`, so this file is the one place the mapping lives.
+;;;
+;;; Since: 0.1.0
+;; lmdb/error
+
+(defmodule lmdb/error
+  (export LmdbError MapFull KeyTooLong ReadersFull DbsFull TxnFull
+          NotADatabase Incompatible ReadOnly Io
+          lmdb-error-of lmdb-open-error-of lmdb-error-message
+          lmdb-error-map-full?)
+
+;;; LmdbError -- why an LMDB operation failed.
+;;;
+;;; Constructors:
+;;;   MapFull            -- MDB_MAP_FULL: grow with env-set-map-size!, rerun
+;;;   KeyTooLong n       -- the key is n bytes; the limit is env-max-key-size
+;;;   ReadersFull        -- MDB_READERS_FULL: raise EnvOpts max-readers
+;;;   DbsFull            -- MDB_DBS_FULL: raise EnvOpts max-dbs
+;;;   TxnFull            -- MDB_TXN_FULL: too many dirty pages in one txn
+;;;   NotADatabase path  -- MDB_INVALID / MDB_VERSION_MISMATCH at env-open
+;;;   Incompatible       -- MDB_INCOMPATIBLE: dbi flags differ from the file's
+;;;   ReadOnly           -- a write in a read-only transaction or environment
+;;;   Io code msg        -- anything else: the errno or MDB_* code, and its
+;;;                         mdb_strerror text
+;;;
+;;; Example:
+;;;   (match e (MapFull) "grow and retry" (Io c m) m ...)
+;;;
+;;; Since: 0.1.0
+(defdata LmdbError
+  (MapFull)
+  (KeyTooLong int)
+  (ReadersFull)
+  (DbsFull)
+  (TxnFull)
+  (NotADatabase cstr)
+  (Incompatible)
+  (ReadOnly)
+  (Io int cstr))
+
+;; -------------------------------------------------------------------------
+;; Private: LMDB's codes, read from lmdb.h so they cannot drift
+;; -------------------------------------------------------------------------
+
+;;; rc-class -- sort an LMDB return code into the constructor it maps to.
+;;; 1 MapFull, 2 ReadersFull, 3 DbsFull, 4 TxnFull, 5 NotADatabase,
+;;; 6 Incompatible, 7 ReadOnly (EACCES), 0 anything else (Io).
+(defn rc-class [rc : int] : int
+  ```c
+  #include <errno.h>
+  #include <lmdb.h>
+  switch ((int)rc) {
+    case MDB_MAP_FULL:         return 1;
+    case MDB_READERS_FULL:     return 2;
+    case MDB_DBS_FULL:         return 3;
+    case MDB_TXN_FULL:         return 4;
+    case MDB_INVALID:
+    case MDB_VERSION_MISMATCH: return 5;
+    case MDB_INCOMPATIBLE:     return 6;
+    case EACCES:               return 7;
+    default:                   return 0;
+  }
+  ```)
+
+;;; rc-message -- mdb_strerror's text for a code. Static: LMDB's own codes
+;;; index a const table and anything else is strerror's, so nothing is
+;;; allocated and an `Io` error owns no memory.
+(defn rc-message [rc : int] : cstr
+  ```c
+  #include <lmdb.h>
+  const char *m = mdb_strerror((int)rc);
+  return (char *)(m ? m : "unknown LMDB error");
+  ```)
+
+;; -------------------------------------------------------------------------
+;; Public
+;; -------------------------------------------------------------------------
+
+;;; lmdb-error-of -- the LmdbError for a non-zero LMDB return code.
+;;;
+;;; Used by the other lmdb modules after an operation on an open environment.
+;;; `EACCES` there means a write in a read-only transaction, so it is
+;;; `ReadOnly`.
+;;;
+;;; Parameters:
+;;;   rc -- the code LMDB returned (not 0, MDB_NOTFOUND or MDB_KEYEXIST)
+;;;
+;;; Returns:
+;;;   The matching LmdbError.
+;;;
+;;; Example:
+;;;   (lmdb-error-of -30792)  ; => (MapFull)
+;;;
+;;; Since: 0.1.0
+(defn lmdb-error-of [rc : int] : LmdbError
+  (let [c (rc-class rc)]
+    (cond (= c 1) (MapFull)
+          (= c 2) (ReadersFull)
+          (= c 3) (DbsFull)
+          (= c 4) (TxnFull)
+          (= c 5) (NotADatabase "")
+          (= c 6) (Incompatible)
+          (= c 7) (ReadOnly)
+          :else   (Io rc (rc-message rc)))))
+
+;;; lmdb-open-error-of -- the LmdbError for a failed env-open of `path`.
+;;;
+;;; At open, `EACCES` is a file permission problem, not a read-only
+;;; transaction, so it is `Io`; and a file that is not an LMDB database is
+;;; `NotADatabase` carrying the path.
+;;;
+;;; Parameters:
+;;;   rc   -- the code mdb_env_open (or a step before it) returned
+;;;   path -- the path being opened
+;;;
+;;; Returns:
+;;;   The matching LmdbError.
+;;;
+;;; Example:
+;;;   (lmdb-open-error-of -30793 "x.mdb")  ; => (NotADatabase "x.mdb")
+;;;
+;;; Since: 0.1.0
+(defn lmdb-open-error-of [rc : int path : cstr] : LmdbError
+  (let [c (rc-class rc)]
+    (cond (= c 5) (NotADatabase path)
+          (= c 7) (Io rc (rc-message rc))
+          :else   (lmdb-error-of rc))))
+
+;;; lmdb-error-message -- a one-line description of an LmdbError.
+;;;
+;;; Parameters:
+;;;   e -- the error
+;;;
+;;; Returns:
+;;;   A human-readable cstr.
+;;;
+;;; Example:
+;;;   (lmdb-error-message (MapFull))  ; => "map full: grow it with env-set-map-size!"
+;;;
+;;; Since: 0.1.0
+(defn lmdb-error-message [e : LmdbError] : cstr
+  (match e
+    (MapFull)        "map full: grow it with env-set-map-size!"
+    (KeyTooLong n)   "key longer than env-max-key-size"
+    (ReadersFull)    "reader table full: raise EnvOpts max-readers"
+    (DbsFull)        "named database limit reached: raise EnvOpts max-dbs"
+    (TxnFull)        "transaction has too many dirty pages"
+    (NotADatabase p) "not an LMDB database"
+    (Incompatible)   "database flags differ from the file's"
+    (ReadOnly)       "write in a read-only transaction or environment"
+    (Io c m)         m))
+
+;;; lmdb-error-map-full? -- is this error MapFull?
+;;;
+;;; Parameters:
+;;;   e -- the error
+;;;
+;;; Returns:
+;;;   true for (MapFull), false otherwise.
+;;;
+;;; Example:
+;;;   (lmdb-error-map-full? (MapFull))  ; => true
+;;;
+;;; Since: 0.1.0
+(defn lmdb-error-map-full? [e : LmdbError] : bool
+  (match e
+    (MapFull) true
+    _         false))
+
+) ;; end defmodule lmdb/error

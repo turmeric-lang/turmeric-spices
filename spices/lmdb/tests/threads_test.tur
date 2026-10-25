@@ -1,0 +1,209 @@
+;; tests/threads_test.tur -- lmdb: readers on two OS threads while a third writes.
+;;
+;; lmdb-spice-plan section 6. One env is shared by three pthreads. The writer
+;; commits a counter 1..N, one write transaction per step; each reader opens
+;; read transactions in a loop and checks that the counter it sees never goes
+;; backwards (each snapshot is consistent and later than the last). Every env
+;; is opened MDB_NOTLS, which is what lets a read transaction's reader slot be
+;; independent of the thread.
+;;
+;; The threads are plain pthreads started on Turmeric functions, as
+;; turmeric's own channel fixtures do. A thread receives the env as a word:
+;; `env-view` re-types it for the borrowing calls and `env-unview` spends the
+;; view -- the main thread still owns the real Env and closes it after the
+;; joins.
+
+(defmodule lmdb/tests/threads
+  (import test/suite  :refer [describe it])
+  (import test/assert :refer [assert-true])
+  (import test/runner :refer [run-all-status])
+  (import lmdb/error  :refer [LmdbError])
+  (import lmdb/env    :refer [Env env-opts opts-map-size opts-sync SyncNone
+                              env-open env-close])
+  (import lmdb/txn    :refer [Txn with-read-txn with-write-txn])
+  (import lmdb/dbi    :refer [dbi-main])
+  (import lmdb/ops    :refer [get put!])
+
+(def writes 300)
+(def reads 400)
+
+;; -------------------------------------------------------------------------
+;; Helpers
+;; -------------------------------------------------------------------------
+
+;;; tmp-dir -- a fresh empty directory under $TMPDIR (or /tmp).
+(defn tmp-dir [] : cstr
+  ```c
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
+  #include <unistd.h>
+  const char *base = getenv("TMPDIR");
+  if (!base || !*base) base = "/tmp";
+  size_t n = strlen(base) + 32;
+  char *p = (char *)malloc(n);
+  snprintf(p, n, "%s/tur-lmdb-XXXXXX", base);
+  if (!mkdtemp(p)) { perror("mkdtemp"); exit(1); }
+  return p;
+  ```)
+
+;;; db-path -- dir/t.mdb.
+(defn db-path [dir : cstr] : cstr
+  ```c
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
+  size_t n = strlen((const char *)dir) + 16;
+  char *p = (char *)malloc(n);
+  snprintf(p, n, "%s/t.mdb", (const char *)dir);
+  return p;
+  ```)
+
+;;; cleanup -- remove dir/t.mdb, its lock file and dir.
+(defn cleanup [dir : cstr] : bool
+  ```c
+  #include <stdio.h>
+  #include <unistd.h>
+  char p[4096];
+  snprintf(p, sizeof p, "%s/t.mdb", (const char *)dir);
+  int ok = unlink(p) == 0;
+  snprintf(p, sizeof p, "%s/t.mdb-lock", (const char *)dir);
+  ok = (unlink(p) == 0) && ok;
+  return (rmdir((const char *)dir) == 0) && ok;
+  ```)
+
+;;; env-word -- the Env's pointer, to hand to a thread.
+(defn env-word [^borrow env : Env] : ptr<void>
+  ```c
+  return (void *)(intptr_t)env;
+  ```)
+
+;;; env-view -- re-type a thread's env word for the borrowing calls.
+(defn env-view [w : ptr<void>] : Env
+  ```c
+  return (int64_t)(intptr_t)w;
+  ```)
+
+;;; env-unview -- spend a view; the main thread owns and closes the real Env.
+(defn env-unview [e : Env] : nil
+  ```c
+  (void)e;
+  ```)
+
+;;; int-str -- n in decimal.
+(defn int-str [n : int] : cstr
+  ```c
+  #include <stdio.h>
+  #include <stdlib.h>
+  char *p = (char *)malloc(24);
+  snprintf(p, 24, "%lld", (long long)n);
+  return p;
+  ```)
+
+;;; str-int -- the decimal value of s.
+(defn str-int [s : cstr] : int
+  ```c
+  #include <stdlib.h>
+  return (int64_t)strtoll((const char *)s, NULL, 10);
+  ```)
+
+;;; word -- an int as a thread result.
+(defn word [n : int] : ptr<void>
+  ```c
+  return (void *)(intptr_t)n;
+  ```)
+
+;;; spawn -- pthread_create on fn with arg; the pthread_t as a word.
+(defn spawn [fn : ptr<void> arg : ptr<void>] : int
+  ```c
+  #include <pthread.h>
+  #include <stdio.h>
+  #include <stdlib.h>
+  pthread_t *t = (pthread_t *)malloc(sizeof *t);
+  if (pthread_create(t, NULL, (void *(*)(void *))fn, arg)) { perror("pthread_create"); exit(1); }
+  return (int64_t)(intptr_t)t;
+  ```)
+
+;;; join -- pthread_join; the thread's result as an int.
+(defn join [t : int] : int
+  ```c
+  #include <pthread.h>
+  #include <stdlib.h>
+  void *r = NULL;
+  pthread_t *pt = (pthread_t *)(intptr_t)t;
+  pthread_join(*pt, &r);
+  free(pt);
+  return (int64_t)(intptr_t)r;
+  ```)
+
+;; -------------------------------------------------------------------------
+;; The threads
+;; -------------------------------------------------------------------------
+
+;;; read-counter -- the counter in a fresh read txn (0 when unset, -1 on error).
+(defn read-counter [^borrow env : Env] : int
+  (let [r (with-read-txn env
+            (fn [^borrow t : Txn] : (Result int LmdbError)
+              (let [v (get t (? (dbi-main t)) "counter")]
+                (ok (if (some? v) (str-int (unwrap v)) 0)))))]
+    (if (ok? r) (ok-val r) -1)))
+
+;;; reader-loop -- i more reads; the number of backwards or failed reads.
+(defn reader-loop [^borrow env : Env i : int last : int bad : int] : int
+  (if (<= i 0)
+    bad
+    (let [n (read-counter env)]
+      (reader-loop env (- i 1) (if (> n last) n last)
+                   (if (or (< n 0) (< n last)) (+ bad 1) bad)))))
+
+;;; reader -- thread body: reads, returning how many went wrong.
+(defn reader [arg : ptr<void>] : ptr<void>
+  (let [env (env-view arg)
+        bad (reader-loop env reads 0 0)]
+    (do (env-unview env) (word bad))))
+
+;;; writer-loop -- commit counter = i .. n; the number of failed commits.
+(defn writer-loop [^borrow env : Env i : int n : int bad : int] : int
+  (if (> i n)
+    bad
+    (let [w (with-write-txn env
+              (fn [^borrow t : Txn] : (Result nil LmdbError)
+                (put! t (? (dbi-main t)) "counter" (int-str i))))]
+      (writer-loop env (+ i 1) n (if (ok? w) bad (+ bad 1))))))
+
+;;; writer -- thread body: writes, returning how many failed.
+(defn writer [arg : ptr<void>] : ptr<void>
+  (let [env (env-view arg)
+        bad (writer-loop env 1 writes 0)]
+    (do (env-unview env) (word bad))))
+
+;; -------------------------------------------------------------------------
+
+;;; t-threads -- two readers and a writer, concurrently, on one env.
+(defn t-threads [] : bool
+  (let [dir (tmp-dir)
+        r   (env-open (db-path dir) (opts-sync (opts-map-size (env-opts) (* 8 1048576)) (SyncNone)))]
+    (if (err? r)
+      false
+      (let [env  (ok-val r)
+            w    (env-word env)
+            r1   (spawn reader w)
+            wr   (spawn writer w)
+            r2   (spawn reader w)
+            bad1 (join r1)
+            badw (join wr)
+            bad2 (join r2)
+            fin  (read-counter env)]
+        (do
+          (env-close env)
+          (and (= bad1 0) (= bad2 0) (= badw 0) (= fin writes) (cleanup dir)))))))
+
+(defn __all-tests [] : void
+  (describe "threads"
+    (it "two reader threads and a writer thread share an env" (t-threads))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule lmdb/tests/threads
