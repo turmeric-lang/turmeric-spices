@@ -40,6 +40,7 @@
   ;; Imported for the ambient DeltaCRDT methods (C4); a defclass is not an
   ;; exportable name, so the import anchor is `join-all`.
   (import crdt/lattice :refer [join-all])
+  (import crdt/replica :refer [ReplicaId replica replica-sym])
   (export ORSet orset-new orset-add orset-remove orset-has? orset-count
           orset-dots orset-ctx-size
           OrsetDelta orset-delta-new orset-delta-add orset-delta-remove
@@ -176,17 +177,17 @@
 ;;;   A new OR-Set in which e is present, tagged with a fresh dot for r.
 ;;;
 ;;; Example:
-;;;   (orset-add (orset-new) (quote apple) (quote alice))
+;;;   (orset-add (orset-new) (quote apple) (replica (quote alice)))
 ;;;
 ;;; Since: crdt-spice-plan C2
 ;;
 ;; The dot is minted from this replica's own context, so it is one nobody else
 ;; has seen -- which is exactly what lets it survive a concurrent remove.
-(defn orset-add [s : ORSet e : Sym r : Sym] : ORSet
+(defn orset-add [s : ORSet e : Sym r : ReplicaId] : ORSet
   (let [d   (dotctx-next (.ctx s) r)
         n   (dot-counter d)
         cur (__inner-of (.elems s) e)
-        nxt (:: (map-assoc (:: cur (Map Sym int)) r n) int)]
+        nxt (:: (map-assoc (:: cur (Map Sym int)) (replica-sym r) n) int)]
     (ORSet (:: (map-assoc (:: (.elems s) (Map Sym int)) e nxt) int)
            (dotctx-witness (.ctx s) (mk-dot r n)))))
 
@@ -362,7 +363,7 @@
 ;;;   A delta asserting exactly one dot on e, retracting nothing.
 ;;;
 ;;; Example:
-;;;   (orset-delta-add s (quote apple) (quote alice))
+;;;   (orset-delta-add s (quote apple) (replica (quote alice)))
 ;;;
 ;;; Since: crdt-spice-plan C4
 ;;
@@ -376,12 +377,12 @@
 ;;
 ;;   (let [d  (orset-delta-add s (quote apple) r)
 ;;         s2 (orset-add s (quote apple) r)] ...)
-(defn orset-delta-add [^borrow s : ORSet e : Sym r : Sym] : OrsetDelta
+(defn orset-delta-add [^borrow s : ORSet e : Sym r : ReplicaId] : OrsetDelta
   (let [d (dotctx-next (.ctx s) r)
         n (dot-counter d)]
     (OrsetDelta
       (:: (map-assoc (:: (map-new) (Map Sym int)) e
-                     (:: (map-assoc (:: (map-new) (Map Sym int)) r n) int)) int)
+                     (:: (map-assoc (:: (map-new) (Map Sym int)) (replica-sym r) n) int)) int)
       (dotset-new))))
 
 ;;; orset-delta-remove -- the DELTA of removing an element.
@@ -422,7 +423,7 @@
 (defn __dots-of-loop [it : ptr<void> acc : DotSet] : DotSet
   (if (hamt/iter-advance! it)
     (__dots-of-loop
-      it (dotset-add acc (mk-dot (:: (hamt/iter-cur-key it) Sym)
+      it (dotset-add acc (mk-dot (replica (:: (hamt/iter-cur-key it) Sym))
                                  (:: (hamt/iter-cur-val it) int))))
     acc))
 
@@ -518,7 +519,7 @@
 ;;;   The set with d's assertions added and d's retractions withdrawn.
 ;;;
 ;;; Example:
-;;;   (orset-apply s (orset-delta-add other (quote apple) (quote alice)))
+;;;   (orset-apply s (orset-delta-add other (quote apple) (replica (quote alice))))
 ;;;
 ;;; Since: crdt-spice-plan C4
 ;;
@@ -566,7 +567,7 @@
   (if (hamt/iter-advance! it)
     (let [r (:: (hamt/iter-cur-key it) Sym)
           n (__max-ctr-of (:: (hamt/iter-cur-val it) int))
-          w (dotctx-witness acc (mk-dot r n))]
+          w (dotctx-witness acc (mk-dot (replica r) n))]
       (__witness-rms-loop w it))
     acc))
 
@@ -629,11 +630,19 @@
     acc))
 
 ;;; __retract -- internal: drop every dot the delta withdraws.
+;;
+;; The walk rebuilds the whole element map, so an add delta, which withdraws
+;; nothing, skips it: without the check a one-element add cost as much as
+;; copying the set (bench/join.tur's orset-apply row).  A remove delta still
+;; walks every element -- finding a dot's element without one needs a
+;; dot -> element index the state does not keep.
 (defn __retract [elems : int rms : int] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: elems (Map Sym int))))
-        r  (__retract-loop (:: (map-new) int) it rms)]
-    (hamt/iter-destroy! it)
-    r))
+  (if (= (map-count (:: rms (Map Sym int))) 0)
+    elems
+    (let [it (hamt/iter-alloc (map-hamt (:: elems (Map Sym int))))
+          r  (__retract-loop (:: (map-new) int) it rms)]
+      (hamt/iter-destroy! it)
+      r)))
 
 ;;; __retract-loop -- internal.
 (defn __retract-loop [acc : int it : ptr<void> rms : int] : int
@@ -692,7 +701,7 @@
 ;;; __witness-inner-loop -- internal.
 (defn __witness-inner-loop [acc : DotContext it : ptr<void>] : DotContext
   (if (hamt/iter-advance! it)
-    (let [w (dotctx-witness acc (mk-dot (:: (hamt/iter-cur-key it) Sym)
+    (let [w (dotctx-witness acc (mk-dot (replica (:: (hamt/iter-cur-key it) Sym))
                                         (:: (hamt/iter-cur-val it) int)))]
       (__witness-inner-loop w it))
     acc))

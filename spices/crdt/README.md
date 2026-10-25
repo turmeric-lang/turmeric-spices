@@ -38,7 +38,7 @@ guarantees ARE the inline C.
 | C6 | `crdt-sync` -- transport, delta buffering, anti-entropy | not started, separate spice |
 
 Design plan:
-[`docs/upcoming/crdt-spice-plan.md`](https://github.com/turmeric-lang/turmeric/blob/main/docs/upcoming/crdt-spice-plan.md)
+[`docs/upcoming/spices/crdt-spice-plan.md`](https://github.com/turmeric-lang/turmeric/blob/main/docs/upcoming/spices/crdt-spice-plan.md)
 in the compiler repo. Eleven test suites, including two seeded convergence
 fuzzers.
 
@@ -67,7 +67,8 @@ Two replicas count independently and converge on merge:
 
 ```turmeric
 (defmodule demo
-  (import crdt/counter :refer [replica GCounter gcounter-new gcounter-bump
+  (import crdt/replica :refer [replica])
+  (import crdt/counter :refer [GCounter gcounter-new gcounter-bump
                                gcounter-value])
 
 (defn alice [] : GCounter
@@ -84,7 +85,8 @@ Two replicas count independently and converge on merge:
 
 ```sweet-exp
 defmodule demo
-  (import crdt/counter :refer [replica GCounter gcounter-new gcounter-bump
+  (import crdt/replica :refer [replica])
+  (import crdt/counter :refer [GCounter gcounter-new gcounter-bump
                                gcounter-value])
   defn alice [] : GCounter
     gcounter-bump(gcounter-new() replica((quote alice)) 3)
@@ -117,7 +119,8 @@ module loads it, and the classes are ambient once any of them is in the build.
 | `ORMap V` | `crdt/ormap` | keys by dot, values by `V`'s join | add-wins + recursive | the value at a key |
 | `Rga` | `crdt/rga` | ordered nodes + tombstones | node union, re-integrated | the visible sequence |
 
-Elements and keys are `Sym`; register and map values are `int` carriers. That
+Elements and keys are `Sym`, replicas are `ReplicaId`, and register and map
+values are `int` carriers. That
 is a real restriction, not a stylistic one -- see **Limits** below.
 
 ## Counters -- `crdt/counter`
@@ -138,8 +141,10 @@ A `PNCounter` is two `GCounter`s, one for increments and one for decrements,
 read as `P - N`. That is the standard trick for a counter that can go down
 without either half ever decreasing.
 
-`replica` names a replica. `ReplicaId` is a transparent `defalias` for `Sym`
-and cannot appear in an export list, so callers spell `Sym` or use `replica`.
+Every type takes its replica as a `ReplicaId`, from `crdt/replica`: a newtype
+over `Sym`, so the element or key symbol that `orset-add` and `ormap-put` also
+take cannot be passed where the replica is due. `replica` makes one from a
+symbol and `replica-sym` gives the symbol back.
 
 ## Sets -- `crdt/set` and `crdt/orset`
 
@@ -155,13 +160,14 @@ Three designs, and the differences are the whole point:
 
 ```turmeric
 (defmodule demo
+  (import crdt/replica :refer [replica])
   (import crdt/orset :refer [ORSet orset-new orset-add orset-remove orset-has?
                              orset-count])
 
 (defn main [] : int
   (let [s (orset-remove
-            (orset-add (orset-add (orset-new) (quote apple) (quote alice))
-                       (quote pear) (quote alice))
+            (orset-add (orset-add (orset-new) (quote apple) (replica (quote alice)))
+                       (quote pear) (replica (quote alice)))
             (quote apple))]
     (println (orset-count s)))     ;; 1 -- pear
   0)
@@ -216,16 +222,17 @@ The cost is that a read is a set.
 
 ```turmeric
 (defmodule demo
+  (import crdt/replica :refer [replica])
   (import crdt/register :refer [LwwRegister lww-new lww-set lww-value
                                 MvRegister mv-new mv-set mv-values])
 
 (defn main [] : int
   ;; Later stamp wins.
-  (println (lww-value (join (lww-set (lww-new (quote alice)) 1 1000)
-                            (lww-set (lww-new (quote bob)) 2 2000))))   ;; 2
+  (println (lww-value (join (lww-set (lww-new (replica (quote alice))) 1 1000)
+                            (lww-set (lww-new (replica (quote bob))) 2 2000))))   ;; 2
   ;; Concurrent writes: both survive.
-  (println (mv-values (join (mv-set (mv-new (quote alice)) 1 1000)
-                            (mv-set (mv-new (quote bob)) 2 1000))))     ;; 2
+  (println (mv-values (join (mv-set (mv-new (replica (quote alice))) 1 1000)
+                            (mv-set (mv-new (replica (quote bob))) 2 1000))))     ;; 2
   0)
 )
 ```
@@ -241,16 +248,17 @@ dispatches to `V`'s own instance:
 
 ```turmeric
 (defmodule demo
+  (import crdt/replica :refer [replica])
   (import crdt/ormap :refer [ORMap ormap-new ormap-put ormap-get ormap-count])
 
 (defn hi [] : (ORMap MaxI)
   (:: (ormap-put (:: (ormap-new) (ORMap MaxI))
-                 (quote alice) (quote temp) (:: 21 MaxI))
+                 (replica (quote alice)) (quote temp) (:: 21 MaxI))
       (ORMap MaxI)))
 
 (defn lo [] : (ORMap MaxI)
   (:: (ormap-put (:: (ormap-new) (ORMap MaxI))
-                 (quote bob) (quote temp) (:: 19 MaxI))
+                 (replica (quote bob)) (quote temp) (:: 19 MaxI))
       (ORMap MaxI)))
 
 (defn main [] : int
@@ -279,7 +287,8 @@ in with `apply-delta`:
 
 ```turmeric
 (defmodule demo
-  (import crdt/counter :refer [replica GCounter gcounter-new gcounter-bump
+  (import crdt/replica :refer [replica])
+  (import crdt/counter :refer [GCounter gcounter-new gcounter-bump
                                gcounter-value gcounter-delta-bump])
 
 (defn alice [] : GCounter
@@ -338,11 +347,12 @@ forest.
 
 ```turmeric
 (defmodule demo
+  (import crdt/replica :refer [replica])
   (import crdt/rga :refer [Rga rga-new rga-append rga-insert rga-delete
                            rga-get rga-len rga-size])
 
 (defn main [] : int
-  (let [d (rga-append (rga-append (rga-new) (quote alice) 72) (quote alice) 105)]
+  (let [d (rga-append (rga-append (rga-new) (replica (quote alice)) 72) (replica (quote alice)) 105)]
     (println (rga-len d))      ;; 2
     (println (rga-get d 1)))   ;; 105 -- character codes
   0)
@@ -439,9 +449,35 @@ replica does not hand its state away and keep using it either.
   one does. The lattice law helpers are correspondingly weaker for those two
   types, which is why the OR-Set has a convergence fuzzer AND hand-written
   scenarios. `Eq [Rga]` is structural.
-- **`ReplicaId` is a `defalias`, not a newtype**, so it buys no type safety and
-  cannot be exported.
-- **No benchmark yet** for HAMT join cost at realistic sizes.
+- **A full join costs microseconds per entry, and more as the state grows.**
+  See **Performance**.
+
+## Performance
+
+`bench/run.sh [path/to/tur]` times a full join and a one-element delta at
+16 to 65536 entries and checks each merge's answer. Linux x86-64, gcc 13,
+`tur` v0.71.0, best of 4 to 200 repetitions per row:
+
+| entries | `GCounter` join | `ORSet` join | `ORSet` add delta |
+|--------:|----------------:|-------------:|------------------:|
+| 16 | 6 us | 40 us | 1 us |
+| 1024 | 1.4 ms | 14 ms | 3 us |
+| 16384 | 129 ms | 334 ms | 6 us |
+| 65536 | 708 ms | 1.6 s | 9 us |
+
+Two things to read off it:
+
+- **A full join is not linear.** Going from 1024 to 16384 entries is 16
+  times the input and about 90 times the time for a counter, so a state
+  merge costs 1.4 us an entry at 1024 and 11 us at 65536. Each entry of one
+  side is a separate `map-assoc` into the other -- a path copy of the
+  persistent map -- rather than a node-by-node union that would share the
+  untouched subtrees. This is the case for delta-state: ship deltas, and
+  keep full-state joins for anti-entropy.
+- **An add delta costs the delta, not the state.** A remove delta still
+  walks every element of an `ORSet` (finding a dot's element needs an
+  index the state does not keep), and every `ORMap` delta rebuilds the map
+  today.
 
 ## Tests
 

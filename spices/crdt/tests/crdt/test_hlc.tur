@@ -16,6 +16,7 @@
 ;; main returns the failure count so `tur test` reports a non-zero exit.
 
 (defmodule crdt/tests/test_hlc
+  (import crdt/replica :refer [ReplicaId replica replica-sym])
   (import crdt/hlc :refer [Hlc hlc-zero hlc-tick hlc-recv hlc-after?
                            hlc-wall hlc-logical hlc-max-drift hlc-later])
 
@@ -24,7 +25,7 @@
 
 ;; 1. Same millisecond -- the logical counter has to do the ordering.
 (defn test-same-ms [] : int
-  (let [a (hlc-tick (hlc-zero (quote alice)) 1000)
+  (let [a (hlc-tick (hlc-zero (replica (quote alice))) 1000)
         b (hlc-tick a 1000)
         c (hlc-tick b 1000)]
     (+ (fail-if (not (hlc-after? b a)) "FAIL hlc: same-ms tick not strictly after")
@@ -39,7 +40,7 @@
 ;;    `now` is LOWER than the last stamp, so taking `now` would move the stamp
 ;;    backwards and an LWW keyed on it would resurrect an overwritten value.
 (defn test-backwards [] : int
-  (let [a (hlc-tick (hlc-zero (quote alice)) 5000)
+  (let [a (hlc-tick (hlc-zero (replica (quote alice))) 5000)
         b (hlc-tick a 4000)]     ;; NTP stepped the clock back one second
     (+ (fail-if (not (hlc-after? b a)) "FAIL hlc: backwards clock broke monotonicity")
        (fail-if (not (= (hlc-wall b) 5000)) "FAIL hlc: backwards clock moved wall down"))))
@@ -49,8 +50,8 @@
 ;;    ordered) without adopting the bogus wall time (so it does not stay a year
 ;;    fast forever).
 (defn test-drift-bound [] : int
-  (let [mine  (hlc-tick (hlc-zero (quote alice)) 1000)
-        wild  (hlc-tick (hlc-zero (quote bob)) (+ 1000 (* 10 (hlc-max-drift))))
+  (let [mine  (hlc-tick (hlc-zero (replica (quote alice))) 1000)
+        wild  (hlc-tick (hlc-zero (replica (quote bob))) (+ 1000 (* 10 (hlc-max-drift))))
         after (hlc-recv mine wild 1000)]
     (+ (fail-if (not (hlc-after? after mine)) "FAIL hlc: recv did not advance local clock")
        (fail-if (> (hlc-wall after) (+ 1000 (hlc-max-drift)))
@@ -60,8 +61,8 @@
 ;; it is what causality transfer looks like -- and must be adopted, or two
 ;; replicas exchanging messages never converge on an order.
 (defn test-drift-ok [] : int
-  (let [mine  (hlc-tick (hlc-zero (quote alice)) 1000)
-        near  (hlc-tick (hlc-zero (quote bob)) 1500)
+  (let [mine  (hlc-tick (hlc-zero (replica (quote alice))) 1000)
+        near  (hlc-tick (hlc-zero (replica (quote bob))) 1500)
         after (hlc-recv mine near 1000)]
     (+ (fail-if (not (hlc-after? after near)) "FAIL hlc: recv did not pass the remote stamp")
        (fail-if (not (= (hlc-wall after) 1500)) "FAIL hlc: did not adopt an in-bound remote clock"))))
@@ -69,8 +70,8 @@
 ;; The order must be TOTAL: two replicas stamping the same instant with the
 ;; same logical counter still have to compare, or LWW has no winner to agree on.
 (defn test-total-order [] : int
-  (let [a (hlc-tick (hlc-zero (quote alice)) 1000)
-        b (hlc-tick (hlc-zero (quote bob)) 1000)]
+  (let [a (hlc-tick (hlc-zero (replica (quote alice))) 1000)
+        b (hlc-tick (hlc-zero (replica (quote bob))) 1000)]
     (+ (fail-if (not (or (hlc-after? a b) (hlc-after? b a)))
                 "FAIL hlc: same instant, same logical -- incomparable")
        (+ (fail-if (and (hlc-after? a b) (hlc-after? b a))
