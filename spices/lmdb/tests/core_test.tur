@@ -1,0 +1,645 @@
+;; tests/core_test.tur -- lmdb L1: persistence, transactions, limits, errors.
+;;
+;; lmdb-spice-plan section 6. Every case works in its own temporary
+;; directory, closes every env it opens, and removes the directory.
+
+(defmodule lmdb/tests/core
+  (import test/suite  :refer [describe it])
+  (import test/assert :refer [assert-true assert-eq])
+  (import test/runner :refer [run-all-status])
+  (import lmdb/error  :refer [LmdbError MapFull KeyTooLong NotADatabase ReadOnly
+                              lmdb-error-map-full?])
+  (import lmdb/env    :refer [Env env-opts opts-map-size opts-read-only opts-sync
+                              opts-no-create opts-subdir SyncNone
+                              env-open env-close env-map-size env-max-key-size
+                              env-stat env-info env-read-only? env-sync])
+  (import lmdb/txn    :refer [Txn txn-begin txn-commit txn-abort txn-read-only?
+                              with-read-txn with-write-txn with-write-txn-growing
+                              with-nested-txn txn-begin-nested])
+  (import lmdb/dbi    :refer [Dbi dbi-main])
+  (import lmdb/ops    :refer [get has? put! put-new! del!])
+
+;; -------------------------------------------------------------------------
+;; Helpers
+;; -------------------------------------------------------------------------
+
+;;; tmp-dir -- a fresh empty directory under $TMPDIR (or /tmp).
+(defn tmp-dir [] : cstr
+  ```c
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
+  #if defined(_WIN32)
+  #include <direct.h>
+  #include <io.h>
+  #else
+  #include <unistd.h>
+  #endif
+  const char *base = getenv("TMPDIR");
+  if (!base || !*base) base = "/tmp";
+  size_t n = strlen(base) + 32;
+  char *p = (char *)malloc(n);
+  #if defined(_WIN32)
+  snprintf(p, n, "%s/tur-lmdb-XXXXXX", base);
+  _mktemp(p);
+  _mkdir(p);
+  #else
+  snprintf(p, n, "%s/tur-lmdb-XXXXXX", base);
+  if (!mkdtemp(p)) { perror("mkdtemp"); exit(1); }
+  #endif
+  return p;
+  ```)
+
+;;; rm-tree -- remove dir and the files directly in it (and one level of
+;;; subdirectories, for the subdir layout).
+(defn rm-tree [dir : cstr] : bool
+  ```c
+  #include <dirent.h>
+  #include <stdio.h>
+  #include <string.h>
+  #include <sys/stat.h>
+  #include <unistd.h>
+  int ok = 1;
+  DIR *d = opendir((const char *)dir);
+  if (d) {
+    struct dirent *e;
+    while ((e = readdir(d))) {
+      if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+      char p[4096];
+      snprintf(p, sizeof p, "%s/%s", (const char *)dir, e->d_name);
+      struct stat st;
+      if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) {
+        DIR *d2 = opendir(p);
+        if (d2) {
+          struct dirent *e2;
+          while ((e2 = readdir(d2))) {
+            if (!strcmp(e2->d_name, ".") || !strcmp(e2->d_name, "..")) continue;
+            char q[8192];
+            snprintf(q, sizeof q, "%s/%s", p, e2->d_name);
+            if (unlink(q)) ok = 0;
+          }
+          closedir(d2);
+        }
+        if (rmdir(p)) ok = 0;
+      } else if (unlink(p)) ok = 0;
+    }
+    closedir(d);
+  }
+  if (rmdir((const char *)dir)) ok = 0;
+  return ok;
+  ```)
+
+;;; path-in -- dir/name.
+(defn path-in [dir : cstr name : cstr] : cstr
+  ```c
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
+  size_t n = strlen((const char *)dir) + strlen((const char *)name) + 2;
+  char *p = (char *)malloc(n);
+  snprintf(p, n, "%s/%s", (const char *)dir, (const char *)name);
+  return p;
+  ```)
+
+;;; write-file -- write text to path; true on success.
+(defn write-file [path : cstr text : cstr] : bool
+  ```c
+  #include <stdio.h>
+  #include <string.h>
+  FILE *f = fopen((const char *)path, "wb");
+  if (!f) return false;
+  size_t n = strlen((const char *)text);
+  int ok = fwrite(text, 1, n, f) == n;
+  fclose(f);
+  return ok;
+  ```)
+
+;;; file-exists? -- does path exist?
+(defn file-exists? [path : cstr] : bool
+  ```c
+  #include <sys/stat.h>
+  struct stat st;
+  return stat((const char *)path, &st) == 0;
+  ```)
+
+;;; same? -- strcmp equality.
+(defn same? [a : cstr b : cstr] : bool
+  ```c
+  #include <string.h>
+  return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+
+;;; repeat-char -- a string of n copies of c.
+(defn repeat-char [c : int n : int] : cstr
+  ```c
+  #include <stdlib.h>
+  #include <string.h>
+  char *p = (char *)malloc((size_t)n + 1);
+  memset(p, (int)c, (size_t)n);
+  p[n] = '\0';
+  return p;
+  ```)
+
+;;; key-n -- "k" followed by i, zero-padded to 8 digits.
+(defn key-n [i : int] : cstr
+  ```c
+  #include <stdio.h>
+  #include <stdlib.h>
+  char *p = (char *)malloc(32);
+  snprintf(p, 32, "k%08lld", (long long)i);
+  return p;
+  ```)
+
+;;; opts-test -- small map, no fsync: what a test wants.
+(defn open-test [path : cstr] : (Result Env LmdbError)
+  (env-open path (opts-sync (opts-map-size (env-opts) (* 16 1048576)) (SyncNone))))
+
+;;; get-is? -- does key read back as want in a fresh read txn?
+(defn get-is? [^borrow env : Env key : cstr want : cstr] : bool
+  (let [r (with-read-txn env
+            (fn [^borrow t : Txn] : (Result bool LmdbError)
+              (let [d (dbi-main t)]
+                (if (err? d)
+                  (err (err-val d))
+                  (let [v (get t (ok-val d) key)]
+                    (ok (and (some? v) (same? (unwrap v) want))))))))]
+    (and (ok? r) (ok-val r))))
+
+;;; absent? -- is key absent, in a fresh read txn?
+(defn absent? [^borrow env : Env key : cstr] : bool
+  (let [r (with-read-txn env
+            (fn [^borrow t : Txn] : (Result bool LmdbError)
+              (let [d (dbi-main t)]
+                (if (err? d)
+                  (err (err-val d))
+                  (ok (not (has? t (ok-val d) key)))))))]
+    (and (ok? r) (ok-val r))))
+
+;;; put1 -- one put in its own write txn.
+(defn put1 [^borrow env : Env key : cstr val : cstr] : (Result nil LmdbError)
+  (with-write-txn env
+    (fn [^borrow t : Txn] : (Result nil LmdbError)
+      (let [d (dbi-main t)]
+        (if (err? d) (err (err-val d)) (put! t (ok-val d) key val))))))
+
+;; -------------------------------------------------------------------------
+;; Persistence
+;; -------------------------------------------------------------------------
+
+;;; t-persist -- a value written and committed survives close and reopen.
+(defn t-persist [] : bool
+  (let [dir  (tmp-dir)
+        path (path-in dir "p.mdb")
+        r1   (open-test path)]
+    (if (err? r1)
+      false
+      (let [env1 (ok-val r1)
+            w    (put1 env1 "hello" "world")]
+        (do
+          (env-close env1)
+          (let [r2 (open-test path)]
+            (if (err? r2)
+              false
+              (let [env2 (ok-val r2)
+                    seen (get-is? env2 "hello" "world")]
+                (do
+                  (env-close env2)
+                  (and (ok? w) seen (rm-tree dir)))))))))))
+
+;;; t-single-file -- the default layout is path plus path-lock.
+(defn t-single-file [] : bool
+  (let [dir  (tmp-dir)
+        path (path-in dir "one.mdb")
+        r    (open-test path)]
+    (if (err? r)
+      false
+      (let [env (ok-val r)]
+        (do
+          (env-close env)
+          (and (file-exists? path)
+               (file-exists? (path-in dir "one.mdb-lock"))
+               (rm-tree dir)))))))
+
+;;; t-subdir -- opts-subdir makes a directory holding data.mdb.
+(defn t-subdir [] : bool
+  (let [dir  (tmp-dir)
+        path (path-in dir "envdir")
+        r    (env-open path (opts-subdir (opts-map-size (env-opts) 1048576) true))]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            w   (put1 env "a" "1")]
+        (do
+          (env-close env)
+          (and (ok? w)
+               (file-exists? (path-in path "data.mdb"))
+               (rm-tree dir)))))))
+
+;;; t-no-create -- opts-no-create refuses a missing path.
+(defn t-no-create [] : bool
+  (let [dir  (tmp-dir)
+        r    (env-open (path-in dir "missing.mdb") (opts-no-create (env-opts)))
+        bad  (err? r)]
+    (do
+      (when (ok? r) (env-close (ok-val r)))
+      (and bad (rm-tree dir)))))
+
+;;; t-put-new-del -- put-new! refuses to overwrite; del! reports presence.
+(defn t-put-new-del [] : bool
+  (let [dir  (tmp-dir)
+        r    (open-test (path-in dir "n.mdb"))]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            w   (with-write-txn env
+                  (fn [^borrow t : Txn] : (Result bool LmdbError)
+                    (let [d   (ok-val (dbi-main t))
+                          a   (put-new! t d "k" "first")
+                          b   (put-new! t d "k" "second")
+                          c   (del! t d "k")
+                          e   (del! t d "k")
+                          f   (put-new! t d "k" "third")]
+                      (ok (and (ok? a) (ok-val a)
+                               (ok? b) (not (ok-val b))
+                               (ok? c) (ok-val c)
+                               (ok? e) (not (ok-val e))
+                               (ok? f) (ok-val f))))))
+            seen (get-is? env "k" "third")]
+        (do
+          (env-close env)
+          (and (ok? w) (ok-val w) seen (rm-tree dir)))))))
+
+;;; t-stat -- env-stat counts the entries of the main database.
+(defn t-stat [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test (path-in dir "s.mdb"))]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            a   (put1 env "a" "1")
+            b   (put1 env "b" "2")
+            c   (put1 env "a" "3")
+            n   (.entries (env-stat env))
+            ps  (.page-size (env-stat env))]
+        (do
+          (env-close env)
+          (and (= n 2) (> ps 0) (rm-tree dir)))))))
+
+;; -------------------------------------------------------------------------
+;; Transactions
+;; -------------------------------------------------------------------------
+
+;;; t-err-rolls-back -- a write txn whose fn returns Err leaves nothing.
+(defn t-err-rolls-back [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test (path-in dir "e.mdb"))]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            w   (with-write-txn env
+                  (fn [^borrow t : Txn] : (Result nil LmdbError)
+                    (let [d (ok-val (dbi-main t))
+                          p (put! t d "ghost" "boo")]
+                      (err (MapFull)))))
+            gone (absent? env "ghost")]
+        (do
+          (env-close env)
+          (and (err? w) (lmdb-error-map-full? (err-val w)) gone (rm-tree dir)))))))
+
+;;; panicky-write -- write a key, then panic inside with-write-txn.
+(defn panicky-write [^borrow env : Env] : int
+  (let [w (with-write-txn env
+            (fn [^borrow t : Txn] : (Result nil LmdbError)
+              (let [d (ok-val (dbi-main t))
+                    p (put! t d "ghost" "boo")]
+                (panic "deliberate"))))]
+    0))
+
+;;; t-panic-rolls-back -- a panic inside with-write-txn aborts the txn:
+;;; the write is gone and the writer lock is free for the next txn.
+(defn t-panic-rolls-back [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test (path-in dir "x.mdb"))]
+    (if (err? r)
+      false
+      (let [env    (ok-val r)
+            caught (catch-unwind (fn [] : int (panicky-write env)))
+            gone   (absent? env "ghost")
+            after  (put1 env "after" "ok")
+            seen   (get-is? env "after" "ok")]
+        (do
+          (env-close env)
+          (and (err? caught) gone (ok? after) seen (rm-tree dir)))))))
+
+;;; t-mvcc -- a reader begun before a commit still sees the old value.
+(defn t-mvcc [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test (path-in dir "m.mdb"))]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            a   (put1 env "k" "old")
+            rr  (txn-begin env true)]
+        (if (err? rr)
+          (do (env-close env) false)
+          (let [reader (ok-val rr)
+                b      (put1 env "k" "new")
+                d      (ok-val (dbi-main reader))
+                v      (get reader d "k")
+                old?   (and (some? v) (same? (unwrap v) "old"))
+                ro?    (txn-read-only? reader)]
+            (do
+              (txn-abort reader)
+              (let [new? (get-is? env "k" "new")]
+                (do
+                  (env-close env)
+                  (and (ok? a) (ok? b) old? ro? new? (rm-tree dir)))))))))))
+
+;;; t-raw-commit -- txn-begin / put! / txn-commit by hand.
+(defn t-raw-commit [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test (path-in dir "raw.mdb"))]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            tr  (txn-begin env false)]
+        (if (err? tr)
+          (do (env-close env) false)
+          (let [t  (ok-val tr)
+                rw (not (txn-read-only? t))
+                d  (ok-val (dbi-main t))
+                p  (put! t d "raw" "yes")
+                c  (txn-commit t)
+                s  (get-is? env "raw" "yes")]
+            (do
+              (env-close env)
+              (and rw (ok? p) (ok? c) s (rm-tree dir)))))))))
+
+;;; t-raw-abort -- txn-abort discards the writes.
+(defn t-raw-abort [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test (path-in dir "ab.mdb"))]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            tr  (txn-begin env false)]
+        (if (err? tr)
+          (do (env-close env) false)
+          (let [t (ok-val tr)
+                d (ok-val (dbi-main t))
+                p (put! t d "raw" "no")]
+            (do
+              (txn-abort t)
+              (let [gone (absent? env "raw")]
+                (do
+                  (env-close env)
+                  (and (ok? p) gone (rm-tree dir)))))))))))
+
+;;; t-nested-abort -- a nested txn that aborts leaves its parent's writes.
+(defn t-nested-abort [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test (path-in dir "nest.mdb"))]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            w   (with-write-txn env
+                  (fn [^borrow t : Txn] : (Result nil LmdbError)
+                    (let [d  (ok-val (dbi-main t))
+                          p  (put! t d "parent" "kept")
+                          c  (with-nested-txn t
+                               (fn [^borrow c : Txn] : (Result nil LmdbError)
+                                 (let [q (put! c d "child" "dropped")]
+                                   (err (MapFull)))))
+                          c2 (with-nested-txn t
+                               (fn [^borrow c : Txn] : (Result nil LmdbError)
+                                 (put! c d "child2" "kept")))]
+                      (if (and (ok? p) (err? c) (ok? c2)) (Ok nil) (err (MapFull))))))
+            kept  (get-is? env "parent" "kept")
+            kept2 (get-is? env "child2" "kept")
+            gone  (absent? env "child")]
+        (do
+          (env-close env)
+          (and (ok? w) kept kept2 gone (rm-tree dir)))))))
+
+;;; t-raw-nested -- txn-begin-nested by hand: abort drops only the child.
+(defn t-raw-nested [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test (path-in dir "rn.mdb"))]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            tr  (txn-begin env false)]
+        (if (err? tr)
+          (do (env-close env) false)
+          (let [t  (ok-val tr)
+                d  (ok-val (dbi-main t))
+                p  (put! t d "parent" "kept")
+                cr (txn-begin-nested t)]
+            (if (err? cr)
+              (do (txn-abort t) (env-close env) false)
+              (let [c (ok-val cr)
+                    q (put! c d "child" "dropped")]
+                (do
+                  (txn-abort c)
+                  (let [still (get t d "parent")
+                        cm    (txn-commit t)
+                        kept  (get-is? env "parent" "kept")
+                        gone  (absent? env "child")]
+                    (do
+                      (env-close env)
+                      (and (ok? p) (ok? q) (some? still) (ok? cm) kept gone
+                           (rm-tree dir)))))))))))))
+
+;; -------------------------------------------------------------------------
+;; Limits
+;; -------------------------------------------------------------------------
+
+;;; t-key-limit -- a 511-byte key is accepted, a 512-byte one is KeyTooLong.
+(defn t-key-limit [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test (path-in dir "kl.mdb"))]
+    (if (err? r)
+      false
+      (let [env  (ok-val r)
+            max  (env-max-key-size env)
+            k511 (repeat-char 97 511)
+            k512 (repeat-char 98 512)
+            a    (put1 env k511 "fits")
+            b    (put1 env k512 "too long")
+            long (and (err? b)
+                      (match (err-val b)
+                        (KeyTooLong n) (= n 512)
+                        _              false))
+            seen (get-is? env k511 "fits")]
+        (do
+          (env-close env)
+          (and (= max 511) (ok? a) long seen (rm-tree dir)))))))
+
+;;; fill -- write keys from i to n, 4 KiB values, 50 per txn; stop at the
+;;; first error and return it.
+(defn fill [^borrow env : Env i : int n : int] : (Result nil LmdbError)
+  (if (>= i n)
+    (Ok nil)
+    (let [big (repeat-char 120 4096)
+          w   (with-write-txn env
+                (fn [^borrow t : Txn] : (Result nil LmdbError)
+                  (put-batch t (ok-val (dbi-main t)) i (if (> (+ i 50) n) n (+ i 50)) big)))]
+      (if (err? w) w (fill env (+ i 50) n)))))
+
+;;; put-batch -- put keys i..end-1 with value v.
+(defn put-batch [^borrow t : Txn d : Dbi i : int end : int v : cstr] : (Result nil LmdbError)
+  (if (>= i end)
+    (Ok nil)
+    (let [p (put! t d (key-n i) v)]
+      (if (err? p) p (put-batch t d (+ i 1) end v)))))
+
+;;; t-map-full -- a 1 MiB map fills up with MapFull.
+(defn t-map-full [] : bool
+  (let [dir (tmp-dir)
+        r   (env-open (path-in dir "full.mdb")
+                      (opts-sync (opts-map-size (env-opts) 1048576) (SyncNone)))]
+    (if (err? r)
+      false
+      (let [env  (ok-val r)
+            w    (fill env 0 1000)
+            full (and (err? w) (lmdb-error-map-full? (err-val w)))]
+        (do
+          (env-close env)
+          (and full (rm-tree dir)))))))
+
+;;; t-growing -- with-write-txn-growing gets past MapFull by doubling.
+(defn t-growing [] : bool
+  (let [dir (tmp-dir)
+        r   (env-open (path-in dir "grow.mdb")
+                      (opts-sync (opts-map-size (env-opts) 1048576) (SyncNone)))]
+    (if (err? r)
+      false
+      (let [env    (ok-val r)
+            big    (repeat-char 121 4096)
+            w      (with-write-txn-growing env (* 64 1048576)
+                     (fn [^borrow t : Txn] : (Result nil LmdbError)
+                       (put-batch t (ok-val (dbi-main t)) 0 1000 big)))
+            size   (env-map-size env)
+            n      (.entries (env-stat env))]
+        (do
+          (env-close env)
+          (and (ok? w) (> size 1048576) (= n 1000) (rm-tree dir)))))))
+
+;;; t-growing-capped -- with max at the current size, MapFull comes back.
+(defn t-growing-capped [] : bool
+  (let [dir (tmp-dir)
+        r   (env-open (path-in dir "cap.mdb")
+                      (opts-sync (opts-map-size (env-opts) 1048576) (SyncNone)))]
+    (if (err? r)
+      false
+      (let [env  (ok-val r)
+            cur  (env-map-size env)
+            big  (repeat-char 122 4096)
+            w    (with-write-txn-growing env cur
+                   (fn [^borrow t : Txn] : (Result nil LmdbError)
+                     (put-batch t (ok-val (dbi-main t)) 0 1000 big)))
+            full (and (err? w) (lmdb-error-map-full? (err-val w)))
+            same (= (env-map-size env) cur)]
+        (do
+          (env-close env)
+          (and full same (rm-tree dir)))))))
+
+;; -------------------------------------------------------------------------
+;; Errors
+;; -------------------------------------------------------------------------
+
+;;; t-read-only -- a read-only env refuses a write transaction.
+(defn t-read-only [] : bool
+  (let [dir  (tmp-dir)
+        path (path-in dir "ro.mdb")
+        r1   (open-test path)]
+    (if (err? r1)
+      false
+      (let [env1 (ok-val r1)
+            a    (put1 env1 "k" "v")]
+        (do
+          (env-close env1)
+          (let [r2 (env-open path (opts-read-only (env-opts) true))]
+            (if (err? r2)
+              false
+              (let [env2 (ok-val r2)
+                    ro   (env-read-only? env2)
+                    w    (put1 env2 "k" "changed")
+                    refused (and (err? w)
+                                 (match (err-val w)
+                                   (ReadOnly) true
+                                   _          false))
+                    kept (get-is? env2 "k" "v")]
+                (do
+                  (env-close env2)
+                  (and (ok? a) ro refused kept (rm-tree dir)))))))))))
+
+;;; t-read-txn-refuses-put -- a put! in a read transaction is ReadOnly.
+(defn t-read-txn-refuses-put [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test (path-in dir "rt.mdb"))]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            a   (put1 env "k" "v")
+            w   (with-read-txn env
+                  (fn [^borrow t : Txn] : (Result nil LmdbError)
+                    (put! t (ok-val (dbi-main t)) "k" "changed")))
+            refused (and (err? w)
+                         (match (err-val w)
+                           (ReadOnly) true
+                           _          false))]
+        (do
+          (env-close env)
+          (and (ok? a) refused (rm-tree dir)))))))
+
+;;; t-not-a-database -- a non-LMDB file is NotADatabase carrying the path.
+(defn t-not-a-database [] : bool
+  (let [dir   (tmp-dir)
+        path  (path-in dir "junk.mdb")
+        wrote (write-file path (repeat-char 33 65536))
+        r     (open-test path)
+        bad   (and (err? r)
+                   (match (err-val r)
+                     (NotADatabase p) (same? p path)
+                     _                false))]
+    (do
+      (when (ok? r) (env-close (ok-val r)))
+      (and wrote bad (rm-tree dir)))))
+
+;; -------------------------------------------------------------------------
+
+(defn __all-tests [] : void
+  (describe "persistence"
+    (it "a committed value survives close and reopen"     (t-persist))
+    (it "the default layout is one file plus -lock"        (t-single-file))
+    (it "opts-subdir gives LMDB's directory layout"        (t-subdir))
+    (it "opts-no-create refuses a missing path"            (t-no-create))
+    (it "put-new! refuses to overwrite; del! reports"      (t-put-new-del))
+    (it "env-stat counts the main database's entries"      (t-stat)))
+
+  (describe "transactions"
+    (it "an Err from with-write-txn leaves nothing"        (t-err-rolls-back))
+    (it "a panic in with-write-txn aborts it"              (t-panic-rolls-back))
+    (it "a reader keeps its snapshot across a commit"      (t-mvcc))
+    (it "txn-begin / txn-commit by hand"                   (t-raw-commit))
+    (it "txn-abort discards the writes"                    (t-raw-abort))
+    (it "an aborted nested txn keeps the parent's writes"  (t-nested-abort))
+    (it "txn-begin-nested by hand"                         (t-raw-nested)))
+
+  (describe "limits"
+    (it "511-byte key accepted, 512-byte KeyTooLong"       (t-key-limit))
+    (it "a 1 MiB map fills to MapFull"                     (t-map-full))
+    (it "with-write-txn-growing grows past MapFull"        (t-growing))
+    (it "with-write-txn-growing stops at its max"          (t-growing-capped)))
+
+  (describe "errors"
+    (it "a read-only env refuses writes"                   (t-read-only))
+    (it "a put! in a read txn is ReadOnly"                 (t-read-txn-refuses-put))
+    (it "a non-LMDB file is NotADatabase"                  (t-not-a-database))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule lmdb/tests/core

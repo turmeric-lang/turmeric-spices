@@ -1,0 +1,364 @@
+;; tests/bytes_test.tur -- lmdb L3: binary values, backup, bulk load, reserve.
+;;
+;; lmdb-spice-plan section 6. Every case works in its own temporary
+;; directory, closes every env it opens, and removes the directory.
+(load "stdlib/serial.tur")
+
+(defmodule lmdb/tests/bytes
+  (import test/suite  :refer [describe it])
+  (import test/assert :refer [assert-true])
+  (import test/runner :refer [run-all-status])
+  (import lmdb/error  :refer [LmdbError MapFull])
+  (import lmdb/env    :refer [Env env-opts opts-map-size opts-sync SyncNone
+                              env-open env-close env-copy env-reader-check env-stat
+                              env-sync env-info])
+  (import lmdb/txn    :refer [Txn with-read-txn with-write-txn])
+  (import lmdb/dbi    :refer [Dbi dbi-main])
+  (import lmdb/ops    :refer [get put! put-append!])
+  (import lmdb/cursor :refer [Cursor with-cursor cursor-next])
+  (import lmdb/bytes  :refer [bytes-of-cstr bytes->cstr get-bytes put-bytes!
+                              put-new-bytes! put-append-bytes! del-bytes!
+                              put-reserve! cursor-key-bytes cursor-val-bytes
+                              cursor-seek-bytes])
+
+;; -------------------------------------------------------------------------
+;; Helpers
+;; -------------------------------------------------------------------------
+
+;;; tmp-dir -- a fresh empty directory under $TMPDIR (or /tmp).
+(defn tmp-dir [] : cstr
+  ```c
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
+  #include <unistd.h>
+  const char *base = getenv("TMPDIR");
+  if (!base || !*base) base = "/tmp";
+  size_t n = strlen(base) + 32;
+  char *p = (char *)malloc(n);
+  snprintf(p, n, "%s/tur-lmdb-XXXXXX", base);
+  if (!mkdtemp(p)) { perror("mkdtemp"); exit(1); }
+  return p;
+  ```)
+
+;;; path-in -- dir/name.
+(defn path-in [dir : cstr name : cstr] : cstr
+  ```c
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
+  size_t n = strlen((const char *)dir) + strlen((const char *)name) + 2;
+  char *p = (char *)malloc(n);
+  snprintf(p, n, "%s/%s", (const char *)dir, (const char *)name);
+  return p;
+  ```)
+
+;;; rm-flat -- remove every file in dir, then dir.
+(defn rm-flat [dir : cstr] : bool
+  ```c
+  #include <dirent.h>
+  #include <stdio.h>
+  #include <string.h>
+  #include <unistd.h>
+  int ok = 1;
+  DIR *d = opendir((const char *)dir);
+  if (d) {
+    struct dirent *e;
+    while ((e = readdir(d))) {
+      if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+      char p[8192];
+      snprintf(p, sizeof p, "%s/%s", (const char *)dir, e->d_name);
+      if (unlink(p)) ok = 0;
+    }
+    closedir(d);
+  }
+  return (rmdir((const char *)dir) == 0) && ok;
+  ```)
+
+;;; same? -- strcmp equality.
+(defn same? [a : cstr b : cstr] : bool
+  ```c
+  #include <string.h>
+  return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+
+;;; binary -- the 5 bytes 00 01 ff 00 7f, NULs included.
+(defn binary [] : Bytes
+  ```c
+  #include <stdlib.h>
+  int64_t *b = (int64_t *)malloc(sizeof(int64_t) + 5);
+  unsigned char *d = (unsigned char *)(b + 1);
+  b[0] = 5; d[0] = 0; d[1] = 1; d[2] = 0xff; d[3] = 0; d[4] = 0x7f;
+  return (void *)b;
+  ```)
+
+;;; bytes-eq? -- same length and contents.
+(defn bytes-eq? [^borrow a : Bytes ^borrow b : Bytes] : bool
+  ```c
+  #include <string.h>
+  int64_t n = ((int64_t *)a)[0];
+  return n == ((int64_t *)b)[0] && memcmp((int64_t *)a + 1, (int64_t *)b + 1, (size_t)n) == 0;
+  ```)
+
+;;; u64-key -- i as an 8-byte big-endian key (so byte order is numeric order).
+(defn u64-key [i : int] : Bytes
+  ```c
+  #include <stdlib.h>
+  int64_t *b = (int64_t *)malloc(sizeof(int64_t) + 8);
+  unsigned char *d = (unsigned char *)(b + 1);
+  b[0] = 8;
+  for (int k = 0; k < 8; k++) d[k] = (unsigned char)((uint64_t)i >> (56 - 8 * k));
+  return (void *)b;
+  ```)
+
+;;; fill-pattern -- write bytes 0, 1, 2, ... into p[0..n).
+(defn fill-pattern [p : ptr<void> n : int] : nil
+  ```c
+  unsigned char *d = (unsigned char *)p;
+  for (int64_t k = 0; k < n; k++) d[k] = (unsigned char)k;
+  ```)
+
+;;; pattern? -- is b the bytes 0, 1, 2, ... of length n?
+(defn pattern? [^borrow b : Bytes n : int] : bool
+  ```c
+  if (((int64_t *)b)[0] != n) return false;
+  const unsigned char *d = (const unsigned char *)((int64_t *)b + 1);
+  for (int64_t k = 0; k < n; k++) if (d[k] != (unsigned char)k) return false;
+  return true;
+  ```)
+
+;;; open-test -- an 8 MiB env at dir/name without fsync.
+(defn open-test [dir : cstr name : cstr] : (Result Env LmdbError)
+  (env-open (path-in dir name) (opts-sync (opts-map-size (env-opts) (* 8 1048576)) (SyncNone))))
+
+;;; load-sorted -- put-append-bytes! keys i..n-1 (u64), value "v".
+(defn load-sorted [^borrow t : Txn d : Dbi i : int n : int] : (Result nil LmdbError)
+  (if (>= i n)
+    (Ok nil)
+    (let [k (u64-key i)
+          v (bytes-of-cstr "v")
+          r (put-append-bytes! t d k v)]
+      (do
+        (bytes-free k)
+        (bytes-free v)
+        (if (err? r) r (load-sorted t d (+ i 1) n))))))
+
+;; -------------------------------------------------------------------------
+;; Cases
+;; -------------------------------------------------------------------------
+
+;;; t-binary -- a value with NUL bytes round-trips exactly.
+(defn t-binary [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test dir "b.mdb")]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            w   (with-write-txn env
+                  (fn [^borrow t : Txn] : (Result nil LmdbError)
+                    (let [k (binary)
+                          v (binary)
+                          p (put-bytes! t (? (dbi-main t)) k v)]
+                      (do (bytes-free k) (bytes-free v) p))))
+            g   (with-read-txn env
+                  (fn [^borrow t : Txn] : (Result bool LmdbError)
+                    (let [k (binary)
+                          o (get-bytes t (? (dbi-main t)) k)]
+                      (if (some? o)
+                        (let [got  (unwrap o)
+                              want (binary)
+                              eq   (bytes-eq? got want)]
+                          (do (bytes-free got) (bytes-free want) (bytes-free k) (ok eq)))
+                        (do (bytes-free k) (ok false))))))]
+        (do
+          (env-close env)
+          (and (ok? w) (ok? g) (ok-val g) (rm-flat dir)))))))
+
+;;; t-cstr-is-bytes -- a cstr key and the Bytes of the same bytes are one key.
+(defn t-cstr-is-bytes [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test dir "cb.mdb")]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            w   (with-write-txn env
+                  (fn [^borrow t : Txn] : (Result bool LmdbError)
+                    (let [d  (? (dbi-main t))
+                          a  (? (put! t d "hello" "world"))
+                          k  (bytes-of-cstr "hello")
+                          o  (get-bytes t d k)
+                          v2 (bytes-of-cstr "again")
+                          pn (put-new-bytes! t d k v2)
+                          dl (del-bytes! t d k)
+                          gone (get t d "hello")]
+                      (do
+                        (bytes-free k)
+                        (bytes-free v2)
+                        (if (some? o)
+                          (let [got (unwrap o)
+                                s   (bytes->cstr got)]
+                            (do
+                              (bytes-free got)
+                              (ok (and (same? s "world")
+                                       (ok? pn) (not (ok-val pn))
+                                       (ok? dl) (ok-val dl)
+                                       (none? gone)))))
+                          (ok false))))))]
+        (do
+          (env-close env)
+          (and (ok? w) (ok-val w) (rm-flat dir)))))))
+
+;;; t-backup -- env-copy with compaction makes a file that opens and holds
+;;; the same entries.
+(defn t-backup [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test dir "src.mdb")]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            w   (with-write-txn env
+                  (fn [^borrow t : Txn] : (Result nil LmdbError)
+                    (let [d (? (dbi-main t))]
+                      (do
+                        (? (put! t d "a" "1"))
+                        (? (put! t d "b" "2"))
+                        (put! t d "c" "3")))))
+            c   (env-copy env (path-in dir "copy.mdb") true)
+            n   (.entries (env-stat env))
+            s   (env-sync env)
+            rc  (env-reader-check env)]
+        (do
+          (env-close env)
+          (let [r2 (open-test dir "copy.mdb")]
+            (if (err? r2)
+              false
+              (let [env2 (ok-val r2)
+                    n2   (.entries (env-stat env2))
+                    g    (with-read-txn env2
+                           (fn [^borrow t : Txn] : (Result bool LmdbError)
+                             (let [v (get t (? (dbi-main t)) "b")]
+                               (ok (and (some? v) (same? (unwrap v) "2"))))))]
+                (do
+                  (env-close env2)
+                  (and (ok? w) (ok? c) (ok? s) (ok? rc) (= (ok-val rc) 0)
+                       (= n 3) (= n2 3) (ok? g) (ok-val g)
+                       (rm-flat dir)))))))))))
+
+;;; t-bulk-load -- put-append-bytes! loads sorted keys; an out-of-order one
+;;; is refused rather than stored; put-append! does the same for cstr.
+(defn t-bulk-load [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test dir "bulk.mdb")]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            w   (with-write-txn env
+                  (fn [^borrow t : Txn] : (Result bool LmdbError)
+                    (let [d   (? (dbi-main t))
+                          l   (? (load-sorted t d 0 1000))
+                          k   (u64-key 5)
+                          v   (bytes-of-cstr "late")
+                          bad (put-append-bytes! t d k v)]
+                      (do
+                        (bytes-free k)
+                        (bytes-free v)
+                        (ok (err? bad))))))
+            n   (.entries (env-stat env))
+            ;; cstr flavour on a fresh database
+            r2  (open-test dir "bulk2.mdb")]
+        (do
+          (env-close env)
+          (if (err? r2)
+            false
+            (let [env2 (ok-val r2)
+                  w2   (with-write-txn env2
+                         (fn [^borrow t : Txn] : (Result bool LmdbError)
+                           (let [d  (? (dbi-main t))
+                                 a  (? (put-append! t d "a" "1"))
+                                 b  (? (put-append! t d "b" "2"))
+                                 no (put-append! t d "a0" "x")]
+                             (ok (err? no)))))]
+              (do
+                (env-close env2)
+                (and (ok? w) (ok-val w) (= n 1000) (ok? w2) (ok-val w2)
+                     (rm-flat dir))))))))))
+
+;;; t-reserve -- put-reserve! writes a value in place.
+(defn t-reserve [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test dir "res.mdb")]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            w   (with-write-txn env
+                  (fn [^borrow t : Txn] : (Result nil LmdbError)
+                    (let [k (bytes-of-cstr "blob")
+                          p (put-reserve! t (? (dbi-main t)) k 300 fill-pattern)]
+                      (do (bytes-free k) p))))
+            g   (with-read-txn env
+                  (fn [^borrow t : Txn] : (Result bool LmdbError)
+                    (let [k (bytes-of-cstr "blob")
+                          o (get-bytes t (? (dbi-main t)) k)]
+                      (do
+                        (bytes-free k)
+                        (if (some? o)
+                          (let [b    (unwrap o)
+                                good (pattern? b 300)]
+                            (do (bytes-free b) (ok good)))
+                          (ok false))))))]
+        (do
+          (env-close env)
+          (and (ok? w) (ok? g) (ok-val g) (rm-flat dir)))))))
+
+;;; t-cursor-bytes -- cursor-seek-bytes and the Bytes readers of a cursor.
+(defn t-cursor-bytes [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test dir "cur.mdb")]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            w   (with-write-txn env
+                  (fn [^borrow t : Txn] : (Result nil LmdbError)
+                    (load-sorted t (? (dbi-main t)) 0 10)))
+            g   (with-read-txn env
+                  (fn [^borrow t : Txn] : (Result bool LmdbError)
+                    (with-cursor t (? (dbi-main t))
+                      (fn [^borrow c : Cursor] : (Result bool LmdbError)
+                        (let [lo  (u64-key 7)
+                              hit (cursor-seek-bytes c lo)
+                              ko  (cursor-key-bytes c)
+                              vo  (cursor-val-bytes c)
+                              nx  (cursor-next c)]
+                          (if (and hit (some? ko) (some? vo))
+                            (let [kb  (unwrap ko)
+                                  vb  (unwrap vo)
+                                  kok (bytes-eq? kb lo)
+                                  vs  (bytes->cstr vb)]
+                              (do
+                                (bytes-free kb)
+                                (bytes-free vb)
+                                (bytes-free lo)
+                                (ok (and kok (same? vs "v") (some? nx)))))
+                            (do (bytes-free lo) (ok false))))))))]
+        (do
+          (env-close env)
+          (and (ok? w) (ok? g) (ok-val g) (rm-flat dir)))))))
+
+;; -------------------------------------------------------------------------
+
+(defn __all-tests [] : void
+  (describe "bytes"
+    (it "a value with NUL bytes round-trips"            (t-binary))
+    (it "a cstr key and its Bytes are the same key"     (t-cstr-is-bytes))
+    (it "cursor-seek-bytes and the cursor Bytes readers" (t-cursor-bytes)))
+  (describe "backup and maintenance"
+    (it "env-copy compacts into a file that reopens"    (t-backup)))
+  (describe "bulk writes"
+    (it "put-append refuses an out-of-order key"        (t-bulk-load))
+    (it "put-reserve! fills a value in place"           (t-reserve))))
+
+(defn main [] : int
+  (__all-tests)
+  (run-all-status))
+
+) ;; end defmodule lmdb/tests/bytes

@@ -1,0 +1,568 @@
+;;; lmdb/cursor -- Cursor: walk a database in key order, and range scans.
+;;;
+;;; A cursor sits on one entry of one database inside one transaction. Each
+;;; move returns the entry it lands on, copied out, or `None` when there is
+;;; nowhere to go:
+;;;
+;;;   (with-cursor txn dbi
+;;;     (fn [^borrow c : Cursor] : (Result int LmdbError)
+;;;       (ok (count-from (cursor-seek c "user:") 0))))   ;; a prefix scan
+;;;
+;;; Keys are visited in LMDB's byte order (memcmp, shorter first on a tie),
+;;; or reversed under `dbi-reverse-key`. In a `dbi-dup-sort` database a key's
+;;; values are visited in their own sorted order: `cursor-next` steps through
+;;; every (key, value) pair, `cursor-next-dup` stays on the current key and
+;;; `cursor-next-nodup` jumps to the next key.
+;;;
+;;; `Cursor` is `:linear`: close it with `cursor-close`, and close it before
+;;; its transaction ends -- LMDB frees a write transaction's cursors when the
+;;; transaction ends, so a close after that would free one twice.
+;;; `with-cursor` does both for you.
+;;;
+;;; Since: 0.1.0
+;; lmdb/cursor
+
+(defmodule lmdb/cursor
+  (import lmdb/error :refer [LmdbError KeyTooLong lmdb-error-of])
+  (import lmdb/txn   :refer [Txn])
+  (import lmdb/dbi   :refer [Dbi])
+  (export Cursor cursor-open cursor-close with-cursor
+          cursor-first cursor-last cursor-next cursor-prev
+          cursor-seek cursor-seek-exact cursor-current
+          cursor-next-dup cursor-prev-dup cursor-next-nodup cursor-prev-nodup
+          cursor-first-dup cursor-last-dup cursor-seek-dup cursor-dup-count
+          cursor-put! cursor-del! cursor-del-all-dups!)
+
+;;; Cursor -- an open cursor (an `MDB_cursor *`).
+;;;
+;;; `:linear`: a Cursor from `cursor-open` must be closed exactly once with
+;;; `cursor-close`, before its transaction ends. Moves borrow it.
+;;;
+;;; Since: 0.1.0
+(defopaque Cursor :int :linear)
+
+;; -------------------------------------------------------------------------
+;; Private
+;; -------------------------------------------------------------------------
+
+;;; cursor-op -- the MDB_cursor_op for an index (see move-* below).
+(defn cursor-op [i : int] : int
+  ```c
+  #include <lmdb.h>
+  static const MDB_cursor_op ops[] = {
+    MDB_FIRST, MDB_LAST, MDB_NEXT, MDB_PREV, MDB_SET_RANGE, MDB_SET_KEY,
+    MDB_GET_CURRENT, MDB_NEXT_DUP, MDB_PREV_DUP, MDB_NEXT_NODUP,
+    MDB_PREV_NODUP, MDB_FIRST_DUP, MDB_LAST_DUP, MDB_GET_BOTH_RANGE
+  };
+  return (int64_t)ops[i];
+  ```)
+
+;;; cursor-get-raw -- run mdb_cursor_get with op; on success a malloc'd
+;;; { char *key; char *val; } holding fresh NUL-terminated copies, else NULL.
+;;; key / val are the operands of the seeking ops and ignored by the others.
+(defn cursor-get-raw [^borrow c : Cursor op : int key : cstr val : cstr] : ptr<void>
+  ```c
+  #include <lmdb.h>
+  #include <stdlib.h>
+  #include <string.h>
+  MDB_val k = { strlen((const char *)key), (void *)key };
+  MDB_val v = { strlen((const char *)val), (void *)val };
+  MDB_cursor_op o = (MDB_cursor_op)op;
+  if ((o == MDB_SET_RANGE || o == MDB_SET_KEY || o == MDB_GET_BOTH_RANGE) &&
+      k.mv_size == 0) {
+    if (o != MDB_SET_RANGE) return NULL;
+    o = MDB_FIRST;                       /* "" sorts first: seek to the start */
+  }
+  if (mdb_cursor_get((MDB_cursor *)(intptr_t)c, &k, &v, o)) return NULL;
+  /* Not every op reports both halves -- MDB_FIRST_DUP / MDB_LAST_DUP leave
+     the key untouched -- so read the entry the cursor now sits on. */
+  if (o != MDB_GET_CURRENT &&
+      mdb_cursor_get((MDB_cursor *)(intptr_t)c, &k, &v, MDB_GET_CURRENT)) return NULL;
+  struct { char *key; char *val; } *kv = malloc(sizeof *kv);
+  kv->key = (char *)malloc(k.mv_size + 1);
+  memcpy(kv->key, k.mv_data, k.mv_size);
+  kv->key[k.mv_size] = '\0';
+  kv->val = (char *)malloc(v.mv_size + 1);
+  memcpy(kv->val, v.mv_data, v.mv_size);
+  kv->val[v.mv_size] = '\0';
+  return kv;
+  ```)
+
+;;; kv-null? -- did cursor-get-raw find nothing?
+(defn kv-null? [kv : ptr<void>] : bool
+  ```c
+  return kv == NULL;
+  ```)
+
+;;; kv-key -- the key copy of a cursor-get-raw result.
+(defn kv-key [kv : ptr<void>] : cstr
+  ```c
+  return ((char **)kv)[0];
+  ```)
+
+;;; kv-val-free -- the value copy of a cursor-get-raw result, freeing the pair
+;;; struct (not the copies, which now belong to the caller).
+(defn kv-val-free [kv : ptr<void>] : cstr
+  ```c
+  #include <stdlib.h>
+  char *v = ((char **)kv)[1];
+  free(kv);
+  return v;
+  ```)
+
+;;; move -- one cursor move, as an Option of the entry.
+(defn move [^borrow c : Cursor op : int key : cstr val : cstr] : (Option (Pair cstr cstr))
+  (let [kv (cursor-get-raw c (cursor-op op) key val)]
+    (if (kv-null? kv)
+      (none)
+      (let [k (kv-key kv)
+            v (kv-val-free kv)]
+        (some (pair k v))))))
+
+;;; cursor-open-raw -- mdb_cursor_open; ok: the cursor, err: the code.
+(defn cursor-open-raw [^borrow txn : Txn dbi : Dbi] : (Result Cursor int)
+  ```c
+  #include <lmdb.h>
+  MDB_cursor *c = NULL;
+  int rc = mdb_cursor_open((MDB_txn *)(intptr_t)txn, (MDB_dbi)dbi, &c);
+  if (rc) return tur_err_int(rc);
+  return tur_ok_ptr(c);
+  ```)
+
+;;; cursor-word -- the cursor pointer as a word, without spending it.
+(defn cursor-word [^borrow c : Cursor] : int
+  ```c
+  return c;
+  ```)
+
+;;; cursor-of-word -- view a raw pointer as a Cursor (with-cursor only).
+(defn cursor-of-word [w : int] : Cursor
+  ```c
+  return w;
+  ```)
+
+;;; cursor-release-view -- spend the view with-cursor lent its callback.
+(defn cursor-release-view [c : Cursor] : nil
+  ```c
+  (void)c;
+  ```)
+
+;;; close-word -- mdb_cursor_close on a raw pointer.
+(defn close-word [w : int] : nil
+  ```c
+  #include <lmdb.h>
+  mdb_cursor_close((MDB_cursor *)(intptr_t)w);
+  ```)
+
+;;; over-key-limit -- the key's length when it exceeds the env's limit, else -1.
+(defn over-key-limit [^borrow c : Cursor key : cstr] : int
+  ```c
+  #include <lmdb.h>
+  #include <string.h>
+  size_t n = strlen((const char *)key);
+  MDB_txn *t = mdb_cursor_txn((MDB_cursor *)(intptr_t)c);
+  int max = mdb_env_get_maxkeysize(mdb_txn_env(t));
+  return n > (size_t)max ? (int64_t)n : -1;
+  ```)
+
+;;; cursor-put-raw -- mdb_cursor_put of two cstrs; the code.
+(defn cursor-put-raw [^borrow c : Cursor key : cstr val : cstr] : int
+  ```c
+  #include <lmdb.h>
+  #include <string.h>
+  MDB_val k = { strlen((const char *)key), (void *)key };
+  MDB_val v = { strlen((const char *)val), (void *)val };
+  return (int64_t)mdb_cursor_put((MDB_cursor *)(intptr_t)c, &k, &v, 0);
+  ```)
+
+;;; cursor-del-raw -- mdb_cursor_del; all-dups uses MDB_NODUPDATA.
+(defn cursor-del-raw [^borrow c : Cursor all-dups : bool] : int
+  ```c
+  #include <lmdb.h>
+  return (int64_t)mdb_cursor_del((MDB_cursor *)(intptr_t)c,
+                                 all_dups ? MDB_NODUPDATA : 0);
+  ```)
+
+;; -------------------------------------------------------------------------
+;; Opening and closing
+;; -------------------------------------------------------------------------
+
+;;; cursor-open -- open a cursor on dbi in txn.
+;;;
+;;; It starts unpositioned: the first move places it.
+;;;
+;;; Parameters:
+;;;   txn -- a Txn, borrowed; the cursor must be closed before it ends
+;;;   dbi -- the database
+;;;
+;;; Returns:
+;;;   (Result Cursor LmdbError)
+;;;
+;;; Example:
+;;;   (let [c (ok-val (cursor-open txn dbi))] (do (cursor-first c) (cursor-close c)))
+;;;
+;;; Since: 0.1.0
+(defn cursor-open [^borrow txn : Txn dbi : Dbi] : (Result Cursor LmdbError)
+  (let [r (cursor-open-raw txn dbi)]
+    (if (ok? r) (ok (ok-val r)) (err (lmdb-error-of (err-val r))))))
+
+;;; cursor-close -- close a cursor.
+;;;
+;;; Parameters:
+;;;   c -- the Cursor; consumed. Its transaction must still be open.
+;;;
+;;; Example:
+;;;   (cursor-close c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-close [c : Cursor] : nil
+  ```c
+  #include <lmdb.h>
+  mdb_cursor_close((MDB_cursor *)(intptr_t)c);
+  ```)
+
+;;; with-cursor -- run f on a fresh cursor, then close it.
+;;;
+;;; The cursor is closed however f ends, a panic included.
+;;;
+;;; Parameters:
+;;;   txn -- a Txn, borrowed
+;;;   dbi -- the database
+;;;   f   -- (fn [^borrow Cursor] (Result A LmdbError))
+;;;
+;;; Returns:
+;;;   f's result, or the error opening the cursor.
+;;;
+;;; Example:
+;;;   (with-cursor txn dbi
+;;;     (fn [^borrow c : Cursor] : (Result bool LmdbError) (ok (some? (cursor-first c)))))
+;;;
+;;; Since: 0.1.0
+(defn with-cursor [A] [^borrow txn : Txn dbi : Dbi f : (fn [^borrow Cursor] (Result A LmdbError))]
+                      : (Result A LmdbError)
+  (let [o (cursor-open txn dbi)]
+    (if (err? o)
+      (err (err-val o))
+      (let [owned (ok-val o)
+            w     (cursor-word owned)]
+        (do
+          (cursor-release-view owned)
+          (defer (close-word w))
+          (let [c (cursor-of-word w)
+                r (f c)]
+            (do (cursor-release-view c) r)))))))
+
+;; -------------------------------------------------------------------------
+;; Moves -- each returns (Option (Pair cstr cstr)): (some (pair key value))
+;; for the entry the cursor lands on, (none) when there is none
+;; -------------------------------------------------------------------------
+
+;;; cursor-first -- move to the first entry.
+;;;
+;;; Parameters:
+;;;   c -- the Cursor, borrowed
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr)) -- (none) for an empty database.
+;;;
+;;; Example:
+;;;   (pair-fst (unwrap (cursor-first c)))  ; => "a"
+;;;
+;;; Since: 0.1.0
+(defn cursor-first [^borrow c : Cursor] : (Option (Pair cstr cstr))
+  (move c 0 "" ""))
+
+;;; cursor-last -- move to the last entry.
+;;;
+;;; Parameters:
+;;;   c -- the Cursor, borrowed
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr))
+;;;
+;;; Example:
+;;;   (cursor-last c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-last [^borrow c : Cursor] : (Option (Pair cstr cstr))
+  (move c 1 "" ""))
+
+;;; cursor-next -- move to the next entry (the first, from unpositioned).
+;;;
+;;; Parameters:
+;;;   c -- the Cursor, borrowed
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr)) -- (none) past the end.
+;;;
+;;; Example:
+;;;   (cursor-next c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-next [^borrow c : Cursor] : (Option (Pair cstr cstr))
+  (move c 2 "" ""))
+
+;;; cursor-prev -- move to the previous entry (the last, from unpositioned).
+;;;
+;;; Parameters:
+;;;   c -- the Cursor, borrowed
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr)) -- (none) before the start.
+;;;
+;;; Example:
+;;;   (cursor-prev c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-prev [^borrow c : Cursor] : (Option (Pair cstr cstr))
+  (move c 3 "" ""))
+
+;;; cursor-seek -- move to the first entry whose key is >= key (MDB_SET_RANGE).
+;;;
+;;; The start of a range or prefix scan: seek to the prefix, then
+;;; cursor-next while the key still starts with it.
+;;;
+;;; Parameters:
+;;;   c   -- the Cursor, borrowed
+;;;   key -- the lower bound ("" for the first entry)
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr)) -- (none) when every key is smaller.
+;;;
+;;; Example:
+;;;   (cursor-seek c "user:")
+;;;
+;;; Since: 0.1.0
+(defn cursor-seek [^borrow c : Cursor key : cstr] : (Option (Pair cstr cstr))
+  (move c 4 key ""))
+
+;;; cursor-seek-exact -- move to key exactly (MDB_SET_KEY).
+;;;
+;;; Parameters:
+;;;   c   -- the Cursor, borrowed
+;;;   key -- the key
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr)) -- the key's (first) entry, or (none) when
+;;;   absent (the cursor's position is then unspecified).
+;;;
+;;; Example:
+;;;   (cursor-seek-exact c "post-1")
+;;;
+;;; Since: 0.1.0
+(defn cursor-seek-exact [^borrow c : Cursor key : cstr] : (Option (Pair cstr cstr))
+  (move c 5 key ""))
+
+;;; cursor-current -- the entry the cursor is on, without moving.
+;;;
+;;; Parameters:
+;;;   c -- the Cursor, borrowed
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr)) -- (none) when unpositioned.
+;;;
+;;; Example:
+;;;   (cursor-current c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-current [^borrow c : Cursor] : (Option (Pair cstr cstr))
+  (move c 6 "" ""))
+
+;;; cursor-next-dup -- the next value of the current key (dbi-dup-sort).
+;;;
+;;; Parameters:
+;;;   c -- the Cursor, borrowed
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr)) -- (none) after the key's last value.
+;;;
+;;; Example:
+;;;   (cursor-next-dup c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-next-dup [^borrow c : Cursor] : (Option (Pair cstr cstr))
+  (move c 7 "" ""))
+
+;;; cursor-prev-dup -- the previous value of the current key (dbi-dup-sort).
+;;;
+;;; Parameters:
+;;;   c -- the Cursor, borrowed
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr)) -- (none) before the key's first value.
+;;;
+;;; Example:
+;;;   (cursor-prev-dup c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-prev-dup [^borrow c : Cursor] : (Option (Pair cstr cstr))
+  (move c 8 "" ""))
+
+;;; cursor-next-nodup -- the first value of the next key.
+;;;
+;;; Parameters:
+;;;   c -- the Cursor, borrowed
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr)) -- (none) after the last key.
+;;;
+;;; Example:
+;;;   (cursor-next-nodup c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-next-nodup [^borrow c : Cursor] : (Option (Pair cstr cstr))
+  (move c 9 "" ""))
+
+;;; cursor-prev-nodup -- the last value of the previous key.
+;;;
+;;; Parameters:
+;;;   c -- the Cursor, borrowed
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr)) -- (none) before the first key.
+;;;
+;;; Example:
+;;;   (cursor-prev-nodup c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-prev-nodup [^borrow c : Cursor] : (Option (Pair cstr cstr))
+  (move c 10 "" ""))
+
+;;; cursor-first-dup -- the first value of the current key (dbi-dup-sort).
+;;;
+;;; Parameters:
+;;;   c -- the Cursor, borrowed
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr))
+;;;
+;;; Example:
+;;;   (cursor-first-dup c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-first-dup [^borrow c : Cursor] : (Option (Pair cstr cstr))
+  (move c 11 "" ""))
+
+;;; cursor-last-dup -- the last value of the current key (dbi-dup-sort).
+;;;
+;;; Parameters:
+;;;   c -- the Cursor, borrowed
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr))
+;;;
+;;; Example:
+;;;   (cursor-last-dup c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-last-dup [^borrow c : Cursor] : (Option (Pair cstr cstr))
+  (move c 12 "" ""))
+
+;;; cursor-seek-dup -- move to key's first value >= val (MDB_GET_BOTH_RANGE).
+;;;
+;;; Parameters:
+;;;   c   -- the Cursor on a dup-sort database, borrowed
+;;;   key -- the key
+;;;   val -- the lower bound among its values
+;;;
+;;; Returns:
+;;;   (Option (Pair cstr cstr)) -- (none) when the key is absent or every
+;;;   value of it is smaller.
+;;;
+;;; Example:
+;;;   (cursor-seek-dup c "post-1" "m")
+;;;
+;;; Since: 0.1.0
+(defn cursor-seek-dup [^borrow c : Cursor key : cstr val : cstr] : (Option (Pair cstr cstr))
+  (move c 13 key val))
+
+;;; cursor-dup-count -- how many values the current key holds.
+;;;
+;;; Parameters:
+;;;   c -- the Cursor, positioned, on a dup-sort database, borrowed
+;;;
+;;; Returns:
+;;;   (Result int LmdbError) -- `Incompatible` on a database that is not
+;;;   dup-sort (every key there holds exactly one value).
+;;;
+;;; Example:
+;;;   (cursor-dup-count c)  ; => (ok 3)
+;;;
+;;; Since: 0.1.0
+(defn cursor-dup-count [^borrow c : Cursor] : (Result int LmdbError)
+  (let [n (dup-count-raw c)]
+    (if (>= n 0) (ok n) (err (lmdb-error-of (- -1 n))))))
+
+;;; dup-count-raw -- mdb_cursor_count, or -1 - |code|.
+(defn dup-count-raw [^borrow c : Cursor] : int
+  ```c
+  #include <lmdb.h>
+  size_t n = 0;
+  int rc = mdb_cursor_count((MDB_cursor *)(intptr_t)c, &n);
+  if (rc) return -1 - (int64_t)(rc < 0 ? -rc : rc);
+  return (int64_t)n;
+  ```)
+
+;; -------------------------------------------------------------------------
+;; Writes through a cursor
+;; -------------------------------------------------------------------------
+
+;;; cursor-put! -- store val under key and leave the cursor on it.
+;;;
+;;; As put!: replaces a plain database's value, adds to a dup-sort key's.
+;;;
+;;; Parameters:
+;;;   c   -- a Cursor in a write Txn, borrowed
+;;;   key -- the key
+;;;   val -- the value
+;;;
+;;; Returns:
+;;;   (Result nil LmdbError)
+;;;
+;;; Example:
+;;;   (cursor-put! c "k" "v")
+;;;
+;;; Since: 0.1.0
+(defn cursor-put! [^borrow c : Cursor key : cstr val : cstr] : (Result nil LmdbError)
+  (let [over (over-key-limit c key)]
+    (if (>= over 0)
+      (err (KeyTooLong over))
+      (let [rc (cursor-put-raw c key val)]
+        (if (= rc 0) (Ok nil) (err (lmdb-error-of rc)))))))
+
+;;; cursor-del! -- delete the entry under the cursor (one value, under dup-sort).
+;;;
+;;; The cursor then sits where the next move continues from the entry
+;;; after it.
+;;;
+;;; Parameters:
+;;;   c -- a positioned Cursor in a write Txn, borrowed
+;;;
+;;; Returns:
+;;;   (Result nil LmdbError)
+;;;
+;;; Example:
+;;;   (cursor-del! c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-del! [^borrow c : Cursor] : (Result nil LmdbError)
+  (let [rc (cursor-del-raw c false)]
+    (if (= rc 0) (Ok nil) (err (lmdb-error-of rc)))))
+
+;;; cursor-del-all-dups! -- delete every value of the current key (MDB_NODUPDATA).
+;;;
+;;; Parameters:
+;;;   c -- a positioned Cursor on a dup-sort database in a write Txn
+;;;
+;;; Returns:
+;;;   (Result nil LmdbError)
+;;;
+;;; Example:
+;;;   (cursor-del-all-dups! c)
+;;;
+;;; Since: 0.1.0
+(defn cursor-del-all-dups! [^borrow c : Cursor] : (Result nil LmdbError)
+  (let [rc (cursor-del-raw c true)]
+    (if (= rc 0) (Ok nil) (err (lmdb-error-of rc)))))
+
+) ;; end defmodule lmdb/cursor
