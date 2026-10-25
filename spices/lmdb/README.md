@@ -162,6 +162,7 @@ fixes (`^borrow` in a callback type, `?` inside callbacks) from turmeric's
 `lmdb-spice` branch. With v0.71.0 the `txn`, `dbi`, `ops`, `cursor` and
 `bytes` modules do not compile.
 
-Linux x86-64 is measured. macOS arm64 and Linux arm64 build in CI. Windows
-(MSYS2 UCRT64) is unverified: lmdb-spice-plan section 7's hand-run
-assessment has not been done yet.
+CI builds and tests it on Linux x86-64 and macOS arm64, and the benchmark
+was measured on Linux x86-64. Linux arm64 has no CI leg here and is
+untested. Windows (MSYS2 UCRT64) is unverified: lmdb-spice-plan section 7's
+hand-run assessment has not been done yet.
