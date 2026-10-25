@@ -1,0 +1,313 @@
+;; bench/kv.tur -- lmdb vs sqlite on the same key-value workloads.
+;;
+;; N keys "k00000000".. (9 bytes), 100-byte values. Both stores run with
+;; fsync off (lmdb SyncNone; sqlite synchronous=OFF, journal_mode=WAL), so
+;; the numbers compare the engines and the bindings, not the disk.
+;;
+;;   load    -- N puts in one write transaction (sqlite: BEGIN ... COMMIT,
+;;              one prepared INSERT)
+;;   get     -- N point reads in pseudo-random order, one read transaction
+;;   scan    -- every entry in key order (lmdb cursor; sqlite ORDER BY k)
+;;   commits -- M single-put transactions, a commit each
+;;
+;; Every value read is copied out by both bindings and freed here.
+
+(defmodule bench/kv
+  (import lmdb/error  :refer [LmdbError])
+  (import lmdb/env    :refer [Env env-opts opts-map-size opts-sync SyncNone env-open env-close])
+  (import lmdb/txn    :refer [Txn with-read-txn with-write-txn])
+  (import lmdb/dbi    :refer [Dbi dbi-main])
+  (import lmdb/ops    :refer [get put!])
+  (import lmdb/cursor :refer [Cursor with-cursor cursor-fold])
+  (import sqlite/db   :refer [Db Stmt db-open db-close db-exec db-prepare])
+  (import sqlite/stmt :refer [stmt-step stmt-bind-text stmt-reset stmt-finalize])
+  (import sqlite/row  :refer [col-text])
+
+(def n-keys 100000)
+(def n-commits 2000)
+
+;; -------------------------------------------------------------------------
+;; Helpers
+;; -------------------------------------------------------------------------
+
+;;; now-ns -- CLOCK_MONOTONIC in nanoseconds.
+(defn now-ns [] : int
+  ```c
+  #include <time.h>
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+  ```)
+
+;;; key -- "k%08d" of i, in a static buffer (valid until the next call).
+(defn key [i : int] : cstr
+  ```c
+  #include <stdio.h>
+  static char buf[32];
+  snprintf(buf, sizeof buf, "k%08lld", (long long)i);
+  return buf;
+  ```)
+
+;;; value -- a fixed 100-byte value.
+(defn value [] : cstr
+  ```c
+  static char buf[101];
+  if (!buf[0]) { for (int i = 0; i < 100; i++) buf[i] = 'a' + i % 26; buf[100] = 0; }
+  return buf;
+  ```)
+
+;;; scramble -- the i-th of n indices in a fixed pseudo-random order.
+(defn scramble [i : int n : int] : int
+  ```c
+  return (int64_t)(((uint64_t)i * 2654435761u) % (uint64_t)n);
+  ```)
+
+;;; drop -- free a copied-out cstr.
+(defn drop [s : cstr] : nil
+  ```c
+  #include <stdlib.h>
+  free((void *)s);
+  ```)
+
+;;; fresh-dir -- an empty directory under $TMPDIR (or /tmp).
+(defn fresh-dir [] : cstr
+  ```c
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
+  #include <unistd.h>
+  const char *base = getenv("TMPDIR");
+  if (!base || !*base) base = "/tmp";
+  size_t n = strlen(base) + 32;
+  char *p = (char *)malloc(n);
+  snprintf(p, n, "%s/lmdb-bench-XXXXXX", base);
+  if (!mkdtemp(p)) { perror("mkdtemp"); exit(1); }
+  return p;
+  ```)
+
+;;; path-in -- dir/name.
+(defn path-in [dir : cstr name : cstr] : cstr
+  ```c
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
+  size_t n = strlen((const char *)dir) + strlen((const char *)name) + 2;
+  char *p = (char *)malloc(n);
+  snprintf(p, n, "%s/%s", (const char *)dir, (const char *)name);
+  return p;
+  ```)
+
+;;; rm-dir -- remove every file in dir, then dir.
+(defn rm-dir [dir : cstr] : nil
+  ```c
+  #include <dirent.h>
+  #include <stdio.h>
+  #include <string.h>
+  #include <unistd.h>
+  DIR *d = opendir((const char *)dir);
+  if (d) {
+    struct dirent *e;
+    while ((e = readdir(d))) {
+      if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+      char p[8192];
+      snprintf(p, sizeof p, "%s/%s", (const char *)dir, e->d_name);
+      unlink(p);
+    }
+    closedir(d);
+  }
+  rmdir((const char *)dir);
+  ```)
+
+;;; report -- one result line: engine, workload, ops, elapsed.
+(defn report [engine : cstr work : cstr ops : int ns : int] : nil
+  ```c
+  printf("%-7s %-8s %8lld ops %9.1f ms %10.0f ops/s %8.0f ns/op\n",
+         (const char *)engine, (const char *)work, (long long)ops, ns / 1e6,
+         ns ? ops * 1e9 / ns : 0.0, ops ? (double)ns / ops : 0.0);
+  ```)
+
+;; -------------------------------------------------------------------------
+;; lmdb
+;; -------------------------------------------------------------------------
+
+;;; lm-load -- puts 0..n-1 into d; how many failed.
+(defn lm-load [^borrow t : Txn d : Dbi n : int] : int
+  (let [^mut i 0 ^mut bad 0]
+    (do
+      (while (< i n)
+        (do
+          (when (err? (put! t d (key i) (value))) (set! bad (+ bad 1)))
+          (set! i (+ i 1))))
+      bad)))
+
+;;; lm-get -- n point reads in scrambled order; how many were found.
+(defn lm-get [^borrow t : Txn d : Dbi n : int] : int
+  (let [^mut i 0 ^mut found 0]
+    (do
+      (while (< i n)
+        (let [v (get t d (key (scramble i n)))]
+          (do
+            (when (some? v) (do (drop (unwrap v)) (set! found (+ found 1))))
+            (set! i (+ i 1)))))
+      found)))
+
+;;; count-entry -- a cursor-fold step: count, freeing the copies.
+(defn count-entry [n : int k : cstr v : cstr] : int
+  (do (drop k) (drop v) (+ n 1)))
+
+;;; lm-commits -- m one-put write transactions; how many failed.
+(defn lm-commits [^borrow env : Env m : int] : int
+  (let [^mut i 0 ^mut bad 0]
+    (do
+      (while (< i m)
+        (let [k (key (+ n-keys i))
+              w (with-write-txn env
+                  (fn [^borrow t : Txn] : (Result nil LmdbError)
+                    (put! t (? (dbi-main t)) k (value))))]
+          (do
+            (when (err? w) (set! bad (+ bad 1)))
+            (set! i (+ i 1)))))
+      bad)))
+
+(defn bench-lmdb [dir : cstr] : bool
+  (let [r (env-open (path-in dir "kv.mdb")
+                    (opts-sync (opts-map-size (env-opts) (* 1024 1048576)) (SyncNone)))]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            t0  (now-ns)
+            l   (with-write-txn env
+                  (fn [^borrow t : Txn] : (Result int LmdbError)
+                    (ok (lm-load t (? (dbi-main t)) n-keys))))
+            t1  (now-ns)
+            g   (with-read-txn env
+                  (fn [^borrow t : Txn] : (Result int LmdbError)
+                    (ok (lm-get t (? (dbi-main t)) n-keys))))
+            t2  (now-ns)
+            s   (with-read-txn env
+                  (fn [^borrow t : Txn] : (Result int LmdbError)
+                    (with-cursor t (? (dbi-main t))
+                      (fn [^borrow c : Cursor] : (Result int LmdbError)
+                        (ok (cursor-fold c 0 count-entry))))))
+            t3  (now-ns)
+            bad (lm-commits env n-commits)
+            t4  (now-ns)]
+        (do
+          (env-close env)
+          (report "lmdb" "load" n-keys (- t1 t0))
+          (report "lmdb" "get" n-keys (- t2 t1))
+          (report "lmdb" "scan" n-keys (- t3 t2))
+          (report "lmdb" "commits" n-commits (- t4 t3))
+          (and (ok? l) (= (ok-val l) 0) (ok? g) (= (ok-val g) n-keys)
+               (ok? s) (= (ok-val s) n-keys) (= bad 0)))))))
+
+;; -------------------------------------------------------------------------
+;; sqlite
+;; -------------------------------------------------------------------------
+
+;;; sq-load -- insert 0..n-1 through the prepared INSERT; failures.
+(defn sq-load [^borrow st : Stmt n : int] : int
+  (let [^mut i 0 ^mut bad 0]
+    (do
+      (while (< i n)
+        (let [a (stmt-bind-text st 1 (key i))
+              b (stmt-bind-text st 2 (value))
+              r (stmt-step st)
+              z (stmt-reset st)]
+          (do
+            (when (not (= r 0)) (set! bad (+ bad 1)))
+            (set! i (+ i 1)))))
+      bad)))
+
+;;; copy -- a heap copy of s (sqlite's column text dies at the next step).
+(defn copy [s : cstr] : cstr
+  ```c
+  #include <stdlib.h>
+  #include <string.h>
+  size_t n = strlen((const char *)s);
+  char *p = (char *)malloc(n + 1);
+  memcpy(p, s, n + 1);
+  return p;
+  ```)
+
+;;; sq-get -- n point reads in scrambled order; how many were found.
+(defn sq-get [^borrow st : Stmt n : int] : int
+  (let [^mut i 0 ^mut found 0]
+    (do
+      (while (< i n)
+        (let [a (stmt-bind-text st 1 (key (scramble i n)))
+              r (stmt-step st)]
+          (do
+            (when (= r 1) (do (drop (copy (col-text st 0))) (set! found (+ found 1))))
+            (stmt-reset st)
+            (set! i (+ i 1)))))
+      found)))
+
+;;; sq-scan -- step the ORDER BY query to the end; rows seen.
+(defn sq-scan [^borrow st : Stmt] : int
+  (let [^mut n 0]
+    (do
+      (while (= (stmt-step st) 1)
+        (do
+          (drop (copy (col-text st 0)))
+          (drop (copy (col-text st 1)))
+          (set! n (+ n 1))))
+      n)))
+
+;;; sq-commits -- m single-row autocommit inserts; failures.
+(defn sq-commits [^borrow st : Stmt m : int] : int
+  (let [^mut i 0 ^mut bad 0]
+    (do
+      (while (< i m)
+        (let [a (stmt-bind-text st 1 (key (+ n-keys i)))
+              b (stmt-bind-text st 2 (value))
+              r (stmt-step st)
+              z (stmt-reset st)]
+          (do
+            (when (not (= r 0)) (set! bad (+ bad 1)))
+            (set! i (+ i 1)))))
+      bad)))
+
+(defn bench-sqlite [dir : cstr] : bool
+  (let [r (db-open (path-in dir "kv.sqlite"))]
+    (if (err? r)
+      false
+      (let [db  (ok-val r)
+            p1  (db-exec db "PRAGMA journal_mode=WAL")
+            p2  (db-exec db "PRAGMA synchronous=OFF")
+            c   (db-exec db "CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID")
+            ins (ok-val (db-prepare db "INSERT INTO kv (k, v) VALUES (?, ?)"))
+            t0  (now-ns)
+            b   (db-exec db "BEGIN")
+            l   (sq-load ins n-keys)
+            e   (db-exec db "COMMIT")
+            t1  (now-ns)
+            sel (ok-val (db-prepare db "SELECT v FROM kv WHERE k = ?"))
+            g   (sq-get sel n-keys)
+            t2  (now-ns)
+            scn (ok-val (db-prepare db "SELECT k, v FROM kv ORDER BY k"))
+            s   (sq-scan scn)
+            t3  (now-ns)
+            bad (sq-commits ins n-commits)
+            t4  (now-ns)]
+        (do
+          (stmt-finalize ins)
+          (stmt-finalize sel)
+          (stmt-finalize scn)
+          (db-close db)
+          (report "sqlite" "load" n-keys (- t1 t0))
+          (report "sqlite" "get" n-keys (- t2 t1))
+          (report "sqlite" "scan" n-keys (- t3 t2))
+          (report "sqlite" "commits" n-commits (- t4 t3))
+          (and (= l 0) (= g n-keys) (= s n-keys) (= bad 0)))))))
+
+(defn main [] : int
+  (let [dir (fresh-dir)
+        a   (bench-lmdb dir)
+        b   (bench-sqlite dir)]
+    (do
+      (rm-dir dir)
+      (println (if (and a b) "# all workloads checked" "# a workload returned a wrong count"))
+      (if (and a b) 0 1))))
+
+) ;; end defmodule bench/kv

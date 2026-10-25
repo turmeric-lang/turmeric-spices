@@ -41,6 +41,7 @@ turmeric's [Emscripten spice audit](https://github.com/turmeric-lang/turmeric/bl
 | [`tur-ecs`](spices/ecs/) | Entity-Component-System for Turmeric. E1 surface: dense + sparse + tag storages, variadic-looking for-each (up to 8 components) over the row-typed Query value, with/without tag filters, defquery + run-query! functional surface | 2 | ✅ | ✅ | ✅ | ✅ | -- |
 | [`tur-ecs-raylib`](spices/ecs-raylib/) | Raylib companion to tur-ecs: standard 2D components, systems, and a with-game-loop macro for ECS-driven games | 2 | ✅ | ✅ | ✅ | ✅ | tur-raylib |
 | [`tur-raygui`](spices/raygui/) | Immediate-mode GUI controls for Turmeric, layered on tur-raylib | 2 | ✅ | ✅ | ✅ | ✅ | raygui 4.0 (vendored), tur-raylib |
+| [`tur-lmdb`](spices/lmdb/) | LMDB bindings: an embedded, memory-mapped, transactional key-value store (MVCC, sorted keys, dup-sort, cursors) | 2 | ✅ | ✅ | ⚠️ | ❌ | LMDB 0.9.33 (vendored) |
 | [`tur-httpd`](spices/httpd/) | Minimal threaded HTTP/1.1 server (POSIX sockets) | 2 | ✅ | ✅ | ❌ | ❌ | tur-json, tur-http (optional), tur-tls (optional) |
 | [`tur-dom-core`](spices/dom-core/) | Shared Document/Node markup tree and SAX event vocabulary for tur-xml and tur-html | 2 | ✅ | ✅ | ? | ? | -- |
 | [`tur-msgpack`](spices/msgpack/) | MessagePack binary serialization for Turmeric -- the binary twin of tur-json | 2 | ✅ | ✅ | ✅ | ✅ | -- |
@@ -313,6 +314,28 @@ Add to your project:
 ```sh
 tur add https://github.com/turmeric-lang/turmeric-spices \
   --ref opengl-v0.1.0 --subdir spices/opengl --name opengl
+```
+
+---
+
+### tur-lmdb -- LMDB key-value store
+
+Exports: `lmdb/error`, `lmdb/env`, `lmdb/txn`, `lmdb/dbi`, `lmdb/ops`,
+`lmdb/cursor`, `lmdb/bytes`
+
+```turmeric no-check
+(let [env (ok-val (env-open "app.mdb" (env-opts)))]
+  (with-write-txn env
+    (fn [^borrow t : Txn] : (Result nil LmdbError)
+      (put! t (? (dbi-main t)) "hello" "world")))
+  (env-close env))
+```
+
+Add to your project:
+
+```sh
+tur add https://github.com/turmeric-lang/turmeric-spices \
+  --ref lmdb-v0.1.0 --subdir spices/lmdb --name lmdb
 ```
 
 ---

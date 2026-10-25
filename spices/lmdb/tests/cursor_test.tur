@@ -20,7 +20,8 @@
                               cursor-seek cursor-seek-exact cursor-current
                               cursor-next-dup cursor-prev-dup cursor-next-nodup
                               cursor-first-dup cursor-last-dup cursor-seek-dup
-                              cursor-dup-count cursor-put! cursor-del!
+                              cursor-dup-count cursor-fold cursor-fold-from
+                              cursor-put! cursor-del!
                               cursor-del-all-dups!])
 
 ;; -------------------------------------------------------------------------
@@ -405,6 +406,38 @@
           (env-close env)
           (and (ok? w) (ok? g) (ok-val g) (cleanup dir)))))))
 
+;;; count-entry -- a cursor-fold step: count, freeing the copies.
+(defn count-entry [n : int k : cstr v : cstr] : int
+  ```c
+  #include <stdlib.h>
+  free((void *)k); free((void *)v);
+  return n + 1;
+  ```)
+
+;;; t-fold -- cursor-fold visits every entry; cursor-fold-from starts at a key.
+(defn t-fold [] : bool
+  (let [dir (tmp-dir)
+        r   (open-test dir)]
+    (if (err? r)
+      false
+      (let [env (ok-val r)
+            w   (with-write-txn env
+                  (fn [^borrow t : Txn] : (Result nil LmdbError)
+                    (put-sample t (? (dbi-main t)))))
+            g   (with-read-txn env
+                  (fn [^borrow t : Txn] : (Result bool LmdbError)
+                    (with-cursor t (? (dbi-main t))
+                      (fn [^borrow c : Cursor] : (Result bool LmdbError)
+                        (let [all  (cursor-fold c 0 count-entry)
+                              keys (cursor-fold-from c "user:" "" (fn [acc : cstr k : cstr v : cstr] : cstr (str3 acc k ",")))
+                              none (cursor-fold-from c "zzz" 0 count-entry)]
+                          (ok (and (= all 5)
+                                   (same? keys "user:alice,user:bob,user:carol,zebra,")
+                                   (= none 0))))))))]
+        (do
+          (env-close env)
+          (and (ok? w) (ok? g) (ok-val g) (cleanup dir)))))))
+
 ;;; t-reverse-key -- DbiReverseKey compares keys from the last byte.
 (defn t-reverse-key [] : bool
   (let [dir (tmp-dir)
@@ -513,6 +546,7 @@
   (describe "cursors"
     (it "first/next and last/prev walk both ways"        (t-walk))
     (it "cursor-seek is a range/prefix scan"             (t-prefix-scan))
+    (it "cursor-fold and cursor-fold-from"               (t-fold))
     (it "DbiReverseKey sorts from the last byte"         (t-reverse-key))
     (it "cursor-put! and cursor-del!"                    (t-cursor-write))
     (it "cursor-open / cursor-close by hand"             (t-raw-cursor))

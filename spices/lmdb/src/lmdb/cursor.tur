@@ -31,6 +31,7 @@
           cursor-seek cursor-seek-exact cursor-current
           cursor-next-dup cursor-prev-dup cursor-next-nodup cursor-prev-nodup
           cursor-first-dup cursor-last-dup cursor-seek-dup cursor-dup-count
+          cursor-fold cursor-fold-from
           cursor-put! cursor-del! cursor-del-all-dups!)
 
 ;;; Cursor -- an open cursor (an `MDB_cursor *`).
@@ -74,9 +75,9 @@
     o = MDB_FIRST;                       /* "" sorts first: seek to the start */
   }
   if (mdb_cursor_get((MDB_cursor *)(intptr_t)c, &k, &v, o)) return NULL;
-  /* Not every op reports both halves -- MDB_FIRST_DUP / MDB_LAST_DUP leave
-     the key untouched -- so read the entry the cursor now sits on. */
-  if (o != MDB_GET_CURRENT &&
+  /* MDB_FIRST_DUP / MDB_LAST_DUP move to a value of the current key but
+     leave `k` untouched, so read the entry the cursor now sits on. */
+  if ((o == MDB_FIRST_DUP || o == MDB_LAST_DUP) &&
       mdb_cursor_get((MDB_cursor *)(intptr_t)c, &k, &v, MDB_GET_CURRENT)) return NULL;
   struct { char *key; char *val; } *kv = malloc(sizeof *kv);
   kv->key = (char *)malloc(k.mv_size + 1);
@@ -502,6 +503,67 @@
   if (rc) return -1 - (int64_t)(rc < 0 ? -rc : rc);
   return (int64_t)n;
   ```)
+
+;; -------------------------------------------------------------------------
+;; Folds -- a loop, not recursion, so a walk over millions of entries runs in
+;; constant stack
+;; -------------------------------------------------------------------------
+
+;;; fold-loop -- fold f over the entries from o onward with cursor-next.
+(defn fold-loop [A] [^borrow c : Cursor o : (Option (Pair cstr cstr)) init : A
+                     f : (fn [A cstr cstr] A)] : A
+  (let [^mut acc init
+        ^mut cur o]
+    (do
+      (while (some? cur)
+        (let [p (unwrap cur)]
+          (do
+            (set! acc (f acc (pair-fst p) (pair-snd p)))
+            (set! cur (cursor-next c)))))
+      acc)))
+
+;;; cursor-fold -- fold f over every entry, in key order.
+;;;
+;;; f gets the accumulator, then each key and value: fresh copies it owns
+;;; (free them, or keep them). In a dup-sort database each (key, value)
+;;; pair is one step.
+;;;
+;;; Parameters:
+;;;   c    -- the Cursor, borrowed; left past the last entry
+;;;   init -- the starting accumulator
+;;;   f    -- (fn [A cstr cstr] A)
+;;;
+;;; Returns:
+;;;   The final accumulator.
+;;;
+;;; Example:
+;;;   (cursor-fold c 0 (fn [n : int k : cstr v : cstr] : int (+ n 1)))  ; => entry count
+;;;
+;;; Since: 0.1.0
+(defn cursor-fold [A] [^borrow c : Cursor init : A f : (fn [A cstr cstr] A)] : A
+  (fold-loop c (cursor-first c) init f))
+
+;;; cursor-fold-from -- fold f over the entries whose key is >= key.
+;;;
+;;; A range scan: stop early by having f ignore what is past the range (the
+;;; walk itself always runs to the end), or walk by hand with cursor-seek and
+;;; cursor-next to stop at a bound.
+;;;
+;;; Parameters:
+;;;   c    -- the Cursor, borrowed
+;;;   key  -- the lower bound
+;;;   init -- the starting accumulator
+;;;   f    -- (fn [A cstr cstr] A)
+;;;
+;;; Returns:
+;;;   The final accumulator.
+;;;
+;;; Example:
+;;;   (cursor-fold-from c "user:" 0 count-users)
+;;;
+;;; Since: 0.1.0
+(defn cursor-fold-from [A] [^borrow c : Cursor key : cstr init : A f : (fn [A cstr cstr] A)] : A
+  (fold-loop c (cursor-seek c key) init f))
 
 ;; -------------------------------------------------------------------------
 ;; Writes through a cursor
