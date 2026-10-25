@@ -16,6 +16,7 @@
 
 (defmodule crdt/causal
   (import crdt/lattice :refer [map-merge-with])
+  (import crdt/replica :refer [ReplicaId replica replica-sym])
   (export Dot mk-dot dot-replica dot-counter
           DotContext dotctx-new dotctx-witness dotctx-seen? dotctx-next
           dotctx-count dotctx-witness-set
@@ -25,17 +26,13 @@
 ;;;
 ;;; Since: crdt-spice-plan C2
 ;;
-;; `replica : Sym` rather than a ReplicaId newtype -- see crdt/counter for why
-;; (defopaque over Sym does not compile; the defstruct alternative forces a
-;; MapKey instance that can only be written in inline C).  A Sym field in a
-;; record only became legal in v0.46.1.
 ;; NOTE the constructor is `mk-dot`, not `dot`: stdlib/macros.tur (which IS
 ;; auto-loaded) already defines a `dot` macro for method-call sugar, and macro
 ;; expansion precedes everything, so a function of that name is unreachable.
 ;; Same collision shape that retired the max/min macros in
 ;; lattice-vocabulary-plan L1 -- worth checking a name against macros.tur before
 ;; exporting it.
-(defstruct Dot [replica : Sym counter : int])
+(defstruct Dot [replica : ReplicaId counter : int])
 
 ;;; mk-dot -- mint a dot.
 ;;;
@@ -47,10 +44,10 @@
 ;;;   The Dot (r, n).
 ;;;
 ;;; Example:
-;;;   (mk-dot (quote alice) 3)
+;;;   (mk-dot (replica (quote alice)) 3)
 ;;;
 ;;; Since: crdt-spice-plan C2
-(defn mk-dot [r : Sym n : int] : Dot (Dot r n))
+(defn mk-dot [r : ReplicaId n : int] : Dot (Dot r n))
 
 ;;; dot-replica -- the replica that minted this dot.
 ;;;
@@ -61,10 +58,10 @@
 ;;;   Its replica.
 ;;;
 ;;; Example:
-;;;   (dot-replica (mk-dot (quote alice) 3))   ; => alice
+;;;   (replica-sym (dot-replica (mk-dot (replica (quote alice)) 3)))   ; => alice
 ;;;
 ;;; Since: crdt-spice-plan C2
-(defn dot-replica [^borrow d : Dot] : Sym (.replica d))
+(defn dot-replica [^borrow d : Dot] : ReplicaId (.replica d))
 
 ;;; dot-counter -- the counter value of this dot.
 ;;;
@@ -75,7 +72,7 @@
 ;;;   Its counter.
 ;;;
 ;;; Example:
-;;;   (dot-counter (mk-dot (quote alice) 3))   ; => 3
+;;;   (dot-counter (mk-dot (replica (quote alice)) 3))   ; => 3
 ;;;
 ;;; Since: crdt-spice-plan C2
 (defn dot-counter [^borrow d : Dot] : int (.counter d))
@@ -107,7 +104,7 @@
 ;;;   A new DotContext including d.
 ;;;
 ;;; Example:
-;;;   (dotctx-witness (dotctx-new) (mk-dot (quote alice) 1))
+;;;   (dotctx-witness (dotctx-new) (mk-dot (replica (quote alice)) 1))
 ;;;
 ;;; Since: crdt-spice-plan C2
 ;;
@@ -116,7 +113,7 @@
 ;; growing log.
 (defn dotctx-witness [c : DotContext ^borrow d : Dot] : DotContext
   (let [m   (:: (.seen c) (Map Sym int))
-        r   (.replica d)
+        r   (replica-sym (.replica d))
         n   (.counter d)
         cur (if (map-has? m r) (map-get m r) 0)]
     (DotContext (:: (map-assoc m r (if (< cur n) n cur)) int))))
@@ -131,12 +128,12 @@
 ;;;   true when the context's counter for d's replica is at least d's.
 ;;;
 ;;; Example:
-;;;   (dotctx-seen? ctx (mk-dot (quote alice) 1))
+;;;   (dotctx-seen? ctx (mk-dot (replica (quote alice)) 1))
 ;;;
 ;;; Since: crdt-spice-plan C2
 (defn dotctx-seen? [^borrow c : DotContext ^borrow d : Dot] : bool
   (let [m (:: (.seen c) (Map Sym int))
-        r (.replica d)]
+        r (replica-sym (.replica d))]
     (if (map-has? m r) (>= (map-get m r) (.counter d)) false)))
 
 ;;; dotctx-next -- the next dot this replica may mint.
@@ -149,12 +146,13 @@
 ;;;   The dot one past the highest this context has for r.
 ;;;
 ;;; Example:
-;;;   (dotctx-next ctx (quote alice))
+;;;   (dotctx-next ctx (replica (quote alice)))
 ;;;
 ;;; Since: crdt-spice-plan C2
-(defn dotctx-next [^borrow c : DotContext r : Sym] : Dot
-  (let [m (:: (.seen c) (Map Sym int))]
-    (Dot r (+ 1 (if (map-has? m r) (map-get m r) 0)))))
+(defn dotctx-next [^borrow c : DotContext r : ReplicaId] : Dot
+  (let [m (:: (.seen c) (Map Sym int))
+        k (replica-sym r)]
+    (Dot r (+ 1 (if (map-has? m k) (map-get m k) 0)))))
 
 ;;; dotctx-count -- how many replicas this context has heard from.
 ;;;
@@ -225,12 +223,12 @@
 ;;;   A new DotSet containing d.
 ;;;
 ;;; Example:
-;;;   (dotset-add (dotset-new) (mk-dot (quote alice) 3))
+;;;   (dotset-add (dotset-new) (mk-dot (replica (quote alice)) 3))
 ;;;
 ;;; Since: crdt-spice-plan C4
 (defn dotset-add [s : DotSet ^borrow d : Dot] : DotSet
   (let [m   (.dots s)
-        r   (.replica d)
+        r   (replica-sym (.replica d))
         inn (:: (map-assoc (:: (__inner-dots m r) (Map int int)) (.counter d) 1) int)]
     (DotSet (:: (map-assoc (:: m (Map Sym int)) r inn) int))))
 
@@ -245,12 +243,12 @@
 ;;;   whole difference from dotctx-seen?.
 ;;;
 ;;; Example:
-;;;   (dotset-has? s (mk-dot (quote alice) 3))
+;;;   (dotset-has? s (mk-dot (replica (quote alice)) 3))
 ;;;
 ;;; Since: crdt-spice-plan C4
 (defn dotset-has? [^borrow s : DotSet ^borrow d : Dot] : bool
   (let [m (.dots s)
-        r (.replica d)]
+        r (replica-sym (.replica d))]
     (if (map-has? (:: m (Map Sym int)) r)
       (map-has? (:: (:: (map-get (:: m (Map Sym int)) r) int) (Map int int))
                 (.counter d))
@@ -352,7 +350,7 @@
 ;;;   A DotContext that has observed all of them.
 ;;;
 ;;; Example:
-;;;   (dotctx-witness-set ctx (dotset-add (dotset-new) (mk-dot (quote alice) 3)))
+;;;   (dotctx-witness-set ctx (dotset-add (dotset-new) (mk-dot (replica (quote alice)) 3)))
 ;;;
 ;;; Since: crdt-spice-plan C4
 ;;
@@ -375,7 +373,7 @@
   (if (hamt/iter-advance! it)
     (let [r (:: (hamt/iter-cur-key it) Sym)
           n (__max-counter (:: (hamt/iter-cur-val it) int))
-          w (dotctx-witness acc (Dot r n))]
+          w (dotctx-witness acc (Dot (replica r) n))]
       (__witness-reps-loop w it))
     acc))
 
