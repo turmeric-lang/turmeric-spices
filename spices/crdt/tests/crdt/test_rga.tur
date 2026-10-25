@@ -26,6 +26,7 @@
 ;; main returns the failure count so `tur test` reports a non-zero exit.
 
 (defmodule crdt/tests/test_rga
+  (import crdt/replica :refer [ReplicaId replica replica-sym])
   (import crdt/rga :refer [Rga rga-new rga-len rga-size rga-clock rga-get
                            rga-alive? rga-insert rga-append rga-delete
                            rga-delta-insert rga-delta-delete])
@@ -52,8 +53,8 @@
 ;; "HELLO" = 72 69 76 76 79, typed left to right by alice.
 (defn hello [] : Rga
   (rga-append (rga-append (rga-append (rga-append
-    (rga-append (rga-new) (quote alice) 72)
-    (quote alice) 69) (quote alice) 76) (quote alice) 76) (quote alice) 79))
+    (rga-append (rga-new) (replica (quote alice)) 72)
+    (replica (quote alice)) 69) (replica (quote alice)) 76) (replica (quote alice)) 76) (replica (quote alice)) 79))
 
 (defn test-local [] : int
   (let [s  (hello)
@@ -64,7 +65,7 @@
 
 ;;; An insert in the MIDDLE, which is where an append-only test would stop.
 (defn test-insert-middle [] : int
-  (let [s  (rga-insert (hello) (quote alice) 1 88)   ;; H X E L L O
+  (let [s  (rga-insert (hello) (replica (quote alice)) 1 88)   ;; H X E L L O
         ok (__codes-match? s (vec-of 72 88 69 76 76 79) 0)]
     (fail-if (not ok) "FAIL rga: middle insert landed in the wrong place")))
 
@@ -76,8 +77,8 @@
 ;; -- and it must break it the same way on both replicas or they diverge.
 ;; carol > bob, so carol's character comes first, in either merge order.
 
-(defn c-bob   [] : Rga (rga-insert (hello) (quote bob)   0 88))   ;; X
-(defn c-carol [] : Rga (rga-insert (hello) (quote carol) 0 89))   ;; Y
+(defn c-bob   [] : Rga (rga-insert (hello) (replica (quote bob))   0 88))   ;; X
+(defn c-carol [] : Rga (rga-insert (hello) (replica (quote carol)) 0 89))   ;; Y
 
 (defn test-concurrent-same-spot [] : int
   (let [m1 (join (c-bob) (c-carol))
@@ -105,11 +106,11 @@
 ;; buys, and this assertion is what would notice if it stopped holding.
 
 (defn run-alice [] : Rga
-  (rga-insert (rga-insert (rga-insert (rga-new) (quote alice) 0 97)
-                          (quote alice) 1 98) (quote alice) 2 99))   ;; a b c
+  (rga-insert (rga-insert (rga-insert (rga-new) (replica (quote alice)) 0 97)
+                          (replica (quote alice)) 1 98) (replica (quote alice)) 2 99))   ;; a b c
 (defn run-bob [] : Rga
-  (rga-insert (rga-insert (rga-insert (rga-new) (quote bob) 0 120)
-                          (quote bob) 1 121) (quote bob) 2 122))     ;; x y z
+  (rga-insert (rga-insert (rga-insert (rga-new) (replica (quote bob)) 0 120)
+                          (replica (quote bob)) 1 121) (replica (quote bob)) 2 122))     ;; x y z
 
 (defn test-no-interleave [] : int
   (let [m1 (join (run-alice) (run-bob))
@@ -130,7 +131,7 @@
 ;; array instead of being removed: it is still somebody's origin.
 
 (defn del-e   [] : Rga (rga-delete (hello) 1))                     ;; H _ L L O
-(defn ins-after-e [] : Rga (rga-insert (hello) (quote carol) 2 88)) ;; H E X L L O
+(defn ins-after-e [] : Rga (rga-insert (hello) (replica (quote carol)) 2 88)) ;; H E X L L O
 
 (defn test-insert-after-tombstone [] : int
   (let [m  (join (del-e) (ins-after-e))
@@ -162,7 +163,7 @@
 ;; BELOW its own origin's alice@5, and the integration scan would have placed
 ;; it wrongly.  That is the reason crdt/rga keeps a Lamport clock instead.
 
-(defn bob-appends [] : Rga (rga-append (hello) (quote bob) 33))
+(defn bob-appends [] : Rga (rga-append (hello) (replica (quote bob)) 33))
 
 (defn test-causal-chain [] : int
   (let [m  (join (hello) (bob-appends))
@@ -190,7 +191,7 @@
   ;; `b` first, so a merge that simply kept the left clock would report 3.
   (let [m (join (run-bob) (hello))
         c (rga-clock m)
-        after (rga-clock (rga-append (join (run-bob) (hello)) (quote carol) 33))]
+        after (rga-clock (rga-append (join (run-bob) (hello)) (replica (quote carol)) 33))]
     (+ (fail-if (not (>= c 5))
                 "FAIL rga: merge did not raise the clock to cover the other side")
        (fail-if (not (> after 5))
@@ -216,14 +217,14 @@
 ;; Deltas (C4's channel, on C5's type).
 
 (defn test-delta [] : int
-  (let [di   (rga-delta-insert (hello) (quote bob) 0 88)
+  (let [di   (rga-delta-insert (hello) (replica (quote bob)) 0 88)
         dd   (rga-delta-delete (hello) 1)
-        seq  (apply-delta (apply-delta (hello) (rga-delta-insert (hello) (quote bob) 0 88))
+        seq  (apply-delta (apply-delta (hello) (rga-delta-insert (hello) (replica (quote bob)) 0 88))
                           (rga-delta-delete (hello) 1))
-        full (join (rga-delete (rga-insert (hello) (quote bob) 0 88) 2) (hello))
+        full (join (rga-delete (rga-insert (hello) (replica (quote bob)) 0 88) 2) (hello))
         idem (apply-delta (apply-delta (hello)
-                                       (rga-delta-insert (hello) (quote bob) 0 88))
-                          (rga-delta-insert (hello) (quote bob) 0 88))]
+                                       (rga-delta-insert (hello) (replica (quote bob)) 0 88))
+                          (rga-delta-insert (hello) (replica (quote bob)) 0 88))]
     (+ ;; One node on the wire against five in the document.
        (fail-if (not (= (rga-size di) 1))
                 "FAIL rga delta: insert delta is not one node")

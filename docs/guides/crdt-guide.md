@@ -74,7 +74,8 @@ us has seen fewer updates", never a conflict.
 
 ```turmeric
 (defmodule demo
-  (import crdt/counter :refer [replica GCounter gcounter-new gcounter-bump
+  (import crdt/replica :refer [replica])
+  (import crdt/counter :refer [GCounter gcounter-new gcounter-bump
                                gcounter-value])
 
   (defn alice [] : GCounter
@@ -90,7 +91,8 @@ us has seen fewer updates", never a conflict.
 
 ```sweet-exp
 defmodule demo
-  import crdt/counter :refer [replica GCounter gcounter-new gcounter-bump
+  import crdt/replica :refer [replica]
+  import crdt/counter :refer [GCounter gcounter-new gcounter-bump
                                gcounter-value]
   defn alice [] : GCounter
     gcounter-bump(gcounter-new() replica((quote alice)) 3)
@@ -101,11 +103,17 @@ defmodule demo
     0
 ```
 
+A replica is a `ReplicaId` (from `crdt/replica`), not a bare `Sym`: every
+type takes one, and a newtype keeps it apart from the element and key
+symbols the same calls take. `replica` makes one; `replica-sym` gives the
+symbol back.
+
 A `PNCounter` is two `GCounter`s -- one for increments, one for decrements
 -- read as `P - N`. That is the standard trick for a counter that can go
 down without either half ever decreasing.
 
 ```turmeric
+(import crdt/replica :refer [replica])
 (import crdt/counter :refer [PNCounter pncounter-new pncounter-inc
                              pncounter-dec pncounter-value])
 
@@ -115,6 +123,7 @@ down without either half ever decreasing.
 ```
 
 ```sweet-exp
+import crdt/replica :refer [replica]
 import crdt/counter :refer [PNCounter pncounter-new pncounter-inc
                              pncounter-dec pncounter-value]
 let [c pncounter-inc(pncounter-new() replica((quote alice)) 5)]
@@ -138,13 +147,14 @@ Three designs, and the differences are the whole point:
 
 ```turmeric
 (defmodule demo
+  (import crdt/replica :refer [replica])
   (import crdt/orset :refer [ORSet orset-new orset-add orset-remove
                              orset-has? orset-count])
 
   (defn main [] : int
     (let [s (orset-remove
-              (orset-add (orset-add (orset-new) (quote apple) (quote alice))
-                         (quote pear) (quote alice))
+              (orset-add (orset-add (orset-new) (quote apple) (replica (quote alice)))
+                         (quote pear) (replica (quote alice)))
               (quote apple))]
       (println (orset-count s)))     ;; 1 -- pear
     0))
@@ -152,13 +162,14 @@ Three designs, and the differences are the whole point:
 
 ```sweet-exp
 defmodule demo
+  import crdt/replica :refer [replica]
   import crdt/orset :refer [ORSet orset-new orset-add orset-remove
                              orset-has? orset-count]
   defn main [] : int
-    let [s orset-remove
-           orset-add(orset-add(orset-new() (quote apple) (quote alice))
-                      (quote pear) (quote alice))
-           (quote apple)]
+    let [s orset-remove(orset-add(orset-add(orset-new() (quote apple)
+                                            replica((quote alice)))
+                                  (quote pear) replica((quote alice)))
+                        (quote apple))]
       println $ orset-count s   ;; 1 -- pear
     0
 ```
@@ -190,32 +201,32 @@ The cost is that a read is a set.
 
 ```turmeric
 (defmodule demo
+  (import crdt/replica :refer [replica])
   (import crdt/register :refer [LwwRegister lww-new lww-set lww-value
                                 MvRegister mv-new mv-set mv-values])
 
   (defn main [] : int
     ;; Later stamp wins.
-    (println (lww-value (join (lww-set (lww-new (quote alice)) 1 1000)
-                              (lww-set (lww-new (quote bob)) 2 2000))))   ;; 2
+    (println (lww-value (join (lww-set (lww-new (replica (quote alice))) 1 1000)
+                              (lww-set (lww-new (replica (quote bob))) 2 2000))))   ;; 2
     ;; Concurrent writes: both survive.
-    (println (mv-values (join (mv-set (mv-new (quote alice)) 1 1000)
-                              (mv-set (mv-new (quote bob)) 2 1000))))     ;; 2
+    (println (mv-values (join (mv-set (mv-new (replica (quote alice))) 1 1000)
+                              (mv-set (mv-new (replica (quote bob))) 2 1000))))     ;; 2
     0))
 ```
 
 ```sweet-exp
 defmodule demo
+  import crdt/replica :refer [replica]
   import crdt/register :refer [LwwRegister lww-new lww-set lww-value
                                 MvRegister mv-new mv-set mv-values]
   defn main [] : int
     ;; Later stamp wins.
-    println $ lww-value $ join
-      lww-set(lww-new((quote alice)) 1 1000)
-      lww-set(lww-new((quote bob)) 2 2000)   ;; 2
+    println(lww-value(join(lww-set(lww-new(replica((quote alice))) 1 1000)
+                           lww-set(lww-new(replica((quote bob))) 2 2000))))   ;; 2
     ;; Concurrent writes: both survive.
-    println $ mv-values $ join
-      mv-set(mv-new((quote alice)) 1 1000)
-      mv-set(mv-new((quote bob)) 2 1000)     ;; 2
+    println(mv-values(join(mv-set(mv-new(replica((quote alice))) 1 1000)
+                           mv-set(mv-new(replica((quote bob))) 2 1000))))     ;; 2
     0
 ```
 
@@ -237,16 +248,17 @@ dispatches to `V`'s own instance:
 
 ```turmeric
 (defmodule demo
+  (import crdt/replica :refer [replica])
   (import crdt/ormap :refer [ORMap ormap-new ormap-put ormap-get ormap-count])
 
   (defn hi [] : (ORMap MaxI)
     (:: (ormap-put (:: (ormap-new) (ORMap MaxI))
-                   (quote alice) (quote temp) (:: 21 MaxI))
+                   (replica (quote alice)) (quote temp) (:: 21 MaxI))
         (ORMap MaxI)))
 
   (defn lo [] : (ORMap MaxI)
     (:: (ormap-put (:: (ormap-new) (ORMap MaxI))
-                   (quote bob) (quote temp) (:: 19 MaxI))
+                   (replica (quote bob)) (quote temp) (:: 19 MaxI))
         (ORMap MaxI)))
 
   (defn main [] : int
@@ -258,19 +270,21 @@ dispatches to `V`'s own instance:
 
 ```sweet-exp
 defmodule demo
+  import crdt/replica :refer [replica]
   import crdt/ormap :refer [ORMap ormap-new ormap-put ormap-get ormap-count]
   defn hi [] : (ORMap MaxI)
     :: (ormap-put (:: (ormap-new) (ORMap MaxI))
-                   (quote alice) (quote temp) (:: 21 MaxI))
+                   replica((quote alice)) (quote temp) (:: 21 MaxI))
        (ORMap MaxI)
   defn lo [] : (ORMap MaxI)
     :: (ormap-put (:: (ormap-new) (ORMap MaxI))
-                   (quote bob) (quote temp) (:: 19 MaxI))
+                   replica((quote bob)) (quote temp) (:: 19 MaxI))
        (ORMap MaxI)
   defn main [] : int
-    println $ :: (:: (ormap-get (:: (join (hi) (lo)) (ORMap MaxI)) (quote temp))
-                     MaxI)
-                 int   ;; 21 -- MaxI's join
+    println
+      (:: (:: (ormap-get (:: (join (hi) (lo)) (ORMap MaxI)) (quote temp))
+              MaxI)
+          int)   ;; 21 -- MaxI's join
     0
 ```
 
@@ -294,9 +308,9 @@ receiver folds in with `apply-delta`:
 
 ```turmeric
 (defmodule demo
-  (import crdt/counter :refer [replica GCounter gcounter-new gcounter-bump
-                               gcounter-value gcounter-delta-bump
-                               apply-delta])
+  (import crdt/replica :refer [replica])
+  (import crdt/counter :refer [GCounter gcounter-new gcounter-bump
+                               gcounter-value gcounter-delta-bump])
 
   (defn alice [] : GCounter
     (gcounter-bump (gcounter-new) (replica (quote alice)) 3))
@@ -313,9 +327,9 @@ receiver folds in with `apply-delta`:
 
 ```sweet-exp
 defmodule demo
-  import crdt/counter :refer [replica GCounter gcounter-new gcounter-bump
-                               gcounter-value gcounter-delta-bump
-                               apply-delta]
+  import crdt/replica :refer [replica]
+  import crdt/counter :refer [GCounter gcounter-new gcounter-bump
+                               gcounter-value gcounter-delta-bump]
   defn alice [] : GCounter
     gcounter-bump(gcounter-new() replica((quote alice)) 3)
   defn bob [] : GCounter
@@ -366,12 +380,13 @@ that forest.
 
 ```turmeric
 (defmodule demo
+  (import crdt/replica :refer [replica])
   (import crdt/rga :refer [Rga rga-new rga-append rga-insert rga-delete
                            rga-get rga-len rga-size])
 
   (defn main [] : int
-    (let [d (rga-append (rga-append (rga-new) (quote alice) 72)
-                        (quote alice) 105)]
+    (let [d (rga-append (rga-append (rga-new) (replica (quote alice)) 72)
+                        (replica (quote alice)) 105)]
       (println (rga-len d))      ;; 2
       (println (rga-get d 1)))   ;; 105 -- character codes
     0))
@@ -379,11 +394,12 @@ that forest.
 
 ```sweet-exp
 defmodule demo
+  import crdt/replica :refer [replica]
   import crdt/rga :refer [Rga rga-new rga-append rga-insert rga-delete
                            rga-get rga-len rga-size]
   defn main [] : int
-    let [d rga-append(rga-append(rga-new() (quote alice) 72)
-                        (quote alice) 105)]
+    let [d rga-append(rga-append(rga-new() replica((quote alice)) 72)
+                        replica((quote alice)) 105)]
       println $ rga-len d      ;; 2
       println $ rga-get d 1    ;; 105 -- character codes
     0
@@ -463,8 +479,10 @@ replica does not hand its state away and keep using it either.
   needs a set iterator the stdlib `Set` API does not expose. The lattice law
   helpers are correspondingly weaker for those two types, which is why the
   OR-Set has a convergence fuzzer AND hand-written scenarios.
-- **`ReplicaId` is a `defalias`, not a newtype**, so it buys no type safety
-  and cannot be exported.
+- **A full join costs microseconds per entry, and more as the state
+  grows**: about 1.4 us an entry for a 1024-replica `GCounter`, 11 us at
+  65536. Ship deltas; an `ORSet` add delta costs microseconds at any size.
+  `bench/run.sh` in the spice has the numbers.
 
 ---
 
@@ -485,5 +503,5 @@ replaying the seed, and a failing case prints its seed.
 
 - [API reference](api/)
 - [README](../../spices/crdt/README.md) -- the full type catalog and status table
-- [Design plan](https://github.com/turmeric-lang/turmeric/blob/main/docs/upcoming/crdt-spice-plan.md) -- the six-phase roadmap
+- [Design plan](https://github.com/turmeric-lang/turmeric/blob/main/docs/upcoming/spices/crdt-spice-plan.md) -- the six-phase roadmap
 - [Lattice typeclass guide](https://turmeric-lang.com/docs/html/guides/lattice-guide.html) -- `JoinSemilattice`, `BoundedJoin`
