@@ -6,167 +6,167 @@
 ;; server-add-method takes a captureless `(c-fn ...)` handler that is
 ;; registered directly with liblo's dispatch loop -- no trampoline needed,
 ;; since c-fn parameters lower to the bare C-ABI function pointer.
-
 (defmodule osc/server
   (export Server
-          server-new server-new-tcp server-free
-          server-add-method server-recv server-recv-noblock)
-
-;;; Server -- opaque handle to a liblo lo_server_thread.
-;;;
-;;; Stored as int64_t (cast through intptr_t). server-new / server-new-tcp
-;;; return (Result Server int); extract the handle with stdlib `ok-val`
-;;; after checking ok?. Release with server-free.
-;;;
-;;; Since: OSC1
-(defopaque Server :int)
-
-;; -------------------------------------------------------------------------
-;; Public API
-;; -------------------------------------------------------------------------
-
-;;; server-new -- create a new UDP OSC server thread on the given port.
-;;;
-;;; Parameters:
-;;;   port  -- port string (e.g. "7770"); passed directly to liblo
-;;;   proto -- ignored; always creates a UDP server in this implementation
-;;;
-;;; Returns:
-;;;   (Result Server int) -- ok carries the Server handle; err carries 0
-;;;   when lo_server_thread_new fails.
-;;;
-;;; Example:
-;;;   (let [r (server-new "7770" "udp")]
-;;;     (if (ok? r) (let [s (ok-val r)] ...) (println "server-new failed")))
-;;;
-;;; Since: OSC0
-(defn server-new [port : cstr proto : cstr] : (Result Server int)
-  ```c
-  #include <lo/lo.h>
+    server-new
+    server-new-tcp
+    server-free
+    server-add-method
+    server-recv
+    server-recv-noblock)
+  ;;; Server -- opaque handle to a liblo lo_server_thread.
+  ;;;
+  ;;; Stored as int64_t (cast through intptr_t). server-new / server-new-tcp
+  ;;; return (Result Server int); extract the handle with stdlib `ok-val`
+  ;;; after checking ok?. Release with server-free.
+  ;;;
+  ;;; Since: OSC1
+  (defopaque Server :int)
+  ;; -------------------------------------------------------------------------
+  ;; Public API
+  ;; -------------------------------------------------------------------------
+  ;;; server-new -- create a new UDP OSC server thread on the given port.
+  ;;;
+  ;;; Parameters:
+  ;;;   port  -- port string (e.g. "7770"); passed directly to liblo
+  ;;;   proto -- ignored; always creates a UDP server in this implementation
+  ;;;
+  ;;; Returns:
+  ;;;   (Result Server int) -- ok carries the Server handle; err carries 0
+  ;;;   when lo_server_thread_new fails.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (server-new "7770" "udp")]
+  ;;;     (if (ok? r) (let [s (ok-val r)] ...) (println "server-new failed")))
+  ;;;
+  ;;; Since: OSC0
+  (defn server-new [port : cstr proto : cstr] : (Result Server int)
+    ```c
+    #include <lo/lo.h>
   (void)proto; /* proto arg reserved; always UDP in this implementation */
   lo_server_thread st = lo_server_thread_new((const char *)port, NULL);
   if (!st) return tur_err_int(0);
   lo_server_thread_start(st);
   return tur_ok_ptr(st);
   ```)
-
-;;; server-new-tcp -- create a new TCP OSC server thread on the given port.
-;;;
-;;; Parameters:
-;;;   port -- port string (e.g. "7771")
-;;;
-;;; Returns:
-;;;   (Result Server int) -- ok carries the Server handle; err carries 0
-;;;   on failure.
-;;;
-;;; Example:
-;;;   (let [r (server-new-tcp "7771")]
-;;;     (if (ok? r) (let [s (ok-val r)] ...) (println "server-new-tcp failed")))
-;;;
-;;; Since: OSC0
-(defn server-new-tcp [port : cstr] : (Result Server int)
-  ```c
-  #include <lo/lo.h>
+  ;;; server-new-tcp -- create a new TCP OSC server thread on the given port.
+  ;;;
+  ;;; Parameters:
+  ;;;   port -- port string (e.g. "7771")
+  ;;;
+  ;;; Returns:
+  ;;;   (Result Server int) -- ok carries the Server handle; err carries 0
+  ;;;   on failure.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (server-new-tcp "7771")]
+  ;;;     (if (ok? r) (let [s (ok-val r)] ...) (println "server-new-tcp failed")))
+  ;;;
+  ;;; Since: OSC0
+  (defn server-new-tcp [port : cstr] : (Result Server int)
+    ```c
+    #include <lo/lo.h>
   lo_server_thread st = lo_server_thread_new_with_proto((const char *)port,
                                                         LO_TCP, NULL);
   if (!st) return tur_err_int(0);
   lo_server_thread_start(st);
   return tur_ok_ptr(st);
   ```)
-
-;;; server-free -- stop and free a server thread created by server-new or server-new-tcp.
-;;;
-;;; Parameters:
-;;;   s -- st-ptr (ok-val from server-new or server-new-tcp)
-;;;
-;;; Returns:
-;;;   void
-;;;
-;;; Example:
-;;;   (server-free s)
-;;;
-;;; Since: OSC0
-(defn server-free [s : Server] : void
-  ```c
-  #include <lo/lo.h>
+  ;;; server-free -- stop and free a server thread created by server-new or server-new-tcp.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- st-ptr (ok-val from server-new or server-new-tcp)
+  ;;;
+  ;;; Returns:
+  ;;;   void
+  ;;;
+  ;;; Example:
+  ;;;   (server-free s)
+  ;;;
+  ;;; Since: OSC0
+  (defn server-free [s : Server] : void
+    ```c
+    #include <lo/lo.h>
   lo_server_thread st = (lo_server_thread)(intptr_t)s;
   lo_server_thread_stop(st);
   lo_server_thread_free(st);
   ```)
-
-;;; server-add-method -- register a handler for an OSC path and type spec.
-;;;
-;;; Parameters:
-;;;   s        -- st-ptr (ok-val from server-new)
-;;;   path     -- OSC address path string (e.g. "/synth/freq"); NULL matches all
-;;;   typespec -- OSC type tag string (e.g. "f"); NULL matches all
-;;;   handler  -- captureless C-ABI liblo method handler of shape
-;;;               `int (*)(const char *path, const char *types,
-;;;                        lo_arg **argv, int argc, lo_message msg,
-;;;                        void *user)` -- spelled
-;;;               `(c-fn [cstr cstr ptr<void> int ptr<void> ptr<void>] int)`
-;;;
-;;; Returns:
-;;;   void
-;;;
-;;; Example:
-;;;   (defn noop-handler [p : cstr t : cstr argv : ptr<void> argc : int
-;;;                       msg : ptr<void> user : ptr<void>] : int
-;;;     0)
-;;;   (server-add-method s "/synth/freq" "f" noop-handler)
-;;;
-;;; Since: OSC0
-(defn server-add-method
-  [s : Server path : cstr typespec : cstr
-   handler : (c-fn [cstr cstr ptr<void> int ptr<void> ptr<void>] int)] : void
-  ```c
-  #include <lo/lo.h>
+  ;;; server-add-method -- register a handler for an OSC path and type spec.
+  ;;;
+  ;;; Parameters:
+  ;;;   s        -- st-ptr (ok-val from server-new)
+  ;;;   path     -- OSC address path string (e.g. "/synth/freq"); NULL matches all
+  ;;;   typespec -- OSC type tag string (e.g. "f"); NULL matches all
+  ;;;   handler  -- captureless C-ABI liblo method handler of shape
+  ;;;               `int (*)(const char *path, const char *types,
+  ;;;                        lo_arg **argv, int argc, lo_message msg,
+  ;;;                        void *user)` -- spelled
+  ;;;               `(c-fn [cstr cstr ptr<void> int ptr<void> ptr<void>] int)`
+  ;;;
+  ;;; Returns:
+  ;;;   void
+  ;;;
+  ;;; Example:
+  ;;;   (defn noop-handler [p : cstr t : cstr argv : ptr<void> argc : int
+  ;;;                       msg : ptr<void> user : ptr<void>] : int
+  ;;;     0)
+  ;;;   (server-add-method s "/synth/freq" "f" noop-handler)
+  ;;;
+  ;;; Since: OSC0
+  (defn server-add-method [s : Server
+                           path : cstr
+                           typespec : cstr
+                           handler : (c-fn [cstr
+                                            cstr
+                                            ptr<void>
+                                            int
+                                            ptr<void>
+                                            ptr<void>]
+                                       int)] : void
+    ```c
+    #include <lo/lo.h>
   lo_server_thread st = (lo_server_thread)(intptr_t)s;
   lo_server_thread_add_method(st,
     path ? (const char *)path : NULL,
     typespec ? (const char *)typespec : NULL,
     (lo_method_handler)handler, NULL);
   ```)
-
-;;; server-recv -- dispatch pending OSC messages, blocking up to timeout-ms milliseconds.
-;;;
-;;; Parameters:
-;;;   s          -- st-ptr (ok-val from server-new)
-;;;   timeout-ms -- maximum wait time in milliseconds
-;;;
-;;; Returns:
-;;;   Number of messages dispatched as :int.
-;;;
-;;; Example:
-;;;   (server-recv s 100)  ; => 1
-;;;
-;;; Since: OSC0
-(defn server-recv [s : Server timeout-ms : Server] : int
-  ```c
-  #include <lo/lo.h>
+  ;;; server-recv -- dispatch pending OSC messages, blocking up to timeout-ms milliseconds.
+  ;;;
+  ;;; Parameters:
+  ;;;   s          -- st-ptr (ok-val from server-new)
+  ;;;   timeout-ms -- maximum wait time in milliseconds
+  ;;;
+  ;;; Returns:
+  ;;;   Number of messages dispatched as :int.
+  ;;;
+  ;;; Example:
+  ;;;   (server-recv s 100)  ; => 1
+  ;;;
+  ;;; Since: OSC0
+  (defn server-recv [s : Server timeout-ms : Server] : int
+    ```c
+    #include <lo/lo.h>
   lo_server_thread st = (lo_server_thread)(intptr_t)s;
   lo_server srv = lo_server_thread_get_server(st);
   return (int64_t)lo_server_recv_noblock(srv, (int)timeout_ms);
   ```)
-
-;;; server-recv-noblock -- dispatch any pending OSC messages without blocking.
-;;;
-;;; Parameters:
-;;;   s -- st-ptr (ok-val from server-new)
-;;;
-;;; Returns:
-;;;   Number of messages dispatched as :int (0 if none pending).
-;;;
-;;; Example:
-;;;   (server-recv-noblock s)  ; => 0
-;;;
-;;; Since: OSC0
-(defn server-recv-noblock [s : Server] : int
-  ```c
-  #include <lo/lo.h>
+  ;;; server-recv-noblock -- dispatch any pending OSC messages without blocking.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- st-ptr (ok-val from server-new)
+  ;;;
+  ;;; Returns:
+  ;;;   Number of messages dispatched as :int (0 if none pending).
+  ;;;
+  ;;; Example:
+  ;;;   (server-recv-noblock s)  ; => 0
+  ;;;
+  ;;; Since: OSC0
+  (defn server-recv-noblock [s : Server] : int
+    ```c
+    #include <lo/lo.h>
   lo_server_thread st = (lo_server_thread)(intptr_t)s;
   lo_server srv = lo_server_thread_get_server(st);
   return (int64_t)lo_server_recv_noblock(srv, 0);
-  ```)
-
-) ;; end defmodule osc/server
+  ```)) ;; end defmodule osc/server

@@ -5,26 +5,42 @@
 ;; document is chosen to straddle every boundary that matters -- a chunk
 ;; split inside a tag, an attribute value, an entity reference, a CDATA
 ;; terminator and a multi-byte UTF-8 sequence.
-
-(defmodule sax_push_test (export)
-
-(import dom/ownstr :refer [String to-cstr])
-(import dom/core   :refer [ParseError parse-error-message])
-(import dom/event  :refer [SaxEvent SaxControl Attr StartElement EndElement
-                           Chars Comment Pi StartCdata EndCdata Doctype
-                           Continue Stop])
-(import xml/sax    :refer [SaxParser sax-parser-new sax-feed! sax-finish!
-                           sax-parser-free sax-parse-string sax-parse-file])
-(import test/suite  :refer [describe it])
-(import test/assert :refer [assert-true assert-eq])
-(import test/runner :refer [run-all-status])
-
-;; ---- trace buffers: A (reference) and B (under test) ----------------------
-
-;;; __t-reset -- clear trace `which` (0 or 1).
-(defn __t-reset [which : int] : nil
-  ```c
-  /* __tur_include__: #include <stddef.h> */
+(defmodule sax_push_test
+  (export)
+  (import dom/ownstr :refer [String to-cstr])
+  (import dom/core :refer [ParseError parse-error-message])
+  (import dom/event
+    :refer
+    [SaxEvent
+     SaxControl
+     Attr
+     StartElement
+     EndElement
+     Chars
+     Comment
+     Pi
+     StartCdata
+     EndCdata
+     Doctype
+     Continue
+     Stop])
+  (import xml/sax
+    :refer
+    [SaxParser
+     sax-parser-new
+     sax-feed!
+     sax-finish!
+     sax-parser-free
+     sax-parse-string
+     sax-parse-file])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true assert-eq])
+  (import test/runner :refer [run-all-status])
+  ;; ---- trace buffers: A (reference) and B (under test) ----------------------
+  ;;; __t-reset -- clear trace `which` (0 or 1).
+  (defn __t-reset [which : int] : nil
+    ```c
+    /* __tur_include__: #include <stddef.h> */
   /* __tur_include__: #include <stdint.h> */
   /* __tur_include__: static char *g_tr[2] = {0, 0}; */
   /* __tur_include__: static size_t g_tr_len[2] = {0, 0}, g_tr_cap[2] = {0, 0}; */
@@ -33,11 +49,10 @@
   if (g_tr[which]) g_tr[which][0] = '\0';
   g_tr_cur = (int)which;
   ```)
-
-;;; __t-put -- append to the current trace.
-(defn __t-put [s : cstr] : nil
-  ```c
-  int w = g_tr_cur;
+  ;;; __t-put -- append to the current trace.
+  (defn __t-put [s : cstr] : nil
+    ```c
+    int w = g_tr_cur;
   size_t n = strlen((const char *)s);
   if (g_tr_len[w] + n + 1 > g_tr_cap[w]) {
     size_t cap = g_tr_cap[w] ? g_tr_cap[w] : 256;
@@ -49,58 +64,70 @@
   g_tr_len[w] += n;
   g_tr[w][g_tr_len[w]] = '\0';
   ```)
-
-;;; __t-same? -- are the two traces identical (and non-empty)?
-(defn __t-same? [] : bool
-  ```c
-  #include <stdio.h>
+  ;;; __t-same? -- are the two traces identical (and non-empty)?
+  (defn __t-same? [] : bool
+    ```c
+    #include <stdio.h>
   const char *a = g_tr[0] ? g_tr[0] : "", *b = g_tr[1] ? g_tr[1] : "";
   if (a[0] && strcmp(a, b) == 0) return true;
   fprintf(stderr, "# traces differ\n# one-shot: [%s]\n# pushed:   [%s]\n", a, b);
   return false;
   ```)
-
-;;; __t-is? -- is the current trace exactly `want`?
-(defn __t-is? [want : cstr] : bool
-  ```c
-  #include <stdio.h>
+  ;;; __t-is? -- is the current trace exactly `want`?
+  (defn __t-is? [want : cstr] : bool
+    ```c
+    #include <stdio.h>
   const char *got = g_tr[g_tr_cur] ? g_tr[g_tr_cur] : "";
   if (strcmp(got, (const char *)want) == 0) return true;
   fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
   return false;
   ```)
-
-;;; __trace-attrs -- " name=value" per attribute.
-(defn __trace-attrs [xs : (Cons Attr)] : nil
-  (if (tnil? xs)
-    nil
-    (do (__t-put " ") (__t-put (to-cstr (.name (thead xs))))
-        (__t-put "=") (__t-put (to-cstr (.value (thead xs))))
+  ;;; __trace-attrs -- " name=value" per attribute.
+  (defn __trace-attrs [xs : (Cons Attr)] : nil
+    (if (tnil? xs)
+      nil
+      (do
+        (__t-put " ")
+        (__t-put (to-cstr (.name (thead xs))))
+        (__t-put "=")
+        (__t-put (to-cstr (.value (thead xs))))
         (__trace-attrs (ttail xs)))))
-
-;;; trace -- record one event and continue.
-(defn trace [e : SaxEvent] : SaxControl
-  (do
-    (match e
-      (StartElement n as) (do (__t-put "S ") (__t-put (to-cstr n))
-                              (__trace-attrs as) (__t-put "|"))
-      (EndElement n)      (do (__t-put "E ") (__t-put (to-cstr n)) (__t-put "|"))
-      (Chars t)           (do (__t-put "T ") (__t-put (to-cstr t)) (__t-put "|"))
-      (Comment t)         (do (__t-put "C ") (__t-put (to-cstr t)) (__t-put "|"))
-      (Pi t d)            (do (__t-put "P ") (__t-put (to-cstr t)) (__t-put " ")
-                              (__t-put (to-cstr d)) (__t-put "|"))
-      (StartCdata)        (__t-put "[|")
-      (EndCdata)          (__t-put "]|")
-      (Doctype n p s)     (do (__t-put "D ") (__t-put (to-cstr n)) (__t-put "|")))
-    (Continue)))
-
-;; ---- input helpers --------------------------------------------------------
-
-;;; __doc -- the boundary-straddling document (UTF-8, built in C so the test
-;;; source stays ASCII).
-(defn __doc [] : cstr
-  ```c
-  return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+  ;;; trace -- record one event and continue.
+  (defn trace [e : SaxEvent] : SaxControl
+    (do
+      (match e
+        (StartElement n as)
+        (do
+          (__t-put "S ")
+          (__t-put (to-cstr n))
+          (__trace-attrs as)
+          (__t-put "|"))
+        (EndElement n)
+        (do (__t-put "E ") (__t-put (to-cstr n)) (__t-put "|"))
+        (Chars t)
+        (do (__t-put "T ") (__t-put (to-cstr t)) (__t-put "|"))
+        (Comment t)
+        (do (__t-put "C ") (__t-put (to-cstr t)) (__t-put "|"))
+        (Pi t d)
+        (do
+          (__t-put "P ")
+          (__t-put (to-cstr t))
+          (__t-put " ")
+          (__t-put (to-cstr d))
+          (__t-put "|"))
+        (StartCdata)
+        (__t-put "[|")
+        (EndCdata)
+        (__t-put "]|")
+        (Doctype n p s)
+        (do (__t-put "D ") (__t-put (to-cstr n)) (__t-put "|")))
+      (Continue)))
+  ;; ---- input helpers --------------------------------------------------------
+  ;;; __doc -- the boundary-straddling document (UTF-8, built in C so the test
+  ;;; source stays ASCII).
+  (defn __doc [] : cstr
+    ```c
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
          "<!DOCTYPE feed [<!ENTITY co \"Turmeric &amp; Co\">]>\n"
          "<feed xmlns=\"http://www.w3.org/2005/Atom\" xmlns:m=\"urn:m\">\n"
          "  <!-- a comment that is long enough to be split -->\n"
@@ -113,120 +140,108 @@
          "  </entry>\n"
          "</feed>\n";
   ```)
-
-;;; __len -- byte length of a cstr.
-(defn __len [s : cstr] : int
-  ```c
-  return (int64_t)strlen((const char *)s);
+  ;;; __len -- byte length of a cstr.
+  (defn __len [s : cstr] : int
+    ```c
+    return (int64_t)strlen((const char *)s);
   ```)
-
-;;; __slice -- malloc'd copy of s[off, off+n).
-(defn __slice [s : cstr off : int n : int] : cstr
-  ```c
-  char *p = (char *)malloc((size_t)n + 1);
+  ;;; __slice -- malloc'd copy of s[off, off+n).
+  (defn __slice [s : cstr off : int n : int] : cstr
+    ```c
+    char *p = (char *)malloc((size_t)n + 1);
   memcpy(p, (const char *)s + off, (size_t)n);
   p[n] = '\0';
   return p;
   ```)
-
-;;; __rand -- next value of a xorshift generator seeded by `seed`.
-(defn __rand-seed [seed : int] : nil
-  ```c
-  /* __tur_include__: static uint64_t g_rng = 88172645463325252ULL; */
+  ;;; __rand -- next value of a xorshift generator seeded by `seed`.
+  (defn __rand-seed [seed : int] : nil
+    ```c
+    /* __tur_include__: static uint64_t g_rng = 88172645463325252ULL; */
   g_rng = (uint64_t)seed * 2654435761ULL + 1;
   ```)
-
-;;; __rand-chunk -- a chunk size in [1, max].
-(defn __rand-chunk [max : int] : int
-  ```c
-  g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
+  ;;; __rand-chunk -- a chunk size in [1, max].
+  (defn __rand-chunk [max : int] : int
+    ```c
+    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
   return (int64_t)(g_rng % (uint64_t)max) + 1;
   ```)
-
-;;; __free-cstr -- free a malloc'd cstr.
-(defn __free-cstr [s : cstr] : nil
-  ```c
-  free((void *)s);
+  ;;; __free-cstr -- free a malloc'd cstr.
+  (defn __free-cstr [s : cstr] : nil
+    ```c
+    free((void *)s);
   ```)
-
-;; ---- driving the push parser ----------------------------------------------
-
-;;; feed-fixed -- feed src in `step`-byte chunks; true when all feeds were ok.
-;;;
-;;; A while loop, not self-recursion: sax-feed! calls the handler closure, so
-;;; a recursive feeder is CPS-converted and nests a frame chain per chunk --
-;;; ~1000 of them for this document fed one byte at a time.
-(defn feed-fixed [p : SaxParser src : cstr len : int step : int] : bool
-  (let [^mut off 0
-        ^mut ok  true]
-    (while (< off len)
-      (let [n     (if (> (+ off step) len) (- len off) step)
-            chunk (__slice src off n)
-            r     (sax-feed! p chunk)]
-        (__free-cstr chunk)
-        (match r (Ok _) nil (Err _) (set! ok false))
-        (set! off (+ off n))))
-    ok))
-
-;;; feed-random -- feed src in random chunks of 1..max bytes.
-(defn feed-random [p : SaxParser src : cstr len : int max : int] : bool
-  (let [^mut off 0
-        ^mut ok  true]
-    (while (< off len)
-      (let [want  (__rand-chunk max)
-            n     (if (> (+ off want) len) (- len off) want)
-            chunk (__slice src off n)
-            r     (sax-feed! p chunk)]
-        (__free-cstr chunk)
-        (match r (Ok _) nil (Err _) (set! ok false))
-        (set! off (+ off n))))
-    ok))
-
-;;; finished? -- finish and free; true when the finish was ok.
-(defn finished? [p : SaxParser] : bool
-  (let [r (sax-finish! p)]
-    (sax-parser-free p)
-    (match r (Ok _) true (Err e) (do (println (parse-error-message e)) false))))
-
-;;; reference -- trace the one-shot parse into buffer 0.
-(defn reference [src : cstr] : bool
-  (do (__t-reset 0)
+  ;; ---- driving the push parser ----------------------------------------------
+  ;;; feed-fixed -- feed src in `step`-byte chunks; true when all feeds were ok.
+  ;;;
+  ;;; A while loop, not self-recursion: sax-feed! calls the handler closure, so
+  ;;; a recursive feeder is CPS-converted and nests a frame chain per chunk --
+  ;;; ~1000 of them for this document fed one byte at a time.
+  (defn feed-fixed [p : SaxParser src : cstr len : int step : int] : bool
+    (let [^mut off 0
+          ^mut ok  true]
+      (while (< off len)
+        (let [n     (if (> (+ off step) len) (- len off) step)
+              chunk (__slice src off n)
+              r     (sax-feed! p chunk)]
+          (__free-cstr chunk)
+          (match r (Ok _) nil (Err _) (set! ok false))
+          (set! off (+ off n))))
+      ok))
+  ;;; feed-random -- feed src in random chunks of 1..max bytes.
+  (defn feed-random [p : SaxParser src : cstr len : int max : int] : bool
+    (let [^mut off 0
+          ^mut ok  true]
+      (while (< off len)
+        (let [want  (__rand-chunk max)
+              n     (if (> (+ off want) len) (- len off) want)
+              chunk (__slice src off n)
+              r     (sax-feed! p chunk)]
+          (__free-cstr chunk)
+          (match r (Ok _) nil (Err _) (set! ok false))
+          (set! off (+ off n))))
+      ok))
+  ;;; finished? -- finish and free; true when the finish was ok.
+  (defn finished? [p : SaxParser] : bool
+    (let [r (sax-finish! p)]
+      (sax-parser-free p)
+      (match r (Ok _) true (Err e) (do (println (parse-error-message e)) false))))
+  ;;; reference -- trace the one-shot parse into buffer 0.
+  (defn reference [src : cstr] : bool
+    (do
+      (__t-reset 0)
       (match (sax-parse-string src trace) (Ok _) true (Err _) false)))
-
-;;; pushed-fixed? -- trace a fixed-step push into buffer 1 and compare.
-(defn pushed-fixed? [src : cstr step : int] : bool
-  (and (reference src)
-       (do (__t-reset 1)
-           (match (sax-parser-new trace)
-             (Err _) false
-             (Ok p)  (and (feed-fixed p src (__len src) step)
-                          (finished? p)
-                          (__t-same?))))))
-
-;;; pushed-random? -- trace a random-chunk push into buffer 1 and compare.
-(defn pushed-random? [src : cstr seed : int max : int] : bool
-  (and (reference src)
-       (do (__rand-seed seed)
-           (__t-reset 1)
-           (match (sax-parser-new trace)
-             (Err _) false
-             (Ok p)  (and (feed-random p src (__len src) max)
-                          (finished? p)
-                          (__t-same?))))))
-
-;;; seeds-ok? -- pushed-random? for seeds 1..n.
-(defn seeds-ok? [src : cstr seed : int n : int] : bool
-  (if (> seed n)
-    true
-    (and (pushed-random? src seed 17) (seeds-ok? src (+ seed 1) n))))
-
-;; ---- encodings ------------------------------------------------------------
-
-;;; __write-utf16 -- write "<a>X</a>" as UTF-16 with a BOM (le = 1 for LE),
-;;; X being U+00E9 U+20AC; returns the malloc'd path.
-(defn __write-utf16 [le : bool] : cstr
-  ```c
-  #include <stdio.h>
+  ;;; pushed-fixed? -- trace a fixed-step push into buffer 1 and compare.
+  (defn pushed-fixed? [src : cstr step : int] : bool
+    (and (reference src)
+      (do
+        (__t-reset 1)
+        (match (sax-parser-new trace)
+          (Err _)
+          false
+          (Ok p)
+          (and (feed-fixed p src (__len src) step) (finished? p) (__t-same?))))))
+  ;;; pushed-random? -- trace a random-chunk push into buffer 1 and compare.
+  (defn pushed-random? [src : cstr seed : int max : int] : bool
+    (and (reference src)
+      (do
+        (__rand-seed seed)
+        (__t-reset 1)
+        (match (sax-parser-new trace)
+          (Err _)
+          false
+          (Ok p)
+          (and (feed-random p src (__len src) max) (finished? p) (__t-same?))))))
+  ;;; seeds-ok? -- pushed-random? for seeds 1..n.
+  (defn seeds-ok? [src : cstr seed : int n : int] : bool
+    (if (> seed n)
+      true
+      (and (pushed-random? src seed 17) (seeds-ok? src (+ seed 1) n))))
+  ;; ---- encodings ------------------------------------------------------------
+  ;;; __write-utf16 -- write "<a>X</a>" as UTF-16 with a BOM (le = 1 for LE),
+  ;;; X being U+00E9 U+20AC; returns the malloc'd path.
+  (defn __write-utf16 [le : bool] : cstr
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   #include <unistd.h>
   static const uint16_t units[] = { 0xFEFF, '<', 'a', '>', 0x00E9, 0x20AC,
@@ -243,89 +258,91 @@
   close(fd);
   return strdup(tmpl);
   ```)
-
-;;; __latin1-doc -- an ISO-8859-1 document whose text is the byte 0xE9.
-(defn __latin1-doc [] : cstr
-  ```c
-  return "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>\xE9</a>";
+  ;;; __latin1-doc -- an ISO-8859-1 document whose text is the byte 0xE9.
+  (defn __latin1-doc [] : cstr
+    ```c
+    return "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>\xE9</a>";
   ```)
-
-;;; __utf8-want -- the trace a UTF-16 / Latin-1 document should produce.
-(defn __want-e-euro [] : cstr
-  ```c
-  return "S a|T \xC3\xA9\xE2\x82\xAC|E a|";
+  ;;; __utf8-want -- the trace a UTF-16 / Latin-1 document should produce.
+  (defn __want-e-euro [] : cstr
+    ```c
+    return "S a|T \xC3\xA9\xE2\x82\xAC|E a|";
   ```)
-
-;;; __want-e -- the trace of the Latin-1 document.
-(defn __want-e [] : cstr
-  ```c
-  return "S a|T \xC3\xA9|E a|";
+  ;;; __want-e -- the trace of the Latin-1 document.
+  (defn __want-e [] : cstr
+    ```c
+    return "S a|T \xC3\xA9|E a|";
   ```)
-
-;;; file-traces? -- trace a file parse into buffer 0 and compare.
-(defn file-traces? [path : cstr want : cstr] : bool
-  (do (__t-reset 0)
+  ;;; file-traces? -- trace a file parse into buffer 0 and compare.
+  (defn file-traces? [path : cstr want : cstr] : bool
+    (do
+      (__t-reset 0)
       (match (sax-parse-file path trace)
-        (Ok _)  (__t-is? want)
-        (Err e) (do (println (parse-error-message e)) false))))
-
-(defn __all-tests [] : void
-  (describe "xml/sax -- push parser"
-    (it "one byte at a time gives the one-shot events"
-      (pushed-fixed? (__doc) 1))
-    (it "two, three and seven bytes at a time give the one-shot events"
-      (and (pushed-fixed? (__doc) 2)
-           (and (pushed-fixed? (__doc) 3) (pushed-fixed? (__doc) 7))))
-    (it "random chunk sizes (20 seeds) give the one-shot events"
-      (seeds-ok? (__doc) 1 20))
-    (it "the whole document as one chunk gives the one-shot events"
-      (pushed-fixed? (__doc) 100000))
-    (it "a malformed chunk fails, and later feeds keep failing"
-      (match (sax-parser-new trace)
-        (Err _) false
-        (Ok p)  (let [a (sax-feed! p "<a><b>")
-                      b (sax-feed! p "</c>")
-                      c (sax-feed! p "</a>")]
-                  (sax-parser-free p)
-                  (and (match a (Ok _) true (Err _) false)
-                       (and (match b (Ok _) false (Err _) true)
-                            (match c (Ok _) false (Err _) true))))))
-    (it "ending the input inside the root fails at finish"
-      (match (sax-parser-new trace)
-        (Err _) false
-        (Ok p)  (let [a (sax-feed! p "<a><b/>")
-                      b (sax-finish! p)]
-                  (sax-parser-free p)
-                  (and (match a (Ok _) true (Err _) false)
-                       (match b (Ok _) false (Err _) true)))))
-    (it "after Stop, further chunks are accepted and ignored"
-      (do (__t-reset 1)
-          (match (sax-parser-new
-                   (fn [e : SaxEvent] : SaxControl
-                     (match e
-                       (StartElement n _) (do (__t-put (to-cstr n)) (Stop))
-                       _ (Continue))))
-            (Err _) false
-            (Ok p)  (let [a (sax-feed! p "<a><b/>")
-                          b (sax-feed! p "</nonsense>")
-                          c (sax-finish! p)]
-                      (sax-parser-free p)
-                      (and (__t-is? "a")
-                           (match c (Ok _) true (Err _) false)))))))
-
-  (describe "xml/sax -- encodings"
-    (it "UTF-16LE with a BOM"
-      (file-traces? (__write-utf16 true) (__want-e-euro)))
-    (it "UTF-16BE with a BOM"
-      (file-traces? (__write-utf16 false) (__want-e-euro)))
-    (it "ISO-8859-1 named in the XML declaration is delivered as UTF-8"
-      (do (__t-reset 0)
+        (Ok _)
+        (__t-is? want)
+        (Err e)
+        (do (println (parse-error-message e)) false))))
+  (defn __all-tests [] : void
+    (describe "xml/sax -- push parser"
+      (it "one byte at a time gives the one-shot events"
+        (pushed-fixed? (__doc) 1))
+      (it "two, three and seven bytes at a time give the one-shot events"
+        (and (pushed-fixed? (__doc) 2)
+          (and (pushed-fixed? (__doc) 3) (pushed-fixed? (__doc) 7))))
+      (it "random chunk sizes (20 seeds) give the one-shot events"
+        (seeds-ok? (__doc) 1 20))
+      (it "the whole document as one chunk gives the one-shot events"
+        (pushed-fixed? (__doc) 100000))
+      (it "a malformed chunk fails, and later feeds keep failing"
+        (match (sax-parser-new trace)
+          (Err _)
+          false
+          (Ok p)
+          (let [a (sax-feed! p "<a><b>")
+                b (sax-feed! p "</c>")
+                c (sax-feed! p "</a>")]
+            (sax-parser-free p)
+            (and (match a (Ok _) true (Err _) false)
+              (and (match b (Ok _) false (Err _) true)
+                (match c (Ok _) false (Err _) true))))))
+      (it "ending the input inside the root fails at finish"
+        (match (sax-parser-new trace)
+          (Err _)
+          false
+          (Ok p)
+          (let [a (sax-feed! p "<a><b/>")
+                b (sax-finish! p)]
+            (sax-parser-free p)
+            (and (match a (Ok _) true (Err _) false)
+              (match b (Ok _) false (Err _) true)))))
+      (it "after Stop, further chunks are accepted and ignored"
+        (do
+          (__t-reset 1)
+          (match (sax-parser-new (fn [e : SaxEvent] : SaxControl
+                                   (match e
+                                     (StartElement n _)
+                                     (do (__t-put (to-cstr n)) (Stop))
+                                     _
+                                     (Continue))))
+            (Err _)
+            false
+            (Ok p)
+            (let [a (sax-feed! p "<a><b/>")
+                  b (sax-feed! p "</nonsense>")
+                  c (sax-finish! p)]
+              (sax-parser-free p)
+              (and (__t-is? "a") (match c (Ok _) true (Err _) false)))))))
+    (describe "xml/sax -- encodings"
+      (it "UTF-16LE with a BOM"
+        (file-traces? (__write-utf16 true) (__want-e-euro)))
+      (it "UTF-16BE with a BOM"
+        (file-traces? (__write-utf16 false) (__want-e-euro)))
+      (it "ISO-8859-1 named in the XML declaration is delivered as UTF-8"
+        (do
+          (__t-reset 0)
           (match (sax-parse-string (__latin1-doc) trace)
-            (Ok _)  (__t-is? (__want-e))
-            (Err _) false)))))
-
-(defn main [] : int
-  (__all-tests)
-  (run-all-status))
-
-) ;; end defmodule sax_push_test
+            (Ok _)
+            (__t-is? (__want-e))
+            (Err _)
+            false)))))
+  (defn main [] : int (__all-tests) (run-all-status))) ;; end defmodule sax_push_test

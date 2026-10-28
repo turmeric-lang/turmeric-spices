@@ -31,35 +31,50 @@
 ;;     the C boundary trivial. On 0 the caller should return a normal HTTP
 ;;     error Response; on 1 the Response the handler returns is ignored (the
 ;;     worker loop skips it, the connection having been upgraded).
-
 (defmodule ws-server/server
-  (import httpd/types   :refer [Conn Request])
-  (import httpd/conn    :refer [conn-fd conn-tls conn-mark-upgraded!])
+  (import httpd/types :refer [Conn Request])
+  (import httpd/conn :refer [conn-fd conn-tls conn-mark-upgraded!])
   (import httpd/request :refer [req-header])
   ;; NAME-V0: WsConn, WsFrame, and the frame predicates are the canonical
   ;; ws-core definitions, shared with ws-client. ws-server adds only the
   ;; server-side behaviour (upgrade / send / recv / close).
-  (import ws-core/conn  :refer [WsConn])
-  (import ws-core/frame :refer [WsFrame
-                                ws-frame-kind ws-frame-data ws-frame-len ws-frame-text
-                                ws-text? ws-binary? ws-ping? ws-pong?
-                                ws-closed? ws-timeout? ws-error?])
-  (export ws-upgrade ws-upgrade-or-zero
-          ws-upgrade-with-subprotocols
-          ws-server-subprotocol
-          UpgradeError UpgradeMissingHeader UpgradeBadVersion
-          UpgradeUnsupportedProto UpgradeWriteFailed
-          ws-server-send ws-server-send-bytes ws-server-send-fragmented
-          ws-server-recv ws-server-close
-          ws-set-server-timeout)
-
-;; ---------------------------------------------------------------------------
-;; file-scope C: shared types + static codec helpers, emitted into the same
-;; translation unit as every defn body below (same property tur-http / ws-client
-;; rely on), so the statics are visible without per-defn duplication.
-;; ---------------------------------------------------------------------------
-```c
-#include <stdint.h>
+  (import ws-core/conn :refer [WsConn])
+  (import ws-core/frame
+    :refer
+    [WsFrame
+     ws-frame-kind
+     ws-frame-data
+     ws-frame-len
+     ws-frame-text
+     ws-text?
+     ws-binary?
+     ws-ping?
+     ws-pong?
+     ws-closed?
+     ws-timeout?
+     ws-error?])
+  (export ws-upgrade
+    ws-upgrade-or-zero
+    ws-upgrade-with-subprotocols
+    ws-server-subprotocol
+    UpgradeError
+    UpgradeMissingHeader
+    UpgradeBadVersion
+    UpgradeUnsupportedProto
+    UpgradeWriteFailed
+    ws-server-send
+    ws-server-send-bytes
+    ws-server-send-fragmented
+    ws-server-recv
+    ws-server-close
+    ws-set-server-timeout)
+  ;; ---------------------------------------------------------------------------
+  ;; file-scope C: shared types + static codec helpers, emitted into the same
+  ;; translation unit as every defn body below (same property tur-http / ws-client
+  ;; rely on), so the statics are visible without per-defn duplication.
+  ;; ---------------------------------------------------------------------------
+  ```c
+  #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -371,44 +386,39 @@ static int wss__rbuf_append(ws_srv_conn_t *c, const unsigned char *p, size_t n) 
   return 0;
 }
 ```
-
-;; WsConn / WsFrame and the frame accessors + predicates are imported from
-;; ws-core (NAME-V0). ws_srv_conn_t below embeds a ws_frame_t whose layout
-;; matches ws-core/frame's, so ws-server-recv can hand back a pointer to it as
-;; a WsFrame. A server WsConn is created by ws-upgrade and owns the raw client
-;; fd (taken over from httpd) plus an internal reassembly buffer; it must not
-;; be used after the ws-handler returns.
-
-;; ---------------------------------------------------------------------------
-;; internal: handshake + connection lifecycle.
-;; ---------------------------------------------------------------------------
-
-;; True if a header value names the websocket upgrade (case-insensitive). The
-;; value may be a token list (e.g. "websocket"); a substring check is enough.
-(defn wss-header-websocket? [v : cstr] : bool
-  ```c
-  return v != 0 && strcasestr((const char *)v, "websocket") != NULL;
+  ;; WsConn / WsFrame and the frame accessors + predicates are imported from
+  ;; ws-core (NAME-V0). ws_srv_conn_t below embeds a ws_frame_t whose layout
+  ;; matches ws-core/frame's, so ws-server-recv can hand back a pointer to it as
+  ;; a WsFrame. A server WsConn is created by ws-upgrade and owns the raw client
+  ;; fd (taken over from httpd) plus an internal reassembly buffer; it must not
+  ;; be used after the ws-handler returns.
+  ;; ---------------------------------------------------------------------------
+  ;; internal: handshake + connection lifecycle.
+  ;; ---------------------------------------------------------------------------
+  ;; True if a header value names the websocket upgrade (case-insensitive). The
+  ;; value may be a token list (e.g. "websocket"); a substring check is enough.
+  (defn wss-header-websocket? [v : cstr] : bool
+    ```c
+    return v != 0 && strcasestr((const char *)v, "websocket") != NULL;
   ```)
-
-;; Wrap a connection (raw fd + optional tls_conn_t*) into a server WsConn. The
-;; handshake is written through this handle so it travels over the same
-;; transport (plaintext or TLS) the rest of the session will use.
-(defn wss-wrap [fd : int tls : int] : WsConn
-  ```c
-  ws_srv_conn_t *c = (ws_srv_conn_t *)calloc(1, sizeof(*c));
+  ;; Wrap a connection (raw fd + optional tls_conn_t*) into a server WsConn. The
+  ;; handshake is written through this handle so it travels over the same
+  ;; transport (plaintext or TLS) the rest of the session will use.
+  (defn wss-wrap [fd : int tls : int] : WsConn
+    ```c
+    ws_srv_conn_t *c = (ws_srv_conn_t *)calloc(1, sizeof(*c));
   if (!c) return 0;
   c->fd  = (int)fd;
   c->tls = (void *)(intptr_t)tls;
   return (int64_t)(intptr_t)c;
   ```)
-
-;; Compute Sec-WebSocket-Accept for `key` and write the 101 Switching Protocols
-;; response over the WsConn's transport. When `proto` is a non-empty string it
-;; is echoed back as the selected Sec-WebSocket-Protocol (SUB-V0). Returns 1
-;; on success, 0 on failure.
-(defn wss-write-handshake-proto [ws : WsConn key : cstr proto : cstr] : int
-  ```c
-  if (ws == 0) return 0;
+  ;; Compute Sec-WebSocket-Accept for `key` and write the 101 Switching Protocols
+  ;; response over the WsConn's transport. When `proto` is a non-empty string it
+  ;; is echoed back as the selected Sec-WebSocket-Protocol (SUB-V0). Returns 1
+  ;; on success, 0 on failure.
+  (defn wss-write-handshake-proto [ws : WsConn key : cstr proto : cstr] : int
+    ```c
+    if (ws == 0) return 0;
   ws_srv_conn_t *c = (ws_srv_conn_t *)(intptr_t)ws;
   char accept[64];
   wss__accept((const char *)key, accept);
@@ -435,47 +445,42 @@ static int wss__rbuf_append(ws_srv_conn_t *c, const unsigned char *p, size_t n) 
   }
   return wss__send_all(c, (const unsigned char *)resp, (size_t)n) < 0 ? 0 : 1;
   ```)
-
-(defn wss-write-handshake [ws : WsConn key : cstr] : int
-  (wss-write-handshake-proto ws key ""))
-
-;; SUB-V0: intersect the client offer with the server-side accepted list, write
-;; the picked subprotocol into the WsConn's slot (or "" when no intersection),
-;; and return 1 when a pick was made / 0 when not. An empty offer trivially
-;; returns 0 with subproto cleared (caller treats absent header as "no proto").
-(defn wss-negotiate-subproto [ws : WsConn offered : cstr accepted : cstr] : int
-  ```c
-  if (ws == 0) return 0;
+  (defn wss-write-handshake [ws : WsConn key : cstr] : int
+    (wss-write-handshake-proto ws key ""))
+  ;; SUB-V0: intersect the client offer with the server-side accepted list, write
+  ;; the picked subprotocol into the WsConn's slot (or "" when no intersection),
+  ;; and return 1 when a pick was made / 0 when not. An empty offer trivially
+  ;; returns 0 with subproto cleared (caller treats absent header as "no proto").
+  (defn wss-negotiate-subproto [ws : WsConn offered : cstr accepted : cstr] : int
+    ```c
+    if (ws == 0) return 0;
   ws_srv_conn_t *c = (ws_srv_conn_t *)(intptr_t)ws;
   return wss__pick_subproto((const char *)offered, (const char *)accepted,
                             c->subproto, sizeof(c->subproto));
   ```)
-
-;; SUB-V0: read back the negotiated subprotocol slot from a server WsConn.
-(defn wss-read-subproto [ws : WsConn] : cstr
-  ```c
-  if (ws == 0) return (char *)"";
+  ;; SUB-V0: read back the negotiated subprotocol slot from a server WsConn.
+  (defn wss-read-subproto [ws : WsConn] : cstr
+    ```c
+    if (ws == 0) return (char *)"";
   ws_srv_conn_t *c = (ws_srv_conn_t *)(intptr_t)ws;
   return c->subproto;
   ```)
-
-;; Release only the WsConn wrapper struct, leaving the fd and tls_conn_t alone.
-;; Used when the upgrade aborts before conn-mark-upgraded!: the httpd worker
-;; still owns the transport and will close / tls-free it on its normal path.
-(defn wss-free-wrapper [ws : WsConn] : void
-  ```c
-  if (ws == 0) return;
+  ;; Release only the WsConn wrapper struct, leaving the fd and tls_conn_t alone.
+  ;; Used when the upgrade aborts before conn-mark-upgraded!: the httpd worker
+  ;; still owns the transport and will close / tls-free it on its normal path.
+  (defn wss-free-wrapper [ws : WsConn] : void
+    ```c
+    if (ws == 0) return;
   ws_srv_conn_t *c = (ws_srv_conn_t *)(intptr_t)ws;
   if (c->rbuf) free(c->rbuf);
   free(c);
   ```)
-
-;; Release a fully-owned WsConn: tear down the TLS session (if any), close the
-;; fd, free the reassembly buffer and the struct. Called by ws-upgrade after the
-;; ws-handler returns, once ownership of the transport has transferred here.
-(defn wss-free [ws : WsConn] : void
-  ```c
-  if (ws == 0) return;
+  ;; Release a fully-owned WsConn: tear down the TLS session (if any), close the
+  ;; fd, free the reassembly buffer and the struct. Called by ws-upgrade after the
+  ;; ws-handler returns, once ownership of the transport has transferred here.
+  (defn wss-free [ws : WsConn] : void
+    ```c
+    if (ws == 0) return;
   ws_srv_conn_t *c = (ws_srv_conn_t *)(intptr_t)ws;
 #ifdef __TUR_WSS_TLS
   if (c->tls) {
@@ -489,267 +494,294 @@ static int wss__rbuf_append(ws_srv_conn_t *c, const unsigned char *p, size_t n) 
   if (c->rbuf) free(c->rbuf);
   free(c);
   ```)
-
-;;; UpgradeError -- why a ws-upgrade attempt did not produce a WebSocket
-;;; session (UPG-V0).
-;;;
-;;; ws-upgrade used to return a bare :int (1 upgraded / 0 not), which told the
-;;; caller nothing about *why* a request was rejected. It now returns a
-;;; `(Result bool UpgradeError)`: ok(true) on a successful upgrade, or
-;;; err(UpgradeError) describing the failure so the handler can answer with a
-;;; precise HTTP error. Match on the variants:
-;;;
-;;;   * UpgradeMissingHeader   -- a required header was absent; carries its name
-;;;                               ("Upgrade" or "Sec-WebSocket-Key").
-;;;   * UpgradeBadVersion      -- Sec-WebSocket-Version was present but not 13;
-;;;                               carries the requested version.
-;;;   * UpgradeUnsupportedProto -- the Upgrade header did not name "websocket";
-;;;                               carries the offered value.
-;;;   * UpgradeWriteFailed     -- the 101 handshake (or connection setup) could
-;;;                               not be written to the socket.
-;;;
-;;; Since: UPG-V0
-(defdata UpgradeError
-  (UpgradeMissingHeader :cstr)
-  (UpgradeBadVersion :int)
-  (UpgradeUnsupportedProto :cstr)
-  (UpgradeWriteFailed))
-
-;; Parse Sec-WebSocket-Version. Returns the integer version, or 0 when the
-;; header is absent (we stay lenient about omission; only a present-but-wrong
-;; version is rejected, matching what our own clients send).
-(defn wss-atoi [s : cstr] : int
-  ```c
-  return s ? (int64_t)atoi((const char *)s) : 0;
+  ;;; UpgradeError -- why a ws-upgrade attempt did not produce a WebSocket
+  ;;; session (UPG-V0).
+  ;;;
+  ;;; ws-upgrade used to return a bare :int (1 upgraded / 0 not), which told the
+  ;;; caller nothing about *why* a request was rejected. It now returns a
+  ;;; `(Result bool UpgradeError)`: ok(true) on a successful upgrade, or
+  ;;; err(UpgradeError) describing the failure so the handler can answer with a
+  ;;; precise HTTP error. Match on the variants:
+  ;;;
+  ;;;   * UpgradeMissingHeader   -- a required header was absent; carries its name
+  ;;;                               ("Upgrade" or "Sec-WebSocket-Key").
+  ;;;   * UpgradeBadVersion      -- Sec-WebSocket-Version was present but not 13;
+  ;;;                               carries the requested version.
+  ;;;   * UpgradeUnsupportedProto -- the Upgrade header did not name "websocket";
+  ;;;                               carries the offered value.
+  ;;;   * UpgradeWriteFailed     -- the 101 handshake (or connection setup) could
+  ;;;                               not be written to the socket.
+  ;;;
+  ;;; Since: UPG-V0
+  (defdata UpgradeError
+    (UpgradeMissingHeader :cstr)
+    (UpgradeBadVersion :int)
+    (UpgradeUnsupportedProto :cstr)
+    (UpgradeWriteFailed))
+  ;; Parse Sec-WebSocket-Version. Returns the integer version, or 0 when the
+  ;; header is absent (we stay lenient about omission; only a present-but-wrong
+  ;; version is rejected, matching what our own clients send).
+  (defn wss-atoi [s : cstr] : int
+    ```c
+    return s ? (int64_t)atoi((const char *)s) : 0;
   ```)
-
-(defn wss-req-version [req : Request] : int
-  (let [v (req-header req "Sec-WebSocket-Version")]
-    (if (ok? v) (wss-atoi (ok-val v)) 0)))
-
-;; True when `s` is the empty string (or null). Used to distinguish "client did
-;; not offer any subprotocol" from "client offered, but none matched."
-(defn wss-cstr-empty? [s : cstr] : bool
-  ```c
-  return s == 0 || ((const char *)s)[0] == '\0';
+  (defn wss-req-version [req : Request] : int
+    (let [v (req-header req "Sec-WebSocket-Version")]
+      (if (ok? v) (wss-atoi (ok-val v)) 0)))
+  ;; True when `s` is the empty string (or null). Used to distinguish "client did
+  ;; not offer any subprotocol" from "client offered, but none matched."
+  (defn wss-cstr-empty? [s : cstr] : bool
+    ```c
+    return s == 0 || ((const char *)s)[0] == '\0';
   ```)
-
-;;; ws-upgrade -- upgrade an httpd connection to a WebSocket session.
-;;;
-;;; Must be called from an httpd handler registered via server-start-conn /
-;;; serve-conn (so the handler receives a Conn alongside the Request). Validates
-;;; the Upgrade + Sec-WebSocket-Key (+ Sec-WebSocket-Version) headers, writes
-;;; "101 Switching Protocols" directly to the socket, marks the Conn upgraded
-;;; (so the httpd worker loop does not flush a second response or close the fd),
-;;; wraps the fd into a WsConn, and invokes `handler` with it. The WsConn is
-;;; released after the handler returns.
-;;;
-;;; Parameters:
-;;;   conn    -- httpd Conn handle (from the two-arg handler signature).
-;;;   req     -- httpd Request (read for the Upgrade / Sec-WebSocket-Key /
-;;;              Sec-WebSocket-Version headers).
-;;;   handler -- (fn [WsConn] void), called after the upgrade succeeds. (The
-;;;              plan sketches a `^linear WsConn` handler that owns the close;
-;;;              WsConn is shared with ws-client as a non-linear ws-core type,
-;;;              so ws-upgrade keeps ownership and frees after the handler
-;;;              returns -- a safe default. See UPG-V0 notes in the README.)
-;;;
-;;; Returns:
-;;;   (Result bool UpgradeError) -- ok(true) once the upgrade succeeded and the
-;;;   handler ran (the Response the handler returns is then ignored, the
-;;;   connection having been hijacked); err(UpgradeError) when the request was
-;;;   not a valid WebSocket Upgrade, in which case the caller should return a
-;;;   normal HTTP error Response. For the old 1/0 shape see ws-upgrade-or-zero.
-;;;
-;;; Example:
-;;;   (defn ws-echo [conn : Conn req : Request] : Response
-;;;     (if (ok? (ws-upgrade conn req
-;;;                (fn [ws : WsConn] : void
-;;;                  (let [f (ws-server-recv ws)]
-;;;                    (ws-server-send ws (ws-frame-text f))
-;;;                    (ws-server-close ws)))))
-;;;       (resp-ok "text/plain" "")            ;; placeholder; worker skips it
-;;;       (bad-request "not a websocket request")))
-;;;
-;;; Since: WS1 (result-shaped since UPG-V0)
-(defn ws-upgrade [conn : Conn req : Request ^fat handler : (fn [WsConn] void)]
-  : (Result bool UpgradeError)
-  (let [up  (req-header req "Upgrade")
-        kr  (req-header req "Sec-WebSocket-Key")
-        ver (wss-req-version req)]
-    (cond
-      ;; No Upgrade header at all -- not a WebSocket request.
-      (not (ok? up))
-        (:: (err (UpgradeMissingHeader "Upgrade")) (Result bool UpgradeError))
-      ;; Upgrade present but does not name websocket.
-      (not (wss-header-websocket? (ok-val up)))
-        (:: (err (UpgradeUnsupportedProto (ok-val up))) (Result bool UpgradeError))
-      ;; Version present but not the RFC 6455 value (13).
-      (and (not= ver 0) (not= ver 13))
-        (:: (err (UpgradeBadVersion ver)) (Result bool UpgradeError))
-      ;; Missing the client key we must echo back.
-      (not (ok? kr))
-        (:: (err (UpgradeMissingHeader "Sec-WebSocket-Key")) (Result bool UpgradeError))
-      :else
-        ;; Wrap the connection first so the 101 handshake -- and every frame
-        ;; after it -- travels over the same transport (raw fd, or TLS when
-        ;; conn-tls is set by httpd's TLS listener).
-        (let [ws (wss-wrap (conn-fd conn) (conn-tls conn))]
-          (if (= (:: ws :int) 0)
-            (:: (err (UpgradeWriteFailed)) (Result bool UpgradeError))
-            (if (= (wss-write-handshake ws (ok-val kr)) 0)
-              ;; Handshake never landed: the httpd worker still owns the fd /
-              ;; TLS session, so release only our wrapper and let it clean up.
-              (do (wss-free-wrapper ws)
-                  (:: (err (UpgradeWriteFailed)) (Result bool UpgradeError)))
-              (do
-                (conn-mark-upgraded! conn)
-                (handler ws)
-                (wss-free ws)
-                (ok true))))))))
-
-;;; ws-upgrade-or-zero -- backward-compatible :int shape of ws-upgrade.
-;;;
-;;; DEPRECATED (UPG-V0): returns 1 if the upgrade succeeded and the handler ran,
-;;; 0 otherwise -- the pre-UPG-V0 contract -- by routing through the new
-;;; result-based ws-upgrade and discarding the error detail. Provided for one
-;;; release to ease migration; prefer ws-upgrade and match on UpgradeError.
-;;;
-;;; Since: UPG-V0
-(defn ws-upgrade-or-zero [conn : Conn req : Request ^fat handler : (fn [WsConn] void)] : int
-  (if (ok? (ws-upgrade conn req handler)) 1 0))
-
-;;; ws-upgrade-with-subprotocols -- upgrade with application subprotocol
-;;; negotiation (SUB-V0, RFC 6455 1.9).
-;;;
-;;; Performs the same validation as ws-upgrade, plus:
-;;;   * Reads the client's Sec-WebSocket-Protocol offer.
-;;;   * Intersects it with `accepted` (a comma-separated list of supported
-;;;     subprotocols, e.g. "json.v1, msgpack.v1") -- the first offered token
-;;;     that appears in `accepted` wins.
-;;;   * Echoes the selected subprotocol back in the 101 response.
-;;;
-;;; When the client offered subprotocols but none intersect with `accepted` the
-;;; upgrade fails with UpgradeUnsupportedProto carrying the offered list. When
-;;; the client offered nothing the upgrade succeeds with no subprotocol
-;;; selected; query ws-server-subprotocol from the handler to inspect.
-;;;
-;;; Parameters:
-;;;   conn     -- httpd Conn handle.
-;;;   req      -- httpd Request.
-;;;   accepted -- comma-separated list of supported subprotocols.
-;;;   handler  -- (fn [WsConn] void), invoked after a successful upgrade.
-;;;
-;;; Returns:
-;;;   (Result bool UpgradeError) -- ok(true) on a successful upgrade and handler
-;;;   run; err(UpgradeError) otherwise.
-;;;
-;;; Since: SUB-V0
-(defn ws-upgrade-with-subprotocols
-  [conn : Conn req : Request accepted : cstr ^fat handler : (fn [WsConn] void)]
-  : (Result bool UpgradeError)
-  (let [up  (req-header req "Upgrade")
-        kr  (req-header req "Sec-WebSocket-Key")
-        spr (req-header req "Sec-WebSocket-Protocol")
-        ver (wss-req-version req)]
-    (cond
-      (not (ok? up))
-        (:: (err (UpgradeMissingHeader "Upgrade")) (Result bool UpgradeError))
-      (not (wss-header-websocket? (ok-val up)))
-        (:: (err (UpgradeUnsupportedProto (ok-val up))) (Result bool UpgradeError))
-      (and (not= ver 0) (not= ver 13))
-        (:: (err (UpgradeBadVersion ver)) (Result bool UpgradeError))
-      (not (ok? kr))
-        (:: (err (UpgradeMissingHeader "Sec-WebSocket-Key")) (Result bool UpgradeError))
-      :else
-        (let [offered (if (ok? spr) (ok-val spr) "")
-              ws      (wss-wrap (conn-fd conn) (conn-tls conn))]
-          (if (= (:: ws :int) 0)
-            (:: (err (UpgradeWriteFailed)) (Result bool UpgradeError))
-            ;; Negotiate. If the client offered something and nothing matched,
-            ;; reject; otherwise (no offer, or a successful pick) proceed.
-            (let [picked (wss-negotiate-subproto ws offered accepted)]
-              (if (and (not= picked 1) (not (wss-cstr-empty? offered)))
-                (do (wss-free-wrapper ws)
-                    (:: (err (UpgradeUnsupportedProto offered)) (Result bool UpgradeError)))
-                (if (= (wss-write-handshake-proto ws (ok-val kr) (wss-read-subproto ws)) 0)
-                  (do (wss-free-wrapper ws)
-                      (:: (err (UpgradeWriteFailed)) (Result bool UpgradeError)))
-                  (do
-                    (conn-mark-upgraded! conn)
-                    (handler ws)
-                    (wss-free ws)
-                    (ok true))))))))))
-
-;;; ws-server-subprotocol -- the application subprotocol selected during the
-;;; upgrade handshake (SUB-V0).
-;;;
-;;; Returns "" when the upgrade did not negotiate one (ws-upgrade was used
-;;; instead of ws-upgrade-with-subprotocols, or no intersection was offered).
-;;; Static storage tied to the WsConn; do not free.
-;;;
-;;; Since: SUB-V0
-(defn ws-server-subprotocol [ws : WsConn] : cstr
-  (wss-read-subproto ws))
-
-;;; ws-server-send -- send a UTF-8 text frame to the client (unmasked).
-;;;
-;;; Parameters:
-;;;   ws  -- server WsConn handle.
-;;;   msg -- null-terminated UTF-8 string.
-;;;
-;;; Returns:
-;;;   Bytes written, or negative on error.
-;;;
-;;; Since: WS1
-(defn ws-server-send [ws : WsConn msg : cstr] : int
-  ```c
-  if (ws == 0) return -1;
+  ;;; ws-upgrade -- upgrade an httpd connection to a WebSocket session.
+  ;;;
+  ;;; Must be called from an httpd handler registered via server-start-conn /
+  ;;; serve-conn (so the handler receives a Conn alongside the Request). Validates
+  ;;; the Upgrade + Sec-WebSocket-Key (+ Sec-WebSocket-Version) headers, writes
+  ;;; "101 Switching Protocols" directly to the socket, marks the Conn upgraded
+  ;;; (so the httpd worker loop does not flush a second response or close the fd),
+  ;;; wraps the fd into a WsConn, and invokes `handler` with it. The WsConn is
+  ;;; released after the handler returns.
+  ;;;
+  ;;; Parameters:
+  ;;;   conn    -- httpd Conn handle (from the two-arg handler signature).
+  ;;;   req     -- httpd Request (read for the Upgrade / Sec-WebSocket-Key /
+  ;;;              Sec-WebSocket-Version headers).
+  ;;;   handler -- (fn [WsConn] void), called after the upgrade succeeds. (The
+  ;;;              plan sketches a `^linear WsConn` handler that owns the close;
+  ;;;              WsConn is shared with ws-client as a non-linear ws-core type,
+  ;;;              so ws-upgrade keeps ownership and frees after the handler
+  ;;;              returns -- a safe default. See UPG-V0 notes in the README.)
+  ;;;
+  ;;; Returns:
+  ;;;   (Result bool UpgradeError) -- ok(true) once the upgrade succeeded and the
+  ;;;   handler ran (the Response the handler returns is then ignored, the
+  ;;;   connection having been hijacked); err(UpgradeError) when the request was
+  ;;;   not a valid WebSocket Upgrade, in which case the caller should return a
+  ;;;   normal HTTP error Response. For the old 1/0 shape see ws-upgrade-or-zero.
+  ;;;
+  ;;; Example:
+  ;;;   (defn ws-echo [conn : Conn req : Request] : Response
+  ;;;     (if (ok? (ws-upgrade conn req
+  ;;;                (fn [ws : WsConn] : void
+  ;;;                  (let [f (ws-server-recv ws)]
+  ;;;                    (ws-server-send ws (ws-frame-text f))
+  ;;;                    (ws-server-close ws)))))
+  ;;;       (resp-ok "text/plain" "")            ;; placeholder; worker skips it
+  ;;;       (bad-request "not a websocket request")))
+  ;;;
+  ;;; Since: WS1 (result-shaped since UPG-V0)
+  (defn ws-upgrade [conn : Conn req : Request ^fat handler : (fn [WsConn] void)] : (Result bool
+                                                                                     UpgradeError)
+    (let [up  (req-header req "Upgrade")
+          kr  (req-header req "Sec-WebSocket-Key")
+          ver (wss-req-version req)]
+      (cond
+            ;; No Upgrade header at all -- not a WebSocket request.
+            (not (ok? up))                            (:: (err (UpgradeMissingHeader "Upgrade"))
+                                                        (Result bool
+                                                          UpgradeError))
+            ;; Upgrade present but does not name websocket.
+            (not (wss-header-websocket? (ok-val up))) (:: (err (UpgradeUnsupportedProto (ok-val up)))
+                                                        (Result bool
+                                                          UpgradeError))
+            ;; Version present but not the RFC 6455 value (13).
+            (and (not= ver 0) (not= ver 13))          (:: (err (UpgradeBadVersion ver))
+                                                        (Result bool
+                                                          UpgradeError))
+            ;; Missing the client key we must echo back.
+            (not (ok? kr))                            (:: (err (UpgradeMissingHeader "Sec-WebSocket-Key"))
+                                                        (Result bool
+                                                          UpgradeError))
+            :else
+            ;; Wrap the connection first so the 101 handshake -- and every frame
+            ;; after it -- travels over the same transport (raw fd, or TLS when
+            ;; conn-tls is set by httpd's TLS listener).
+                                                      (let [ws (wss-wrap (conn-fd conn)
+                                                                 (conn-tls conn))]
+                                                        (if (= (:: ws :int) 0)
+                                                          (:: (err (UpgradeWriteFailed))
+                                                            (Result bool
+                                                              UpgradeError))
+                                                          (if (= (wss-write-handshake ws
+                                                                   (ok-val kr))
+                                                                0)
+                                                            ;; Handshake never landed: the httpd worker still owns the fd /
+                                                            ;; TLS session, so release only our wrapper and let it clean up.
+                                                            (do
+                                                              (wss-free-wrapper ws)
+                                                              (:: (err (UpgradeWriteFailed))
+                                                                (Result bool
+                                                                  UpgradeError)))
+                                                            (do
+                                                              (conn-mark-upgraded! conn)
+                                                              (handler ws)
+                                                              (wss-free ws)
+                                                              (ok true))))))))
+  ;;; ws-upgrade-or-zero -- backward-compatible :int shape of ws-upgrade.
+  ;;;
+  ;;; DEPRECATED (UPG-V0): returns 1 if the upgrade succeeded and the handler ran,
+  ;;; 0 otherwise -- the pre-UPG-V0 contract -- by routing through the new
+  ;;; result-based ws-upgrade and discarding the error detail. Provided for one
+  ;;; release to ease migration; prefer ws-upgrade and match on UpgradeError.
+  ;;;
+  ;;; Since: UPG-V0
+  (defn ws-upgrade-or-zero [conn : Conn
+                            req : Request
+                            ^fat handler : (fn [WsConn] void)] : int
+    (if (ok? (ws-upgrade conn req handler)) 1 0))
+  ;;; ws-upgrade-with-subprotocols -- upgrade with application subprotocol
+  ;;; negotiation (SUB-V0, RFC 6455 1.9).
+  ;;;
+  ;;; Performs the same validation as ws-upgrade, plus:
+  ;;;   * Reads the client's Sec-WebSocket-Protocol offer.
+  ;;;   * Intersects it with `accepted` (a comma-separated list of supported
+  ;;;     subprotocols, e.g. "json.v1, msgpack.v1") -- the first offered token
+  ;;;     that appears in `accepted` wins.
+  ;;;   * Echoes the selected subprotocol back in the 101 response.
+  ;;;
+  ;;; When the client offered subprotocols but none intersect with `accepted` the
+  ;;; upgrade fails with UpgradeUnsupportedProto carrying the offered list. When
+  ;;; the client offered nothing the upgrade succeeds with no subprotocol
+  ;;; selected; query ws-server-subprotocol from the handler to inspect.
+  ;;;
+  ;;; Parameters:
+  ;;;   conn     -- httpd Conn handle.
+  ;;;   req      -- httpd Request.
+  ;;;   accepted -- comma-separated list of supported subprotocols.
+  ;;;   handler  -- (fn [WsConn] void), invoked after a successful upgrade.
+  ;;;
+  ;;; Returns:
+  ;;;   (Result bool UpgradeError) -- ok(true) on a successful upgrade and handler
+  ;;;   run; err(UpgradeError) otherwise.
+  ;;;
+  ;;; Since: SUB-V0
+  (defn ws-upgrade-with-subprotocols [conn : Conn
+                                      req : Request
+                                      accepted : cstr
+                                      ^fat handler : (fn [WsConn] void)] : (Result bool
+                                                                             UpgradeError)
+    (let [up  (req-header req "Upgrade")
+          kr  (req-header req "Sec-WebSocket-Key")
+          spr (req-header req "Sec-WebSocket-Protocol")
+          ver (wss-req-version req)]
+      (cond (not (ok? up))                            (:: (err (UpgradeMissingHeader "Upgrade"))
+                                                        (Result bool
+                                                          UpgradeError))
+            (not (wss-header-websocket? (ok-val up))) (:: (err (UpgradeUnsupportedProto (ok-val up)))
+                                                        (Result bool
+                                                          UpgradeError))
+            (and (not= ver 0) (not= ver 13))          (:: (err (UpgradeBadVersion ver))
+                                                        (Result bool
+                                                          UpgradeError))
+            (not (ok? kr))                            (:: (err (UpgradeMissingHeader "Sec-WebSocket-Key"))
+                                                        (Result bool
+                                                          UpgradeError))
+            :else                                     (let [offered (if (ok? spr)
+                                                                      (ok-val spr)
+                                                                      "")
+                                                            ws      (wss-wrap (conn-fd conn)
+                                                                      (conn-tls conn))]
+                                                        (if (= (:: ws :int) 0)
+                                                          (:: (err (UpgradeWriteFailed))
+                                                            (Result bool
+                                                              UpgradeError))
+                                                          ;; Negotiate. If the client offered something and nothing matched,
+                                                          ;; reject; otherwise (no offer, or a successful pick) proceed.
+                                                          (let [picked (wss-negotiate-subproto ws
+                                                                         offered
+                                                                         accepted)]
+                                                            (if (and (not= picked
+                                                                       1)
+                                                                  (not (wss-cstr-empty? offered)))
+                                                              (do
+                                                                (wss-free-wrapper ws)
+                                                                (:: (err (UpgradeUnsupportedProto offered))
+                                                                  (Result bool
+                                                                    UpgradeError)))
+                                                              (if (= (wss-write-handshake-proto ws
+                                                                       (ok-val kr)
+                                                                       (wss-read-subproto ws))
+                                                                    0)
+                                                                (do
+                                                                  (wss-free-wrapper ws)
+                                                                  (:: (err (UpgradeWriteFailed))
+                                                                    (Result bool
+                                                                      UpgradeError)))
+                                                                (do
+                                                                  (conn-mark-upgraded! conn)
+                                                                  (handler ws)
+                                                                  (wss-free ws)
+                                                                  (ok true))))))))))
+  ;;; ws-server-subprotocol -- the application subprotocol selected during the
+  ;;; upgrade handshake (SUB-V0).
+  ;;;
+  ;;; Returns "" when the upgrade did not negotiate one (ws-upgrade was used
+  ;;; instead of ws-upgrade-with-subprotocols, or no intersection was offered).
+  ;;; Static storage tied to the WsConn; do not free.
+  ;;;
+  ;;; Since: SUB-V0
+  (defn ws-server-subprotocol [ws : WsConn] : cstr (wss-read-subproto ws))
+  ;;; ws-server-send -- send a UTF-8 text frame to the client (unmasked).
+  ;;;
+  ;;; Parameters:
+  ;;;   ws  -- server WsConn handle.
+  ;;;   msg -- null-terminated UTF-8 string.
+  ;;;
+  ;;; Returns:
+  ;;;   Bytes written, or negative on error.
+  ;;;
+  ;;; Since: WS1
+  (defn ws-server-send [ws : WsConn msg : cstr] : int
+    ```c
+    if (ws == 0) return -1;
   ws_srv_conn_t *c = (ws_srv_conn_t *)(intptr_t)ws;
   const char *m = (const char *)msg;
   return wss__send_frame(c, 0x1, (const unsigned char *)m, m ? strlen(m) : 0);
   ```)
-
-;;; ws-server-send-bytes -- send a binary frame to the client (unmasked).
-;;;
-;;; Parameters:
-;;;   ws  -- server WsConn handle.
-;;;   ptr -- payload buffer.
-;;;   len -- byte length.
-;;;
-;;; Returns:
-;;;   Bytes written, or negative on error.
-;;;
-;;; Since: WS1
-(defn ws-server-send-bytes [ws : WsConn ptr : ptr<void> len : int] : int
-  ```c
-  if (ws == 0) return -1;
+  ;;; ws-server-send-bytes -- send a binary frame to the client (unmasked).
+  ;;;
+  ;;; Parameters:
+  ;;;   ws  -- server WsConn handle.
+  ;;;   ptr -- payload buffer.
+  ;;;   len -- byte length.
+  ;;;
+  ;;; Returns:
+  ;;;   Bytes written, or negative on error.
+  ;;;
+  ;;; Since: WS1
+  (defn ws-server-send-bytes [ws : WsConn ptr : ptr<void> len : int] : int
+    ```c
+    if (ws == 0) return -1;
   ws_srv_conn_t *c = (ws_srv_conn_t *)(intptr_t)ws;
   return wss__send_frame(c, 0x2, (const unsigned char *)ptr, (size_t)len);
   ```)
-
-;;; ws-server-send-fragmented -- send a binary message split across multiple
-;;; frames (FRAG-V0, RFC 6455 5.4).
-;;;
-;;; The payload is sent as a sequence of frames each at most `frame-size` bytes,
-;;; with FIN=0 on every frame except the last. The first frame carries the
-;;; binary opcode (0x2); the rest carry continuation (0x0). For payloads that
-;;; fit in a single frame this is equivalent to ws-server-send-bytes. The peer
-;;; reassembles automatically.
-;;;
-;;; Parameters:
-;;;   ws         -- server WsConn handle.
-;;;   ptr        -- payload buffer.
-;;;   len        -- byte length of the payload.
-;;;   frame-size -- max bytes per outbound frame (a value <= 0 sends one frame).
-;;;
-;;; Returns:
-;;;   Total bytes handed to the transport, or negative on error.
-;;;
-;;; Since: FRAG-V0
-(defn ws-server-send-fragmented [ws : WsConn ptr : ptr<void> len : int frame-size : int] : int
-  ```c
-  if (ws == 0) return -1;
+  ;;; ws-server-send-fragmented -- send a binary message split across multiple
+  ;;; frames (FRAG-V0, RFC 6455 5.4).
+  ;;;
+  ;;; The payload is sent as a sequence of frames each at most `frame-size` bytes,
+  ;;; with FIN=0 on every frame except the last. The first frame carries the
+  ;;; binary opcode (0x2); the rest carry continuation (0x0). For payloads that
+  ;;; fit in a single frame this is equivalent to ws-server-send-bytes. The peer
+  ;;; reassembles automatically.
+  ;;;
+  ;;; Parameters:
+  ;;;   ws         -- server WsConn handle.
+  ;;;   ptr        -- payload buffer.
+  ;;;   len        -- byte length of the payload.
+  ;;;   frame-size -- max bytes per outbound frame (a value <= 0 sends one frame).
+  ;;;
+  ;;; Returns:
+  ;;;   Total bytes handed to the transport, or negative on error.
+  ;;;
+  ;;; Since: FRAG-V0
+  (defn ws-server-send-fragmented [ws : WsConn
+                                   ptr : ptr<void>
+                                   len : int
+                                   frame-size : int] : int
+    ```c
+    if (ws == 0) return -1;
   ws_srv_conn_t *c = (ws_srv_conn_t *)(intptr_t)ws;
   const unsigned char *p = (const unsigned char *)ptr;
   size_t total = (size_t)len;
@@ -774,24 +806,23 @@ static int wss__rbuf_append(ws_srv_conn_t *c, const unsigned char *p, size_t n) 
   }
   return (int64_t)sent;
   ```)
-
-;;; ws-server-recv -- receive the next message from the client.
-;;;
-;;; Blocks until a complete (possibly reassembled) message arrives, or the
-;;; receive timeout fires. Ping frames are answered with a Pong automatically
-;;; and then surfaced; Pong and Close frames are surfaced to the caller.
-;;;
-;;; Parameters:
-;;;   ws -- server WsConn handle.
-;;;
-;;; Returns:
-;;;   A WsFrame handle (a view valid until the next ws-server-recv). Its kind is
-;;;   :text / :binary / :ping / :pong / :close / :timeout / :error.
-;;;
-;;; Since: WS1
-(defn ws-server-recv [ws : WsConn] : WsFrame
-  ```c
-  if (ws == 0) return 0;
+  ;;; ws-server-recv -- receive the next message from the client.
+  ;;;
+  ;;; Blocks until a complete (possibly reassembled) message arrives, or the
+  ;;; receive timeout fires. Ping frames are answered with a Pong automatically
+  ;;; and then surfaced; Pong and Close frames are surfaced to the caller.
+  ;;;
+  ;;; Parameters:
+  ;;;   ws -- server WsConn handle.
+  ;;;
+  ;;; Returns:
+  ;;;   A WsFrame handle (a view valid until the next ws-server-recv). Its kind is
+  ;;;   :text / :binary / :ping / :pong / :close / :timeout / :error.
+  ;;;
+  ;;; Since: WS1
+  (defn ws-server-recv [ws : WsConn] : WsFrame
+    ```c
+    if (ws == 0) return 0;
   ws_srv_conn_t *c = (ws_srv_conn_t *)(intptr_t)ws;
   c->rlen = 0;
   if (c->rbuf) c->rbuf[0] = '\0';
@@ -848,20 +879,19 @@ static int wss__rbuf_append(ws_srv_conn_t *c, const unsigned char *p, size_t n) 
     /* else: not final -- keep reading continuation frames */
   }
   ```)
-
-;;; ws-server-close -- initiate the WebSocket closing handshake.
-;;;
-;;; Sends a Close frame, drains until the peer's Close echo (best-effort,
-;;; bounded), then closes the underlying socket. The WsConn itself is released
-;;; by ws-upgrade after the handler returns.
-;;;
-;;; Parameters:
-;;;   ws -- server WsConn handle.
-;;;
-;;; Since: WS1
-(defn ws-server-close [ws : WsConn] : void
-  ```c
-  if (ws == 0) return;
+  ;;; ws-server-close -- initiate the WebSocket closing handshake.
+  ;;;
+  ;;; Sends a Close frame, drains until the peer's Close echo (best-effort,
+  ;;; bounded), then closes the underlying socket. The WsConn itself is released
+  ;;; by ws-upgrade after the handler returns.
+  ;;;
+  ;;; Parameters:
+  ;;;   ws -- server WsConn handle.
+  ;;;
+  ;;; Since: WS1
+  (defn ws-server-close [ws : WsConn] : void
+    ```c
+    if (ws == 0) return;
   ws_srv_conn_t *c = (ws_srv_conn_t *)(intptr_t)ws;
   wss__send_frame(c, 0x8, NULL, 0);
   for (int i = 0; i < 8; i++) {
@@ -878,31 +908,28 @@ static int wss__rbuf_append(ws_srv_conn_t *c, const unsigned char *p, size_t n) 
 #endif
   if (c->fd >= 0) { close(c->fd); c->fd = -1; }
   ```)
-
-;;; ws-set-server-timeout -- set the receive timeout in milliseconds.
-;;;
-;;; A value of 0 disables the timeout (ws-server-recv blocks indefinitely).
-;;; When the timeout fires, ws-server-recv returns a frame whose kind is
-;;; :timeout.
-;;;
-;;; Parameters:
-;;;   ws -- server WsConn handle.
-;;;   ms -- timeout in milliseconds.
-;;;
-;;; Since: WS1
-(defn ws-set-server-timeout [ws : WsConn ms : int] : void
-  ```c
-  if (ws == 0) return;
+  ;;; ws-set-server-timeout -- set the receive timeout in milliseconds.
+  ;;;
+  ;;; A value of 0 disables the timeout (ws-server-recv blocks indefinitely).
+  ;;; When the timeout fires, ws-server-recv returns a frame whose kind is
+  ;;; :timeout.
+  ;;;
+  ;;; Parameters:
+  ;;;   ws -- server WsConn handle.
+  ;;;   ms -- timeout in milliseconds.
+  ;;;
+  ;;; Since: WS1
+  (defn ws-set-server-timeout [ws : WsConn ms : int] : void
+    ```c
+    if (ws == 0) return;
   ws_srv_conn_t *c = (ws_srv_conn_t *)(intptr_t)ws;
   struct timeval tv;
   tv.tv_sec  = (time_t)(ms / 1000);
   tv.tv_usec = (suseconds_t)((ms % 1000) * 1000);
   setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   ```)
-
-;; The WsFrame accessors + predicates (ws-frame-kind ... ws-error?) live in
-;; ws-core/frame (NAME-V0) and are imported above; ws-server-recv hands back a
-;; pointer to the ws_frame_t embedded in ws_srv_conn_t, which those accessors
-;; read.
-
-) ;; end defmodule ws-server/server
+  ;; The WsFrame accessors + predicates (ws-frame-kind ... ws-error?) live in
+  ;; ws-core/frame (NAME-V0) and are imported above; ws-server-recv hands back a
+  ;; pointer to the ws_frame_t embedded in ws_srv_conn_t, which those accessors
+  ;; read.
+  ) ;; end defmodule ws-server/server

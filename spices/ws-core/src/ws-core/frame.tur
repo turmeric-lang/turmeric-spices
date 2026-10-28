@@ -10,19 +10,25 @@
 ;; layout) in their connection struct and hand back a pointer to it from their
 ;; recv op; the accessors below cast the handle back to `ws_frame_t *`. The
 ;; struct layout is fixed here and must match the embedded copy on each side.
-
 (defmodule ws-core/frame
   (export WsFrame
-          ws-frame-kind ws-frame-data ws-frame-len ws-frame-text
-          ws-text? ws-binary? ws-ping? ws-pong?
-          ws-closed? ws-timeout? ws-error?)
-
-;; ---------------------------------------------------------------------------
-;; file-scope C: the shared frame kinds + the ws_frame_t view layout, emitted
-;; into the same translation unit as every accessor below.
-;; ---------------------------------------------------------------------------
-```c
-#include <stdint.h>
+    ws-frame-kind
+    ws-frame-data
+    ws-frame-len
+    ws-frame-text
+    ws-text?
+    ws-binary?
+    ws-ping?
+    ws-pong?
+    ws-closed?
+    ws-timeout?
+    ws-error?)
+  ;; ---------------------------------------------------------------------------
+  ;; file-scope C: the shared frame kinds + the ws_frame_t view layout, emitted
+  ;; into the same translation unit as every accessor below.
+  ;; ---------------------------------------------------------------------------
+  ```c
+  #include <stdint.h>
 
 /* WsFrame kinds: the data opcodes match the wire opcodes; the synthetic
    negatives are surfaced by a recv for non-frame conditions. ws-client and
@@ -38,80 +44,66 @@
 
 typedef struct { int kind; unsigned char *data; long len; } ws_frame_t;
 ```
-
-;;; WsFrame -- opaque handle to the frame most recently returned by a recv.
-;;;
-;;; A view into the producing connection's internal reassembly buffer: the
-;;; data / text pointers are valid only until the next recv or free on the
-;;; same connection. Callers that need the payload longer must copy it. Read
-;;; fields via ws-frame-kind / ws-frame-data / ws-frame-len / ws-frame-text and
-;;; the ws-text? ... ws-error? predicates.
-;;;
-;;; Since: NAME-V0
-(defopaque WsFrame :int)
-
-;;; ws-frame-kind -- integer kind of a frame (see the WS_KIND_* constants).
-;;; Since: NAME-V0
-(defn ws-frame-kind [frame : WsFrame] : int
-  ```c
-  if (frame == 0) return WS_KIND_ERROR;
+  ;;; WsFrame -- opaque handle to the frame most recently returned by a recv.
+  ;;;
+  ;;; A view into the producing connection's internal reassembly buffer: the
+  ;;; data / text pointers are valid only until the next recv or free on the
+  ;;; same connection. Callers that need the payload longer must copy it. Read
+  ;;; fields via ws-frame-kind / ws-frame-data / ws-frame-len / ws-frame-text and
+  ;;; the ws-text? ... ws-error? predicates.
+  ;;;
+  ;;; Since: NAME-V0
+  (defopaque WsFrame :int)
+  ;;; ws-frame-kind -- integer kind of a frame (see the WS_KIND_* constants).
+  ;;; Since: NAME-V0
+  (defn ws-frame-kind [frame : WsFrame] : int
+    ```c
+    if (frame == 0) return WS_KIND_ERROR;
   return (int64_t)((ws_frame_t *)(intptr_t)frame)->kind;
   ```)
-
-;;; ws-frame-data -- pointer to the frame payload (valid until the next recv).
-;;; Since: NAME-V0
-(defn ws-frame-data [frame : WsFrame] : ptr<void>
-  ```c
-  if (frame == 0) return NULL;
+  ;;; ws-frame-data -- pointer to the frame payload (valid until the next recv).
+  ;;; Since: NAME-V0
+  (defn ws-frame-data [frame : WsFrame] : ptr<void>
+    ```c
+    if (frame == 0) return NULL;
   return ((ws_frame_t *)(intptr_t)frame)->data;
   ```)
-
-;;; ws-frame-len -- payload length of a frame, in bytes.
-;;; Since: NAME-V0
-(defn ws-frame-len [frame : WsFrame] : int
-  ```c
-  if (frame == 0) return 0;
+  ;;; ws-frame-len -- payload length of a frame, in bytes.
+  ;;; Since: NAME-V0
+  (defn ws-frame-len [frame : WsFrame] : int
+    ```c
+    if (frame == 0) return 0;
   return (int64_t)((ws_frame_t *)(intptr_t)frame)->len;
   ```)
-
-;;; ws-frame-text -- frame payload as a NUL-terminated string.
-;;;
-;;; Convenience for :text frames; the reassembly buffer is always
-;;; NUL-terminated. Valid until the next recv / free.
-;;; Since: NAME-V0
-(defn ws-frame-text [frame : WsFrame] : cstr
-  ```c
-  if (frame == 0) return (char *)"";
+  ;;; ws-frame-text -- frame payload as a NUL-terminated string.
+  ;;;
+  ;;; Convenience for :text frames; the reassembly buffer is always
+  ;;; NUL-terminated. Valid until the next recv / free.
+  ;;; Since: NAME-V0
+  (defn ws-frame-text [frame : WsFrame] : cstr
+    ```c
+    if (frame == 0) return (char *)"";
   ws_frame_t *f = (ws_frame_t *)(intptr_t)frame;
   return f->data ? (char *)f->data : (char *)"";
   ```)
-
-;;; ws-text? -- true if the frame is a text message. Since: NAME-V0
-(defn ws-text? [frame : WsFrame] : bool
-  ```c return frame != 0 && ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_TEXT; ```)
-
-;;; ws-binary? -- true if the frame is a binary message. Since: NAME-V0
-(defn ws-binary? [frame : WsFrame] : bool
-  ```c return frame != 0 && ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_BINARY; ```)
-
-;;; ws-ping? -- true if the frame is a ping (already auto-ponged). Since: NAME-V0
-(defn ws-ping? [frame : WsFrame] : bool
-  ```c return frame != 0 && ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_PING; ```)
-
-;;; ws-pong? -- true if the frame is a pong. Since: NAME-V0
-(defn ws-pong? [frame : WsFrame] : bool
-  ```c return frame != 0 && ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_PONG; ```)
-
-;;; ws-closed? -- true if the frame is a close (or the peer closed). Since: NAME-V0
-(defn ws-closed? [frame : WsFrame] : bool
-  ```c return frame != 0 && ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_CLOSE; ```)
-
-;;; ws-timeout? -- true if a recv returned because the timeout fired. Since: NAME-V0
-(defn ws-timeout? [frame : WsFrame] : bool
-  ```c return frame != 0 && ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_TIMEOUT; ```)
-
-;;; ws-error? -- true if a recv hit a transport error. Since: NAME-V0
-(defn ws-error? [frame : WsFrame] : bool
-  ```c return frame == 0 || ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_ERROR; ```)
-
-) ;; end defmodule ws-core/frame
+  ;;; ws-text? -- true if the frame is a text message. Since: NAME-V0
+  (defn ws-text? [frame : WsFrame] : bool
+    ```c return frame != 0 && ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_TEXT; ```)
+  ;;; ws-binary? -- true if the frame is a binary message. Since: NAME-V0
+  (defn ws-binary? [frame : WsFrame] : bool
+    ```c return frame != 0 && ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_BINARY; ```)
+  ;;; ws-ping? -- true if the frame is a ping (already auto-ponged). Since: NAME-V0
+  (defn ws-ping? [frame : WsFrame] : bool
+    ```c return frame != 0 && ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_PING; ```)
+  ;;; ws-pong? -- true if the frame is a pong. Since: NAME-V0
+  (defn ws-pong? [frame : WsFrame] : bool
+    ```c return frame != 0 && ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_PONG; ```)
+  ;;; ws-closed? -- true if the frame is a close (or the peer closed). Since: NAME-V0
+  (defn ws-closed? [frame : WsFrame] : bool
+    ```c return frame != 0 && ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_CLOSE; ```)
+  ;;; ws-timeout? -- true if a recv returned because the timeout fired. Since: NAME-V0
+  (defn ws-timeout? [frame : WsFrame] : bool
+    ```c return frame != 0 && ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_TIMEOUT; ```)
+  ;;; ws-error? -- true if a recv hit a transport error. Since: NAME-V0
+  (defn ws-error? [frame : WsFrame] : bool
+    ```c return frame == 0 || ((ws_frame_t *)(intptr_t)frame)->kind == WS_KIND_ERROR; ```)) ;; end defmodule ws-core/frame

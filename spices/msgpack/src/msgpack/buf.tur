@@ -17,235 +17,220 @@
 ;;;
 ;;; Since: Phase MP1
 ;; Owned byte buffer for the msgpack codec.
-
 (defmodule msgpack/buf
-  (export Buf buf-alloc buf-len buf-data buf-free buf-concat
-          buf-byte buf-empty? buf=? buf->hex hex->buf)
-
-;;; Buf -- an owned length-prefixed byte buffer (ABI: ptr<void>).
-(defopaque Buf :ptr<void>)
-
-;; The raw producers below declare `ptr<void>`, not `Buf`, and the Turmeric
-;; wrapper does the `(:: p Buf)`.  Written as one function the inline C would
-;; have to `return` a value of whatever C type the compiler chose to lower
-;; `(defopaque Buf :ptr<void>)` to -- and that choice is not stable across
-;; compiler versions.  Where it lowers to `int64_t`, `return (void *)p;` is a
-;; pointer returned from an integer-typed function: gcc calls that
-;; -Wint-conversion and carries on, newer clang rejects it outright, which is
-;; how four spices came to fail on macOS CI and pass on Linux.  Handing the
-;; carrier to `::` lets the compiler emit whichever conversion its own
-;; lowering needs.  Same reasoning as json/ownstr's `__adopt-cstr-raw`.
-
-;;; __buf-alloc-raw -- internal: allocate a zeroed buffer, as a bare pointer.
-(defn __buf-alloc-raw [n : int] : ptr<void>
-  ```c
-  extern void *mp_buf_alloc(int64_t);
+  (export Buf
+    buf-alloc
+    buf-len
+    buf-data
+    buf-free
+    buf-concat
+    buf-byte
+    buf-empty?
+    buf=?
+    buf->hex
+    hex->buf)
+  ;;; Buf -- an owned length-prefixed byte buffer (ABI: ptr<void>).
+  (defopaque Buf :ptr<void>)
+  ;; The raw producers below declare `ptr<void>`, not `Buf`, and the Turmeric
+  ;; wrapper does the `(:: p Buf)`.  Written as one function the inline C would
+  ;; have to `return` a value of whatever C type the compiler chose to lower
+  ;; `(defopaque Buf :ptr<void>)` to -- and that choice is not stable across
+  ;; compiler versions.  Where it lowers to `int64_t`, `return (void *)p;` is a
+  ;; pointer returned from an integer-typed function: gcc calls that
+  ;; -Wint-conversion and carries on, newer clang rejects it outright, which is
+  ;; how four spices came to fail on macOS CI and pass on Linux.  Handing the
+  ;; carrier to `::` lets the compiler emit whichever conversion its own
+  ;; lowering needs.  Same reasoning as json/ownstr's `__adopt-cstr-raw`.
+  ;;; __buf-alloc-raw -- internal: allocate a zeroed buffer, as a bare pointer.
+  (defn __buf-alloc-raw [n : int] : ptr<void>
+    ```c
+    extern void *mp_buf_alloc(int64_t);
   return mp_buf_alloc((int64_t)n);
   ```)
-
-;;; buf-alloc -- allocate a zeroed buffer of `n` bytes.
-;;;
-;;; Parameters:
-;;;   n -- number of data bytes (not counting the 8-byte length prefix)
-;;;
-;;; Returns:
-;;;   A fresh owned Buf; release it with buf-free.
-;;;
-;;; Example:
-;;;   (let [b (buf-alloc 4)] (buf-len b))   ; => 4
-;;;
-;;; Since: Phase MP1
-(defn buf-alloc [n : int] : Buf
-  (:: (__buf-alloc-raw n) Buf))
-
-;;; buf-len -- the number of data bytes the buffer holds.
-;;;
-;;; Parameters:
-;;;   b -- the buffer to measure
-;;;
-;;; Returns:
-;;;   int -- the byte length (0 for a null handle).
-;;;
-;;; Example:
-;;;   (buf-len (hex->buf "c3"))   ; => 1
-;;;
-;;; Since: Phase MP1
-(defn buf-len [b : Buf] : int
-  ```c
-  extern int64_t mp_buf_len(const void *);
+  ;;; buf-alloc -- allocate a zeroed buffer of `n` bytes.
+  ;;;
+  ;;; Parameters:
+  ;;;   n -- number of data bytes (not counting the 8-byte length prefix)
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh owned Buf; release it with buf-free.
+  ;;;
+  ;;; Example:
+  ;;;   (let [b (buf-alloc 4)] (buf-len b))   ; => 4
+  ;;;
+  ;;; Since: Phase MP1
+  (defn buf-alloc [n : int] : Buf (:: (__buf-alloc-raw n) Buf))
+  ;;; buf-len -- the number of data bytes the buffer holds.
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer to measure
+  ;;;
+  ;;; Returns:
+  ;;;   int -- the byte length (0 for a null handle).
+  ;;;
+  ;;; Example:
+  ;;;   (buf-len (hex->buf "c3"))   ; => 1
+  ;;;
+  ;;; Since: Phase MP1
+  (defn buf-len [b : Buf] : int
+    ```c
+    extern int64_t mp_buf_len(const void *);
   return mp_buf_len((const void *)(intptr_t)b);
   ```)
-
-;;; buf-data -- a borrowed pointer to the buffer's first data byte.
-;;;
-;;; Valid only while the Buf is alive; do not use after buf-free.
-;;;
-;;; Parameters:
-;;;   b -- the buffer to borrow from
-;;;
-;;; Returns:
-;;;   ptr<void> -- the data region (past the length prefix).
-;;;
-;;; Example:
-;;;   (let [b (buf-alloc 8)] (buf-data b))
-;;;
-;;; Since: Phase MP1
-(defn buf-data [b : Buf] : ptr<void>
-  ```c
-  extern void *mp_buf_data(void *);
+  ;;; buf-data -- a borrowed pointer to the buffer's first data byte.
+  ;;;
+  ;;; Valid only while the Buf is alive; do not use after buf-free.
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer to borrow from
+  ;;;
+  ;;; Returns:
+  ;;;   ptr<void> -- the data region (past the length prefix).
+  ;;;
+  ;;; Example:
+  ;;;   (let [b (buf-alloc 8)] (buf-data b))
+  ;;;
+  ;;; Since: Phase MP1
+  (defn buf-data [b : Buf] : ptr<void>
+    ```c
+    extern void *mp_buf_data(void *);
   return mp_buf_data((void *)(intptr_t)b);
   ```)
-
-;;; buf-free -- release the buffer.
-;;;
-;;; Parameters:
-;;;   b -- the buffer whose owning handle is being dropped
-;;;
-;;; Example:
-;;;   (buf-free (encode-mp 42))
-;;;
-;;; Since: Phase MP1
-(defn buf-free [b : Buf] : nil
-  ```c
-  extern void mp_buf_free(void *);
+  ;;; buf-free -- release the buffer.
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer whose owning handle is being dropped
+  ;;;
+  ;;; Example:
+  ;;;   (buf-free (encode-mp 42))
+  ;;;
+  ;;; Since: Phase MP1
+  (defn buf-free [b : Buf] : nil
+    ```c
+    extern void mp_buf_free(void *);
   mp_buf_free((void *)(intptr_t)b);
   ```)
-
-;;; __buf-concat-raw -- internal: concatenate, as a bare pointer.
-(defn __buf-concat-raw [a : Buf b : Buf] : ptr<void>
-  ```c
-  extern void *mp_buf_concat(void *, void *);
+  ;;; __buf-concat-raw -- internal: concatenate, as a bare pointer.
+  (defn __buf-concat-raw [a : Buf b : Buf] : ptr<void>
+    ```c
+    extern void *mp_buf_concat(void *, void *);
   return mp_buf_concat((void *)(intptr_t)a, (void *)(intptr_t)b);
   ```)
-
-;;; buf-concat -- concatenate two buffers, CONSUMING both.
-;;;
-;;; MessagePack is concatenative -- a container's encoding is its header
-;;; followed by its elements' encodings back to back -- so joining fragments
-;;; is the whole of how the derive macros build a map or an array. Both
-;;; operands are freed; do not touch them afterwards.
-;;;
-;;; Parameters:
-;;;   a -- the left fragment (consumed)
-;;;   b -- the right fragment (consumed)
-;;;
-;;; Returns:
-;;;   A fresh owned Buf holding a's bytes followed by b's.
-;;;
-;;; Example:
-;;;   (buf->hex (buf-concat (encode-mp 1) (encode-mp 2)))   ; => "0102"
-;;;
-;;; Since: Phase MP1
-(defn buf-concat [a : Buf b : Buf] : Buf
-  (:: (__buf-concat-raw a b) Buf))
-
-;;; buf-byte -- the i-th data byte, as an int in 0..255.
-;;;
-;;; Parameters:
-;;;   b -- the buffer to read
-;;;   i -- zero-based byte index
-;;;
-;;; Returns:
-;;;   int -- the byte, or -1 when i is out of range.
-;;;
-;;; Example:
-;;;   (buf-byte (encode-mp true) 0)   ; => 195   (0xc3)
-;;;
-;;; Since: Phase MP1
-(defn buf-byte [b : Buf i : int] : int
-  ```c
-  extern int64_t mp_buf_byte(const void *, int64_t);
+  ;;; buf-concat -- concatenate two buffers, CONSUMING both.
+  ;;;
+  ;;; MessagePack is concatenative -- a container's encoding is its header
+  ;;; followed by its elements' encodings back to back -- so joining fragments
+  ;;; is the whole of how the derive macros build a map or an array. Both
+  ;;; operands are freed; do not touch them afterwards.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the left fragment (consumed)
+  ;;;   b -- the right fragment (consumed)
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh owned Buf holding a's bytes followed by b's.
+  ;;;
+  ;;; Example:
+  ;;;   (buf->hex (buf-concat (encode-mp 1) (encode-mp 2)))   ; => "0102"
+  ;;;
+  ;;; Since: Phase MP1
+  (defn buf-concat [a : Buf b : Buf] : Buf (:: (__buf-concat-raw a b) Buf))
+  ;;; buf-byte -- the i-th data byte, as an int in 0..255.
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer to read
+  ;;;   i -- zero-based byte index
+  ;;;
+  ;;; Returns:
+  ;;;   int -- the byte, or -1 when i is out of range.
+  ;;;
+  ;;; Example:
+  ;;;   (buf-byte (encode-mp true) 0)   ; => 195   (0xc3)
+  ;;;
+  ;;; Since: Phase MP1
+  (defn buf-byte [b : Buf i : int] : int
+    ```c
+    extern int64_t mp_buf_byte(const void *, int64_t);
   return mp_buf_byte((const void *)(intptr_t)b, (int64_t)i);
   ```)
-
-;;; buf-empty? -- true when the buffer holds no data bytes.
-;;;
-;;; Parameters:
-;;;   b -- the buffer to test
-;;;
-;;; Returns:
-;;;   bool -- true for a zero-length (or null) buffer.
-;;;
-;;; Example:
-;;;   (buf-empty? (buf-alloc 0))   ; => true
-;;;
-;;; Since: Phase MP1
-(defn buf-empty? [b : Buf] : bool
-  (= 0 (buf-len b)))
-
-;;; buf=? -- byte-for-byte equality.
-;;;
-;;; Parameters:
-;;;   a -- the first buffer
-;;;   b -- the second buffer
-;;;
-;;; Returns:
-;;;   bool -- true when both hold the same bytes in the same order.
-;;;
-;;; Example:
-;;;   (buf=? (encode-mp 7) (hex->buf "07"))   ; => true
-;;;
-;;; Since: Phase MP1
-(defn buf=? [a : Buf b : Buf] : bool
-  ```c
-  extern int mp_buf_eq(const void *, const void *);
+  ;;; buf-empty? -- true when the buffer holds no data bytes.
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer to test
+  ;;;
+  ;;; Returns:
+  ;;;   bool -- true for a zero-length (or null) buffer.
+  ;;;
+  ;;; Example:
+  ;;;   (buf-empty? (buf-alloc 0))   ; => true
+  ;;;
+  ;;; Since: Phase MP1
+  (defn buf-empty? [b : Buf] : bool (= 0 (buf-len b)))
+  ;;; buf=? -- byte-for-byte equality.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the first buffer
+  ;;;   b -- the second buffer
+  ;;;
+  ;;; Returns:
+  ;;;   bool -- true when both hold the same bytes in the same order.
+  ;;;
+  ;;; Example:
+  ;;;   (buf=? (encode-mp 7) (hex->buf "07"))   ; => true
+  ;;;
+  ;;; Since: Phase MP1
+  (defn buf=? [a : Buf b : Buf] : bool
+    ```c
+    extern int mp_buf_eq(const void *, const void *);
   return mp_buf_eq((const void *)(intptr_t)a, (const void *)(intptr_t)b) != 0;
   ```)
-
-;;; buf->hex -- render the buffer as lowercase hex.
-;;;
-;;; The readable form for golden-byte assertions: a hex mismatch names the
-;;; exact bytes that moved, where a `buf=?` failure only says "not equal".
-;;;
-;;; Parameters:
-;;;   b -- the buffer to render
-;;;
-;;; Returns:
-;;;   cstr -- a freshly malloc'd hex string; the caller frees it.
-;;;
-;;; Example:
-;;;   (buf->hex (encode-mp 128))   ; => "cc80"
-;;;
-;;; Since: Phase MP1
-(defn buf->hex [b : Buf] : cstr
-  ```c
-  extern char *mp_buf_to_hex(const void *);
+  ;;; buf->hex -- render the buffer as lowercase hex.
+  ;;;
+  ;;; The readable form for golden-byte assertions: a hex mismatch names the
+  ;;; exact bytes that moved, where a `buf=?` failure only says "not equal".
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer to render
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- a freshly malloc'd hex string; the caller frees it.
+  ;;;
+  ;;; Example:
+  ;;;   (buf->hex (encode-mp 128))   ; => "cc80"
+  ;;;
+  ;;; Since: Phase MP1
+  (defn buf->hex [b : Buf] : cstr
+    ```c
+    extern char *mp_buf_to_hex(const void *);
   return mp_buf_to_hex((const void *)(intptr_t)b);
   ```)
-
-;;; __buf-null-ptr? -- internal: is this a null pointer?
-(defn __buf-null-ptr? [p : ptr<void>] : bool
-  ```c
-  return p == NULL;
+  ;;; __buf-null-ptr? -- internal: is this a null pointer?
+  (defn __buf-null-ptr? [p : ptr<void>] : bool
+    ```c
+    return p == NULL;
   ```)
-
-;;; __hex->buf-raw -- internal: parse hex, as a bare pointer (NULL on error).
-(defn __hex->buf-raw [s : cstr] : ptr<void>
-  ```c
-  extern void *mp_buf_of_hex(const char *);
+  ;;; __hex->buf-raw -- internal: parse hex, as a bare pointer (NULL on error).
+  (defn __hex->buf-raw [s : cstr] : ptr<void>
+    ```c
+    extern void *mp_buf_of_hex(const char *);
   return mp_buf_of_hex((const char *)s);
   ```)
-
-;;; hex->buf -- parse a lowercase-or-uppercase hex string into a Buf.
-;;;
-;;; The inverse of `buf->hex`, so a checked-in golden byte string can be
-;;; turned back into bytes to feed the decoder.
-;;;
-;;; Parameters:
-;;;   s -- an even-length string of hex digits
-;;;
-;;; Returns:
-;;;   A fresh owned Buf; an EMPTY buf when `s` is malformed (odd length or a
-;;;   non-hex digit).
-;;;
-;;; Example:
-;;;   (buf-byte (hex->buf "c0") 0)   ; => 192
-;;;
-;;; Since: Phase MP1
-(defn hex->buf [s : cstr] : Buf
-  (let [p (__hex->buf-raw s)]
-    (if (__buf-null-ptr? p)
-      (buf-alloc 0)
-      (:: p Buf))))
-
-) ;; end defmodule msgpack/buf
+  ;;; hex->buf -- parse a lowercase-or-uppercase hex string into a Buf.
+  ;;;
+  ;;; The inverse of `buf->hex`, so a checked-in golden byte string can be
+  ;;; turned back into bytes to feed the decoder.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- an even-length string of hex digits
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh owned Buf; an EMPTY buf when `s` is malformed (odd length or a
+  ;;;   non-hex digit).
+  ;;;
+  ;;; Example:
+  ;;;   (buf-byte (hex->buf "c0") 0)   ; => 192
+  ;;;
+  ;;; Since: Phase MP1
+  (defn hex->buf [s : cstr] : Buf
+    (let [p (__hex->buf-raw s)]
+      (if (__buf-null-ptr? p) (buf-alloc 0) (:: p Buf))))) ;; end defmodule msgpack/buf

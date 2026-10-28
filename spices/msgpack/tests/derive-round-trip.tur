@@ -5,165 +5,139 @@
 ;;
 ;; Expected hex cross-generated with CPython's `msgpack` 1.2.2 at
 ;; fixture-authoring time; the bytes are the artifact.
-
-(defmodule derive_round_trip_test (export)
-
-(import msgpack/buf    :refer [Buf buf-free buf->hex hex->buf])
-(import msgpack/decode :refer [MpTree MpNode mp-parse mp-tree-root mp-tree-free])
-(import msgpack/encode :refer [derive-msgpack derive-msgpack-encode
-                               derive-msgpack-decode derive-msgpack-opaque
-                               derive-msgpack-sum])
-(import test/suite     :refer [describe it])
-(import test/assert    :refer [assert-true assert-eq])
-(import test/runner    :refer [run-all-status])
-
-(defn cstr-eq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+(defmodule derive_round_trip_test
+  (export)
+  (import msgpack/buf :refer [Buf buf-free buf->hex hex->buf])
+  (import msgpack/decode
+    :refer
+    [MpTree MpNode mp-parse mp-tree-root mp-tree-free])
+  (import msgpack/encode
+    :refer
+    [derive-msgpack
+     derive-msgpack-encode
+     derive-msgpack-decode
+     derive-msgpack-opaque
+     derive-msgpack-sum])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true assert-eq])
+  (import test/runner :refer [run-all-status])
+  (defn cstr-eq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn cstr-free [p : cstr] : nil
-  ```c
-  free((void *)(intptr_t)p);
+  (defn cstr-free [p : cstr] : nil
+    ```c
+    free((void *)(intptr_t)p);
   ```)
-
-;; hex=? -- does `b` render to `expect`? CONSUMES b.
-(defn hex=? [b : Buf expect : cstr] : bool
-  (let [h (buf->hex b)
-        r (cstr-eq? expect h)]
-    (cstr-free h)
-    (buf-free b)
-    r))
-
-;; parse -- Buf -> MpTree. CONSUMES the buffer; the tree copies the bytes.
-(defn parse [b : Buf] : MpTree
-  (let [r (mp-parse b)]
-    (buf-free b)
-    (ok-val r)))
-
-(defstruct Pt   [x : int  y : int])
-(defstruct Line [a : Pt   b : Pt])
-(defstruct User [id : int  name : cstr  active : bool])
-(defstruct Log  [level : cstr  msg : cstr])
-(defstruct Conf [port : int  host : cstr])
-
-(derive-msgpack Pt   (x int) (y int))
-(derive-msgpack Line (a Pt)  (b Pt))
-(derive-msgpack User (id int) (name cstr) (active bool))
-(derive-msgpack-encode Log  (level cstr) (msg cstr))
-(derive-msgpack-decode Conf (port int) (host cstr))
-
-(defopaque UserId :int)
-(derive-msgpack-opaque UserId :as int)
-
-(defdata ^copy Event [] (Click :int :int) (Scroll :int) (Tick))
-(derive-msgpack-sum Event
-  (Click (x int) (y int))
-  (Scroll (dy int))
-  (Tick))
-
-(defn __struct-tests [] : void
-  (describe "msgpack derive-msgpack -- defstruct round trip"
-
-    (it "a 3-field struct encodes to a fixmap with string keys"
-      (assert-true (hex=? (encode-mp (make-struct User 7 "alice" true))
-                          "83a2696407a46e616d65a5616c696365a6616374697665c3")))
-
-    (it "a 3-field struct round-trips every field"
-      (let [t (parse (encode-mp (make-struct User 7 "alice" true)))
-            u (ok-val (:: (decode-mp t (mp-tree-root t)) (Result User cstr)))
-            r (assert-true (and (= 7 (.id u))
-                                (and (cstr-eq? "alice" (.name u))
-                                     (.active u))))]
-        (mp-tree-free t)
-        r))
-
-    (it "a nested struct field dispatches to the inner type's own instance"
-      (assert-true (hex=? (encode-mp (make-struct Line (make-struct Pt 1 2)
-                                                      (make-struct Pt 3 4)))
-                          "82a16182a17801a17902a16282a17803a17904")))
-
-    (it "a nested struct round-trips through the leaf fields"
-      (let [t (parse (encode-mp (make-struct Line (make-struct Pt 1 2)
-                                                  (make-struct Pt 3 4))))
-            l (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Line cstr)))
-            r (assert-true (and (= 1 (.x (.a l)))
-                                (and (= 2 (.y (.a l)))
-                                     (and (= 3 (.x (.b l)))
-                                          (= 4 (.y (.b l)))))))]
-        (mp-tree-free t)
-        r))
-
-    (it "decoding looks keys up by name, so a reordered producer still decodes"
-      ;; {"y":2,"x":1} -- the reverse of the declaration order.
-      (let [t (parse (hex->buf "82a17902a17801"))
-            p (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Pt cstr)))
-            r (assert-true (and (= 1 (.x p)) (= 2 (.y p))))]
-        (mp-tree-free t)
-        r))
-
-    (it "derive-msgpack-encode emits only the encode half"
-      (assert-true (hex=? (encode-mp (make-struct Log "info" "hi"))
-                          "82a56c6576656ca4696e666fa36d7367a26869")))
-
-    (it "derive-msgpack-decode emits only the decode half"
-      ;; {"port":8080,"host":"localhost"}
-      (let [t (parse (hex->buf "82a4706f7274cd1f90a4686f7374a96c6f63616c686f7374"))
-            c (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Conf cstr)))
-            r (assert-true (and (= 8080 (.port c)) (cstr-eq? "localhost" (.host c))))]
-        (mp-tree-free t)
-        r))))
-
-(defn __opaque-tests [] : void
-  (describe "msgpack derive-msgpack-opaque -- a newtype on its carrier's wire form"
-
-    (it "encodes exactly as its int carrier"
-      (assert-true (hex=? (encode-mp (:: 42 UserId)) "2a")))
-
-    (it "round-trips back into the opaque"
-      (let [t (parse (encode-mp (:: 42 UserId)))
-            u (ok-val (:: (decode-mp t (mp-tree-root t)) (Result UserId cstr)))
-            r (assert-eq 42 (:: u :int))]
-        (mp-tree-free t)
-        r))))
-
-(defn __sum-tests [] : void
-  (describe "msgpack derive-msgpack-sum -- externally tagged {\"Ctor\": {...}}"
-
-    (it "a multi-field constructor tags its inner map"
-      (assert-true (hex=? (encode-mp (Click 3 4)) "81a5436c69636b82a17803a17904")))
-
-    (it "a single-field constructor tags its inner map"
-      (assert-true (hex=? (encode-mp (Scroll 9)) "81a65363726f6c6c81a2647909")))
-
-    (it "a nullary constructor is an empty inner map"
-      (assert-true (hex=? (encode-mp (Tick)) "81a45469636b80")))
-
-    (it "a multi-field variant round-trips unchanged"
-      (let [t (parse (encode-mp (Click 3 4)))
-            e (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Event cstr)))
-            r (assert-true (hex=? (encode-mp e) "81a5436c69636b82a17803a17904"))]
-        (mp-tree-free t)
-        r))
-
-    (it "the second constructor's tag selects the second arm"
-      (let [t (parse (encode-mp (Scroll 9)))
-            e (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Event cstr)))
-            r (assert-true (hex=? (encode-mp e) "81a65363726f6c6c81a2647909"))]
-        (mp-tree-free t)
-        r))
-
-    (it "a nullary variant round-trips as an empty inner map"
-      (let [t (parse (encode-mp (Tick)))
-            e (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Event cstr)))
-            r (assert-true (hex=? (encode-mp e) "81a45469636b80"))]
-        (mp-tree-free t)
-        r))))
-
-(defn main [] : int
-  (__struct-tests)
-  (__opaque-tests)
-  (__sum-tests)
-  (run-all-status))
-)
+  ;; hex=? -- does `b` render to `expect`? CONSUMES b.
+  (defn hex=? [b : Buf expect : cstr] : bool
+    (let [h (buf->hex b)
+          r (cstr-eq? expect h)]
+      (cstr-free h)
+      (buf-free b)
+      r))
+  ;; parse -- Buf -> MpTree. CONSUMES the buffer; the tree copies the bytes.
+  (defn parse [b : Buf] : MpTree (let [r (mp-parse b)] (buf-free b) (ok-val r)))
+  (defstruct Pt [x : int y : int])
+  (defstruct Line [a : Pt b : Pt])
+  (defstruct User [id : int name : cstr active : bool])
+  (defstruct Log [level : cstr msg : cstr])
+  (defstruct Conf [port : int host : cstr])
+  (derive-msgpack Pt (x int) (y int))
+  (derive-msgpack Line (a Pt) (b Pt))
+  (derive-msgpack User (id int) (name cstr) (active bool))
+  (derive-msgpack-encode Log (level cstr) (msg cstr))
+  (derive-msgpack-decode Conf (port int) (host cstr))
+  (defopaque UserId :int)
+  (derive-msgpack-opaque UserId :as int)
+  (defdata ^copy Event [] (Click :int :int) (Scroll :int) (Tick))
+  (derive-msgpack-sum Event (Click (x int) (y int)) (Scroll (dy int)) (Tick))
+  (defn __struct-tests [] : void
+    (describe "msgpack derive-msgpack -- defstruct round trip"
+      (it "a 3-field struct encodes to a fixmap with string keys"
+        (assert-true (hex=? (encode-mp (make-struct User 7 "alice" true))
+                       "83a2696407a46e616d65a5616c696365a6616374697665c3")))
+      (it "a 3-field struct round-trips every field"
+        (let [t (parse (encode-mp (make-struct User 7 "alice" true)))
+              u (ok-val (:: (decode-mp t (mp-tree-root t)) (Result User cstr)))
+              r (assert-true (and (= 7 (.id u))
+                               (and (cstr-eq? "alice" (.name u)) (.active u))))]
+          (mp-tree-free t)
+          r))
+      (it "a nested struct field dispatches to the inner type's own instance"
+        (assert-true (hex=? (encode-mp (make-struct Line
+                                         (make-struct Pt 1 2)
+                                         (make-struct Pt 3 4)))
+                       "82a16182a17801a17902a16282a17803a17904")))
+      (it "a nested struct round-trips through the leaf fields"
+        (let [t (parse (encode-mp (make-struct Line
+                                    (make-struct Pt 1 2)
+                                    (make-struct Pt 3 4))))
+              l (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Line cstr)))
+              r (assert-true (and (= 1 (.x (.a l)))
+                               (and (= 2 (.y (.a l)))
+                                 (and (= 3 (.x (.b l))) (= 4 (.y (.b l)))))))]
+          (mp-tree-free t)
+          r))
+      (it "decoding looks keys up by name, so a reordered producer still decodes"
+        ;; {"y":2,"x":1} -- the reverse of the declaration order.
+        (let [t (parse (hex->buf "82a17902a17801"))
+              p (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Pt cstr)))
+              r (assert-true (and (= 1 (.x p)) (= 2 (.y p))))]
+          (mp-tree-free t)
+          r))
+      (it "derive-msgpack-encode emits only the encode half"
+        (assert-true (hex=? (encode-mp (make-struct Log "info" "hi"))
+                       "82a56c6576656ca4696e666fa36d7367a26869")))
+      (it "derive-msgpack-decode emits only the decode half"
+        ;; {"port":8080,"host":"localhost"}
+        (let [t (parse (hex->buf "82a4706f7274cd1f90a4686f7374a96c6f63616c686f7374"))
+              c (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Conf cstr)))
+              r (assert-true (and (= 8080 (.port c))
+                               (cstr-eq? "localhost" (.host c))))]
+          (mp-tree-free t)
+          r))))
+  (defn __opaque-tests [] : void
+    (describe "msgpack derive-msgpack-opaque -- a newtype on its carrier's wire form"
+      (it "encodes exactly as its int carrier"
+        (assert-true (hex=? (encode-mp (:: 42 UserId)) "2a")))
+      (it "round-trips back into the opaque"
+        (let [t (parse (encode-mp (:: 42 UserId)))
+              u (ok-val (:: (decode-mp t (mp-tree-root t)) (Result UserId cstr)))
+              r (assert-eq 42 (:: u :int))]
+          (mp-tree-free t)
+          r))))
+  (defn __sum-tests [] : void
+    (describe "msgpack derive-msgpack-sum -- externally tagged {\"Ctor\": {...}}"
+      (it "a multi-field constructor tags its inner map"
+        (assert-true (hex=? (encode-mp (Click 3 4))
+                       "81a5436c69636b82a17803a17904")))
+      (it "a single-field constructor tags its inner map"
+        (assert-true (hex=? (encode-mp (Scroll 9)) "81a65363726f6c6c81a2647909")))
+      (it "a nullary constructor is an empty inner map"
+        (assert-true (hex=? (encode-mp (Tick)) "81a45469636b80")))
+      (it "a multi-field variant round-trips unchanged"
+        (let [t (parse (encode-mp (Click 3 4)))
+              e (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Event cstr)))
+              r (assert-true (hex=? (encode-mp e)
+                               "81a5436c69636b82a17803a17904"))]
+          (mp-tree-free t)
+          r))
+      (it "the second constructor's tag selects the second arm"
+        (let [t (parse (encode-mp (Scroll 9)))
+              e (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Event cstr)))
+              r (assert-true (hex=? (encode-mp e) "81a65363726f6c6c81a2647909"))]
+          (mp-tree-free t)
+          r))
+      (it "a nullary variant round-trips as an empty inner map"
+        (let [t (parse (encode-mp (Tick)))
+              e (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Event cstr)))
+              r (assert-true (hex=? (encode-mp e) "81a45469636b80"))]
+          (mp-tree-free t)
+          r))))
+  (defn main [] : int
+    (__struct-tests)
+    (__opaque-tests)
+    (__sum-tests)
+    (run-all-status)))

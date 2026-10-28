@@ -21,547 +21,508 @@
 ;;;
 ;;; Since: 0.1.0
 ;; SAX driver over the event queue in c/xml/turxml.c.
-
 (defmodule xml/sax
-  (export ParseOpts default-parse-opts SaxParser
-          sax-parse-string sax-parse-string-opts
-          sax-parse-file sax-parse-file-opts
-          sax-parser-new sax-parser-new-opts sax-feed! sax-finish!
-          sax-parser-free xml-backend-version)
-
-(import dom/ownstr :refer [String from-cstr])
-(import dom/core   :refer [ParseError ParseErrorKind
-                           syntax-kind limit-kind refused-kind io-kind])
-(import dom/event  :refer [SaxEvent SaxControl Attr sax-event-release
-                           StartElement EndElement Chars Comment
-                           Pi StartCdata EndCdata Doctype Continue Stop])
-
-;;; ParseOpts -- limits and switches for one parse.
-;;;
-;;;   max-depth               -- deepest element nesting accepted (0 = no cap)
-;;;   max-bytes               -- most input bytes accepted (0 = no cap); pass
-;;;                              0 to stream a multi-gigabyte file
-;;;   max-expansion-ratio     -- expat's billion-laughs limit: output bytes of
-;;;                              entity expansion per input byte
-;;;   allow-external-entities -- load SYSTEM entities and the external DTD
-;;;                              subset from the LOCAL filesystem (never a
-;;;                              URL). Off by default; turning it on lets the
-;;;                              document read any file the process can.
-;;;   namespaces              -- namespace processing: names in Clark form
-;;;                              `{uri}local`, xmlns not reported as attributes
-;;;
-;;; A `:copy` struct, so adjust one field with `with`:
-;;;   (with (default-parse-opts) [max-bytes 0])
-(defstruct ^copy ParseOpts
-  [max-depth : int
-   max-bytes : int
-   max-expansion-ratio : float
-   allow-external-entities : bool
-   namespaces : bool])
-
-;;; default-parse-opts -- the safe defaults.
-;;;
-;;; Depth 256 (libxml2's default), 64 MiB of input, expansion ratio 100.0
-;;; (expat's default), no external entities, namespace processing on.
-;;;
-;;; Returns:
-;;;   ParseOpts
-;;;
-;;; Example:
-;;;   (sax-parse-file-opts "big.xml" (with (default-parse-opts) [max-bytes 0]) h)
-;;;
-;;; Since: 0.1.0
-(defn default-parse-opts [] : ParseOpts
-  (ParseOpts 256 67108864 100.0 false true))
-
-;;; XmlSaxRaw -- internal: the C parser state (c/xml/turxml.c).
-(defopaque XmlSaxRaw :ptr<void>)
-
-;;; SaxParser -- a push parser: a C parser plus the handler it feeds.
-;;; Release with `sax-parser-free`.
-(defstruct ^copy SaxParser [raw : XmlSaxRaw handler : (fn [SaxEvent] SaxControl)])
-
-;;; xml-backend-version -- the linked expat's version string.
-;;;
-;;; Returns:
-;;;   cstr -- static, e.g. "expat_2.9.0".
-;;;
-;;; Example:
-;;;   (println (xml-backend-version))
-;;;
-;;; Since: 0.1.0
-(defn xml-backend-version [] : cstr
-  ```c
-  #include <expat.h>
+  (export ParseOpts
+    default-parse-opts
+    SaxParser
+    sax-parse-string
+    sax-parse-string-opts
+    sax-parse-file
+    sax-parse-file-opts
+    sax-parser-new
+    sax-parser-new-opts
+    sax-feed!
+    sax-finish!
+    sax-parser-free
+    xml-backend-version)
+  (import dom/ownstr :refer [String from-cstr])
+  (import dom/core
+    :refer
+    [ParseError ParseErrorKind syntax-kind limit-kind refused-kind io-kind])
+  (import dom/event
+    :refer
+    [SaxEvent
+     SaxControl
+     Attr
+     sax-event-release
+     StartElement
+     EndElement
+     Chars
+     Comment
+     Pi
+     StartCdata
+     EndCdata
+     Doctype
+     Continue
+     Stop])
+  ;;; ParseOpts -- limits and switches for one parse.
+  ;;;
+  ;;;   max-depth               -- deepest element nesting accepted (0 = no cap)
+  ;;;   max-bytes               -- most input bytes accepted (0 = no cap); pass
+  ;;;                              0 to stream a multi-gigabyte file
+  ;;;   max-expansion-ratio     -- expat's billion-laughs limit: output bytes of
+  ;;;                              entity expansion per input byte
+  ;;;   allow-external-entities -- load SYSTEM entities and the external DTD
+  ;;;                              subset from the LOCAL filesystem (never a
+  ;;;                              URL). Off by default; turning it on lets the
+  ;;;                              document read any file the process can.
+  ;;;   namespaces              -- namespace processing: names in Clark form
+  ;;;                              `{uri}local`, xmlns not reported as attributes
+  ;;;
+  ;;; A `:copy` struct, so adjust one field with `with`:
+  ;;;   (with (default-parse-opts) [max-bytes 0])
+  (defstruct ^copy ParseOpts
+    [max-depth : int
+     max-bytes : int
+     max-expansion-ratio : float
+     allow-external-entities : bool
+     namespaces : bool])
+  ;;; default-parse-opts -- the safe defaults.
+  ;;;
+  ;;; Depth 256 (libxml2's default), 64 MiB of input, expansion ratio 100.0
+  ;;; (expat's default), no external entities, namespace processing on.
+  ;;;
+  ;;; Returns:
+  ;;;   ParseOpts
+  ;;;
+  ;;; Example:
+  ;;;   (sax-parse-file-opts "big.xml" (with (default-parse-opts) [max-bytes 0]) h)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn default-parse-opts [] : ParseOpts
+    (ParseOpts 256 67108864 1e+02 false true))
+  ;;; XmlSaxRaw -- internal: the C parser state (c/xml/turxml.c).
+  (defopaque XmlSaxRaw :ptr<void>)
+  ;;; SaxParser -- a push parser: a C parser plus the handler it feeds.
+  ;;; Release with `sax-parser-free`.
+  (defstruct ^copy SaxParser
+    [raw : XmlSaxRaw handler : (fn [SaxEvent] SaxControl)])
+  ;;; xml-backend-version -- the linked expat's version string.
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- static, e.g. "expat_2.9.0".
+  ;;;
+  ;;; Example:
+  ;;;   (println (xml-backend-version))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn xml-backend-version [] : cstr
+    ```c
+    #include <expat.h>
   return XML_ExpatVersion();
   ```)
-
-;; ---------------------------------------------------------------------------
-;; C bridge
-;; ---------------------------------------------------------------------------
-
-;;; __new-raw -- internal: allocate the C parser (NULL on OOM).
-(defn __new-raw [ns : bool depth : int nbytes : int ratio : float
-                 ext : bool] : ptr<void>
-  ```c
-  extern void *turxml_new(int, int64_t, int64_t, double, int);
+  ;; ---------------------------------------------------------------------------
+  ;; C bridge
+  ;; ---------------------------------------------------------------------------
+  ;;; __new-raw -- internal: allocate the C parser (NULL on OOM).
+  (defn __new-raw [ns : bool depth : int nbytes : int ratio : float ext : bool] : ptr<void>
+    ```c
+    extern void *turxml_new(int, int64_t, int64_t, double, int);
   return turxml_new(ns ? 1 : 0, depth, nbytes, ratio, ext ? 1 : 0);
   ```)
-
-;;; __null? -- internal: is this a null pointer?
-(defn __null? [p : ptr<void>] : bool
-  ```c
-  return p == NULL;
+  ;;; __null? -- internal: is this a null pointer?
+  (defn __null? [p : ptr<void>] : bool
+    ```c
+    return p == NULL;
   ```)
-
-;;; __free -- internal: release the C parser.
-(defn __free [x : XmlSaxRaw] : nil
-  ```c
-  extern void turxml_free(void *);
+  ;;; __free -- internal: release the C parser.
+  (defn __free [x : XmlSaxRaw] : nil
+    ```c
+    extern void turxml_free(void *);
   turxml_free((void *)(intptr_t)x);
   ```)
-
-;;; __set-string -- internal: parse `src` (borrowed for the parse).
-(defn __set-string [x : XmlSaxRaw src : cstr] : nil
-  ```c
-  extern void turxml_set_string(void *, const char *, int64_t);
+  ;;; __set-string -- internal: parse `src` (borrowed for the parse).
+  (defn __set-string [x : XmlSaxRaw src : cstr] : nil
+    ```c
+    extern void turxml_set_string(void *, const char *, int64_t);
   turxml_set_string((void *)(intptr_t)x, (const char *)src, -1);
   ```)
-
-;;; __set-file -- internal: parse a file; 0 or -1 (Io error recorded).
-(defn __set-file [x : XmlSaxRaw path : cstr] : int
-  ```c
-  extern int turxml_set_file(void *, const char *);
+  ;;; __set-file -- internal: parse a file; 0 or -1 (Io error recorded).
+  (defn __set-file [x : XmlSaxRaw path : cstr] : int
+    ```c
+    extern int turxml_set_file(void *, const char *);
   return turxml_set_file((void *)(intptr_t)x, (const char *)path);
   ```)
-
-;;; __pump -- internal: feed the next source chunk; 1 more, 0 done, -1 error.
-(defn __pump [x : XmlSaxRaw] : int
-  ```c
-  extern int turxml_pump(void *);
+  ;;; __pump -- internal: feed the next source chunk; 1 more, 0 done, -1 error.
+  (defn __pump [x : XmlSaxRaw] : int
+    ```c
+    extern int turxml_pump(void *);
   return turxml_pump((void *)(intptr_t)x);
   ```)
-
-;;; __feed -- internal: feed a caller's chunk; 0 ok, -1 error.
-(defn __feed [x : XmlSaxRaw chunk : cstr final : bool] : int
-  ```c
-  #include <string.h>
+  ;;; __feed -- internal: feed a caller's chunk; 0 ok, -1 error.
+  (defn __feed [x : XmlSaxRaw chunk : cstr final : bool] : int
+    ```c
+    #include <string.h>
   extern int turxml_feed(void *, const char *, int64_t, int);
   const char *c = (const char *)chunk;
   return turxml_feed((void *)(intptr_t)x, c, c ? (int64_t)strlen(c) : 0,
                      final ? 1 : 0);
   ```)
-
-;;; __next -- internal: advance to the next queued event; its kind or 0.
-(defn __next [x : XmlSaxRaw] : int
-  ```c
-  extern int turxml_next(void *);
+  ;;; __next -- internal: advance to the next queued event; its kind or 0.
+  (defn __next [x : XmlSaxRaw] : int
+    ```c
+    extern int turxml_next(void *);
   return turxml_next((void *)(intptr_t)x);
   ```)
-
-;;; __stop -- internal: the handler said Stop.
-(defn __stop [x : XmlSaxRaw] : nil
-  ```c
-  extern void turxml_stop(void *);
+  ;;; __stop -- internal: the handler said Stop.
+  (defn __stop [x : XmlSaxRaw] : nil
+    ```c
+    extern void turxml_stop(void *);
   turxml_stop((void *)(intptr_t)x);
   ```)
-
-;;; __ev-name -- internal: the current event's name / target.
-(defn __ev-name [x : XmlSaxRaw] : cstr
-  ```c
-  extern const char *turxml_ev_name(void *);
+  ;;; __ev-name -- internal: the current event's name / target.
+  (defn __ev-name [x : XmlSaxRaw] : cstr
+    ```c
+    extern const char *turxml_ev_name(void *);
   return turxml_ev_name((void *)(intptr_t)x);
   ```)
-
-;;; __ev-text -- internal: the current event's text / PI data.
-(defn __ev-text [x : XmlSaxRaw] : cstr
-  ```c
-  extern const char *turxml_ev_text(void *);
+  ;;; __ev-text -- internal: the current event's text / PI data.
+  (defn __ev-text [x : XmlSaxRaw] : cstr
+    ```c
+    extern const char *turxml_ev_text(void *);
   return turxml_ev_text((void *)(intptr_t)x);
   ```)
-
-;;; __ev-pubid -- internal: doctype public id, or NULL.
-(defn __ev-pubid [x : XmlSaxRaw] : cstr
-  ```c
-  extern const char *turxml_ev_pubid(void *);
+  ;;; __ev-pubid -- internal: doctype public id, or NULL.
+  (defn __ev-pubid [x : XmlSaxRaw] : cstr
+    ```c
+    extern const char *turxml_ev_pubid(void *);
   return turxml_ev_pubid((void *)(intptr_t)x);
   ```)
-
-;;; __ev-sysid -- internal: doctype system id, or NULL.
-(defn __ev-sysid [x : XmlSaxRaw] : cstr
-  ```c
-  extern const char *turxml_ev_sysid(void *);
+  ;;; __ev-sysid -- internal: doctype system id, or NULL.
+  (defn __ev-sysid [x : XmlSaxRaw] : cstr
+    ```c
+    extern const char *turxml_ev_sysid(void *);
   return turxml_ev_sysid((void *)(intptr_t)x);
   ```)
-
-;;; __ev-nattrs -- internal: attribute count of the current start tag.
-(defn __ev-nattrs [x : XmlSaxRaw] : int
-  ```c
-  extern int64_t turxml_ev_nattrs(void *);
+  ;;; __ev-nattrs -- internal: attribute count of the current start tag.
+  (defn __ev-nattrs [x : XmlSaxRaw] : int
+    ```c
+    extern int64_t turxml_ev_nattrs(void *);
   return turxml_ev_nattrs((void *)(intptr_t)x);
   ```)
-
-;;; __ev-attr-name -- internal: i-th attribute name.
-(defn __ev-attr-name [x : XmlSaxRaw i : int] : cstr
-  ```c
-  extern const char *turxml_ev_attr_name(void *, int64_t);
+  ;;; __ev-attr-name -- internal: i-th attribute name.
+  (defn __ev-attr-name [x : XmlSaxRaw i : int] : cstr
+    ```c
+    extern const char *turxml_ev_attr_name(void *, int64_t);
   return turxml_ev_attr_name((void *)(intptr_t)x, i);
   ```)
-
-;;; __ev-attr-value -- internal: i-th attribute value.
-(defn __ev-attr-value [x : XmlSaxRaw i : int] : cstr
-  ```c
-  extern const char *turxml_ev_attr_value(void *, int64_t);
+  ;;; __ev-attr-value -- internal: i-th attribute value.
+  (defn __ev-attr-value [x : XmlSaxRaw i : int] : cstr
+    ```c
+    extern const char *turxml_ev_attr_value(void *, int64_t);
   return turxml_ev_attr_value((void *)(intptr_t)x, i);
   ```)
-
-;;; __null-cstr? -- internal.
-(defn __null-cstr? [s : cstr] : bool
-  ```c
-  return s == NULL;
+  ;;; __null-cstr? -- internal.
+  (defn __null-cstr? [s : cstr] : bool
+    ```c
+    return s == NULL;
   ```)
-
-;;; __err-kind -- internal: the recorded ParseErrorKind ordinal.
-(defn __err-kind [x : XmlSaxRaw] : int
-  ```c
-  extern int turxml_err_kind(void *);
+  ;;; __err-kind -- internal: the recorded ParseErrorKind ordinal.
+  (defn __err-kind [x : XmlSaxRaw] : int
+    ```c
+    extern int turxml_err_kind(void *);
   return (int64_t)turxml_err_kind((void *)(intptr_t)x);
   ```)
-
-;;; __err-msg -- internal: the recorded message (borrowed).
-(defn __err-msg [x : XmlSaxRaw] : cstr
-  ```c
-  extern const char *turxml_err_msg(void *);
+  ;;; __err-msg -- internal: the recorded message (borrowed).
+  (defn __err-msg [x : XmlSaxRaw] : cstr
+    ```c
+    extern const char *turxml_err_msg(void *);
   return turxml_err_msg((void *)(intptr_t)x);
   ```)
-
-;;; __err-line -- internal.
-(defn __err-line [x : XmlSaxRaw] : int
-  ```c
-  extern int64_t turxml_err_line(void *);
+  ;;; __err-line -- internal.
+  (defn __err-line [x : XmlSaxRaw] : int
+    ```c
+    extern int64_t turxml_err_line(void *);
   return turxml_err_line((void *)(intptr_t)x);
   ```)
-
-;;; __err-col -- internal.
-(defn __err-col [x : XmlSaxRaw] : int
-  ```c
-  extern int64_t turxml_err_col(void *);
+  ;;; __err-col -- internal.
+  (defn __err-col [x : XmlSaxRaw] : int
+    ```c
+    extern int64_t turxml_err_col(void *);
   return turxml_err_col((void *)(intptr_t)x);
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Events and errors as Turmeric values
-;; ---------------------------------------------------------------------------
-
-;;; __kind-of -- internal: ParseErrorKind from its ordinal.
-(defn __kind-of [k : int] : ParseErrorKind
-  (cond
-    (= k 1) (limit-kind)
-    (= k 2) (refused-kind)
-    (= k 3) (io-kind)
-    :else   (syntax-kind)))
-
-;;; __error -- internal: the recorded error as a ParseError (msg copied).
-(defn __error [x : XmlSaxRaw] : ParseError
-  (ParseError (__kind-of (__err-kind x))
-              (from-cstr (__err-msg x))
-              (__err-line x)
-              (__err-col x)))
-
-;;; __oom -- internal: the error for a parser that could not be allocated.
-(defn __oom [] : ParseError
-  (ParseError (limit-kind) (from-cstr "out of memory") 0 0))
-
-;;; __id-string -- internal: a doctype identifier, the empty String if absent.
-(defn __id-string [s : cstr] : String
-  (if (__null-cstr? s) (from-cstr "") (from-cstr s)))
-
-;;; __attrs-acc -- internal: the current start tag's attributes, built from
-;;; the last one back so the list comes out in document order.
-(defn __attrs-acc [x : XmlSaxRaw i : int acc : (Cons Attr)] : (Cons Attr)
-  (if (< i 0)
-    acc
-    (__attrs-acc x (- i 1)
-                 (tcons-of (Attr (from-cstr (__ev-attr-name x i))
-                                 (from-cstr (__ev-attr-value x i)))
-                           acc))))
-
-;;; __event -- internal: the current queued event as a SaxEvent.
-(defn __event [x : XmlSaxRaw k : int] : SaxEvent
-  (cond
-    (= k 1) (StartElement (from-cstr (__ev-name x))
-                          (__attrs-acc x (- (__ev-nattrs x) 1) (tnil)))
-    (= k 2) (EndElement (from-cstr (__ev-name x)))
-    (= k 3) (Chars (from-cstr (__ev-text x)))
-    (= k 4) (Comment (from-cstr (__ev-text x)))
-    (= k 5) (Pi (from-cstr (__ev-name x)) (from-cstr (__ev-text x)))
-    (= k 6) (StartCdata)
-    (= k 7) (EndCdata)
-    :else   (Doctype (from-cstr (__ev-name x))
-                     (__id-string (__ev-pubid x))
-                     (__id-string (__ev-sysid x)))))
-
-;;; __deliver -- internal: hand every queued event to the handler. Returns
-;;; true when the handler stopped the parse.
-;;;
-;;; A loop rather than self-recursion: the self-call in a match arm is not
-;;; turned into a jump, and one 64 KiB chunk of `<a/>`s is ~30k events.
-(defn __deliver [x : XmlSaxRaw h : (fn [SaxEvent] SaxControl)] : bool
-  (let [^mut stopped false
-        ^mut k       (__next x)]
-    (while (> k 0)
-      (let [ev  (__event x k)
-            ctl (h ev)]
-        (sax-event-release ev)
-        (match ctl
-          (Continue) (set! k (__next x))
-          (Stop)     (do (__stop x)
-                         (set! stopped true)
-                         (set! k 0)))))
-    stopped))
-
-;;; __deliver-chunk -- internal: deliver one chunk's events inside a region.
-;;;
-;;; Every SaxEvent and attribute cell built for the chunk is a :heap node, so
-;;; the region rewinds them all when the chunk is done -- which is what keeps
-;;; a stream at constant memory. A handler that stores an event (or anything
-;;; it allocates) somewhere longer-lived makes the region retire instead of
-;;; rewind: safe, just not reclaimed.
-(defn __deliver-chunk [x : XmlSaxRaw h : (fn [SaxEvent] SaxControl)] : bool
-  ;; The thunk is let-bound so its scope exit frees it. Written directly as
-  ;; with-region's argument, this one (it captures the handler closure) was
-  ;; never freed: valgrind showed 32 bytes per chunk, one per sax-feed!.
-  (let [deliver (fn [] : bool (__deliver x h))]
-    (with-region deliver)))
-
-;;; __run -- internal: pump the configured source to the end.
-(defn __run [x : XmlSaxRaw h : (fn [SaxEvent] SaxControl)]
-  : (Result nil ParseError)
-  (let [^mut rc      1
-        ^mut stopped false]
-    (while (and (> rc 0) (not stopped))
-      (set! rc (__pump x))
-      (set! stopped (__deliver-chunk x h)))
-    ;; Nested ifs, not cond: a cond whose first test is a bare boolean
-    ;; miscompiles a later equality test to false (turmeric
-    ;; docs/reported/cond-bare-symbol-test-folds-later-equality.md).
-    (if stopped
-      (Ok nil)
-      (if (< rc 0)
-        (Err (__error x))
-        (Ok nil)))))
-
-;;; __make -- internal: a C parser for these options, or none on OOM.
-(defn __make [opts : ParseOpts] : (Option XmlSaxRaw)
-  (let [p (__new-raw (.namespaces opts) (.max-depth opts) (.max-bytes opts)
-                     (.max-expansion-ratio opts)
-                     (.allow-external-entities opts))]
-    (if (__null? p) (None) (Some (:: p XmlSaxRaw)))))
-
-;; ---------------------------------------------------------------------------
-;; One-shot parsing
-;; ---------------------------------------------------------------------------
-
-;;; sax-parse-string-opts -- stream the events of an in-memory document.
-;;;
-;;; Parameters:
-;;;   src  -- the document (UTF-8, or any encoding its XML declaration names
-;;;           that expat knows: UTF-8, UTF-16, ISO-8859-1, US-ASCII)
-;;;   opts -- limits and switches
-;;;   h    -- called once per event; return (Continue) or (Stop)
-;;;
-;;; Returns:
-;;;   (Result nil ParseError) -- ok when the document was well-formed or the
-;;;   handler stopped early; err (with every event before the error already
-;;;   delivered) otherwise.
-;;;
-;;; Example:
-;;;   (sax-parse-string-opts src (with (default-parse-opts) [namespaces false])
-;;;                          (fn [e : SaxEvent] : SaxControl (Continue)))
-;;;
-;;; Since: 0.1.0
-(defn sax-parse-string-opts [src : cstr opts : ParseOpts
-                             h : (fn [SaxEvent] SaxControl)]
-  : (Result nil ParseError)
-  (match (__make opts)
-    (None)   (Err (__oom))
-    (Some x) (do (__set-string x src)
-                 (let [r (__run x h)]
-                   (__free x)
-                   r))))
-
-;;; sax-parse-string -- stream the events of an in-memory document with the
-;;; safe default options.
-;;;
-;;; Parameters:
-;;;   src -- the document
-;;;   h   -- called once per event; return (Continue) or (Stop)
-;;;
-;;; Returns:
-;;;   (Result nil ParseError)
-;;;
-;;; Example:
-;;;   (let [^mut n 0]
-;;;     (sax-parse-string "<a><b/><b/></a>"
-;;;       (fn [e : SaxEvent] : SaxControl
-;;;         (match e
-;;;           (StartElement name _) (do (set! n (+ n 1)) (Continue))
-;;;           _ (Continue))))
-;;;     n)   ; => 3
-;;;
-;;; Since: 0.1.0
-(defn sax-parse-string [src : cstr h : (fn [SaxEvent] SaxControl)]
-  : (Result nil ParseError)
-  (sax-parse-string-opts src (default-parse-opts) h))
-
-;;; sax-parse-file-opts -- stream the events of a file, 64 KiB at a time.
-;;;
-;;; The file is read incrementally, so with `max-bytes` 0 there is no limit
-;;; on its size. Its encoding is detected from the BOM and XML declaration
-;;; (UTF-8, UTF-16LE/BE, ISO-8859-1, US-ASCII).
-;;;
-;;; Parameters:
-;;;   path -- the file to parse
-;;;   opts -- limits and switches
-;;;   h    -- called once per event
-;;;
-;;; Returns:
-;;;   (Result nil ParseError) -- an Io error when the file cannot be opened.
-;;;
-;;; Example:
-;;;   (sax-parse-file-opts "dump.xml" (with (default-parse-opts) [max-bytes 0]) h)
-;;;
-;;; Since: 0.1.0
-(defn sax-parse-file-opts [path : cstr opts : ParseOpts
-                           h : (fn [SaxEvent] SaxControl)]
-  : (Result nil ParseError)
-  (match (__make opts)
-    (None)   (Err (__oom))
-    (Some x) (let [r (if (< (__set-file x path) 0)
-                       (Err (__error x))
-                       (__run x h))]
-               (__free x)
-               r)))
-
-;;; sax-parse-file -- stream the events of a file with the safe defaults.
-;;;
-;;; Parameters:
-;;;   path -- the file to parse
-;;;   h    -- called once per event
-;;;
-;;; Returns:
-;;;   (Result nil ParseError)
-;;;
-;;; Example:
-;;;   (sax-parse-file "feed.xml" h)
-;;;
-;;; Since: 0.1.0
-(defn sax-parse-file [path : cstr h : (fn [SaxEvent] SaxControl)]
-  : (Result nil ParseError)
-  (sax-parse-file-opts path (default-parse-opts) h))
-
-;; ---------------------------------------------------------------------------
-;; Push parsing
-;; ---------------------------------------------------------------------------
-
-;;; sax-parser-new-opts -- a push parser with explicit options.
-;;;
-;;; Parameters:
-;;;   opts -- limits and switches
-;;;   h    -- called once per event as chunks are fed
-;;;
-;;; Returns:
-;;;   (Result SaxParser ParseError) -- err only when out of memory.
-;;;
-;;; Example:
-;;;   (sax-parser-new-opts (default-parse-opts) h)
-;;;
-;;; Since: 0.1.0
-(defn sax-parser-new-opts [opts : ParseOpts h : (fn [SaxEvent] SaxControl)]
-  : (Result SaxParser ParseError)
-  (match (__make opts)
-    (None)   (Err (__oom))
-    (Some x) (Ok (SaxParser x h))))
-
-;;; sax-parser-new -- a push parser with the safe default options.
-;;;
-;;; Parameters:
-;;;   h -- called once per event as chunks are fed
-;;;
-;;; Returns:
-;;;   (Result SaxParser ParseError) -- err only when out of memory.
-;;;
-;;; Example:
-;;;   (match (sax-parser-new h)
-;;;     (Ok p) (do (sax-feed! p "<a>") (sax-feed! p "</a>") (sax-finish! p)
-;;;                (sax-parser-free p))
-;;;     (Err e) ...)
-;;;
-;;; Since: 0.1.0
-(defn sax-parser-new [h : (fn [SaxEvent] SaxControl)]
-  : (Result SaxParser ParseError)
-  (sax-parser-new-opts (default-parse-opts) h))
-
-;;; __push -- internal: feed one chunk (or the end) and deliver its events.
-(defn __push [p : SaxParser chunk : cstr final : bool] : (Result nil ParseError)
-  (let [x       (.raw p)
-        rc      (__feed x chunk final)
-        stopped (__deliver-chunk x (.handler p))]
-    (if (and (< rc 0) (not stopped))
-      (Err (__error x))
-      (Ok nil))))
-
-;;; sax-feed! -- feed the next chunk of input and deliver its events.
-;;;
-;;; Chunks may split the input anywhere -- inside a tag, a name, a multi-byte
-;;; UTF-8 sequence. Text that might continue in the next chunk is held back,
-;;; so the events never depend on where the chunks fall. After the handler
-;;; returns (Stop), later feeds are accepted and ignored.
-;;;
-;;; Parameters:
-;;;   p     -- the push parser
-;;;   chunk -- the next bytes (a NUL-terminated cstr)
-;;;
-;;; Returns:
-;;;   (Result nil ParseError) -- err once the input seen so far is malformed;
-;;;   every later call returns the same error.
-;;;
-;;; Example:
-;;;   (sax-feed! p "<item>he")
-;;;   (sax-feed! p "llo</item>")
-;;;
-;;; Since: 0.1.0
-(defn sax-feed! [p : SaxParser chunk : cstr] : (Result nil ParseError)
-  (__push p chunk false))
-
-;;; sax-finish! -- signal the end of input and deliver the last events.
-;;;
-;;; An input that ends inside the root element is an error here ("no element
-;;; found" / "unclosed token").
-;;;
-;;; Parameters:
-;;;   p -- the push parser
-;;;
-;;; Returns:
-;;;   (Result nil ParseError)
-;;;
-;;; Example:
-;;;   (sax-finish! p)
-;;;
-;;; Since: 0.1.0
-(defn sax-finish! [p : SaxParser] : (Result nil ParseError)
-  (__push p "" true))
-
-;;; sax-parser-free -- release a push parser.
-;;;
-;;; Parameters:
-;;;   p -- the parser, not used afterwards
-;;;
-;;; Example:
-;;;   (sax-parser-free p)
-;;;
-;;; Since: 0.1.0
-(defn sax-parser-free [p : SaxParser] : nil
-  (__free (.raw p)))
-
-) ;; end defmodule xml/sax
+  ;; ---------------------------------------------------------------------------
+  ;; Events and errors as Turmeric values
+  ;; ---------------------------------------------------------------------------
+  ;;; __kind-of -- internal: ParseErrorKind from its ordinal.
+  (defn __kind-of [k : int] : ParseErrorKind
+    (cond (= k 1) (limit-kind)
+          (= k 2) (refused-kind)
+          (= k 3) (io-kind)
+          :else   (syntax-kind)))
+  ;;; __error -- internal: the recorded error as a ParseError (msg copied).
+  (defn __error [x : XmlSaxRaw] : ParseError
+    (ParseError (__kind-of (__err-kind x))
+      (from-cstr (__err-msg x))
+      (__err-line x)
+      (__err-col x)))
+  ;;; __oom -- internal: the error for a parser that could not be allocated.
+  (defn __oom [] : ParseError
+    (ParseError (limit-kind) (from-cstr "out of memory") 0 0))
+  ;;; __id-string -- internal: a doctype identifier, the empty String if absent.
+  (defn __id-string [s : cstr] : String
+    (if (__null-cstr? s) (from-cstr "") (from-cstr s)))
+  ;;; __attrs-acc -- internal: the current start tag's attributes, built from
+  ;;; the last one back so the list comes out in document order.
+  (defn __attrs-acc [x : XmlSaxRaw i : int acc : (Cons Attr)] : (Cons Attr)
+    (if (< i 0)
+      acc
+      (__attrs-acc x
+        (- i 1)
+        (tcons-of (Attr (from-cstr (__ev-attr-name x i))
+                    (from-cstr (__ev-attr-value x i)))
+          acc))))
+  ;;; __event -- internal: the current queued event as a SaxEvent.
+  (defn __event [x : XmlSaxRaw k : int] : SaxEvent
+    (cond (= k 1) (StartElement (from-cstr (__ev-name x))
+                    (__attrs-acc x (- (__ev-nattrs x) 1) (tnil)))
+          (= k 2) (EndElement (from-cstr (__ev-name x)))
+          (= k 3) (Chars (from-cstr (__ev-text x)))
+          (= k 4) (Comment (from-cstr (__ev-text x)))
+          (= k 5) (Pi (from-cstr (__ev-name x)) (from-cstr (__ev-text x)))
+          (= k 6) (StartCdata)
+          (= k 7) (EndCdata)
+          :else   (Doctype (from-cstr (__ev-name x))
+                    (__id-string (__ev-pubid x))
+                    (__id-string (__ev-sysid x)))))
+  ;;; __deliver -- internal: hand every queued event to the handler. Returns
+  ;;; true when the handler stopped the parse.
+  ;;;
+  ;;; A loop rather than self-recursion: the self-call in a match arm is not
+  ;;; turned into a jump, and one 64 KiB chunk of `<a/>`s is ~30k events.
+  (defn __deliver [x : XmlSaxRaw h : (fn [SaxEvent] SaxControl)] : bool
+    (let [^mut stopped false
+          ^mut k       (__next x)]
+      (while (> k 0)
+        (let [ev  (__event x k)
+              ctl (h ev)]
+          (sax-event-release ev)
+          (match ctl
+            (Continue)
+            (set! k (__next x))
+            (Stop)
+            (do (__stop x) (set! stopped true) (set! k 0)))))
+      stopped))
+  ;;; __deliver-chunk -- internal: deliver one chunk's events inside a region.
+  ;;;
+  ;;; Every SaxEvent and attribute cell built for the chunk is a :heap node, so
+  ;;; the region rewinds them all when the chunk is done -- which is what keeps
+  ;;; a stream at constant memory. A handler that stores an event (or anything
+  ;;; it allocates) somewhere longer-lived makes the region retire instead of
+  ;;; rewind: safe, just not reclaimed.
+  (defn __deliver-chunk [x : XmlSaxRaw h : (fn [SaxEvent] SaxControl)] : bool
+    ;; The thunk is let-bound so its scope exit frees it. Written directly as
+    ;; with-region's argument, this one (it captures the handler closure) was
+    ;; never freed: valgrind showed 32 bytes per chunk, one per sax-feed!.
+    (let [deliver (fn [] : bool (__deliver x h))] (with-region deliver)))
+  ;;; __run -- internal: pump the configured source to the end.
+  (defn __run [x : XmlSaxRaw h : (fn [SaxEvent] SaxControl)] : (Result nil
+                                                                 ParseError)
+    (let [^mut rc      1
+          ^mut stopped false]
+      (while (and (> rc 0) (not stopped))
+        (set! rc (__pump x))
+        (set! stopped (__deliver-chunk x h)))
+      ;; Nested ifs, not cond: a cond whose first test is a bare boolean
+      ;; miscompiles a later equality test to false (turmeric
+      ;; docs/reported/cond-bare-symbol-test-folds-later-equality.md).
+      (if stopped (Ok nil) (if (< rc 0) (Err (__error x)) (Ok nil)))))
+  ;;; __make -- internal: a C parser for these options, or none on OOM.
+  (defn __make [opts : ParseOpts] : (Option XmlSaxRaw)
+    (let [p (__new-raw (.namespaces opts)
+              (.max-depth opts)
+              (.max-bytes opts)
+              (.max-expansion-ratio opts)
+              (.allow-external-entities opts))]
+      (if (__null? p) (None) (Some (:: p XmlSaxRaw)))))
+  ;; ---------------------------------------------------------------------------
+  ;; One-shot parsing
+  ;; ---------------------------------------------------------------------------
+  ;;; sax-parse-string-opts -- stream the events of an in-memory document.
+  ;;;
+  ;;; Parameters:
+  ;;;   src  -- the document (UTF-8, or any encoding its XML declaration names
+  ;;;           that expat knows: UTF-8, UTF-16, ISO-8859-1, US-ASCII)
+  ;;;   opts -- limits and switches
+  ;;;   h    -- called once per event; return (Continue) or (Stop)
+  ;;;
+  ;;; Returns:
+  ;;;   (Result nil ParseError) -- ok when the document was well-formed or the
+  ;;;   handler stopped early; err (with every event before the error already
+  ;;;   delivered) otherwise.
+  ;;;
+  ;;; Example:
+  ;;;   (sax-parse-string-opts src (with (default-parse-opts) [namespaces false])
+  ;;;                          (fn [e : SaxEvent] : SaxControl (Continue)))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn sax-parse-string-opts [src : cstr
+                               opts : ParseOpts
+                               h : (fn [SaxEvent] SaxControl)] : (Result nil
+                                                                   ParseError)
+    (match (__make opts)
+      (None)
+      (Err (__oom))
+      (Some x)
+      (do (__set-string x src) (let [r (__run x h)] (__free x) r))))
+  ;;; sax-parse-string -- stream the events of an in-memory document with the
+  ;;; safe default options.
+  ;;;
+  ;;; Parameters:
+  ;;;   src -- the document
+  ;;;   h   -- called once per event; return (Continue) or (Stop)
+  ;;;
+  ;;; Returns:
+  ;;;   (Result nil ParseError)
+  ;;;
+  ;;; Example:
+  ;;;   (let [^mut n 0]
+  ;;;     (sax-parse-string "<a><b/><b/></a>"
+  ;;;       (fn [e : SaxEvent] : SaxControl
+  ;;;         (match e
+  ;;;           (StartElement name _) (do (set! n (+ n 1)) (Continue))
+  ;;;           _ (Continue))))
+  ;;;     n)   ; => 3
+  ;;;
+  ;;; Since: 0.1.0
+  (defn sax-parse-string [src : cstr h : (fn [SaxEvent] SaxControl)] : (Result nil
+                                                                         ParseError)
+    (sax-parse-string-opts src (default-parse-opts) h))
+  ;;; sax-parse-file-opts -- stream the events of a file, 64 KiB at a time.
+  ;;;
+  ;;; The file is read incrementally, so with `max-bytes` 0 there is no limit
+  ;;; on its size. Its encoding is detected from the BOM and XML declaration
+  ;;; (UTF-8, UTF-16LE/BE, ISO-8859-1, US-ASCII).
+  ;;;
+  ;;; Parameters:
+  ;;;   path -- the file to parse
+  ;;;   opts -- limits and switches
+  ;;;   h    -- called once per event
+  ;;;
+  ;;; Returns:
+  ;;;   (Result nil ParseError) -- an Io error when the file cannot be opened.
+  ;;;
+  ;;; Example:
+  ;;;   (sax-parse-file-opts "dump.xml" (with (default-parse-opts) [max-bytes 0]) h)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn sax-parse-file-opts [path : cstr
+                             opts : ParseOpts
+                             h : (fn [SaxEvent] SaxControl)] : (Result nil
+                                                                 ParseError)
+    (match (__make opts)
+      (None)
+      (Err (__oom))
+      (Some x)
+      (let [r (if (< (__set-file x path) 0) (Err (__error x)) (__run x h))]
+        (__free x)
+        r)))
+  ;;; sax-parse-file -- stream the events of a file with the safe defaults.
+  ;;;
+  ;;; Parameters:
+  ;;;   path -- the file to parse
+  ;;;   h    -- called once per event
+  ;;;
+  ;;; Returns:
+  ;;;   (Result nil ParseError)
+  ;;;
+  ;;; Example:
+  ;;;   (sax-parse-file "feed.xml" h)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn sax-parse-file [path : cstr h : (fn [SaxEvent] SaxControl)] : (Result nil
+                                                                        ParseError)
+    (sax-parse-file-opts path (default-parse-opts) h))
+  ;; ---------------------------------------------------------------------------
+  ;; Push parsing
+  ;; ---------------------------------------------------------------------------
+  ;;; sax-parser-new-opts -- a push parser with explicit options.
+  ;;;
+  ;;; Parameters:
+  ;;;   opts -- limits and switches
+  ;;;   h    -- called once per event as chunks are fed
+  ;;;
+  ;;; Returns:
+  ;;;   (Result SaxParser ParseError) -- err only when out of memory.
+  ;;;
+  ;;; Example:
+  ;;;   (sax-parser-new-opts (default-parse-opts) h)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn sax-parser-new-opts [opts : ParseOpts h : (fn [SaxEvent] SaxControl)] : (Result SaxParser
+                                                                                  ParseError)
+    (match (__make opts) (None) (Err (__oom)) (Some x) (Ok (SaxParser x h))))
+  ;;; sax-parser-new -- a push parser with the safe default options.
+  ;;;
+  ;;; Parameters:
+  ;;;   h -- called once per event as chunks are fed
+  ;;;
+  ;;; Returns:
+  ;;;   (Result SaxParser ParseError) -- err only when out of memory.
+  ;;;
+  ;;; Example:
+  ;;;   (match (sax-parser-new h)
+  ;;;     (Ok p) (do (sax-feed! p "<a>") (sax-feed! p "</a>") (sax-finish! p)
+  ;;;                (sax-parser-free p))
+  ;;;     (Err e) ...)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn sax-parser-new [h : (fn [SaxEvent] SaxControl)] : (Result SaxParser
+                                                            ParseError)
+    (sax-parser-new-opts (default-parse-opts) h))
+  ;;; __push -- internal: feed one chunk (or the end) and deliver its events.
+  (defn __push [p : SaxParser chunk : cstr final : bool] : (Result nil
+                                                             ParseError)
+    (let [x       (.raw p)
+          rc      (__feed x chunk final)
+          stopped (__deliver-chunk x (.handler p))]
+      (if (and (< rc 0) (not stopped)) (Err (__error x)) (Ok nil))))
+  ;;; sax-feed! -- feed the next chunk of input and deliver its events.
+  ;;;
+  ;;; Chunks may split the input anywhere -- inside a tag, a name, a multi-byte
+  ;;; UTF-8 sequence. Text that might continue in the next chunk is held back,
+  ;;; so the events never depend on where the chunks fall. After the handler
+  ;;; returns (Stop), later feeds are accepted and ignored.
+  ;;;
+  ;;; Parameters:
+  ;;;   p     -- the push parser
+  ;;;   chunk -- the next bytes (a NUL-terminated cstr)
+  ;;;
+  ;;; Returns:
+  ;;;   (Result nil ParseError) -- err once the input seen so far is malformed;
+  ;;;   every later call returns the same error.
+  ;;;
+  ;;; Example:
+  ;;;   (sax-feed! p "<item>he")
+  ;;;   (sax-feed! p "llo</item>")
+  ;;;
+  ;;; Since: 0.1.0
+  (defn sax-feed! [p : SaxParser chunk : cstr] : (Result nil ParseError)
+    (__push p chunk false))
+  ;;; sax-finish! -- signal the end of input and deliver the last events.
+  ;;;
+  ;;; An input that ends inside the root element is an error here ("no element
+  ;;; found" / "unclosed token").
+  ;;;
+  ;;; Parameters:
+  ;;;   p -- the push parser
+  ;;;
+  ;;; Returns:
+  ;;;   (Result nil ParseError)
+  ;;;
+  ;;; Example:
+  ;;;   (sax-finish! p)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn sax-finish! [p : SaxParser] : (Result nil ParseError)
+    (__push p "" true))
+  ;;; sax-parser-free -- release a push parser.
+  ;;;
+  ;;; Parameters:
+  ;;;   p -- the parser, not used afterwards
+  ;;;
+  ;;; Example:
+  ;;;   (sax-parser-free p)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn sax-parser-free [p : SaxParser] : nil (__free (.raw p)))) ;; end defmodule xml/sax

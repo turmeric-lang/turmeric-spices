@@ -1,42 +1,85 @@
 ;; plot/core.tur -- renderer representation and plot entrypoints.
-
 (defmodule plot/core
-  (export plot plot-write-png plot-into-canvas render
-          ;; `render` is generic over `^Backend B`, so a caller cannot build
-          ;; an argument for it without the backend structs -- exporting the
-          ;; entry point but not its sinks left it unusable, and is what made
-          ;; tests/plot/backend_test.tur fail on "symbol 'SurfaceBackend' is
-          ;; private to module 'plot/core'".
-          CanvasBackend SurfaceBackend PngBackend
-          ;; any-renderer boxes a value as the AnyRenderer every public
-          ;; constructor returns. (The `Renderer` class, its methods and the
-          ;; `AnyRenderer` alias are global, as every class and alias is;
-          ;; they are not exported by name.)
-          any-renderer
-          ;; what a kind's `draw` method draws through
-          DrawCtx FrameMarks no-frame-marks frame-marks-union
-          ;; `legend-labels`' default body, compiled in each instance's module
-          __one-label
-          __surface-create __surface-destroy __surface-write-png
-          __canvas-create __canvas-destroy
-          __plot-sample-adaptive
-          BBox renderer-bbox renderers-bbox bbox-empty? bbox-from-raw
-          __bbox-of-points __bbox-of-error-bars __bbox-of-arrows __bbox-of-rects
-          __bbox-of-bars __bbox-of-groups
-          bbox-union bbox-empty-box point-bbox hint-bbox
-          __point-list-bbox __error-bars-bbox __arrows-bbox __rects-bbox
-          __discrete-hist-bbox __stacked-hist-bbox
-          plot-anyrenderers __surfaces-equal?
-          __ok? __ok-val __err-val
-          __surface-width __surface-height __surface-pixel-byte
-          __pixel-is-background? __count-non-background)
-
+  (export plot
+    plot-write-png
+    plot-into-canvas
+    render
+    ;; `render` is generic over `^Backend B`, so a caller cannot build
+    ;; an argument for it without the backend structs -- exporting the
+    ;; entry point but not its sinks left it unusable, and is what made
+    ;; tests/plot/backend_test.tur fail on "symbol 'SurfaceBackend' is
+    ;; private to module 'plot/core'".
+    CanvasBackend
+    SurfaceBackend
+    PngBackend
+    ;; any-renderer boxes a value as the AnyRenderer every public
+    ;; constructor returns. (The `Renderer` class, its methods and the
+    ;; `AnyRenderer` alias are global, as every class and alias is;
+    ;; they are not exported by name.)
+    any-renderer
+    ;; what a kind's `draw` method draws through
+    DrawCtx
+    FrameMarks
+    no-frame-marks
+    frame-marks-union
+    ;; `legend-labels`' default body, compiled in each instance's module
+    __one-label
+    __surface-create
+    __surface-destroy
+    __surface-write-png
+    __canvas-create
+    __canvas-destroy
+    __plot-sample-adaptive
+    BBox
+    renderer-bbox
+    renderers-bbox
+    bbox-empty?
+    bbox-from-raw
+    __bbox-of-points
+    __bbox-of-error-bars
+    __bbox-of-arrows
+    __bbox-of-rects
+    __bbox-of-bars
+    __bbox-of-groups
+    bbox-union
+    bbox-empty-box
+    point-bbox
+    hint-bbox
+    __point-list-bbox
+    __error-bars-bbox
+    __arrows-bbox
+    __rects-bbox
+    __discrete-hist-bbox
+    __stacked-hist-bbox
+    plot-anyrenderers
+    __surfaces-equal?
+    __ok?
+    __ok-val
+    __err-val
+    __surface-width
+    __surface-height
+    __surface-pixel-byte
+    __pixel-is-background?
+    __count-non-background)
   (import plot/style :refer [PlotOpts plot-opts-width plot-opts-height])
-  (import plot/data  :refer [Point ErrorBar Arrow Rect Bar Group Cells
-                             __points->cells __error-bars->cells __arrows->cells __rects->cells
-                             __bars->cells __groups->cells __labels->cells
-                             __free-cells __free-groups])
-
+  (import plot/data
+    :refer
+    [Point
+     ErrorBar
+     Arrow
+     Rect
+     Bar
+     Group
+     Cells
+     __points->cells
+     __error-bars->cells
+     __arrows->cells
+     __rects->cells
+     __bars->cells
+     __groups->cells
+     __labels->cells
+     __free-cells
+     __free-groups])
   ;; Result helpers: route through the typed preamble builders /
   ;; inspectors (tur_ok_int / tur_err_int / tur_is_ok / tur_ok_value /
   ;; tur_err_value) so the canonical layout lives in one place
@@ -44,37 +87,31 @@
   ;; because the in-tree plot modules and test suite both call these
   ;; through their existing types; tightening to (Result int int) is a
   ;; downstream sweep beyond this migration's scope.
-
   ;;; __ok -- create an ok result wrapping integer value v.
   (defn __ok [v : int] : ptr<void>
     ```c
     return (void *)(intptr_t)tur_ok_int(v);
     ```)
-
   ;;; __err -- create an err result wrapping integer error value e.
   (defn __err [e : int] : ptr<void>
     ```c
     return (void *)(intptr_t)tur_err_int(e);
     ```)
-
   ;;; __ok? -- predicate for the local :ptr<void> result envelope.
   (defn __ok? [r : ptr<void>] : bool
     ```c
     return r != 0 && tur_is_ok((int64_t)(intptr_t)r);
     ```)
-
   ;;; __ok-val -- extract the ok payload from the local :ptr<void> result envelope.
   (defn __ok-val [r : ptr<void>] : int
     ```c
     return r != 0 ? tur_ok_value((int64_t)(intptr_t)r) : 0;
     ```)
-
   ;;; __err-val -- extract the err payload from the local :ptr<void> result envelope.
   (defn __err-val [r : ptr<void>] : int
     ```c
     return r != 0 ? tur_err_value((int64_t)(intptr_t)r) : 0;
     ```)
-
   ;;; __surface-create -- allocate a new plutovg surface.
   (defn __surface-create [width : int height : int] : ptr<void>
     ```c
@@ -86,7 +123,6 @@
     void *s = plutovg_surface_create((int)width, (int)height);
     return (void *)(intptr_t)(s ? tur_ok_ptr(s) : tur_err_int(1));
     ```)
-
   ;;; __surface-destroy -- destroy a plutovg surface.
   (defn __surface-destroy [surface : int] : void
     ```c
@@ -97,7 +133,6 @@
     #endif
     if (surface) plutovg_surface_destroy((void *)(intptr_t)surface);
     ```)
-
   ;;; __surface-write-png -- write a plutovg surface to a PNG file.
   (defn __surface-write-png [surface : int path : cstr] : ptr<void>
     ```c
@@ -110,7 +145,6 @@
                                            (const char *)(intptr_t)path);
     return (void *)(intptr_t)(ok ? tur_ok_int(0) : tur_err_int(1));
     ```)
-
   ;;; __canvas-create -- allocate a canvas for an existing surface.
   (defn __canvas-create [surface : int] : ptr<void>
     ```c
@@ -122,7 +156,6 @@
     void *c = plutovg_canvas_create((void *)(intptr_t)surface);
     return (void *)(intptr_t)(c ? tur_ok_ptr(c) : tur_err_int(1));
     ```)
-
   ;;; __canvas-destroy -- destroy a plutovg canvas.
   (defn __canvas-destroy [canvas : int] : void
     ```c
@@ -133,7 +166,6 @@
     #endif
     if (canvas) plutovg_canvas_destroy((void *)(intptr_t)canvas);
     ```)
-
   ;;; __surface-width -- width of a plutovg surface in pixels.
   (defn __surface-width [surface : int] : int
     ```c
@@ -145,7 +177,6 @@
     if (!surface) return 0;
     return (int64_t)plutovg_surface_get_width((const void *)(intptr_t)surface);
     ```)
-
   ;;; __surface-height -- height of a plutovg surface in pixels.
   (defn __surface-height [surface : int] : int
     ```c
@@ -157,7 +188,6 @@
     if (!surface) return 0;
     return (int64_t)plutovg_surface_get_height((const void *)(intptr_t)surface);
     ```)
-
   ;;; __surface-pixel-byte -- read a single byte from the surface's raw pixel buffer.
   ;;;
   ;;; plutovg stores pixels in 32-bpp BGRA order (premultiplied alpha) on
@@ -184,14 +214,15 @@
     if (!data) return -1;
     return (int64_t)data[(int)y * stride + (int)x * 4 + (int)channel];
     ```)
-
   ;;; __count-non-background -- count pixels in [x0, x1) x [y0, y1) that are not background.
   ;;;
   ;;; Useful for "this renderer produced *some* ink in this region" assertions
   ;;; without pinning a specific pixel.
   (defn __count-non-background [surface : int
-                                x0 : int y0 : int
-                                x1 : int y1 : int] : int
+                                x0 : int
+                                y0 : int
+                                x1 : int
+                                y1 : int] : int
     ```c
     /* Stand-ins for <plutovg.h>, for a build without it on the include
        path; with it (a project build hoists it) these would conflict. */
@@ -223,7 +254,6 @@
     }
     return cnt;
     ```)
-
   ;;; __pixel-is-background? -- true when a pixel is near pure white (>=250 in all RGB channels and full alpha).
   ;;;
   ;;; Useful for "this region was not drawn over" assertions. The plot
@@ -251,7 +281,6 @@
     unsigned char a = data[(int)y * stride + (int)x * 4 + 3];
     return r >= 250 && g >= 250 && b >= 250 && a >= 250;
     ```)
-
   ;;; __plot-sample-adaptive -- adaptive subdivision sampler for sampled-line renderers.
   ;;;
   ;;; Walks the parameter interval `[t-lo, t-hi]` in `initial-samples`
@@ -281,10 +310,12 @@
   ;;; Without the pin, turmeric's injective identifier mangler encodes this
   ;;; `__`-prefixed, kebab-cased name as `..._un_unplot_hysample_hyadaptive`,
   ;;; which the hand-written C call could not track across mangling changes.
-  (defn (export-as "plot_sample_adaptive")
-        __plot-sample-adaptive [ctx : ptr<void>  mode : int  curve : int
-                                t-lo : float  t-hi : float
-                                initial-samples : int] : void
+  (defn (export-as "plot_sample_adaptive") __plot-sample-adaptive [ctx : ptr<void>
+                                                                   mode : int
+                                                                   curve : int
+                                                                   t-lo : float
+                                                                   t-hi : float
+                                                                   initial-samples : int] : void
     ```c
     extern double cos(double);
     extern double sin(double);
@@ -427,35 +458,38 @@
     #undef EMIT
     #undef ADAPTIVE_ISNAN
     ```)
-
   ;;; __store-f64 -- internal: write a double through a C out-pointer.
-  (defn __store-f64 [p : ptr<void>  v : float] : void
-    ```c *(double *)p = v; ```)
-
+  (defn __store-f64 [p : ptr<void> v : float] : void ```c *(double *)p = v; ```)
   ;;; __eval-point -- evaluate a curve callback for C: write f(t)'s x and y
   ;;; through `x-out` / `y-out` (double *). Pinned as `plot_eval_point` so the
   ;;; sampler and the parametric bands can call a Point-returning closure
   ;;; without naming the struct's C type.
-  (defn (export-as "plot_eval_point")
-        __eval-point [^fat f : (fn [float] Point)  t : float  x-out : ptr<void>  y-out : ptr<void>] : void
-    (let [p (f t)]
-      (__store-f64 x-out (.x p))
-      (__store-f64 y-out (.y p))))
-
+  (defn (export-as "plot_eval_point") __eval-point [^fat f : (fn [float] Point)
+                                                    t : float
+                                                    x-out : ptr<void>
+                                                    y-out : ptr<void>] : void
+    (let [p (f t)] (__store-f64 x-out (.x p)) (__store-f64 y-out (.y p))))
   ;;; __eval-vector -- evaluate a vector-field callback for C: write f(x, y)'s
   ;;; components through `dx-out` / `dy-out` (double *). Pinned as
   ;;; `plot_eval_vector`.
-  (defn (export-as "plot_eval_vector")
-        __eval-vector [^fat f : (fn [float float] Point)  x : float  y : float
-                       dx-out : ptr<void>  dy-out : ptr<void>] : void
-    (let [p (f x y)]
-      (__store-f64 dx-out (.x p))
-      (__store-f64 dy-out (.y p))))
-
+  (defn (export-as "plot_eval_vector") __eval-vector [^fat f : (fn [float float]
+                                                                 Point)
+                                                      x : float
+                                                      y : float
+                                                      dx-out : ptr<void>
+                                                      dy-out : ptr<void>] : void
+    (let [p (f x y)] (__store-f64 dx-out (.x p)) (__store-f64 dy-out (.y p))))
   ;;; data->viewport -- map data coordinates to viewport coordinates.
-  (defn data->viewport [x : float y : float bx-min : float bx-max : float
-                        by-min : float by-max : float
-                        px : int py : int pw : int ph : int] : int
+  (defn data->viewport [x : float
+                        y : float
+                        bx-min : float
+                        bx-max : float
+                        by-min : float
+                        by-max : float
+                        px : int
+                        py : int
+                        pw : int
+                        ph : int] : int
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -467,11 +501,17 @@
     p->y = (double)py + (1.0 - ty) * (double)ph;
     return (int64_t)(intptr_t)p;
     ```)
-
   ;;; viewport->data -- map viewport coordinates back to data coordinates.
-  (defn viewport->data [vx : float vy : float bx-min : float bx-max : float
-                        by-min : float by-max : float
-                        px : int py : int pw : int ph : int] : int
+  (defn viewport->data [vx : float
+                        vy : float
+                        bx-min : float
+                        bx-max : float
+                        by-min : float
+                        by-max : float
+                        px : int
+                        py : int
+                        pw : int
+                        ph : int] : int
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -483,13 +523,12 @@
     p->y = by_min + ty * (by_max - by_min);
     return (int64_t)(intptr_t)p;
     ```)
-
   ;;; BBox -- an axis-aligned data-space bounding box: what a renderer's
   ;;; `bounds` method returns and what the plot's data extent is folded from.
   ;;; An empty box -- a renderer that contributed no finite point -- is
   ;;; represented with `x-min` = NaN; use `bbox-empty?` to test for it.
-  (defstruct ^copy BBox [x-min : float  x-max : float  y-min : float  y-max : float])
-
+  (defstruct ^copy BBox
+    [x-min : float x-max : float y-min : float y-max : float])
   ;; Raw-carrier accessors over the { x0,x1,y0,y1; valid } buffer the C bounds
   ;; helpers below return.
   (defn __rbb-valid? [b : ptr<void>] : bool
@@ -502,11 +541,8 @@
     ```)
   (defn __rbb-free [b : ptr<void>] : void ```c free(b); ```)
   (defn __rbb-nan [] : float ```c return 0.0 / 0.0; ```)
-
   ;;; bbox-empty? -- true when a BBox carries no finite extent (x-min is NaN).
-  (defn bbox-empty? [bb : BBox] : bool
-    (let [lo (.x-min bb)] (not (= lo lo))))
-
+  (defn bbox-empty? [bb : BBox] : bool (let [lo (.x-min bb)] (not (= lo lo))))
   ;;; bbox-from-raw -- pack the raw { x0,x1,y0,y1; valid } carrier (as produced
   ;;; by the `__*-bbox` helpers) into a typed BBox with make-struct (so no
   ;;; struct-by-value crosses the inline-C boundary), freeing the carrier. An
@@ -517,48 +553,51 @@
   ;;; int64 carrier instead of `BBox` and trips TUR-E0709.
   (defn bbox-from-raw [b : ptr<void>] : BBox
     (if (__rbb-valid? b)
-      (let [box (make-struct BBox (__rbb-get b 0) (__rbb-get b 1)
-                                  (__rbb-get b 2) (__rbb-get b 3))]
+      (let [box (make-struct BBox
+                  (__rbb-get b 0)
+                  (__rbb-get b 1)
+                  (__rbb-get b 2)
+                  (__rbb-get b 3))]
         (do (__rbb-free b) box))
       (let [n   (__rbb-nan)
             box (make-struct BBox n n n n)]
         (do (__rbb-free b) box))))
-
   ;;; bbox-empty-box -- the identity element for `bbox-union`: an empty BBox
   ;;; (x-min = NaN), matching `bbox-empty?`.
   (defn bbox-empty-box [] : BBox
     (let [n (__rbb-nan)] (make-struct BBox n n n n)))
-
   ;;; bbox-union -- the smallest box covering both inputs; an empty box is the
   ;;; identity (so folding from `bbox-empty-box` recovers the first non-empty).
   ;;
   ;; On a tie the left box's coordinate is kept, as the draw pass's own union
   ;; once kept the first point it saw.
-  (defn bbox-union [a : BBox  b : BBox] : BBox
-    (if (bbox-empty? a) b
-      (if (bbox-empty? b) a
+  (defn bbox-union [a : BBox b : BBox] : BBox
+    (if (bbox-empty? a)
+      b
+      (if (bbox-empty? b)
+        a
         (make-struct BBox
           (if (< (.x-min b) (.x-min a)) (.x-min b) (.x-min a))
           (if (> (.x-max b) (.x-max a)) (.x-max b) (.x-max a))
           (if (< (.y-min b) (.y-min a)) (.y-min b) (.y-min a))
           (if (> (.y-max b) (.y-max a)) (.y-max b) (.y-max a))))))
-
   ;;; point-bbox -- the degenerate box of one data point; empty when either
   ;;; coordinate is NaN (a NaN point contributes nothing to the extent).
-  (defn point-bbox [x : float  y : float] : BBox
+  (defn point-bbox [x : float y : float] : BBox
     (if (or (not (= x x)) (not (= y y)))
       (bbox-empty-box)
       (make-struct BBox x x y y)))
-
   ;;; hint-bbox -- the box spanned by the corners (x0, y0) and (x1, y1) of an
   ;;; explicit domain, as the sampled-grid kinds (contours, vector fields)
   ;;; declare. Empty unless all four are finite numbers.
-  (defn hint-bbox [x0 : float  x1 : float  y0 : float  y1 : float] : BBox
+  (defn hint-bbox [x0 : float x1 : float y0 : float y1 : float] : BBox
     (if (or (not (= x0 x0)) (not (= x1 x1)) (not (= y0 y0)) (not (= y1 y1)))
       (bbox-empty-box)
-      (make-struct BBox (if (< x1 x0) x1 x0) (if (> x1 x0) x1 x0)
-                        (if (< y1 y0) y1 y0) (if (> y1 y0) y1 y0))))
-
+      (make-struct BBox
+        (if (< x1 x0) x1 x0)
+        (if (> x1 x0) x1 x0)
+        (if (< y1 y0) y1 y0)
+        (if (> y1 y0) y1 y0))))
   ;; ---------------------------------------------------------------------------
   ;; Bounds of the lowered payloads. Each helper walks one payload shape's
   ;; Cells (see plot/data) and returns the raw { x0,x1,y0,y1; valid } carrier
@@ -566,7 +605,6 @@
   ;; per-kind bounds `switch`, moved verbatim -- a kind's `bounds` method now
   ;; picks its helper by type instead of by a `kind` tag.
   ;; ---------------------------------------------------------------------------
-
   ;;; __point-list-bbox -- bounding box of a cons-list of (cons x y) points: the
   ;;; rule shared by the lines / points / lines-interval kinds.
   (defn (export-as "plot_point_list_bbox") __point-list-bbox [points : Cells] : ptr<void>
@@ -594,10 +632,9 @@
     #undef BITS_DBL
     #undef ISNAN
     ```)
-
   ;;; __error-bars-bbox -- bounding box of a cons-list of (x . (y . h)) error
   ;;; bars: each bar spans y +/- h, or x +/- h when `horizontal`.
-  (defn __error-bars-bbox [bars : Cells  horizontal : bool] : ptr<void>
+  (defn __error-bars-bbox [bars : Cells horizontal : bool] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -637,7 +674,6 @@
     #undef BITS_DBL
     #undef ISNAN
     ```)
-
   ;;; __arrows-bbox -- bounding box of a cons-list of (x1 . (y1 . (x2 . y2)))
   ;;; arrow segments: both endpoints of every arrow.
   ;;
@@ -683,7 +719,6 @@
     #undef BITS_DBL
     #undef ISNAN
     ```)
-
   ;;; __rects-bbox -- bounding box of a cons-list of (x0 . (x1 . (y0 . y1)))
   ;;; rectangles: the rectangles / area-histogram rule.
   (defn __rects-bbox [rects : Cells] : ptr<void>
@@ -727,11 +762,10 @@
     #undef BITS_DBL
     #undef ISNAN
     ```)
-
   ;;; __discrete-hist-bbox -- bounding box of a cons-list of (label . height)
   ;;; bars laid out at category slots 0, 1, 2, ... (each 0.8 wide), rotated
   ;;; onto the y axis when `horizontal`.
-  (defn __discrete-hist-bbox [bars : Cells  horizontal : bool] : ptr<void>
+  (defn __discrete-hist-bbox [bars : Cells horizontal : bool] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -768,10 +802,9 @@
     #undef BITS_DBL
     #undef ISNAN
     ```)
-
   ;;; __stacked-hist-bbox -- bounding box of a cons-list of (label . values)
   ;;; groups: each slot is as tall as the sum of its stacked values.
-  (defn __stacked-hist-bbox [groups : Cells  horizontal : bool] : ptr<void>
+  (defn __stacked-hist-bbox [groups : Cells horizontal : bool] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -809,53 +842,45 @@
     #undef BITS_DBL
     #undef ISNAN
     ```)
-
   ;; The typed payloads' bounds: lower the Vec to Cells, run the shape's
   ;; helper above, free the Cells.
-
   ;;; __bbox-of-points -- the box of a (Vec Point), NaN points skipped.
   (defn __bbox-of-points [v : (Vec Point)] : BBox
     (let [cells (__points->cells v)
           bb    (bbox-from-raw (__point-list-bbox cells))]
       (__free-cells cells 1)
       bb))
-
   ;;; __bbox-of-error-bars -- the box spanning every bar's y +/- err (x +/- err
   ;;; when `horizontal`).
-  (defn __bbox-of-error-bars [v : (Vec ErrorBar)  horizontal : bool] : BBox
+  (defn __bbox-of-error-bars [v : (Vec ErrorBar) horizontal : bool] : BBox
     (let [cells (__error-bars->cells v)
           bb    (bbox-from-raw (__error-bars-bbox cells horizontal))]
       (__free-cells cells 2)
       bb))
-
   ;;; __bbox-of-arrows -- the box spanning both ends of every arrow.
   (defn __bbox-of-arrows [v : (Vec Arrow)] : BBox
     (let [cells (__arrows->cells v)
           bb    (bbox-from-raw (__arrows-bbox cells))]
       (__free-cells cells 3)
       bb))
-
   ;;; __bbox-of-rects -- the box spanning every rectangle.
   (defn __bbox-of-rects [v : (Vec Rect)] : BBox
     (let [cells (__rects->cells v)
           bb    (bbox-from-raw (__rects-bbox cells))]
       (__free-cells cells 3)
       bb))
-
   ;;; __bbox-of-bars -- the box of a discrete histogram's category slots.
-  (defn __bbox-of-bars [v : (Vec Bar)  horizontal : bool] : BBox
+  (defn __bbox-of-bars [v : (Vec Bar) horizontal : bool] : BBox
     (let [cells (__bars->cells v)
           bb    (bbox-from-raw (__discrete-hist-bbox cells horizontal))]
       (__free-cells cells 1)
       bb))
-
   ;;; __bbox-of-groups -- the box of a stacked histogram's category slots.
-  (defn __bbox-of-groups [v : (Vec Group)  horizontal : bool] : BBox
+  (defn __bbox-of-groups [v : (Vec Group) horizontal : bool] : BBox
     (let [cells (__groups->cells v)
           bb    (bbox-from-raw (__stacked-hist-bbox cells horizontal))]
       (__free-groups cells)
       bb))
-
   ;; ===========================================================================
   ;; Renderer typeclass -- U2 renderer-kind collapse.
   ;;
@@ -871,37 +896,34 @@
   ;; first `categorical?` renderer; then each renderer's `draw` paints it,
   ;; in order, and the legend lists every non-empty `legend-label`.
   ;; ===========================================================================
-
   ;;; DrawCtx -- one plot's draw context: the canvas, the resolved data bounds,
   ;;; the viewport rectangle, the loaded font, and the auto-color cursor the
   ;;; renderers advance as they take default colors. Created by the frame
   ;;; pass, threaded through every `draw`, released after the legend.
   (defopaque DrawCtx :ptr<void>)
-
   ;;; FrameMarks -- the axis lines and tick grids a renderer asks the frame for.
-  (defstruct ^copy FrameMarks [x-axis : bool  y-axis : bool  x-grid : bool  y-grid : bool])
-
+  (defstruct ^copy FrameMarks
+    [x-axis : bool y-axis : bool x-grid : bool y-grid : bool])
   ;;; no-frame-marks -- FrameMarks asking for nothing; what most renderers want.
   (defn no-frame-marks [] : FrameMarks
     (make-struct FrameMarks false false false false))
-
   ;;; frame-marks-union -- the marks either side asks for.
-  (defn frame-marks-union [a : FrameMarks  b : FrameMarks] : FrameMarks
-    (make-struct FrameMarks (or (.x-axis a) (.x-axis b)) (or (.y-axis a) (.y-axis b))
-                            (or (.x-grid a) (.x-grid b)) (or (.y-grid a) (.y-grid b))))
-
+  (defn frame-marks-union [a : FrameMarks b : FrameMarks] : FrameMarks
+    (make-struct FrameMarks
+      (or (.x-axis a) (.x-axis b))
+      (or (.y-axis a) (.y-axis b))
+      (or (.x-grid a) (.x-grid b))
+      (or (.y-grid a) (.y-grid b))))
   ;;; __nonempty? -- is `s` a non-empty string?
   (defn __nonempty? [s : cstr] : bool
     ```c
     return s && s[0];
     ```)
-
   ;;; __one-label -- a fresh Vec holding `label`, or empty for "".
   (defn __one-label [label : cstr] : (Vec cstr)
     (let [v (:: (vec-new) (Vec cstr))]
       (when (__nonempty? label) (vec-push! v label))
       v))
-
   ;;; Renderer -- the class every plot renderer kind implements.
   ;;;
   ;;; Parameters:
@@ -932,19 +954,17 @@
   ;;; Since: plot-v0.4.0
   (defclass Renderer [a]
     (bounds [r : a] : BBox)
-    (draw [r : a  ctx : DrawCtx] : void)
+    (draw [r : a ctx : DrawCtx] : void)
     (legend-label [r : a] : cstr "")
     (legend-labels [r : a] : (Vec cstr) (__one-label (legend-label r)))
     (frame-marks [r : a] : FrameMarks (no-frame-marks))
     (categorical? [r : a] : bool false)
     (categories-on-y? [r : a] : bool false)
     (category-labels [r : a] : (Vec cstr) (:: (vec-new) (Vec cstr))))
-
   ;;; AnyRenderer -- a value of any `Renderer` kind, boxed with its instance.
   ;;; Every public constructor (`lines`, `function`, `axes`, ...) returns one,
   ;;; and `plot` / `plot-write-png` / `render` take a `(Vec AnyRenderer)`.
   (defalias AnyRenderer (exists [a] [(Renderer a)] a))
-
   ;;; any-renderer -- box a value whose type has a `Renderer` instance as an
   ;;; `AnyRenderer`. The `(exists ...)` form must appear literally at the pack
   ;;; site, so this is a macro (same reason as stdlib `showable`).
@@ -957,8 +977,8 @@
   ;;;
   ;;; Example:
   ;;;   (any-renderer (make-struct LinesR pts (default-line-style) ""))
-  (defmacro any-renderer [x] (list pack x (list exists [a] [(list Renderer a)] a)))
-
+  (defmacro any-renderer [x]
+    (list pack x (list exists [a] [(list Renderer a)] a)))
   ;;; renderer-bbox -- the data-space bounding box of one renderer.
   ;;;
   ;;; Parameters:
@@ -969,20 +989,19 @@
   ;;;
   ;;; Example:
   ;;;   (renderer-bbox (lines pts (default-line-style) ""))
-  (defn renderer-bbox [r : AnyRenderer] : BBox
-    (open r [a v] (bounds v)))
-
+  (defn renderer-bbox [r : AnyRenderer] : BBox (open r [a v] (bounds v)))
   ;; The folds below are top-level recursive defns rather than local `letrec`
   ;; closures: the compiler mallocs a letrec closure's env and, for a struct
   ;; argument, a box per call, and frees neither -- a leak on every `plot`.
   ;; A top-level defn passes `acc` by value and allocates nothing.
-
   ;;; __bbox-fold -- union the `bounds` of rs[i..n) into acc.
-  (defn __bbox-fold [rs : (Vec AnyRenderer)  i : int  n : int  acc : BBox] : BBox
-    (if (>= i n) acc
-      (__bbox-fold rs (+ i 1) n
-                   (bbox-union acc (open (vec-get rs i) [a v] (bounds v))))))
-
+  (defn __bbox-fold [rs : (Vec AnyRenderer) i : int n : int acc : BBox] : BBox
+    (if (>= i n)
+      acc
+      (__bbox-fold rs
+        (+ i 1)
+        n
+        (bbox-union acc (open (vec-get rs i) [a v] (bounds v))))))
   ;;; renderers-bbox -- the data-space bounding box of a renderer Vec: the
   ;;; union of every element's `bounds`, each dispatched through the instance
   ;;; its `AnyRenderer` carries. This is the extent the plot is laid out over
@@ -998,7 +1017,6 @@
   ;;;   (renderers-bbox (vec-of (axes) (lines pts (default-line-style) "")))
   (defn renderers-bbox [rs : (Vec AnyRenderer)] : BBox
     (__bbox-fold rs 0 (vec-len rs) (bbox-empty-box)))
-
   ;; ---------------------------------------------------------------------------
   ;; Shared drawing helpers. Every kind's `draw` is inline C over a DrawCtx;
   ;; these are the pieces they share -- resolving a style handle onto the
@@ -1006,9 +1024,9 @@
   ;; data point into the viewport. Pinned to stable C symbols via `export-as`
   ;; so the per-kind inline C (in this module and the others) can call them.
   ;; ---------------------------------------------------------------------------
-
   ;;; __ctx-line-style -- install a line-style handle's color, alpha and width.
-  (defn (export-as "plot_ctx_line_style") __ctx-line-style [ctx : ptr<void>  style : int] : void
+  (defn (export-as "plot_ctx_line_style") __ctx-line-style [ctx : ptr<void>
+                                                            style : int] : void
     ```c
     #include <stddef.h>
     #include <stdint.h>
@@ -1069,9 +1087,9 @@
       sw->line_alpha = __alpha; sw->line_width = __width;
     }
     ```)
-
   ;;; __ctx-fill-style -- install a fill-style handle's color and alpha.
-  (defn (export-as "plot_ctx_fill_style") __ctx-fill-style [ctx : ptr<void>  style : int] : void
+  (defn (export-as "plot_ctx_fill_style") __ctx-fill-style [ctx : ptr<void>
+                                                            style : int] : void
     ```c
     #include <stdint.h>
     /* Stand-ins for <plutovg.h>, for a build without it on the include
@@ -1124,15 +1142,16 @@
       sw->has_fill = 1; sw->fill_color = __color; sw->fill_alpha = __alpha;
     }
     ```)
-
   ;;; __ctx-point-style -- resolve a point-style handle's stroke and fill palette
   ;;; indices into `stroke-out` / `fill-out` (int *).
   ;;;
   ;;; Each of the three style helpers also records the first style of its kind
   ;;; the renderer now drawing (`__ctx-drawing`) resolves -- auto colors
   ;;; included -- as that renderer's legend swatch.
-  (defn (export-as "plot_ctx_point_style")
-        __ctx-point-style [ctx : ptr<void>  style : int  stroke-out : ptr<void>  fill-out : ptr<void>] : void
+  (defn (export-as "plot_ctx_point_style") __ctx-point-style [ctx : ptr<void>
+                                                              style : int
+                                                              stroke-out : ptr<void>
+                                                              fill-out : ptr<void>] : void
     ```c
     #include <stdint.h>
     typedef struct PlotSwatch {
@@ -1171,12 +1190,12 @@
       sw->point_alpha = (__ps && __ps->alpha > 0.0) ? __ps->alpha : 1.0;
     }
     ```)
-
   ;;; __ctx-note-fill -- record palette color `color` at `alpha` as the
   ;;; drawing renderer's fill swatch, for a draw that fills without a
   ;;; FillStyle (the contour bands). Draws nothing.
-  (defn (export-as "plot_ctx_note_fill")
-        __ctx-note-fill [ctx : ptr<void>  color : int  alpha : float] : void
+  (defn (export-as "plot_ctx_note_fill") __ctx-note-fill [ctx : ptr<void>
+                                                          color : int
+                                                          alpha : float] : void
     ```c
     #include <stdint.h>
     typedef struct PlotSwatch {
@@ -1204,15 +1223,19 @@
       sw->has_fill = 1; sw->fill_color = c; sw->fill_alpha = alpha;
     }
     ```)
-
   ;;; __ctx-marker -- draw one point marker centered on viewport pixel
   ;;; (vx, vy): symbol `sym` (0 circle, 1 square, 2 triangle, 3 cross,
   ;;; 4 plus, 5 diamond) of width `size`, filled with palette color `fill` and
   ;;; outlined with `stroke`, both at `alpha`. `points` draws each point with
   ;;; it, and the legend its swatch.
-  (defn (export-as "plot_ctx_marker")
-        __ctx-marker [ctx : ptr<void>  vx : float  vy : float  stroke : int  fill : int
-                      sym : int  size : float  alpha : float] : void
+  (defn (export-as "plot_ctx_marker") __ctx-marker [ctx : ptr<void>
+                                                    vx : float
+                                                    vy : float
+                                                    stroke : int
+                                                    fill : int
+                                                    sym : int
+                                                    size : float
+                                                    alpha : float] : void
     ```c
     #include <stdint.h>
     /* Stand-ins for <plutovg.h>, for a build without it on the include
@@ -1310,11 +1333,13 @@
       plutovg_canvas_stroke((plutovg_canvas_t *)(intptr_t)canvas);
     }
     ```)
-
   ;;; __ctx-map -- map the data point (x, y) into viewport pixels, written to
   ;;; `vx-out` / `vy-out` (double *).
-  (defn (export-as "plot_ctx_map")
-        __ctx-map [ctx : ptr<void>  x : float  y : float  vx-out : ptr<void>  vy-out : ptr<void>] : void
+  (defn (export-as "plot_ctx_map") __ctx-map [ctx : ptr<void>
+                                              x : float
+                                              y : float
+                                              vx-out : ptr<void>
+                                              vy-out : ptr<void>] : void
     ```c
     #include <stdint.h>
     typedef struct PlotDrawCtx {
@@ -1332,63 +1357,71 @@
     *(double *)vx_out = (double)dc->left + __tx * (double)dc->plot_w;
     *(double *)vy_out = (double)dc->bottom - __ty * (double)dc->plot_h;
     ```)
-
   ;; ---------------------------------------------------------------------------
   ;; The folds a plot makes over its renderers, each a top-level recursive
   ;; defn (a `letrec` closure leaked its env and a struct box per call). Every
   ;; element is opened and the method dispatched through its own instance.
   ;; ---------------------------------------------------------------------------
-
   ;;; __marks-fold -- union the `frame-marks` of rs[i..n) into acc.
-  (defn __marks-fold [rs : (Vec AnyRenderer)  i : int  n : int  acc : FrameMarks] : FrameMarks
-    (if (>= i n) acc
-      (__marks-fold rs (+ i 1) n
-                    (frame-marks-union acc (open (vec-get rs i) [a v] (frame-marks v))))))
-
+  (defn __marks-fold [rs : (Vec AnyRenderer) i : int n : int acc : FrameMarks] : FrameMarks
+    (if (>= i n)
+      acc
+      (__marks-fold rs
+        (+ i 1)
+        n
+        (frame-marks-union acc (open (vec-get rs i) [a v] (frame-marks v))))))
   ;;; __first-categorical -- the index of the first `categorical?` renderer of
   ;;; rs[i..n), or -1.
-  (defn __first-categorical [rs : (Vec AnyRenderer)  i : int  n : int] : int
-    (if (>= i n) -1
+  (defn __first-categorical [rs : (Vec AnyRenderer) i : int n : int] : int
+    (if (>= i n)
+      -1
       (if (open (vec-get rs i) [a v] (categorical? v))
         i
         (__first-categorical rs (+ i 1) n))))
-
   ;;; __draw-fold -- `draw` each of rs[i..n), in order, telling the DrawCtx
   ;;; which one is drawing so its legend swatch is recorded.
-  (defn __draw-fold [rs : (Vec AnyRenderer)  ctx : DrawCtx  i : int  n : int] : int
+  (defn __draw-fold [rs : (Vec AnyRenderer) ctx : DrawCtx i : int n : int] : int
     (if (>= i n)
       (do (__ctx-drawing ctx -1) n)
-      (do (__ctx-drawing ctx i)
-          (open (vec-get rs i) [a v] (draw v ctx))
-          (__draw-fold rs ctx (+ i 1) n))))
-
+      (do
+        (__ctx-drawing ctx i)
+        (open (vec-get rs i) [a v] (draw v ctx))
+        (__draw-fold rs ctx (+ i 1) n))))
   ;;; __legend-rows -- renderer i's legend rows for labels[k..m); `row` is
   ;;; the next row's index, and the result the one after the last drawn.
-  (defn __legend-rows [ctx : DrawCtx  i : int  labels : (Vec cstr)  k : int  m : int  row : int] : int
-    (if (>= k m) row
-      (__legend-rows ctx i labels (+ k 1) m
-                     (if (__legend-row ctx row i k (vec-get labels k))
-                       (+ row 1)
-                       row))))
-
+  (defn __legend-rows [ctx : DrawCtx
+                       i : int
+                       labels : (Vec cstr)
+                       k : int
+                       m : int
+                       row : int] : int
+    (if (>= k m)
+      row
+      (__legend-rows ctx
+        i
+        labels
+        (+ k 1)
+        m
+        (if (__legend-row ctx row i k (vec-get labels k)) (+ row 1) row))))
   ;;; __legend-fold -- the legend rows of rs[i..n), each renderer's
   ;;; `legend-labels` in order; `row` is the next row's index.
-  (defn __legend-fold [rs : (Vec AnyRenderer)  ctx : DrawCtx  i : int  n : int  row : int] : int
-    (if (>= i n) row
+  (defn __legend-fold [rs : (Vec AnyRenderer)
+                       ctx : DrawCtx
+                       i : int
+                       n : int
+                       row : int] : int
+    (if (>= i n)
+      row
       (let [labels (open (vec-get rs i) [a v] (legend-labels v))
             next   (__legend-rows ctx i labels 0 (vec-len labels) row)]
         (vec-free labels)
         (__legend-fold rs ctx (+ i 1) n next))))
-
   ;;; __null-ptr? -- is this a null pointer?
-  (defn __null-ptr? [p : ptr<void>] : bool
-    ```c return p == NULL; ```)
-
+  (defn __null-ptr? [p : ptr<void>] : bool ```c return p == NULL; ```)
   ;;; plot-anyrenderers -- deprecated: `plot` takes a (Vec AnyRenderer) itself
   ;;; now. Kept for one release; call `plot`.
   (defn plot-anyrenderers [rs : (Vec AnyRenderer) opts : PlotOpts] : ptr<void>
     (plot rs opts))
-
   ;;; __surfaces-equal? -- true when two plutovg surfaces have identical
   ;;; dimensions and pixel bytes. Used to assert that the typed `AnyRenderer`
   ;;; draw path is pixel-identical to the legacy constructor path.
@@ -1416,7 +1449,6 @@
     }
     return true;
     ```)
-
   ;;; __plot-frame -- lay out and paint one plot's frame: background, border,
   ;;; ticks, grid, axes, title and axis labels, over the data extent the caller
   ;;; folded from the renderers' `bounds` (all NaN when nothing constrains it),
@@ -1424,10 +1456,23 @@
   ;;; Cells. Returns the DrawCtx (as a
   ;;; pointer) the renderers then draw through, or NULL when the viewport is
   ;;; too small to hold a plot.
-  (defn __plot-frame [canvas : int  opts : PlotOpts  px : int  py : int  pw : int  ph : int
-                      data-x-min : float  data-x-max : float  data-y-min : float  data-y-max : float
-                      mark-x-axis : bool  mark-y-axis : bool  mark-x-grid : bool  mark-y-grid : bool
-                      has-categories : bool  categories-on-y : bool  category-cells : Cells] : ptr<void>
+  (defn __plot-frame [canvas : int
+                      opts : PlotOpts
+                      px : int
+                      py : int
+                      pw : int
+                      ph : int
+                      data-x-min : float
+                      data-x-max : float
+                      data-y-min : float
+                      data-y-max : float
+                      mark-x-axis : bool
+                      mark-y-axis : bool
+                      mark-x-grid : bool
+                      mark-y-grid : bool
+                      has-categories : bool
+                      categories-on-y : bool
+                      category-cells : Cells] : ptr<void>
     ```c
     #include <stdlib.h>
     #include <stdint.h>
@@ -1774,11 +1819,10 @@
     #undef UNION_POINT
     #undef ISNAN
     ```)
-
   ;;; __ctx-track-renderers -- give the DrawCtx legend swatches for each of
   ;;; `n` renderers, one per series each draws, filled in as they draw (see
   ;;; `__ctx-drawing` and `__ctx-series`).
-  (defn __ctx-track-renderers [ctx : DrawCtx  n : int] : void
+  (defn __ctx-track-renderers [ctx : DrawCtx n : int] : void
     ```c
     #include <stdint.h>
     #include <stdlib.h>
@@ -1810,11 +1854,10 @@
     dc->swatches = (PlotSeries *)calloc((size_t)n, sizeof(PlotSeries));
     dc->n_swatches = dc->swatches ? n : 0;
     ```)
-
   ;;; __ctx-drawing -- say which renderer (its index in the plot's Vec) is about
   ;;; to draw, so the style helpers record its swatch; -1 for none. It starts
   ;;; on series 0.
-  (defn __ctx-drawing [ctx : DrawCtx  i : int] : void
+  (defn __ctx-drawing [ctx : DrawCtx i : int] : void
     ```c
     #include <stdint.h>
     typedef struct PlotSwatch {
@@ -1844,11 +1887,10 @@
     dc->cur_swatch = i;
     dc->cur_series = 0;
     ```)
-
   ;;; __ctx-series -- say the drawing renderer now draws its series `k` (a
   ;;; stacked histogram's layer k): the style helpers record into that
   ;;; series' swatch, which is its k-th legend row's.
-  (defn (export-as "plot_ctx_series") __ctx-series [ctx : ptr<void>  k : int] : void
+  (defn (export-as "plot_ctx_series") __ctx-series [ctx : ptr<void> k : int] : void
     ```c
     #include <stdint.h>
     typedef struct PlotSwatch {
@@ -1877,7 +1919,6 @@
     PlotDrawCtx *dc = (PlotDrawCtx *)ctx;
     dc->cur_series = k < 0 ? 0 : k;
     ```)
-
   ;;; __ctx-swatch -- the swatch of the drawing renderer's current series,
   ;;; added (empty) on first use; NULL when no renderer is drawing.
   (defn (export-as "plot_ctx_swatch") __ctx-swatch [ctx : ptr<void>] : ptr<void>
@@ -1921,10 +1962,11 @@
     }
     return &se->items[k];
     ```)
-
   ;;; __ctx-swatch-at -- renderer `i`'s series `k` swatch, or NULL when it
   ;;; recorded none.
-  (defn (export-as "plot_ctx_swatch_at") __ctx-swatch-at [ctx : ptr<void>  i : int  k : int] : ptr<void>
+  (defn (export-as "plot_ctx_swatch_at") __ctx-swatch-at [ctx : ptr<void>
+                                                          i : int
+                                                          k : int] : ptr<void>
     ```c
     #include <stdint.h>
     typedef struct PlotSwatch {
@@ -1956,7 +1998,6 @@
     if (k < 0 || k >= se->n) return NULL;
     return &se->items[k];
     ```)
-
   ;;; __ctx-clip-begin -- clip drawing to the viewport, as the renderers draw.
   (defn __ctx-clip-begin [ctx : DrawCtx] : void
     ```c
@@ -1984,7 +2025,6 @@
                         (float)dc->plot_w, (float)dc->plot_h);
     plutovg_canvas_clip((plutovg_canvas_t *)dc->canvas);
     ```)
-
   ;;; __ctx-clip-end -- lift the viewport clip.
   (defn __ctx-clip-end [ctx : DrawCtx] : void
     ```c
@@ -2007,7 +2047,6 @@
     PlotDrawCtx *dc = (PlotDrawCtx *)(intptr_t)ctx;
     plutovg_canvas_restore((plutovg_canvas_t *)dc->canvas);
     ```)
-
   ;;; __legend-begin -- select the legend font, when there is a legend to draw.
   (defn __legend-begin [ctx : DrawCtx] : void
     ```c
@@ -2033,10 +2072,9 @@
     plutovg_canvas_set_font_face((plutovg_canvas_t *)dc->canvas, dc->font);
     plutovg_canvas_set_font_size((plutovg_canvas_t *)dc->canvas, 12.0f);
     ```)
-
   ;;; __ctx-text-width -- the advance width of `text` in the legend's font, in
   ;;; pixels; 0 with no font. Call after `__legend-begin` has set the font.
-  (defn __ctx-text-width [ctx : DrawCtx  text : cstr] : float
+  (defn __ctx-text-width [ctx : DrawCtx text : cstr] : float
     ```c
     #include <stdint.h>
     #include <string.h>
@@ -2078,37 +2116,45 @@
     return (double)plutovg_canvas_text_extents((plutovg_canvas_t *)dc->canvas, text, (int)strlen(text),
                                                PLUTOVG_TEXT_ENCODING_UTF8, &r);
     ```)
-
   ;;; LegendSize -- how many legend rows a plot has, and its widest label.
-  (defstruct ^copy LegendSize [rows : int  width : float])
-
+  (defstruct ^copy LegendSize [rows : int width : float])
   ;;; __legend-size-rows -- `acc` grown by the non-empty labels[k..m).
-  (defn __legend-size-rows [ctx : DrawCtx  labels : (Vec cstr)  k : int  m : int
+  (defn __legend-size-rows [ctx : DrawCtx
+                            labels : (Vec cstr)
+                            k : int
+                            m : int
                             acc : LegendSize] : LegendSize
-    (if (>= k m) acc
+    (if (>= k m)
+      acc
       (let [label (vec-get labels k)
             w     (__ctx-text-width ctx label)]
-        (__legend-size-rows ctx labels (+ k 1) m
-                            (if (__nonempty? label)
-                              (LegendSize (+ (.rows acc) 1) (if (> w (.width acc)) w (.width acc)))
-                              acc)))))
-
+        (__legend-size-rows ctx
+          labels
+          (+ k 1)
+          m
+          (if (__nonempty? label)
+            (LegendSize (+ (.rows acc) 1)
+              (if (> w (.width acc)) w (.width acc)))
+            acc)))))
   ;;; __legend-size -- the legend rows of rs[i..n) and their widest label,
   ;;; folded into `acc`; the same rows `__legend-fold` draws.
-  (defn __legend-size [rs : (Vec AnyRenderer)  ctx : DrawCtx  i : int  n : int
+  (defn __legend-size [rs : (Vec AnyRenderer)
+                       ctx : DrawCtx
+                       i : int
+                       n : int
                        acc : LegendSize] : LegendSize
-    (if (>= i n) acc
+    (if (>= i n)
+      acc
       (let [labels (open (vec-get rs i) [a v] (legend-labels v))
             next   (__legend-size-rows ctx labels 0 (vec-len labels) acc)]
         (vec-free labels)
         (__legend-size rs ctx (+ i 1) n next))))
-
   ;;; __legend-box -- lay the legend out for `rows` rows whose widest label is
   ;;; `width` pixels, and draw its backing: a translucent white box with a
   ;;; light border, so the rows read over whatever the plot drew there. A
   ;;; right-hand legend moves left to keep a long label inside the plot, and
   ;;; a bottom one stacks upward from the bottom edge.
-  (defn __legend-box [ctx : DrawCtx  rows : int  width : float] : void
+  (defn __legend-box [ctx : DrawCtx rows : int width : float] : void
     ```c
     #include <stdint.h>
     #include <stdbool.h>
@@ -2166,14 +2212,17 @@
     plutovg_canvas_set_line_width(cv, 1.0f);
     plutovg_canvas_stroke(cv);
     ```)
-
   ;;; __legend-row -- draw legend row `row`: the swatch of renderer `index`'s
   ;;; series `series`, and `label`. The swatch is what that series drew with -- its point marker,
   ;;; else its fill as a box (edged top and bottom in its line style, as an
   ;;; interval band is), else a stroke of its line style; a renderer that
   ;;; recorded no style gets none. Returns false, drawing nothing, for an
   ;;; empty label or when there is no legend (no font, or `legend-pos` 0).
-  (defn __legend-row [ctx : DrawCtx  row : int  index : int  series : int  label : cstr] : bool
+  (defn __legend-row [ctx : DrawCtx
+                      row : int
+                      index : int
+                      series : int
+                      label : cstr] : bool
     ```c
     #include <stdint.h>
     #include <string.h>
@@ -2274,7 +2323,6 @@
                              PLUTOVG_TEXT_ENCODING_UTF8, (float)(lx + 18.0), (float)(y + 4.0));
     return true;
     ```)
-
   ;;; __ctx-finish -- hand the canvas back in the state the frame found it
   ;;; (undoing its save), then release a DrawCtx, its swatches and its font.
   (defn __ctx-finish [ctx : DrawCtx] : void
@@ -2318,7 +2366,6 @@
     free(dc->swatches);
     free(dc);
     ```)
-
   ;;; plot-into-canvas -- render renderers into an existing canvas and viewport.
   ;;;
   ;;; The data extent is the union of the renderers' `bounds` (padded 5%, and
@@ -2340,8 +2387,13 @@
   ;;;
   ;;; Example:
   ;;;   (plot-into-canvas canvas (vec-of (axes) (lines pts ls "")) opts 0 0 600 450)
-  (defn plot-into-canvas [canvas : int  renderers : (Vec AnyRenderer)  opts : PlotOpts
-                          px : int  py : int  pw : int  ph : int] : ptr<void>
+  (defn plot-into-canvas [canvas : int
+                          renderers : (Vec AnyRenderer)
+                          opts : PlotOpts
+                          px : int
+                          py : int
+                          pw : int
+                          ph : int] : ptr<void>
     (let [n      (vec-len renderers)
           bb     (renderers-bbox renderers)
           marks  (__marks-fold renderers 0 n (no-frame-marks))
@@ -2353,10 +2405,23 @@
                    (open (vec-get renderers ci) [a v] (category-labels v))
                    (:: (vec-new) (Vec cstr)))
           cells  (__labels->cells labels)
-          raw    (__plot-frame canvas opts px py pw ph
-                               (.x-min bb) (.x-max bb) (.y-min bb) (.y-max bb)
-                               (.x-axis marks) (.y-axis marks) (.x-grid marks) (.y-grid marks)
-                               (>= ci 0) on-y cells)]
+          raw    (__plot-frame canvas
+                   opts
+                   px
+                   py
+                   pw
+                   ph
+                   (.x-min bb)
+                   (.x-max bb)
+                   (.y-min bb)
+                   (.y-max bb)
+                   (.x-axis marks)
+                   (.y-axis marks)
+                   (.x-grid marks)
+                   (.y-grid marks)
+                   (>= ci 0)
+                   on-y
+                   cells)]
       ;; The frame has drawn the category ticks; their cells and labels go.
       (__free-cells cells 1)
       (vec-free labels)
@@ -2373,7 +2438,6 @@
           (__legend-fold renderers ctx 0 n 0)
           (__ctx-finish ctx)
           (__ok 0)))))
-
   ;; ---------------------------------------------------------------------------
   ;; Backend -- the output target a plot renders to (U2 typeclass collapse).
   ;;
@@ -2394,31 +2458,34 @@
   ;; 0 for the canvas/PNG sinks; err-val carries the failure code.
   ;; ---------------------------------------------------------------------------
   (defclass Backend [b]
-    (render-to [self : b  renderers : (Vec AnyRenderer)  opts : PlotOpts] : ptr<void>))
-
+    (render-to [self : b renderers : (Vec AnyRenderer) opts : PlotOpts]
+      : ptr<void>))
   ;; CanvasBackend -- draw into an existing canvas at the given viewport.
-  (defstruct CanvasBackend [canvas : int  px : int  py : int  pw : int  ph : int])
-
+  (defstruct CanvasBackend [canvas : int px : int py : int pw : int ph : int])
   ;; SurfaceBackend -- allocate a fresh surface and return it (caller owns).
   ;; A width/height of 0 falls back to the opts dimensions (or 600x450).
-  (defstruct SurfaceBackend [width : int  height : int])
-
+  (defstruct SurfaceBackend [width : int height : int])
   ;; PngBackend -- render to a fresh surface and write it to `path` as PNG.
   (defstruct PngBackend [path : cstr])
-
   ;; CanvasBackend delegates straight to the inline-C drawing worker.
   (definstance Backend [CanvasBackend]
     (render-to [self renderers opts]
-      (plot-into-canvas (.canvas self) renderers opts
-                        (.px self) (.py self) (.pw self) (.ph self))))
-
+      (plot-into-canvas (.canvas self)
+        renderers
+        opts
+        (.px self)
+        (.py self)
+        (.pw self)
+        (.ph self))))
   ;; SurfaceBackend allocates the surface + canvas, then dispatches the draw
   ;; through CanvasBackend and hands the surface back on success.
   (definstance Backend [SurfaceBackend]
     (render-to [self renderers opts]
-      (let [w  (if (> (.width self) 0) (.width self)
+      (let [w  (if (> (.width self) 0)
+                 (.width self)
                  (if (> (plot-opts-width opts) 0) (plot-opts-width opts) 600))
-            h  (if (> (.height self) 0) (.height self)
+            h  (if (> (.height self) 0)
+                 (.height self)
                  (if (> (plot-opts-height opts) 0) (plot-opts-height opts) 450))
             sr (__surface-create w h)]
         (if (__ok? sr)
@@ -2426,17 +2493,15 @@
                 cr      (__canvas-create surface)]
             (if (__ok? cr)
               (let [canvas (__ok-val cr)
-                    rr (render-to (make-struct CanvasBackend canvas 0 0 w h)
-                                  renderers opts)]
+                    rr     (render-to (make-struct CanvasBackend canvas 0 0 w h)
+                             renderers
+                             opts)]
                 (__canvas-destroy canvas)
                 (if (__ok? rr)
                   (__ok surface)
-                  (do
-                    (__surface-destroy surface)
-                    (__err (__err-val rr)))))
+                  (do (__surface-destroy surface) (__err (__err-val rr)))))
               (__err (__err-val cr))))
           (__err (__err-val sr))))))
-
   ;; PngBackend renders through SurfaceBackend, then writes + frees the surface.
   (definstance Backend [PngBackend]
     (render-to [self renderers opts]
@@ -2447,7 +2512,6 @@
             (__surface-destroy s)
             wr)
           (__err (__err-val r))))))
-
   ;;; render -- draw `renderers` to any Backend, generic over the sink.
   ;;;
   ;;; This is the plan's "the plot DSL becomes generic in Backend": one entry
@@ -2459,9 +2523,8 @@
   ;;; Example:
   ;;;   (render (make-struct PngBackend "out.png") rs opts)
   ;;;   (render (make-struct SurfaceBackend 0 0)   rs opts)
-  (defn render [^Backend B b : B  renderers : (Vec AnyRenderer)  opts : PlotOpts] : ptr<void>
+  (defn render [^Backend B b : B renderers : (Vec AnyRenderer) opts : PlotOpts] : ptr<void>
     (render-to b renderers opts))
-
   ;;; plot -- render renderers to a new surface and return it.
   ;;;
   ;;; renderers is a (Vec AnyRenderer): build it with vec-of over the
@@ -2472,14 +2535,13 @@
   ;;; equivalent to `(render-to (make-struct SurfaceBackend 0 0) renderers opts)`.
   (defn plot [renderers : (Vec AnyRenderer) opts : PlotOpts] : ptr<void>
     (render-to (make-struct SurfaceBackend 0 0) renderers opts))
-
   ;;; plot-write-png -- render renderers and write them to a PNG file.
   ;;;
   ;;; renderers is a (Vec AnyRenderer), as for `plot`.
   ;;;
   ;;; Thin wrapper over the `Backend` dispatch (the `PngBackend` instance);
   ;;; equivalent to `(render-to (make-struct PngBackend path) renderers opts)`.
-  (defn plot-write-png [renderers : (Vec AnyRenderer) opts : PlotOpts path : cstr] : ptr<void>
-    (render-to (make-struct PngBackend path) renderers opts))
-
-) ;; end defmodule plot/core
+  (defn plot-write-png [renderers : (Vec AnyRenderer)
+                        opts : PlotOpts
+                        path : cstr] : ptr<void>
+    (render-to (make-struct PngBackend path) renderers opts))) ;; end defmodule plot/core

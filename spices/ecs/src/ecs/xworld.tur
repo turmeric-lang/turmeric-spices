@@ -19,125 +19,121 @@
 ;;; by `defxsystem`'s auto-consume -- not per write call.
 ;;;
 ;;; Since: X1
-
 (defmodule ecs/xworld
   (export sized-defcomponent-accessors-xmono
-          box-world load-world free-world-box
-          defworld-box-helpers)
-
-(import ecs/sized-storage :refer [SizedDense sized-dense-get
-                                   sized-dense-set! sized-dense-has?])
-(import ecs/xcap          :refer [XWriteCap XReadCap])
-(import ecs/entity        :refer [Slot])
-
-;;; box-world -- box a world's carrier value onto the heap and return
-;;; the `:int` cell the cross-world scheduler threads through.
-;;; Polymorphic in the world type `W`; the inline-C body reflects the
-;;; concrete world's C carrier type via the `__TUR_TY_W__` template
-;;; marker. Replaces the hand-written per-world `box-<WorldName>` triple
-;;; that every cross-world setup previously had to copy (retired from
-;;; the tests 2026-07-26 -- their inline-C assumed the old by-value
-;;; struct ABI and no longer compiled).
-;;;
-;;; Representation note: worlds lowered from `sized-defworld-mono` are
-;;; int64-carried record ADTs, so `__TUR_TY_W__` resolves to the int64
-;;; carrier and the box holds the world HANDLE -- `load-world` hands the
-;;; same world back, so every accessor stays pointed at the same dense
-;;; arrays and state cell across round-trips (the same sharing the old
-;;; struct-copy discipline preserved via `:int` alias fields).
-;;;
-;;; Since: GEN-V0
-(defn box-world [W] [w : W] : int
-  ```c
-  #include <stdlib.h>
+    box-world
+    load-world
+    free-world-box
+    defworld-box-helpers)
+  (import ecs/sized-storage
+    :refer
+    [SizedDense sized-dense-get sized-dense-set! sized-dense-has?])
+  (import ecs/xcap :refer [XWriteCap XReadCap])
+  (import ecs/entity :refer [Slot])
+  ;;; box-world -- box a world's carrier value onto the heap and return
+  ;;; the `:int` cell the cross-world scheduler threads through.
+  ;;; Polymorphic in the world type `W`; the inline-C body reflects the
+  ;;; concrete world's C carrier type via the `__TUR_TY_W__` template
+  ;;; marker. Replaces the hand-written per-world `box-<WorldName>` triple
+  ;;; that every cross-world setup previously had to copy (retired from
+  ;;; the tests 2026-07-26 -- their inline-C assumed the old by-value
+  ;;; struct ABI and no longer compiled).
+  ;;;
+  ;;; Representation note: worlds lowered from `sized-defworld-mono` are
+  ;;; int64-carried record ADTs, so `__TUR_TY_W__` resolves to the int64
+  ;;; carrier and the box holds the world HANDLE -- `load-world` hands the
+  ;;; same world back, so every accessor stays pointed at the same dense
+  ;;; arrays and state cell across round-trips (the same sharing the old
+  ;;; struct-copy discipline preserved via `:int` alias fields).
+  ;;;
+  ;;; Since: GEN-V0
+  (defn box-world [W] [w : W] : int
+    ```c
+    #include <stdlib.h>
   __TUR_TY_W__ *p = (__TUR_TY_W__ *)malloc(sizeof(__TUR_TY_W__));
   *p = w;
   return (int64_t)(intptr_t)p;
   ```)
-
-;;; load-world -- dereference a `box-world` carrier back into the typed
-;;; world struct. Used inside each cross-world system's run-fn to
-;;; recover the typed world handle from the `:int` slot the scheduler
-;;; threads.
-;;;
-;;; Since: GEN-V0
-(defn load-world [W] [wp : int] : W
-  ```c
-  return *(__TUR_TY_W__ *)(intptr_t)wp;
+  ;;; load-world -- dereference a `box-world` carrier back into the typed
+  ;;; world struct. Used inside each cross-world system's run-fn to
+  ;;; recover the typed world handle from the `:int` slot the scheduler
+  ;;; threads.
+  ;;;
+  ;;; Since: GEN-V0
+  (defn load-world [W] [wp : int] : W
+    ```c
+    return *(__TUR_TY_W__ *)(intptr_t)wp;
   ```)
-
-;;; free-world-box -- release the heap-allocated world carrier produced
-;;; by `box-world`. Call once, after the last `xstage-run!` that uses
-;;; the world.
-;;;
-;;; Since: GEN-V0
-(defn free-world-box [W] [wp : int] : nil
-  ```c
-  #include <stdlib.h>
+  ;;; free-world-box -- release the heap-allocated world carrier produced
+  ;;; by `box-world`. Call once, after the last `xstage-run!` that uses
+  ;;; the world.
+  ;;;
+  ;;; Since: GEN-V0
+  (defn free-world-box [W] [wp : int] : nil
+    ```c
+    #include <stdlib.h>
   free((__TUR_TY_W__ *)(intptr_t)wp);
   ```)
-
-;;; defworld-box-helpers -- emit the per-world `box-<W>` / `load-<W>` /
-;;; `free-<W>-box` trio for a monomorphic world type. The emitted
-;;; helpers are thin wrappers over the generic `box-world` /
-;;; `load-world` / `free-world-box` above, so their codegen
-;;; monomorphises against the world's C struct name without the caller
-;;; pasting a per-world inline-C block.
-;;;
-;;; Example:
-;;;   (sized-defworld-mono SimWorld (Static 1024) [Pos])
-;;;   (defworld-box-helpers SimWorld)
-;;;   ;; box-SimWorld      : (SimWorld) -> int
-;;;   ;; load-SimWorld     : (int) -> SimWorld
-;;;   ;; free-SimWorld-box : (int) -> nil
-;;;
-;;; The names match the convention `defxsystem` / `sized-defsystem-scheduled`
-;;; expect, so a cross-world setup needs only the macro call instead of
-;;; the three hand-written inline-C blocks the tests have historically
-;;; carried (see `tests/xworld-extract.tur` for the legacy shape).
-;;;
-;;; Since: GEN-V0
-(defmacro defworld-box-helpers [world-name]
-  (let [box-name  (str->sym (str-append "box-"  (symbol-name world-name)))
-        load-name (str->sym (str-append "load-" (symbol-name world-name)))
-        free-name (str->sym (str-append "free-" (symbol-name world-name) "-box"))]
-    `(do
-       (defn ~box-name  [w  : ~world-name] : int  (box-world w))
-       (defn ~load-name [wp : int]         : ~world-name (load-world wp))
-       (defn ~free-name [wp : int]         : nil  (free-world-box wp)))))
-
-;;; sized-defcomponent-accessors-xmono -- emit world-keyed get/set/has
-;;; accessors for `comp-name` on the monomorphic sized world
-;;; `world-name`. Identical in shape to
-;;; `sized-defcomponent-accessors-mono`, but the cap parameter is the
-;;; two-param `(XWriteCap world-name comp-name)` / `(XReadCap world-name
-;;; comp-name)` rather than the component-only form.
-;;;
-;;; Example:
-;;;   (sized-defworld-mono RenderWorld (Static 1024) [RenderPos])
-;;;   (sized-defcomponent-accessors-xmono RenderWorld RenderPos)
-;;;   ;; get-RenderPos : (XReadCap  RenderWorld RenderPos) RenderWorld Slot -> RenderPos
-;;;   ;; set-RenderPos!: (XWriteCap RenderWorld RenderPos) RenderWorld Slot RenderPos -> nil
-;;;
-;;; Since: X1
-(defmacro sized-defcomponent-accessors-xmono [world-name comp-name]
-  (let [getter (str->sym (str-append "get-"  (symbol-name comp-name)))
-        setter (str->sym (str-append "set-"  (symbol-name comp-name) "!"))
-        haser  (str->sym (str-append "has-"  (symbol-name comp-name) "?"))
-        field  (dot-sym comp-name)]
-    `(do
-       (defn ~getter [^borrow cap : (XReadCap ~world-name ~comp-name)
-                      ^borrow w   : ~world-name
-                      e           : Slot]
-                    : ~comp-name
-         (let [p : ~comp-name (sized-dense-get (~field w) e)] p))
-       (defn ~setter [^borrow cap : (XWriteCap ~world-name ~comp-name)
-                      ^borrow w   : ~world-name
-                      e           : Slot
-                      v           : ~comp-name]
-                    : nil
-         (sized-dense-set! (~field w) e v))
-       (defn ~haser [^borrow w : ~world-name e : Slot] : bool
-         (sized-dense-has? (~field w) e)))))
-
-) ;; end defmodule ecs/xworld
+  ;;; defworld-box-helpers -- emit the per-world `box-<W>` / `load-<W>` /
+  ;;; `free-<W>-box` trio for a monomorphic world type. The emitted
+  ;;; helpers are thin wrappers over the generic `box-world` /
+  ;;; `load-world` / `free-world-box` above, so their codegen
+  ;;; monomorphises against the world's C struct name without the caller
+  ;;; pasting a per-world inline-C block.
+  ;;;
+  ;;; Example:
+  ;;;   (sized-defworld-mono SimWorld (Static 1024) [Pos])
+  ;;;   (defworld-box-helpers SimWorld)
+  ;;;   ;; box-SimWorld      : (SimWorld) -> int
+  ;;;   ;; load-SimWorld     : (int) -> SimWorld
+  ;;;   ;; free-SimWorld-box : (int) -> nil
+  ;;;
+  ;;; The names match the convention `defxsystem` / `sized-defsystem-scheduled`
+  ;;; expect, so a cross-world setup needs only the macro call instead of
+  ;;; the three hand-written inline-C blocks the tests have historically
+  ;;; carried (see `tests/xworld-extract.tur` for the legacy shape).
+  ;;;
+  ;;; Since: GEN-V0
+  (defmacro defworld-box-helpers [world-name]
+    (let [box-name  (str->sym (str-append "box-" (symbol-name world-name)))
+          load-name (str->sym (str-append "load-" (symbol-name world-name)))
+          free-name (str->sym (str-append "free-"
+                                (symbol-name world-name)
+                                "-box"))]
+      `(do
+         (defn ~box-name [w : ~world-name] : int (box-world w))
+         (defn ~load-name [wp : int] : ~world-name (load-world wp))
+         (defn ~free-name [wp : int] : nil (free-world-box wp)))))
+  ;;; sized-defcomponent-accessors-xmono -- emit world-keyed get/set/has
+  ;;; accessors for `comp-name` on the monomorphic sized world
+  ;;; `world-name`. Identical in shape to
+  ;;; `sized-defcomponent-accessors-mono`, but the cap parameter is the
+  ;;; two-param `(XWriteCap world-name comp-name)` / `(XReadCap world-name
+  ;;; comp-name)` rather than the component-only form.
+  ;;;
+  ;;; Example:
+  ;;;   (sized-defworld-mono RenderWorld (Static 1024) [RenderPos])
+  ;;;   (sized-defcomponent-accessors-xmono RenderWorld RenderPos)
+  ;;;   ;; get-RenderPos : (XReadCap  RenderWorld RenderPos) RenderWorld Slot -> RenderPos
+  ;;;   ;; set-RenderPos!: (XWriteCap RenderWorld RenderPos) RenderWorld Slot RenderPos -> nil
+  ;;;
+  ;;; Since: X1
+  (defmacro sized-defcomponent-accessors-xmono [world-name comp-name]
+    (let [getter (str->sym (str-append "get-" (symbol-name comp-name)))
+          setter (str->sym (str-append "set-" (symbol-name comp-name) "!"))
+          haser  (str->sym (str-append "has-" (symbol-name comp-name) "?"))
+          field  (dot-sym comp-name)]
+      `(do
+         (defn ~getter [^borrow cap : (XReadCap ~world-name ~comp-name)
+                        ^borrow w : ~world-name
+                        e : Slot] : ~comp-name
+           (let [p                              : ~comp-name
+                 (sized-dense-get (~field w) e)]
+             p))
+         (defn ~setter [^borrow cap : (XWriteCap ~world-name ~comp-name)
+                        ^borrow w : ~world-name
+                        e : Slot
+                        v : ~comp-name] : nil
+           (sized-dense-set! (~field w) e v))
+         (defn ~haser [^borrow w : ~world-name e : Slot] : bool
+           (sized-dense-has? (~field w) e)))))) ;; end defmodule ecs/xworld

@@ -36,137 +36,148 @@
 ;;;
 ;;; Since: RE1 2026-07-26; :sealed 2026-07-29
 (defmodule ecs/refined-world
-  (export RGWorld rgworld-new rgworld-spawn! rgworld-despawn!
-          rgworld-alive? rgworld-get-x! rgworld-set-x!
-          rgworld-ent-at for-each-alive!)
-
-(import ecs/entity :refer [Entity entity-new entity-index entity-generation
-                           slot-new slot->int generation-new generation->int])
-
-;; opaque backing: a malloc'd block of { gens[CAP]; xs[CAP]; next }.
-(defn rgw-alloc [] #fx{} : int
-  ```c
-  int64_t* b = (int64_t*)calloc(129, sizeof(int64_t)); /* 64 gens, 64 xs, 1 next */
+  (export RGWorld
+    rgworld-new
+    rgworld-spawn!
+    rgworld-despawn!
+    rgworld-alive?
+    rgworld-get-x!
+    rgworld-set-x!
+    rgworld-ent-at
+    for-each-alive!)
+  (import ecs/entity
+    :refer
+    [Entity
+     entity-new
+     entity-index
+     entity-generation
+     slot-new
+     slot->int
+     generation-new
+     generation->int])
+  ;; opaque backing: a malloc'd block of { gens[CAP]; xs[CAP]; next }.
+  (defn rgw-alloc []
+    #fx{}
+    : int
+    ```c
+    int64_t* b = (int64_t*)calloc(129, sizeof(int64_t)); /* 64 gens, 64 xs, 1 next */
   return (int64_t)(intptr_t)b;
   ```)
-;; R4 prototype: the one read the aliveness measure depends on is now
-;; Turmeric-VISIBLE -- a typed-pointer load instead of inline C -- so a
-;; footprint walk can see it and attribute it to the ctrl argument.
-(defn rgw-gen [ctrl : int idx : int] : int
-  (unsafe (array-get-unchecked (:: ctrl :ptr<void>) idx)))
-(defn rgw-bump [ctrl : int idx : int] #fx{} : int
-  ```c
-  int64_t* b = (int64_t*)(intptr_t)ctrl; b[idx]++; return 0;
+  ;; R4 prototype: the one read the aliveness measure depends on is now
+  ;; Turmeric-VISIBLE -- a typed-pointer load instead of inline C -- so a
+  ;; footprint walk can see it and attribute it to the ctrl argument.
+  (defn rgw-gen [ctrl : int idx : int] : int
+    (unsafe (array-get-unchecked (:: ctrl :ptr<void>) idx)))
+  (defn rgw-bump [ctrl : int idx : int]
+    #fx{}
+    : int
+    ```c
+    int64_t* b = (int64_t*)(intptr_t)ctrl; b[idx]++; return 0;
   ```)
-(defn rgw-xget [ctrl : int idx : int] #fx{} : int
-  ```c
-  int64_t* b = (int64_t*)(intptr_t)ctrl; return b[64 + idx];
+  (defn rgw-xget [ctrl : int idx : int]
+    #fx{}
+    : int
+    ```c
+    int64_t* b = (int64_t*)(intptr_t)ctrl; return b[64 + idx];
   ```)
-(defn rgw-xset [ctrl : int idx : int v : int] #fx{} : int
-  ```c
-  int64_t* b = (int64_t*)(intptr_t)ctrl; b[64 + idx] = v; return 0;
+  (defn rgw-xset [ctrl : int idx : int v : int]
+    #fx{}
+    : int
+    ```c
+    int64_t* b = (int64_t*)(intptr_t)ctrl; b[64 + idx] = v; return 0;
   ```)
-(defn rgw-next [ctrl : int] #fx{} : int
-  ```c
-  int64_t* b = (int64_t*)(intptr_t)ctrl; int64_t s = b[128]; b[128] = s + 1; return s;
+  (defn rgw-next [ctrl : int]
+    #fx{}
+    : int
+    ```c
+    int64_t* b = (int64_t*)(intptr_t)ctrl; int64_t s = b[128]; b[128] = s + 1; return s;
   ```)
-
-;; The world is an OPAQUE handle: a `frozen` borrow locks out its `^unique ^mut`
-;; mutators (verified: TUR-E0200). `rgw-ctrl` (the internal unwrap) is PRIVATE.
-;;
-;; `:sealed` is what actually closes the extract-reconstruct-despawn hole.
-;; Opacity alone does NOT -- this comment used to claim callers "can neither
-;; read its backing handle nor reconstruct an alias of it", which was wrong and
-;; contradicted this file's own TRUST BOUNDARY docstring: `::` is a COERCING
-;; cast, so any module could write `(:: w :int)` and `(:: that-int RGWorld)` to
-;; mint an alias the borrow checker did not recognise as `w`. Sealed, both of
-;; those are TUR-E0302 outside this module.
-(defopaque ^sealed RGWorld :int)
-
-;; R4 prototype: the unwrap is `::` (modeled pure since 2026-08-19), not an
-;; inline-C identity cast (which classified IMPURE by EX_INLINE_C). Legal
-;; here despite :sealed because this IS the declaring module.
-(defn rgw-ctrl [w : RGWorld] : int
-  (:: w :int))
-
-(defn rgworld-new [] : RGWorld
-  (:: (rgw-alloc) RGWorld))
-
-(defn rgworld-spawn! [^unique ^mut w : RGWorld x0 : int] : Entity
-  (let [slot (rgw-next (rgw-ctrl w))
-        _    (rgw-xset (rgw-ctrl w) slot x0)]
-    (entity-new (slot-new slot) (generation-new (rgw-gen (rgw-ctrl w) slot)))))
-
-(defn rgworld-despawn! [^unique ^mut w : RGWorld e : Entity] : int
-  (rgw-bump (rgw-ctrl w) (slot->int (entity-index e))))
-
-;; alive? reads liveness through the opaque handle -> impure -> #reads w.
-(defn rgworld-alive? [^borrow w : RGWorld e : Entity] #reads w : bool
-  (= (rgw-gen (rgw-ctrl w) (slot->int (entity-index e)))
-     (generation->int (entity-generation e))))
-
-;; the refined accessor: its entity must be proven alive.
-(defn rgworld-get-x! [^borrow w : RGWorld
-                      e : #refine{ x : Entity | (rgworld-alive? w x) }] : int
-  (rgw-xget (rgw-ctrl w) (slot->int (entity-index e))))
-
-(defn rgworld-set-x! [^unique ^mut w : RGWorld e : Entity v : int] : int
-  (rgw-xset (rgw-ctrl w) (slot->int (entity-index e)) v))
-
-;;; rgworld-ent-at -- the first-generation entity candidate for slot i.
-;;;
-;;; The iteration candidate `for-each-alive!` tests: slot i at generation 0
-;;; (the generation every spawn in this facade's simple model is born with; a
-;;; despawn bumps the slot's generation, which is exactly what
-;;; `rgworld-alive?` detects). Exported so the macro's expansion resolves in
-;;; the CALLER's module without an `ecs/entity` import.
-;;;
-;;; Parameters:
-;;;   i -- slot index
-;;;
-;;; Returns:
-;;;   The Entity (slot i, generation 0).
-;;;
-;;; Example:
-;;;   (rgworld-alive? w (rgworld-ent-at 0))
-;;;
-;;; Since: RE1 2026-07-26
-(defn rgworld-ent-at [i : int] : Entity
-  (entity-new (slot-new i) (generation-new 0)))
-
-;;; for-each-alive! -- run body for each still-alive entity in slots 0..n-1,
-;;; with the aliveness PROVEN to the refinement checker.
-;;;
-;;; The ergonomic RE1 (c) surface: ONE macro generates the recursive loop
-;;; (tail-recursive named-let -- TCO'd, no set!, so the crossing path-cond
-;;; collector's assignment decline never trips), the frozen re-borrow of `w`
-;;; (which makes the `#reads` measure `rgworld-alive?` congruent inside each
-;;; iteration), and the aliveness guard. The user's body -- typically holding
-;;; a refined `(rgworld-get-x! w e)` read -- is spliced in under a binder for
-;;; the proven-alive entity, and its crossing discharges per-entity: under
-;;; `--strict-refine` the body compiles ONLY because the guard proves it.
-;;;
-;;; Parameters:
-;;;   w      -- the owned `^mut` world local (borrowed per iteration)
-;;;   n      -- slot count to scan (slots 0..n-1)
-;;;   binder -- name bound to the proven-alive Entity for the body
-;;;   body   -- forms run per alive entity (result discarded; loop yields 0)
-;;;
-;;; Example:
-;;;   (for-each-alive! w 3 e
-;;;     (println (rgworld-get-x! w e)))   ;; proves; skips despawned slots
-;;;
-;;; Since: RE1 2026-07-26
-(defmacro for-each-alive! [w n binder & body]
-  `(let __fea-go [__i 0]
-     (if (< __i ~n)
-       (do
-         (let [__fea-e (rgworld-ent-at __i)]
-           (let [__fea-b (& ~w)]
-             (if (rgworld-alive? ~w __fea-e)
-               (do (let [~binder __fea-e] ~@body) 0)
-               0)))
-         (__fea-go (+ __i 1)))
-       0)))
-
-) ;; end module
+  ;; The world is an OPAQUE handle: a `frozen` borrow locks out its `^unique ^mut`
+  ;; mutators (verified: TUR-E0200). `rgw-ctrl` (the internal unwrap) is PRIVATE.
+  ;;
+  ;; `:sealed` is what actually closes the extract-reconstruct-despawn hole.
+  ;; Opacity alone does NOT -- this comment used to claim callers "can neither
+  ;; read its backing handle nor reconstruct an alias of it", which was wrong and
+  ;; contradicted this file's own TRUST BOUNDARY docstring: `::` is a COERCING
+  ;; cast, so any module could write `(:: w :int)` and `(:: that-int RGWorld)` to
+  ;; mint an alias the borrow checker did not recognise as `w`. Sealed, both of
+  ;; those are TUR-E0302 outside this module.
+  (defopaque ^sealed RGWorld :int)
+  ;; R4 prototype: the unwrap is `::` (modeled pure since 2026-08-19), not an
+  ;; inline-C identity cast (which classified IMPURE by EX_INLINE_C). Legal
+  ;; here despite :sealed because this IS the declaring module.
+  (defn rgw-ctrl [w : RGWorld] : int (:: w :int))
+  (defn rgworld-new [] : RGWorld (:: (rgw-alloc) RGWorld))
+  (defn rgworld-spawn! [^unique ^mut w : RGWorld x0 : int] : Entity
+    (let [slot (rgw-next (rgw-ctrl w))
+          _    (rgw-xset (rgw-ctrl w) slot x0)]
+      (entity-new (slot-new slot) (generation-new (rgw-gen (rgw-ctrl w) slot)))))
+  (defn rgworld-despawn! [^unique ^mut w : RGWorld e : Entity] : int
+    (rgw-bump (rgw-ctrl w) (slot->int (entity-index e))))
+  ;; alive? reads liveness through the opaque handle -> impure -> #reads w.
+  (defn rgworld-alive? [^borrow w : RGWorld e : Entity]
+    #reads w
+    : bool
+    (= (rgw-gen (rgw-ctrl w) (slot->int (entity-index e)))
+      (generation->int (entity-generation e))))
+  ;; the refined accessor: its entity must be proven alive.
+  (defn rgworld-get-x! [^borrow w : RGWorld
+                        e : #refine{ x : Entity | (rgworld-alive? w x) }] : int
+    (rgw-xget (rgw-ctrl w) (slot->int (entity-index e))))
+  (defn rgworld-set-x! [^unique ^mut w : RGWorld e : Entity v : int] : int
+    (rgw-xset (rgw-ctrl w) (slot->int (entity-index e)) v))
+  ;;; rgworld-ent-at -- the first-generation entity candidate for slot i.
+  ;;;
+  ;;; The iteration candidate `for-each-alive!` tests: slot i at generation 0
+  ;;; (the generation every spawn in this facade's simple model is born with; a
+  ;;; despawn bumps the slot's generation, which is exactly what
+  ;;; `rgworld-alive?` detects). Exported so the macro's expansion resolves in
+  ;;; the CALLER's module without an `ecs/entity` import.
+  ;;;
+  ;;; Parameters:
+  ;;;   i -- slot index
+  ;;;
+  ;;; Returns:
+  ;;;   The Entity (slot i, generation 0).
+  ;;;
+  ;;; Example:
+  ;;;   (rgworld-alive? w (rgworld-ent-at 0))
+  ;;;
+  ;;; Since: RE1 2026-07-26
+  (defn rgworld-ent-at [i : int] : Entity
+    (entity-new (slot-new i) (generation-new 0)))
+  ;;; for-each-alive! -- run body for each still-alive entity in slots 0..n-1,
+  ;;; with the aliveness PROVEN to the refinement checker.
+  ;;;
+  ;;; The ergonomic RE1 (c) surface: ONE macro generates the recursive loop
+  ;;; (tail-recursive named-let -- TCO'd, no set!, so the crossing path-cond
+  ;;; collector's assignment decline never trips), the frozen re-borrow of `w`
+  ;;; (which makes the `#reads` measure `rgworld-alive?` congruent inside each
+  ;;; iteration), and the aliveness guard. The user's body -- typically holding
+  ;;; a refined `(rgworld-get-x! w e)` read -- is spliced in under a binder for
+  ;;; the proven-alive entity, and its crossing discharges per-entity: under
+  ;;; `--strict-refine` the body compiles ONLY because the guard proves it.
+  ;;;
+  ;;; Parameters:
+  ;;;   w      -- the owned `^mut` world local (borrowed per iteration)
+  ;;;   n      -- slot count to scan (slots 0..n-1)
+  ;;;   binder -- name bound to the proven-alive Entity for the body
+  ;;;   body   -- forms run per alive entity (result discarded; loop yields 0)
+  ;;;
+  ;;; Example:
+  ;;;   (for-each-alive! w 3 e
+  ;;;     (println (rgworld-get-x! w e)))   ;; proves; skips despawned slots
+  ;;;
+  ;;; Since: RE1 2026-07-26
+  (defmacro for-each-alive! [w n binder & body]
+    `(let __fea-go
+       [__i 0]
+       (if (< __i ~n)
+         (do
+           (let [__fea-e (rgworld-ent-at __i)]
+             (let [__fea-b (& ~w)]
+               (if (rgworld-alive? ~w __fea-e)
+                 (do (let [~binder __fea-e] ~@body) 0)
+                 0)))
+           (__fea-go (+ __i 1)))
+         0)))) ;; end module

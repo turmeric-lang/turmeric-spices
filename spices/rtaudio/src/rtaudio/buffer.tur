@@ -30,21 +30,26 @@
 ;;; `stdlib/sized.tur` (the `Size` / `Static` type) must be loaded for the
 ;;; `(AudioBuf (Static 256) (Static 2))` annotations callers write; this module
 ;;; loads it.
-
 (load "stdlib/sized.tur")
 
 (defmodule rtaudio/buffer
   (export AudioBuf
-          audiobuf-silence audiobuf-free audiobuf-frames audiobuf-channels
-          audiobuf-samples audiobuf-get audiobuf-set!
-          audiobuf-mix audiobuf-gain audiobuf-peak)
-
+    audiobuf-silence
+    audiobuf-free
+    audiobuf-frames
+    audiobuf-channels
+    audiobuf-samples
+    audiobuf-get
+    audiobuf-set!
+    audiobuf-mix
+    audiobuf-gain
+    audiobuf-peak)
   ;; (AudioBuf n c) -- phantom-indexed handle to an interleaved float32 buffer.
   (defopaque AudioBuf [n c] :int)
-
   ;; ===== raw int-carried implementation (private) =====
-
-  (defn __abuf-new-raw [frames : int chans : int] #fx{Unsafe} : int
+  (defn __abuf-new-raw [frames : int chans : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t frames; int64_t chans; float *data; } *b = malloc(sizeof(*b));
     int64_t nsamp = frames * chans;
@@ -53,21 +58,25 @@
     b->data   = nsamp > 0 ? (float *)calloc((size_t)nsamp, sizeof(float)) : NULL;
     return (int64_t)(intptr_t)b;
     ```)
-
-  (defn __abuf-free-raw [b : int] #fx{Unsafe} : nil
+  (defn __abuf-free-raw [b : int]
+    #fx{Unsafe}
+    : nil
     ```c
     struct { int64_t frames; int64_t chans; float *data; } *v = (void *)(intptr_t)b;
     if (v->data) free(v->data);
     free(v);
     ```)
-
-  (defn __abuf-frames-raw [b : int] #fx{Unsafe} : int
+  (defn __abuf-frames-raw [b : int]
+    #fx{Unsafe}
+    : int
     ```c struct { int64_t frames; int64_t chans; float *data; } *v = (void *)(intptr_t)b; return (int)v->frames; ```)
-
-  (defn __abuf-chans-raw [b : int] #fx{Unsafe} : int
+  (defn __abuf-chans-raw [b : int]
+    #fx{Unsafe}
+    : int
     ```c struct { int64_t frames; int64_t chans; float *data; } *v = (void *)(intptr_t)b; return (int)v->chans; ```)
-
-  (defn __abuf-get-raw [b : int frame : int chan : int] #fx{Unsafe} : float
+  (defn __abuf-get-raw [b : int frame : int chan : int]
+    #fx{Unsafe}
+    : float
     ```c
     struct { int64_t frames; int64_t chans; float *data; } *v = (void *)(intptr_t)b;
     if (frame < 0 || frame >= v->frames || chan < 0 || chan >= v->chans) {
@@ -77,8 +86,9 @@
     }
     return v->data[frame * v->chans + chan];
     ```)
-
-  (defn __abuf-set-raw [b : int frame : int chan : int x : float] #fx{Unsafe} : nil
+  (defn __abuf-set-raw [b : int frame : int chan : int x : float]
+    #fx{Unsafe}
+    : nil
     ```c
     struct { int64_t frames; int64_t chans; float *data; } *v = (void *)(intptr_t)b;
     if (frame < 0 || frame >= v->frames || chan < 0 || chan >= v->chans) {
@@ -88,11 +98,12 @@
     }
     v->data[frame * v->chans + chan] = (float)x;
     ```)
-
   ;; sample-wise a + b into a fresh buffer. Runtime shape guard (belt-and-
   ;; suspenders; when both operands carry static sizes the elaborator has
   ;; already proven the shapes equal).
-  (defn __abuf-mix-raw [a : int b : int] #fx{Unsafe} : int
+  (defn __abuf-mix-raw [a : int b : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct B { int64_t frames; int64_t chans; float *data; };
     struct B *x = (void *)(intptr_t)a;
@@ -110,8 +121,9 @@
     for (int64_t i = 0; i < nsamp; i++) o->data[i] = x->data[i] + y->data[i];
     return (int64_t)(intptr_t)o;
     ```)
-
-  (defn __abuf-gain-raw [b : int g : float] #fx{Unsafe} : int
+  (defn __abuf-gain-raw [b : int g : float]
+    #fx{Unsafe}
+    : int
     ```c
     struct B { int64_t frames; int64_t chans; float *data; };
     struct B *x = (void *)(intptr_t)b;
@@ -122,8 +134,9 @@
     for (int64_t i = 0; i < nsamp; i++) o->data[i] = (float)(x->data[i] * g);
     return (int64_t)(intptr_t)o;
     ```)
-
-  (defn __abuf-peak-raw [b : int] #fx{Unsafe} : float
+  (defn __abuf-peak-raw [b : int]
+    #fx{Unsafe}
+    : float
     ```c
     struct B { int64_t frames; int64_t chans; float *data; };
     struct B *x = (void *)(intptr_t)b;
@@ -135,52 +148,43 @@
     }
     return peak;
     ```)
-
   ;; ===== public phantom-typed surface =====
-
   ;;; audiobuf-silence -- a fresh `frames` x `chans` buffer of zeros. The static
   ;;; shape is pinned by the caller's annotation, e.g.
   ;;;   (defn block [] : (AudioBuf (Static 256) (Static 2)) (audiobuf-silence 256 2))
   (defn audiobuf-silence [n c] [frames : int chans : int] : (AudioBuf n c)
     (:: (unsafe (__abuf-new-raw frames chans)) :AudioBuf))
-
   ;;; audiobuf-free -- free a buffer and its backing samples.
   (defn audiobuf-free [n c] [b : (AudioBuf n c)] : nil
     (unsafe (__abuf-free-raw (:: b :int))))
-
   ;;; audiobuf-frames -- runtime frame count (equals the static `n`).
   (defn audiobuf-frames [n c] [b : (AudioBuf n c)] : int
     (unsafe (__abuf-frames-raw (:: b :int))))
-
   ;;; audiobuf-channels -- runtime channel count (equals the static `c`).
   (defn audiobuf-channels [n c] [b : (AudioBuf n c)] : int
     (unsafe (__abuf-chans-raw (:: b :int))))
-
   ;;; audiobuf-samples -- total interleaved sample count (frames * channels).
   (defn audiobuf-samples [n c] [b : (AudioBuf n c)] : int
     (* (audiobuf-frames b) (audiobuf-channels b)))
-
   ;;; audiobuf-get -- bounds-checked sample read at (frame, channel).
   (defn audiobuf-get [n c] [b : (AudioBuf n c) frame : int chan : int] : float
     (unsafe (__abuf-get-raw (:: b :int) frame chan)))
-
   ;;; audiobuf-set! -- bounds-checked sample write at (frame, channel).
-  (defn audiobuf-set! [n c] [b : (AudioBuf n c) frame : int chan : int x : float] : nil
+  (defn audiobuf-set! [n c] [b : (AudioBuf n c)
+                             frame : int
+                             chan : int
+                             x : float] : nil
     (unsafe (__abuf-set-raw (:: b :int) frame chan x)))
-
   ;;; audiobuf-mix -- sample-wise sum; both operands share shape (n, c), so a
   ;;; frame-count or channel-count mismatch is a compile-time TUR-E0260.
   ;;; Returns a fresh buffer.
-  (defn audiobuf-mix [n c] [a : (AudioBuf n c) b : (AudioBuf n c)] : (AudioBuf n c)
+  (defn audiobuf-mix [n c] [a : (AudioBuf n c) b : (AudioBuf n c)] : (AudioBuf n
+                                                                       c)
     (:: (unsafe (__abuf-mix-raw (:: a :int) (:: b :int))) :AudioBuf))
-
   ;;; audiobuf-gain -- multiply every sample by `g`; returns a fresh buffer.
   (defn audiobuf-gain [n c] [b : (AudioBuf n c) g : float] : (AudioBuf n c)
     (:: (unsafe (__abuf-gain-raw (:: b :int) g)) :AudioBuf))
-
   ;;; audiobuf-peak -- the largest absolute sample value across the buffer
   ;;; (peak amplitude). Returns 0.0 for an empty buffer.
   (defn audiobuf-peak [n c] [b : (AudioBuf n c)] : float
-    (unsafe (__abuf-peak-raw (:: b :int))))
-
-) ;; end defmodule rtaudio/buffer
+    (unsafe (__abuf-peak-raw (:: b :int))))) ;; end defmodule rtaudio/buffer

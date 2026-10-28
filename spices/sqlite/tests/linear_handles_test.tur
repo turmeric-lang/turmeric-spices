@@ -15,42 +15,40 @@
 ;; (The real open -> exec -> prepare -> bind -> step -> finalize -> query ->
 ;; close lifecycle was verified coherent under -Xsubstructural against the
 ;; actual sqlite/db + sqlite/stmt API while landing this slice.)
-
 (defmodule sqlite/tests/linear-handles
-
-;; Miniatures of Db and Stmt: each :linear, observed by a borrow accessor
-;; and released by a consuming closer. A statement is derived from a
-;; *borrowed* connection (mirroring db-prepare), so the connection outlives
-;; the statement and is closed afterward.
-(defopaque ^linear Conn :int)
-(defopaque ^linear Cur  :int)
-
-(defn conn-open  [tag : int] : Conn ```c return (int64_t)tag; ```)
-(defn cur-from   [^borrow c : Conn n : int] : Cur ```c (void)c; return (int64_t)n; ```)
-(defn cur-step   [^borrow s : Cur] : int ```c return (int64_t)s; ```)
-(defn cur-close  [s : Cur]  : nil ```c (void)s; ```)
-(defn conn-close [c : Conn] : nil ```c (void)c; ```)
-
-(defn tap [idx : int name : cstr ok : bool] #fx{Unsafe} : int
-  ```c
-  printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
+  ;; Miniatures of Db and Stmt: each :linear, observed by a borrow accessor
+  ;; and released by a consuming closer. A statement is derived from a
+  ;; *borrowed* connection (mirroring db-prepare), so the connection outlives
+  ;; the statement and is closed afterward.
+  (defopaque ^linear Conn :int)
+  (defopaque ^linear Cur :int)
+  (defn conn-open [tag : int] : Conn ```c return (int64_t)tag; ```)
+  (defn cur-from [^borrow c : Conn n : int] : Cur
+    ```c (void)c; return (int64_t)n; ```)
+  (defn cur-step [^borrow s : Cur] : int ```c return (int64_t)s; ```)
+  (defn cur-close [s : Cur] : nil ```c (void)s; ```)
+  (defn conn-close [c : Conn] : nil ```c (void)c; ```)
+  (defn tap [idx : int name : cstr ok : bool]
+    #fx{Unsafe}
+    : int
+    ```c
+    printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
   return ok ? 0 : 1;
   ```)
-
-;; Open conn, derive a cur from the borrowed conn, step (borrow) + finalize
-;; the cur (consume), then close the conn (consume). Each handle consumed once.
-(defn lifecycle [] : int
-  (let [c (conn-open 100)]
-    (let [s (cur-from c 5)]
-      (let [stepped (cur-step s)]
-        (do (cur-close s) (conn-close c) stepped)))))
-
-(defn main [] #fx{Unsafe IO} : int
-  (let [r1 (tap 1 "nested borrow/consume lifecycle returns cur value" (= (lifecycle) 5))]
-    (do
-      (println "1..1")
-      (if (= r1 0)
-        (do (println "# All 1 sqlite/linear-handles tests passed.") 0)
-        1))))
-
-) ;; end defmodule sqlite/tests/linear-handles
+  ;; Open conn, derive a cur from the borrowed conn, step (borrow) + finalize
+  ;; the cur (consume), then close the conn (consume). Each handle consumed once.
+  (defn lifecycle [] : int
+    (let [c (conn-open 100)]
+      (let [s (cur-from c 5)]
+        (let [stepped (cur-step s)] (do (cur-close s) (conn-close c) stepped)))))
+  (defn main []
+    #fx{Unsafe IO}
+    : int
+    (let [r1 (tap 1
+               "nested borrow/consume lifecycle returns cur value"
+               (= (lifecycle) 5))]
+      (do
+        (println "1..1")
+        (if (= r1 0)
+          (do (println "# All 1 sqlite/linear-handles tests passed.") 0)
+          1))))) ;; end defmodule sqlite/tests/linear-handles

@@ -9,205 +9,190 @@
 ;;
 ;; Every socket that receives gets a receive timeout first. Without one, a
 ;; round trip that fails to connect does not fail the test -- it hangs it.
-
-(defmodule nng/tests/msg (export)
-
-(import nng/socket :refer [Socket
-                           req-open rep-open push-open pull-open pair-open
-                           dial listen close
-                           set-recv-timeout-ms timed-out?])
-(import nng/payload    :refer [Payload payload-len payload-free payload-byte payload=? payload-of-cstr])
-(import nng/msg    :refer [send-str recv-str send-payload recv-payload])
-(import test/suite  :refer [describe it])
-(import test/assert :refer [assert-true assert-false])
-(import test/runner :refer [run-all-status])
-
-;; Long enough that a loaded CI runner never trips it, short enough that a
-;; genuinely broken round trip fails the suite in seconds instead of hanging it.
-(def recv-timeout-ms 2000)
-
-(defn cstr-eq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+(defmodule nng/tests/msg
+  (export)
+  (import nng/socket
+    :refer
+    [Socket
+     req-open
+     rep-open
+     push-open
+     pull-open
+     pair-open
+     dial
+     listen
+     close
+     set-recv-timeout-ms
+     timed-out?])
+  (import nng/payload
+    :refer
+    [Payload payload-len payload-free payload-byte payload=? payload-of-cstr])
+  (import nng/msg :refer [send-str recv-str send-payload recv-payload])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true assert-false])
+  (import test/runner :refer [run-all-status])
+  ;; Long enough that a loaded CI runner never trips it, short enough that a
+  ;; genuinely broken round trip fails the suite in seconds instead of hanging it.
+  (def recv-timeout-ms 2000)
+  (defn cstr-eq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn cstr-free [p : cstr] : nil
-  ```c
-  free((void *)(intptr_t)p);
+  (defn cstr-free [p : cstr] : nil
+    ```c
+    free((void *)(intptr_t)p);
   ```)
-
-;; recv-str=? -- receive one message and compare it to `expect`, freeing the
-;; received string either way. False on any error, including a timeout.
-(defn recv-str=? [^borrow s : Socket expect : cstr] : bool
-  (let [r (recv-str s)]
-    (if (ok? r)
-      (let [got (ok-val r)
-            eq  (cstr-eq? expect got)]
-        (cstr-free got)
-        eq)
-      false)))
-
-;; __buf-with-nul-raw -- internal: build the 0x01 0x00 0x02 payload in C.
-;; Returns a bare pointer; the `::` in buf-with-nul does the opaque cast, for
-;; the reason nng/payload's own raw producers spell out.
-(defn __buf-with-nul-raw [] : ptr<void>
-  ```c
-  extern void *turnng_payload_of_bytes(const void *, int64_t);
+  ;; recv-str=? -- receive one message and compare it to `expect`, freeing the
+  ;; received string either way. False on any error, including a timeout.
+  (defn recv-str=? [^borrow s : Socket expect : cstr] : bool
+    (let [r (recv-str s)]
+      (if (ok? r)
+        (let [got (ok-val r)
+              eq  (cstr-eq? expect got)]
+          (cstr-free got)
+          eq)
+        false)))
+  ;; __buf-with-nul-raw -- internal: build the 0x01 0x00 0x02 payload in C.
+  ;; Returns a bare pointer; the `::` in buf-with-nul does the opaque cast, for
+  ;; the reason nng/payload's own raw producers spell out.
+  (defn __buf-with-nul-raw [] : ptr<void>
+    ```c
+    extern void *turnng_payload_of_bytes(const void *, int64_t);
   static const unsigned char payload[3] = { 0x01, 0x00, 0x02 };
   return turnng_payload_of_bytes(payload, 3);
   ```)
-
-;; buf-with-nul -- a 3-byte payload whose middle byte is NUL. The witness that
-;; the Payload path is binary-safe where the cstr path is not: recv-str would read
-;; this back as a 1-byte string.
-(defn buf-with-nul [] : Payload
-  (:: (__buf-with-nul-raw) Payload))
-
-(defn __all-tests [] : void
-  (describe "nng/msg -- request / reply"
-
-    (it "round-trips a request and its reply"
-      (let [rep (ok-val (rep-open))
-            req (ok-val (req-open))
-            _   (listen rep "inproc://ng2-reqrep")
-            _   (dial req "inproc://ng2-reqrep")
-            _   (set-recv-timeout-ms rep recv-timeout-ms)
-            _   (set-recv-timeout-ms req recv-timeout-ms)
-            _   (send-str req "ping")
-            hb  (recv-str=? rep "ping")
-            _   (send-str rep "pong")
-            hr  (recv-str=? req "pong")
-            r   (assert-true (and hb hr))]
-        (close req)
-        (close rep)
-        r)))
-
-  (describe "nng/msg -- pipeline (push / pull)"
-
-    (it "delivers a pushed message to the puller"
-      (let [push (ok-val (push-open))
-            pull (ok-val (pull-open))
-            _    (listen push "inproc://ng2-pipeline")
-            _    (dial pull "inproc://ng2-pipeline")
-            _    (set-recv-timeout-ms pull recv-timeout-ms)
-            _    (send-str push "job:42")
-            r    (assert-true (recv-str=? pull "job:42"))]
-        (close pull)
-        (close push)
-        r))
-
-    (it "delivers messages in order to a single puller"
-      (let [push (ok-val (push-open))
-            pull (ok-val (pull-open))
-            _    (listen push "inproc://ng2-pipeline-order")
-            _    (dial pull "inproc://ng2-pipeline-order")
-            _    (set-recv-timeout-ms pull recv-timeout-ms)
-            _    (send-str push "a")
-            _    (send-str push "b")
-            fst  (recv-str=? pull "a")
-            snd  (recv-str=? pull "b")
-            r    (assert-true (and fst snd))]
-        (close pull)
-        (close push)
-        r)))
-
-  (describe "nng/msg -- pair"
-
-    (it "carries messages in both directions"
-      (let [a (ok-val (pair-open))
-            b (ok-val (pair-open))
-            _ (listen a "inproc://ng2-pair")
-            _ (dial b "inproc://ng2-pair")
-            _ (set-recv-timeout-ms a recv-timeout-ms)
-            _ (set-recv-timeout-ms b recv-timeout-ms)
-            _ (send-str a "a->b")
-            ab (recv-str=? b "a->b")
-            _ (send-str b "b->a")
-            ba (recv-str=? a "b->a")
-            r (assert-true (and ab ba))]
-        (close b)
-        (close a)
-        r)))
-
-  (describe "nng/msg -- binary payloads"
-
-    (it "round-trips a Payload unchanged"
-      (let [push (ok-val (push-open))
-            pull (ok-val (pull-open))
-            _    (listen push "inproc://ng2-buf")
-            _    (dial pull "inproc://ng2-buf")
-            _    (set-recv-timeout-ms pull recv-timeout-ms)
-            sent (payload-of-cstr "payload")
-            _    (send-payload push sent)
-            got  (recv-payload pull)
-            r    (assert-true (and (ok? got) (payload=? sent (ok-val got))))]
-        (when (ok? got) (payload-free (ok-val got)))
-        (payload-free sent)
-        (close pull)
-        (close push)
-        r))
-
-    (it "leaves the sent Payload owned by the caller"
-      (let [push (ok-val (push-open))
-            pull (ok-val (pull-open))
-            _    (listen push "inproc://ng2-buf-borrow")
-            _    (dial pull "inproc://ng2-buf-borrow")
-            _    (set-recv-timeout-ms pull recv-timeout-ms)
-            sent (payload-of-cstr "twice")
-            _    (send-payload push sent)
-            _    (send-payload push sent)
-            one  (recv-payload pull)
-            two  (recv-payload pull)
-            r    (assert-true (and (ok? one) (ok? two)))]
-        (when (ok? one) (payload-free (ok-val one)))
-        (when (ok? two) (payload-free (ok-val two)))
-        (payload-free sent)
-        (close pull)
-        (close push)
-        r))
-
-    (it "preserves an embedded NUL byte"
-      (let [push (ok-val (push-open))
-            pull (ok-val (pull-open))
-            _    (listen push "inproc://ng2-buf-nul")
-            _    (dial pull "inproc://ng2-buf-nul")
-            _    (set-recv-timeout-ms pull recv-timeout-ms)
-            sent (buf-with-nul)
-            _    (send-payload push sent)
-            got  (recv-payload pull)
-            r    (assert-true (and (ok? got)
-                                   (and (= 3 (payload-len (ok-val got)))
-                                        (and (= 1 (payload-byte (ok-val got) 0))
-                                             (and (= 0 (payload-byte (ok-val got) 1))
-                                                  (= 2 (payload-byte (ok-val got) 2)))))))]
-        (when (ok? got) (payload-free (ok-val got)))
-        (payload-free sent)
-        (close pull)
-        (close push)
-        r)))
-
-  (describe "nng/msg -- timeouts"
-
-    (it "times out instead of blocking forever on an idle socket"
-      (let [pull (ok-val (pull-open))
-            _    (listen pull "inproc://ng2-idle")
-            _    (set-recv-timeout-ms pull 100)
-            got  (recv-str pull)
-            r    (assert-true (and (err? got) (timed-out? (err-val got))))]
-        (close pull)
-        r))
-
-    (it "times out on the Payload receive path too"
-      (let [pull (ok-val (pull-open))
-            _    (listen pull "inproc://ng2-idle-buf")
-            _    (set-recv-timeout-ms pull 100)
-            got  (recv-payload pull)
-            r    (assert-true (and (err? got) (timed-out? (err-val got))))]
-        (close pull)
-        r))))
-
-(defn main [] : int
-  (__all-tests)
-  (run-all-status))
-)
+  ;; buf-with-nul -- a 3-byte payload whose middle byte is NUL. The witness that
+  ;; the Payload path is binary-safe where the cstr path is not: recv-str would read
+  ;; this back as a 1-byte string.
+  (defn buf-with-nul [] : Payload (:: (__buf-with-nul-raw) Payload))
+  (defn __all-tests [] : void
+    (describe "nng/msg -- request / reply"
+      (it "round-trips a request and its reply"
+        (let [rep (ok-val (rep-open))
+              req (ok-val (req-open))
+              _   (listen rep "inproc://ng2-reqrep")
+              _   (dial req "inproc://ng2-reqrep")
+              _   (set-recv-timeout-ms rep recv-timeout-ms)
+              _   (set-recv-timeout-ms req recv-timeout-ms)
+              _   (send-str req "ping")
+              hb  (recv-str=? rep "ping")
+              _   (send-str rep "pong")
+              hr  (recv-str=? req "pong")
+              r   (assert-true (and hb hr))]
+          (close req)
+          (close rep)
+          r)))
+    (describe "nng/msg -- pipeline (push / pull)"
+      (it "delivers a pushed message to the puller"
+        (let [push (ok-val (push-open))
+              pull (ok-val (pull-open))
+              _    (listen push "inproc://ng2-pipeline")
+              _    (dial pull "inproc://ng2-pipeline")
+              _    (set-recv-timeout-ms pull recv-timeout-ms)
+              _    (send-str push "job:42")
+              r    (assert-true (recv-str=? pull "job:42"))]
+          (close pull)
+          (close push)
+          r))
+      (it "delivers messages in order to a single puller"
+        (let [push (ok-val (push-open))
+              pull (ok-val (pull-open))
+              _    (listen push "inproc://ng2-pipeline-order")
+              _    (dial pull "inproc://ng2-pipeline-order")
+              _    (set-recv-timeout-ms pull recv-timeout-ms)
+              _    (send-str push "a")
+              _    (send-str push "b")
+              fst  (recv-str=? pull "a")
+              snd  (recv-str=? pull "b")
+              r    (assert-true (and fst snd))]
+          (close pull)
+          (close push)
+          r)))
+    (describe "nng/msg -- pair"
+      (it "carries messages in both directions"
+        (let [a  (ok-val (pair-open))
+              b  (ok-val (pair-open))
+              _  (listen a "inproc://ng2-pair")
+              _  (dial b "inproc://ng2-pair")
+              _  (set-recv-timeout-ms a recv-timeout-ms)
+              _  (set-recv-timeout-ms b recv-timeout-ms)
+              _  (send-str a "a->b")
+              ab (recv-str=? b "a->b")
+              _  (send-str b "b->a")
+              ba (recv-str=? a "b->a")
+              r  (assert-true (and ab ba))]
+          (close b)
+          (close a)
+          r)))
+    (describe "nng/msg -- binary payloads"
+      (it "round-trips a Payload unchanged"
+        (let [push (ok-val (push-open))
+              pull (ok-val (pull-open))
+              _    (listen push "inproc://ng2-buf")
+              _    (dial pull "inproc://ng2-buf")
+              _    (set-recv-timeout-ms pull recv-timeout-ms)
+              sent (payload-of-cstr "payload")
+              _    (send-payload push sent)
+              got  (recv-payload pull)
+              r    (assert-true (and (ok? got) (payload=? sent (ok-val got))))]
+          (when (ok? got) (payload-free (ok-val got)))
+          (payload-free sent)
+          (close pull)
+          (close push)
+          r))
+      (it "leaves the sent Payload owned by the caller"
+        (let [push (ok-val (push-open))
+              pull (ok-val (pull-open))
+              _    (listen push "inproc://ng2-buf-borrow")
+              _    (dial pull "inproc://ng2-buf-borrow")
+              _    (set-recv-timeout-ms pull recv-timeout-ms)
+              sent (payload-of-cstr "twice")
+              _    (send-payload push sent)
+              _    (send-payload push sent)
+              one  (recv-payload pull)
+              two  (recv-payload pull)
+              r    (assert-true (and (ok? one) (ok? two)))]
+          (when (ok? one) (payload-free (ok-val one)))
+          (when (ok? two) (payload-free (ok-val two)))
+          (payload-free sent)
+          (close pull)
+          (close push)
+          r))
+      (it "preserves an embedded NUL byte"
+        (let [push (ok-val (push-open))
+              pull (ok-val (pull-open))
+              _    (listen push "inproc://ng2-buf-nul")
+              _    (dial pull "inproc://ng2-buf-nul")
+              _    (set-recv-timeout-ms pull recv-timeout-ms)
+              sent (buf-with-nul)
+              _    (send-payload push sent)
+              got  (recv-payload pull)
+              r    (assert-true (and (ok? got)
+                                  (and (= 3 (payload-len (ok-val got)))
+                                    (and (= 1 (payload-byte (ok-val got) 0))
+                                      (and (= 0 (payload-byte (ok-val got) 1))
+                                        (= 2 (payload-byte (ok-val got) 2)))))))]
+          (when (ok? got) (payload-free (ok-val got)))
+          (payload-free sent)
+          (close pull)
+          (close push)
+          r)))
+    (describe "nng/msg -- timeouts"
+      (it "times out instead of blocking forever on an idle socket"
+        (let [pull (ok-val (pull-open))
+              _    (listen pull "inproc://ng2-idle")
+              _    (set-recv-timeout-ms pull 100)
+              got  (recv-str pull)
+              r    (assert-true (and (err? got) (timed-out? (err-val got))))]
+          (close pull)
+          r))
+      (it "times out on the Payload receive path too"
+        (let [pull (ok-val (pull-open))
+              _    (listen pull "inproc://ng2-idle-buf")
+              _    (set-recv-timeout-ms pull 100)
+              got  (recv-payload pull)
+              r    (assert-true (and (err? got) (timed-out? (err-val got))))]
+          (close pull)
+          r))))
+  (defn main [] : int (__all-tests) (run-all-status)))

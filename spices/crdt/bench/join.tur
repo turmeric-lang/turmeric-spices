@@ -24,122 +24,113 @@
 ;; checks the checksums against the arithmetic.
 ;;
 ;; Output, one line per row: kind n reps best-us checksum
-
 (load "stdlib/typeclass-lattice.tur")
+
 (load "stdlib/sym-dynamic.tur")
+
 (load "stdlib/str-build.tur")
 
 (defmodule crdt_join_bench
   (import crdt/replica :refer [ReplicaId replica])
   (import crdt/lattice :refer [join-all])
-  (import crdt/counter :refer [GCounter gcounter-new gcounter-bump gcounter-value])
-  (import crdt/orset   :refer [ORSet orset-new orset-add orset-count
-                               orset-delta-add orset-apply])
-
-;; now-us -- monotonic clock in microseconds.  Inline C, so the spice's own
-;; modules stay free of it (crdt-spice-plan 2.5); the benchmark is not part
-;; of the spice.
-(defn now-us [] : int
-  ```c
-  #include <time.h>
+  (import crdt/counter
+    :refer
+    [GCounter gcounter-new gcounter-bump gcounter-value])
+  (import crdt/orset
+    :refer
+    [ORSet orset-new orset-add orset-count orset-delta-add orset-apply])
+  ;; now-us -- monotonic clock in microseconds.  Inline C, so the spice's own
+  ;; modules stay free of it (crdt-spice-plan 2.5); the benchmark is not part
+  ;; of the spice.
+  (defn now-us [] : int
+    ```c
+    #include <time.h>
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
   ```)
-
-;; One timed repetition: how long the merge took, and its checksum.
-(defstruct Sample [us : int sum : int])
-
-(defn imin [a : int b : int] : int (if (< a b) a b))
-(defn imax [a : int b : int] : int (if (< a b) b a))
-
-;; The i-th replica and the i-th element.  Interned at run time: a literal
-;; per name would not scale to 65536 of them.
-(defn rid [i : int] : ReplicaId (replica (str->sym (str-concat "r" (int->str i)))))
-(defn elem [i : int] : Sym (str->sym (str-concat "e" (int->str i))))
-
-;; --- gcounter-join -------------------------------------------------------
-
-;; A counter whose replicas lo..hi-1 each hold `v`.
-(defn gc-range [c : GCounter lo : int hi : int v : int] : GCounter
-  (if (< lo hi) (gc-range (gcounter-bump c (rid lo) v) (+ lo 1) hi v) c))
-
-;; a holds 0..n-1 at 1, b holds n/2..n/2+n-1 at 2.  The join keeps the max
-;; per replica: n/2 replicas at 1, the other n at 2, so 2.5n in all.
-(defn gc-sample [n : int] : Sample
-  (let [a  (gc-range (gcounter-new) 0 n 1)
-        b  (gc-range (gcounter-new) (/ n 2) (+ (/ n 2) n) 2)
-        t0 (now-us)
-        m  (join a b)
-        t1 (now-us)]
-    (Sample (- t1 t0) (gcounter-value m))))
-
-;; --- orset-join ----------------------------------------------------------
-
-;; A set holding elements lo..hi-1, each added by replica r.
-(defn os-range [s : ORSet lo : int hi : int r : ReplicaId] : ORSet
-  (if (< lo hi) (os-range (orset-add s (elem lo) r) (+ lo 1) hi r) s))
-
-;; a holds 0..n-1 (from r0), b holds n/2..n/2+n-1 (from r1): 1.5n distinct.
-(defn os-sample [n : int] : Sample
-  (let [a  (os-range (orset-new) 0 n (rid 0))
-        b  (os-range (orset-new) (/ n 2) (+ (/ n 2) n) (rid 1))
-        t0 (now-us)
-        m  (join a b)
-        t1 (now-us)]
-    (Sample (- t1 t0) (orset-count m))))
-
-;; --- orset-apply ---------------------------------------------------------
-
-;; s holds 0..n-1; the delta adds element n.  n+1 afterwards.
-(defn od-sample [n : int] : Sample
-  (let [s  (os-range (orset-new) 0 n (rid 0))
-        d  (orset-delta-add s (elem n) (rid 0))
-        t0 (now-us)
-        m  (orset-apply s d)
-        t1 (now-us)]
-    (Sample (- t1 t0) (orset-count m))))
-
-;; --- driver --------------------------------------------------------------
-
-;; kind 0 = gcounter-join, 1 = orset-join, 2 = orset-apply.
-(defn sample [kind : int n : int] : Sample
-  (if (= kind 0) (gc-sample n) (if (= kind 1) (os-sample n) (od-sample n))))
-
-;; Best of `reps` repetitions.  The checksum must be the same every time;
-;; -1 says it was not.
-(defn best [kind : int n : int reps : int us : int sum : int] : Sample
-  (if (= reps 0)
-    (Sample us sum)
-    (let [s (sample kind n)]
-      (best kind n (- reps 1) (imin us (.us s))
-            (if (or (< sum 0) (= sum (.sum s))) (.sum s) -1)))))
-
-;; Enough repetitions to make the small rows stable, few enough that the
-;; 65536 rows finish: about 2^18 elements' worth of input per row.
-(defn reps-for [n : int] : int (imax 3 (imin 200 (/ 262144 n))))
-
-;; Five fields joined by single spaces.
-(defn words [a : cstr b : cstr c : cstr d : cstr e : cstr] : cstr
-  (str-concat a (str-concat " " (str-concat b (str-concat " "
-    (str-concat c (str-concat " " (str-concat d (str-concat " " e)))))))))
-
-(defn row [label : cstr kind : int n : int] : int
-  (let [reps (reps-for n)
-        s    (best kind n reps 9223372036854775807 0)]
-    (println (words label (int->str n) (int->str reps) (int->str (.us s))
-                    (int->str (.sum s))))
-    0))
-
-(defn sizes [label : cstr kind : int n : int top : int] : int
-  (if (> n top)
-    0
-    (do (row label kind n)
-        (sizes label kind (* n 4) top))))
-
-(defn main [] : int
-  (do (sizes "gcounter-join" 0 16 65536)
-      (sizes "orset-join"    1 16 65536)
-      (sizes "orset-apply"   2 16 65536)
+  ;; One timed repetition: how long the merge took, and its checksum.
+  (defstruct Sample [us : int sum : int])
+  (defn imin [a : int b : int] : int (if (< a b) a b))
+  (defn imax [a : int b : int] : int (if (< a b) b a))
+  ;; The i-th replica and the i-th element.  Interned at run time: a literal
+  ;; per name would not scale to 65536 of them.
+  (defn rid [i : int] : ReplicaId
+    (replica (str->sym (str-concat "r" (int->str i)))))
+  (defn elem [i : int] : Sym (str->sym (str-concat "e" (int->str i))))
+  ;; --- gcounter-join -------------------------------------------------------
+  ;; A counter whose replicas lo..hi-1 each hold `v`.
+  (defn gc-range [c : GCounter lo : int hi : int v : int] : GCounter
+    (if (< lo hi) (gc-range (gcounter-bump c (rid lo) v) (+ lo 1) hi v) c))
+  ;; a holds 0..n-1 at 1, b holds n/2..n/2+n-1 at 2.  The join keeps the max
+  ;; per replica: n/2 replicas at 1, the other n at 2, so 2.5n in all.
+  (defn gc-sample [n : int] : Sample
+    (let [a  (gc-range (gcounter-new) 0 n 1)
+          b  (gc-range (gcounter-new) (/ n 2) (+ (/ n 2) n) 2)
+          t0 (now-us)
+          m  (join a b)
+          t1 (now-us)]
+      (Sample (- t1 t0) (gcounter-value m))))
+  ;; --- orset-join ----------------------------------------------------------
+  ;; A set holding elements lo..hi-1, each added by replica r.
+  (defn os-range [s : ORSet lo : int hi : int r : ReplicaId] : ORSet
+    (if (< lo hi) (os-range (orset-add s (elem lo) r) (+ lo 1) hi r) s))
+  ;; a holds 0..n-1 (from r0), b holds n/2..n/2+n-1 (from r1): 1.5n distinct.
+  (defn os-sample [n : int] : Sample
+    (let [a  (os-range (orset-new) 0 n (rid 0))
+          b  (os-range (orset-new) (/ n 2) (+ (/ n 2) n) (rid 1))
+          t0 (now-us)
+          m  (join a b)
+          t1 (now-us)]
+      (Sample (- t1 t0) (orset-count m))))
+  ;; --- orset-apply ---------------------------------------------------------
+  ;; s holds 0..n-1; the delta adds element n.  n+1 afterwards.
+  (defn od-sample [n : int] : Sample
+    (let [s  (os-range (orset-new) 0 n (rid 0))
+          d  (orset-delta-add s (elem n) (rid 0))
+          t0 (now-us)
+          m  (orset-apply s d)
+          t1 (now-us)]
+      (Sample (- t1 t0) (orset-count m))))
+  ;; --- driver --------------------------------------------------------------
+  ;; kind 0 = gcounter-join, 1 = orset-join, 2 = orset-apply.
+  (defn sample [kind : int n : int] : Sample
+    (if (= kind 0) (gc-sample n) (if (= kind 1) (os-sample n) (od-sample n))))
+  ;; Best of `reps` repetitions.  The checksum must be the same every time;
+  ;; -1 says it was not.
+  (defn best [kind : int n : int reps : int us : int sum : int] : Sample
+    (if (= reps 0)
+      (Sample us sum)
+      (let [s (sample kind n)]
+        (best kind
+          n
+          (- reps 1)
+          (imin us (.us s))
+          (if (or (< sum 0) (= sum (.sum s))) (.sum s) -1)))))
+  ;; Enough repetitions to make the small rows stable, few enough that the
+  ;; 65536 rows finish: about 2^18 elements' worth of input per row.
+  (defn reps-for [n : int] : int (imax 3 (imin 200 (/ 262144 n))))
+  ;; Five fields joined by single spaces.
+  (defn words [a : cstr b : cstr c : cstr d : cstr e : cstr] : cstr
+    (str-concat a
+      (str-concat " "
+        (str-concat b
+          (str-concat " "
+            (str-concat c (str-concat " " (str-concat d (str-concat " " e)))))))))
+  (defn row [label : cstr kind : int n : int] : int
+    (let [reps (reps-for n)
+          s    (best kind n reps 9223372036854775807 0)]
+      (println (words label
+                 (int->str n)
+                 (int->str reps)
+                 (int->str (.us s))
+                 (int->str (.sum s))))
       0))
-) ;; end defmodule crdt_join_bench
+  (defn sizes [label : cstr kind : int n : int top : int] : int
+    (if (> n top) 0 (do (row label kind n) (sizes label kind (* n 4) top))))
+  (defn main [] : int
+    (do
+      (sizes "gcounter-join" 0 16 65536)
+      (sizes "orset-join" 1 16 65536)
+      (sizes "orset-apply" 2 16 65536)
+      0))) ;; end defmodule crdt_join_bench

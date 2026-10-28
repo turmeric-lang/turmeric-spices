@@ -17,27 +17,37 @@
 ;; "future" -- exporting a dense_union requires emitting two extra buffers
 ;; (type IDs + offsets) and child arrays, which is a larger surface than the
 ;; v0 deep-copy path.
-
 (defmodule frame/interop
   (export arrow-export arrow-import arrow-export-column arrow-import-column)
-
-  (import frame/type    :refer [type-int32 type-int64 type-float32 type-float64
-                                 type-bool type-utf8 type-arrow-fmt])
-  (import frame/schema  :refer [field field-name field-type field-nullable
-                                 schema schema-arity schema-field-at])
-  (import frame/column  :refer [column-type column-length column-null-count])
-  (import frame/frame   :refer [frame frame-nrows frame-ncols frame-schema
-                                 frame-column-at])
-
-;; ---------------------------------------------------------------------------
-;; Cons helpers.
-;; ---------------------------------------------------------------------------
-
-(defn __ip-nil [] : int ```c return 0; ```)
-
-(defn __ip-cons [v : int n : int] : int
-  ```c
-  #include <stdlib.h>
+  (import frame/type
+    :refer
+    [type-int32
+     type-int64
+     type-float32
+     type-float64
+     type-bool
+     type-utf8
+     type-arrow-fmt])
+  (import frame/schema
+    :refer
+    [field
+     field-name
+     field-type
+     field-nullable
+     schema
+     schema-arity
+     schema-field-at])
+  (import frame/column :refer [column-type column-length column-null-count])
+  (import frame/frame
+    :refer
+    [frame frame-nrows frame-ncols frame-schema frame-column-at])
+  ;; ---------------------------------------------------------------------------
+  ;; Cons helpers.
+  ;; ---------------------------------------------------------------------------
+  (defn __ip-nil [] : int ```c return 0; ```)
+  (defn __ip-cons [v : int n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   struct __cons *c = (struct __cons *)malloc(sizeof(*c));
@@ -45,29 +55,27 @@
   c->value = v; c->next = n;
   return (int64_t)(intptr_t)c;
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Release callbacks.  Defined as their own defns so their C names can be
-;; referenced as void(*)(struct Arrow*) by cast.
-;;
-;; Each is pinned to a stable C symbol with `export-as`, the same way plot
-;; pins `plot_sample_adaptive` / `plot_renderer_bbox`.  Without the pin the
-;; hand-written `extern` declarations below have to spell out whatever
-;; turmeric's injective identifier mangler produces for a `__`-prefixed,
-;; kebab-cased name -- which they did, as `frame__interop____ip_release_array`,
-;; until the mangler began encoding `_` as `_un` and `-` as `_hy` and the real
-;; symbol became `frame__interop___un_unip_hyrelease_hyarray`.  The externs
-;; then referred to nothing and every build of this module failed at link.
-;; The pin makes the C name part of this file rather than of the mangler.
-;; ---------------------------------------------------------------------------
-
-;;; __ip-release-array -- ArrowArray release callback.  Frees buffers, the
-;;; buffers[] pointer array, the children[] array (releasing each child
-;;; recursively), and `private_data` (currently NULL).  Idempotent: sets
-;;; release to NULL.
-(defn #[used] (export-as "frame_interop_release_array") __ip-release-array [arr : int] : void
-  ```c
-  #include <stdlib.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Release callbacks.  Defined as their own defns so their C names can be
+  ;; referenced as void(*)(struct Arrow*) by cast.
+  ;;
+  ;; Each is pinned to a stable C symbol with `export-as`, the same way plot
+  ;; pins `plot_sample_adaptive` / `plot_renderer_bbox`.  Without the pin the
+  ;; hand-written `extern` declarations below have to spell out whatever
+  ;; turmeric's injective identifier mangler produces for a `__`-prefixed,
+  ;; kebab-cased name -- which they did, as `frame__interop____ip_release_array`,
+  ;; until the mangler began encoding `_` as `_un` and `-` as `_hy` and the real
+  ;; symbol became `frame__interop___un_unip_hyrelease_hyarray`.  The externs
+  ;; then referred to nothing and every build of this module failed at link.
+  ;; The pin makes the C name part of this file rather than of the mangler.
+  ;; ---------------------------------------------------------------------------
+  ;;; __ip-release-array -- ArrowArray release callback.  Frees buffers, the
+  ;;; buffers[] pointer array, the children[] array (releasing each child
+  ;;; recursively), and `private_data` (currently NULL).  Idempotent: sets
+  ;;; release to NULL.
+  (defn #[used] (export-as "frame_interop_release_array") __ip-release-array [arr : int] : void
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct ArrowArray {
     int64_t length; int64_t null_count; int64_t offset;
@@ -98,12 +106,11 @@
   if (a->private_data) free(a->private_data);
   a->release = NULL;
   ```)
-
-;;; __ip-release-schema -- ArrowSchema release callback.  Frees format/name
-;;; strings, children, and `private_data`.  Idempotent.
-(defn #[used] (export-as "frame_interop_release_schema") __ip-release-schema [sch : int] : void
-  ```c
-  #include <stdlib.h>
+  ;;; __ip-release-schema -- ArrowSchema release callback.  Frees format/name
+  ;;; strings, children, and `private_data`.  Idempotent.
+  (defn #[used] (export-as "frame_interop_release_schema") __ip-release-schema [sch : int] : void
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct ArrowSchema {
     const char* format; const char* name; const char* metadata;
@@ -131,17 +138,18 @@
   if (s->private_data) free(s->private_data);
   s->release = NULL;
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Column-level export.
-;; ---------------------------------------------------------------------------
-
-;;; __ip-export-column-into -- fill an externally-allocated (schema, array)
-;;; pair from a tur-frame column.  Sets release callbacks.  Used internally
-;;; by both arrow-export-column (single column) and arrow-export (frame).
-(defn #[used] (export-as "frame_interop_export_column_into") __ip-export-column-into [col : int name : cstr sch : int arr : int] : int
-  ```c
-  #include <stdlib.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Column-level export.
+  ;; ---------------------------------------------------------------------------
+  ;;; __ip-export-column-into -- fill an externally-allocated (schema, array)
+  ;;; pair from a tur-frame column.  Sets release callbacks.  Used internally
+  ;;; by both arrow-export-column (single column) and arrow-export (frame).
+  (defn #[used] (export-as "frame_interop_export_column_into") __ip-export-column-into [col : int
+                                                                                        name : cstr
+                                                                                        sch : int
+                                                                                        arr : int] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
   struct ArrowSchema {
@@ -254,22 +262,18 @@
   }
   return 1;
   ```)
-
-;;; arrow-export-column -- export a single column as (ArrowSchema*, ArrowArray*)
-;;; both heap-allocated by us.  Caller invokes the release callbacks when done.
-;;; Returns a cons list of two :int pointers: (schema-ptr . (array-ptr . nil)).
-;;; Since: FR8
-(defn arrow-export-column [col : int name : cstr] : int
-  (let [sch (__ip-alloc-schema)
-        arr (__ip-alloc-array)
-        ok  (__ip-export-column-into col name sch arr)]
-    (if (= ok 0)
-      0
-      (__ip-cons sch (__ip-cons arr (__ip-nil))))))
-
-(defn __ip-alloc-schema [] : int
-  ```c
-  #include <stdlib.h>
+  ;;; arrow-export-column -- export a single column as (ArrowSchema*, ArrowArray*)
+  ;;; both heap-allocated by us.  Caller invokes the release callbacks when done.
+  ;;; Returns a cons list of two :int pointers: (schema-ptr . (array-ptr . nil)).
+  ;;; Since: FR8
+  (defn arrow-export-column [col : int name : cstr] : int
+    (let [sch (__ip-alloc-schema)
+          arr (__ip-alloc-array)
+          ok  (__ip-export-column-into col name sch arr)]
+      (if (= ok 0) 0 (__ip-cons sch (__ip-cons arr (__ip-nil))))))
+  (defn __ip-alloc-schema [] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct ArrowSchema {
     const char* format; const char* name; const char* metadata;
@@ -279,10 +283,9 @@
   };
   return (int64_t)(intptr_t)calloc(1, sizeof(struct ArrowSchema));
   ```)
-
-(defn __ip-alloc-array [] : int
-  ```c
-  #include <stdlib.h>
+  (defn __ip-alloc-array [] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct ArrowArray {
     int64_t length; int64_t null_count; int64_t offset;
@@ -293,25 +296,20 @@
   };
   return (int64_t)(intptr_t)calloc(1, sizeof(struct ArrowArray));
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Frame-level export -- "+s" struct-typed.
-;; ---------------------------------------------------------------------------
-
-;;; arrow-export -- export a frame as a "+s" struct-typed
-;;; (ArrowSchema*, ArrowArray*) pair.  Returns a cons list (schema-ptr . (array-ptr . nil))
-;;; or 0 on failure.  Since: FR8
-(defn arrow-export [f : int] : int
-  (let [sch (__ip-alloc-schema)
-        arr (__ip-alloc-array)
-        ok  (__ip-export-frame-into f sch arr)]
-    (if (= ok 0)
-      0
-      (__ip-cons sch (__ip-cons arr (__ip-nil))))))
-
-(defn __ip-export-frame-into [f : int sch : int arr : int] : int
-  ```c
-  #include <stdlib.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Frame-level export -- "+s" struct-typed.
+  ;; ---------------------------------------------------------------------------
+  ;;; arrow-export -- export a frame as a "+s" struct-typed
+  ;;; (ArrowSchema*, ArrowArray*) pair.  Returns a cons list (schema-ptr . (array-ptr . nil))
+  ;;; or 0 on failure.  Since: FR8
+  (defn arrow-export [f : int] : int
+    (let [sch (__ip-alloc-schema)
+          arr (__ip-alloc-array)
+          ok  (__ip-export-frame-into f sch arr)]
+      (if (= ok 0) 0 (__ip-cons sch (__ip-cons arr (__ip-nil))))))
+  (defn __ip-export-frame-into [f : int sch : int arr : int] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
   struct ArrowSchema {
@@ -373,14 +371,12 @@
   }
   return 1;
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Column-level import.
-;; ---------------------------------------------------------------------------
-
-(defn #[used] (export-as "frame_interop_fmt_to_tag") __ip-fmt-to-tag [fmt : cstr] : int
-  ```c
-  #include <string.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Column-level import.
+  ;; ---------------------------------------------------------------------------
+  (defn #[used] (export-as "frame_interop_fmt_to_tag") __ip-fmt-to-tag [fmt : cstr] : int
+    ```c
+    #include <string.h>
   #include <stdint.h>
   const char *p = (const char *)(intptr_t)fmt;
   if (!p) return 0;
@@ -392,14 +388,13 @@
   if (strcmp(p, "u") == 0) return 6;
   return 0;
   ```)
-
-;;; arrow-import-column -- build a tur-frame column from an external
-;;; (ArrowSchema*, ArrowArray*) pair.  v0 deep-copies the buffers and calls
-;;; the consumer's release callbacks immediately afterwards, so the consumer
-;;; struct allocations are theirs to free.  Since: FR8
-(defn arrow-import-column [sch : int arr : int] : int
-  ```c
-  #include <stdlib.h>
+  ;;; arrow-import-column -- build a tur-frame column from an external
+  ;;; (ArrowSchema*, ArrowArray*) pair.  v0 deep-copies the buffers and calls
+  ;;; the consumer's release callbacks immediately afterwards, so the consumer
+  ;;; struct allocations are theirs to free.  Since: FR8
+  (defn arrow-import-column [sch : int arr : int] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
   struct ArrowSchema {
@@ -523,24 +518,21 @@
 
   return (int64_t)(intptr_t)col;
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Frame-level import.
-;; ---------------------------------------------------------------------------
-
-;;; arrow-import -- build a tur-frame from a "+s" struct-typed
-;;; (ArrowSchema*, ArrowArray*) pair.  v0 deep-copies child column data and
-;;; releases the consumer structs immediately afterwards.  Since: FR8
-(defn arrow-import [sch : int arr : int] : int
-  (let [ncols (__ip-array-n-children arr)
-        flds  (__ip-build-fields sch ncols (- ncols 1) (__ip-nil))
-        cols  (__ip-build-cols sch arr ncols (- ncols 1) (__ip-nil))
-        f     (frame (schema flds) cols)]
-    (do (__ip-release-toplevel sch arr) f)))
-
-(defn __ip-array-n-children [arr : int] : int
-  ```c
-  #include <stdint.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Frame-level import.
+  ;; ---------------------------------------------------------------------------
+  ;;; arrow-import -- build a tur-frame from a "+s" struct-typed
+  ;;; (ArrowSchema*, ArrowArray*) pair.  v0 deep-copies child column data and
+  ;;; releases the consumer structs immediately afterwards.  Since: FR8
+  (defn arrow-import [sch : int arr : int] : int
+    (let [ncols (__ip-array-n-children arr)
+          flds  (__ip-build-fields sch ncols (- ncols 1) (__ip-nil))
+          cols  (__ip-build-cols sch arr ncols (- ncols 1) (__ip-nil))
+          f     (frame (schema flds) cols)]
+      (do (__ip-release-toplevel sch arr) f)))
+  (defn __ip-array-n-children [arr : int] : int
+    ```c
+    #include <stdint.h>
   struct ArrowArray {
     int64_t length; int64_t null_count; int64_t offset;
     int64_t n_buffers; int64_t n_children;
@@ -551,10 +543,9 @@
   if (!arr) return 0;
   return ((struct ArrowArray *)(intptr_t)arr)->n_children;
   ```)
-
-(defn __ip-schema-child [sch : int i : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __ip-schema-child [sch : int i : int] : int
+    ```c
+    #include <stdint.h>
   struct ArrowSchema {
     const char* format; const char* name; const char* metadata;
     int64_t flags; int64_t n_children;
@@ -564,10 +555,9 @@
   if (!sch) return 0;
   return (int64_t)(intptr_t)((struct ArrowSchema *)(intptr_t)sch)->children[i];
   ```)
-
-(defn __ip-array-child [arr : int i : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __ip-array-child [arr : int i : int] : int
+    ```c
+    #include <stdint.h>
   struct ArrowArray {
     int64_t length; int64_t null_count; int64_t offset;
     int64_t n_buffers; int64_t n_children;
@@ -578,10 +568,9 @@
   if (!arr) return 0;
   return (int64_t)(intptr_t)((struct ArrowArray *)(intptr_t)arr)->children[i];
   ```)
-
-(defn __ip-schema-name [sch : int] : cstr
-  ```c
-  #include <stdint.h>
+  (defn __ip-schema-name [sch : int] : cstr
+    ```c
+    #include <stdint.h>
   struct ArrowSchema {
     const char* format; const char* name; const char* metadata;
     int64_t flags; int64_t n_children;
@@ -592,10 +581,9 @@
   struct ArrowSchema *s = (struct ArrowSchema *)(intptr_t)sch;
   return (const char *)(intptr_t)(s->name ? s->name : "");
   ```)
-
-(defn __ip-schema-format [sch : int] : cstr
-  ```c
-  #include <stdint.h>
+  (defn __ip-schema-format [sch : int] : cstr
+    ```c
+    #include <stdint.h>
   struct ArrowSchema {
     const char* format; const char* name; const char* metadata;
     int64_t flags; int64_t n_children;
@@ -606,36 +594,32 @@
   struct ArrowSchema *s = (struct ArrowSchema *)(intptr_t)sch;
   return (const char *)(intptr_t)(s->format ? s->format : "");
   ```)
-
-(defn __ip-import-child-column [csch : int carr : int] : int
-  ;; v0: just call arrow-import-column on the child structs.  arrow-import-column
-  ;; itself releases the child structs after copying, which is the correct
-  ;; lifecycle when the parent caller will *not* call release on children.
-  ;; (The Arrow spec leaves child-release to the parent's release callback;
-  ;; we sidestep that by consuming each child up-front.)
-  (arrow-import-column csch carr))
-
-(defn __ip-build-cols [sch : int arr : int ncols : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [csch (__ip-schema-child sch i)
-          carr (__ip-array-child arr i)
-          col  (__ip-import-child-column csch carr)]
-      (__ip-build-cols sch arr ncols (- i 1) (__ip-cons col acc)))))
-
-(defn __ip-build-fields [sch : int ncols : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [csch (__ip-schema-child sch i)
-          nm   (__ip-schema-name csch)
-          fmt  (__ip-schema-format csch)
-          tag  (__ip-fmt-to-tag fmt)
-          fd   (field nm tag 1)]
-      (__ip-build-fields sch ncols (- i 1) (__ip-cons fd acc)))))
-
-(defn __ip-release-toplevel [sch : int arr : int] : void
-  ```c
-  #include <stdint.h>
+  (defn __ip-import-child-column [csch : int carr : int] : int
+    ;; v0: just call arrow-import-column on the child structs.  arrow-import-column
+    ;; itself releases the child structs after copying, which is the correct
+    ;; lifecycle when the parent caller will *not* call release on children.
+    ;; (The Arrow spec leaves child-release to the parent's release callback;
+    ;; we sidestep that by consuming each child up-front.)
+    (arrow-import-column csch carr))
+  (defn __ip-build-cols [sch : int arr : int ncols : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (let [csch (__ip-schema-child sch i)
+            carr (__ip-array-child arr i)
+            col  (__ip-import-child-column csch carr)]
+        (__ip-build-cols sch arr ncols (- i 1) (__ip-cons col acc)))))
+  (defn __ip-build-fields [sch : int ncols : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (let [csch (__ip-schema-child sch i)
+            nm   (__ip-schema-name csch)
+            fmt  (__ip-schema-format csch)
+            tag  (__ip-fmt-to-tag fmt)
+            fd   (field nm tag 1)]
+        (__ip-build-fields sch ncols (- i 1) (__ip-cons fd acc)))))
+  (defn __ip-release-toplevel [sch : int arr : int] : void
+    ```c
+    #include <stdint.h>
   struct ArrowSchema {
     const char* format; const char* name; const char* metadata;
     int64_t flags; int64_t n_children;
@@ -665,6 +649,4 @@
     }
     if (a->release) a->release(a);
   }
-  ```)
-
-) ;; end defmodule frame/interop
+  ```)) ;; end defmodule frame/interop

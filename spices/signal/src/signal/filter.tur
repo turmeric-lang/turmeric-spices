@@ -26,104 +26,107 @@
 ;; call and ignores `t`: sample it once per sample period, in order, and give
 ;; each consumer its own instance (see signal/delay). State cells live for the
 ;; process.
-
 (defmodule signal/filter
-  (export low-pass high-pass one-pole-lp one-pole-hp dc-block
-          biquad biquad-lp biquad-hp biquad-bp biquad-notch biquad-allpass
-          biquad-peak biquad-low-shelf biquad-high-shelf
-          svf-lp svf-hp svf-bp svf-notch ladder)
-
-;; =============================================================================
-;; State cells
-;; =============================================================================
-
-;;; __filter_alloc_state -- allocate a zero-initialized double cell.
-;;;
-;;; Each filter instance owns one of these for its previous sample. Four
-;;; doubles, so the one-pole, DC-blocker, biquad, SVF and ladder states all fit.
-(defn __filter_alloc_state [] :int
-  ```c
-  double *p = (double *)calloc(4, sizeof(double));
+  (export low-pass
+    high-pass
+    one-pole-lp
+    one-pole-hp
+    dc-block
+    biquad
+    biquad-lp
+    biquad-hp
+    biquad-bp
+    biquad-notch
+    biquad-allpass
+    biquad-peak
+    biquad-low-shelf
+    biquad-high-shelf
+    svf-lp
+    svf-hp
+    svf-bp
+    svf-notch
+    ladder)
+  ;; =============================================================================
+  ;; State cells
+  ;; =============================================================================
+  ;;; __filter_alloc_state -- allocate a zero-initialized double cell.
+  ;;;
+  ;;; Each filter instance owns one of these for its previous sample. Four
+  ;;; doubles, so the one-pole, DC-blocker, biquad, SVF and ladder states all fit.
+  (defn __filter_alloc_state [] :int
+    ```c
+    double *p = (double *)calloc(4, sizeof(double));
   if (!p) { fprintf(stderr, "filter: state alloc failed\n"); abort(); }
   return (int64_t)(intptr_t)p;
   ```)
-
-;;; __filter_lp_step -- low-pass EMA step.
-;;;
-;;; Reads `*prev` as the previous output, computes
-;;; `y = alpha * x + (1 - alpha) * prev`, stores `y`, and returns it.
-(defn __filter_lp_step [state :int alpha :float x :float] :float
-  ```c
-  double *prev = (double *)(intptr_t)state;
+  ;;; __filter_lp_step -- low-pass EMA step.
+  ;;;
+  ;;; Reads `*prev` as the previous output, computes
+  ;;; `y = alpha * x + (1 - alpha) * prev`, stores `y`, and returns it.
+  (defn __filter_lp_step [state :int alpha :float x :float] :float
+    ```c
+    double *prev = (double *)(intptr_t)state;
   double y = alpha * x + (1.0 - alpha) * (*prev);
   *prev = y;
   return y;
   ```)
-
-;;; __filter_hp_step -- high-pass step.
-;;;
-;;; Tracks the low-pass output internally; emits `x - lp`.
-(defn __filter_hp_step [state :int alpha :float x :float] :float
-  ```c
-  double *prev_lp = (double *)(intptr_t)state;
+  ;;; __filter_hp_step -- high-pass step.
+  ;;;
+  ;;; Tracks the low-pass output internally; emits `x - lp`.
+  (defn __filter_hp_step [state :int alpha :float x :float] :float
+    ```c
+    double *prev_lp = (double *)(intptr_t)state;
   double lp = alpha * x + (1.0 - alpha) * (*prev_lp);
   *prev_lp = lp;
   return x - lp;
   ```)
-
-;; =============================================================================
-;; Filters
-;; =============================================================================
-
-;;; low-pass -- first-order IIR low-pass filter Signal Function.
-;;;
-;;; Parameters:
-;;;   alpha -- smoothing coefficient in (0, 1); lower = more smoothing.
-;;;
-;;; Returns:
-;;;   SF Sample Sample. Each instance owns its own state cell, so the
-;;;   same `(low-pass alpha)` SF is stateful from the moment it is
-;;;   applied to an input signal.
-;;;
-;;; Example:
-;;;   ((low-pass 0.3) (sine 440.0 0.0))
-(defn low-pass [alpha :float]
-  (let [av alpha]
-    (fn [^fat sig : (fn [float] float)]
-      (let [state (__filter_alloc_state)]
-        (fn [t :float] :float
-          (__filter_lp_step state av (sig t)))))))
-
-;;; high-pass -- first-order IIR high-pass filter Signal Function.
-;;;
-;;; Parameters:
-;;;   alpha -- smoothing coefficient of the internal low-pass tap
-;;;            (matches `low-pass`'s convention).
-;;;
-;;; Returns:
-;;;   SF Sample Sample emitting `x - low_pass(x)` per sample.
-;;;
-;;; Example:
-;;;   ((high-pass 0.3) (sawtooth 110.0))
-(defn high-pass [alpha :float]
-  (let [av alpha]
-    (fn [^fat sig : (fn [float] float)]
-      (let [state (__filter_alloc_state)]
-        (fn [t :float] :float
-          (__filter_hp_step state av (sig t)))))))
-
-;; =============================================================================
-;; Cutoff-based one-poles and the DC blocker
-;; =============================================================================
-
-;;; __filter_onepole_alpha -- EMA coefficient for a cutoff in Hz.
-;;;
-;;; alpha = 1 - exp(-2*pi*freq/sample-rate), the impulse-invariant one-pole.
-;;; The cutoff is clamped to [0, 0.49 * sample-rate]; a non-positive sample
-;;; rate gives alpha = 1 (pass-through for `one-pole-lp`).
-(defn __filter_onepole_alpha [sample-rate :float freq :float] :float
-  ```c
-  /* __tur_autolink__: -lm */
+  ;; =============================================================================
+  ;; Filters
+  ;; =============================================================================
+  ;;; low-pass -- first-order IIR low-pass filter Signal Function.
+  ;;;
+  ;;; Parameters:
+  ;;;   alpha -- smoothing coefficient in (0, 1); lower = more smoothing.
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample. Each instance owns its own state cell, so the
+  ;;;   same `(low-pass alpha)` SF is stateful from the moment it is
+  ;;;   applied to an input signal.
+  ;;;
+  ;;; Example:
+  ;;;   ((low-pass 0.3) (sine 440.0 0.0))
+  (defn low-pass [alpha :float]
+    (let [av alpha]
+      (fn [^fat sig : (fn [float] float)]
+        (let [state (__filter_alloc_state)]
+          (fn [t :float] :float (__filter_lp_step state av (sig t)))))))
+  ;;; high-pass -- first-order IIR high-pass filter Signal Function.
+  ;;;
+  ;;; Parameters:
+  ;;;   alpha -- smoothing coefficient of the internal low-pass tap
+  ;;;            (matches `low-pass`'s convention).
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample emitting `x - low_pass(x)` per sample.
+  ;;;
+  ;;; Example:
+  ;;;   ((high-pass 0.3) (sawtooth 110.0))
+  (defn high-pass [alpha :float]
+    (let [av alpha]
+      (fn [^fat sig : (fn [float] float)]
+        (let [state (__filter_alloc_state)]
+          (fn [t :float] :float (__filter_hp_step state av (sig t)))))))
+  ;; =============================================================================
+  ;; Cutoff-based one-poles and the DC blocker
+  ;; =============================================================================
+  ;;; __filter_onepole_alpha -- EMA coefficient for a cutoff in Hz.
+  ;;;
+  ;;; alpha = 1 - exp(-2*pi*freq/sample-rate), the impulse-invariant one-pole.
+  ;;; The cutoff is clamped to [0, 0.49 * sample-rate]; a non-positive sample
+  ;;; rate gives alpha = 1 (pass-through for `one-pole-lp`).
+  (defn __filter_onepole_alpha [sample-rate :float freq :float] :float
+    ```c
+    /* __tur_autolink__: -lm */
   extern double exp(double);
   if (!(sample_rate > 0.0)) return 1.0;
   double f = freq;
@@ -131,90 +134,87 @@
   if (f > 0.49 * sample_rate) f = 0.49 * sample_rate;
   return 1.0 - exp(-2.0 * 3.14159265358979323846 * f / sample_rate);
   ```)
-
-;;; __filter_dc_step -- DC blocker: y = x - x[n-1] + r * y[n-1].
-;;;
-;;; State: [0] previous input, [1] previous output.
-(defn __filter_dc_step [state :int r :float x :float] :float
-  ```c
-  double *s = (double *)(intptr_t)state;
+  ;;; __filter_dc_step -- DC blocker: y = x - x[n-1] + r * y[n-1].
+  ;;;
+  ;;; State: [0] previous input, [1] previous output.
+  (defn __filter_dc_step [state :int r :float x :float] :float
+    ```c
+    double *s = (double *)(intptr_t)state;
   double y = x - s[0] + r * s[1];
   s[0] = x;
   s[1] = y;
   return y;
   ```)
-
-;;; one-pole-lp -- one-pole low-pass with its cutoff given in Hz.
-;;;
-;;; `low-pass` with alpha = 1 - exp(-2*pi*freq/sample-rate): -3 dB near
-;;; `freq` for cutoffs well below Nyquist, then -6 dB/oct.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   freq        -- cutoff in Hz
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful).
-;;;
-;;; Example:
-;;;   ((one-pole-lp 48000.0 500.0) input)
-(defn one-pole-lp [sample-rate :float freq :float]
-  (low-pass (__filter_onepole_alpha sample-rate freq)))
-
-;;; one-pole-hp -- one-pole high-pass with its cutoff given in Hz.
-;;;
-;;; `high-pass` with the same coefficient as `one-pole-lp`: x - lp(x).
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   freq        -- cutoff in Hz
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful).
-;;;
-;;; Example:
-;;;   ((one-pole-hp 48000.0 80.0) input)
-(defn one-pole-hp [sample-rate :float freq :float]
-  (high-pass (__filter_onepole_alpha sample-rate freq)))
-
-;;; dc-block -- remove a constant offset: y = x - x[n-1] + r * y[n-1].
-;;;
-;;; A zero at DC and a pole just inside it, r = exp(-2*pi*freq/sample-rate).
-;;; Use it after anything that can leave an offset behind -- a rectifier, an
-;;; asymmetric clip, a unipolar oscillator, ring modulation of an offset
-;;; signal. 5 to 20 Hz is a typical corner.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   freq        -- corner frequency in Hz
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful).
-;;;
-;;; Example:
-;;;   ((dc-block 48000.0 10.0) ((sawtooth 110.0) (constant 0.0)))
-(defn dc-block [sample-rate :float freq :float]
-  (let [rv (- 1.0 (__filter_onepole_alpha sample-rate freq))]
-    (fn [^fat sig : (fn [float] float)]
-      (let [state (__filter_alloc_state)]
-        (fn [t :float] :float
-          (__filter_dc_step state rv (sig t)))))))
-
-;; =============================================================================
-;; Biquads (RBJ Audio-EQ-Cookbook)
-;; =============================================================================
-;;
-;; Coefficients live in one cell per constructor call, [b0 b1 b2 a1 a2]
-;; normalized by a0, and are shared read-only by every application. Each
-;; application owns a state cell [z1 z2] for the transposed direct form II.
-
-;;; __biquad_coeffs -- compute a normalized RBJ coefficient cell.
-;;;
-;;; kind: 0 lp, 1 hp, 2 bp (0 dB peak), 3 notch, 4 allpass, 5 peaking EQ,
-;;; 6 low shelf, 7 high shelf. `gain-db` is read by kinds 5..7 only.
-(defn __biquad_coeffs [kind :int sample-rate :float freq :float q :float gain-db :float] :int
-  ```c
-  /* __tur_autolink__: -lm */
+  ;;; one-pole-lp -- one-pole low-pass with its cutoff given in Hz.
+  ;;;
+  ;;; `low-pass` with alpha = 1 - exp(-2*pi*freq/sample-rate): -3 dB near
+  ;;; `freq` for cutoffs well below Nyquist, then -6 dB/oct.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   freq        -- cutoff in Hz
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful).
+  ;;;
+  ;;; Example:
+  ;;;   ((one-pole-lp 48000.0 500.0) input)
+  (defn one-pole-lp [sample-rate :float freq :float]
+    (low-pass (__filter_onepole_alpha sample-rate freq)))
+  ;;; one-pole-hp -- one-pole high-pass with its cutoff given in Hz.
+  ;;;
+  ;;; `high-pass` with the same coefficient as `one-pole-lp`: x - lp(x).
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   freq        -- cutoff in Hz
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful).
+  ;;;
+  ;;; Example:
+  ;;;   ((one-pole-hp 48000.0 80.0) input)
+  (defn one-pole-hp [sample-rate :float freq :float]
+    (high-pass (__filter_onepole_alpha sample-rate freq)))
+  ;;; dc-block -- remove a constant offset: y = x - x[n-1] + r * y[n-1].
+  ;;;
+  ;;; A zero at DC and a pole just inside it, r = exp(-2*pi*freq/sample-rate).
+  ;;; Use it after anything that can leave an offset behind -- a rectifier, an
+  ;;; asymmetric clip, a unipolar oscillator, ring modulation of an offset
+  ;;; signal. 5 to 20 Hz is a typical corner.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   freq        -- corner frequency in Hz
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful).
+  ;;;
+  ;;; Example:
+  ;;;   ((dc-block 48000.0 10.0) ((sawtooth 110.0) (constant 0.0)))
+  (defn dc-block [sample-rate :float freq :float]
+    (let [rv (- 1.0 (__filter_onepole_alpha sample-rate freq))]
+      (fn [^fat sig : (fn [float] float)]
+        (let [state (__filter_alloc_state)]
+          (fn [t :float] :float (__filter_dc_step state rv (sig t)))))))
+  ;; =============================================================================
+  ;; Biquads (RBJ Audio-EQ-Cookbook)
+  ;; =============================================================================
+  ;;
+  ;; Coefficients live in one cell per constructor call, [b0 b1 b2 a1 a2]
+  ;; normalized by a0, and are shared read-only by every application. Each
+  ;; application owns a state cell [z1 z2] for the transposed direct form II.
+  ;;; __biquad_coeffs -- compute a normalized RBJ coefficient cell.
+  ;;;
+  ;;; kind: 0 lp, 1 hp, 2 bp (0 dB peak), 3 notch, 4 allpass, 5 peaking EQ,
+  ;;; 6 low shelf, 7 high shelf. `gain-db` is read by kinds 5..7 only.
+  (defn __biquad_coeffs [kind :int
+                         sample-rate :float
+                         freq :float
+                         q :float
+                         gain-db :float] :int
+    ```c
+    /* __tur_autolink__: -lm */
   extern double sin(double);
   extern double cos(double);
   extern double sqrt(double);
@@ -263,199 +263,195 @@
   c[3] = a1 / a0; c[4] = a2 / a0;
   return (int64_t)(intptr_t)c;
   ```)
-
-;;; __biquad_raw_coeffs -- a coefficient cell from caller-supplied values.
-(defn __biquad_raw_coeffs [b0 :float b1 :float b2 :float a1 :float a2 :float] :int
-  ```c
-  double *c = (double *)calloc(5, sizeof(double));
+  ;;; __biquad_raw_coeffs -- a coefficient cell from caller-supplied values.
+  (defn __biquad_raw_coeffs [b0 :float b1 :float b2 :float a1 :float a2 :float] :int
+    ```c
+    double *c = (double *)calloc(5, sizeof(double));
   if (!c) { fprintf(stderr, "filter: coefficient alloc failed\n"); abort(); }
   c[0] = b0; c[1] = b1; c[2] = b2; c[3] = a1; c[4] = a2;
   return (int64_t)(intptr_t)c;
   ```)
-
-;;; __biquad_step -- one transposed-direct-form-II step.
-;;;
-;;;   y  = b0*x + z1
-;;;   z1 = b1*x - a1*y + z2
-;;;   z2 = b2*x - a2*y
-(defn __biquad_step [coeffs :int state :int x :float] :float
-  ```c
-  const double *c = (const double *)(intptr_t)coeffs;
+  ;;; __biquad_step -- one transposed-direct-form-II step.
+  ;;;
+  ;;;   y  = b0*x + z1
+  ;;;   z1 = b1*x - a1*y + z2
+  ;;;   z2 = b2*x - a2*y
+  (defn __biquad_step [coeffs :int state :int x :float] :float
+    ```c
+    const double *c = (const double *)(intptr_t)coeffs;
   double *z = (double *)(intptr_t)state;
   double y = c[0] * x + z[0];
   z[0] = c[1] * x - c[3] * y + z[1];
   z[1] = c[2] * x - c[4] * y;
   return y;
   ```)
-
-;;; __biquad_sf -- wrap a coefficient cell as an SF; each application owns state.
-(defn __biquad_sf [coeffs :int]
-  (let [cv coeffs]
-    (fn [^fat sig : (fn [float] float)]
-      (let [state (__filter_alloc_state)]
-        (fn [t :float] :float
-          (__biquad_step cv state (sig t)))))))
-
-;;; biquad -- second-order section from raw, a0-normalized coefficients.
-;;;
-;;;   y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
-;;;
-;;; The primitive the `biquad-*` designs are built on. Stable only when both
-;;; poles are inside the unit circle (|a2| < 1 and |a1| < 1 + a2).
-;;;
-;;; Parameters:
-;;;   b0 b1 b2 -- feedforward coefficients
-;;;   a1 a2    -- feedback coefficients (a0 = 1)
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful).
-;;;
-;;; Example:
-;;;   ((biquad 0.5 0.5 0.0 0.0 0.0) input)   ;; two-tap average
-(defn biquad [b0 :float b1 :float b2 :float a1 :float a2 :float]
-  (__biquad_sf (__biquad_raw_coeffs b0 b1 b2 a1 a2)))
-
-;;; biquad-lp -- resonant second-order low-pass, 12 dB/oct.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   freq        -- cutoff in Hz
-;;;   q           -- resonance; 0.7071 is maximally flat (Butterworth)
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful). Unity gain at DC; gain q at `freq`.
-;;;
-;;; Example:
-;;;   ((biquad-lp 48000.0 1200.0 0.7071) input)
-(defn biquad-lp [sample-rate :float freq :float q :float]
-  (__biquad_sf (__biquad_coeffs 0 sample-rate freq q 0.0)))
-
-;;; biquad-hp -- resonant second-order high-pass, 12 dB/oct.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   freq        -- cutoff in Hz
-;;;   q           -- resonance; 0.7071 is maximally flat
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful). Zero gain at DC; unity at Nyquist.
-;;;
-;;; Example:
-;;;   ((biquad-hp 48000.0 80.0 0.7071) input)
-(defn biquad-hp [sample-rate :float freq :float q :float]
-  (__biquad_sf (__biquad_coeffs 1 sample-rate freq q 0.0)))
-
-;;; biquad-bp -- second-order band-pass, 0 dB at the center frequency.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   freq        -- center frequency in Hz
-;;;   q           -- center / bandwidth; higher is narrower
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful).
-;;;
-;;; Example:
-;;;   ((biquad-bp 48000.0 1000.0 4.0) noise)
-(defn biquad-bp [sample-rate :float freq :float q :float]
-  (__biquad_sf (__biquad_coeffs 2 sample-rate freq q 0.0)))
-
-;;; biquad-notch -- second-order band-reject: zero gain at `freq`.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   freq        -- the frequency to remove, in Hz
-;;;   q           -- center / bandwidth; higher is narrower
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful). Unity gain at DC and Nyquist.
-;;;
-;;; Example:
-;;;   ((biquad-notch 48000.0 60.0 10.0) input)   ;; remove mains hum
-(defn biquad-notch [sample-rate :float freq :float q :float]
-  (__biquad_sf (__biquad_coeffs 3 sample-rate freq q 0.0)))
-
-;;; biquad-allpass -- second-order allpass: unit gain, phase turns 360 deg.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   freq        -- where the phase passes -180 deg, in Hz
-;;;   q           -- how fast the phase turns around `freq`
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful). The building block of a phaser.
-;;;
-;;; Example:
-;;;   ((biquad-allpass 48000.0 800.0 0.7071) input)
-(defn biquad-allpass [sample-rate :float freq :float q :float]
-  (__biquad_sf (__biquad_coeffs 4 sample-rate freq q 0.0)))
-
-;;; biquad-peak -- peaking EQ: boost or cut `gain-db` around `freq`.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   freq        -- center frequency in Hz
-;;;   q           -- center / bandwidth
-;;;   gain-db     -- gain at `freq`; negative cuts. 0 is a pass-through.
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful). Unity gain far from `freq`.
-;;;
-;;; Example:
-;;;   ((biquad-peak 48000.0 3000.0 1.0 6.0) input)   ;; +6 dB presence
-(defn biquad-peak [sample-rate :float freq :float q :float gain-db :float]
-  (__biquad_sf (__biquad_coeffs 5 sample-rate freq q gain-db)))
-
-;;; biquad-low-shelf -- boost or cut everything below `freq` by `gain-db`.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   freq        -- shelf midpoint in Hz (half the gain, in dB, is reached here)
-;;;   q           -- shelf steepness; 0.7071 gives the steepest without overshoot
-;;;   gain-db     -- gain at DC
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful). Unity gain at Nyquist.
-;;;
-;;; Example:
-;;;   ((biquad-low-shelf 48000.0 200.0 0.7071 -6.0) input)
-(defn biquad-low-shelf [sample-rate :float freq :float q :float gain-db :float]
-  (__biquad_sf (__biquad_coeffs 6 sample-rate freq q gain-db)))
-
-;;; biquad-high-shelf -- boost or cut everything above `freq` by `gain-db`.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   freq        -- shelf midpoint in Hz
-;;;   q           -- shelf steepness; 0.7071 gives the steepest without overshoot
-;;;   gain-db     -- gain at Nyquist
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful). Unity gain at DC.
-;;;
-;;; Example:
-;;;   ((biquad-high-shelf 48000.0 6000.0 0.7071 3.0) input)
-(defn biquad-high-shelf [sample-rate :float freq :float q :float gain-db :float]
-  (__biquad_sf (__biquad_coeffs 7 sample-rate freq q gain-db)))
-
-;; =============================================================================
-;; State-variable filter (trapezoidal / TPT, Simper)
-;; =============================================================================
-
-;;; __svf_step -- one SVF step with the cutoff read for this sample.
-;;;
-;;; State: [0] ic1eq, [1] ic2eq. mode: 0 lp, 1 hp, 2 bp (unity peak), 3 notch.
-;;;
-;;;   g = tan(pi * fc / sr), k = 1 / q
-;;;   a1 = 1 / (1 + g*(g + k)), a2 = g*a1, a3 = g*a2
-;;;   v3 = x - ic2eq
-;;;   v1 = a1*ic1eq + a2*v3            (band)
-;;;   v2 = ic2eq + a2*ic1eq + a3*v3    (low)
-;;;   ic1eq = 2*v1 - ic1eq, ic2eq = 2*v2 - ic2eq
-;;;   high = x - k*v1 - v2, notch = x - k*v1, band (unity peak) = k*v1
-(defn __svf_step [state :int mode :int sample-rate :float cutoff :float q :float x :float] :float
-  ```c
-  /* __tur_autolink__: -lm */
+  ;;; __biquad_sf -- wrap a coefficient cell as an SF; each application owns state.
+  (defn __biquad_sf [coeffs :int]
+    (let [cv coeffs]
+      (fn [^fat sig : (fn [float] float)]
+        (let [state (__filter_alloc_state)]
+          (fn [t :float] :float (__biquad_step cv state (sig t)))))))
+  ;;; biquad -- second-order section from raw, a0-normalized coefficients.
+  ;;;
+  ;;;   y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
+  ;;;
+  ;;; The primitive the `biquad-*` designs are built on. Stable only when both
+  ;;; poles are inside the unit circle (|a2| < 1 and |a1| < 1 + a2).
+  ;;;
+  ;;; Parameters:
+  ;;;   b0 b1 b2 -- feedforward coefficients
+  ;;;   a1 a2    -- feedback coefficients (a0 = 1)
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful).
+  ;;;
+  ;;; Example:
+  ;;;   ((biquad 0.5 0.5 0.0 0.0 0.0) input)   ;; two-tap average
+  (defn biquad [b0 :float b1 :float b2 :float a1 :float a2 :float]
+    (__biquad_sf (__biquad_raw_coeffs b0 b1 b2 a1 a2)))
+  ;;; biquad-lp -- resonant second-order low-pass, 12 dB/oct.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   freq        -- cutoff in Hz
+  ;;;   q           -- resonance; 0.7071 is maximally flat (Butterworth)
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful). Unity gain at DC; gain q at `freq`.
+  ;;;
+  ;;; Example:
+  ;;;   ((biquad-lp 48000.0 1200.0 0.7071) input)
+  (defn biquad-lp [sample-rate :float freq :float q :float]
+    (__biquad_sf (__biquad_coeffs 0 sample-rate freq q 0.0)))
+  ;;; biquad-hp -- resonant second-order high-pass, 12 dB/oct.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   freq        -- cutoff in Hz
+  ;;;   q           -- resonance; 0.7071 is maximally flat
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful). Zero gain at DC; unity at Nyquist.
+  ;;;
+  ;;; Example:
+  ;;;   ((biquad-hp 48000.0 80.0 0.7071) input)
+  (defn biquad-hp [sample-rate :float freq :float q :float]
+    (__biquad_sf (__biquad_coeffs 1 sample-rate freq q 0.0)))
+  ;;; biquad-bp -- second-order band-pass, 0 dB at the center frequency.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   freq        -- center frequency in Hz
+  ;;;   q           -- center / bandwidth; higher is narrower
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful).
+  ;;;
+  ;;; Example:
+  ;;;   ((biquad-bp 48000.0 1000.0 4.0) noise)
+  (defn biquad-bp [sample-rate :float freq :float q :float]
+    (__biquad_sf (__biquad_coeffs 2 sample-rate freq q 0.0)))
+  ;;; biquad-notch -- second-order band-reject: zero gain at `freq`.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   freq        -- the frequency to remove, in Hz
+  ;;;   q           -- center / bandwidth; higher is narrower
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful). Unity gain at DC and Nyquist.
+  ;;;
+  ;;; Example:
+  ;;;   ((biquad-notch 48000.0 60.0 10.0) input)   ;; remove mains hum
+  (defn biquad-notch [sample-rate :float freq :float q :float]
+    (__biquad_sf (__biquad_coeffs 3 sample-rate freq q 0.0)))
+  ;;; biquad-allpass -- second-order allpass: unit gain, phase turns 360 deg.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   freq        -- where the phase passes -180 deg, in Hz
+  ;;;   q           -- how fast the phase turns around `freq`
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful). The building block of a phaser.
+  ;;;
+  ;;; Example:
+  ;;;   ((biquad-allpass 48000.0 800.0 0.7071) input)
+  (defn biquad-allpass [sample-rate :float freq :float q :float]
+    (__biquad_sf (__biquad_coeffs 4 sample-rate freq q 0.0)))
+  ;;; biquad-peak -- peaking EQ: boost or cut `gain-db` around `freq`.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   freq        -- center frequency in Hz
+  ;;;   q           -- center / bandwidth
+  ;;;   gain-db     -- gain at `freq`; negative cuts. 0 is a pass-through.
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful). Unity gain far from `freq`.
+  ;;;
+  ;;; Example:
+  ;;;   ((biquad-peak 48000.0 3000.0 1.0 6.0) input)   ;; +6 dB presence
+  (defn biquad-peak [sample-rate :float freq :float q :float gain-db :float]
+    (__biquad_sf (__biquad_coeffs 5 sample-rate freq q gain-db)))
+  ;;; biquad-low-shelf -- boost or cut everything below `freq` by `gain-db`.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   freq        -- shelf midpoint in Hz (half the gain, in dB, is reached here)
+  ;;;   q           -- shelf steepness; 0.7071 gives the steepest without overshoot
+  ;;;   gain-db     -- gain at DC
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful). Unity gain at Nyquist.
+  ;;;
+  ;;; Example:
+  ;;;   ((biquad-low-shelf 48000.0 200.0 0.7071 -6.0) input)
+  (defn biquad-low-shelf [sample-rate :float
+                          freq :float
+                          q :float
+                          gain-db :float]
+    (__biquad_sf (__biquad_coeffs 6 sample-rate freq q gain-db)))
+  ;;; biquad-high-shelf -- boost or cut everything above `freq` by `gain-db`.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   freq        -- shelf midpoint in Hz
+  ;;;   q           -- shelf steepness; 0.7071 gives the steepest without overshoot
+  ;;;   gain-db     -- gain at Nyquist
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful). Unity gain at DC.
+  ;;;
+  ;;; Example:
+  ;;;   ((biquad-high-shelf 48000.0 6000.0 0.7071 3.0) input)
+  (defn biquad-high-shelf [sample-rate :float
+                           freq :float
+                           q :float
+                           gain-db :float]
+    (__biquad_sf (__biquad_coeffs 7 sample-rate freq q gain-db)))
+  ;; =============================================================================
+  ;; State-variable filter (trapezoidal / TPT, Simper)
+  ;; =============================================================================
+  ;;; __svf_step -- one SVF step with the cutoff read for this sample.
+  ;;;
+  ;;; State: [0] ic1eq, [1] ic2eq. mode: 0 lp, 1 hp, 2 bp (unity peak), 3 notch.
+  ;;;
+  ;;;   g = tan(pi * fc / sr), k = 1 / q
+  ;;;   a1 = 1 / (1 + g*(g + k)), a2 = g*a1, a3 = g*a2
+  ;;;   v3 = x - ic2eq
+  ;;;   v1 = a1*ic1eq + a2*v3            (band)
+  ;;;   v2 = ic2eq + a2*ic1eq + a3*v3    (low)
+  ;;;   ic1eq = 2*v1 - ic1eq, ic2eq = 2*v2 - ic2eq
+  ;;;   high = x - k*v1 - v2, notch = x - k*v1, band (unity peak) = k*v1
+  (defn __svf_step [state :int
+                    mode :int
+                    sample-rate :float
+                    cutoff :float
+                    q :float
+                    x :float] :float
+    ```c
+    /* __tur_autolink__: -lm */
   extern double tan(double);
   double *s = (double *)(intptr_t)state;
   double f = cutoff;
@@ -480,92 +476,94 @@
     default: return v2;
   }
   ```)
-
-;;; __svf_sf -- shared body of the svf-* constructors.
-(defn __svf_sf [mode :int sample-rate :float ^fat cutoff : (fn [float] float) q :float]
-  (let [mv mode sv sample-rate cv cutoff qv q]
-    (fn [^fat sig : (fn [float] float)]
-      (let [state (__filter_alloc_state)]
-        (fn [t :float] :float
-          (__svf_step state mv sv (cv t) qv (sig t)))))))
-
-;;; svf-lp -- state-variable low-pass, 12 dB/oct, cutoff driven by a signal.
-;;;
-;;; The cutoff signal is sampled at the same `t` as the input, once per
-;;; sample, so an LFO or envelope sweeps the filter. Pass `(constant hz)` for
-;;; a fixed cutoff.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   cutoff      -- Signal of the cutoff in Hz
-;;;   q           -- resonance; 0.7071 is maximally flat, higher rings
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful).
-;;;
-;;; Example:
-;;;   ((svf-lp 48000.0 (constant 800.0) 2.0) saw)
-(defn svf-lp [sample-rate :float ^fat cutoff : (fn [float] float) q :float]
-  (__svf_sf 0 sample-rate cutoff q))
-
-;;; svf-hp -- state-variable high-pass, 12 dB/oct, cutoff driven by a signal.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   cutoff      -- Signal of the cutoff in Hz
-;;;   q           -- resonance
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful).
-;;;
-;;; Example:
-;;;   ((svf-hp 48000.0 (constant 200.0) 0.7071) input)
-(defn svf-hp [sample-rate :float ^fat cutoff : (fn [float] float) q :float]
-  (__svf_sf 1 sample-rate cutoff q))
-
-;;; svf-bp -- state-variable band-pass, unity gain at the center frequency.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   cutoff      -- Signal of the center frequency in Hz
-;;;   q           -- center / bandwidth; higher is narrower
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful).
-;;;
-;;; Example:
-;;;   ((svf-bp 48000.0 sweep 8.0) noise)
-(defn svf-bp [sample-rate :float ^fat cutoff : (fn [float] float) q :float]
-  (__svf_sf 2 sample-rate cutoff q))
-
-;;; svf-notch -- state-variable band-reject, cutoff driven by a signal.
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   cutoff      -- Signal of the rejected frequency in Hz
-;;;   q           -- center / bandwidth; higher is narrower
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful).
-;;;
-;;; Example:
-;;;   ((svf-notch 48000.0 (constant 1000.0) 2.0) input)
-(defn svf-notch [sample-rate :float ^fat cutoff : (fn [float] float) q :float]
-  (__svf_sf 3 sample-rate cutoff q))
-
-;; =============================================================================
-;; Ladder (linear zero-delay-feedback, Zavalishin)
-;; =============================================================================
-
-;;; __ladder_step -- one step of the 4-pole ladder.
-;;;
-;;; Each stage is a trapezoidal one-pole, y = G*u + s/(1+g) with G = g/(1+g).
-;;; Chaining four gives y4 = G^4*u + S, and the feedback u = x - k*y4 is solved
-;;; in closed form: y4 = (G^4*x + S) / (1 + k*G^4). State: the four stage
-;;; integrators.
-(defn __ladder_step [state :int sample-rate :float cutoff :float k :float x :float] :float
-  ```c
-  /* __tur_autolink__: -lm */
+  ;;; __svf_sf -- shared body of the svf-* constructors.
+  (defn __svf_sf [mode :int
+                  sample-rate :float
+                  ^fat cutoff : (fn [float] float)
+                  q :float]
+    (let [mv mode
+          sv sample-rate
+          cv cutoff
+          qv q]
+      (fn [^fat sig : (fn [float] float)]
+        (let [state (__filter_alloc_state)]
+          (fn [t :float] :float (__svf_step state mv sv (cv t) qv (sig t)))))))
+  ;;; svf-lp -- state-variable low-pass, 12 dB/oct, cutoff driven by a signal.
+  ;;;
+  ;;; The cutoff signal is sampled at the same `t` as the input, once per
+  ;;; sample, so an LFO or envelope sweeps the filter. Pass `(constant hz)` for
+  ;;; a fixed cutoff.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   cutoff      -- Signal of the cutoff in Hz
+  ;;;   q           -- resonance; 0.7071 is maximally flat, higher rings
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful).
+  ;;;
+  ;;; Example:
+  ;;;   ((svf-lp 48000.0 (constant 800.0) 2.0) saw)
+  (defn svf-lp [sample-rate :float ^fat cutoff : (fn [float] float) q :float]
+    (__svf_sf 0 sample-rate cutoff q))
+  ;;; svf-hp -- state-variable high-pass, 12 dB/oct, cutoff driven by a signal.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   cutoff      -- Signal of the cutoff in Hz
+  ;;;   q           -- resonance
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful).
+  ;;;
+  ;;; Example:
+  ;;;   ((svf-hp 48000.0 (constant 200.0) 0.7071) input)
+  (defn svf-hp [sample-rate :float ^fat cutoff : (fn [float] float) q :float]
+    (__svf_sf 1 sample-rate cutoff q))
+  ;;; svf-bp -- state-variable band-pass, unity gain at the center frequency.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   cutoff      -- Signal of the center frequency in Hz
+  ;;;   q           -- center / bandwidth; higher is narrower
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful).
+  ;;;
+  ;;; Example:
+  ;;;   ((svf-bp 48000.0 sweep 8.0) noise)
+  (defn svf-bp [sample-rate :float ^fat cutoff : (fn [float] float) q :float]
+    (__svf_sf 2 sample-rate cutoff q))
+  ;;; svf-notch -- state-variable band-reject, cutoff driven by a signal.
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   cutoff      -- Signal of the rejected frequency in Hz
+  ;;;   q           -- center / bandwidth; higher is narrower
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful).
+  ;;;
+  ;;; Example:
+  ;;;   ((svf-notch 48000.0 (constant 1000.0) 2.0) input)
+  (defn svf-notch [sample-rate :float ^fat cutoff : (fn [float] float) q :float]
+    (__svf_sf 3 sample-rate cutoff q))
+  ;; =============================================================================
+  ;; Ladder (linear zero-delay-feedback, Zavalishin)
+  ;; =============================================================================
+  ;;; __ladder_step -- one step of the 4-pole ladder.
+  ;;;
+  ;;; Each stage is a trapezoidal one-pole, y = G*u + s/(1+g) with G = g/(1+g).
+  ;;; Chaining four gives y4 = G^4*u + S, and the feedback u = x - k*y4 is solved
+  ;;; in closed form: y4 = (G^4*x + S) / (1 + k*G^4). State: the four stage
+  ;;; integrators.
+  (defn __ladder_step [state :int
+                       sample-rate :float
+                       cutoff :float
+                       k :float
+                       x :float] :float
+    ```c
+    /* __tur_autolink__: -lm */
   extern double tan(double);
   double *s = (double *)(intptr_t)state;
   double f = cutoff;
@@ -586,31 +584,30 @@
   }
   return u;
   ```)
-
-;;; ladder -- 4-pole (24 dB/oct) resonant low-pass, Moog-style topology.
-;;;
-;;; Linear model: no saturation, so it is exact and level-independent, and the
-;;; passband drops as resonance rises (DC gain 1 / (1 + 4*resonance)) -- follow
-;;; it with `gain` to make up the level. At resonance 1 the loop gain reaches 1
-;;; and the filter rings at the cutoff indefinitely (self-oscillation).
-;;;
-;;; Parameters:
-;;;   sample-rate -- the rate the result will be sampled at, in Hz
-;;;   cutoff      -- Signal of the cutoff in Hz
-;;;   resonance   -- feedback amount, clamped to [0, 1]
-;;;
-;;; Returns:
-;;;   SF Sample Sample (stateful).
-;;;
-;;; Example:
-;;;   ((ladder 48000.0 (constant 1000.0) 0.5) saw)
-(defn ladder [sample-rate :float ^fat cutoff : (fn [float] float) resonance :float]
-  (let [sv sample-rate
-        cv cutoff
-        kv (* 4.0 (if (< resonance 0.0) 0.0 (if (> resonance 1.0) 1.0 resonance)))]
-    (fn [^fat sig : (fn [float] float)]
-      (let [state (__filter_alloc_state)]
-        (fn [t :float] :float
-          (__ladder_step state sv (cv t) kv (sig t)))))))
-
-) ;; end defmodule signal/filter
+  ;;; ladder -- 4-pole (24 dB/oct) resonant low-pass, Moog-style topology.
+  ;;;
+  ;;; Linear model: no saturation, so it is exact and level-independent, and the
+  ;;; passband drops as resonance rises (DC gain 1 / (1 + 4*resonance)) -- follow
+  ;;; it with `gain` to make up the level. At resonance 1 the loop gain reaches 1
+  ;;; and the filter rings at the cutoff indefinitely (self-oscillation).
+  ;;;
+  ;;; Parameters:
+  ;;;   sample-rate -- the rate the result will be sampled at, in Hz
+  ;;;   cutoff      -- Signal of the cutoff in Hz
+  ;;;   resonance   -- feedback amount, clamped to [0, 1]
+  ;;;
+  ;;; Returns:
+  ;;;   SF Sample Sample (stateful).
+  ;;;
+  ;;; Example:
+  ;;;   ((ladder 48000.0 (constant 1000.0) 0.5) saw)
+  (defn ladder [sample-rate :float
+                ^fat cutoff : (fn [float] float)
+                resonance :float]
+    (let [sv sample-rate
+          cv cutoff
+          kv (* 4.0
+               (if (< resonance 0.0) 0.0 (if (> resonance 1.0) 1.0 resonance)))]
+      (fn [^fat sig : (fn [float] float)]
+        (let [state (__filter_alloc_state)]
+          (fn [t :float] :float (__ladder_step state sv (cv t) kv (sig t)))))))) ;; end defmodule signal/filter

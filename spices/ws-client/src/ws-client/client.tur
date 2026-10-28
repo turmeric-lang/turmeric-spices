@@ -40,33 +40,49 @@
 ;; server->client frames are never masked. Fragmented data messages are
 ;; reassembled before being surfaced. Ping frames are answered with a Pong
 ;; automatically and then surfaced to the caller.
-
 (defmodule ws-client/client
   ;; NAME-V0: the connection-handle type, frame view, and frame predicates are
   ;; the canonical ws-core definitions, shared with ws-server. ws-client adds
   ;; only the client-side behaviour (connect / send / recv / close).
-  (import ws-core/conn  :refer [WsConn])
-  (import ws-core/frame :refer [WsFrame
-                                ws-frame-kind ws-frame-data ws-frame-len ws-frame-text
-                                ws-text? ws-binary? ws-ping? ws-pong?
-                                ws-closed? ws-timeout? ws-error?])
-  (export ws-connect ws-connect-with-ca ws-connect-insecure
-          ws-connect-with-subprotocols
-          ws-subprotocol
-          ws-conn-null? ws-last-error
-          ws-send ws-send-bytes ws-send-fragmented ws-recv
-          ws-close ws-free ws-set-timeout)
-
-;; ---------------------------------------------------------------------------
-;; file-scope C: shared types + static helpers.
-;;
-;; Each `defn` inline-C body is emitted into the same translation unit as this
-;; block (the tur-http spice relies on the same property for its file-scope
-;; yyjson include), so the statics below are visible to every op without the
-;; per-defn typedef duplication other spices use.
-;; ---------------------------------------------------------------------------
-```c
-#include <stdint.h>
+  (import ws-core/conn :refer [WsConn])
+  (import ws-core/frame
+    :refer
+    [WsFrame
+     ws-frame-kind
+     ws-frame-data
+     ws-frame-len
+     ws-frame-text
+     ws-text?
+     ws-binary?
+     ws-ping?
+     ws-pong?
+     ws-closed?
+     ws-timeout?
+     ws-error?])
+  (export ws-connect
+    ws-connect-with-ca
+    ws-connect-insecure
+    ws-connect-with-subprotocols
+    ws-subprotocol
+    ws-conn-null?
+    ws-last-error
+    ws-send
+    ws-send-bytes
+    ws-send-fragmented
+    ws-recv
+    ws-close
+    ws-free
+    ws-set-timeout)
+  ;; ---------------------------------------------------------------------------
+  ;; file-scope C: shared types + static helpers.
+  ;;
+  ;; Each `defn` inline-C body is emitted into the same translation unit as this
+  ;; block (the tur-http spice relies on the same property for its file-scope
+  ;; yyjson include), so the statics below are visible to every op without the
+  ;; per-defn typedef duplication other spices use.
+  ;; ---------------------------------------------------------------------------
+  ```c
+  #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -522,28 +538,26 @@ static int ws__handshake(ws_conn_t *c, const char *host, const char *port,
   return 0;
 }
 ```
-
-;; WsConn / WsFrame and the frame accessors + predicates are imported from
-;; ws-core (NAME-V0). ws_conn_t below embeds a ws_frame_t whose layout matches
-;; ws-core/frame's, so ws-recv can hand back a pointer to it as a WsFrame.
-
-;;; ws-connect-impl -- internal core driving every connect entry point.
-;;;
-;;; Parameters:
-;;;   uri      -- a ws:// or wss:// URI string.
-;;;   insecure -- when non-zero, skip TLS certificate verification (the
-;;;               historic, unsafe behaviour; reachable only via
-;;;               ws-connect-insecure).
-;;;   capath   -- a CA bundle file path for verification, or "" to use the
-;;;               platform's system trust store.
-;;;
-;;; ws:// connections ignore `insecure` / `capath` entirely. For wss:// the
-;;; default (insecure=0) installs the trust anchors and enables
-;;; MBEDTLS_SSL_VERIFY_REQUIRED so an invalid or untrusted certificate aborts
-;;; the connect. Private: the three public entry points below fix the policy.
-(defn ws-connect-impl [uri : cstr insecure : int capath : cstr offered : cstr] : WsConn
-  ```c
-  const char *raw = (const char *)uri;
+  ;; WsConn / WsFrame and the frame accessors + predicates are imported from
+  ;; ws-core (NAME-V0). ws_conn_t below embeds a ws_frame_t whose layout matches
+  ;; ws-core/frame's, so ws-recv can hand back a pointer to it as a WsFrame.
+  ;;; ws-connect-impl -- internal core driving every connect entry point.
+  ;;;
+  ;;; Parameters:
+  ;;;   uri      -- a ws:// or wss:// URI string.
+  ;;;   insecure -- when non-zero, skip TLS certificate verification (the
+  ;;;               historic, unsafe behaviour; reachable only via
+  ;;;               ws-connect-insecure).
+  ;;;   capath   -- a CA bundle file path for verification, or "" to use the
+  ;;;               platform's system trust store.
+  ;;;
+  ;;; ws:// connections ignore `insecure` / `capath` entirely. For wss:// the
+  ;;; default (insecure=0) installs the trust anchors and enables
+  ;;; MBEDTLS_SSL_VERIFY_REQUIRED so an invalid or untrusted certificate aborts
+  ;;; the connect. Private: the three public entry points below fix the policy.
+  (defn ws-connect-impl [uri : cstr insecure : int capath : cstr offered : cstr] : WsConn
+    ```c
+    const char *raw = (const char *)uri;
   int use_tls;
   const char *hoststart;
   if (strncmp(raw, "wss://", 6) == 0)      { use_tls = 1; hoststart = raw + 6; }
@@ -664,197 +678,188 @@ static int ws__handshake(ws_conn_t *c, const char *host, const char *port,
   }
   return (int64_t)(intptr_t)c;
   ```)
-
-;;; ws-connect -- open a WebSocket connection to uri with verified TLS.
-;;;
-;;; For wss:// the server certificate is verified against the platform's
-;;; system CA store and the hostname is checked; an untrusted, expired, or
-;;; mismatched certificate makes the connect fail (TLS-V0). ws:// is
-;;; unaffected. To trust a private CA use ws-connect-with-ca; to disable
-;;; verification entirely (development only) use ws-connect-insecure.
-;;;
-;;; Parameters:
-;;;   uri -- a ws:// or wss:// URI string (e.g. "ws://localhost:9000/feed").
-;;;
-;;; Returns:
-;;;   A WsConn handle on success; a null handle on failure (test with
-;;;   ws-conn-null?, then read ws-last-error). wss:// requires the spice to
-;;;   have been built with mbedTLS available.
-;;;
-;;; Example:
-;;;   (let [c (ws-connect "wss://example.com/feed")]
-;;;     (when (not (ws-conn-null? c)) (ws-send c "hi") (ws-free c)))
-;;;
-;;; Since: WC1 (verified-by-default since TLS-V0)
-(defn ws-connect [uri : cstr] : WsConn
-  (ws-connect-impl uri 0 "" ""))
-
-;;; ws-connect-with-ca -- open a wss:// connection verifying against a custom
-;;; CA bundle.
-;;;
-;;; Use this for servers presenting a certificate signed by a private or
-;;; self-signed authority (e.g. an internal dev CA): pass the path to a
-;;; PEM/DER bundle of trusted roots. Verification and hostname checking stay
-;;; on -- only the trust anchors change. For ws:// the CA path is ignored.
-;;;
-;;; Parameters:
-;;;   uri     -- a ws:// or wss:// URI string.
-;;;   ca-path -- filesystem path to a CA certificate bundle.
-;;;
-;;; Returns:
-;;;   A WsConn handle on success; a null handle on failure (test with
-;;;   ws-conn-null?, then read ws-last-error -- e.g. the bundle failed to load).
-;;;
-;;; Example:
-;;;   (ws-connect-with-ca "wss://localhost:8443/socket" "/path/to/dev-ca.pem")
-;;;
-;;; Since: TLS-V0
-(defn ws-connect-with-ca [uri : cstr ca-path : cstr] : WsConn
-  (ws-connect-impl uri 0 ca-path ""))
-
-;;; ws-connect-insecure -- open a wss:// connection WITHOUT verifying the
-;;; server certificate.
-;;;
-;;; UNSAFE: this restores the pre-TLS-V0 behaviour and accepts any
-;;; certificate, so the connection is exposed to man-in-the-middle attackers.
-;;; It exists only as an explicit, greppable opt-out for local development
-;;; against self-signed servers; never use it in production. Prefer
-;;; ws-connect-with-ca with the dev CA bundle instead.
-;;;
-;;; Parameters:
-;;;   uri -- a ws:// or wss:// URI string.
-;;;
-;;; Returns:
-;;;   A WsConn handle on success; a null handle on failure (test with
-;;;   ws-conn-null?, then read ws-last-error).
-;;;
-;;; Since: TLS-V0
-(defn ws-connect-insecure [uri : cstr] : WsConn
-  (ws-connect-impl uri 1 "" ""))
-
-;;; ws-connect-with-subprotocols -- open a verified WebSocket connection that
-;;; advertises one or more application subprotocols (SUB-V0, RFC 6455 1.9).
-;;;
-;;; The `offered` list is sent verbatim as the Sec-WebSocket-Protocol request
-;;; header (a comma-separated list, e.g. "json.v1, msgpack.v1"). Servers pick at
-;;; most one and echo it back; query the negotiated value with ws-subprotocol.
-;;; A server that does not echo the header means "no subprotocol" -- the link
-;;; is still open, ws-subprotocol returns "", and it is the caller's choice
-;;; whether to keep talking or close.
-;;;
-;;; Parameters:
-;;;   uri     -- a ws:// or wss:// URI string.
-;;;   offered -- comma-separated subprotocol list (RFC 6455 1.9 token list).
-;;;
-;;; Returns:
-;;;   A WsConn handle on success; null on failure (read ws-last-error). TLS uses
-;;;   the system CA store, exactly like ws-connect.
-;;;
-;;; Example:
-;;;   (let [c (ws-connect-with-subprotocols "wss://api.example.com/feed"
-;;;                                          "json.v1, msgpack.v1")]
-;;;     (when (not (ws-conn-null? c))
-;;;       (println (ws-subprotocol c))))   ; e.g. "json.v1"
-;;;
-;;; Since: SUB-V0
-(defn ws-connect-with-subprotocols [uri : cstr offered : cstr] : WsConn
-  (ws-connect-impl uri 0 "" offered))
-
-;;; ws-subprotocol -- the application subprotocol the server selected during the
-;;; handshake (SUB-V0).
-;;;
-;;; Returns the value echoed in the server's Sec-WebSocket-Protocol response
-;;; header, or "" when the server did not select a subprotocol (the client did
-;;; not offer one, or the server chose to ignore the offers). Returns static
-;;; storage tied to the WsConn; do not free.
-;;;
-;;; Since: SUB-V0
-(defn ws-subprotocol [conn : WsConn] : cstr
-  ```c
-  if (conn == 0) return (char *)"";
+  ;;; ws-connect -- open a WebSocket connection to uri with verified TLS.
+  ;;;
+  ;;; For wss:// the server certificate is verified against the platform's
+  ;;; system CA store and the hostname is checked; an untrusted, expired, or
+  ;;; mismatched certificate makes the connect fail (TLS-V0). ws:// is
+  ;;; unaffected. To trust a private CA use ws-connect-with-ca; to disable
+  ;;; verification entirely (development only) use ws-connect-insecure.
+  ;;;
+  ;;; Parameters:
+  ;;;   uri -- a ws:// or wss:// URI string (e.g. "ws://localhost:9000/feed").
+  ;;;
+  ;;; Returns:
+  ;;;   A WsConn handle on success; a null handle on failure (test with
+  ;;;   ws-conn-null?, then read ws-last-error). wss:// requires the spice to
+  ;;;   have been built with mbedTLS available.
+  ;;;
+  ;;; Example:
+  ;;;   (let [c (ws-connect "wss://example.com/feed")]
+  ;;;     (when (not (ws-conn-null? c)) (ws-send c "hi") (ws-free c)))
+  ;;;
+  ;;; Since: WC1 (verified-by-default since TLS-V0)
+  (defn ws-connect [uri : cstr] : WsConn (ws-connect-impl uri 0 "" ""))
+  ;;; ws-connect-with-ca -- open a wss:// connection verifying against a custom
+  ;;; CA bundle.
+  ;;;
+  ;;; Use this for servers presenting a certificate signed by a private or
+  ;;; self-signed authority (e.g. an internal dev CA): pass the path to a
+  ;;; PEM/DER bundle of trusted roots. Verification and hostname checking stay
+  ;;; on -- only the trust anchors change. For ws:// the CA path is ignored.
+  ;;;
+  ;;; Parameters:
+  ;;;   uri     -- a ws:// or wss:// URI string.
+  ;;;   ca-path -- filesystem path to a CA certificate bundle.
+  ;;;
+  ;;; Returns:
+  ;;;   A WsConn handle on success; a null handle on failure (test with
+  ;;;   ws-conn-null?, then read ws-last-error -- e.g. the bundle failed to load).
+  ;;;
+  ;;; Example:
+  ;;;   (ws-connect-with-ca "wss://localhost:8443/socket" "/path/to/dev-ca.pem")
+  ;;;
+  ;;; Since: TLS-V0
+  (defn ws-connect-with-ca [uri : cstr ca-path : cstr] : WsConn
+    (ws-connect-impl uri 0 ca-path ""))
+  ;;; ws-connect-insecure -- open a wss:// connection WITHOUT verifying the
+  ;;; server certificate.
+  ;;;
+  ;;; UNSAFE: this restores the pre-TLS-V0 behaviour and accepts any
+  ;;; certificate, so the connection is exposed to man-in-the-middle attackers.
+  ;;; It exists only as an explicit, greppable opt-out for local development
+  ;;; against self-signed servers; never use it in production. Prefer
+  ;;; ws-connect-with-ca with the dev CA bundle instead.
+  ;;;
+  ;;; Parameters:
+  ;;;   uri -- a ws:// or wss:// URI string.
+  ;;;
+  ;;; Returns:
+  ;;;   A WsConn handle on success; a null handle on failure (test with
+  ;;;   ws-conn-null?, then read ws-last-error).
+  ;;;
+  ;;; Since: TLS-V0
+  (defn ws-connect-insecure [uri : cstr] : WsConn (ws-connect-impl uri 1 "" ""))
+  ;;; ws-connect-with-subprotocols -- open a verified WebSocket connection that
+  ;;; advertises one or more application subprotocols (SUB-V0, RFC 6455 1.9).
+  ;;;
+  ;;; The `offered` list is sent verbatim as the Sec-WebSocket-Protocol request
+  ;;; header (a comma-separated list, e.g. "json.v1, msgpack.v1"). Servers pick at
+  ;;; most one and echo it back; query the negotiated value with ws-subprotocol.
+  ;;; A server that does not echo the header means "no subprotocol" -- the link
+  ;;; is still open, ws-subprotocol returns "", and it is the caller's choice
+  ;;; whether to keep talking or close.
+  ;;;
+  ;;; Parameters:
+  ;;;   uri     -- a ws:// or wss:// URI string.
+  ;;;   offered -- comma-separated subprotocol list (RFC 6455 1.9 token list).
+  ;;;
+  ;;; Returns:
+  ;;;   A WsConn handle on success; null on failure (read ws-last-error). TLS uses
+  ;;;   the system CA store, exactly like ws-connect.
+  ;;;
+  ;;; Example:
+  ;;;   (let [c (ws-connect-with-subprotocols "wss://api.example.com/feed"
+  ;;;                                          "json.v1, msgpack.v1")]
+  ;;;     (when (not (ws-conn-null? c))
+  ;;;       (println (ws-subprotocol c))))   ; e.g. "json.v1"
+  ;;;
+  ;;; Since: SUB-V0
+  (defn ws-connect-with-subprotocols [uri : cstr offered : cstr] : WsConn
+    (ws-connect-impl uri 0 "" offered))
+  ;;; ws-subprotocol -- the application subprotocol the server selected during the
+  ;;; handshake (SUB-V0).
+  ;;;
+  ;;; Returns the value echoed in the server's Sec-WebSocket-Protocol response
+  ;;; header, or "" when the server did not select a subprotocol (the client did
+  ;;; not offer one, or the server chose to ignore the offers). Returns static
+  ;;; storage tied to the WsConn; do not free.
+  ;;;
+  ;;; Since: SUB-V0
+  (defn ws-subprotocol [conn : WsConn] : cstr
+    ```c
+    if (conn == 0) return (char *)"";
   ws_conn_t *c = (ws_conn_t *)(intptr_t)conn;
   return c->subproto;
   ```)
-
-;;; ws-conn-null? -- true if `conn` is the failure sentinel from ws-connect.
-;;; Since: WC1
-(defn ws-conn-null? [conn : WsConn] : bool
-  ```c
-  return conn == 0;
+  ;;; ws-conn-null? -- true if `conn` is the failure sentinel from ws-connect.
+  ;;; Since: WC1
+  (defn ws-conn-null? [conn : WsConn] : bool
+    ```c
+    return conn == 0;
   ```)
-
-;;; ws-last-error -- human-readable reason for the most recent failure.
-;;;
-;;; Returns static storage (do not free); meaningful immediately after a
-;;; ws-connect that returned a null handle.
-;;;
-;;; Since: WC1
-(defn ws-last-error [] : cstr
-  ```c
-  return ws__errbuf[0] ? ws__errbuf : (char *)"no error";
+  ;;; ws-last-error -- human-readable reason for the most recent failure.
+  ;;;
+  ;;; Returns static storage (do not free); meaningful immediately after a
+  ;;; ws-connect that returned a null handle.
+  ;;;
+  ;;; Since: WC1
+  (defn ws-last-error [] : cstr
+    ```c
+    return ws__errbuf[0] ? ws__errbuf : (char *)"no error";
   ```)
-
-;;; ws-send -- send a UTF-8 text frame.
-;;;
-;;; Parameters:
-;;;   conn -- WsConn handle.
-;;;   msg  -- null-terminated UTF-8 string.
-;;;
-;;; Returns:
-;;;   Number of bytes handed to the transport, or negative on error.
-;;;
-;;; Since: WC1
-(defn ws-send [conn : WsConn msg : cstr] : int
-  ```c
-  if (conn == 0) return -1;
+  ;;; ws-send -- send a UTF-8 text frame.
+  ;;;
+  ;;; Parameters:
+  ;;;   conn -- WsConn handle.
+  ;;;   msg  -- null-terminated UTF-8 string.
+  ;;;
+  ;;; Returns:
+  ;;;   Number of bytes handed to the transport, or negative on error.
+  ;;;
+  ;;; Since: WC1
+  (defn ws-send [conn : WsConn msg : cstr] : int
+    ```c
+    if (conn == 0) return -1;
   ws_conn_t *c = (ws_conn_t *)(intptr_t)conn;
   const char *m = (const char *)msg;
   return ws__send_frame(c, 0x1, (const unsigned char *)m, m ? strlen(m) : 0);
   ```)
-
-;;; ws-send-bytes -- send a binary frame.
-;;;
-;;; Parameters:
-;;;   conn -- WsConn handle.
-;;;   ptr  -- pointer to the payload buffer.
-;;;   len  -- byte length of the payload.
-;;;
-;;; Returns:
-;;;   Number of bytes handed to the transport, or negative on error.
-;;;
-;;; Since: WC1
-(defn ws-send-bytes [conn : WsConn ptr : ptr<void> len : int] : int
-  ```c
-  if (conn == 0) return -1;
+  ;;; ws-send-bytes -- send a binary frame.
+  ;;;
+  ;;; Parameters:
+  ;;;   conn -- WsConn handle.
+  ;;;   ptr  -- pointer to the payload buffer.
+  ;;;   len  -- byte length of the payload.
+  ;;;
+  ;;; Returns:
+  ;;;   Number of bytes handed to the transport, or negative on error.
+  ;;;
+  ;;; Since: WC1
+  (defn ws-send-bytes [conn : WsConn ptr : ptr<void> len : int] : int
+    ```c
+    if (conn == 0) return -1;
   ws_conn_t *c = (ws_conn_t *)(intptr_t)conn;
   return ws__send_frame(c, 0x2, (const unsigned char *)ptr, (size_t)len);
   ```)
-
-;;; ws-send-fragmented -- send a binary message split across multiple frames
-;;; (FRAG-V0, RFC 6455 5.4).
-;;;
-;;; The payload is sent as a sequence of frames each at most `frame-size` bytes,
-;;; with FIN=0 on every frame except the last. The first frame carries the
-;;; binary opcode (0x2); the rest carry continuation (0x0). For payloads that
-;;; fit in a single frame (len <= frame-size, or frame-size <= 0) this is
-;;; equivalent to ws-send-bytes. The receive side reassembles automatically.
-;;;
-;;; Parameters:
-;;;   conn       -- WsConn handle.
-;;;   ptr        -- payload buffer.
-;;;   len        -- byte length of the payload.
-;;;   frame-size -- max bytes per outbound frame (a value <= 0 sends one frame).
-;;;
-;;; Returns:
-;;;   Total bytes handed to the transport, or negative on error.
-;;;
-;;; Example:
-;;;   (ws-send-fragmented c big-buf 1048576 16384)   ; 1 MiB across 16 KiB frames
-;;;
-;;; Since: FRAG-V0
-(defn ws-send-fragmented [conn : WsConn ptr : ptr<void> len : int frame-size : int] : int
-  ```c
-  if (conn == 0) return -1;
+  ;;; ws-send-fragmented -- send a binary message split across multiple frames
+  ;;; (FRAG-V0, RFC 6455 5.4).
+  ;;;
+  ;;; The payload is sent as a sequence of frames each at most `frame-size` bytes,
+  ;;; with FIN=0 on every frame except the last. The first frame carries the
+  ;;; binary opcode (0x2); the rest carry continuation (0x0). For payloads that
+  ;;; fit in a single frame (len <= frame-size, or frame-size <= 0) this is
+  ;;; equivalent to ws-send-bytes. The receive side reassembles automatically.
+  ;;;
+  ;;; Parameters:
+  ;;;   conn       -- WsConn handle.
+  ;;;   ptr        -- payload buffer.
+  ;;;   len        -- byte length of the payload.
+  ;;;   frame-size -- max bytes per outbound frame (a value <= 0 sends one frame).
+  ;;;
+  ;;; Returns:
+  ;;;   Total bytes handed to the transport, or negative on error.
+  ;;;
+  ;;; Example:
+  ;;;   (ws-send-fragmented c big-buf 1048576 16384)   ; 1 MiB across 16 KiB frames
+  ;;;
+  ;;; Since: FRAG-V0
+  (defn ws-send-fragmented [conn : WsConn
+                            ptr : ptr<void>
+                            len : int
+                            frame-size : int] : int
+    ```c
+    if (conn == 0) return -1;
   ws_conn_t *c = (ws_conn_t *)(intptr_t)conn;
   const unsigned char *p = (const unsigned char *)ptr;
   size_t total = (size_t)len;
@@ -879,24 +884,23 @@ static int ws__handshake(ws_conn_t *c, const char *host, const char *port,
   }
   return (int64_t)sent;
   ```)
-
-;;; ws-recv -- receive the next WebSocket message.
-;;;
-;;; Blocks until a complete (possibly reassembled) message arrives, or the
-;;; receive timeout fires. Ping frames are answered with a Pong automatically
-;;; and then surfaced; Pong and Close frames are surfaced to the caller.
-;;;
-;;; Parameters:
-;;;   conn -- WsConn handle.
-;;;
-;;; Returns:
-;;;   A WsFrame handle (a view valid until the next ws-recv / ws-free). Its
-;;;   kind is :text / :binary / :ping / :pong / :close / :timeout / :error.
-;;;
-;;; Since: WC1
-(defn ws-recv [conn : WsConn] : WsFrame
-  ```c
-  if (conn == 0) return 0;
+  ;;; ws-recv -- receive the next WebSocket message.
+  ;;;
+  ;;; Blocks until a complete (possibly reassembled) message arrives, or the
+  ;;; receive timeout fires. Ping frames are answered with a Pong automatically
+  ;;; and then surfaced; Pong and Close frames are surfaced to the caller.
+  ;;;
+  ;;; Parameters:
+  ;;;   conn -- WsConn handle.
+  ;;;
+  ;;; Returns:
+  ;;;   A WsFrame handle (a view valid until the next ws-recv / ws-free). Its
+  ;;;   kind is :text / :binary / :ping / :pong / :close / :timeout / :error.
+  ;;;
+  ;;; Since: WC1
+  (defn ws-recv [conn : WsConn] : WsFrame
+    ```c
+    if (conn == 0) return 0;
   ws_conn_t *c = (ws_conn_t *)(intptr_t)conn;
   c->rlen = 0;
   if (c->rbuf) c->rbuf[0] = '\0';
@@ -953,17 +957,16 @@ static int ws__handshake(ws_conn_t *c, const char *host, const char *port,
     /* else: not final -- keep reading continuation frames */
   }
   ```)
-
-;;; ws-close -- initiate the WebSocket closing handshake.
-;;;
-;;; Sends a Close frame, drains until the peer's Close echo (best-effort,
-;;; bounded), then closes the underlying socket. The handle's memory is still
-;;; owned by the caller -- call ws-free afterward.
-;;;
-;;; Since: WC1
-(defn ws-close [conn : WsConn] : void
-  ```c
-  if (conn == 0) return;
+  ;;; ws-close -- initiate the WebSocket closing handshake.
+  ;;;
+  ;;; Sends a Close frame, drains until the peer's Close echo (best-effort,
+  ;;; bounded), then closes the underlying socket. The handle's memory is still
+  ;;; owned by the caller -- call ws-free afterward.
+  ;;;
+  ;;; Since: WC1
+  (defn ws-close [conn : WsConn] : void
+    ```c
+    if (conn == 0) return;
   ws_conn_t *c = (ws_conn_t *)(intptr_t)conn;
   ws__send_frame(c, 0x8, NULL, 0);
   for (int i = 0; i < 8; i++) {
@@ -974,16 +977,15 @@ static int ws__handshake(ws_conn_t *c, const char *host, const char *port,
   }
   if (c->fd >= 0) { close(c->fd); c->fd = -1; }
   ```)
-
-;;; ws-free -- unconditionally release all resources for conn.
-;;;
-;;; Closes the fd if still open, tears down any TLS state, and frees the
-;;; handle. Safe on a null handle.
-;;;
-;;; Since: WC1
-(defn ws-free [conn : WsConn] : void
-  ```c
-  if (conn == 0) return;
+  ;;; ws-free -- unconditionally release all resources for conn.
+  ;;;
+  ;;; Closes the fd if still open, tears down any TLS state, and frees the
+  ;;; handle. Safe on a null handle.
+  ;;;
+  ;;; Since: WC1
+  (defn ws-free [conn : WsConn] : void
+    ```c
+    if (conn == 0) return;
   ws_conn_t *c = (ws_conn_t *)(intptr_t)conn;
   #ifdef __TUR_WS_TLS
   if (c->is_tls && c->tls) {
@@ -1000,30 +1002,27 @@ static int ws__handshake(ws_conn_t *c, const char *host, const char *port,
   if (c->rbuf) free(c->rbuf);
   free(c);
   ```)
-
-;;; ws-set-timeout -- set the receive timeout in milliseconds.
-;;;
-;;; A value of 0 disables the timeout (ws-recv blocks indefinitely). When the
-;;; timeout fires, ws-recv returns a frame whose kind is :timeout.
-;;;
-;;; Parameters:
-;;;   conn -- WsConn handle.
-;;;   ms   -- timeout in milliseconds.
-;;;
-;;; Since: WC3
-(defn ws-set-timeout [conn : WsConn ms : int] : void
-  ```c
-  if (conn == 0) return;
+  ;;; ws-set-timeout -- set the receive timeout in milliseconds.
+  ;;;
+  ;;; A value of 0 disables the timeout (ws-recv blocks indefinitely). When the
+  ;;; timeout fires, ws-recv returns a frame whose kind is :timeout.
+  ;;;
+  ;;; Parameters:
+  ;;;   conn -- WsConn handle.
+  ;;;   ms   -- timeout in milliseconds.
+  ;;;
+  ;;; Since: WC3
+  (defn ws-set-timeout [conn : WsConn ms : int] : void
+    ```c
+    if (conn == 0) return;
   ws_conn_t *c = (ws_conn_t *)(intptr_t)conn;
   struct timeval tv;
   tv.tv_sec  = (time_t)(ms / 1000);
   tv.tv_usec = (suseconds_t)((ms % 1000) * 1000);
   setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   ```)
-
-;; ws-accept-key and the WsFrame accessors / predicates now live in ws-core
-;; (NAME-V0) and are imported above. ws-client keeps its own internal SHA-1 +
-;; base64 (ws__sha1 / ws__b64 / ws__accept) for the handshake verification in
-;; ws__handshake; the exported, tested entry point is ws-core's ws-accept-key.
-
-) ;; end defmodule ws-client/client
+  ;; ws-accept-key and the WsFrame accessors / predicates now live in ws-core
+  ;; (NAME-V0) and are imported above. ws-client keeps its own internal SHA-1 +
+  ;; base64 (ws__sha1 / ws__b64 / ws__accept) for the handshake verification in
+  ;; ws__handshake; the exported, tested entry point is ws-core's ws-accept-key.
+  ) ;; end defmodule ws-client/client

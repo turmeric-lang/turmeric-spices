@@ -13,82 +13,74 @@
 ;;      whichever side is last frees the cell).
 ;;
 ;; main returns the failed-assertion count.
-
 (defmodule thread-pool/tests/future
-  (import thread-pool/pool   :refer [Pool pool-new pool-stop])
-  (import thread-pool/future :refer [Future pool-submit-future
-                                     future-await future-try future-cancel])
-
-```c
-#include <pthread.h>
+  (import thread-pool/pool :refer [Pool pool-new pool-stop])
+  (import thread-pool/future
+    :refer
+    [Future pool-submit-future future-await future-try future-cancel])
+  ```c
+  #include <pthread.h>
 static pthread_mutex_t gate_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  gate_cv = PTHREAD_COND_INITIALIZER;
 static int             gate_open_flag = 0;
 ```
-(defn gate-reset [] : void ```c pthread_mutex_lock(&gate_mu); gate_open_flag = 0; pthread_mutex_unlock(&gate_mu); ```)
-(defn gate-wait  [] : void ```c pthread_mutex_lock(&gate_mu); while(!gate_open_flag) pthread_cond_wait(&gate_cv,&gate_mu); pthread_mutex_unlock(&gate_mu); ```)
-(defn gate-open  [] : void ```c pthread_mutex_lock(&gate_mu); gate_open_flag=1; pthread_cond_broadcast(&gate_cv); pthread_mutex_unlock(&gate_mu); ```)
-
-(defn fail-if [cond : bool label : cstr] : int
-  (if cond (do (println label) 1) 0))
-
-;; Pool callback is unused by futures, but pool-new needs one to pin T = int.
-(defn noop [x : int] : void nil)
-
-;; The future task: a result that can only come from the task running.
-(defn work-add-1000 [x : int] : int (+ x 1000))
-
-;; A task that parks on the gate before producing, so future-try observes none.
-(defn work-gated [x : int] : int (do (gate-wait) (+ x 1)))
-
-;; spin-until-set -- poll future-try until it yields some, return that value.
-(defn spin-until-set [^borrow f : (Future int)] : int
-  (let [o (future-try f)]
-    (if (some? o) (unwrap o) (spin-until-set f))))
-
-;; Case 1: four futures, await all, sum == (1+2+3+4) + 4*1000 = 4010.
-(defn case-fanout [] : int
-  (let [p (pool-new 4 noop)]
-    (let [f1 (pool-submit-future p 1 work-add-1000)]
-      (let [f2 (pool-submit-future p 2 work-add-1000)]
-        (let [f3 (pool-submit-future p 3 work-add-1000)]
-          (let [f4 (pool-submit-future p 4 work-add-1000)]
-            (let [s (+ (future-await f1)
-                       (+ (future-await f2)
-                          (+ (future-await f3)
-                             (future-await f4))))]
-              (do (pool-stop p)
+  (defn gate-reset [] : void
+    ```c pthread_mutex_lock(&gate_mu); gate_open_flag = 0; pthread_mutex_unlock(&gate_mu); ```)
+  (defn gate-wait [] : void
+    ```c pthread_mutex_lock(&gate_mu); while(!gate_open_flag) pthread_cond_wait(&gate_cv,&gate_mu); pthread_mutex_unlock(&gate_mu); ```)
+  (defn gate-open [] : void
+    ```c pthread_mutex_lock(&gate_mu); gate_open_flag=1; pthread_cond_broadcast(&gate_cv); pthread_mutex_unlock(&gate_mu); ```)
+  (defn fail-if [cond : bool label : cstr] : int
+    (if cond (do (println label) 1) 0))
+  ;; Pool callback is unused by futures, but pool-new needs one to pin T = int.
+  (defn noop [x : int] : void nil)
+  ;; The future task: a result that can only come from the task running.
+  (defn work-add-1000 [x : int] : int (+ x 1000))
+  ;; A task that parks on the gate before producing, so future-try observes none.
+  (defn work-gated [x : int] : int (do (gate-wait) (+ x 1)))
+  ;; spin-until-set -- poll future-try until it yields some, return that value.
+  (defn spin-until-set [^borrow f : (Future int)] : int
+    (let [o (future-try f)] (if (some? o) (unwrap o) (spin-until-set f))))
+  ;; Case 1: four futures, await all, sum == (1+2+3+4) + 4*1000 = 4010.
+  (defn case-fanout [] : int
+    (let [p (pool-new 4 noop)]
+      (let [f1 (pool-submit-future p 1 work-add-1000)]
+        (let [f2 (pool-submit-future p 2 work-add-1000)]
+          (let [f3 (pool-submit-future p 3 work-add-1000)]
+            (let [f4 (pool-submit-future p 4 work-add-1000)]
+              (let [s (+ (future-await f1)
+                        (+ (future-await f2)
+                          (+ (future-await f3) (future-await f4))))]
+                (do
+                  (pool-stop p)
                   (fail-if (not= s 4010) "FAIL: fan-out sum != 4010")))))))))
-
-;; Case 2: future-try is none while the worker is parked, some after release.
-(defn case-try [] : int
-  (do
-    (gate-reset)
-    (let [p (pool-new 1 noop)]
-      (let [f (pool-submit-future p 41 work-gated)]
-        (let [before (fail-if (some? (future-try f)) "FAIL: future-try some before run")]
-          (do
-            (gate-open)
-            (let [v (spin-until-set f)]
-              (let [after (+ before (fail-if (not= v 42) "FAIL: future-try value != 42"))]
-                (do (future-await f)   ;; consume the future
+  ;; Case 2: future-try is none while the worker is parked, some after release.
+  (defn case-try [] : int
+    (do
+      (gate-reset)
+      (let [p (pool-new 1 noop)]
+        (let [f (pool-submit-future p 41 work-gated)]
+          (let [before (fail-if (some? (future-try f))
+                         "FAIL: future-try some before run")]
+            (do
+              (gate-open)
+              (let [v (spin-until-set f)]
+                (let [after (+ before
+                              (fail-if (not= v 42)
+                                "FAIL: future-try value != 42"))]
+                  (do
+                    (future-await f) ;; consume the future
                     (pool-stop p)
                     after)))))))))
-
-;; Case 3: cancel a future without awaiting; program completes cleanly.
-(defn case-cancel [] : int
-  (let [p (pool-new 2 noop)]
-    (let [f (pool-submit-future p 9 work-add-1000)]
-      (do
-        (future-cancel f)   ;; drop without awaiting
-        (pool-stop p)       ;; worker still runs the task + frees its ref
-        0))))
-
-(defn main [] : int
-  (let [f (+ (case-fanout) (+ (case-try) (case-cancel)))]
-    (if (= f 0)
-      (println "PASS future")
-      (println "future: failures above"))
-    f))
-
-) ;; end defmodule thread-pool/tests/future
+  ;; Case 3: cancel a future without awaiting; program completes cleanly.
+  (defn case-cancel [] : int
+    (let [p (pool-new 2 noop)]
+      (let [f (pool-submit-future p 9 work-add-1000)]
+        (do
+          (future-cancel f) ;; drop without awaiting
+          (pool-stop p) ;; worker still runs the task + frees its ref
+          0))))
+  (defn main [] : int
+    (let [f (+ (case-fanout) (+ (case-try) (case-cancel)))]
+      (if (= f 0) (println "PASS future") (println "future: failures above"))
+      f))) ;; end defmodule thread-pool/tests/future

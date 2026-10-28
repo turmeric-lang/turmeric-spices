@@ -5,21 +5,21 @@
 ;; value / store contents across requests. Also exercises a signed-cookie
 ;; round-trip end to end (S0) since the rotate path re-signs the new ID.
 (defmodule session/tests/rotate
-  (import test/suite  :refer [describe it])
+  (import test/suite :refer [describe it])
   (import test/assert :refer [assert-true assert-eq])
   (import test/runner :refer [run-all-status])
   (import session/memory-store :refer [memory-store-new memory-store-count])
-  (import session/config       :refer [dev-session-config with-signing-key])
-  (import session/mw           :refer [session-mw session-flush])
-  (import session/ctx          :refer [session-get session-set! session-id
-                                       session-rotate!])
-  (import tourist/param        :refer [tourist-ctx-new tourist-ctx-free])
-  (import tourist/types        :refer [Ctx])
-  (import tourist/helpers      :refer [text])
-  (import httpd/types          :refer [Response])
-
-```c
-/* Leak detection is off for this suite.  It fabricates requests, contexts
+  (import session/config :refer [dev-session-config with-signing-key])
+  (import session/mw :refer [session-mw session-flush])
+  (import session/ctx
+    :refer
+    [session-get session-set! session-id session-rotate!])
+  (import tourist/param :refer [tourist-ctx-new tourist-ctx-free])
+  (import tourist/types :refer [Ctx])
+  (import tourist/helpers :refer [text])
+  (import httpd/types :refer [Response])
+  ```c
+  /* Leak detection is off for this suite.  It fabricates requests, contexts
    and responses it never frees, and installs a store and config per case
    (session-mw); none of that was checked until session/ctx began importing
    tourist/request (tourist-on-stdlib-httpd H5), which links libturi and so
@@ -28,32 +28,28 @@
 const char *__asan_default_options(void);
 const char *__asan_default_options(void) { return "detect_leaks=0"; }
 ```
-
-(defn seq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+  (defn seq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn cdup [s : cstr] : cstr
-  ```c
-  #include <string.h>
+  (defn cdup [s : cstr] : cstr
+    ```c
+    #include <string.h>
   return (const char *)strdup((const char *)s);
   ```)
-
-(defn cookie-of [val : cstr] : cstr
-  ```c
-  #include <stdlib.h>
+  (defn cookie-of [val : cstr] : cstr
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   const char *i = (const char *)val;
   char *out = malloc(strlen(i) + 16);
   sprintf(out, "tur_session=%s", i);
   return (const char *)out;
   ```)
-
-(defn fake-req [cookie : cstr] : int
-  ```c
-  #include <stdlib.h>
+  (defn fake-req [cookie : cstr] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   struct __httpd_req {
     char *method; char *path; char *query; char *body;
@@ -71,102 +67,97 @@ const char *__asan_default_options(void) { return "detect_leaks=0"; }
   r->body_len = 0;
   return (int64_t)(intptr_t)r;
   ```)
-
-(defn mk-ctx [cookie : cstr] : Ctx
-  (:: (tourist-ctx-new (fake-req cookie) 0) :Ctx))
-
-(defn got-val? [r : (Result cstr cstr) want : cstr] : bool
-  (if (ok? r) (seq? (ok-val r) want) false))
-
-(defn main [] : int
- (do
-  (describe "session/rotate"
-    (it "rotate changes the id but preserves the data"
-      (let [s (memory-store-new)
-            _ (session-mw s (dev-session-config))
-            c (mk-ctx "")]
-        (session-set! c "user_id" "42")
-        (let [before (cdup (session-id c))]
-          (session-rotate! c)
-          (let [after  (cdup (session-id c))
-                moved  (if (seq? before after) false true)
-                kept   (got-val? (session-get c "user_id") "42")]
-            (tourist-ctx-free c)
-            (assert-true (if moved kept false))))))
-
-    (it "after flush only the new id is stored"
-      (let [s (memory-store-new)
-            _ (session-mw s (dev-session-config))
-            c (mk-ctx "")]
-        (session-set! c "k" "v")
-        (session-rotate! c)
-        (let [newid (cdup (session-id c))]
-          (session-flush c (:: (text "ok") :Response))
-          (tourist-ctx-free c)
-          ;; exactly one entry (the new id); the original was deleted.
-          (assert-eq (memory-store-count s) 1))))
-
-    (it "the rotated id loads the carried-over data on the next request"
-      (let [s (memory-store-new)
-            _ (session-mw s (dev-session-config))
-            c (mk-ctx "")]
-        (session-set! c "user_id" "99")
-        (session-rotate! c)
-        (let [newid (cdup (session-id c))]
-          (session-flush c (:: (text "ok") :Response))
-          (tourist-ctx-free c)
-          (let [c2 (mk-ctx (cookie-of newid))
-                ok (got-val? (session-get c2 "user_id") "99")]
-            (tourist-ctx-free c2)
-            (assert-true ok)))))
-
-    (it "a second rotate still leaves exactly one stored entry"
-      (let [s (memory-store-new)
-            _ (session-mw s (dev-session-config))
-            c (mk-ctx "")]
-        (session-set! c "k" "v")
-        (session-rotate! c)
-        (session-rotate! c)            ;; rotate-during-rotate: no orphan
-        (session-flush c (:: (text "ok") :Response))
-        (tourist-ctx-free c)
-        (assert-eq (memory-store-count s) 1)))
-
-    (it "rotating an established session deletes the original entry"
-      (let [s (memory-store-new)
-            _ (session-mw s (dev-session-config))
-            c0 (mk-ctx "")]
-        ;; establish a session under id0
-        (session-set! c0 "user_id" "7")
-        (let [id0 (cdup (session-id c0))]
-          (session-flush c0 (:: (text "ok") :Response))
-          (tourist-ctx-free c0)
-          (assert-eq (memory-store-count s) 1)
-          ;; come back, rotate, flush -> still one entry, but a different id
-          (let [c1 (mk-ctx (cookie-of id0))]
-            (session-rotate! c1)
-            (let [id1 (cdup (session-id c1))]
-              (session-flush c1 (:: (text "ok") :Response))
-              (tourist-ctx-free c1)
-              (let [c2 (mk-ctx (cookie-of id0))   ;; old cookie now unknown
-                    old-gone (if (ok? (session-get c2 "user_id")) false true)]
+  (defn mk-ctx [cookie : cstr] : Ctx
+    (:: (tourist-ctx-new (fake-req cookie) 0) :Ctx))
+  (defn got-val? [r : (Result cstr cstr) want : cstr] : bool
+    (if (ok? r) (seq? (ok-val r) want) false))
+  (defn main [] : int
+    (do
+      (describe "session/rotate"
+        (it "rotate changes the id but preserves the data"
+          (let [s (memory-store-new)
+                _ (session-mw s (dev-session-config))
+                c (mk-ctx "")]
+            (session-set! c "user_id" "42")
+            (let [before (cdup (session-id c))]
+              (session-rotate! c)
+              (let [after (cdup (session-id c))
+                    moved (if (seq? before after) false true)
+                    kept  (got-val? (session-get c "user_id") "42")]
+                (tourist-ctx-free c)
+                (assert-true (if moved kept false))))))
+        (it "after flush only the new id is stored"
+          (let [s (memory-store-new)
+                _ (session-mw s (dev-session-config))
+                c (mk-ctx "")]
+            (session-set! c "k" "v")
+            (session-rotate! c)
+            (let [newid (cdup (session-id c))]
+              (session-flush c (:: (text "ok") :Response))
+              (tourist-ctx-free c)
+              ;; exactly one entry (the new id); the original was deleted.
+              (assert-eq (memory-store-count s) 1))))
+        (it "the rotated id loads the carried-over data on the next request"
+          (let [s (memory-store-new)
+                _ (session-mw s (dev-session-config))
+                c (mk-ctx "")]
+            (session-set! c "user_id" "99")
+            (session-rotate! c)
+            (let [newid (cdup (session-id c))]
+              (session-flush c (:: (text "ok") :Response))
+              (tourist-ctx-free c)
+              (let [c2 (mk-ctx (cookie-of newid))
+                    ok (got-val? (session-get c2 "user_id") "99")]
                 (tourist-ctx-free c2)
-                (assert-true (if (= (memory-store-count s) 1) old-gone false))))))))
-
-    (it "signed cookies round-trip end to end (S0)"
-      (let [s (memory-store-new)
-            _ (session-mw s (with-signing-key (dev-session-config) "top-secret"))
-            c (mk-ctx "")]
-        (session-set! c "user_id" "42")
-        (let [val (cdup (session-id c))]   ;; bare id; cookie carries id.mac
-          (session-flush c (:: (text "ok") :Response))
-          (tourist-ctx-free c)
-          ;; re-present the SIGNED cookie value (id.mac) by rebuilding it: the
-          ;; flush emitted it, but here we just verify a forged bare id is
-          ;; rejected and a fresh session results.
-          (let [c2 (mk-ctx (cookie-of val))      ;; bare id, no MAC
-                rejected (if (ok? (session-get c2 "user_id")) false true)]
-            (tourist-ctx-free c2)
-            (assert-true rejected))))))
-  (run-all-status)))
-
-) ;; end module
+                (assert-true ok)))))
+        (it "a second rotate still leaves exactly one stored entry"
+          (let [s (memory-store-new)
+                _ (session-mw s (dev-session-config))
+                c (mk-ctx "")]
+            (session-set! c "k" "v")
+            (session-rotate! c)
+            (session-rotate! c) ;; rotate-during-rotate: no orphan
+            (session-flush c (:: (text "ok") :Response))
+            (tourist-ctx-free c)
+            (assert-eq (memory-store-count s) 1)))
+        (it "rotating an established session deletes the original entry"
+          (let [s  (memory-store-new)
+                _  (session-mw s (dev-session-config))
+                c0 (mk-ctx "")]
+            ;; establish a session under id0
+            (session-set! c0 "user_id" "7")
+            (let [id0 (cdup (session-id c0))]
+              (session-flush c0 (:: (text "ok") :Response))
+              (tourist-ctx-free c0)
+              (assert-eq (memory-store-count s) 1)
+              ;; come back, rotate, flush -> still one entry, but a different id
+              (let [c1 (mk-ctx (cookie-of id0))]
+                (session-rotate! c1)
+                (let [id1 (cdup (session-id c1))]
+                  (session-flush c1 (:: (text "ok") :Response))
+                  (tourist-ctx-free c1)
+                  (let [c2       (mk-ctx (cookie-of id0)) ;; old cookie now unknown
+                        old-gone (if (ok? (session-get c2 "user_id"))
+                                   false
+                                   true)]
+                    (tourist-ctx-free c2)
+                    (assert-true (if (= (memory-store-count s) 1)
+                                   old-gone
+                                   false))))))))
+        (it "signed cookies round-trip end to end (S0)"
+          (let [s (memory-store-new)
+                _ (session-mw s
+                    (with-signing-key (dev-session-config) "top-secret"))
+                c (mk-ctx "")]
+            (session-set! c "user_id" "42")
+            (let [val (cdup (session-id c))] ;; bare id; cookie carries id.mac
+              (session-flush c (:: (text "ok") :Response))
+              (tourist-ctx-free c)
+              ;; re-present the SIGNED cookie value (id.mac) by rebuilding it: the
+              ;; flush emitted it, but here we just verify a forged bare id is
+              ;; rejected and a fresh session results.
+              (let [c2       (mk-ctx (cookie-of val)) ;; bare id, no MAC
+                    rejected (if (ok? (session-get c2 "user_id")) false true)]
+                (tourist-ctx-free c2)
+                (assert-true rejected))))))
+      (run-all-status)))) ;; end module

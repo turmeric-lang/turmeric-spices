@@ -44,382 +44,364 @@
 ;;;
 ;;; Since: E0 (defstruct emission); E2 (accessor emission via
 ;;; defcomponent-accessors -- depends on gaps A + E + G)
-
 (defmodule ecs/world
-  (export defcomponent defworld defworld-classes defcomponent-accessors
-          defcomponent-cids
-          defcomponent-class defcomponent-class-instance
-          world-alloc-entity! world-despawn!)
-
-;;; `defcomponent-accessors` lowers to the `StorageOps` class methods
-;;; (`storage-insert!` / `storage-get` / `storage-has?`) rather than the
-;;; hard-coded `dense-*` family, so the generated accessors dispatch by the
-;;; storage handle's type (`(Storage Comp)`). Importing it here registers
-;;; the class + its `(Dense A)` / `(Sparse A)` instances globally, so any
-;;; module that imports `ecs/world` gets the methods the accessor expansion
-;;; emits transitively -- the same way `Component` / `(Storage T)` resolve.
-(import ecs/storage-ops)
-
-;; RE0: real handle types on the entity-bookkeeping surface. The packed
-;; entity handle is `Entity`, and -- since the RE0 storage-side follow-up
-;; (2026-07-26) -- the generated accessors and the storage layer index by
-;; `Slot`, not a bare `:int`. The world's `gens` vector is still passed as
-;; an `:int` carrier (callers hand `(.gens w)`).
-(import ecs/entity :refer [Entity Slot])
-
-
-;;; Component -- the associated-type storage class (E2d-P2).
-;;;
-;;; `(Component T)` has a single associated type member `Storage`, which
-;;; names the concrete storage handle a component lives in. A component
-;;; declares its storage by giving an instance:
-;;;
-;;;   (definstance Component [Pos] (type Storage = (Dense Pos)))
-;;;
-;;; `defworld` then projects each component's field type through `(Storage
-;;; T)` instead of consulting a macro-time storage registry, so the choice
-;;; of backend (dense today; sparse/tag once `StorageOps` lands in E2d-P6)
-;;; is a property of the component, visible on the world's type to every
-;;; consumer.
-;;;
-;;; The class is intentionally **not** in the module's `(export ...)` list:
-;;; typeclasses register globally and become visible to any module that
-;;; imports `ecs/world` (export-list entries are only recognised for
-;;; `defn`/`defmacro`/value-level names). `(Storage T)` and `Component`
-;;; resolve in consumer modules through this transitive visibility.
-;;;
-;;; Since: E2d-P2
-(defclass Component [T]
-  (type Storage : Type))
-
-;;; defcomponent -- register a type as a component (E2d-P4).
-;;;
-;;; `(defcomponent Pos)` lowers to the `Component`/`Storage` instance that
-;;; binds the component to its storage backend; `(defcomponent Pos :storage
-;;; :dense)` is the explicit spelling of the dense default. Dense is the
-;;; only fully-wired backend today -- the `for-each` / accessor surface
-;;; reaches storages through `dense-*`; sparse/tag components carry their
-;;; own hand-rolled worlds until the polymorphic `StorageOps` class lands
-;;; (E2d-P6).
-;;;
-;;; The component type itself must already be a type when `defcomponent`
-;;; runs: a `defstruct` for a payload-carrying component
-;;; (`(defstruct Pos [x : int y : int])`), or a `defopaque` carrier for a
-;;; bare marker component (`(defopaque Health :int)`). `defcomponent` only
-;;; emits the instance; it never (re)defines the type, so it composes with
-;;; either declaration.
-;;;
-;;; Since: E0 (documentation marker); E2d-P4 (emits the Component instance)
-(defmacro defcomponent [T]
-  `(definstance Component [~T]
-     (type Storage = (Dense ~T))))
-
-;;; defcomponent-accessors -- emit `get-<Comp>` / `set-<Comp>!` /
-;;; `has-<Comp>?` for one (world, component) pair. Used internally by
-;;; `defworld`; can also be called directly if a user is mixing
-;;; hand-written and macro-generated parts of a world.
-;;;
-;;; Each accessor dispatches the corresponding `StorageOps` method
-;;; (`storage-insert!` / `storage-get` / `storage-has?`) against the
-;;; storage field named after the component type (`(.Pos w)`, `(.Vel w)`,
-;;; ...). The field's type is `(Storage Comp)`, so the backend is chosen by
-;;; the component's `Component` instance: a `(Dense Comp)` field drives the
-;;; dense instance and a `(Sparse Comp)` field the sparse instance through
-;;; the identical accessor body -- the "swap the backend with one line"
-;;; payoff carried by the type system. The typed-let binding in
-;;; `get-<Comp>` propagates the component type into `storage-get`'s
-;;; associated `Elem` return so struct-by-value components round-trip
-;;; cleanly without a witness arg (unblocked by turmeric's parametric
-;;; struct-element projection landing, 2026-06-19).
-;;;
-;;; **Cap-gated since I4.** `get-<Comp>` takes `^borrow cap :
-;;; (ReadCap Comp)` as its first parameter and `set-<Comp>!` takes
-;;; `^borrow cap : (WriteCap Comp)`.  Borrow (not consume) so a body
-;;; can write the same component many times per tick without re-
-;;; minting; the linear cap is auto-consumed once by `defsystem`'s
-;;; body-end wrapper.  The deviation from the report (which named
-;;; `^linear` on `set-<Comp>!`) is deliberate -- consuming per-call
-;;; would force every loop iteration to re-borrow via a wrapper,
-;;; which the report itself flags as an ergonomic risk.  The plan's
-;;; load-bearing claim ("writing a component you didn't list is a
-;;; compile-time error") is met as soon as the cap type-gates the
-;;; accessor: a body that never declared `:writes [Vel]` has no
-;;; `(WriteCap Vel)` in scope, so the `set-Vel!` call fails to
-;;; elaborate.
-;;;
-;;; Required imports at the call site:
-;;;   (import ecs/cap :refer [WriteCap ReadCap])
-;;; The `StorageOps` methods the expansion emits arrive transitively via
-;;; `(import ecs/world)` (which imports `ecs/storage-ops`), so the call
-;;; site needs no separate storage import.
-;;;
-;;; Since: E2 (initial); I4 (cap gating); E2d-P6 (StorageOps routing)
-(defmacro defcomponent-accessors [world-name comp-name]
-  (let [getter (str->sym (str-append "get-"  (symbol-name comp-name)))
-        setter (str->sym (str-append "set-"  (symbol-name comp-name) "!"))
-        haser  (str->sym (str-append "has-"  (symbol-name comp-name) "?"))
-        field  (dot-sym comp-name)]
-    `(do
-       (defn ~getter [^borrow cap : (ReadCap  ~comp-name)
-                      ^borrow w   : ~world-name
-                      e           : Slot]
-                    : ~comp-name
-         (let [p : ~comp-name (storage-get (~field w) e)] p))
-       (defn ~setter [^borrow cap : (WriteCap ~comp-name)
-                      ^borrow w   : ~world-name
-                      e           : Slot
-                      v           : ~comp-name]
-                    : nil
-         (storage-insert! (~field w) e v))
-       (defn ~haser [^borrow w : ~world-name e : Slot] : bool
-         (storage-has? (~field w) e)))))
-
-;;; world-fields -- expand a component vector into the flat
-;;; `Comp : (Storage Comp)` field triples a `defstruct` body wants.
-;;;
-;;; Recurses over `comps`, emitting three tokens per component
-;;; (`name`, `:`, `(Storage name)`) and splicing the tail in via `~@`.
-;;; Because each recursion contributes a *flat* run of tokens rather than
-;;; a nested `[name : type]` group, the whole sequence splices straight
-;;; into `defworld`'s field vector as valid `name : type` pairs.
-;;;
-;;; This is the macro-eval-time computation that collapses the former
-;;; `defworld--0..5` per-arity cascade: it requires both `~@`-splice into
-;;; a vector literal (turmeric
-;;; `docs/archive/quasiquote-splice-into-vector-unsupported.md`) and a
-;;; nested user-macro call inside a splice expression (turmeric
-;;; `docs/archive/ct-macro-evaluator-no-function-call-in-splice.md`),
-;;; both of which landed 2026-06-17. It is intentionally not exported:
-;;; macros resolve in their defining module's scope at expansion time, so
-;;; consumers that `(import ecs/world :refer [defworld])` get the helper
-;;; transitively without naming it.
-;;;
-;;; Since: E2d-P5b (cascade collapse)
-(defmacro world-fields [comps]
-  (if (empty? comps)
-    `()
-    `(~(first comps) : (Storage ~(first comps))
-      ~@(world-fields (rest comps)))))
-
-;;; defworld -- declare a closed world type carrying typed storages.
-;;;
-;;; Syntax:
-;;;   (defworld Name [Comp1 Comp2 ...])     ;; any number of components
-;;;
-;;; Lowers to a defstruct only. Per-component accessors are emitted
-;;; separately via `defcomponent-accessors`; see this module's top
-;;; docstring for the rationale.
-;;;
-;;; E2d-P5: each component field is typed `(Storage ~Comp)` -- the
-;;; associated-type projection on the `Component` class -- rather than the
-;;; old hard-coded `: int`. With a `(defcomponent Comp)` instance in scope,
-;;; `(Storage Comp)` reduces to `(Dense Comp)`, so the world struct now
-;;; records each component's storage backend on its type. A component used
-;;; in a `defworld` must therefore be a real type with a `Component`
-;;; instance (a `defstruct` or a `(defopaque Marker :int)` plus
-;;; `(defcomponent Marker)`), where E0 allowed bare-int markers.
-;;;
-;;; E2d-P5b: the former `defworld--0..5` per-arity cascade is collapsed
-;;; into one variadic body that computes its field list with the
-;;; `world-fields` helper macro and splices it into the `defstruct` field
-;;; vector. Arity is no longer capped at five -- a world may carry any
-;;; number of components (see `tests/spawn1k-wide.tur`, which builds an
-;;; eight-component world). The collapse depends on two turmeric fixes
-;;; that landed 2026-06-17: `~@`-splice into a vector literal and a nested
-;;; user-macro call from inside a splice expression.
-;;;
-;;; Since: E0 (1..4 components); E1 (5 components); E2d-P5 ((Storage T)
-;;; fields); E2d-P5b (variadic, uncapped arity)
-(defmacro defworld [name comps]
-  `(defstruct ~name [gens : int ~@(world-fields comps)]))
-
-;;; defcomponent-cids--from -- internal helper. Walks a component
-;;; vector and emits `(def <Comp>-cid <idx>)` for each entry, starting
-;;; from `idx`. Returns a flat list of `def` forms that
-;;; `defcomponent-cids` splices into a `do`.
-(defmacro defcomponent-cids--from [comps idx]
-  (if (empty? comps)
-    `()
-    `((def ~(str->sym (str-append (symbol-name (first comps)) "-cid")) ~idx)
-      ~@(defcomponent-cids--from (rest comps) (+ idx 1)))))
-
-;;; defcomponent-cids -- emit `(def <Comp>-cid N)` for each component
-;;; in `comps`, numbered in declaration order starting at 0.
-;;;
-;;; Syntax:
-;;;   (defcomponent-cids [Pos Vel Sprite])
-;;;     ;; emits:
-;;;     ;;   (def Pos-cid    0)
-;;;     ;;   (def Vel-cid    1)
-;;;     ;;   (def Sprite-cid 2)
-;;;
-;;; Cids are per-world: the conflict key used by every scheduler in this
-;;; spice is `(world, cid)`, so two distinct worlds may legitimately
-;;; assign `0` to different components. Pair one `defcomponent-cids` call
-;;; with each `defworld` / `sized-defworld-mono` to retire the
-;;; hand-numbered `(def Pos-cid 0)` / `(def Vel-cid 1)` boilerplate that
-;;; every cross-world setup previously had to keep in sync by hand.
-;;;
-;;; **Numbering is stable per `:components` order; reordering is a
-;;; breaking change to any external consumer of cid numbers** (persisted
-;;; save files, on-the-wire formats, manually-written caps that hold a
-;;; raw cid). Re-order with care.
-;;;
-;;; Since: GEN-V0
-(defmacro defcomponent-cids [comps]
-  `(do ~@(defcomponent-cids--from comps 0)))
-
-;;; defcomponent-class -- declare a `Has<Comp>` typeclass with one
-;;; method `<Comp>-storage-of` that returns the component's dense
-;;; storage handle from any world that has the component.
-;;;
-;;; Syntax:
-;;;   (defcomponent-class Pos)
-;;;     ;; emits: (defclass HasPos [W]
-;;;     ;;          (Pos-storage-of [^borrow w] : int))
-;;;
-;;; Per-world instances are emitted by `defcomponent-class-instance`
-;;; (one per (world, component) pair). Once both are in scope, the
-;;; method `(Pos-storage-of w)` dispatches by the receiver's runtime
-;;; type to return the right field of the world struct.
-;;;
-;;; *Monomorphic* call sites work today; the polymorphic-wrapper
-;;; surface (the ECS plan's "typeclass-bounded systems") needs more
-;;; elaborator work -- see gap H in the prereq plan. The class is
-;;; declared with an untyped `[^borrow w]` parameter rather than `[w :
-;;; W]` for the same reason; the typed-parameter shape is what trips
-;;; the gap H item 2 SEGV (now bailing with a clean diagnostic but
-;;; still not functioning).
-;;;
-;;; Since: E2 (depends on gap A + gap E + gap G; SEGV-safe under gap H
-;;; item 2's defensive fix)
-(defmacro defcomponent-class [comp-name]
-  (let [class-name  (str->sym (str-append "Has" (symbol-name comp-name)))
-        method-name (str->sym (str-append (symbol-name comp-name) "-storage-of"))]
-    `(defclass ~class-name [W]
-       (~method-name [^borrow w] : int))))
-
-;;; defcomponent-class-instance -- bind a (world, component) pair into
-;;; the `Has<Comp>` typeclass, threading the method through to the
-;;; world's `.<Comp>` field; also emits per-(World, Comp) cap-mint
-;;; helpers
-;;; `mint-<World>-<Comp>-write-cap` / `mint-<World>-<Comp>-read-cap`
-;;; that produce a freshly-typed `WriteCap<Comp>` / `ReadCap<Comp>`
-;;; from a CID.
-;;;
-;;; The minters are emitted as factory *functions* (not top-level
-;;; `def`s) so the resulting `:linear` `WriteCap<Comp>` value lives
-;;; inside the caller's scope and is consumed there -- emitting a
-;;; top-level `def <Comp>-write-cap (...)` would leave the linear
-;;; value un-consumed and trip TUR-E0100. This is the I2 pragmatic
-;;; deviation from
-;;; `docs/archive/history/ecs-defsystem-write-caps-not-enforced.md` (which
-;;; named a top-level def); callers say
-;;; `(mint-GameWorld-Pos-write-cap pos-cid)` to get a
-;;; `WriteCap<Pos>`.
-;;;
-;;; The mint name carries the world to avoid duplicate-defn errors
-;;; when the same component is registered against multiple worlds
-;;; (e.g. `Pos` against both `GameWorld` and `AltWorld`); this is
-;;; load-bearing for the polymorphic-instance tests today and lines
-;;; up with the semantic fact that a `:reads`/`:writes` set is always
-;;; bound to a single world type at the system site.
-;;;
-;;; Syntax:
-;;;   (defcomponent-class-instance GameWorld Pos)
-;;;     ;; emits:
-;;;     ;;   (definstance HasPos [GameWorld]
-;;;     ;;     (Pos-storage-of [w] (.Pos w)))
-;;;     ;;   (defn mint-GameWorld-Pos-write-cap [cid : int]
-;;;     ;;       : (WriteCap Pos)
-;;;     ;;     (make-write-cap cid))
-;;;     ;;   (defn mint-GameWorld-Pos-read-cap [cid : int]
-;;;     ;;       : (ReadCap Pos)
-;;;     ;;     (make-read-cap cid))
-;;;
-;;; Since: E2 (instance binding); I2 (cap minting)
-(defmacro defcomponent-class-instance [world-name comp-name]
-  (let [class-name       (str->sym (str-append "Has" (symbol-name comp-name)))
-        method-name      (str->sym (str-append (symbol-name comp-name) "-storage-of"))
-        field            (dot-sym comp-name)
-        world-dash-comp  (str-append (symbol-name world-name)
-                                     (str-append "-" (symbol-name comp-name)))
-        mint-write-name  (str->sym (str-append "mint-"
-                                               (str-append world-dash-comp
-                                                           "-write-cap")))
-        mint-read-name   (str->sym (str-append "mint-"
-                                               (str-append world-dash-comp
-                                                           "-read-cap")))]
-    `(do
-       (definstance ~class-name [~world-name]
-         (~method-name [w] (~field w)))
-       (defn ~mint-write-name [cid : int] : (WriteCap ~comp-name)
-         (make-write-cap cid))
-       (defn ~mint-read-name  [cid : int] : (ReadCap  ~comp-name)
-         (make-read-cap  cid)))))
-
-;;; defworld-classes--from -- internal helper. Walks a component vector
-;;; and emits the `Has<Comp>` class plus its `(world, component)`
-;;; instance for each entry. Returns a flat list of forms that
-;;; `defworld-classes` splices into a `do`.
-(defmacro defworld-classes--from [world-name comps]
-  (if (empty? comps)
-    `()
-    `((defcomponent-class ~(first comps))
-      (defcomponent-class-instance ~world-name ~(first comps))
-      ~@(defworld-classes--from world-name (rest comps)))))
-
-;;; defworld-classes -- `defworld`, plus the `Has<Comp>` class and the
-;;; per-(World, Comp) instance for every component in one declaration.
-;;;
-;;; `defworld` already knows its component list at expansion time, so the
-;;; `(defcomponent-class C)` / `(defcomponent-class-instance W C)` pair that
-;;; a typeclass-bounded system needs is derivable rather than hand-written.
-;;; This collapses `1 + 2N` declarations to one.
-;;;
-;;; Parameters:
-;;;   name  -- the world type name
-;;;   comps -- vector of component type names
-;;;
-;;; Example:
-;;;   (defworld-classes GameWorld [Pos Vel])
-;;;     ;; emits:
-;;;     ;;   (defworld GameWorld [Pos Vel])
-;;;     ;;   (defcomponent-class Pos)
-;;;     ;;   (defcomponent-class-instance GameWorld Pos)
-;;;     ;;   (defcomponent-class Vel)
-;;;     ;;   (defcomponent-class-instance GameWorld Vel)
-;;;
-;;; This is a SEPARATE macro rather than a change to `defworld` on
-;;; purpose. The instance expansion emits cap-mint helpers that name
-;;; `ecs/cap` symbols at the call site, so folding it into `defworld`
-;;; would require every existing call site to import
-;;; `WriteCap`/`ReadCap`/`make-write-cap`/`make-read-cap` -- a breaking
-;;; change to a macro whose users overwhelmingly do not touch the
-;;; typeclass surface at all. Use `defworld` when you just want the world
-;;; struct; use this when you also want `Has<Comp>` dispatch.
-;;;
-;;; Callers must import both `ecs/cap` (the four cap symbols above) and
-;;; this module. Redeclaring a component's class is harmless, so two
-;;; worlds may share a component -- each `defworld-classes` re-emits
-;;; `(defcomponent-class C)` and only the instances differ.
-;;;
-;;; Since: ECB step 3 (docs/upcoming/v1/ecs-component-set-bounds-plan.md)
-(defmacro defworld-classes [name comps]
-  `(do
-     (defworld ~name ~comps)
-     ~@(defworld-classes--from name comps)))
-
-;;; world-alloc-entity! -- allocate the next entity slot.
-;;;
-;;; Takes the world's `gens` vec (callers pass `(.gens w)`), grows it by
-;;; one, and returns the new Entity at generation 0.
-;;;
-;;; Since: E0
-;;; RE0: returns a real `Entity` handle rather than a bare `:int`.
-(defn world-alloc-entity! [gens : int] : Entity
-  ```c
-  #include <stdlib.h>
+  (export defcomponent
+    defworld
+    defworld-classes
+    defcomponent-accessors
+    defcomponent-cids
+    defcomponent-class
+    defcomponent-class-instance
+    world-alloc-entity!
+    world-despawn!)
+  ;;; `defcomponent-accessors` lowers to the `StorageOps` class methods
+  ;;; (`storage-insert!` / `storage-get` / `storage-has?`) rather than the
+  ;;; hard-coded `dense-*` family, so the generated accessors dispatch by the
+  ;;; storage handle's type (`(Storage Comp)`). Importing it here registers
+  ;;; the class + its `(Dense A)` / `(Sparse A)` instances globally, so any
+  ;;; module that imports `ecs/world` gets the methods the accessor expansion
+  ;;; emits transitively -- the same way `Component` / `(Storage T)` resolve.
+  (import ecs/storage-ops)
+  ;; RE0: real handle types on the entity-bookkeeping surface. The packed
+  ;; entity handle is `Entity`, and -- since the RE0 storage-side follow-up
+  ;; (2026-07-26) -- the generated accessors and the storage layer index by
+  ;; `Slot`, not a bare `:int`. The world's `gens` vector is still passed as
+  ;; an `:int` carrier (callers hand `(.gens w)`).
+  (import ecs/entity :refer [Entity Slot])
+  ;;; Component -- the associated-type storage class (E2d-P2).
+  ;;;
+  ;;; `(Component T)` has a single associated type member `Storage`, which
+  ;;; names the concrete storage handle a component lives in. A component
+  ;;; declares its storage by giving an instance:
+  ;;;
+  ;;;   (definstance Component [Pos] (type Storage = (Dense Pos)))
+  ;;;
+  ;;; `defworld` then projects each component's field type through `(Storage
+  ;;; T)` instead of consulting a macro-time storage registry, so the choice
+  ;;; of backend (dense today; sparse/tag once `StorageOps` lands in E2d-P6)
+  ;;; is a property of the component, visible on the world's type to every
+  ;;; consumer.
+  ;;;
+  ;;; The class is intentionally **not** in the module's `(export ...)` list:
+  ;;; typeclasses register globally and become visible to any module that
+  ;;; imports `ecs/world` (export-list entries are only recognised for
+  ;;; `defn`/`defmacro`/value-level names). `(Storage T)` and `Component`
+  ;;; resolve in consumer modules through this transitive visibility.
+  ;;;
+  ;;; Since: E2d-P2
+  (defclass Component [T] (type Storage : Type))
+  ;;; defcomponent -- register a type as a component (E2d-P4).
+  ;;;
+  ;;; `(defcomponent Pos)` lowers to the `Component`/`Storage` instance that
+  ;;; binds the component to its storage backend; `(defcomponent Pos :storage
+  ;;; :dense)` is the explicit spelling of the dense default. Dense is the
+  ;;; only fully-wired backend today -- the `for-each` / accessor surface
+  ;;; reaches storages through `dense-*`; sparse/tag components carry their
+  ;;; own hand-rolled worlds until the polymorphic `StorageOps` class lands
+  ;;; (E2d-P6).
+  ;;;
+  ;;; The component type itself must already be a type when `defcomponent`
+  ;;; runs: a `defstruct` for a payload-carrying component
+  ;;; (`(defstruct Pos [x : int y : int])`), or a `defopaque` carrier for a
+  ;;; bare marker component (`(defopaque Health :int)`). `defcomponent` only
+  ;;; emits the instance; it never (re)defines the type, so it composes with
+  ;;; either declaration.
+  ;;;
+  ;;; Since: E0 (documentation marker); E2d-P4 (emits the Component instance)
+  (defmacro defcomponent [T]
+    `(definstance Component [~T] (type Storage = (Dense ~T))))
+  ;;; defcomponent-accessors -- emit `get-<Comp>` / `set-<Comp>!` /
+  ;;; `has-<Comp>?` for one (world, component) pair. Used internally by
+  ;;; `defworld`; can also be called directly if a user is mixing
+  ;;; hand-written and macro-generated parts of a world.
+  ;;;
+  ;;; Each accessor dispatches the corresponding `StorageOps` method
+  ;;; (`storage-insert!` / `storage-get` / `storage-has?`) against the
+  ;;; storage field named after the component type (`(.Pos w)`, `(.Vel w)`,
+  ;;; ...). The field's type is `(Storage Comp)`, so the backend is chosen by
+  ;;; the component's `Component` instance: a `(Dense Comp)` field drives the
+  ;;; dense instance and a `(Sparse Comp)` field the sparse instance through
+  ;;; the identical accessor body -- the "swap the backend with one line"
+  ;;; payoff carried by the type system. The typed-let binding in
+  ;;; `get-<Comp>` propagates the component type into `storage-get`'s
+  ;;; associated `Elem` return so struct-by-value components round-trip
+  ;;; cleanly without a witness arg (unblocked by turmeric's parametric
+  ;;; struct-element projection landing, 2026-06-19).
+  ;;;
+  ;;; **Cap-gated since I4.** `get-<Comp>` takes `^borrow cap :
+  ;;; (ReadCap Comp)` as its first parameter and `set-<Comp>!` takes
+  ;;; `^borrow cap : (WriteCap Comp)`.  Borrow (not consume) so a body
+  ;;; can write the same component many times per tick without re-
+  ;;; minting; the linear cap is auto-consumed once by `defsystem`'s
+  ;;; body-end wrapper.  The deviation from the report (which named
+  ;;; `^linear` on `set-<Comp>!`) is deliberate -- consuming per-call
+  ;;; would force every loop iteration to re-borrow via a wrapper,
+  ;;; which the report itself flags as an ergonomic risk.  The plan's
+  ;;; load-bearing claim ("writing a component you didn't list is a
+  ;;; compile-time error") is met as soon as the cap type-gates the
+  ;;; accessor: a body that never declared `:writes [Vel]` has no
+  ;;; `(WriteCap Vel)` in scope, so the `set-Vel!` call fails to
+  ;;; elaborate.
+  ;;;
+  ;;; Required imports at the call site:
+  ;;;   (import ecs/cap :refer [WriteCap ReadCap])
+  ;;; The `StorageOps` methods the expansion emits arrive transitively via
+  ;;; `(import ecs/world)` (which imports `ecs/storage-ops`), so the call
+  ;;; site needs no separate storage import.
+  ;;;
+  ;;; Since: E2 (initial); I4 (cap gating); E2d-P6 (StorageOps routing)
+  (defmacro defcomponent-accessors [world-name comp-name]
+    (let [getter (str->sym (str-append "get-" (symbol-name comp-name)))
+          setter (str->sym (str-append "set-" (symbol-name comp-name) "!"))
+          haser  (str->sym (str-append "has-" (symbol-name comp-name) "?"))
+          field  (dot-sym comp-name)]
+      `(do
+         (defn ~getter [^borrow cap : (ReadCap ~comp-name)
+                        ^borrow w : ~world-name
+                        e : Slot] : ~comp-name
+           (let [p                          : ~comp-name
+                 (storage-get (~field w) e)]
+             p))
+         (defn ~setter [^borrow cap : (WriteCap ~comp-name)
+                        ^borrow w : ~world-name
+                        e : Slot
+                        v : ~comp-name] : nil
+           (storage-insert! (~field w) e v))
+         (defn ~haser [^borrow w : ~world-name e : Slot] : bool
+           (storage-has? (~field w) e)))))
+  ;;; world-fields -- expand a component vector into the flat
+  ;;; `Comp : (Storage Comp)` field triples a `defstruct` body wants.
+  ;;;
+  ;;; Recurses over `comps`, emitting three tokens per component
+  ;;; (`name`, `:`, `(Storage name)`) and splicing the tail in via `~@`.
+  ;;; Because each recursion contributes a *flat* run of tokens rather than
+  ;;; a nested `[name : type]` group, the whole sequence splices straight
+  ;;; into `defworld`'s field vector as valid `name : type` pairs.
+  ;;;
+  ;;; This is the macro-eval-time computation that collapses the former
+  ;;; `defworld--0..5` per-arity cascade: it requires both `~@`-splice into
+  ;;; a vector literal (turmeric
+  ;;; `docs/archive/quasiquote-splice-into-vector-unsupported.md`) and a
+  ;;; nested user-macro call inside a splice expression (turmeric
+  ;;; `docs/archive/ct-macro-evaluator-no-function-call-in-splice.md`),
+  ;;; both of which landed 2026-06-17. It is intentionally not exported:
+  ;;; macros resolve in their defining module's scope at expansion time, so
+  ;;; consumers that `(import ecs/world :refer [defworld])` get the helper
+  ;;; transitively without naming it.
+  ;;;
+  ;;; Since: E2d-P5b (cascade collapse)
+  (defmacro world-fields [comps]
+    (if (empty? comps)
+      `()
+      `(~(first comps) : (Storage ~(first comps)) ~@(world-fields (rest comps)))))
+  ;;; defworld -- declare a closed world type carrying typed storages.
+  ;;;
+  ;;; Syntax:
+  ;;;   (defworld Name [Comp1 Comp2 ...])     ;; any number of components
+  ;;;
+  ;;; Lowers to a defstruct only. Per-component accessors are emitted
+  ;;; separately via `defcomponent-accessors`; see this module's top
+  ;;; docstring for the rationale.
+  ;;;
+  ;;; E2d-P5: each component field is typed `(Storage ~Comp)` -- the
+  ;;; associated-type projection on the `Component` class -- rather than the
+  ;;; old hard-coded `: int`. With a `(defcomponent Comp)` instance in scope,
+  ;;; `(Storage Comp)` reduces to `(Dense Comp)`, so the world struct now
+  ;;; records each component's storage backend on its type. A component used
+  ;;; in a `defworld` must therefore be a real type with a `Component`
+  ;;; instance (a `defstruct` or a `(defopaque Marker :int)` plus
+  ;;; `(defcomponent Marker)`), where E0 allowed bare-int markers.
+  ;;;
+  ;;; E2d-P5b: the former `defworld--0..5` per-arity cascade is collapsed
+  ;;; into one variadic body that computes its field list with the
+  ;;; `world-fields` helper macro and splices it into the `defstruct` field
+  ;;; vector. Arity is no longer capped at five -- a world may carry any
+  ;;; number of components (see `tests/spawn1k-wide.tur`, which builds an
+  ;;; eight-component world). The collapse depends on two turmeric fixes
+  ;;; that landed 2026-06-17: `~@`-splice into a vector literal and a nested
+  ;;; user-macro call from inside a splice expression.
+  ;;;
+  ;;; Since: E0 (1..4 components); E1 (5 components); E2d-P5 ((Storage T)
+  ;;; fields); E2d-P5b (variadic, uncapped arity)
+  (defmacro defworld [name comps]
+    `(defstruct ~name [gens : int ~@(world-fields comps)]))
+  ;;; defcomponent-cids--from -- internal helper. Walks a component
+  ;;; vector and emits `(def <Comp>-cid <idx>)` for each entry, starting
+  ;;; from `idx`. Returns a flat list of `def` forms that
+  ;;; `defcomponent-cids` splices into a `do`.
+  (defmacro defcomponent-cids--from [comps idx]
+    (if (empty? comps)
+      `()
+      `((def ~(str->sym (str-append (symbol-name (first comps)) "-cid")) ~idx) ~@(defcomponent-cids--from (rest comps)
+                                                                                   (+ idx
+                                                                                     1)))))
+  ;;; defcomponent-cids -- emit `(def <Comp>-cid N)` for each component
+  ;;; in `comps`, numbered in declaration order starting at 0.
+  ;;;
+  ;;; Syntax:
+  ;;;   (defcomponent-cids [Pos Vel Sprite])
+  ;;;     ;; emits:
+  ;;;     ;;   (def Pos-cid    0)
+  ;;;     ;;   (def Vel-cid    1)
+  ;;;     ;;   (def Sprite-cid 2)
+  ;;;
+  ;;; Cids are per-world: the conflict key used by every scheduler in this
+  ;;; spice is `(world, cid)`, so two distinct worlds may legitimately
+  ;;; assign `0` to different components. Pair one `defcomponent-cids` call
+  ;;; with each `defworld` / `sized-defworld-mono` to retire the
+  ;;; hand-numbered `(def Pos-cid 0)` / `(def Vel-cid 1)` boilerplate that
+  ;;; every cross-world setup previously had to keep in sync by hand.
+  ;;;
+  ;;; **Numbering is stable per `:components` order; reordering is a
+  ;;; breaking change to any external consumer of cid numbers** (persisted
+  ;;; save files, on-the-wire formats, manually-written caps that hold a
+  ;;; raw cid). Re-order with care.
+  ;;;
+  ;;; Since: GEN-V0
+  (defmacro defcomponent-cids [comps] `(do ~@(defcomponent-cids--from comps 0)))
+  ;;; defcomponent-class -- declare a `Has<Comp>` typeclass with one
+  ;;; method `<Comp>-storage-of` that returns the component's dense
+  ;;; storage handle from any world that has the component.
+  ;;;
+  ;;; Syntax:
+  ;;;   (defcomponent-class Pos)
+  ;;;     ;; emits: (defclass HasPos [W]
+  ;;;     ;;          (Pos-storage-of [^borrow w] : int))
+  ;;;
+  ;;; Per-world instances are emitted by `defcomponent-class-instance`
+  ;;; (one per (world, component) pair). Once both are in scope, the
+  ;;; method `(Pos-storage-of w)` dispatches by the receiver's runtime
+  ;;; type to return the right field of the world struct.
+  ;;;
+  ;;; *Monomorphic* call sites work today; the polymorphic-wrapper
+  ;;; surface (the ECS plan's "typeclass-bounded systems") needs more
+  ;;; elaborator work -- see gap H in the prereq plan. The class is
+  ;;; declared with an untyped `[^borrow w]` parameter rather than `[w :
+  ;;; W]` for the same reason; the typed-parameter shape is what trips
+  ;;; the gap H item 2 SEGV (now bailing with a clean diagnostic but
+  ;;; still not functioning).
+  ;;;
+  ;;; Since: E2 (depends on gap A + gap E + gap G; SEGV-safe under gap H
+  ;;; item 2's defensive fix)
+  (defmacro defcomponent-class [comp-name]
+    (let [class-name  (str->sym (str-append "Has" (symbol-name comp-name)))
+          method-name (str->sym (str-append (symbol-name comp-name)
+                                  "-storage-of"))]
+      `(defclass ~class-name [W] (~method-name [^borrow w] : int))))
+  ;;; defcomponent-class-instance -- bind a (world, component) pair into
+  ;;; the `Has<Comp>` typeclass, threading the method through to the
+  ;;; world's `.<Comp>` field; also emits per-(World, Comp) cap-mint
+  ;;; helpers
+  ;;; `mint-<World>-<Comp>-write-cap` / `mint-<World>-<Comp>-read-cap`
+  ;;; that produce a freshly-typed `WriteCap<Comp>` / `ReadCap<Comp>`
+  ;;; from a CID.
+  ;;;
+  ;;; The minters are emitted as factory *functions* (not top-level
+  ;;; `def`s) so the resulting `:linear` `WriteCap<Comp>` value lives
+  ;;; inside the caller's scope and is consumed there -- emitting a
+  ;;; top-level `def <Comp>-write-cap (...)` would leave the linear
+  ;;; value un-consumed and trip TUR-E0100. This is the I2 pragmatic
+  ;;; deviation from
+  ;;; `docs/archive/history/ecs-defsystem-write-caps-not-enforced.md` (which
+  ;;; named a top-level def); callers say
+  ;;; `(mint-GameWorld-Pos-write-cap pos-cid)` to get a
+  ;;; `WriteCap<Pos>`.
+  ;;;
+  ;;; The mint name carries the world to avoid duplicate-defn errors
+  ;;; when the same component is registered against multiple worlds
+  ;;; (e.g. `Pos` against both `GameWorld` and `AltWorld`); this is
+  ;;; load-bearing for the polymorphic-instance tests today and lines
+  ;;; up with the semantic fact that a `:reads`/`:writes` set is always
+  ;;; bound to a single world type at the system site.
+  ;;;
+  ;;; Syntax:
+  ;;;   (defcomponent-class-instance GameWorld Pos)
+  ;;;     ;; emits:
+  ;;;     ;;   (definstance HasPos [GameWorld]
+  ;;;     ;;     (Pos-storage-of [w] (.Pos w)))
+  ;;;     ;;   (defn mint-GameWorld-Pos-write-cap [cid : int]
+  ;;;     ;;       : (WriteCap Pos)
+  ;;;     ;;     (make-write-cap cid))
+  ;;;     ;;   (defn mint-GameWorld-Pos-read-cap [cid : int]
+  ;;;     ;;       : (ReadCap Pos)
+  ;;;     ;;     (make-read-cap cid))
+  ;;;
+  ;;; Since: E2 (instance binding); I2 (cap minting)
+  (defmacro defcomponent-class-instance [world-name comp-name]
+    (let [class-name      (str->sym (str-append "Has" (symbol-name comp-name)))
+          method-name     (str->sym (str-append (symbol-name comp-name)
+                                      "-storage-of"))
+          field           (dot-sym comp-name)
+          world-dash-comp (str-append (symbol-name world-name)
+                            (str-append "-" (symbol-name comp-name)))
+          mint-write-name (str->sym (str-append "mint-"
+                                      (str-append world-dash-comp "-write-cap")))
+          mint-read-name  (str->sym (str-append "mint-"
+                                      (str-append world-dash-comp "-read-cap")))]
+      `(do
+         (definstance ~class-name [~world-name] (~method-name [w] (~field w)))
+         (defn ~mint-write-name [cid : int] : (WriteCap ~comp-name)
+           (make-write-cap cid))
+         (defn ~mint-read-name [cid : int] : (ReadCap ~comp-name)
+           (make-read-cap cid)))))
+  ;;; defworld-classes--from -- internal helper. Walks a component vector
+  ;;; and emits the `Has<Comp>` class plus its `(world, component)`
+  ;;; instance for each entry. Returns a flat list of forms that
+  ;;; `defworld-classes` splices into a `do`.
+  (defmacro defworld-classes--from [world-name comps]
+    (if (empty? comps)
+      `()
+      `((defcomponent-class ~(first comps)) (defcomponent-class-instance ~world-name
+                                              ~(first comps))
+         ~@(defworld-classes--from world-name (rest comps)))))
+  ;;; defworld-classes -- `defworld`, plus the `Has<Comp>` class and the
+  ;;; per-(World, Comp) instance for every component in one declaration.
+  ;;;
+  ;;; `defworld` already knows its component list at expansion time, so the
+  ;;; `(defcomponent-class C)` / `(defcomponent-class-instance W C)` pair that
+  ;;; a typeclass-bounded system needs is derivable rather than hand-written.
+  ;;; This collapses `1 + 2N` declarations to one.
+  ;;;
+  ;;; Parameters:
+  ;;;   name  -- the world type name
+  ;;;   comps -- vector of component type names
+  ;;;
+  ;;; Example:
+  ;;;   (defworld-classes GameWorld [Pos Vel])
+  ;;;     ;; emits:
+  ;;;     ;;   (defworld GameWorld [Pos Vel])
+  ;;;     ;;   (defcomponent-class Pos)
+  ;;;     ;;   (defcomponent-class-instance GameWorld Pos)
+  ;;;     ;;   (defcomponent-class Vel)
+  ;;;     ;;   (defcomponent-class-instance GameWorld Vel)
+  ;;;
+  ;;; This is a SEPARATE macro rather than a change to `defworld` on
+  ;;; purpose. The instance expansion emits cap-mint helpers that name
+  ;;; `ecs/cap` symbols at the call site, so folding it into `defworld`
+  ;;; would require every existing call site to import
+  ;;; `WriteCap`/`ReadCap`/`make-write-cap`/`make-read-cap` -- a breaking
+  ;;; change to a macro whose users overwhelmingly do not touch the
+  ;;; typeclass surface at all. Use `defworld` when you just want the world
+  ;;; struct; use this when you also want `Has<Comp>` dispatch.
+  ;;;
+  ;;; Callers must import both `ecs/cap` (the four cap symbols above) and
+  ;;; this module. Redeclaring a component's class is harmless, so two
+  ;;; worlds may share a component -- each `defworld-classes` re-emits
+  ;;; `(defcomponent-class C)` and only the instances differ.
+  ;;;
+  ;;; Since: ECB step 3 (docs/upcoming/v1/ecs-component-set-bounds-plan.md)
+  (defmacro defworld-classes [name comps]
+    `(do (defworld ~name ~comps) ~@(defworld-classes--from name comps)))
+  ;;; world-alloc-entity! -- allocate the next entity slot.
+  ;;;
+  ;;; Takes the world's `gens` vec (callers pass `(.gens w)`), grows it by
+  ;;; one, and returns the new Entity at generation 0.
+  ;;;
+  ;;; Since: E0
+  ;;; RE0: returns a real `Entity` handle rather than a bare `:int`.
+  (defn world-alloc-entity! [gens : int] : Entity
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
   struct __tur_vec { int64_t *data; size_t len; size_t cap; };
@@ -434,25 +416,22 @@
   uint64_t e = ((uint64_t)0 << 32) | ((uint64_t)idx & 0xFFFFFFFFULL);
   return (int64_t)e;
   ```)
-
-;;; world-despawn! -- bump the generation of an entity slot.
-;;;
-;;; Component data in dense storages is *not* cleared; subsequent
-;;; `dense-get` reads still return the old bits. Aliveness is established
-;;; by comparing the handle's generation against `gens[index]`. Returns
-;;; true on success, false if the slot index is out of range.
-;;;
-;;; Since: E0
-;;; RE0: takes a real `Entity` handle rather than a bare `:int`.
-(defn world-despawn! [gens : int e : Entity] : bool
-  ```c
-  #include <stdint.h>
+  ;;; world-despawn! -- bump the generation of an entity slot.
+  ;;;
+  ;;; Component data in dense storages is *not* cleared; subsequent
+  ;;; `dense-get` reads still return the old bits. Aliveness is established
+  ;;; by comparing the handle's generation against `gens[index]`. Returns
+  ;;; true on success, false if the slot index is out of range.
+  ;;;
+  ;;; Since: E0
+  ;;; RE0: takes a real `Entity` handle rather than a bare `:int`.
+  (defn world-despawn! [gens : int e : Entity] : bool
+    ```c
+    #include <stdint.h>
   struct __tur_vec { int64_t *data; size_t len; size_t cap; };
   struct __tur_vec *v = (struct __tur_vec *)(intptr_t)gens;
   uint64_t idx = (uint64_t)e & 0xFFFFFFFFULL;
   if (idx >= v->len) return false;
   v->data[idx] = v->data[idx] + 1;
   return true;
-  ```)
-
-) ;; end defmodule ecs/world
+  ```)) ;; end defmodule ecs/world

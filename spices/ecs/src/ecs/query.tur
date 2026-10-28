@@ -52,229 +52,209 @@
 ;;;
 ;;; Since: E0/E1' (for-each1..3); E1 (Query, for-each4..8, defquery,
 ;;; run-query!, single user-facing for-each dispatcher).
-
 (defmodule ecs/query
   (export for-each
-          for-each1 for-each2 for-each3
-          world-tagged? world-untagged?
-          Query make-query query-world
-          defquery run-query!)
-
-(import ecs/entity :refer [Slot slot-new])
-
-;;; ----------------------------------------------------------------
-;;; Recursive variadic for-each (E1)
-;;;
-;;; Four helper macros walk the component list at expansion time. The
-;;; user-facing `for-each` macro then assembles a single loop with all
-;;; storages bound, the conjunction of dense-has? checks, and the
-;;; value bindings -- spliced inline in the body. No arity cap.
-;;;
-;;; Hygiene: each helper uses `__c` / `__s-name` / `__vname` (double
-;;; underscore prefix) for its compile-time locals so a user binding
-;;; named `c` or `s-name` inside the body does not collide.
-;;;
-;;; `(let [...] ...)` instead of `min`: the stdlib `min` macro is a
-;;; compile-time literal folder; it does not survive being handed the
-;;; (dense-len __s_*) sub-expressions, so __fe-min-cap rolls its own.
-;;; Likewise __fe-has-conj uses `if`/`false` instead of `and`.
-;;; ----------------------------------------------------------------
-
-;;; __fe-storages -- recursive helper: wrap inner in nested `let`s that
-;;; bind `__s_<Comp>` to `(.<Comp> w)` for each component in comps.
-;;; Since: E1
-(defmacro __fe-storages [w comps inner]
-  (if (empty? comps)
-    `~inner
-    (let [__c (first comps)
+    for-each1
+    for-each2
+    for-each3
+    world-tagged?
+    world-untagged?
+    Query
+    make-query
+    query-world
+    defquery
+    run-query!)
+  (import ecs/entity :refer [Slot slot-new])
+  ;;; ----------------------------------------------------------------
+  ;;; Recursive variadic for-each (E1)
+  ;;;
+  ;;; Four helper macros walk the component list at expansion time. The
+  ;;; user-facing `for-each` macro then assembles a single loop with all
+  ;;; storages bound, the conjunction of dense-has? checks, and the
+  ;;; value bindings -- spliced inline in the body. No arity cap.
+  ;;;
+  ;;; Hygiene: each helper uses `__c` / `__s-name` / `__vname` (double
+  ;;; underscore prefix) for its compile-time locals so a user binding
+  ;;; named `c` or `s-name` inside the body does not collide.
+  ;;;
+  ;;; `(let [...] ...)` instead of `min`: the stdlib `min` macro is a
+  ;;; compile-time literal folder; it does not survive being handed the
+  ;;; (dense-len __s_*) sub-expressions, so __fe-min-cap rolls its own.
+  ;;; Likewise __fe-has-conj uses `if`/`false` instead of `and`.
+  ;;; ----------------------------------------------------------------
+  ;;; __fe-storages -- recursive helper: wrap inner in nested `let`s that
+  ;;; bind `__s_<Comp>` to `(.<Comp> w)` for each component in comps.
+  ;;; Since: E1
+  (defmacro __fe-storages [w comps inner]
+    (if (empty? comps)
+      `~inner
+      (let [__c      (first comps)
+            __s-name (str->sym (str-append "__s_" (symbol-name __c)))]
+        `(let [~__s-name (~(dot-sym __c) ~w)]
+           (__fe-storages ~w ~(rest comps) ~inner)))))
+  ;;; __fe-min-cap -- recursive helper: emit a tower of `if/<` that picks
+  ;;; the smallest `(dense-len __s_C)` across all storages.
+  ;;; Since: E1
+  (defmacro __fe-min-cap [comps]
+    (let [__c      (first comps)
           __s-name (str->sym (str-append "__s_" (symbol-name __c)))]
-      `(let [~__s-name (~(dot-sym __c) ~w)]
-         (__fe-storages ~w ~(rest comps) ~inner)))))
-
-;;; __fe-min-cap -- recursive helper: emit a tower of `if/<` that picks
-;;; the smallest `(dense-len __s_C)` across all storages.
-;;; Since: E1
-(defmacro __fe-min-cap [comps]
-  (let [__c (first comps)
-        __s-name (str->sym (str-append "__s_" (symbol-name __c)))]
-    (if (empty? (rest comps))
-      `(dense-len ~__s-name)
-      `(let [__a (dense-len ~__s-name)
-             __b (__fe-min-cap ~(rest comps))]
-         (if (< __a __b) __a __b)))))
-
-;;; __fe-has-conj -- recursive helper: emit a chain of `if` short-
-;;; circuits equivalent to `(and (dense-has? __s_C1 i) (dense-has? __s_C2 i) ...)`.
-;;; Since: E1
-(defmacro __fe-has-conj [comps i]
-  (let [__c (first comps)
-        __s-name (str->sym (str-append "__s_" (symbol-name __c)))]
-    (if (empty? (rest comps))
-      `(dense-has? ~__s-name ~i)
-      `(if (dense-has? ~__s-name ~i)
-         (__fe-has-conj ~(rest comps) ~i)
-         false))))
-
-;;; __fe-value-binds -- recursive helper: wrap inner in nested `let`s
-;;; binding each value name to `(dense-get __s_CN i)`. comps and binds
-;;; must zip pairwise.
-;;; Since: E1
-(defmacro __fe-value-binds [comps binds i inner]
-  (if (empty? comps)
-    `~inner
-    (let [__c (first comps)
-          __s-name (str->sym (str-append "__s_" (symbol-name __c)))
-          __vname (first binds)]
-      `(let [~__vname (dense-get ~__s-name ~i)]
-         (__fe-value-binds ~(rest comps) ~(rest binds) ~i ~inner)))))
-
-;;; for-each -- truly variadic iteration over the intersection of
-;;; entity slots that have all listed components. No arity cap.
-;;;
-;;; Surface:
-;;;   (for-each world [Comp1 Comp2 ... CompN] [e v1 v2 ... vN] body)
-;;;
-;;; The body sees `e` bound to the entity slot index and each `vN`
-;;; bound to the corresponding component value. The zero-component
-;;; form `(for-each w [] [e] body)` walks every entity slot via the
-;;; `gens` vec.
-;;;
-;;; Since: E1
-(defmacro for-each [world comps binds body]
-  (if (empty? comps)
-    `(let [^mut __i 0
-           __cap (vec-len (~(dot-sym gens) ~world))]
-       (while (< __i __cap)
-         (do
-           (let [~(first binds) (slot-new __i)] ~body)
-           (set! __i (+ __i 1)))))
-    (let [__e-bind (first binds)
-          __v-binds (rest binds)]
-      `(__fe-storages ~world ~comps
-         (let [^mut __i 0
-               __cap (__fe-min-cap ~comps)]
-           (while (< __i __cap)
-             (do
-               (let [__fe-sl (slot-new __i)]
-                 (when (__fe-has-conj ~comps __fe-sl)
-                   (let [~__e-bind __fe-sl]
-                     (__fe-value-binds ~comps ~__v-binds __fe-sl ~body))))
-               (set! __i (+ __i 1)))))))))
-
-;;; for-each1 -- thin shim over the variadic for-each.
-;;; (for-each1 world A1 e v1 body) -- back-compat surface.
-;;; Since: E1'
-(defmacro for-each1 [world A1 e v1 body]
-  `(for-each ~world [~A1] [~e ~v1] ~body))
-
-;;; for-each2 -- thin shim over the variadic for-each.
-;;; Since: E1'
-(defmacro for-each2 [world A1 A2 e v1 v2 body]
-  `(for-each ~world [~A1 ~A2] [~e ~v1 ~v2] ~body))
-
-;;; for-each3 -- thin shim over the variadic for-each.
-;;; Since: E1'
-(defmacro for-each3 [world A1 A2 A3 e v1 v2 v3 body]
-  `(for-each ~world [~A1 ~A2 ~A3] [~e ~v1 ~v2 ~v3] ~body))
-
-;;; world-tagged? -- true if entity slot idx carries the named tag in the
-;;; world's tag storage. Pulls the tag field via `.<TagName>` -- the tag
-;;; field on the world struct must hold a `tag-new` handle (`Tag`).
-;;; (world-tagged? world Player e)
-;;; Since: E1'
-(defmacro world-tagged? [world Tag e]
-  `(tag-has? (~(dot-sym Tag) ~world) ~e))
-
-;;; world-untagged? -- inverse of world-tagged?. Sugar for "the entity
-;;; does NOT carry this tag".
-;;; Since: E1'
-(defmacro world-untagged? [world Tag e]
-  `(not (tag-has? (~(dot-sym Tag) ~world) ~e)))
-
-;;; Query -- row-typed query handle, parameterised by *rows* of input and
-;;; output component types. The rows are phantom: the variadic-HKT-rows
-;;; work (D1) erases them at codegen so a Query value carries only the
-;;; world handle at runtime, but distinguishes queries with different
-;;; (in, out) row arguments at the type level. This is the E1 deliverable
-;;; that the v1' `for-eachN` family could not express -- a single Query
-;;; type whose component list is a kind-`[*]` row, not a fixed-arity
-;;; tuple.
-;;;
-;;; Typical use (caller-side; requires the consumer to enable
-;;; `-Xdata-literals` for the `#row{...}` literal syntax):
-;;;
-;;;   ;; A Query against GameWorld that reads Pos+Vel and writes Pos.
-;;;   (defn integrate [q : (Query #row{Pos Vel} #row{Pos})] : nil
-;;;     ...)
-;;;
-;;; row-union / row-intersect from the type-level row algebra compose
-;;; cleanly with the in/out rows for query joins. Strict element
-;;; resolution (L6 follow-up A) catches typo'd component names at the
-;;; type level: `(Query #row{Pos Velocityy} #row{Pos})` errors because
-;;; `Velocityy` is not declared.
-;;;
-;;; Since: E1
-(defstruct Query [^&in ^&out] (world :int))
-
-;;; make-query -- wrap a world handle as an *untyped* Query (no row info).
-;;; In consumer code, ascribe the result to a row-typed Query at the call
-;;; site:
-;;;
-;;;   (:: (make-query (.world game)) (Query #row{Pos Vel} #row{Pos}))
-;;;
-;;; Rows are phantom; this is a zero-cost runtime tag.
-;;; Since: E1
-(defn make-query [w : int] : int w)
-
-;;; query-world -- unpack the world handle from a Query value. Returns the
-;;; raw int handle so callers can pass it back into world-aware APIs.
-;;;
-;;; Polymorphic over both in and out rows via the row-kinded type
-;;; parameters (L6 follow-up B). Rows erase at codegen, so this is a
-;;; plain field access at runtime.
-;;;
-;;; Since: E1
-(defn query-world [^&in ^&out] [q : (Query in out)] : int
-  (.world q))
-
-;;; defquery -- name a for-each iteration as a `defn` over a specific
-;;; world type. Closest mapping of the plan's
-;;;   def integrate-q (query in out fn ...)
-;;; surface to the current macro system: the query body becomes a
-;;; concrete function over the world value, callable directly or via
-;;; `run-query!`. The user pins the world type explicitly so the
-;;; emitted `defn` is monomorphic.
-;;;
-;;; Syntax:
-;;;   (defquery name w-name WorldType [Comp1 Comp2 ...] [e v1 v2 ...]
-;;;     body)
-;;;
-;;; Expands to:
-;;;   (defn name [^borrow w-name : WorldType] : nil
-;;;     (for-each w-name [Comp1 Comp2 ...] [e v1 v2 ...]
-;;;       body))
-;;;
-;;; The world is taken as a borrow so the caller can reuse the world
-;;; value after `(run-query! integrate w)`. The body sees `w-name` (the
-;;; symbol the user passes) bound to the world inside the iteration, so
-;;; component writes via `(dense-set! (.Pos w-name) e ...)` work as in
-;;; plain for-each bodies.
-;;;
-;;; Since: E1
-(defmacro defquery [name w-sym world-type comps binds body]
-  `(defn ~name [^borrow ~w-sym : ~world-type] : nil
-     (for-each ~w-sym ~comps ~binds ~body)))
-
-;;; run-query! -- call a defquery-defined query against a world. Sugar
-;;; for `(query world)`; useful when reading client code where the
-;;; intent is "apply this query to that world" rather than "call this
-;;; function".
-;;;
-;;;   (run-query! integrate-q game-world)
-;;;     ;; equivalent to: (integrate-q game-world)
-;;;
-;;; Since: E1
-(defmacro run-query! [q world]
-  `(~q ~world))
-
-) ;; end defmodule ecs/query
+      (if (empty? (rest comps))
+        `(dense-len ~__s-name)
+        `(let [__a (dense-len ~__s-name)
+               __b (__fe-min-cap ~(rest comps))]
+           (if (< __a __b) __a __b)))))
+  ;;; __fe-has-conj -- recursive helper: emit a chain of `if` short-
+  ;;; circuits equivalent to `(and (dense-has? __s_C1 i) (dense-has? __s_C2 i) ...)`.
+  ;;; Since: E1
+  (defmacro __fe-has-conj [comps i]
+    (let [__c      (first comps)
+          __s-name (str->sym (str-append "__s_" (symbol-name __c)))]
+      (if (empty? (rest comps))
+        `(dense-has? ~__s-name ~i)
+        `(if (dense-has? ~__s-name ~i) (__fe-has-conj ~(rest comps) ~i) false))))
+  ;;; __fe-value-binds -- recursive helper: wrap inner in nested `let`s
+  ;;; binding each value name to `(dense-get __s_CN i)`. comps and binds
+  ;;; must zip pairwise.
+  ;;; Since: E1
+  (defmacro __fe-value-binds [comps binds i inner]
+    (if (empty? comps)
+      `~inner
+      (let [__c      (first comps)
+            __s-name (str->sym (str-append "__s_" (symbol-name __c)))
+            __vname  (first binds)]
+        `(let [~__vname (dense-get ~__s-name ~i)]
+           (__fe-value-binds ~(rest comps) ~(rest binds) ~i ~inner)))))
+  ;;; for-each -- truly variadic iteration over the intersection of
+  ;;; entity slots that have all listed components. No arity cap.
+  ;;;
+  ;;; Surface:
+  ;;;   (for-each world [Comp1 Comp2 ... CompN] [e v1 v2 ... vN] body)
+  ;;;
+  ;;; The body sees `e` bound to the entity slot index and each `vN`
+  ;;; bound to the corresponding component value. The zero-component
+  ;;; form `(for-each w [] [e] body)` walks every entity slot via the
+  ;;; `gens` vec.
+  ;;;
+  ;;; Since: E1
+  (defmacro for-each [world comps binds body]
+    (if (empty? comps)
+      `(let [^mut __i 0
+             __cap    (vec-len (~(dot-sym gens) ~world))]
+         (while (< __i __cap)
+           (do (let [~(first binds) (slot-new __i)] ~body) (set! __i (+ __i 1)))))
+      (let [__e-bind  (first binds)
+            __v-binds (rest binds)]
+        `(__fe-storages ~world
+           ~comps
+           (let [^mut __i 0
+                 __cap    (__fe-min-cap ~comps)]
+             (while (< __i __cap)
+               (do
+                 (let [__fe-sl (slot-new __i)]
+                   (when (__fe-has-conj ~comps __fe-sl)
+                     (let [~__e-bind __fe-sl]
+                       (__fe-value-binds ~comps ~__v-binds __fe-sl ~body))))
+                 (set! __i (+ __i 1)))))))))
+  ;;; for-each1 -- thin shim over the variadic for-each.
+  ;;; (for-each1 world A1 e v1 body) -- back-compat surface.
+  ;;; Since: E1'
+  (defmacro for-each1 [world A1 e v1 body]
+    `(for-each ~world [~A1] [~e ~v1] ~body))
+  ;;; for-each2 -- thin shim over the variadic for-each.
+  ;;; Since: E1'
+  (defmacro for-each2 [world A1 A2 e v1 v2 body]
+    `(for-each ~world [~A1 ~A2] [~e ~v1 ~v2] ~body))
+  ;;; for-each3 -- thin shim over the variadic for-each.
+  ;;; Since: E1'
+  (defmacro for-each3 [world A1 A2 A3 e v1 v2 v3 body]
+    `(for-each ~world [~A1 ~A2 ~A3] [~e ~v1 ~v2 ~v3] ~body))
+  ;;; world-tagged? -- true if entity slot idx carries the named tag in the
+  ;;; world's tag storage. Pulls the tag field via `.<TagName>` -- the tag
+  ;;; field on the world struct must hold a `tag-new` handle (`Tag`).
+  ;;; (world-tagged? world Player e)
+  ;;; Since: E1'
+  (defmacro world-tagged? [world Tag e] `(tag-has? (~(dot-sym Tag) ~world) ~e))
+  ;;; world-untagged? -- inverse of world-tagged?. Sugar for "the entity
+  ;;; does NOT carry this tag".
+  ;;; Since: E1'
+  (defmacro world-untagged? [world Tag e]
+    `(not (tag-has? (~(dot-sym Tag) ~world) ~e)))
+  ;;; Query -- row-typed query handle, parameterised by *rows* of input and
+  ;;; output component types. The rows are phantom: the variadic-HKT-rows
+  ;;; work (D1) erases them at codegen so a Query value carries only the
+  ;;; world handle at runtime, but distinguishes queries with different
+  ;;; (in, out) row arguments at the type level. This is the E1 deliverable
+  ;;; that the v1' `for-eachN` family could not express -- a single Query
+  ;;; type whose component list is a kind-`[*]` row, not a fixed-arity
+  ;;; tuple.
+  ;;;
+  ;;; Typical use (caller-side; requires the consumer to enable
+  ;;; `-Xdata-literals` for the `#row{...}` literal syntax):
+  ;;;
+  ;;;   ;; A Query against GameWorld that reads Pos+Vel and writes Pos.
+  ;;;   (defn integrate [q : (Query #row{Pos Vel} #row{Pos})] : nil
+  ;;;     ...)
+  ;;;
+  ;;; row-union / row-intersect from the type-level row algebra compose
+  ;;; cleanly with the in/out rows for query joins. Strict element
+  ;;; resolution (L6 follow-up A) catches typo'd component names at the
+  ;;; type level: `(Query #row{Pos Velocityy} #row{Pos})` errors because
+  ;;; `Velocityy` is not declared.
+  ;;;
+  ;;; Since: E1
+  (defstruct Query [^&in ^&out] (world :int))
+  ;;; make-query -- wrap a world handle as an *untyped* Query (no row info).
+  ;;; In consumer code, ascribe the result to a row-typed Query at the call
+  ;;; site:
+  ;;;
+  ;;;   (:: (make-query (.world game)) (Query #row{Pos Vel} #row{Pos}))
+  ;;;
+  ;;; Rows are phantom; this is a zero-cost runtime tag.
+  ;;; Since: E1
+  (defn make-query [w : int] : int w)
+  ;;; query-world -- unpack the world handle from a Query value. Returns the
+  ;;; raw int handle so callers can pass it back into world-aware APIs.
+  ;;;
+  ;;; Polymorphic over both in and out rows via the row-kinded type
+  ;;; parameters (L6 follow-up B). Rows erase at codegen, so this is a
+  ;;; plain field access at runtime.
+  ;;;
+  ;;; Since: E1
+  (defn query-world [^&in ^&out] [q : (Query in out)] : int (.world q))
+  ;;; defquery -- name a for-each iteration as a `defn` over a specific
+  ;;; world type. Closest mapping of the plan's
+  ;;;   def integrate-q (query in out fn ...)
+  ;;; surface to the current macro system: the query body becomes a
+  ;;; concrete function over the world value, callable directly or via
+  ;;; `run-query!`. The user pins the world type explicitly so the
+  ;;; emitted `defn` is monomorphic.
+  ;;;
+  ;;; Syntax:
+  ;;;   (defquery name w-name WorldType [Comp1 Comp2 ...] [e v1 v2 ...]
+  ;;;     body)
+  ;;;
+  ;;; Expands to:
+  ;;;   (defn name [^borrow w-name : WorldType] : nil
+  ;;;     (for-each w-name [Comp1 Comp2 ...] [e v1 v2 ...]
+  ;;;       body))
+  ;;;
+  ;;; The world is taken as a borrow so the caller can reuse the world
+  ;;; value after `(run-query! integrate w)`. The body sees `w-name` (the
+  ;;; symbol the user passes) bound to the world inside the iteration, so
+  ;;; component writes via `(dense-set! (.Pos w-name) e ...)` work as in
+  ;;; plain for-each bodies.
+  ;;;
+  ;;; Since: E1
+  (defmacro defquery [name w-sym world-type comps binds body]
+    `(defn ~name [^borrow ~w-sym : ~world-type] : nil
+       (for-each ~w-sym ~comps ~binds ~body)))
+  ;;; run-query! -- call a defquery-defined query against a world. Sugar
+  ;;; for `(query world)`; useful when reading client code where the
+  ;;; intent is "apply this query to that world" rather than "call this
+  ;;; function".
+  ;;;
+  ;;;   (run-query! integrate-q game-world)
+  ;;;     ;; equivalent to: (integrate-q game-world)
+  ;;;
+  ;;; Since: E1
+  (defmacro run-query! [q world] `(~q ~world))) ;; end defmodule ecs/query

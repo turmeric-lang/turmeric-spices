@@ -53,515 +53,492 @@
   ;; exportable name, so the import anchor is `join-all`.
   (import crdt/lattice :refer [join-all])
   (import crdt/replica :refer [ReplicaId replica-sym])
-  (export Rga rga-new rga-len rga-size rga-clock rga-get rga-alive?
-          rga-insert rga-append rga-delete rga-merge
-          rga-delta-insert rga-delta-delete)
-
-;;; RgaNode -- one element: its id, its origin's id, its value, its tombstone.
-;;;
-;;; Since: crdt-spice-plan C5
-;;
-;; `oc` = 0 means "inserted at the head", the root origin.  No real node has
-;; counter 0 -- the clock starts at 0 and every mint is one past it -- so the
-;; sentinel cannot collide with a node id, and `orep` is ignored when `oc` is
-;; 0.
-(defstruct RgaNode [ctr : int rep : Sym oc : int orep : Sym val : int dead : bool])
-
-;;; Rga -- a replicated sequence.
-;;;
-;;; Since: crdt-spice-plan C5
-;;
-;; `nodes` is a (Vec RgaNode) in RESOLVED DOCUMENT ORDER, carried as an int
-;; handle the way every other container in this spice is.  Keeping the array
-;; sorted is what makes a read O(1) per element; the forest it encodes is what
-;; makes the order converge.
-;;
-;; `clock` is this replica's Lamport counter: the highest node counter it has
-;; seen.  It rises on every local mint AND on every node integrated from
-;; elsewhere, which is what keeps invariant (1) in the header true.
-;;
-;; `:heap`, like stdlib's Map/Vec/Set and like crdt/ormap -- a parametric or
-;; handle-holding struct that is not heap becomes a by-value C aggregate and
-;; the emitter types the result temp at the carrier instead.
-(defstruct ^heap Rga [nodes : int clock : int])
-
-;;; rga-new -- an empty sequence.
-;;;
-;;; Returns:
-;;;   An Rga with no nodes and a clock at 0.
-;;;
-;;; Example:
-;;;   (rga-new)
-;;;
-;;; Since: crdt-spice-plan C5
-(defn rga-new [] : Rga
-  (Rga (:: (:: (vec-of) (Vec RgaNode)) int) 0))
-
-;;; rga-size -- how many nodes the array holds, tombstones included.
-;;;
-;;; Parameters:
-;;;   s -- the sequence
-;;;
-;;; Returns:
-;;;   The physical node count.
-;;;
-;;; Example:
-;;;   (rga-size s)   ; => 5
-;;;
-;;; Since: crdt-spice-plan C5
-;;
-;; The number that never goes down, and the one that crosses the wire.  A
-;; document that has had 1000 characters typed and 1000 deleted reads
-;; `rga-len` 0 and `rga-size` 1000.  Compaction needs a stable causal cut --
-;; agreement that no replica will ever again name a tombstone as an origin --
-;; which is a sync-layer protocol (C6), not something a single replica can
-;; decide.  Exposed rather than hidden so a caller can see the growth.
-(defn rga-size [^borrow s : Rga] : int
-  (vec-len (:: (.nodes s) (Vec RgaNode))))
-
-;;; rga-clock -- this replica's Lamport counter.
-;;;
-;;; Parameters:
-;;;   s -- the sequence
-;;;
-;;; Returns:
-;;;   The highest node counter it has seen.
-;;;
-;;; Example:
-;;;   (rga-clock s)   ; => 7
-;;;
-;;; Since: crdt-spice-plan C5
-(defn rga-clock [^borrow s : Rga] : int (.clock s))
-
-;;; rga-len -- how many elements are visible.
-;;;
-;;; Parameters:
-;;;   s -- the sequence
-;;;
-;;; Returns:
-;;;   The node count excluding tombstones -- the document's length.
-;;;
-;;; Example:
-;;;   (rga-len s)   ; => 3
-;;;
-;;; Since: crdt-spice-plan C5
-;; The handle is LET-BOUND rather than ascribed inline in the call.  Written
-;; inline, `(__alive-count (:: (.nodes s) (Vec RgaNode)) 0 0)` emits the raw
-;; int64 field into a `tur_adt_Vec__RgaNode *` parameter with no bridge, and
-;; cc rejects it (`-Wint-conversion`).  The `let` inserts the cast.  Note the
-;; inline form DOES work for a Map handle passed to a stdlib macro, which is
-;; why the rest of this spice is written the other way round -- match the
-;; neighbouring code rather than generalizing from either.
-(defn rga-len [^borrow s : Rga] : int
-  (let [v (:: (.nodes s) (Vec RgaNode))]
-    (__alive-count v 0 0)))
-
-;;; __alive-count -- internal.
-(defn __alive-count [v : (Vec RgaNode) i : int acc : int] : int
-  (if (>= i (vec-len v))
-    acc
-    (__alive-count v (+ i 1)
-                   (if (.dead (vec-get-byval v i)) acc (+ acc 1)))))
-
-;;; rga-get -- the value at a visible index.
-;;;
-;;; Parameters:
-;;;   s -- the sequence
-;;;   i -- zero-based index among the LIVE elements
-;;;
-;;; Returns:
-;;;   The value there, or 0 when i is out of range.
-;;;
-;;; Example:
-;;;   (rga-get s 0)   ; => 72
-;;;
-;;; Since: crdt-spice-plan C5
-;;
-;; Indexes past the tombstones, so the caller never sees them.  O(n) -- a real
-;; editor keeps a size-annotated index for this; see the header.
-(defn rga-get [^borrow s : Rga i : int] : int
-  (let [v (:: (.nodes s) (Vec RgaNode))
-        p (__nth-live v i)]
-    (if (< p 0) 0 (.val (vec-get-byval v p)))))
-
-;;; rga-alive? -- is there a visible element at this index?
-;;;
-;;; Parameters:
-;;;   s -- the sequence
-;;;   i -- zero-based live index
-;;;
-;;; Returns:
-;;;   true when i is in range.
-;;;
-;;; Example:
-;;;   (rga-alive? s 2)
-;;;
-;;; Since: crdt-spice-plan C5
-(defn rga-alive? [^borrow s : Rga i : int] : bool
-  (let [v (:: (.nodes s) (Vec RgaNode))]
-    (>= (__nth-live v i) 0)))
-
-;;; __nth-live -- internal: the array index of the i-th live node, or -1.
-(defn __nth-live [v : (Vec RgaNode) i : int] : int
-  (__nth-live-loop v 0 i))
-
-;;; __nth-live-loop -- internal.
-(defn __nth-live-loop [v : (Vec RgaNode) p : int left : int] : int
-  (if (>= p (vec-len v))
-    (- 0 1)
-    (if (.dead (vec-get-byval v p))
-      (__nth-live-loop v (+ p 1) left)
-      (if (= left 0) p (__nth-live-loop v (+ p 1) (- left 1))))))
-
-;;; __id-gt? -- internal: is (c1, r1) after (c2, r2) in the total id order?
-;;
-;; Counter first, replica NAME second.  The name tiebreak is what makes the
-;; order total, and comparing interned names by their string form keeps the
-;; answer the same on every replica -- a pointer or intern-order comparison
-;; would differ per process and the replicas would diverge without erroring.
-(defn __id-gt? [c1 : int r1 : Sym c2 : int r2 : Sym] : bool
-  (if (> c1 c2)
-    true
-    (if (< c1 c2)
-      false
-      (gt? (sym->str r1) (sym->str r2)))))
-
-;;; __index-of -- internal: the array index of the node with this id, or -1.
-(defn __index-of [v : (Vec RgaNode) c : int r : Sym] : int
-  (__index-of-loop v 0 c r))
-
-;;; __index-of-loop -- internal.
-(defn __index-of-loop [v : (Vec RgaNode) p : int c : int r : Sym] : int
-  (if (>= p (vec-len v))
-    (- 0 1)
-    (let [n (vec-get-byval v p)]
-      (if (and (= (.ctr n) c) (sym=? (.rep n) r))
-        p
-        (__index-of-loop v (+ p 1) c r)))))
-
-;;; __scan -- internal: walk forward past every node with a LARGER id.
-;;
-;; Header point (2).  The loop skips concurrent siblings that were inserted
-;; before this node and, because a descendant's id always exceeds its
-;; ancestor's, their entire subtrees with them.  It stops at the first smaller
-;; id, which cannot be a child of this node's origin.
-(defn __scan [v : (Vec RgaNode) p : int c : int r : Sym] : int
-  (if (>= p (vec-len v))
-    p
-    (let [n (vec-get-byval v p)]
-      (if (__id-gt? (.ctr n) (.rep n) c r)
-        (__scan v (+ p 1) c r)
-        p))))
-
-;;; __shift -- internal: move v[i..j) one slot right, top-down.
-(defn __shift [v : (Vec RgaNode) j : int i : int] : int
-  (if (<= j i)
-    0
-    (do (vec-set! v j (vec-get-byval v (- j 1)))
-        (__shift v (- j 1) i))))
-
-;;; __ins-at! -- internal: splice a node in at array index i.
-;;
-;; The node is built from FIELDS at the push site rather than passed in as a
-;; struct.  A by-value struct PARAMETER handed to `vec-push!` emits
-;; `*__t = x;` from a `const tur_adt_RgaNode *` into a value slot, which cc
-;; rejects -- so the six fields travel separately.  Verbose, and it is the
-;; spelling that compiles.
-(defn __ins-at! [v : (Vec RgaNode) i : int
-                 c : int r : Sym oc : int orep : Sym val : int dead : bool] : int
-  (let [n (vec-len v)]
-    (if (>= i n)
-      (do (vec-push! v (RgaNode c r oc orep val dead)) 0)
-      (do (vec-push! v (vec-get-byval v (- n 1)))
+  (export Rga
+    rga-new
+    rga-len
+    rga-size
+    rga-clock
+    rga-get
+    rga-alive?
+    rga-insert
+    rga-append
+    rga-delete
+    rga-merge
+    rga-delta-insert
+    rga-delta-delete)
+  ;;; RgaNode -- one element: its id, its origin's id, its value, its tombstone.
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  ;;
+  ;; `oc` = 0 means "inserted at the head", the root origin.  No real node has
+  ;; counter 0 -- the clock starts at 0 and every mint is one past it -- so the
+  ;; sentinel cannot collide with a node id, and `orep` is ignored when `oc` is
+  ;; 0.
+  (defstruct RgaNode
+    [ctr : int rep : Sym oc : int orep : Sym val : int dead : bool])
+  ;;; Rga -- a replicated sequence.
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  ;;
+  ;; `nodes` is a (Vec RgaNode) in RESOLVED DOCUMENT ORDER, carried as an int
+  ;; handle the way every other container in this spice is.  Keeping the array
+  ;; sorted is what makes a read O(1) per element; the forest it encodes is what
+  ;; makes the order converge.
+  ;;
+  ;; `clock` is this replica's Lamport counter: the highest node counter it has
+  ;; seen.  It rises on every local mint AND on every node integrated from
+  ;; elsewhere, which is what keeps invariant (1) in the header true.
+  ;;
+  ;; `:heap`, like stdlib's Map/Vec/Set and like crdt/ormap -- a parametric or
+  ;; handle-holding struct that is not heap becomes a by-value C aggregate and
+  ;; the emitter types the result temp at the carrier instead.
+  (defstruct ^heap Rga [nodes : int clock : int])
+  ;;; rga-new -- an empty sequence.
+  ;;;
+  ;;; Returns:
+  ;;;   An Rga with no nodes and a clock at 0.
+  ;;;
+  ;;; Example:
+  ;;;   (rga-new)
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  (defn rga-new [] : Rga (Rga (:: (:: (vec-of) (Vec RgaNode)) int) 0))
+  ;;; rga-size -- how many nodes the array holds, tombstones included.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the sequence
+  ;;;
+  ;;; Returns:
+  ;;;   The physical node count.
+  ;;;
+  ;;; Example:
+  ;;;   (rga-size s)   ; => 5
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  ;;
+  ;; The number that never goes down, and the one that crosses the wire.  A
+  ;; document that has had 1000 characters typed and 1000 deleted reads
+  ;; `rga-len` 0 and `rga-size` 1000.  Compaction needs a stable causal cut --
+  ;; agreement that no replica will ever again name a tombstone as an origin --
+  ;; which is a sync-layer protocol (C6), not something a single replica can
+  ;; decide.  Exposed rather than hidden so a caller can see the growth.
+  (defn rga-size [^borrow s : Rga] : int
+    (vec-len (:: (.nodes s) (Vec RgaNode))))
+  ;;; rga-clock -- this replica's Lamport counter.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the sequence
+  ;;;
+  ;;; Returns:
+  ;;;   The highest node counter it has seen.
+  ;;;
+  ;;; Example:
+  ;;;   (rga-clock s)   ; => 7
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  (defn rga-clock [^borrow s : Rga] : int (.clock s))
+  ;;; rga-len -- how many elements are visible.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the sequence
+  ;;;
+  ;;; Returns:
+  ;;;   The node count excluding tombstones -- the document's length.
+  ;;;
+  ;;; Example:
+  ;;;   (rga-len s)   ; => 3
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  ;; The handle is LET-BOUND rather than ascribed inline in the call.  Written
+  ;; inline, `(__alive-count (:: (.nodes s) (Vec RgaNode)) 0 0)` emits the raw
+  ;; int64 field into a `tur_adt_Vec__RgaNode *` parameter with no bridge, and
+  ;; cc rejects it (`-Wint-conversion`).  The `let` inserts the cast.  Note the
+  ;; inline form DOES work for a Map handle passed to a stdlib macro, which is
+  ;; why the rest of this spice is written the other way round -- match the
+  ;; neighbouring code rather than generalizing from either.
+  (defn rga-len [^borrow s : Rga] : int
+    (let [v (:: (.nodes s) (Vec RgaNode))] (__alive-count v 0 0)))
+  ;;; __alive-count -- internal.
+  (defn __alive-count [v : (Vec RgaNode) i : int acc : int] : int
+    (if (>= i (vec-len v))
+      acc
+      (__alive-count v (+ i 1) (if (.dead (vec-get-byval v i)) acc (+ acc 1)))))
+  ;;; rga-get -- the value at a visible index.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the sequence
+  ;;;   i -- zero-based index among the LIVE elements
+  ;;;
+  ;;; Returns:
+  ;;;   The value there, or 0 when i is out of range.
+  ;;;
+  ;;; Example:
+  ;;;   (rga-get s 0)   ; => 72
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  ;;
+  ;; Indexes past the tombstones, so the caller never sees them.  O(n) -- a real
+  ;; editor keeps a size-annotated index for this; see the header.
+  (defn rga-get [^borrow s : Rga i : int] : int
+    (let [v (:: (.nodes s) (Vec RgaNode))
+          p (__nth-live v i)]
+      (if (< p 0) 0 (.val (vec-get-byval v p)))))
+  ;;; rga-alive? -- is there a visible element at this index?
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the sequence
+  ;;;   i -- zero-based live index
+  ;;;
+  ;;; Returns:
+  ;;;   true when i is in range.
+  ;;;
+  ;;; Example:
+  ;;;   (rga-alive? s 2)
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  (defn rga-alive? [^borrow s : Rga i : int] : bool
+    (let [v (:: (.nodes s) (Vec RgaNode))] (>= (__nth-live v i) 0)))
+  ;;; __nth-live -- internal: the array index of the i-th live node, or -1.
+  (defn __nth-live [v : (Vec RgaNode) i : int] : int (__nth-live-loop v 0 i))
+  ;;; __nth-live-loop -- internal.
+  (defn __nth-live-loop [v : (Vec RgaNode) p : int left : int] : int
+    (if (>= p (vec-len v))
+      (- 0 1)
+      (if (.dead (vec-get-byval v p))
+        (__nth-live-loop v (+ p 1) left)
+        (if (= left 0) p (__nth-live-loop v (+ p 1) (- left 1))))))
+  ;;; __id-gt? -- internal: is (c1, r1) after (c2, r2) in the total id order?
+  ;;
+  ;; Counter first, replica NAME second.  The name tiebreak is what makes the
+  ;; order total, and comparing interned names by their string form keeps the
+  ;; answer the same on every replica -- a pointer or intern-order comparison
+  ;; would differ per process and the replicas would diverge without erroring.
+  (defn __id-gt? [c1 : int r1 : Sym c2 : int r2 : Sym] : bool
+    (if (> c1 c2) true (if (< c1 c2) false (gt? (sym->str r1) (sym->str r2)))))
+  ;;; __index-of -- internal: the array index of the node with this id, or -1.
+  (defn __index-of [v : (Vec RgaNode) c : int r : Sym] : int
+    (__index-of-loop v 0 c r))
+  ;;; __index-of-loop -- internal.
+  (defn __index-of-loop [v : (Vec RgaNode) p : int c : int r : Sym] : int
+    (if (>= p (vec-len v))
+      (- 0 1)
+      (let [n (vec-get-byval v p)]
+        (if (and (= (.ctr n) c) (sym=? (.rep n) r))
+          p
+          (__index-of-loop v (+ p 1) c r)))))
+  ;;; __scan -- internal: walk forward past every node with a LARGER id.
+  ;;
+  ;; Header point (2).  The loop skips concurrent siblings that were inserted
+  ;; before this node and, because a descendant's id always exceeds its
+  ;; ancestor's, their entire subtrees with them.  It stops at the first smaller
+  ;; id, which cannot be a child of this node's origin.
+  (defn __scan [v : (Vec RgaNode) p : int c : int r : Sym] : int
+    (if (>= p (vec-len v))
+      p
+      (let [n (vec-get-byval v p)]
+        (if (__id-gt? (.ctr n) (.rep n) c r) (__scan v (+ p 1) c r) p))))
+  ;;; __shift -- internal: move v[i..j) one slot right, top-down.
+  (defn __shift [v : (Vec RgaNode) j : int i : int] : int
+    (if (<= j i)
+      0
+      (do (vec-set! v j (vec-get-byval v (- j 1))) (__shift v (- j 1) i))))
+  ;;; __ins-at! -- internal: splice a node in at array index i.
+  ;;
+  ;; The node is built from FIELDS at the push site rather than passed in as a
+  ;; struct.  A by-value struct PARAMETER handed to `vec-push!` emits
+  ;; `*__t = x;` from a `const tur_adt_RgaNode *` into a value slot, which cc
+  ;; rejects -- so the six fields travel separately.  Verbose, and it is the
+  ;; spelling that compiles.
+  (defn __ins-at! [v : (Vec RgaNode)
+                   i : int
+                   c : int
+                   r : Sym
+                   oc : int
+                   orep : Sym
+                   val : int
+                   dead : bool] : int
+    (let [n (vec-len v)]
+      (if (>= i n)
+        (do (vec-push! v (RgaNode c r oc orep val dead)) 0)
+        (do
+          (vec-push! v (vec-get-byval v (- n 1)))
           (__shift v (- n 1) i)
           (vec-set! v i (RgaNode c r oc orep val dead))
           0))))
-
-;;; __integrate! -- internal: place one node, or merge its tombstone if present.
-;;
-;; Returns nothing useful; it mutates `v`.  The "already present" arm is what
-;; makes integration IDEMPOTENT -- re-delivering a node must not duplicate it
-;; -- and OR-ing the tombstone there is what makes a delete converge with a
-;; concurrent re-delivery of the live node.
-(defn __integrate! [v : (Vec RgaNode) c : int r : Sym oc : int orep : Sym
-                    val : int dead : bool] : int
-  (let [at (__index-of v c r)]
-    (if (>= at 0)
-      (__merge-dead! v at dead)
-      (let [;; A root origin starts the scan at the head.  An origin we cannot
-            ;; find is defensive only: under causal delivery it is always
-            ;; present, and treating it as the head at least keeps the node.
-            base (if (= oc 0) 0 (+ 1 (__index-of v oc orep)))
-            from (if (< base 0) 0 base)]
-        (__ins-at! v (__scan v from c r) c r oc orep val dead)))))
-
-;;; __merge-dead! -- internal: a tombstone, once set, stays set.
-(defn __merge-dead! [v : (Vec RgaNode) at : int dead : bool] : int
-  (let [n (vec-get-byval v at)]
-    (if (and dead (not (.dead n)))
-      (do (vec-set! v at (RgaNode (.ctr n) (.rep n) (.oc n) (.orep n) (.val n) true)) 0)
-      0)))
-
-;;; rga-insert -- insert a value at a visible index, on behalf of a replica.
-;;;
-;;; Parameters:
-;;;   s -- the sequence
-;;;   r -- the replica doing the insert
-;;;   i -- the live index the new element should occupy
-;;;   v -- the value (a character code, for text)
-;;;
-;;; Returns:
-;;;   A sequence with v at index i.
-;;;
-;;; Example:
-;;;   (rga-insert (rga-new) (replica (quote alice)) 0 72)
-;;;
-;;; Since: crdt-spice-plan C5
-;;
-;; The index is resolved to an ORIGIN here and never leaves: what ships is
-;; "after node (c, r)", which still means the same thing on a replica whose
-;; indices have moved.  That translation is the only place an index appears in
-;; the whole design.
-(defn rga-insert [s : Rga r : ReplicaId i : int v : int] : Rga
-  (let [nodes (:: (.nodes s) (Vec RgaNode))
-        c     (+ 1 (.clock s))
-        prev  (if (= i 0) (- 0 1) (__nth-live nodes (- i 1)))
-        oc    (if (< prev 0) 0 (.ctr (vec-get-byval nodes prev)))
-        orep  (if (< prev 0) (quote __root) (.rep (vec-get-byval nodes prev)))]
-    (__integrate! nodes c (replica-sym r) oc orep v false)
-    (Rga (:: nodes int) c)))
-
-;;; rga-append -- insert at the end.
-;;;
-;;; Parameters:
-;;;   s -- the sequence
-;;;   r -- the replica
-;;;   v -- the value
-;;;
-;;; Returns:
-;;;   A sequence one longer.
-;;;
-;;; Example:
-;;;   (rga-append s (replica (quote alice)) 33)
-;;;
-;;; Since: crdt-spice-plan C5
-(defn rga-append [s : Rga r : ReplicaId v : int] : Rga
-  (let [n (rga-len s)]
-    (rga-insert s r n v)))
-
-;;; rga-delete -- tombstone the element at a visible index.
-;;;
-;;; Parameters:
-;;;   s -- the sequence
-;;;   i -- the live index to remove
-;;;
-;;; Returns:
-;;;   A sequence in which that element is no longer visible.  Out-of-range is
-;;;   a no-op.
-;;;
-;;; Example:
-;;;   (rga-delete s 2)
-;;;
-;;; Since: crdt-spice-plan C5
-;;
-;; No replica argument: a delete mints no id.  It names a node that already
-;; exists, so it is inherently idempotent and commutes with every other
-;; delete -- which is why tombstones are the easy half of a sequence CRDT and
-;; insertion is the hard half.
-(defn rga-delete [s : Rga i : int] : Rga
-  (let [nodes (:: (.nodes s) (Vec RgaNode))
-        p     (__nth-live nodes i)]
-    (if (>= p 0) (__merge-dead! nodes p true) 0)
-    (Rga (:: nodes int) (.clock s))))
-
-;;; rga-delta-insert -- the DELTA of an insert.
-;;;
-;;; Parameters:
-;;;   s -- the sequence, read for the clock and the origin at index i
-;;;   r -- the replica doing the insert
-;;;   i -- the live index the new element should occupy
-;;;   v -- the value
-;;;
-;;; Returns:
-;;;   A one-node sequence carrying the new node and its origin's id.
-;;;
-;;; Example:
-;;;   (rga-delta-insert s (replica (quote alice)) 0 72)
-;;;
-;;; Since: crdt-spice-plan C5
-;;
-;; `Delta = Rga` here, unlike the causal types in crdt/orset and crdt/ormap,
-;; and the reason is structural: an RGA carries no DotContext, so there is no
-;; downward-closed history for a delta to over-claim.  Its merge is node
-;; union plus tombstone OR, both monotone, so a one-node sequence IS a
-;; well-formed state that happens to be small.
-;;
-;; The delta must be minted alongside the local apply, from the SAME state --
-;; both compute the counter as clock+1, so minting two deltas from one state
-;; would collide:
-;;
-;;   (let [d  (rga-delta-insert s r i v)
-;;         s2 (rga-insert s r i v)] ...)
-(defn rga-delta-insert [^borrow s : Rga r : ReplicaId i : int v : int] : Rga
-  (let [nodes (:: (.nodes s) (Vec RgaNode))
-        c     (+ 1 (.clock s))
-        prev  (if (= i 0) (- 0 1) (__nth-live nodes (- i 1)))
-        oc    (if (< prev 0) 0 (.ctr (vec-get-byval nodes prev)))
-        orep  (if (< prev 0) (quote __root) (.rep (vec-get-byval nodes prev)))
-        out   (:: (vec-of) (Vec RgaNode))]
-    (vec-push! out (RgaNode c (replica-sym r) oc orep v false))
-    (Rga (:: out int) c)))
-
-;;; rga-delta-delete -- the DELTA of a delete.
-;;;
-;;; Parameters:
-;;;   s -- the sequence, read for the node at index i
-;;;   i -- the live index to remove
-;;;
-;;; Returns:
-;;;   A one-node sequence carrying that node with its tombstone set; the empty
-;;;   sequence when i is out of range.
-;;;
-;;; Example:
-;;;   (rga-delta-delete s 2)
-;;;
-;;; Since: crdt-spice-plan C5
-;;
-;; The delta carries the node's ORIGIN as well as its id, so a receiver that
-;; has not yet seen the insert can still place it -- as a tombstone, in the
-;; right position, ready for the insert to arrive and find it.  Shipping the
-;; id alone would work under causal delivery and fail quietly without it.
-(defn rga-delta-delete [^borrow s : Rga i : int] : Rga
-  (let [nodes (:: (.nodes s) (Vec RgaNode))
-        p     (__nth-live nodes i)
-        out   (:: (vec-of) (Vec RgaNode))]
-    (if (>= p 0) (__push-dead! out nodes p) 0)
-    (Rga (:: out int) (.clock s))))
-
-;;; __push-dead! -- internal: copy node p into out with its tombstone set.
-(defn __push-dead! [out : (Vec RgaNode) src : (Vec RgaNode) p : int] : int
-  (let [n (vec-get-byval src p)]
-    (vec-push! out (RgaNode (.ctr n) (.rep n) (.oc n) (.orep n) (.val n) true))
-    0))
-
-;;; __merge-into! -- internal: integrate every node of `src` into `dst`.
-;;
-;; In ASCENDING id order, which is what makes a single pass enough: a node's
-;; origin has a smaller id (header invariant (1)), so by the time a node is
-;; integrated its origin is already placed.  Delivering them in the source's
-;; DOCUMENT order would not have that property -- a node can sit before its
-;; origin's later-arriving siblings -- and the scan would then start from a
-;; missing origin.
-;;
-;; The enumeration is "smallest id strictly greater than the last one taken",
-;; which is O(n) per step and O(n*m) overall.  A sort would be O(m log m) and
-;; needs somewhere to put the permutation; at the sizes this spice is written
-;; for the scan is simpler to read and to be sure of.
-(defn __merge-into! [dst : (Vec RgaNode) src : (Vec RgaNode) pc : int pr : Sym] : int
-  (let [bi (__min-above src 0 (- 0 1) pc pr)]
-    (if (< bi 0)
-      0
-      (do (__integrate-from! dst src bi)
-          (__merge-into! dst src (.ctr (vec-get-byval src bi))
-                         (.rep (vec-get-byval src bi)))))))
-
-;;; __integrate-from! -- internal: integrate src[i] into dst.
-;;
-;; Fields are read here and passed on individually: a by-value struct
-;; parameter cannot be handed to `vec-push!` (see __ins-at!).
-(defn __integrate-from! [dst : (Vec RgaNode) src : (Vec RgaNode) i : int] : int
-  (let [n (vec-get-byval src i)]
-    (__integrate! dst (.ctr n) (.rep n) (.oc n) (.orep n) (.val n) (.dead n))))
-
-;;; __min-above -- internal: index of the smallest id strictly above (pc, pr).
-(defn __min-above [v : (Vec RgaNode) p : int best : int pc : int pr : Sym] : int
-  (if (>= p (vec-len v))
-    best
-    (let [n  (vec-get-byval v p)
-          ok (__id-gt? (.ctr n) (.rep n) pc pr)
-          better (and ok (or (< best 0) (__beats? v p best)))]
-      (__min-above v (+ p 1) (if better p best) pc pr))))
-
-;;; __beats? -- internal: does node p have a smaller id than node q?
-(defn __beats? [v : (Vec RgaNode) p : int q : int] : bool
-  (let [a (vec-get-byval v p)
-        b (vec-get-byval v q)]
-    (__id-gt? (.ctr b) (.rep b) (.ctr a) (.rep a))))
-
-;;; __imax__rga -- internal: the larger of two ints.
-(defn __imax__rga [x : int y : int] : int (if (< x y) y x))
-
-;;; rga-merge -- merge another sequence into this one.
-;;;
-;;; Parameters:
-;;;   a -- this sequence
-;;;   b -- the other
-;;;
-;;; Returns:
-;;;   The merged sequence.  Both arguments are consumed.
-;;;
-;;; Example:
-;;;   (rga-merge mine theirs)
-;;;
-;;; Since: crdt-spice-plan C5
-;;
-;; The clock takes the maximum of both, which is what keeps invariant (1)
-;; true across a merge: after absorbing a remote node with counter 9, this
-;; replica's next mint must exceed 9 or a later insert could carry an id
-;; smaller than the origin it names, and the integration scan would place it
-;; wrongly -- silently, with no error and no crash, just a different document
-;; on two replicas.
-(defn rga-merge [a : Rga b : Rga] : Rga
-  (let [va (:: (.nodes a) (Vec RgaNode))
-        vb (:: (.nodes b) (Vec RgaNode))]
-    (__merge-into! va vb 0 (quote __root))
-    (Rga (:: va int) (__imax__rga (.clock a) (.clock b)))))
-
-;;; JoinSemilattice [Rga] -- node union with tombstone OR, re-integrated.
-;;
-;; Commutative and idempotent because the document order is a function of the
-;; NODE SET and nothing else: integration only ever decides where an id goes
-;; among ids it can see, and that decision does not depend on what arrived
-;; first.  Re-delivering a node finds it already present and does nothing but
-;; OR its tombstone, which is `__integrate!`'s first arm.
-(definstance JoinSemilattice [Rga]
-  (join [x y] (rga-merge x y)))
-
-;;; BoundedJoin [Rga] -- the empty sequence is the least element.
-(definstance BoundedJoin [Rga]
-  (bottom [] (rga-new)))
-
-;;; Eq [Rga] -- the same visible values in the same order.
-;;
-;; STRUCTURAL, not size-only, unlike Eq [GSet] and Eq [ORSet]: the array is
-;; ordered and directly indexable, so there is no missing iterator to work
-;; around.  It compares the DOCUMENT rather than the state, so two replicas
-;; with different tombstone counts that read the same still compare equal --
-;; which is the right equality for a sequence and the one the convergence
-;; tests want.
-(definstance Eq [Rga]
-  (eq? [^borrow x ^borrow y]
-    (if (= (rga-len x) (rga-len y))
-      (__same-values? x y 0)
-      false)))
-
-;;; __same-values? -- internal.
-(defn __same-values? [^borrow x : Rga ^borrow y : Rga i : int] : bool
-  (if (>= i (rga-len x))
-    true
-    (if (= (rga-get x i) (rga-get y i))
-      (__same-values? x y (+ i 1))
-      false)))
-
-;;; DeltaCRDT [Rga] -- the delta is a one-node sequence.
-;;
-;; `Delta = Rga`: no causal context means no downward-closed history to
-;; over-claim, so a fragment of the state IS a delta.  Contrast crdt/orset,
-;; where that shortcut silently deletes the receiver's elements.
-(definstance DeltaCRDT [Rga]
-  (type Delta = Rga)
-  (delta-bottom [x] (rga-new))
-  (delta-join   [x d e] (rga-merge d e))
-  (apply-delta  [x d] (rga-merge x d)))
-
-) ;; end defmodule crdt/rga
+  ;;; __integrate! -- internal: place one node, or merge its tombstone if present.
+  ;;
+  ;; Returns nothing useful; it mutates `v`.  The "already present" arm is what
+  ;; makes integration IDEMPOTENT -- re-delivering a node must not duplicate it
+  ;; -- and OR-ing the tombstone there is what makes a delete converge with a
+  ;; concurrent re-delivery of the live node.
+  (defn __integrate! [v : (Vec RgaNode)
+                      c : int
+                      r : Sym
+                      oc : int
+                      orep : Sym
+                      val : int
+                      dead : bool] : int
+    (let [at (__index-of v c r)]
+      (if (>= at 0)
+        (__merge-dead! v at dead)
+        (let [ ;; A root origin starts the scan at the head.  An origin we cannot
+              ;; find is defensive only: under causal delivery it is always
+              ;; present, and treating it as the head at least keeps the node.
+              base (if (= oc 0) 0 (+ 1 (__index-of v oc orep)))
+              from (if (< base 0) 0 base)]
+          (__ins-at! v (__scan v from c r) c r oc orep val dead)))))
+  ;;; __merge-dead! -- internal: a tombstone, once set, stays set.
+  (defn __merge-dead! [v : (Vec RgaNode) at : int dead : bool] : int
+    (let [n (vec-get-byval v at)]
+      (if (and dead (not (.dead n)))
+        (do
+          (vec-set! v
+            at
+            (RgaNode (.ctr n) (.rep n) (.oc n) (.orep n) (.val n) true))
+          0)
+        0)))
+  ;;; rga-insert -- insert a value at a visible index, on behalf of a replica.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the sequence
+  ;;;   r -- the replica doing the insert
+  ;;;   i -- the live index the new element should occupy
+  ;;;   v -- the value (a character code, for text)
+  ;;;
+  ;;; Returns:
+  ;;;   A sequence with v at index i.
+  ;;;
+  ;;; Example:
+  ;;;   (rga-insert (rga-new) (replica (quote alice)) 0 72)
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  ;;
+  ;; The index is resolved to an ORIGIN here and never leaves: what ships is
+  ;; "after node (c, r)", which still means the same thing on a replica whose
+  ;; indices have moved.  That translation is the only place an index appears in
+  ;; the whole design.
+  (defn rga-insert [s : Rga r : ReplicaId i : int v : int] : Rga
+    (let [nodes (:: (.nodes s) (Vec RgaNode))
+          c     (+ 1 (.clock s))
+          prev  (if (= i 0) (- 0 1) (__nth-live nodes (- i 1)))
+          oc    (if (< prev 0) 0 (.ctr (vec-get-byval nodes prev)))
+          orep  (if (< prev 0) (quote __root) (.rep (vec-get-byval nodes prev)))]
+      (__integrate! nodes c (replica-sym r) oc orep v false)
+      (Rga (:: nodes int) c)))
+  ;;; rga-append -- insert at the end.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the sequence
+  ;;;   r -- the replica
+  ;;;   v -- the value
+  ;;;
+  ;;; Returns:
+  ;;;   A sequence one longer.
+  ;;;
+  ;;; Example:
+  ;;;   (rga-append s (replica (quote alice)) 33)
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  (defn rga-append [s : Rga r : ReplicaId v : int] : Rga
+    (let [n (rga-len s)] (rga-insert s r n v)))
+  ;;; rga-delete -- tombstone the element at a visible index.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the sequence
+  ;;;   i -- the live index to remove
+  ;;;
+  ;;; Returns:
+  ;;;   A sequence in which that element is no longer visible.  Out-of-range is
+  ;;;   a no-op.
+  ;;;
+  ;;; Example:
+  ;;;   (rga-delete s 2)
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  ;;
+  ;; No replica argument: a delete mints no id.  It names a node that already
+  ;; exists, so it is inherently idempotent and commutes with every other
+  ;; delete -- which is why tombstones are the easy half of a sequence CRDT and
+  ;; insertion is the hard half.
+  (defn rga-delete [s : Rga i : int] : Rga
+    (let [nodes (:: (.nodes s) (Vec RgaNode))
+          p     (__nth-live nodes i)]
+      (if (>= p 0) (__merge-dead! nodes p true) 0)
+      (Rga (:: nodes int) (.clock s))))
+  ;;; rga-delta-insert -- the DELTA of an insert.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the sequence, read for the clock and the origin at index i
+  ;;;   r -- the replica doing the insert
+  ;;;   i -- the live index the new element should occupy
+  ;;;   v -- the value
+  ;;;
+  ;;; Returns:
+  ;;;   A one-node sequence carrying the new node and its origin's id.
+  ;;;
+  ;;; Example:
+  ;;;   (rga-delta-insert s (replica (quote alice)) 0 72)
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  ;;
+  ;; `Delta = Rga` here, unlike the causal types in crdt/orset and crdt/ormap,
+  ;; and the reason is structural: an RGA carries no DotContext, so there is no
+  ;; downward-closed history for a delta to over-claim.  Its merge is node
+  ;; union plus tombstone OR, both monotone, so a one-node sequence IS a
+  ;; well-formed state that happens to be small.
+  ;;
+  ;; The delta must be minted alongside the local apply, from the SAME state --
+  ;; both compute the counter as clock+1, so minting two deltas from one state
+  ;; would collide:
+  ;;
+  ;;   (let [d  (rga-delta-insert s r i v)
+  ;;         s2 (rga-insert s r i v)] ...)
+  (defn rga-delta-insert [^borrow s : Rga r : ReplicaId i : int v : int] : Rga
+    (let [nodes (:: (.nodes s) (Vec RgaNode))
+          c     (+ 1 (.clock s))
+          prev  (if (= i 0) (- 0 1) (__nth-live nodes (- i 1)))
+          oc    (if (< prev 0) 0 (.ctr (vec-get-byval nodes prev)))
+          orep  (if (< prev 0) (quote __root) (.rep (vec-get-byval nodes prev)))
+          out   (:: (vec-of) (Vec RgaNode))]
+      (vec-push! out (RgaNode c (replica-sym r) oc orep v false))
+      (Rga (:: out int) c)))
+  ;;; rga-delta-delete -- the DELTA of a delete.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the sequence, read for the node at index i
+  ;;;   i -- the live index to remove
+  ;;;
+  ;;; Returns:
+  ;;;   A one-node sequence carrying that node with its tombstone set; the empty
+  ;;;   sequence when i is out of range.
+  ;;;
+  ;;; Example:
+  ;;;   (rga-delta-delete s 2)
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  ;;
+  ;; The delta carries the node's ORIGIN as well as its id, so a receiver that
+  ;; has not yet seen the insert can still place it -- as a tombstone, in the
+  ;; right position, ready for the insert to arrive and find it.  Shipping the
+  ;; id alone would work under causal delivery and fail quietly without it.
+  (defn rga-delta-delete [^borrow s : Rga i : int] : Rga
+    (let [nodes (:: (.nodes s) (Vec RgaNode))
+          p     (__nth-live nodes i)
+          out   (:: (vec-of) (Vec RgaNode))]
+      (if (>= p 0) (__push-dead! out nodes p) 0)
+      (Rga (:: out int) (.clock s))))
+  ;;; __push-dead! -- internal: copy node p into out with its tombstone set.
+  (defn __push-dead! [out : (Vec RgaNode) src : (Vec RgaNode) p : int] : int
+    (let [n (vec-get-byval src p)]
+      (vec-push! out
+        (RgaNode (.ctr n) (.rep n) (.oc n) (.orep n) (.val n) true))
+      0))
+  ;;; __merge-into! -- internal: integrate every node of `src` into `dst`.
+  ;;
+  ;; In ASCENDING id order, which is what makes a single pass enough: a node's
+  ;; origin has a smaller id (header invariant (1)), so by the time a node is
+  ;; integrated its origin is already placed.  Delivering them in the source's
+  ;; DOCUMENT order would not have that property -- a node can sit before its
+  ;; origin's later-arriving siblings -- and the scan would then start from a
+  ;; missing origin.
+  ;;
+  ;; The enumeration is "smallest id strictly greater than the last one taken",
+  ;; which is O(n) per step and O(n*m) overall.  A sort would be O(m log m) and
+  ;; needs somewhere to put the permutation; at the sizes this spice is written
+  ;; for the scan is simpler to read and to be sure of.
+  (defn __merge-into! [dst : (Vec RgaNode)
+                       src : (Vec RgaNode)
+                       pc : int
+                       pr : Sym] : int
+    (let [bi (__min-above src 0 (- 0 1) pc pr)]
+      (if (< bi 0)
+        0
+        (do
+          (__integrate-from! dst src bi)
+          (__merge-into! dst
+            src
+            (.ctr (vec-get-byval src bi))
+            (.rep (vec-get-byval src bi)))))))
+  ;;; __integrate-from! -- internal: integrate src[i] into dst.
+  ;;
+  ;; Fields are read here and passed on individually: a by-value struct
+  ;; parameter cannot be handed to `vec-push!` (see __ins-at!).
+  (defn __integrate-from! [dst : (Vec RgaNode) src : (Vec RgaNode) i : int] : int
+    (let [n (vec-get-byval src i)]
+      (__integrate! dst (.ctr n) (.rep n) (.oc n) (.orep n) (.val n) (.dead n))))
+  ;;; __min-above -- internal: index of the smallest id strictly above (pc, pr).
+  (defn __min-above [v : (Vec RgaNode) p : int best : int pc : int pr : Sym] : int
+    (if (>= p (vec-len v))
+      best
+      (let [n      (vec-get-byval v p)
+            ok     (__id-gt? (.ctr n) (.rep n) pc pr)
+            better (and ok (or (< best 0) (__beats? v p best)))]
+        (__min-above v (+ p 1) (if better p best) pc pr))))
+  ;;; __beats? -- internal: does node p have a smaller id than node q?
+  (defn __beats? [v : (Vec RgaNode) p : int q : int] : bool
+    (let [a (vec-get-byval v p)
+          b (vec-get-byval v q)]
+      (__id-gt? (.ctr b) (.rep b) (.ctr a) (.rep a))))
+  ;;; __imax__rga -- internal: the larger of two ints.
+  (defn __imax__rga [x : int y : int] : int (if (< x y) y x))
+  ;;; rga-merge -- merge another sequence into this one.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- this sequence
+  ;;;   b -- the other
+  ;;;
+  ;;; Returns:
+  ;;;   The merged sequence.  Both arguments are consumed.
+  ;;;
+  ;;; Example:
+  ;;;   (rga-merge mine theirs)
+  ;;;
+  ;;; Since: crdt-spice-plan C5
+  ;;
+  ;; The clock takes the maximum of both, which is what keeps invariant (1)
+  ;; true across a merge: after absorbing a remote node with counter 9, this
+  ;; replica's next mint must exceed 9 or a later insert could carry an id
+  ;; smaller than the origin it names, and the integration scan would place it
+  ;; wrongly -- silently, with no error and no crash, just a different document
+  ;; on two replicas.
+  (defn rga-merge [a : Rga b : Rga] : Rga
+    (let [va (:: (.nodes a) (Vec RgaNode))
+          vb (:: (.nodes b) (Vec RgaNode))]
+      (__merge-into! va vb 0 (quote __root))
+      (Rga (:: va int) (__imax__rga (.clock a) (.clock b)))))
+  ;;; JoinSemilattice [Rga] -- node union with tombstone OR, re-integrated.
+  ;;
+  ;; Commutative and idempotent because the document order is a function of the
+  ;; NODE SET and nothing else: integration only ever decides where an id goes
+  ;; among ids it can see, and that decision does not depend on what arrived
+  ;; first.  Re-delivering a node finds it already present and does nothing but
+  ;; OR its tombstone, which is `__integrate!`'s first arm.
+  (definstance JoinSemilattice [Rga] (join [x y] (rga-merge x y)))
+  ;;; BoundedJoin [Rga] -- the empty sequence is the least element.
+  (definstance BoundedJoin [Rga] (bottom [] (rga-new)))
+  ;;; Eq [Rga] -- the same visible values in the same order.
+  ;;
+  ;; STRUCTURAL, not size-only, unlike Eq [GSet] and Eq [ORSet]: the array is
+  ;; ordered and directly indexable, so there is no missing iterator to work
+  ;; around.  It compares the DOCUMENT rather than the state, so two replicas
+  ;; with different tombstone counts that read the same still compare equal --
+  ;; which is the right equality for a sequence and the one the convergence
+  ;; tests want.
+  (definstance Eq [Rga]
+    (eq? [^borrow x ^borrow y]
+      (if (= (rga-len x) (rga-len y)) (__same-values? x y 0) false)))
+  ;;; __same-values? -- internal.
+  (defn __same-values? [^borrow x : Rga ^borrow y : Rga i : int] : bool
+    (if (>= i (rga-len x))
+      true
+      (if (= (rga-get x i) (rga-get y i)) (__same-values? x y (+ i 1)) false)))
+  ;;; DeltaCRDT [Rga] -- the delta is a one-node sequence.
+  ;;
+  ;; `Delta = Rga`: no causal context means no downward-closed history to
+  ;; over-claim, so a fragment of the state IS a delta.  Contrast crdt/orset,
+  ;; where that shortcut silently deletes the receiver's elements.
+  (definstance DeltaCRDT [Rga]
+    (type Delta = Rga)
+    (delta-bottom [x] (rga-new))
+    (delta-join [x d e] (rga-merge d e))
+    (apply-delta [x d] (rga-merge x d)))) ;; end defmodule crdt/rga

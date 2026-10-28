@@ -14,27 +14,28 @@
 ;;;
 ;;; Since: E2c sized-world wiring -- see
 ;;; docs/upcoming/ecs-sized-world-plan.md (turmeric repo).
-
 (defmodule ecs/sized-storage
   (export SizedDense
-          sized-dense-new sized-dense-len sized-dense-cap
-          sized-dense-set! sized-dense-get
-          sized-dense-has? sized-dense-free
-          sized-dense-zip-len)
-
-(import ecs/entity :refer [Slot])
-
-;; (SizedDense n A) is a defopaque whose carrier is :int (the raw C
-;; handle). Public accessors take and return (SizedDense n A); private
-;; `__sized-dense-*-raw` helpers carry the original int-typed inline-C
-;; bodies and are wrapped with ascription at the public surface.
-(defopaque SizedDense [n A] :int)
-
-;; ===== Raw int-carried implementation (private) =====
-
-(defn __sized-dense-new-raw [k : int] #fx{Unsafe} : int
-  ```c
-  #include <stdlib.h>
+    sized-dense-new
+    sized-dense-len
+    sized-dense-cap
+    sized-dense-set!
+    sized-dense-get
+    sized-dense-has?
+    sized-dense-free
+    sized-dense-zip-len)
+  (import ecs/entity :refer [Slot])
+  ;; (SizedDense n A) is a defopaque whose carrier is :int (the raw C
+  ;; handle). Public accessors take and return (SizedDense n A); private
+  ;; `__sized-dense-*-raw` helpers carry the original int-typed inline-C
+  ;; bodies and are wrapped with ascription at the public surface.
+  (defopaque SizedDense [n A] :int)
+  ;; ===== Raw int-carried implementation (private) =====
+  (defn __sized-dense-new-raw [k : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
   typedef struct { void *data; uint8_t *present; size_t len; size_t cap; size_t elem_sz; } __ecs_dense;
@@ -46,24 +47,27 @@
   s->present = (uint8_t *)calloc(s->cap, 1);
   return (int64_t)(intptr_t)s;
   ```)
-
-(defn __sized-dense-len-raw [s : int] #fx{Unsafe} : int
-  ```c
-  typedef struct { void *data; uint8_t *present; size_t len; size_t cap; size_t elem_sz; } __ecs_dense;
+  (defn __sized-dense-len-raw [s : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    typedef struct { void *data; uint8_t *present; size_t len; size_t cap; size_t elem_sz; } __ecs_dense;
   __ecs_dense *st = (__ecs_dense *)(intptr_t)s;
   return (int64_t)st->len;
   ```)
-
-(defn __sized-dense-cap-raw [s : int] #fx{Unsafe} : int
-  ```c
-  typedef struct { void *data; uint8_t *present; size_t len; size_t cap; size_t elem_sz; } __ecs_dense;
+  (defn __sized-dense-cap-raw [s : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    typedef struct { void *data; uint8_t *present; size_t len; size_t cap; size_t elem_sz; } __ecs_dense;
   __ecs_dense *st = (__ecs_dense *)(intptr_t)s;
   return (int64_t)st->cap;
   ```)
-
-(defn __sized-dense-set!-raw [A] [s : int idx : int val : A] #fx{Unsafe} : nil
-  ```c
-  typedef struct { void *data; uint8_t *present; size_t len; size_t cap; size_t elem_sz; } __ecs_dense;
+  (defn __sized-dense-set!-raw [A] [s : int idx : int val : A]
+    #fx{Unsafe}
+    : nil
+    ```c
+    typedef struct { void *data; uint8_t *present; size_t len; size_t cap; size_t elem_sz; } __ecs_dense;
   __ecs_dense *st = (__ecs_dense *)(intptr_t)s;
   if ((size_t)idx >= st->cap) {
     fprintf(stderr, "sized-dense-set!: index %lld out of range (cap=%zu)\n",
@@ -78,103 +82,94 @@
   st->present[idx] = 1;
   if ((size_t)idx + 1 > st->len) st->len = (size_t)idx + 1;
   ```)
-
-(defn __sized-dense-get-raw [A] [s : int idx : int] #fx{Unsafe} : A
-  ```c
-  typedef struct { void *data; uint8_t *present; size_t len; size_t cap; size_t elem_sz; } __ecs_dense;
+  (defn __sized-dense-get-raw [A] [s : int idx : int]
+    #fx{Unsafe}
+    : A
+    ```c
+    typedef struct { void *data; uint8_t *present; size_t len; size_t cap; size_t elem_sz; } __ecs_dense;
   __ecs_dense *st = (__ecs_dense *)(intptr_t)s;
   return ((__TUR_TY_A__ *)st->data)[idx];
   ```)
-
-(defn __sized-dense-has?-raw [s : int idx : int] #fx{Unsafe} : bool
-  ```c
-  typedef struct { void *data; uint8_t *present; size_t len; size_t cap; size_t elem_sz; } __ecs_dense;
+  (defn __sized-dense-has?-raw [s : int idx : int]
+    #fx{Unsafe}
+    : bool
+    ```c
+    typedef struct { void *data; uint8_t *present; size_t len; size_t cap; size_t elem_sz; } __ecs_dense;
   __ecs_dense *st = (__ecs_dense *)(intptr_t)s;
   if ((size_t)idx >= st->cap) return false;
   return st->present[idx] != 0;
   ```)
-
-(defn __sized-dense-free-raw [s : int] #fx{Unsafe} : nil
-  ```c
-  #include <stdlib.h>
+  (defn __sized-dense-free-raw [s : int]
+    #fx{Unsafe}
+    : nil
+    ```c
+    #include <stdlib.h>
   typedef struct { void *data; uint8_t *present; size_t len; size_t cap; size_t elem_sz; } __ecs_dense;
   __ecs_dense *st = (__ecs_dense *)(intptr_t)s;
   if (st) { free(st->data); free(st->present); free(st); }
   ```)
-
-;; ===== Public (SizedDense n A) surface =====
-
-;;; sized-dense-new -- allocate a (SizedDense n A) with `k` slots.
-;;;
-;;; The phantom `n` and element type `A` are inferred from the binding
-;;; or call site's expected type (or supplied explicitly via ascription).
-;;; The runtime length `k` should match the static `n` -- a mismatch is
-;;; not a static error here because `k` is a plain int; pin it via the
-;;; declared world type when wiring through `defworld`.
-;;;
-;;; Parameters:
-;;;   k -- number of slots to allocate
-;;;
-;;; Returns:
-;;;   A fresh (SizedDense n A), all slots cleared (present-bit = 0).
-;;;
-;;; Example:
-;;;   (let [s : (SizedDense (Static 4) int) (sized-dense-new 4)] ...)
-;;;
-;;; Since: E2c
-(defn sized-dense-new [n A] [k : int] : (SizedDense n A)
-  (:: (unsafe (__sized-dense-new-raw k)) :SizedDense))
-
-;;; sized-dense-len -- logical length (one past the highest slot written).
-;;;
-;;; Since: E2c
-(defn sized-dense-len [n A] [s : (SizedDense n A)] : int
-  (unsafe (__sized-dense-len-raw (:: s :int))))
-
-;;; sized-dense-cap -- physical capacity (matches the phantom `n`).
-;;;
-;;; Since: E2c
-(defn sized-dense-cap [n A] [s : (SizedDense n A)] : int
-  (unsafe (__sized-dense-cap-raw (:: s :int))))
-
-;;; sized-dense-set! -- write a value at slot idx.
-;;;
-;;; Aborts on out-of-range idx (cap is static at construction).
-;;;
-;;; Since: E2c
-(defn sized-dense-set! [n A] [s : (SizedDense n A) idx : Slot val : A] : nil
-  (unsafe (__sized-dense-set!-raw (:: s :int) (:: idx :int) val)))
-
-;;; sized-dense-get -- read the value at slot idx (typed A).
-;;;
-;;; Caller must has?-check first; absent slots return unspecified bytes.
-;;;
-;;; Since: E2c
-(defn sized-dense-get [n A] [s : (SizedDense n A) idx : Slot] : A
-  (unsafe (__sized-dense-get-raw (:: s :int) (:: idx :int))))
-
-;;; sized-dense-has? -- is slot idx populated?
-;;;
-;;; Since: E2c
-(defn sized-dense-has? [n A] [s : (SizedDense n A) idx : Slot] : bool
-  (unsafe (__sized-dense-has?-raw (:: s :int) (:: idx :int))))
-
-;;; sized-dense-free -- release the storage's backing arrays.
-;;;
-;;; Since: E2c
-(defn sized-dense-free [n A] [s : (SizedDense n A)] : nil
-  (unsafe (__sized-dense-free-raw (:: s :int))))
-
-;;; sized-dense-zip-len -- the cross-parameter unification probe.
-;;;
-;;; Two (SizedDense n _) values sharing `n` are statically rectangular;
-;;; this returns their common length without a runtime min-cap. The
-;;; SZ8 cross-parameter unifier rejects a mismatched-`n` call at
-;;; compile time with TUR-E0260.
-;;;
-;;; Since: E2c
-(defn sized-dense-zip-len [n A B]
-                          [a : (SizedDense n A) b : (SizedDense n B)] : int
-  (sized-dense-len a))
-
-) ;; end defmodule ecs/sized-storage
+  ;; ===== Public (SizedDense n A) surface =====
+  ;;; sized-dense-new -- allocate a (SizedDense n A) with `k` slots.
+  ;;;
+  ;;; The phantom `n` and element type `A` are inferred from the binding
+  ;;; or call site's expected type (or supplied explicitly via ascription).
+  ;;; The runtime length `k` should match the static `n` -- a mismatch is
+  ;;; not a static error here because `k` is a plain int; pin it via the
+  ;;; declared world type when wiring through `defworld`.
+  ;;;
+  ;;; Parameters:
+  ;;;   k -- number of slots to allocate
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh (SizedDense n A), all slots cleared (present-bit = 0).
+  ;;;
+  ;;; Example:
+  ;;;   (let [s : (SizedDense (Static 4) int) (sized-dense-new 4)] ...)
+  ;;;
+  ;;; Since: E2c
+  (defn sized-dense-new [n A] [k : int] : (SizedDense n A)
+    (:: (unsafe (__sized-dense-new-raw k)) :SizedDense))
+  ;;; sized-dense-len -- logical length (one past the highest slot written).
+  ;;;
+  ;;; Since: E2c
+  (defn sized-dense-len [n A] [s : (SizedDense n A)] : int
+    (unsafe (__sized-dense-len-raw (:: s :int))))
+  ;;; sized-dense-cap -- physical capacity (matches the phantom `n`).
+  ;;;
+  ;;; Since: E2c
+  (defn sized-dense-cap [n A] [s : (SizedDense n A)] : int
+    (unsafe (__sized-dense-cap-raw (:: s :int))))
+  ;;; sized-dense-set! -- write a value at slot idx.
+  ;;;
+  ;;; Aborts on out-of-range idx (cap is static at construction).
+  ;;;
+  ;;; Since: E2c
+  (defn sized-dense-set! [n A] [s : (SizedDense n A) idx : Slot val : A] : nil
+    (unsafe (__sized-dense-set!-raw (:: s :int) (:: idx :int) val)))
+  ;;; sized-dense-get -- read the value at slot idx (typed A).
+  ;;;
+  ;;; Caller must has?-check first; absent slots return unspecified bytes.
+  ;;;
+  ;;; Since: E2c
+  (defn sized-dense-get [n A] [s : (SizedDense n A) idx : Slot] : A
+    (unsafe (__sized-dense-get-raw (:: s :int) (:: idx :int))))
+  ;;; sized-dense-has? -- is slot idx populated?
+  ;;;
+  ;;; Since: E2c
+  (defn sized-dense-has? [n A] [s : (SizedDense n A) idx : Slot] : bool
+    (unsafe (__sized-dense-has?-raw (:: s :int) (:: idx :int))))
+  ;;; sized-dense-free -- release the storage's backing arrays.
+  ;;;
+  ;;; Since: E2c
+  (defn sized-dense-free [n A] [s : (SizedDense n A)] : nil
+    (unsafe (__sized-dense-free-raw (:: s :int))))
+  ;;; sized-dense-zip-len -- the cross-parameter unification probe.
+  ;;;
+  ;;; Two (SizedDense n _) values sharing `n` are statically rectangular;
+  ;;; this returns their common length without a runtime min-cap. The
+  ;;; SZ8 cross-parameter unifier rejects a mismatched-`n` call at
+  ;;; compile time with TUR-E0260.
+  ;;;
+  ;;; Since: E2c
+  (defn sized-dense-zip-len [n A B] [a : (SizedDense n A) b : (SizedDense n B)] : int
+    (sized-dense-len a))) ;; end defmodule ecs/sized-storage

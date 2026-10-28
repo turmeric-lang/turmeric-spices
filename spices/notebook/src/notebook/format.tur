@@ -1,53 +1,80 @@
 ;; notebook/format -- parse notebook markdown into prose/cell nodes.
-
 (defmodule notebook/format
-  (import notebook/cmark :refer [md-parse md-tag-code-block md-node-children md-node-tag
-                                 md-node-info md-node-text md-source-span md-emit
-                                 md-node-free md-node-free-shell md-children-free
-                                 md-span-free])
-  (import notebook/cell :refer [parse-attrs attr-get
-                                attr-name attr-value
-                                cell-make cell-id cell-lang cell-source cell-attrs
-                                cell-start-line cell-end-line
-                                cell-free cell-set-source!])
-  (export parse-file parse-string
-          node-tag node-prose node-cell
-          nodes->str nodes-update-cell
-          nodes-free)
-
+  (import notebook/cmark
+    :refer
+    [md-parse
+     md-tag-code-block
+     md-node-children
+     md-node-tag
+     md-node-info
+     md-node-text
+     md-source-span
+     md-emit
+     md-node-free
+     md-node-free-shell
+     md-children-free
+     md-span-free])
+  (import notebook/cell
+    :refer
+    [parse-attrs
+     attr-get
+     attr-name
+     attr-value
+     cell-make
+     cell-id
+     cell-lang
+     cell-source
+     cell-attrs
+     cell-start-line
+     cell-end-line
+     cell-free
+     cell-set-source!])
+  (export parse-file
+    parse-string
+    node-tag
+    node-prose
+    node-cell
+    nodes->str
+    nodes-update-cell
+    nodes-free)
   ;; Minimal cons helpers so the module stays self-contained.
-  (defn __fmt-nil-value [] #fx{Unsafe} : int
+  (defn __fmt-nil-value []
+    #fx{Unsafe}
+    : int
     ```c
     return 0;
     ```)
-
-  (defn __fmt-list-nil? [lst : int] #fx{Unsafe} : bool
+  (defn __fmt-list-nil? [lst : int]
+    #fx{Unsafe}
+    : bool
     ```c
     return lst == 0;
     ```)
-
-  (defn __fmt-cons [value : int next : int] #fx{Unsafe} : int
+  (defn __fmt-cons [value : int next : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t head; int64_t tail; } *cell = malloc(sizeof(*cell));
     cell->head = value;
     cell->tail = next;
     return (int64_t)(intptr_t)cell;
     ```)
-
-  (defn __fmt-head [lst : int] #fx{Unsafe} : int
+  (defn __fmt-head [lst : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t head; int64_t tail; } *cell = (void*)(intptr_t)lst;
     if (!cell) { fprintf(stderr, "head: empty list\n"); exit(1); }
     return cell->head;
     ```)
-
-  (defn __fmt-tail [lst : int] #fx{Unsafe} : int
+  (defn __fmt-tail [lst : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t head; int64_t tail; } *cell = (void*)(intptr_t)lst;
     if (!cell) { fprintf(stderr, "tail: empty list\n"); exit(1); }
     return cell->tail;
     ```)
-
   ;; Result helpers: route through the typed preamble builders so the
   ;; canonical layout lives in one place (tur_runtime.h). The surface
   ;; here stays :int (carrier) because the in-tree consumers in
@@ -55,24 +82,29 @@
   ;; share private __rmd-result-* helpers that read the layout as :int;
   ;; tightening parse-string / parse-file to (Result int int) is a
   ;; downstream sweep beyond this migration's scope.
-  (defn __ok [value : int] #fx{Unsafe} : int
+  (defn __ok [value : int]
+    #fx{Unsafe}
+    : int
     ```c
     return tur_ok_int(value);
     ```)
-
-  (defn __err [value : int] #fx{Unsafe} : int
+  (defn __err [value : int]
+    #fx{Unsafe}
+    : int
     ```c
     return tur_err_int(value);
     ```)
-
-  (defn __fmt-cstr-eq? [a : cstr b : cstr] #fx{Unsafe} : bool
+  (defn __fmt-cstr-eq? [a : cstr b : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *sa = a ? (const char *)(intptr_t)a : "";
     const char *sb = b ? (const char *)(intptr_t)b : "";
     return strcmp(sa, sb) == 0;
     ```)
-
-  (defn __fmt-str-concat [a : cstr b : cstr] #fx{Unsafe} : cstr
+  (defn __fmt-str-concat [a : cstr b : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *sa = a ? (const char *)(intptr_t)a : "";
     const char *sb = b ? (const char *)(intptr_t)b : "";
@@ -83,18 +115,21 @@
     out[la + lb] = '\0';
     return out;
     ```)
-
-  (defn __fmt-cstr-as-int [value : cstr] #fx{Unsafe} : int
+  (defn __fmt-cstr-as-int [value : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     return (int64_t)(intptr_t)value;
     ```)
-
-  (defn __fmt-int-as-cstr [value : int] #fx{Unsafe} : cstr
+  (defn __fmt-int-as-cstr [value : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     return (const char *)(intptr_t)value;
     ```)
-
-  (defn __fmt-slurp [path : cstr] #fx{Unsafe} : cstr
+  (defn __fmt-slurp [path : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *p = path ? (const char *)(intptr_t)path : "";
     FILE *fp = fopen(p, "rb");
@@ -110,35 +145,37 @@
     buf[got] = '\0';
     return (const char *)(intptr_t)buf;
     ```)
-
-  (defn __fmt-cstr-free [s : cstr] #fx{Unsafe} : void
+  (defn __fmt-cstr-free [s : cstr]
+    #fx{Unsafe}
+    : void
     ```c
     void *p = (void *)(intptr_t)s;
     if (p) free(p);
     ```)
-
-;;; __fmt-own -- copy a borrowed string so a concat can consume it.  The
-;;; serialiser mixes literals, borrowed cell fields and malloc'd pieces; making
-;;; every operand owned is what lets __fmt-concat-owned free as it goes.
-  (defn __fmt-own [s : cstr] #fx{Unsafe} : cstr
+  ;;; __fmt-own -- copy a borrowed string so a concat can consume it.  The
+  ;;; serialiser mixes literals, borrowed cell fields and malloc'd pieces; making
+  ;;; every operand owned is what lets __fmt-concat-owned free as it goes.
+  (defn __fmt-own [s : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     return strdup(s ? (const char *)(intptr_t)s : "");
     ```)
-
-;;; __fmt-concat-owned -- concatenate two owned strings, releasing both.
-  (defn __fmt-concat-owned [a : cstr b : cstr] #fx{Unsafe} : cstr
+  ;;; __fmt-concat-owned -- concatenate two owned strings, releasing both.
+  (defn __fmt-concat-owned [a : cstr b : cstr]
+    #fx{Unsafe}
+    : cstr
     (let [out (__fmt-str-concat a b)]
-      (do
-        (__fmt-cstr-free a)
-        (__fmt-cstr-free b)
-        out)))
-
-  (defn __fmt-cstr-null? [s : cstr] #fx{Unsafe} : bool
+      (do (__fmt-cstr-free a) (__fmt-cstr-free b) out)))
+  (defn __fmt-cstr-null? [s : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     return ((const void *)(intptr_t)s) == NULL;
     ```)
-
-  (defn __fmt-node-make [tag : int prose : int cell : int] #fx{Unsafe} : int
+  (defn __fmt-node-make [tag : int prose : int cell : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { int64_t tag; int64_t prose; int64_t cell; } NotebookNode;
     NotebookNode *node = malloc(sizeof(*node));
@@ -147,38 +184,44 @@
     node->cell = cell;
     return (int64_t)(intptr_t)node;
     ```)
-
-  (defn __node-prose-make [prose : int] #fx{Unsafe} : int
+  (defn __node-prose-make [prose : int]
+    #fx{Unsafe}
+    : int
     (__fmt-node-make 0 prose 0))
-
-  (defn __node-cell-make [cell : int] #fx{Unsafe} : int
+  (defn __node-cell-make [cell : int]
+    #fx{Unsafe}
+    : int
     (__fmt-node-make 1 0 cell))
-
   ;;; node-tag -- return 0 for prose nodes and 1 for cell nodes.
-  (defn node-tag [node : int] #fx{Unsafe} : int
+  (defn node-tag [node : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { int64_t tag; int64_t prose; int64_t cell; } NotebookNode;
     NotebookNode *n = (NotebookNode *)(intptr_t)node;
     return n ? n->tag : -1;
     ```)
-
   ;;; node-prose -- extract the md-node handle from a prose node.
-  (defn node-prose [node : int] #fx{Unsafe} : int
+  (defn node-prose [node : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { int64_t tag; int64_t prose; int64_t cell; } NotebookNode;
     NotebookNode *n = (NotebookNode *)(intptr_t)node;
     return n ? n->prose : 0;
     ```)
-
   ;;; node-cell -- extract the cell handle from a cell node.
-  (defn node-cell [node : int] #fx{Unsafe} : int
+  (defn node-cell [node : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { int64_t tag; int64_t prose; int64_t cell; } NotebookNode;
     NotebookNode *n = (NotebookNode *)(intptr_t)node;
     return n ? n->cell : 0;
     ```)
-
-  (defn __lang-from-info [info : cstr] #fx{Unsafe} : int
+  (defn __lang-from-info [info : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     const char *s = info ? (const char *)(intptr_t)info : "";
     size_t n = strlen(s);
@@ -192,19 +235,18 @@
     }
     return -1;
     ```)
-
-  (defn __lang-label [lang : int] #fx{Unsafe} : cstr
-    (if (= lang 0)
-      "turmeric"
-      "sweet-exp"))
-
-  (defn __span-start [span : int] #fx{Unsafe} : int
-    (__fmt-head span))
-
-  (defn __span-end [span : int] #fx{Unsafe} : int
+  (defn __lang-label [lang : int]
+    #fx{Unsafe}
+    : cstr
+    (if (= lang 0) "turmeric" "sweet-exp"))
+  (defn __span-start [span : int] #fx{Unsafe} : int (__fmt-head span))
+  (defn __span-end [span : int]
+    #fx{Unsafe}
+    : int
     (__fmt-head (__fmt-tail span)))
-
-  (defn __inject-no-check-attr [info : cstr attrs : int] #fx{Unsafe} : int
+  (defn __inject-no-check-attr [info : cstr attrs : int]
+    #fx{Unsafe}
+    : int
     ```c
     const char *s = info ? (const char *)(intptr_t)info : "";
     const char *brace = strchr(s, '{');
@@ -229,43 +271,43 @@
     }
     return attrs;
     ```)
-
-;;; __block->node -- wrap one markdown block as a prose or cell node.
-;;;
-;;; A prose node OWNS its md block; a cell node copies everything it needs out
-;;; of the block and releases it.  Neither used to happen: the cell branch
-;;; dropped both the block and the two-cons list md-source-span allocates.
-  (defn __block->node [block : int] #fx{Unsafe} : int
+  ;;; __block->node -- wrap one markdown block as a prose or cell node.
+  ;;;
+  ;;; A prose node OWNS its md block; a cell node copies everything it needs out
+  ;;; of the block and releases it.  Neither used to happen: the cell branch
+  ;;; dropped both the block and the two-cons list md-source-span allocates.
+  (defn __block->node [block : int]
+    #fx{Unsafe}
+    : int
     (if (and (= (md-node-tag block) (md-tag-code-block))
-             (>= (__lang-from-info (md-node-info block)) 0))
-      (let [info (md-node-info block)
+          (>= (__lang-from-info (md-node-info block)) 0))
+      (let [info  (md-node-info block)
             attrs (__inject-no-check-attr info (parse-attrs info))
-            lang (__lang-from-info info)
-            span (md-source-span block)
-            cell (cell-make (attr-get attrs "id" "")
-                            lang
-                            (md-node-text block)
-                            attrs
-                            (__span-start span)
-                            (__span-end span))
-            node (__node-cell-make cell)]
-        (do
-          (md-span-free span)
-          (md-node-free block)
-          node))
+            lang  (__lang-from-info info)
+            span  (md-source-span block)
+            cell  (cell-make (attr-get attrs "id" "")
+                    lang
+                    (md-node-text block)
+                    attrs
+                    (__span-start span)
+                    (__span-end span))
+            node  (__node-cell-make cell)]
+        (do (md-span-free span) (md-node-free block) node))
       (__node-prose-make block)))
-
-  (defn __blocks->nodes [blocks : int] #fx{Unsafe} : int
+  (defn __blocks->nodes [blocks : int]
+    #fx{Unsafe}
+    : int
     (if (__fmt-list-nil? blocks)
       (__fmt-nil-value)
       (__fmt-cons (__block->node (__fmt-head blocks))
-                  (__blocks->nodes (__fmt-tail blocks)))))
-
-;;; nodes-free -- release a node list and everything it owns.
-;;;
-;;; A prose node owns its md block; a cell node owns its Cell (and through it
-;;; the attrs list).  Safe on 0.
-  (defn nodes-free [nodes : int] #fx{Unsafe} : void
+        (__blocks->nodes (__fmt-tail blocks)))))
+  ;;; nodes-free -- release a node list and everything it owns.
+  ;;;
+  ;;; A prose node owns its md block; a cell node owns its Cell (and through it
+  ;;; the attrs list).  Safe on 0.
+  (defn nodes-free [nodes : int]
+    #fx{Unsafe}
+    : void
     (if (__fmt-list-nil? nodes)
       (__fmt-noop)
       (let [next (__fmt-tail nodes)
@@ -277,25 +319,27 @@
           (__fmt-node-free node)
           (__fmt-cons-free nodes)
           (nodes-free next)))))
-
-;;; __fmt-node-free -- free one NotebookNode struct, not what it points at.
-  (defn __fmt-node-free [node : int] #fx{Unsafe} : void
+  ;;; __fmt-node-free -- free one NotebookNode struct, not what it points at.
+  (defn __fmt-node-free [node : int]
+    #fx{Unsafe}
+    : void
     ```c
     free((void *)(intptr_t)node);
     ```)
-
-;;; __fmt-cons-free -- free one cons cell, leaving its head alone.
-  (defn __fmt-cons-free [node : int] #fx{Unsafe} : void
+  ;;; __fmt-cons-free -- free one cons cell, leaving its head alone.
+  (defn __fmt-cons-free [node : int]
+    #fx{Unsafe}
+    : void
     ```c
     free((void *)(intptr_t)node);
     ```)
-
-;;; __fmt-noop -- void no-op, so a cleanup-only `if` has void on both arms.
-  (defn __fmt-noop [] #fx{Unsafe} : void
+  ;;; __fmt-noop -- void no-op, so a cleanup-only `if` has void on both arms.
+  (defn __fmt-noop []
+    #fx{Unsafe}
+    : void
     ```c
     return;
     ```)
-
   ;;; parse-string -- parse notebook markdown into prose and cell nodes.
   ;;;
   ;;; The document's blocks move into the returned nodes, so the (now
@@ -304,7 +348,9 @@
   ;;; document, so the whole parse tree was unreachable the moment it was
   ;;; built.  md-node-children also allocates a fresh cons spine per call,
   ;;; which is freed here too.
-  (defn parse-string [s : cstr] #fx{Unsafe} : int
+  (defn parse-string [s : cstr]
+    #fx{Unsafe}
+    : int
     (let [doc   (md-parse s)
           kids  (md-node-children doc)
           nodes (__blocks->nodes kids)]
@@ -314,18 +360,17 @@
         ;; storage.  The blocks themselves have moved into `nodes`.
         (md-node-free-shell doc)
         (__ok nodes))))
-
   ;;; parse-file -- read a notebook file from disk and parse it.
-  (defn parse-file [path : cstr] #fx{Unsafe} : int
+  (defn parse-file [path : cstr]
+    #fx{Unsafe}
+    : int
     (let [src (__fmt-slurp path)]
-    (if (__fmt-cstr-null? src)
+      (if (__fmt-cstr-null? src)
         (__err 0)
-        (let [parsed (parse-string src)]
-          (do
-          (__fmt-cstr-free src)
-            parsed)))))
-
-  (defn __render-attr-list [attrs : int] #fx{Unsafe} : cstr
+        (let [parsed (parse-string src)] (do (__fmt-cstr-free src) parsed)))))
+  (defn __render-attr-list [attrs : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     typedef struct { char *name; char *value; } Attr;
@@ -356,46 +401,46 @@
     }
     return out;
     ```)
-
-;;; The serialiser hands every caller an owned string.  __render-attr-list and
-;;; md-emit already malloc; the literals and the borrowed cell fields go
-;;; through __fmt-own so __fmt-concat-owned can release each intermediate as
-;;; the result is assembled, instead of dropping it on the floor.
-  (defn __render-attrs [attrs : int] #fx{Unsafe} : cstr
+  ;;; The serialiser hands every caller an owned string.  __render-attr-list and
+  ;;; md-emit already malloc; the literals and the borrowed cell fields go
+  ;;; through __fmt-own so __fmt-concat-owned can release each intermediate as
+  ;;; the result is assembled, instead of dropping it on the floor.
+  (defn __render-attrs [attrs : int]
+    #fx{Unsafe}
+    : cstr
     (if (__fmt-list-nil? attrs)
       (__fmt-own "")
-      (__fmt-concat-owned
-        (__fmt-own " {")
+      (__fmt-concat-owned (__fmt-own " {")
         (__fmt-concat-owned (__render-attr-list attrs) (__fmt-own "}")))))
-
-  (defn __render-node [node : int] #fx{Unsafe} : cstr
+  (defn __render-node [node : int]
+    #fx{Unsafe}
+    : cstr
     (if (= (node-tag node) 0)
       (md-emit (node-prose node))
       (let [cell (node-cell node)]
-        (__fmt-concat-owned
-          (__fmt-own "```")
+        (__fmt-concat-owned (__fmt-own "```")
           (__fmt-concat-owned (__fmt-own (__lang-label (cell-lang cell)))
-                              (__fmt-concat-owned (__render-attrs (cell-attrs cell))
-                                                  (__fmt-concat-owned (__fmt-own "\n")
-                                                                      (__fmt-concat-owned (__fmt-own (cell-source cell))
-                                                                                          (__fmt-own "\n```")))))))))
-
-  (defn __nodes->str-int [nodes : int] #fx{Unsafe} : int
+            (__fmt-concat-owned (__render-attrs (cell-attrs cell))
+              (__fmt-concat-owned (__fmt-own "\n")
+                (__fmt-concat-owned (__fmt-own (cell-source cell))
+                  (__fmt-own "\n```")))))))))
+  (defn __nodes->str-int [nodes : int]
+    #fx{Unsafe}
+    : int
     (if (__fmt-list-nil? nodes)
       (__fmt-cstr-as-int (__fmt-own ""))
       (let [cur (__render-node (__fmt-head nodes))]
         (if (__fmt-list-nil? (__fmt-tail nodes))
           (__fmt-cstr-as-int cur)
-          (__fmt-cstr-as-int
-            (__fmt-concat-owned cur
-                                (__fmt-concat-owned (__fmt-own "\n\n")
-                                                    (__fmt-int-as-cstr (__nodes->str-int (__fmt-tail nodes))))))))))
-
+          (__fmt-cstr-as-int (__fmt-concat-owned cur
+                               (__fmt-concat-owned (__fmt-own "\n\n")
+                                 (__fmt-int-as-cstr (__nodes->str-int (__fmt-tail nodes))))))))))
   ;;; nodes->str -- serialize notebook nodes back to normalized markdown.
   ;;; The result is owned by the caller.
-  (defn nodes->str [nodes : int] #fx{Unsafe} : cstr
+  (defn nodes->str [nodes : int]
+    #fx{Unsafe}
+    : cstr
     (__fmt-int-as-cstr (__nodes->str-int nodes)))
-
   ;;; __replace-node-if-match -- rewrite the matched cell's source in place.
   ;;;
   ;;; This used to build a new Cell (via cell-make) inside a new node, and
@@ -405,29 +450,35 @@
   ;;; freeing neither is what the leak reports were showing.  Since both
   ;;; callers use the return value and drop the input, mutating is both
   ;;; simpler and the only version that can be freed.
-  (defn __replace-node-if-match [node : int cell-id-want : cstr new-source : cstr] #fx{Unsafe} : void
+  (defn __replace-node-if-match [node : int
+                                 cell-id-want : cstr
+                                 new-source : cstr]
+    #fx{Unsafe}
+    : void
     (if (= (node-tag node) 1)
       (let [cell (node-cell node)]
         (if (__fmt-cstr-eq? (cell-id cell) cell-id-want)
           (cell-set-source! cell new-source)
           (__fmt-noop)))
       (__fmt-noop)))
-
-  (defn __node-list-has-cell? [nodes : int cell-id-want : cstr] #fx{Unsafe} : bool
+  (defn __node-list-has-cell? [nodes : int cell-id-want : cstr]
+    #fx{Unsafe}
+    : bool
     (if (__fmt-list-nil? nodes)
       false
       (if (and (= (node-tag (__fmt-head nodes)) 1)
-               (__fmt-cstr-eq? (cell-id (node-cell (__fmt-head nodes))) cell-id-want))
+            (__fmt-cstr-eq? (cell-id (node-cell (__fmt-head nodes)))
+              cell-id-want))
         true
         (__node-list-has-cell? (__fmt-tail nodes) cell-id-want))))
-
-  (defn __replace-node-list [nodes : int cell-id-want : cstr new-source : cstr] #fx{Unsafe} : int
+  (defn __replace-node-list [nodes : int cell-id-want : cstr new-source : cstr]
+    #fx{Unsafe}
+    : int
     (if (__fmt-list-nil? nodes)
       0
       (do
         (__replace-node-if-match (__fmt-head nodes) cell-id-want new-source)
         (__replace-node-list (__fmt-tail nodes) cell-id-want new-source))))
-
   ;;; nodes-update-cell -- replace the source of a named cell.
   ;;;
   ;;; Rewrites the cell in place and returns (ok nodes) -- the same list it
@@ -435,11 +486,9 @@
   ;;; id.  Both callers use the returned list and drop the input, so this is
   ;;; a drop-in change; see __replace-node-if-match for why the previous
   ;;; "immutable" version could not be freed.
-  (defn nodes-update-cell [nodes : int cell-id-want : cstr new-source : cstr] #fx{Unsafe} : int
+  (defn nodes-update-cell [nodes : int cell-id-want : cstr new-source : cstr]
+    #fx{Unsafe}
+    : int
     (if (__node-list-has-cell? nodes cell-id-want)
-      (do
-        (__replace-node-list nodes cell-id-want new-source)
-        (__ok nodes))
-      (__err 0)))
-
-) ;; end defmodule notebook/format
+      (do (__replace-node-list nodes cell-id-want new-source) (__ok nodes))
+      (__err 0)))) ;; end defmodule notebook/format

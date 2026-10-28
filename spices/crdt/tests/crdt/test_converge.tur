@@ -39,194 +39,172 @@
 ;; No inline C, deliberately: stdlib/random.tur is inline-C (and not
 ;; auto-loaded), and a single block anywhere in this spice would cost it the
 ;; interpreter coverage crdt-spice-plan 2.5 argues to protect.
-
 (defmodule crdt/tests/test_converge
   (import crdt/replica :refer [ReplicaId replica replica-sym])
   (import crdt/orset :refer [orset-new orset-add orset-remove orset-has?])
-
-;;; __lcg -- internal: one step of a linear congruential generator.
-;;
-;; Numerical Recipes constants, mod 2^31.  1103515245 * s stays under 2^61 for
-;; s < 2^31, so the multiply does not overflow int64.
-(defn __lcg [s : int] : int
-  (mod (+ (* 1103515245 s) 12345) 2147483648))
-
-;;; __nth-sym -- internal: element alphabet, indexed.
-(defn __nth-sym [i : int] : Sym
-  (if (= i 0) (quote e0) (if (= i 1) (quote e1) (quote e2))))
-
-;;; __nth-replica -- internal: replica alphabet, indexed.
-(defn __nth-replica [i : int] : ReplicaId
-  (replica (if (= i 0) (quote r0) (if (= i 1) (quote r1) (quote r2)))))
-
-;;; __build -- internal: replay `n` ops from `seed`, keeping those for replica `me`.
-;;
-;; Every replica derives the SAME op stream from the seed and applies only its
-;; own ops, so the streams are causally independent -- which is what makes the
-;; merge orders below genuinely concurrent rather than a replayed log.
-;;; __keep -- internal: identity on an ORSet.
-;;
-;; Not redundant.  A by-value struct PARAMETER used directly as an `if` arm is
-;; dereferenced by the emitter -- `*(tur_adt_ORSet *)(intptr_t)(acc)` -- and cc
-;; rejects it, while `tur check` is clean.  Routing the pass-through arm through
-;; any call, even this one, compiles.  See
-;; docs/reported/byvalue-struct-param-as-if-arm-derefs.md in the turmeric repo;
-;; delete this when that lands.
-(defn __keep [s : ORSet] : ORSet s)
-
-;;; __do-op -- internal: apply one operation.
-(defn __do-op [acc : ORSet k : int e : Sym r : ReplicaId] : ORSet
-  (if (= k 0) (orset-add acc e r) (orset-remove acc e)))
-
-;;; __apply -- internal: apply the op if it belongs to this replica.
-(defn __apply [acc : ORSet mine : bool k : int e : Sym r : ReplicaId] : ORSet
-  (if mine (__do-op acc k e r) (__keep acc)))
-
-(defn __build [seed : int me : int n : int acc : ORSet] : ORSet
-  (if (= n 0)
-    (__keep acc)
-    (let [s1  (__lcg seed)
-          s2  (__lcg s1)
-          s3  (__lcg s2)
-          r   (mod s1 3)
-          k   (mod s2 2)
-          e   (__nth-sym (mod s3 3))]
-      (__build s3 me (- n 1) (__apply acc (= r me) k e (__nth-replica r))))))
-
-;;; __replica -- internal: replica `me`'s state after replaying `n` ops.
-(defn __replica [seed : int me : int n : int] : ORSet
-  (__build seed me n (orset-new)))
-
-;;; __order-abc -- internal: deliver a, then b, then c.
-(defn __order-abc [seed : int n : int] : ORSet
-  (join (join (__replica seed 0 n) (__replica seed 1 n)) (__replica seed 2 n)))
-
-;;; __order-cba -- internal: the reverse delivery order.
-(defn __order-cba [seed : int n : int] : ORSet
-  (join (join (__replica seed 2 n) (__replica seed 1 n)) (__replica seed 0 n)))
-
-;;; __order-nested -- internal: a different association, a(bc) rather than (ab)c.
-(defn __order-nested [seed : int n : int] : ORSet
-  (join (__replica seed 0 n) (join (__replica seed 1 n) (__replica seed 2 n))))
-
-;;; __order-dup -- internal: b delivered TWICE, and a re-delivered at the end.
-;;
-;; Duplicate delivery is the normal case over a real network, and it is what
-;; idempotence buys.  An implementation that merges by accumulating rather than
-;; by joining passes every other order here and fails this one.
-(defn __order-dup [seed : int n : int] : ORSet
-  (join (join (join (join (__replica seed 0 n) (__replica seed 1 n))
-                    (__replica seed 1 n))
-              (__replica seed 2 n))
-        (__replica seed 0 n)))
-
-;;; __agree? -- internal: do two states agree on every element of the alphabet?
-;;
-;; Element-wise rather than `Eq [ORSet]`, which is size-only: two states of
-;; equal size holding different elements would compare equal, and that is
-;; precisely the divergence this fuzzer exists to catch.
-(defn __agree? [^borrow x : ORSet ^borrow y : ORSet] : bool
-  (and (= (orset-has? x (quote e0)) (orset-has? y (quote e0)))
-       (and (= (orset-has? x (quote e1)) (orset-has? y (quote e1)))
-            (= (orset-has? x (quote e2)) (orset-has? y (quote e2))))))
-
-;;; __last-op -- internal: replica `me`'s last op kind on element `ei`.
-;;;
-;;; Returns 0 for add, 1 for remove, -1 if it never touched the element.
-(defn __last-op [seed : int me : int ei : int n : int acc : int] : int
-  (if (= n 0)
-    acc
-    (let [s1 (__lcg seed)
-          s2 (__lcg s1)
-          s3 (__lcg s2)
-          r  (mod s1 3)
-          k  (mod s2 2)
-          e  (mod s3 3)]
-      (__last-op s3 me ei (- n 1) (if (and (= r me) (= e ei)) k acc)))))
-
-;;; __expect-present? -- internal: the MODEL's answer for one element.
-;;
-;; No replica merges until the final join, so every replica's ops are
-;; concurrent with every other's.  Under add-wins that makes the expected
-;; membership simple: an element is present iff SOME replica's last op on it
-;; was an add.
-;;
-;; This oracle is why the fuzzer is more than a convergence check.  Measured:
-;; deleting the merge's "has the other side seen this dot" test leaves every
-;; delivery order AGREEING -- 200 seeds converge -- because "keep every dot" is
-;; perfectly order-independent.  It is just wrong: removes stop propagating.
-;; Agreement alone cannot catch a merge that converges on the wrong answer.
-(defn __expect-present? [seed : int n : int ei : int] : bool
-  (or (= (__last-op seed 0 ei n (- 0 1)) 0)
+  ;;; __lcg -- internal: one step of a linear congruential generator.
+  ;;
+  ;; Numerical Recipes constants, mod 2^31.  1103515245 * s stays under 2^61 for
+  ;; s < 2^31, so the multiply does not overflow int64.
+  (defn __lcg [s : int] : int (mod (+ (* 1103515245 s) 12345) 2147483648))
+  ;;; __nth-sym -- internal: element alphabet, indexed.
+  (defn __nth-sym [i : int] : Sym
+    (if (= i 0) (quote e0) (if (= i 1) (quote e1) (quote e2))))
+  ;;; __nth-replica -- internal: replica alphabet, indexed.
+  (defn __nth-replica [i : int] : ReplicaId
+    (replica (if (= i 0) (quote r0) (if (= i 1) (quote r1) (quote r2)))))
+  ;;; __build -- internal: replay `n` ops from `seed`, keeping those for replica `me`.
+  ;;
+  ;; Every replica derives the SAME op stream from the seed and applies only its
+  ;; own ops, so the streams are causally independent -- which is what makes the
+  ;; merge orders below genuinely concurrent rather than a replayed log.
+  ;;; __keep -- internal: identity on an ORSet.
+  ;;
+  ;; Not redundant.  A by-value struct PARAMETER used directly as an `if` arm is
+  ;; dereferenced by the emitter -- `*(tur_adt_ORSet *)(intptr_t)(acc)` -- and cc
+  ;; rejects it, while `tur check` is clean.  Routing the pass-through arm through
+  ;; any call, even this one, compiles.  See
+  ;; docs/reported/byvalue-struct-param-as-if-arm-derefs.md in the turmeric repo;
+  ;; delete this when that lands.
+  (defn __keep [s : ORSet] : ORSet s)
+  ;;; __do-op -- internal: apply one operation.
+  (defn __do-op [acc : ORSet k : int e : Sym r : ReplicaId] : ORSet
+    (if (= k 0) (orset-add acc e r) (orset-remove acc e)))
+  ;;; __apply -- internal: apply the op if it belongs to this replica.
+  (defn __apply [acc : ORSet mine : bool k : int e : Sym r : ReplicaId] : ORSet
+    (if mine (__do-op acc k e r) (__keep acc)))
+  (defn __build [seed : int me : int n : int acc : ORSet] : ORSet
+    (if (= n 0)
+      (__keep acc)
+      (let [s1 (__lcg seed)
+            s2 (__lcg s1)
+            s3 (__lcg s2)
+            r  (mod s1 3)
+            k  (mod s2 2)
+            e  (__nth-sym (mod s3 3))]
+        (__build s3 me (- n 1) (__apply acc (= r me) k e (__nth-replica r))))))
+  ;;; __replica -- internal: replica `me`'s state after replaying `n` ops.
+  (defn __replica [seed : int me : int n : int] : ORSet
+    (__build seed me n (orset-new)))
+  ;;; __order-abc -- internal: deliver a, then b, then c.
+  (defn __order-abc [seed : int n : int] : ORSet
+    (join (join (__replica seed 0 n) (__replica seed 1 n)) (__replica seed 2 n)))
+  ;;; __order-cba -- internal: the reverse delivery order.
+  (defn __order-cba [seed : int n : int] : ORSet
+    (join (join (__replica seed 2 n) (__replica seed 1 n)) (__replica seed 0 n)))
+  ;;; __order-nested -- internal: a different association, a(bc) rather than (ab)c.
+  (defn __order-nested [seed : int n : int] : ORSet
+    (join (__replica seed 0 n) (join (__replica seed 1 n) (__replica seed 2 n))))
+  ;;; __order-dup -- internal: b delivered TWICE, and a re-delivered at the end.
+  ;;
+  ;; Duplicate delivery is the normal case over a real network, and it is what
+  ;; idempotence buys.  An implementation that merges by accumulating rather than
+  ;; by joining passes every other order here and fails this one.
+  (defn __order-dup [seed : int n : int] : ORSet
+    (join (join (join (join (__replica seed 0 n) (__replica seed 1 n))
+                  (__replica seed 1 n))
+            (__replica seed 2 n))
+      (__replica seed 0 n)))
+  ;;; __agree? -- internal: do two states agree on every element of the alphabet?
+  ;;
+  ;; Element-wise rather than `Eq [ORSet]`, which is size-only: two states of
+  ;; equal size holding different elements would compare equal, and that is
+  ;; precisely the divergence this fuzzer exists to catch.
+  (defn __agree? [^borrow x : ORSet ^borrow y : ORSet] : bool
+    (and (= (orset-has? x (quote e0)) (orset-has? y (quote e0)))
+      (and (= (orset-has? x (quote e1)) (orset-has? y (quote e1)))
+        (= (orset-has? x (quote e2)) (orset-has? y (quote e2))))))
+  ;;; __last-op -- internal: replica `me`'s last op kind on element `ei`.
+  ;;;
+  ;;; Returns 0 for add, 1 for remove, -1 if it never touched the element.
+  (defn __last-op [seed : int me : int ei : int n : int acc : int] : int
+    (if (= n 0)
+      acc
+      (let [s1 (__lcg seed)
+            s2 (__lcg s1)
+            s3 (__lcg s2)
+            r  (mod s1 3)
+            k  (mod s2 2)
+            e  (mod s3 3)]
+        (__last-op s3 me ei (- n 1) (if (and (= r me) (= e ei)) k acc)))))
+  ;;; __expect-present? -- internal: the MODEL's answer for one element.
+  ;;
+  ;; No replica merges until the final join, so every replica's ops are
+  ;; concurrent with every other's.  Under add-wins that makes the expected
+  ;; membership simple: an element is present iff SOME replica's last op on it
+  ;; was an add.
+  ;;
+  ;; This oracle is why the fuzzer is more than a convergence check.  Measured:
+  ;; deleting the merge's "has the other side seen this dot" test leaves every
+  ;; delivery order AGREEING -- 200 seeds converge -- because "keep every dot" is
+  ;; perfectly order-independent.  It is just wrong: removes stop propagating.
+  ;; Agreement alone cannot catch a merge that converges on the wrong answer.
+  (defn __expect-present? [seed : int n : int ei : int] : bool
+    (or (= (__last-op seed 0 ei n (- 0 1)) 0)
       (or (= (__last-op seed 1 ei n (- 0 1)) 0)
-          (= (__last-op seed 2 ei n (- 0 1)) 0))))
-
-;;; __matches-model? -- internal: does a merged state match the model?
-(defn __matches-model? [^borrow x : ORSet seed : int n : int] : bool
-  (and (= (orset-has? x (quote e0)) (__expect-present? seed n 0))
-       (and (= (orset-has? x (quote e1)) (__expect-present? seed n 1))
-            (= (orset-has? x (quote e2)) (__expect-present? seed n 2)))))
-
-;;; __case -- internal: one seed; 0 on convergence, 1 on divergence.
-(defn __case [seed : int n : int] : int
-  (let [base (__order-abc seed n)
-        ok1  (__agree? base (__order-cba seed n))
-        ok2  (__agree? base (__order-nested seed n))
-        ok3  (__agree? base (__order-dup seed n))
-        ok4  (__matches-model? base seed n)]
-    (if (and ok1 (and ok2 (and ok3 ok4)))
-      0
-      (do (println (if ok4 "DIVERGED at seed:" "WRONG vs model at seed:"))
+        (= (__last-op seed 2 ei n (- 0 1)) 0))))
+  ;;; __matches-model? -- internal: does a merged state match the model?
+  (defn __matches-model? [^borrow x : ORSet seed : int n : int] : bool
+    (and (= (orset-has? x (quote e0)) (__expect-present? seed n 0))
+      (and (= (orset-has? x (quote e1)) (__expect-present? seed n 1))
+        (= (orset-has? x (quote e2)) (__expect-present? seed n 2)))))
+  ;;; __case -- internal: one seed; 0 on convergence, 1 on divergence.
+  (defn __case [seed : int n : int] : int
+    (let [base (__order-abc seed n)
+          ok1  (__agree? base (__order-cba seed n))
+          ok2  (__agree? base (__order-nested seed n))
+          ok3  (__agree? base (__order-dup seed n))
+          ok4  (__matches-model? base seed n)]
+      (if (and ok1 (and ok2 (and ok3 ok4)))
+        0
+        (do
+          (println (if ok4 "DIVERGED at seed:" "WRONG vs model at seed:"))
           (println seed)
           1))))
-
-;; ---------------------------------------------------------------------------
-;; Sweep 2: replicas that SYNC mid-stream.
-;;
-;; Sweep 1 never merges until the end, so no replica ever removes a dot it
-;; OBSERVED FROM ANOTHER -- and that is the only situation the merge's context
-;; test governs.  Measured: deleting that test leaves sweep 1 entirely green.
-;;
-;; Here replica 1 merges replica 0's state partway through and then keeps
-;; operating, so its removes can target dots replica 0 minted.  That is the
-;; shape test_orset's scenarios 1 and 3 pin by hand.
-
-;;; __synced -- internal: replica 1 after observing replica 0, then operating.
-(defn __synced [seed : int n : int] : ORSet
-  (__build (__lcg (__lcg seed)) 1 n
-           (join (__replica seed 1 n) (__replica seed 0 n))))
-
-;;; __sync-case -- internal: one seed of the mid-stream-sync sweep.
-;;
-;; Convergence only -- the model oracle above is exact only while replicas stay
-;; causally independent, which is no longer true once they sync.  A causal model
-;; would be a second implementation of the OR-Set, which is a different and much
-;; larger thing to get right than what it would check.
-(defn __sync-case [seed : int n : int] : int
-  (let [a (join (__synced seed n) (__replica seed 2 n))
-        b (join (__replica seed 2 n) (__synced seed n))
-        c (join (join (__synced seed n) (__replica seed 2 n))
-                (__synced seed n))]
-    (if (and (__agree? a b) (__agree? a c))
-      0
-      (do (println "SYNC DIVERGED at seed:") (println seed) 1))))
-
-;;; __sync-sweep -- internal.
-(defn __sync-sweep [i : int hi : int n : int acc : int] : int
-  (if (>= i hi) acc (__sync-sweep (+ i 1) hi n (+ acc (__sync-case (* i 7919) n)))))
-
-;;; __sweep -- internal: run cases for seeds [i, hi).
-(defn __sweep [i : int hi : int n : int acc : int] : int
-  (if (>= i hi) acc (__sweep (+ i 1) hi n (+ acc (__case (* i 7919) n)))))
-
-(defn main [] : int
-  ;; 200 seeds x 12 operations across 3 replicas and 3 elements.
-  (let [f1 (__sweep 1 201 12 0)
-        f2 (__sync-sweep 1 201 12 0)
-        fails (+ f1 f2)]
-    (if (= fails 0)
-      (println "test_converge: ok (200 independent + 200 mid-stream-sync seeds)")
-      (do (println "test_converge: FAILURES") (println fails)))
-    fails))
-
-) ;; end defmodule
+  ;; ---------------------------------------------------------------------------
+  ;; Sweep 2: replicas that SYNC mid-stream.
+  ;;
+  ;; Sweep 1 never merges until the end, so no replica ever removes a dot it
+  ;; OBSERVED FROM ANOTHER -- and that is the only situation the merge's context
+  ;; test governs.  Measured: deleting that test leaves sweep 1 entirely green.
+  ;;
+  ;; Here replica 1 merges replica 0's state partway through and then keeps
+  ;; operating, so its removes can target dots replica 0 minted.  That is the
+  ;; shape test_orset's scenarios 1 and 3 pin by hand.
+  ;;; __synced -- internal: replica 1 after observing replica 0, then operating.
+  (defn __synced [seed : int n : int] : ORSet
+    (__build (__lcg (__lcg seed))
+      1
+      n
+      (join (__replica seed 1 n) (__replica seed 0 n))))
+  ;;; __sync-case -- internal: one seed of the mid-stream-sync sweep.
+  ;;
+  ;; Convergence only -- the model oracle above is exact only while replicas stay
+  ;; causally independent, which is no longer true once they sync.  A causal model
+  ;; would be a second implementation of the OR-Set, which is a different and much
+  ;; larger thing to get right than what it would check.
+  (defn __sync-case [seed : int n : int] : int
+    (let [a (join (__synced seed n) (__replica seed 2 n))
+          b (join (__replica seed 2 n) (__synced seed n))
+          c (join (join (__synced seed n) (__replica seed 2 n))
+              (__synced seed n))]
+      (if (and (__agree? a b) (__agree? a c))
+        0
+        (do (println "SYNC DIVERGED at seed:") (println seed) 1))))
+  ;;; __sync-sweep -- internal.
+  (defn __sync-sweep [i : int hi : int n : int acc : int] : int
+    (if (>= i hi)
+      acc
+      (__sync-sweep (+ i 1) hi n (+ acc (__sync-case (* i 7919) n)))))
+  ;;; __sweep -- internal: run cases for seeds [i, hi).
+  (defn __sweep [i : int hi : int n : int acc : int] : int
+    (if (>= i hi) acc (__sweep (+ i 1) hi n (+ acc (__case (* i 7919) n)))))
+  (defn main [] : int
+    ;; 200 seeds x 12 operations across 3 replicas and 3 elements.
+    (let [f1    (__sweep 1 201 12 0)
+          f2    (__sync-sweep 1 201 12 0)
+          fails (+ f1 f2)]
+      (if (= fails 0)
+        (println "test_converge: ok (200 independent + 200 mid-stream-sync seeds)")
+        (do (println "test_converge: FAILURES") (println fails)))
+      fails))) ;; end defmodule

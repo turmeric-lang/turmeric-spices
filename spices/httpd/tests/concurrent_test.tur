@@ -19,28 +19,24 @@
 (load "stdlib/thread.tur")
 
 (defmodule httpd/tests/concurrent
-  (import httpd/server   :refer [server-start-pool server-stop])
+  (import httpd/server :refer [server-start-pool server-stop])
   (import httpd/response :refer [resp-ok])
-  (import http/client    :refer [http-get http-result-free])
-  (import http/response  :refer [response-status])
-  (import test/suite     :refer [describe it])
-  (import test/assert    :refer [assert-eq])
-  (import test/runner    :refer [run-all-status])
-
+  (import http/client :refer [http-get http-result-free])
+  (import http/response :refer [response-status])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-eq])
+  (import test/runner :refer [run-all-status])
   ;; ---------------------------------------------------------------------
   ;; Helpers
   ;; ---------------------------------------------------------------------
-
   (defn __cr-ok? [r : ptr<void>] : bool
     ```c
     return tur_is_ok((int64_t)(intptr_t)r);
     ```)
-
   (defn __cr-val [r : ptr<void>] : int
     ```c
     return tur_ok_value((int64_t)(intptr_t)r);
     ```)
-
   ;; Atomic counter: opcode 0 reset, 1 increment-and-return-new, 2 read.
   ;; Static state shared across calls -- same pattern as test/suite's __ts.
   (defn __cnt [op : int] : int
@@ -53,78 +49,64 @@
       default: return 0;
     }
     ```)
-
   (defn null-ptr [] : ptr<void>
     ```c
     return NULL;
     ```)
-
   ;; ---------------------------------------------------------------------
   ;; Server-side: 200 OK after a short sleep so the pool actually saturates.
   ;; ---------------------------------------------------------------------
-
-  (defn sleep-ms [ms : int] #fx{Unsafe} : void
+  (defn sleep-ms [ms : int]
+    #fx{Unsafe}
+    : void
     ```c
     #include <unistd.h>
     if (ms > 0) usleep((useconds_t)ms * 1000u);
     ```)
-
   (defn slow-handler [req : int] : int
-    (do
-      (unsafe (sleep-ms 40))
-      (:: (resp-ok "text/plain" "ok") :int)))
-
+    (do (unsafe (sleep-ms 40)) (:: (resp-ok "text/plain" "ok") :int)))
   ;; ---------------------------------------------------------------------
   ;; Client-side: issue one GET; on 200 OK, bump the shared counter.
   ;; Signature matches pthread entry: void *(*)(void *).
   ;; ---------------------------------------------------------------------
-
   (defn client-task [arg : ptr<void>] : ptr<void>
     (let [r  (http-get "http://127.0.0.1:18084/work")
           st (if (__cr-ok? r) (response-status (__cr-val r)) 0)]
       (http-result-free r)
       (when (= 200 st) (__cnt 1)))
     (null-ptr))
-
   ;; ---------------------------------------------------------------------
   ;; Test driver
   ;; ---------------------------------------------------------------------
-
   (defn main [] : int
     (let [srv (server-start-pool 18084 slow-handler 4)]
       (do
         (unsafe (sleep-ms 50))
         (__cnt 0)
-
         ;; Spawn 8 client threads -- 2x the pool size, so the listener
         ;; must back-pressure into the ring buffer. thread-spawn-fn /
         ;; thread-join are #{Unsafe}, so the spawn+join block runs under
         ;; an explicit (unsafe ...).
-        (unsafe
-          (let [t1 (thread-spawn-fn client-task (null-ptr))
-                t2 (thread-spawn-fn client-task (null-ptr))
-                t3 (thread-spawn-fn client-task (null-ptr))
-                t4 (thread-spawn-fn client-task (null-ptr))
-                t5 (thread-spawn-fn client-task (null-ptr))
-                t6 (thread-spawn-fn client-task (null-ptr))
-                t7 (thread-spawn-fn client-task (null-ptr))
-                t8 (thread-spawn-fn client-task (null-ptr))]
-            (do
-              (thread-join t1)
-              (thread-join t2)
-              (thread-join t3)
-              (thread-join t4)
-              (thread-join t5)
-              (thread-join t6)
-              (thread-join t7)
-              (thread-join t8))))
-
+        (unsafe (let [t1 (thread-spawn-fn client-task (null-ptr))
+                      t2 (thread-spawn-fn client-task (null-ptr))
+                      t3 (thread-spawn-fn client-task (null-ptr))
+                      t4 (thread-spawn-fn client-task (null-ptr))
+                      t5 (thread-spawn-fn client-task (null-ptr))
+                      t6 (thread-spawn-fn client-task (null-ptr))
+                      t7 (thread-spawn-fn client-task (null-ptr))
+                      t8 (thread-spawn-fn client-task (null-ptr))]
+                  (do
+                    (thread-join t1)
+                    (thread-join t2)
+                    (thread-join t3)
+                    (thread-join t4)
+                    (thread-join t5)
+                    (thread-join t6)
+                    (thread-join t7)
+                    (thread-join t8))))
         (describe "httpd concurrent -- pool saturation"
-          (it "all 8 concurrent clients receive 200 OK"
-            (assert-eq 8 (__cnt 2))))
-
+          (it "all 8 concurrent clients receive 200 OK" (assert-eq 8 (__cnt 2))))
         ;; server-stop must drain the (now-idle) pool and join every
         ;; worker.  If the join hangs, the test process will time out.
-        (server-stop srv)
-        ))
+        (server-stop srv)))
     (run-all-status)))

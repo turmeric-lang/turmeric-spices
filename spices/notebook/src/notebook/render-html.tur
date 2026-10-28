@@ -1,103 +1,133 @@
 ;;; notebook/render-html -- render notebook documents to standalone HTML.
 ;; notebook/render-html -- evaluate .tur.md files and emit HTML output.
-
 (defmodule notebook/render-html
   (import notebook/cmark :refer [md-emit-html])
-  (import notebook/format :refer [parse-file node-tag node-prose node-cell nodes-free])
-  (import notebook/cell :refer [attr-get attr-get-bool cell-id cell-lang cell-source cell-attrs cells-assign-ids])
-  (import notebook/session :refer [session-open-for session-close
-                                   output-status-ok output-status-error output-status-skipped
-                                   cell-output-status cell-output-cell-id
-                                   cell-output-stdout cell-output-value-repr
-                                   cell-output-error-msg cell-output-elapsed-ms
-                                   cell-output-image-paths
-                                   cell-output-type-tag])
+  (import notebook/format
+    :refer
+    [parse-file node-tag node-prose node-cell nodes-free])
+  (import notebook/cell
+    :refer
+    [attr-get
+     attr-get-bool
+     cell-id
+     cell-lang
+     cell-source
+     cell-attrs
+     cells-assign-ids])
+  (import notebook/session
+    :refer
+    [session-open-for
+     session-close
+     output-status-ok
+     output-status-error
+     output-status-skipped
+     cell-output-status
+     cell-output-cell-id
+     cell-output-stdout
+     cell-output-value-repr
+     cell-output-error-msg
+     cell-output-elapsed-ms
+     cell-output-image-paths
+     cell-output-type-tag])
   (import notebook/eval :refer [eval-all outputs-free])
   (import notebook/cache :refer [cache-open cache-close])
   (export render-html-string render-html-string-at render-html)
-
   (defn __rhtml-build-hint [] : int
     ```c
     /* __tur_include__: #include <sys/stat.h> */
     return 0;
     ```)
-
-  (defn __rhtml-nil-value [] #fx{Unsafe} : int
+  (defn __rhtml-nil-value []
+    #fx{Unsafe}
+    : int
     ```c
     return 0;
     ```)
-
-  (defn __rhtml-list-nil? [lst : int] #fx{Unsafe} : bool
+  (defn __rhtml-list-nil? [lst : int]
+    #fx{Unsafe}
+    : bool
     ```c
     return lst == 0;
     ```)
-
-  (defn __rhtml-cons [value : int next : int] #fx{Unsafe} : int
+  (defn __rhtml-cons [value : int next : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t head; int64_t tail; } *cell = malloc(sizeof(*cell));
     cell->head = value;
     cell->tail = next;
     return (int64_t)(intptr_t)cell;
     ```)
-
-  (defn __rhtml-head [lst : int] #fx{Unsafe} : int
+  (defn __rhtml-head [lst : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t head; int64_t tail; } *cell = (void*)(intptr_t)lst;
     if (!cell) { fprintf(stderr, "head: empty list\n"); exit(1); }
     return cell->head;
     ```)
-
-  (defn __rhtml-tail [lst : int] #fx{Unsafe} : int
+  (defn __rhtml-tail [lst : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t head; int64_t tail; } *cell = (void*)(intptr_t)lst;
     if (!cell) { fprintf(stderr, "tail: empty list\n"); exit(1); }
     return cell->tail;
     ```)
-
-  (defn __rhtml-ok [value : int] #fx{Unsafe} : int
+  (defn __rhtml-ok [value : int]
+    #fx{Unsafe}
+    : int
     ```c
     return tur_box_ok(value);
     ```)
-
-  (defn __rhtml-err [value : cstr] #fx{Unsafe} : int
+  (defn __rhtml-err [value : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     return tur_err_ptr(value ? strdup((const char *)(intptr_t)value) : strdup(""));
     ```)
-
-  (defn __rhtml-result-ok? [result : int] #fx{Unsafe} : bool
+  (defn __rhtml-result-ok? [result : int]
+    #fx{Unsafe}
+    : bool
     ```c
     return tur_is_ok(result);
     ```)
-
-  (defn __rhtml-result-ok-val [result : int] #fx{Unsafe} : int
+  (defn __rhtml-result-ok-val [result : int]
+    #fx{Unsafe}
+    : int
     ```c
     return result ? tur_ok_value(result) : 0;
     ```)
-
-  (defn __rhtml-cstr-as-int [s : cstr] #fx{Unsafe} : int
+  (defn __rhtml-cstr-as-int [s : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     return (int64_t)(intptr_t)s;
     ```)
-
-  (defn __rhtml-int-as-cstr [value : int] #fx{Unsafe} : cstr
+  (defn __rhtml-int-as-cstr [value : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     return (const char *)(intptr_t)value;
     ```)
-
-  (defn __rhtml-cstr-empty? [s : cstr] #fx{Unsafe} : bool
+  (defn __rhtml-cstr-empty? [s : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *src = s ? (const char *)(intptr_t)s : "";
     return src[0] == '\0';
     ```)
-
-  (defn __rhtml-cstr-eq? [a : cstr b : cstr] #fx{Unsafe} : bool
+  (defn __rhtml-cstr-eq? [a : cstr b : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *sa = a ? (const char *)(intptr_t)a : "";
     const char *sb = b ? (const char *)(intptr_t)b : "";
     return strcmp(sa, sb) == 0;
     ```)
-
-  (defn __rhtml-str-concat [a : cstr b : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-str-concat [a : cstr b : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *sa = a ? (const char *)(intptr_t)a : "";
     const char *sb = b ? (const char *)(intptr_t)b : "";
@@ -108,25 +138,26 @@
     out[la + lb] = '\0';
     return out;
     ```)
-
-;; ---------------------------------------------------------------------
-;; String ownership
-;;
-;; Every helper below returns a string the CALLER OWNS.  The module used to
-;; mix owned strings and borrowed literals under one type -- and
-;; __rhtml-join-blocks sometimes returned one of its arguments -- so no call
-;; site could know whether to free what it got, and none did.
-;; ---------------------------------------------------------------------
-
-;;; __rhtml-strdup -- an owned copy of a borrowed string.
-  (defn __rhtml-strdup [s : cstr] #fx{Unsafe} : cstr
+  ;; ---------------------------------------------------------------------
+  ;; String ownership
+  ;;
+  ;; Every helper below returns a string the CALLER OWNS.  The module used to
+  ;; mix owned strings and borrowed literals under one type -- and
+  ;; __rhtml-join-blocks sometimes returned one of its arguments -- so no call
+  ;; site could know whether to free what it got, and none did.
+  ;; ---------------------------------------------------------------------
+  ;;; __rhtml-strdup -- an owned copy of a borrowed string.
+  (defn __rhtml-strdup [s : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *p = s ? (const char *)(intptr_t)s : "";
     return strdup(p);
     ```)
-
-;;; __rhtml-join-owned -- join two OWNED blocks with a newline, releasing both.
-  (defn __rhtml-join-owned [a : cstr b : cstr] #fx{Unsafe} : cstr
+  ;;; __rhtml-join-owned -- join two OWNED blocks with a newline, releasing both.
+  (defn __rhtml-join-owned [a : cstr b : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *sa = a ? (const char *)(intptr_t)a : "";
     const char *sb = b ? (const char *)(intptr_t)b : "";
@@ -145,14 +176,15 @@
     if (b) free((void *)(intptr_t)b);
     return out;
     ```)
-
-;;; __rhtml-wrap3 -- pre + a + mid + b + post, in one allocation.
-;;;
-;;; The nested __rhtml-str-concat chains this and its siblings replace built
-;;; one throwaway string per link -- 63 concat calls across ten functions, and
-;;; every intermediate was dropped.  That was the single largest leak in the
-;;; spice: 62 KB in one render_html run.
-  (defn __rhtml-wrap3 [pre : cstr a : cstr mid : cstr b : cstr post : cstr] #fx{Unsafe} : cstr
+  ;;; __rhtml-wrap3 -- pre + a + mid + b + post, in one allocation.
+  ;;;
+  ;;; The nested __rhtml-str-concat chains this and its siblings replace built
+  ;;; one throwaway string per link -- 63 concat calls across ten functions, and
+  ;;; every intermediate was dropped.  That was the single largest leak in the
+  ;;; spice: 62 KB in one render_html run.
+  (defn __rhtml-wrap3 [pre : cstr a : cstr mid : cstr b : cstr post : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *p0 = pre  ? (const char *)(intptr_t)pre  : "";
     const char *p1 = a    ? (const char *)(intptr_t)a    : "";
@@ -164,9 +196,16 @@
     snprintf(out, n, "%s%s%s%s%s", p0, p1, p2, p3, p4);
     return out;
     ```)
-
-;;; __rhtml-wrap4 -- pre + a + m1 + b + m2 + c + post, in one allocation.
-  (defn __rhtml-wrap4 [pre : cstr a : cstr m1 : cstr b : cstr m2 : cstr c : cstr post : cstr] #fx{Unsafe} : cstr
+  ;;; __rhtml-wrap4 -- pre + a + m1 + b + m2 + c + post, in one allocation.
+  (defn __rhtml-wrap4 [pre : cstr
+                       a : cstr
+                       m1 : cstr
+                       b : cstr
+                       m2 : cstr
+                       c : cstr
+                       post : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *p0 = pre  ? (const char *)(intptr_t)pre  : "";
     const char *p1 = a    ? (const char *)(intptr_t)a    : "";
@@ -180,22 +219,25 @@
     snprintf(out, n, "%s%s%s%s%s%s%s", p0, p1, p2, p3, p4, p5, p6);
     return out;
     ```)
-
-;;; __rhtml-cstr-free -- release an owned string.  Safe on 0.
-  (defn __rhtml-cstr-free [s : cstr] #fx{Unsafe} : void
+  ;;; __rhtml-cstr-free -- release an owned string.  Safe on 0.
+  (defn __rhtml-cstr-free [s : cstr]
+    #fx{Unsafe}
+    : void
     ```c
     void *p = (void *)(intptr_t)s;
     if (p) free(p);
     ```)
-
-;;; __rhtml-cons-free -- free one cons cell, leaving its head alone.
-  (defn __rhtml-cons-free [node : int] #fx{Unsafe} : void
+  ;;; __rhtml-cons-free -- free one cons cell, leaving its head alone.
+  (defn __rhtml-cons-free [node : int]
+    #fx{Unsafe}
+    : void
     ```c
     free((void *)(intptr_t)node);
     ```)
-
-;;; __rhtml-spine-free -- free a cons spine, leaving the heads alone.
-  (defn __rhtml-spine-free [lst : int] #fx{Unsafe} : void
+  ;;; __rhtml-spine-free -- free a cons spine, leaving the heads alone.
+  (defn __rhtml-spine-free [lst : int]
+    #fx{Unsafe}
+    : void
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     Cons *node = (Cons *)(intptr_t)lst;
@@ -205,29 +247,33 @@
       node = next;
     }
     ```)
-
-;;; __rhtml-result-box-free -- release a Result box after taking its payload.
-;;; Returns 0 so it can sit in a `let` binding.
-  (defn __rhtml-result-box-free [r : int] #fx{Unsafe} : int
+  ;;; __rhtml-result-box-free -- release a Result box after taking its payload.
+  ;;; Returns 0 so it can sit in a `let` binding.
+  (defn __rhtml-result-box-free [r : int]
+    #fx{Unsafe}
+    : int
     ```c
     if (r) free((void *)(intptr_t)r);
     return 0;
     ```)
-
-;;; __rhtml-noop -- void no-op, so a cleanup-only `if` has void on both arms.
-  (defn __rhtml-noop [] #fx{Unsafe} : void
+  ;;; __rhtml-noop -- void no-op, so a cleanup-only `if` has void on both arms.
+  (defn __rhtml-noop []
+    #fx{Unsafe}
+    : void
     ```c
     return;
     ```)
-
-  (defn __rhtml-join-blocks [a : cstr b : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-join-blocks [a : cstr b : cstr]
+    #fx{Unsafe}
+    : cstr
     (if (__rhtml-cstr-empty? a)
       b
       (if (__rhtml-cstr-empty? b)
         a
         (__rhtml-str-concat a (__rhtml-str-concat "\n" b)))))
-
-  (defn __rhtml-output-path [src_path : cstr output_dir : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-output-path [src_path : cstr output_dir : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *src = src_path ? (const char *)(intptr_t)src_path : "";
     const char *out_dir = output_dir ? (const char *)(intptr_t)output_dir : "";
@@ -271,8 +317,9 @@
     free(dir);
     return out;
     ```)
-
-  (defn __rhtml-style-path [html_path : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-style-path [html_path : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *src = html_path ? (const char *)(intptr_t)html_path : "";
     const char *slash = strrchr(src, '/');
@@ -283,8 +330,9 @@
     else snprintf(out, need, "style.css");
     return out;
     ```)
-
-  (defn __rhtml-ensure-parent-dir [path : cstr] #fx{Unsafe} : int
+  (defn __rhtml-ensure-parent-dir [path : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     #include <sys/stat.h>
     const char *src = path ? (const char *)(intptr_t)path : "";
@@ -321,8 +369,9 @@
     free(dir);
     return ret;
     ```)
-
-  (defn __rhtml-write-file [path : cstr s : cstr] #fx{Unsafe} : int
+  (defn __rhtml-write-file [path : cstr s : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     const char *p = path ? (const char *)(intptr_t)path : "";
     const char *text = s ? (const char *)(intptr_t)s : "";
@@ -333,15 +382,13 @@
     fclose(fp);
     return wrote == len ? 1 : 0;
     ```)
-
-  (defn __rhtml-close-cache [cache : int] #fx{Unsafe} : int
-    (if (not (= cache 0))
-      (do
-        (cache-close cache)
-        0)
-      0))
-
-  (defn __rhtml-render-opts-output-dir [opts : int] #fx{Unsafe} : cstr
+  (defn __rhtml-close-cache [cache : int]
+    #fx{Unsafe}
+    : int
+    (if (not (= cache 0)) (do (cache-close cache) 0) 0))
+  (defn __rhtml-render-opts-output-dir [opts : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct {
       char *output_dir;
@@ -354,8 +401,9 @@
     RenderOpts *o = (RenderOpts *)(intptr_t)opts;
     return o && o->output_dir ? o->output_dir : "";
     ```)
-
-  (defn __rhtml-render-opts-use-cache [opts : int] #fx{Unsafe} : int
+  (defn __rhtml-render-opts-use-cache [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -368,8 +416,9 @@
     RenderOpts *o = (RenderOpts *)(intptr_t)opts;
     return o ? o->use_cache : 0;
     ```)
-
-  (defn __rhtml-render-opts-include-source [opts : int] #fx{Unsafe} : int
+  (defn __rhtml-render-opts-include-source [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -382,8 +431,9 @@
     RenderOpts *o = (RenderOpts *)(intptr_t)opts;
     return o ? o->include_source : 1;
     ```)
-
-  (defn __rhtml-render-opts-include-output [opts : int] #fx{Unsafe} : int
+  (defn __rhtml-render-opts-include-output [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -396,8 +446,9 @@
     RenderOpts *o = (RenderOpts *)(intptr_t)opts;
     return o ? o->include_output : 1;
     ```)
-
-  (defn __rhtml-render-opts-fail-fast [opts : int] #fx{Unsafe} : int
+  (defn __rhtml-render-opts-fail-fast [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -410,8 +461,9 @@
     RenderOpts *o = (RenderOpts *)(intptr_t)opts;
     return o ? o->fail_fast : 1;
     ```)
-
-  (defn __rhtml-render-opts-math-mode [opts : int] #fx{Unsafe} : int
+  (defn __rhtml-render-opts-math-mode [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -425,8 +477,9 @@
     RenderOpts *o = (RenderOpts *)(intptr_t)opts;
     return o ? o->math_mode : 0;
     ```)
-
-  (defn __rhtml-render-opts-assets-mode [opts : int] #fx{Unsafe} : int
+  (defn __rhtml-render-opts-assets-mode [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -440,21 +493,23 @@
     RenderOpts *o = (RenderOpts *)(intptr_t)opts;
     return o ? o->assets_mode : 0;
     ```)
-
-  (defn __rhtml-lang-label [lang : int] #fx{Unsafe} : cstr
+  (defn __rhtml-lang-label [lang : int]
+    #fx{Unsafe}
+    : cstr
     (if (= lang 0) "turmeric" "sweet-exp"))
-
-  (defn __rhtml-status-label [status : int] #fx{Unsafe} : cstr
+  (defn __rhtml-status-label [status : int]
+    #fx{Unsafe}
+    : cstr
     (if (= status (output-status-ok))
       "ok"
-      (if (= status (output-status-skipped))
-        "skipped"
-        "error")))
-
-  (defn __rhtml-cell-class [lang : int] #fx{Unsafe} : cstr
+      (if (= status (output-status-skipped)) "skipped" "error")))
+  (defn __rhtml-cell-class [lang : int]
+    #fx{Unsafe}
+    : cstr
     (if (= lang 0) "turmeric-cell" "sweet-exp-cell"))
-
-  (defn __rhtml-html-escape [text : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-html-escape [text : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *src = text ? (const char *)(intptr_t)text : "";
     size_t cap = strlen(src) * 6 + 1;
@@ -482,8 +537,9 @@
     out[len] = '\0';
     return out;
     ```)
-
-  (defn __rhtml-page-title [path : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-page-title [path : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *src = path ? (const char *)(intptr_t)path : "";
     const char *base = strrchr(src, '/');
@@ -500,8 +556,9 @@
     out[n] = '\0';
     return out;
     ```)
-
-  (defn __rhtml-style-css [] #fx{Unsafe} : cstr
+  (defn __rhtml-style-css []
+    #fx{Unsafe}
+    : cstr
     ```c
     return strdup(
       ":root {\n"
@@ -639,8 +696,9 @@
       ".code-version[hidden] { display: none; }\n"
     );
     ```)
-
-  (defn __rhtml-toggle-script [] #fx{Unsafe} : cstr
+  (defn __rhtml-toggle-script []
+    #fx{Unsafe}
+    : cstr
     ```c
     return strdup(
       "document.querySelectorAll('.code-syntax-toggle').forEach(function(toggle){\n"
@@ -660,20 +718,19 @@
       "});\n"
     );
     ```)
-
-  (defn __rhtml-render-source-pre [cell : int] #fx{Unsafe} : cstr
+  (defn __rhtml-render-source-pre [cell : int]
+    #fx{Unsafe}
+    : cstr
     (let [escaped (__rhtml-html-escape (cell-source cell))
           id-esc  (__rhtml-html-escape (cell-id cell))
-          out (__rhtml-source-pre-build (__rhtml-lang-label (cell-lang cell))
-                                        id-esc
-                                        (__rhtml-cell-class (cell-lang cell))
-                                        escaped)]
-      (do
-        (__rhtml-cstr-free escaped)
-        (__rhtml-cstr-free id-esc)
-        out)))
-
-  (defn __rhtml-source-pre-build [label : cstr id : cstr cls : cstr src : cstr] #fx{Unsafe} : cstr
+          out     (__rhtml-source-pre-build (__rhtml-lang-label (cell-lang cell))
+                    id-esc
+                    (__rhtml-cell-class (cell-lang cell))
+                    escaped)]
+      (do (__rhtml-cstr-free escaped) (__rhtml-cstr-free id-esc) out)))
+  (defn __rhtml-source-pre-build [label : cstr id : cstr cls : cstr src : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *l = label ? (const char *)(intptr_t)label : "";
     const char *i = id    ? (const char *)(intptr_t)id    : "";
@@ -687,12 +744,13 @@
       l, i, c, b);
     return out;
     ```)
-
-  (defn __rhtml-output-skipped? [output : int] #fx{Unsafe} : bool
-    (or (= output 0)
-        (= (cell-output-status output) (output-status-skipped))))
-
-  (defn __rhtml-output-meta [output : int] #fx{Unsafe} : cstr
+  (defn __rhtml-output-skipped? [output : int]
+    #fx{Unsafe}
+    : bool
+    (or (= output 0) (= (cell-output-status output) (output-status-skipped))))
+  (defn __rhtml-output-meta [output : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct {
       char *cell_id;
@@ -713,8 +771,9 @@
              cell_id, status, (long long)out->elapsed_ms);
     return strdup(buf);
     ```)
-
-  (defn __rhtml-output-body [output : int] #fx{Unsafe} : cstr
+  (defn __rhtml-output-body [output : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct {
       char *cell_id;
@@ -748,9 +807,10 @@
     }
     return buf;
     ```)
-
-;;; __rhtml-is-frame-tag? -- case-insensitive check for "frame" in the type tag.
-  (defn __rhtml-is-frame-tag? [tag : cstr] #fx{Unsafe} : bool
+  ;;; __rhtml-is-frame-tag? -- case-insensitive check for "frame" in the type tag.
+  (defn __rhtml-is-frame-tag? [tag : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *s = tag ? (const char *)(intptr_t)tag : "";
     for (const char *p = s; *p; p++) {
@@ -758,11 +818,12 @@
     }
     return false;
     ```)
-
-;;; __rhtml-frame-text-to-table -- parse pipe-delimited print-frame output
-;;; into an HTML <table>.  Skips the type row and separator dashes.
-;;; All cell values are HTML-escaped.  Returns an owned string.
-  (defn __rhtml-frame-text-to-table [text : cstr] #fx{Unsafe} : cstr
+  ;;; __rhtml-frame-text-to-table -- parse pipe-delimited print-frame output
+  ;;; into an HTML <table>.  Skips the type row and separator dashes.
+  ;;; All cell values are HTML-escaped.  Returns an owned string.
+  (defn __rhtml-frame-text-to-table [text : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *src = text ? (const char *)(intptr_t)text : "";
     /* Pre-scan: count lines that start with '|' to size the buffer. */
@@ -866,38 +927,46 @@
     #undef APPEND_ESC
     return out;
     ```)
-
-  (defn __rhtml-render-output-table [output : int] #fx{Unsafe} : cstr
+  (defn __rhtml-render-output-table [output : int]
+    #fx{Unsafe}
+    : cstr
     (if (__rhtml-output-skipped? output)
       (__rhtml-strdup "")
-      (let [status (__rhtml-status-label (cell-output-status output))
+      (let [status   (__rhtml-status-label (cell-output-status output))
             raw-meta (__rhtml-output-meta output)
-            meta (__rhtml-html-escape raw-meta)
+            meta     (__rhtml-html-escape raw-meta)
             raw-body (__rhtml-output-body output)
-            table (__rhtml-frame-text-to-table raw-body)]
-        (let [out (__rhtml-wrap4
-                    "<div class=\"cell-output-block\"><div class=\"cell-output-meta status-"
-                    status "\">" meta "</div>"
-                    table "</div>")]
+            table    (__rhtml-frame-text-to-table raw-body)]
+        (let [out (__rhtml-wrap4 "<div class=\"cell-output-block\"><div class=\"cell-output-meta status-"
+                    status
+                    "\">"
+                    meta
+                    "</div>"
+                    table
+                    "</div>")]
           (do
             (__rhtml-cstr-free raw-meta)
             (__rhtml-cstr-free raw-body)
             (__rhtml-cstr-free meta)
             (__rhtml-cstr-free table)
             out)))))
-
-  (defn __rhtml-render-output-pre [output : int] #fx{Unsafe} : cstr
+  (defn __rhtml-render-output-pre [output : int]
+    #fx{Unsafe}
+    : cstr
     (if (__rhtml-output-skipped? output)
       (__rhtml-strdup "")
-      (let [status (__rhtml-status-label (cell-output-status output))
+      (let [status   (__rhtml-status-label (cell-output-status output))
             ;; __rhtml-output-meta / -body allocate; escape copies them.
             raw-meta (__rhtml-output-meta output)
             raw-body (__rhtml-output-body output)
-            meta (__rhtml-html-escape raw-meta)
-            body (__rhtml-html-escape raw-body)]
-        (let [out (__rhtml-wrap4
-                    "<div class=\"cell-output-block\"><div class=\"cell-output-meta status-"
-                    status "\">" meta "</div><pre class=\"cell-output\">" body
+            meta     (__rhtml-html-escape raw-meta)
+            body     (__rhtml-html-escape raw-body)]
+        (let [out (__rhtml-wrap4 "<div class=\"cell-output-block\"><div class=\"cell-output-meta status-"
+                    status
+                    "\">"
+                    meta
+                    "</div><pre class=\"cell-output\">"
+                    body
                     "</pre></div>")]
           (do
             (__rhtml-cstr-free raw-meta)
@@ -905,8 +974,9 @@
             (__rhtml-cstr-free meta)
             (__rhtml-cstr-free body)
             out)))))
-
-  (defn __rhtml-render-math-body [text : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-render-math-body [text : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     /* Scan text for $$...$$  and $...$, emit HTML math spans interleaved with
        escaped plain text.  Produces markup that KaTeX auto-render will pick up
@@ -982,18 +1052,22 @@
     out[j] = '\0';
     return out;
     ```)
-
-  (defn __rhtml-render-math-output [output : int] #fx{Unsafe} : cstr
+  (defn __rhtml-render-math-output [output : int]
+    #fx{Unsafe}
+    : cstr
     (if (__rhtml-output-skipped? output)
       (__rhtml-strdup "")
-      (let [status (__rhtml-status-label (cell-output-status output))
+      (let [status   (__rhtml-status-label (cell-output-status output))
             raw-meta (__rhtml-output-meta output)
             raw-body (__rhtml-output-body output)
-            meta (__rhtml-html-escape raw-meta)
-            body (__rhtml-render-math-body raw-body)]
-        (let [out (__rhtml-wrap4
-                    "<div class=\"cell-output-block\"><div class=\"cell-output-meta status-"
-                    status "\">" meta "</div><div class=\"math-output\">" body
+            meta     (__rhtml-html-escape raw-meta)
+            body     (__rhtml-render-math-body raw-body)]
+        (let [out (__rhtml-wrap4 "<div class=\"cell-output-block\"><div class=\"cell-output-meta status-"
+                    status
+                    "\">"
+                    meta
+                    "</div><div class=\"math-output\">"
+                    body
                     "</div></div>")]
           (do
             (__rhtml-cstr-free raw-meta)
@@ -1001,15 +1075,17 @@
             (__rhtml-cstr-free meta)
             (__rhtml-cstr-free body)
             out)))))
-
-  (defn __rhtml-int->cstr [value : int] #fx{Unsafe} : cstr
+  (defn __rhtml-int->cstr [value : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long)value);
     return strdup(buf);
     ```)
-
-  (defn __rhtml-copy-file [src_path : cstr dst_path : cstr] #fx{Unsafe} : int
+  (defn __rhtml-copy-file [src_path : cstr dst_path : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     const char *src = src_path ? (const char *)(intptr_t)src_path : "";
     const char *dst = dst_path ? (const char *)(intptr_t)dst_path : "";
@@ -1027,8 +1103,9 @@
     fclose(out);
     return ok;
     ```)
-
-  (defn __rhtml-png-data-url [img_path : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-png-data-url [img_path : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *path = img_path ? (const char *)(intptr_t)img_path : "";
     FILE *fp = fopen(path, "rb");
@@ -1066,8 +1143,12 @@
     free(b64);
     return out;
     ```)
-
-  (defn __rhtml-image-rel-name [img_path : cstr html_path : cstr cell_id_value : cstr idx : int] #fx{Unsafe} : cstr
+  (defn __rhtml-image-rel-name [img_path : cstr
+                                html_path : cstr
+                                cell_id_value : cstr
+                                idx : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *src = img_path ? (const char *)(intptr_t)img_path : "";
     const char *html_out = html_path ? (const char *)(intptr_t)html_path : "";
@@ -1093,8 +1174,9 @@
     free(stem);
     return strdup(buf);
     ```)
-
-  (defn __rhtml-dir-join [dir_path : cstr child : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-dir-join [dir_path : cstr child : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *dir = dir_path ? (const char *)(intptr_t)dir_path : "";
     const char *child_name = child ? (const char *)(intptr_t)child : "";
@@ -1104,8 +1186,9 @@
     else snprintf(out, need, "%s", child_name);
     return out;
     ```)
-
-  (defn __rhtml-output-dir [html_path : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-output-dir [html_path : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *src = html_path ? (const char *)(intptr_t)html_path : "";
     const char *slash = strrchr(src, '/');
@@ -1116,8 +1199,12 @@
     out[n] = '\0';
     return out;
     ```)
-
-  (defn __rhtml-render-image-block [output : int image_mode : cstr html_path : cstr cell_id_value : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-render-image-block [output : int
+                                    image_mode : cstr
+                                    html_path : cstr
+                                    cell_id_value : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     typedef struct {
@@ -1270,59 +1357,80 @@
     strcpy(html + len, "</div>");
     return html;
     ```)
-
-  (defn __rhtml-cell-shows-source? [cell : int opts : int] #fx{Unsafe} : bool
+  (defn __rhtml-cell-shows-source? [cell : int opts : int]
+    #fx{Unsafe}
+    : bool
     (and (= (__rhtml-render-opts-include-source opts) 1)
-         (= (attr-get-bool (cell-attrs cell) "echo" 1) 1)))
-
-  (defn __rhtml-cell-shows-output? [cell : int output : int opts : int] #fx{Unsafe} : bool
+      (= (attr-get-bool (cell-attrs cell) "echo" 1) 1)))
+  (defn __rhtml-cell-shows-output? [cell : int output : int opts : int]
+    #fx{Unsafe}
+    : bool
     (and (not (= output 0))
-         (= (__rhtml-render-opts-include-output opts) 1)
-         (= (attr-get-bool (cell-attrs cell) "output" 1) 1)))
-
-  (defn __rhtml-render-cell-content [cell : int output : int opts : int html_path : cstr] #fx{Unsafe} : cstr
-    (let [source-part (if (__rhtml-cell-shows-source? cell opts)
-                        (__rhtml-render-source-pre cell)
-                        (__rhtml-strdup ""))
-          math-cell? (= (attr-get-bool (cell-attrs cell) "math" 0) 1)
+      (= (__rhtml-render-opts-include-output opts) 1)
+      (= (attr-get-bool (cell-attrs cell) "output" 1) 1)))
+  (defn __rhtml-render-cell-content [cell : int
+                                     output : int
+                                     opts : int
+                                     html_path : cstr]
+    #fx{Unsafe}
+    : cstr
+    (let [source-part   (if (__rhtml-cell-shows-source? cell opts)
+                          (__rhtml-render-source-pre cell)
+                          (__rhtml-strdup ""))
+          math-cell?    (= (attr-get-bool (cell-attrs cell) "math" 0) 1)
           frame-output? (or (__rhtml-is-frame-tag? (cell-output-type-tag output))
-                            (__rhtml-cstr-eq? (attr-get (cell-attrs cell) "html" "") "table"))
-          output-part (if (__rhtml-cell-shows-output? cell output opts)
-                        (if math-cell?
-                          (__rhtml-render-math-output output)
-                          (if frame-output?
-                            (__rhtml-render-output-table output)
-                            (__rhtml-render-output-pre output)))
-                        (__rhtml-strdup ""))
-          image-part (if (__rhtml-cell-shows-output? cell output opts)
-                       (__rhtml-render-image-block output
-                                                   (attr-get (cell-attrs cell) "image" "inline")
-                                                   html_path
-                                                   (cell-id cell))
-                       (__rhtml-strdup ""))]
-      (__rhtml-join-owned source-part (__rhtml-join-owned output-part image-part))))
-
-  (defn __rhtml-render-single-cell [cell : int output : int opts : int html_path : cstr] #fx{Unsafe} : cstr
+                          (__rhtml-cstr-eq? (attr-get (cell-attrs cell)
+                                              "html"
+                                              "")
+                            "table"))
+          output-part   (if (__rhtml-cell-shows-output? cell output opts)
+                          (if math-cell?
+                            (__rhtml-render-math-output output)
+                            (if frame-output?
+                              (__rhtml-render-output-table output)
+                              (__rhtml-render-output-pre output)))
+                          (__rhtml-strdup ""))
+          image-part    (if (__rhtml-cell-shows-output? cell output opts)
+                          (__rhtml-render-image-block output
+                            (attr-get (cell-attrs cell) "image" "inline")
+                            html_path
+                            (cell-id cell))
+                          (__rhtml-strdup ""))]
+      (__rhtml-join-owned source-part
+        (__rhtml-join-owned output-part image-part))))
+  (defn __rhtml-render-single-cell [cell : int
+                                    output : int
+                                    opts : int
+                                    html_path : cstr]
+    #fx{Unsafe}
+    : cstr
     (let [content (__rhtml-render-cell-content cell output opts html_path)
-          out (__rhtml-wrap3 "<section class=\"notebook-cell\">" content "" "" "</section>")]
-      (do
-        (__rhtml-cstr-free content)
-        out)))
-
-  (defn __rhtml-should-toggle-pair? [cell_a : int cell_b : int opts : int] #fx{Unsafe} : bool
+          out     (__rhtml-wrap3 "<section class=\"notebook-cell\">"
+                    content
+                    ""
+                    ""
+                    "</section>")]
+      (do (__rhtml-cstr-free content) out)))
+  (defn __rhtml-should-toggle-pair? [cell_a : int cell_b : int opts : int]
+    #fx{Unsafe}
+    : bool
     (and (not (= (cell-lang cell_a) (cell-lang cell_b)))
-         (and (__rhtml-cell-shows-source? cell_a opts)
-              (__rhtml-cell-shows-source? cell_b opts))))
-
-  (defn __rhtml-toggle-button [lang : int active? : bool] #fx{Unsafe} : cstr
+      (and (__rhtml-cell-shows-source? cell_a opts)
+        (__rhtml-cell-shows-source? cell_b opts))))
+  (defn __rhtml-toggle-button [lang : int active? : bool]
+    #fx{Unsafe}
+    : cstr
     (__rhtml-toggle-button-build (__rhtml-lang-label lang)
-                                 (if active? " active" "")
-                                 (if active? "true" "false")))
-
+      (if active? " active" "")
+      (if active? "true" "false")))
   ;; `activecls`, not `active-cls`: the mangler turns `-` into `_hy`, so the
   ;; C body would have to say `active_hycls`.  A separator-free name mangles
   ;; to itself.
-  (defn __rhtml-toggle-button-build [label : cstr activecls : cstr selected : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-toggle-button-build [label : cstr
+                                     activecls : cstr
+                                     selected : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *l = label     ? (const char *)(intptr_t)label     : "";
     const char *a = activecls ? (const char *)(intptr_t)activecls : "";
@@ -1334,26 +1442,39 @@
       a, l, sel, l);
     return out;
     ```)
-
-  (defn __rhtml-toggle-panel [cell : int output : int opts : int html_path : cstr active? : bool] #fx{Unsafe} : cstr
+  (defn __rhtml-toggle-panel [cell : int
+                              output : int
+                              opts : int
+                              html_path : cstr
+                              active? : bool]
+    #fx{Unsafe}
+    : cstr
     (let [content (__rhtml-render-cell-content cell output opts html_path)
-          out (__rhtml-wrap4 "<div class=\"code-version "
-                             (__rhtml-lang-label (cell-lang cell))
-                             "-version\" role=\"tabpanel\""
-                             (if active? "" " hidden=\"hidden\"")
-                             ">" content "</div>")]
-      (do
-        (__rhtml-cstr-free content)
-        out)))
-
-  (defn __rhtml-render-toggle-pair [cell_a : int output_a : int cell_b : int output_b : int opts : int html_path : cstr] #fx{Unsafe} : cstr
+          out     (__rhtml-wrap4 "<div class=\"code-version "
+                    (__rhtml-lang-label (cell-lang cell))
+                    "-version\" role=\"tabpanel\""
+                    (if active? "" " hidden=\"hidden\"")
+                    ">"
+                    content
+                    "</div>")]
+      (do (__rhtml-cstr-free content) out)))
+  (defn __rhtml-render-toggle-pair [cell_a : int
+                                    output_a : int
+                                    cell_b : int
+                                    output_b : int
+                                    opts : int
+                                    html_path : cstr]
+    #fx{Unsafe}
+    : cstr
     (let [btn-a (__rhtml-toggle-button (cell-lang cell_a) true)
           btn-b (__rhtml-toggle-button (cell-lang cell_b) false)
           pan-a (__rhtml-toggle-panel cell_a output_a opts html_path true)
           pan-b (__rhtml-toggle-panel cell_b output_b opts html_path false)
-          head  (__rhtml-wrap3
-                  "<section class=\"code-card code-toggle\"><div class=\"code-card-bar\"><span class=\"cell-meta\">paired syntax view</span><div class=\"code-syntax-toggle\" role=\"tablist\">"
-                  btn-a "" btn-b "</div></div>")
+          head  (__rhtml-wrap3 "<section class=\"code-card code-toggle\"><div class=\"code-card-bar\"><span class=\"cell-meta\">paired syntax view</span><div class=\"code-syntax-toggle\" role=\"tablist\">"
+                  btn-a
+                  ""
+                  btn-b
+                  "</div></div>")
           out   (__rhtml-wrap3 head pan-a "" pan-b "</section>")]
       (do
         (__rhtml-cstr-free btn-a)
@@ -1362,8 +1483,9 @@
         (__rhtml-cstr-free pan-b)
         (__rhtml-cstr-free head)
         out)))
-
-  (defn __rhtml-render-state-make [text : cstr outputs : int] #fx{Unsafe} : int
+  (defn __rhtml-render-state-make [text : cstr outputs : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { char *text; int64_t outputs; } RenderState;
     RenderState *state = malloc(sizeof(*state));
@@ -1371,23 +1493,26 @@
     state->outputs = outputs;
     return (int64_t)(intptr_t)state;
     ```)
-
-  (defn __rhtml-render-state-text [state : int] #fx{Unsafe} : cstr
+  (defn __rhtml-render-state-text [state : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct { char *text; int64_t outputs; } RenderState;
     RenderState *s = (RenderState *)(intptr_t)state;
     return s && s->text ? s->text : "";
     ```)
-
-  (defn __rhtml-render-state-outputs [state : int] #fx{Unsafe} : int
+  (defn __rhtml-render-state-outputs [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { char *text; int64_t outputs; } RenderState;
     RenderState *s = (RenderState *)(intptr_t)state;
     return s ? s->outputs : 0;
     ```)
-
-;;; __rhtml-render-state-adopt -- build a state that TAKES OWNERSHIP of `text`.
-  (defn __rhtml-render-state-adopt [text : cstr outputs : int] #fx{Unsafe} : int
+  ;;; __rhtml-render-state-adopt -- build a state that TAKES OWNERSHIP of `text`.
+  (defn __rhtml-render-state-adopt [text : cstr outputs : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { char *text; int64_t outputs; } RenderState;
     RenderState *state = malloc(sizeof(*state));
@@ -1395,9 +1520,10 @@
     state->outputs = outputs;
     return (int64_t)(intptr_t)state;
     ```)
-
-;;; __rhtml-state-take-text -- hand the text out and clear the field.
-  (defn __rhtml-state-take-text [state : int] #fx{Unsafe} : cstr
+  ;;; __rhtml-state-take-text -- hand the text out and clear the field.
+  (defn __rhtml-state-take-text [state : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct { char *text; int64_t outputs; } RenderState;
     RenderState *s = (RenderState *)(intptr_t)state;
@@ -1406,9 +1532,10 @@
     s->text = NULL;
     return t;
     ```)
-
-;;; __rhtml-render-state-free -- release a state and its text.  Safe on 0.
-  (defn __rhtml-render-state-free [state : int] #fx{Unsafe} : void
+  ;;; __rhtml-render-state-free -- release a state and its text.  Safe on 0.
+  (defn __rhtml-render-state-free [state : int]
+    #fx{Unsafe}
+    : void
     ```c
     typedef struct { char *text; int64_t outputs; } RenderState;
     RenderState *s = (RenderState *)(intptr_t)state;
@@ -1416,83 +1543,113 @@
     free(s->text);
     free(s);
     ```)
-
-  (defn __rhtml-render-body [nodes : int outputs : int opts : int html_path : cstr] #fx{Unsafe} : int
+  (defn __rhtml-render-body [nodes : int
+                             outputs : int
+                             opts : int
+                             html_path : cstr]
+    #fx{Unsafe}
+    : int
     (if (__rhtml-list-nil? nodes)
       (__rhtml-render-state-make "" outputs)
       (let [node (__rhtml-head nodes)]
         (if (= (node-tag node) 0)
-          (let [rest      (__rhtml-render-body (__rhtml-tail nodes) outputs opts html_path)
+          (let [rest      (__rhtml-render-body (__rhtml-tail nodes)
+                            outputs
+                            opts
+                            html_path)
                 rest-outs (__rhtml-render-state-outputs rest)
                 joined    (__rhtml-join-owned (md-emit-html (node-prose node))
-                                              (__rhtml-state-take-text rest))]
+                            (__rhtml-state-take-text rest))]
             (do
               (__rhtml-render-state-free rest)
               (__rhtml-render-state-adopt joined rest-outs)))
-          (let [cell (node-cell node)
-                cur-output (if (__rhtml-list-nil? outputs) 0 (__rhtml-head outputs))
-                rest-outputs (if (__rhtml-list-nil? outputs) (__rhtml-nil-value) (__rhtml-tail outputs))
-                more-nodes (__rhtml-tail nodes)]
+          (let [cell         (node-cell node)
+                cur-output   (if (__rhtml-list-nil? outputs)
+                               0
+                               (__rhtml-head outputs))
+                rest-outputs (if (__rhtml-list-nil? outputs)
+                               (__rhtml-nil-value)
+                               (__rhtml-tail outputs))
+                more-nodes   (__rhtml-tail nodes)]
             (if (and (not (__rhtml-list-nil? more-nodes))
-                     (= (node-tag (__rhtml-head more-nodes)) 1)
-                     (__rhtml-should-toggle-pair? cell (node-cell (__rhtml-head more-nodes)) opts))
-              (let [next-cell (node-cell (__rhtml-head more-nodes))
-                    next-output (if (__rhtml-list-nil? rest-outputs) 0 (__rhtml-head rest-outputs))
-                    tail-outputs (if (__rhtml-list-nil? rest-outputs) (__rhtml-nil-value) (__rhtml-tail rest-outputs))
-                    rest (__rhtml-render-body (__rhtml-tail more-nodes) tail-outputs opts html_path)
-                    rest-outs (__rhtml-render-state-outputs rest)
-                    joined (__rhtml-join-owned
-                             (__rhtml-render-toggle-pair cell cur-output next-cell next-output opts html_path)
-                             (__rhtml-state-take-text rest))]
+                  (= (node-tag (__rhtml-head more-nodes)) 1)
+                  (__rhtml-should-toggle-pair? cell
+                    (node-cell (__rhtml-head more-nodes))
+                    opts))
+              (let [next-cell    (node-cell (__rhtml-head more-nodes))
+                    next-output  (if (__rhtml-list-nil? rest-outputs)
+                                   0
+                                   (__rhtml-head rest-outputs))
+                    tail-outputs (if (__rhtml-list-nil? rest-outputs)
+                                   (__rhtml-nil-value)
+                                   (__rhtml-tail rest-outputs))
+                    rest         (__rhtml-render-body (__rhtml-tail more-nodes)
+                                   tail-outputs
+                                   opts
+                                   html_path)
+                    rest-outs    (__rhtml-render-state-outputs rest)
+                    joined       (__rhtml-join-owned (__rhtml-render-toggle-pair cell
+                                                       cur-output
+                                                       next-cell
+                                                       next-output
+                                                       opts
+                                                       html_path)
+                                   (__rhtml-state-take-text rest))]
                 (do
                   (__rhtml-render-state-free rest)
                   (__rhtml-render-state-adopt joined rest-outs)))
-              (let [rest (__rhtml-render-body more-nodes rest-outputs opts html_path)
+              (let [rest      (__rhtml-render-body more-nodes
+                                rest-outputs
+                                opts
+                                html_path)
                     rest-outs (__rhtml-render-state-outputs rest)
-                    joined (__rhtml-join-owned
-                             (__rhtml-render-single-cell cell cur-output opts html_path)
-                             (__rhtml-state-take-text rest))]
+                    joined    (__rhtml-join-owned (__rhtml-render-single-cell cell
+                                                    cur-output
+                                                    opts
+                                                    html_path)
+                                (__rhtml-state-take-text rest))]
                 (do
                   (__rhtml-render-state-free rest)
                   (__rhtml-render-state-adopt joined rest-outs)))))))))
-
-  (defn __rhtml-cells-from-nodes-rev [nodes : int acc : int] #fx{Unsafe} : int
+  (defn __rhtml-cells-from-nodes-rev [nodes : int acc : int]
+    #fx{Unsafe}
+    : int
     (if (__rhtml-list-nil? nodes)
       acc
       (let [node (__rhtml-head nodes)]
-        (__rhtml-cells-from-nodes-rev
-          (__rhtml-tail nodes)
-          (if (= (node-tag node) 1)
-            (__rhtml-cons (node-cell node) acc)
-            acc)))))
-
+        (__rhtml-cells-from-nodes-rev (__rhtml-tail nodes)
+          (if (= (node-tag node) 1) (__rhtml-cons (node-cell node) acc) acc)))))
   ;;; __rhtml-reverse -- reverse a list, consuming its cons cells.
-  (defn __rhtml-reverse [lst : int acc : int] #fx{Unsafe} : int
+  (defn __rhtml-reverse [lst : int acc : int]
+    #fx{Unsafe}
+    : int
     (if (__rhtml-list-nil? lst)
       acc
       (let [next (__rhtml-tail lst)
             out  (__rhtml-cons (__rhtml-head lst) acc)]
-        (do
-          (__rhtml-cons-free lst)
-          (__rhtml-reverse next out)))))
-
-  (defn __rhtml-cells-from-nodes [nodes : int] #fx{Unsafe} : int
+        (do (__rhtml-cons-free lst) (__rhtml-reverse next out)))))
+  (defn __rhtml-cells-from-nodes [nodes : int]
+    #fx{Unsafe}
+    : int
     (__rhtml-reverse (__rhtml-cells-from-nodes-rev nodes (__rhtml-nil-value))
-                     (__rhtml-nil-value)))
-
-  (defn __rhtml-list-length [lst : int] #fx{Unsafe} : int
+      (__rhtml-nil-value)))
+  (defn __rhtml-list-length [lst : int]
+    #fx{Unsafe}
+    : int
     (if (__rhtml-list-nil? lst)
       0
       (+ 1 (__rhtml-list-length (__rhtml-tail lst)))))
-
-  (defn __rhtml-cells-has-math-attr? [cells : int] #fx{Unsafe} : bool
+  (defn __rhtml-cells-has-math-attr? [cells : int]
+    #fx{Unsafe}
+    : bool
     (if (__rhtml-list-nil? cells)
       false
       (if (= (attr-get-bool (cell-attrs (__rhtml-head cells)) "math" 0) 1)
         true
         (__rhtml-cells-has-math-attr? (__rhtml-tail cells)))))
-
-  (defn __rhtml-find-katex-vendor-dir [] #fx{Unsafe} : cstr
+  (defn __rhtml-find-katex-vendor-dir []
+    #fx{Unsafe}
+    : cstr
     ```c
     #include <sys/stat.h>
     const char *env = getenv("TUR_NOTEBOOK_VENDOR_KATEX");
@@ -1510,8 +1667,9 @@
     }
     return strdup("");
     ```)
-
-  (defn __rhtml-read-vendor-file [vendor_dir : cstr name : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-read-vendor-file [vendor_dir : cstr name : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *dir = vendor_dir ? (const char *)(intptr_t)vendor_dir : "";
     const char *fname = name ? (const char *)(intptr_t)name : "";
@@ -1530,8 +1688,9 @@
     fclose(fp);
     return buf;
     ```)
-
-  (defn __rhtml-katex-css-rewrite [css : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-katex-css-rewrite [css : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     /* Rewrite @font-face src urls from "fonts/KaTeX_..." to "katex-fonts/KaTeX_..."
        so inline-embedded CSS can find the sibling font directory. */
@@ -1558,14 +1717,16 @@
     out[j] = '\0';
     return out;
     ```)
-
-  (defn __rhtml-body-has-math? [body : cstr] #fx{Unsafe} : bool
+  (defn __rhtml-body-has-math? [body : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *src = body ? (const char *)(intptr_t)body : "";
     return strstr(src, "class=\"math ") != NULL;
     ```)
-
-  (defn __rhtml-katex-copy-fonts [vendor_dir : cstr html_path : cstr] #fx{Unsafe} : int
+  (defn __rhtml-katex-copy-fonts [vendor_dir : cstr html_path : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     const char *dir = vendor_dir ? (const char *)(intptr_t)vendor_dir : "";
     const char *html = html_path ? (const char *)(intptr_t)html_path : "";
@@ -1602,8 +1763,12 @@
     closedir(d);
     return 1;
     ```)
-
-  (defn __rhtml-katex-write-sibling [vendor_dir : cstr html_path : cstr name : cstr rewrite : int] #fx{Unsafe} : int
+  (defn __rhtml-katex-write-sibling [vendor_dir : cstr
+                                     html_path : cstr
+                                     name : cstr
+                                     rewrite : int]
+    #fx{Unsafe}
+    : int
     ```c
     #include <stdio.h>
     #include <string.h>
@@ -1643,8 +1808,12 @@
     free(out);
     return fdst ? 1 : 0;
     ```)
-
-  (defn __rhtml-katex-inject [math_mode : int assets_mode : int body : cstr html_path : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-katex-inject [math_mode : int
+                              assets_mode : int
+                              body : cstr
+                              html_path : cstr]
+    #fx{Unsafe}
+    : cstr
     (let [should-inject (if (= math_mode 2)
                           false
                           (if (= math_mode 1)
@@ -1653,14 +1822,14 @@
       (if (not should-inject)
         (__rhtml-strdup "")
         (if (= assets_mode 1)
-          (__rhtml-strdup
-            (__rhtml-katex-sibling-tags))
-          (let [vendor-dir (__rhtml-find-katex-vendor-dir)   ;; owned path
-                raw-css (__rhtml-read-vendor-file vendor-dir "katex.min.css")
-                css (__rhtml-katex-css-rewrite raw-css)
-                js (__rhtml-read-vendor-file vendor-dir "katex.min.js")
-                ar (__rhtml-read-vendor-file vendor-dir "auto-render.min.js")
-                out (__rhtml-katex-inline-build css js ar)]
+          (__rhtml-strdup (__rhtml-katex-sibling-tags))
+          (let [vendor-dir (__rhtml-find-katex-vendor-dir) ;; owned path
+                raw-css    (__rhtml-read-vendor-file vendor-dir "katex.min.css")
+                css        (__rhtml-katex-css-rewrite raw-css)
+                js         (__rhtml-read-vendor-file vendor-dir "katex.min.js")
+                ar         (__rhtml-read-vendor-file vendor-dir
+                             "auto-render.min.js")
+                out        (__rhtml-katex-inline-build css js ar)]
             (do
               (__rhtml-cstr-free raw-css)
               (__rhtml-cstr-free css)
@@ -1668,18 +1837,20 @@
               (__rhtml-cstr-free ar)
               (__rhtml-cstr-free vendor-dir)
               out))))))
-
   ;; The katex payloads are tens of kilobytes each, so the nested concat
   ;; chain that used to build this copied them four times over and dropped
   ;; every copy: it was 50 KB of the render_html leak on its own.
-  (defn __rhtml-katex-sibling-tags [] #fx{Unsafe} : cstr
+  (defn __rhtml-katex-sibling-tags []
+    #fx{Unsafe}
+    : cstr
     ```c
     return "<link rel=\"stylesheet\" href=\"katex.min.css\" />"
            "<script src=\"katex.min.js\"></script>"
            "<script src=\"auto-render.min.js\"></script>";
     ```)
-
-  (defn __rhtml-katex-inline-build [css : cstr js : cstr ar : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-katex-inline-build [css : cstr js : cstr ar : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *c = css ? (const char *)(intptr_t)css : "";
     const char *j = js  ? (const char *)(intptr_t)js  : "";
@@ -1689,24 +1860,34 @@
     snprintf(out, n, "<style>%s</style><script>%s</script><script>%s</script>", c, j, a);
     return out;
     ```)
-
-
-  (defn __rhtml-document [title : cstr body : cstr math_mode : int assets_mode : int html_path : cstr] #fx{Unsafe} : cstr
-    (let [title_esc (__rhtml-html-escape title)
-          script (__rhtml-toggle-script)
+  (defn __rhtml-document [title : cstr
+                          body : cstr
+                          math_mode : int
+                          assets_mode : int
+                          html_path : cstr]
+    #fx{Unsafe}
+    : cstr
+    (let [title_esc  (__rhtml-html-escape title)
+          script     (__rhtml-toggle-script)
           katex-head (__rhtml-katex-inject math_mode assets_mode body html_path)
-          bootstrap "<script>document.addEventListener(\"DOMContentLoaded\",function(){renderMathInElement(document.body,{delimiters:[{left:\"$$\",right:\"$$\",display:true},{left:\"$\",right:\"$\",display:false}],throwOnError:false,errorColor:\"#cc0000\",strict:\"ignore\"});});</script>"]
-      (let [out (__rhtml-document-build
-                  title_esc katex-head body script
+          bootstrap  "<script>document.addEventListener(\"DOMContentLoaded\",function(){renderMathInElement(document.body,{delimiters:[{left:\"$$\",right:\"$$\",display:true},{left:\"$\",right:\"$\",display:false}],throwOnError:false,errorColor:\"#cc0000\",strict:\"ignore\"});});</script>"]
+      (let [out (__rhtml-document-build title_esc
+                  katex-head
+                  body
+                  script
                   (if (__rhtml-body-has-math? body) bootstrap ""))]
         (do
           (__rhtml-cstr-free title_esc)
           (__rhtml-cstr-free script)
           (__rhtml-cstr-free katex-head)
           out))))
-
-  (defn __rhtml-document-build [title : cstr katex : cstr body : cstr
-                                script : cstr boot : cstr] #fx{Unsafe} : cstr
+  (defn __rhtml-document-build [title : cstr
+                                katex : cstr
+                                body : cstr
+                                script : cstr
+                                boot : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *t = title  ? (const char *)(intptr_t)title  : "";
     const char *k = katex  ? (const char *)(intptr_t)katex  : "";
@@ -1725,56 +1906,61 @@
       t, k, b, s, o);
     return out;
     ```)
-
   ;;; render-html-string-at -- render a parsed notebook to HTML as if writing html_path.
   ;;; render-html-string-at -- as render-html-string, for a known output path.
   ;;; Returns a string the caller owns.
-  (defn render-html-string-at [nodes : int outputs : int opts : int html_path : cstr] #fx{Unsafe} : cstr
-    (let [st (__rhtml-render-body nodes outputs opts html_path)
-          body (__rhtml-state-take-text st)
-          title "Notebook"
-          math-mode (__rhtml-render-opts-math-mode opts)
+  (defn render-html-string-at [nodes : int
+                               outputs : int
+                               opts : int
+                               html_path : cstr]
+    #fx{Unsafe}
+    : cstr
+    (let [st          (__rhtml-render-body nodes outputs opts html_path)
+          body        (__rhtml-state-take-text st)
+          title       "Notebook"
+          math-mode   (__rhtml-render-opts-math-mode opts)
           assets-mode (__rhtml-render-opts-assets-mode opts)
-          doc (__rhtml-document title body math-mode assets-mode html_path)]
-      (do
-        (__rhtml-render-state-free st)
-        (__rhtml-cstr-free body)
-        doc)))
-
+          doc         (__rhtml-document title
+                        body
+                        math-mode
+                        assets-mode
+                        html_path)]
+      (do (__rhtml-render-state-free st) (__rhtml-cstr-free body) doc)))
   ;;; render-html-string -- render a parsed notebook and its outputs to standalone HTML.
   ;;; render-html-string -- render a parsed notebook and its outputs to standalone HTML.
   ;;;
   ;;; Returns a string the caller owns.  It used to hand back the document
   ;;; built over the interior text of a RenderState it dropped, leaking the
   ;;; state and its body at every call.
-  (defn render-html-string [nodes : int outputs : int opts : int] #fx{Unsafe} : cstr
-    (let [st (__rhtml-render-body nodes outputs opts "")
-          body (__rhtml-state-take-text st)
-          title "Notebook"
-          math-mode (__rhtml-render-opts-math-mode opts)
+  (defn render-html-string [nodes : int outputs : int opts : int]
+    #fx{Unsafe}
+    : cstr
+    (let [st          (__rhtml-render-body nodes outputs opts "")
+          body        (__rhtml-state-take-text st)
+          title       "Notebook"
+          math-mode   (__rhtml-render-opts-math-mode opts)
           assets-mode (__rhtml-render-opts-assets-mode opts)
-          doc (__rhtml-document title body math-mode assets-mode "")]
-      (do
-        (__rhtml-render-state-free st)
-        (__rhtml-cstr-free body)
-        doc)))
-
+          doc         (__rhtml-document title body math-mode assets-mode "")]
+      (do (__rhtml-render-state-free st) (__rhtml-cstr-free body) doc)))
   ;;; render-html -- evaluate a notebook file and write rendered HTML beside it.
-  (defn render-html [path : cstr opts : int] #fx{Unsafe} : int
+  (defn render-html [path : cstr opts : int]
+    #fx{Unsafe}
+    : int
     (let [parsed (parse-file path)]
       (if (not (__rhtml-result-ok? parsed))
         (__rhtml-err "failed to parse notebook file")
-        (let [nodes (__rhtml-result-ok-val parsed)
+        (let [nodes   (__rhtml-result-ok-val parsed)
               ;; the Result box itself is ours once the nodes are out of it
-              _box (__rhtml-result-box-free parsed)
-              cells (cells-assign-ids (__rhtml-cells-from-nodes nodes))
+              _box    (__rhtml-result-box-free parsed)
+              cells   (cells-assign-ids (__rhtml-cells-from-nodes nodes))
               session (session-open-for path)
-              cache (if (= (__rhtml-render-opts-use-cache opts) 1)
-                      (cache-open "")
-                      0)
+              cache   (if (= (__rhtml-render-opts-use-cache opts) 1)
+                        (cache-open "")
+                        0)
               outputs (eval-all session cells cache 0)
               halted? (and (= (__rhtml-render-opts-fail-fast opts) 1)
-                           (< (__rhtml-list-length outputs) (__rhtml-list-length cells)))]
+                        (< (__rhtml-list-length outputs)
+                          (__rhtml-list-length cells)))]
           (if halted?
             (do
               (session-close session)
@@ -1783,28 +1969,42 @@
               (__rhtml-spine-free cells)
               (nodes-free nodes)
               (__rhtml-err "render halted after a cell error"))
-            (let [out-path (__rhtml-output-path path (__rhtml-render-opts-output-dir opts))
-                  style-path (__rhtml-style-path out-path)
-                  title (__rhtml-page-title path)
-                  body-state (__rhtml-render-body nodes outputs opts out-path)
-                  body (__rhtml-state-take-text body-state)
-                  math-mode (if (__rhtml-cells-has-math-attr? cells)
-                               1
-                               (__rhtml-render-opts-math-mode opts))
+            (let [out-path    (__rhtml-output-path path
+                                (__rhtml-render-opts-output-dir opts))
+                  style-path  (__rhtml-style-path out-path)
+                  title       (__rhtml-page-title path)
+                  body-state  (__rhtml-render-body nodes outputs opts out-path)
+                  body        (__rhtml-state-take-text body-state)
+                  math-mode   (if (__rhtml-cells-has-math-attr? cells)
+                                1
+                                (__rhtml-render-opts-math-mode opts))
                   assets-mode (__rhtml-render-opts-assets-mode opts)
-                  vendor-dir (__rhtml-find-katex-vendor-dir)
-                  _ (if (__rhtml-body-has-math? body)
-                       (do
-                         (__rhtml-katex-copy-fonts vendor-dir out-path)
-                         (if (= assets-mode 1)
-                           (do
-                             (__rhtml-katex-write-sibling vendor-dir out-path "katex.min.css" 1)
-                             (__rhtml-katex-write-sibling vendor-dir out-path "katex.min.js" 0)
-                             (__rhtml-katex-write-sibling vendor-dir out-path "auto-render.min.js" 0))
-                           0))
-                       0)
-                  html (__rhtml-document title body math-mode assets-mode out-path)
-                  css (__rhtml-style-css)]
+                  vendor-dir  (__rhtml-find-katex-vendor-dir)
+                  _           (if (__rhtml-body-has-math? body)
+                                (do
+                                  (__rhtml-katex-copy-fonts vendor-dir out-path)
+                                  (if (= assets-mode 1)
+                                    (do
+                                      (__rhtml-katex-write-sibling vendor-dir
+                                        out-path
+                                        "katex.min.css"
+                                        1)
+                                      (__rhtml-katex-write-sibling vendor-dir
+                                        out-path
+                                        "katex.min.js"
+                                        0)
+                                      (__rhtml-katex-write-sibling vendor-dir
+                                        out-path
+                                        "auto-render.min.js"
+                                        0))
+                                    0))
+                                0)
+                  html        (__rhtml-document title
+                                body
+                                math-mode
+                                assets-mode
+                                out-path)
+                  css         (__rhtml-style-css)]
               (do
                 (session-close session)
                 (__rhtml-close-cache cache)
@@ -1813,7 +2013,7 @@
                 (__rhtml-spine-free cells)
                 (nodes-free nodes)
                 (let [result (if (or (= (__rhtml-ensure-parent-dir out-path) -1)
-                                     (= (__rhtml-ensure-parent-dir style-path) -1))
+                                   (= (__rhtml-ensure-parent-dir style-path) -1))
                                (__rhtml-err "failed to create output directory")
                                (if (= (__rhtml-write-file style-path css) 1)
                                  (if (= (__rhtml-write-file out-path html) 1)
@@ -1831,6 +2031,4 @@
                     (if (__rhtml-result-ok? result)
                       (__rhtml-noop)
                       (__rhtml-cstr-free out-path))
-                    result)))))))))
-
-) ;; end defmodule notebook/render-html
+                    result)))))))))) ;; end defmodule notebook/render-html

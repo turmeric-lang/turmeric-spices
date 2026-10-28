@@ -19,24 +19,21 @@
 ;;; Since: v0.1.0
 (defmodule tourist-session-valkey/store
   (import session/store :refer [Store store-new])
-  (import session/data  :refer [SessMap])
+  (import session/data :refer [SessMap])
   (import session/serde :refer [sessmap-encode sessmap-decode])
   (import valkey/client :refer [Client])
-  (import valkey/cmd    :refer [cmd-get cmd-set cmd-del cmd-expire])
-  (import valkey/reply  :refer [Reply reply-type reply-string reply-free])
+  (import valkey/cmd :refer [cmd-get cmd-set cmd-del cmd-expire])
+  (import valkey/reply :refer [Reply reply-type reply-string reply-free])
   (export valkey-store-new)
-
-;; default TTL (24h) when a session config asks for max-age 0 ("until browser
-;; close"): a Valkey key needs *some* TTL or it lives forever, so we document a
-;; 24h ceiling for the no-natural-expiry case.
-(def __DEFAULT-TTL 86400)
-
-;; -- backend state ----------------------------------------------------------
-;; struct __vk_state { int64_t client; char *prefix; int64_t max_age; };
-
-(defn __vk-state-new [client : int prefix : cstr max-age : int] : int
-  ```c
-  #include <stdlib.h>
+  ;; default TTL (24h) when a session config asks for max-age 0 ("until browser
+  ;; close"): a Valkey key needs *some* TTL or it lives forever, so we document a
+  ;; 24h ceiling for the no-natural-expiry case.
+  (def __DEFAULT-TTL 86400)
+  ;; -- backend state ----------------------------------------------------------
+  ;; struct __vk_state { int64_t client; char *prefix; int64_t max_age; };
+  (defn __vk-state-new [client : int prefix : cstr max-age : int] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   struct __vk_state { int64_t client; char *prefix; int64_t max_age; };
   struct __vk_state *s = malloc(sizeof(*s));
@@ -45,23 +42,20 @@
   s->max_age = max_age;
   return (int64_t)(intptr_t)s;
   ```)
-
-(defn __vk-client [state : int] : int
-  ```c
-  struct __vk_state { int64_t client; char *prefix; int64_t max_age; };
+  (defn __vk-client [state : int] : int
+    ```c
+    struct __vk_state { int64_t client; char *prefix; int64_t max_age; };
   return ((struct __vk_state *)(intptr_t)state)->client;
   ```)
-
-(defn __vk-prefix [state : int] : cstr
-  ```c
-  struct __vk_state { int64_t client; char *prefix; int64_t max_age; };
+  (defn __vk-prefix [state : int] : cstr
+    ```c
+    struct __vk_state { int64_t client; char *prefix; int64_t max_age; };
   return (const char *)((struct __vk_state *)(intptr_t)state)->prefix;
   ```)
-
-;;; __vk-key -- malloc'd "<prefix>:<id>".
-(defn __vk-key [prefix : cstr id : cstr] : cstr
-  ```c
-  #include <stdlib.h>
+  ;;; __vk-key -- malloc'd "<prefix>:<id>".
+  (defn __vk-key [prefix : cstr id : cstr] : cstr
+    ```c
+    #include <stdlib.h>
   #include <stdio.h>
   #include <string.h>
   const char *p = (const char *)prefix;
@@ -71,103 +65,93 @@
   snprintf(out, n, "%s:%s", p, i);
   return (const char *)out;
   ```)
-
-(defn __itoa [n : int] : cstr
-  ```c
-  #include <stdlib.h>
+  (defn __itoa [n : int] : cstr
+    ```c
+    #include <stdlib.h>
   #include <stdio.h>
   char *out = malloc(24);
   snprintf(out, 24, "%lld", (long long)n);
   return (const char *)out;
   ```)
-
-(defn __cstr-free [s : cstr] : void
-  ```c
-  #include <stdlib.h>
+  (defn __cstr-free [s : cstr] : void
+    ```c
+    #include <stdlib.h>
   free((void *)(intptr_t)s);
   ```)
-
-(defn seq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+  (defn seq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-;; -- cmd-result helpers -----------------------------------------------------
-;; valkey/cmd returns a typed `(Result Reply int)`.  Since SR2a a concrete
-;; monomorph flows BY VALUE, so there is no result box to free -- only the
-;; redisReply* the ok arm carries, which reply-free releases.
-
-;;; __finish -- free the reply a command result carries, when it has one.
-(defn __finish [r : (Result Reply int)] : void
-  (when (ok? r) (reply-free (ok-val r))))
-
-;; -- vtable slots -----------------------------------------------------------
-
-;;; vk-load -- GET <prefix>:<id>, decode the envelope, or 0 on miss.
-(defn vk-load [state : int id : cstr] : int
-  (let [key (__vk-key (__vk-prefix state) id)
-        r   (cmd-get (:: (__vk-client state) :Client) key)]
-    (do
-      (__cstr-free key)
-      (if (ok? r)
-        (let [rep (ok-val r)
-              out (if (seq? (reply-type rep) "string")
-                    (:: (sessmap-decode (reply-string rep)) :int)
-                    0)]
-          (do (reply-free rep) out))
-        0))))
-
-;;; vk-save -- SET the envelope then EXPIRE the key to the session lifetime.
-;;;
-;;; A max-age of 0 ("until browser close") has no natural Valkey TTL, so the
-;;; key is given the documented __DEFAULT-TTL (24h) instead of living forever.
-(defn vk-save [state : int id : cstr map : int ttl : int] : int
-  (let [key  (__vk-key (__vk-prefix state) id)
-        json (sessmap-encode (:: map :SessMap) ttl)
-        eff  (if (> ttl 0) ttl __DEFAULT-TTL)
-        secs (__itoa eff)]
-    (do
-      (__finish (cmd-set (:: (__vk-client state) :Client) key json))
-      (__finish (cmd-expire (:: (__vk-client state) :Client) key secs))
-      (__cstr-free json)
-      (__cstr-free secs)
-      (__cstr-free key)
-      0)))
-
-;;; vk-del -- DEL <prefix>:<id>.
-(defn vk-del [state : int id : cstr] : int
-  (let [key (__vk-key (__vk-prefix state) id)]
-    (do
-      (__finish (cmd-del (:: (__vk-client state) :Client) key))
-      (__cstr-free key)
-      0)))
-
-;;; valkey-store-new -- a Valkey-backed Store.
-;;;
-;;; Keys are namespaced under `<prefix>:<session-id>`. The key TTL tracks the
-;;; session's `max-age` so expired sessions vacate on their own; a `max-age` of
-;;; 0 falls back to a 24h TTL (a Valkey key needs some expiry).
-;;;
-;;; Parameters:
-;;;   client  -- borrowed Valkey client (caller owns its lifecycle)
-;;;   prefix  -- key namespace, e.g. "sess"
-;;;   max-age -- session lifetime in seconds (match SessionConfig's max-age)
-;;;
-;;; Returns:
-;;;   Store -- install it via session-mw, exactly like memory-store-new /
-;;;            file-store-new.
-;;;
-;;; Example:
-;;;   (let [c     (ok-val (client-connect "127.0.0.1" 6379))
-;;;         store (valkey-store-new c "sess" 86400)]
-;;;     (tourist 3000
-;;;       (session-mw store (default-session-config))
-;;;       ...))
-;;;
-;;; Since: v0.1.0
-(defn valkey-store-new [^borrow client : Client prefix : cstr max-age : int] : Store
-  (store-new vk-load vk-save vk-del
-             (__vk-state-new (:: client :int) prefix max-age)))
-
-) ;; end defmodule tourist-session-valkey/store
+  ;; -- cmd-result helpers -----------------------------------------------------
+  ;; valkey/cmd returns a typed `(Result Reply int)`.  Since SR2a a concrete
+  ;; monomorph flows BY VALUE, so there is no result box to free -- only the
+  ;; redisReply* the ok arm carries, which reply-free releases.
+  ;;; __finish -- free the reply a command result carries, when it has one.
+  (defn __finish [r : (Result Reply int)] : void
+    (when (ok? r) (reply-free (ok-val r))))
+  ;; -- vtable slots -----------------------------------------------------------
+  ;;; vk-load -- GET <prefix>:<id>, decode the envelope, or 0 on miss.
+  (defn vk-load [state : int id : cstr] : int
+    (let [key (__vk-key (__vk-prefix state) id)
+          r   (cmd-get (:: (__vk-client state) :Client) key)]
+      (do
+        (__cstr-free key)
+        (if (ok? r)
+          (let [rep (ok-val r)
+                out (if (seq? (reply-type rep) "string")
+                      (:: (sessmap-decode (reply-string rep)) :int)
+                      0)]
+            (do (reply-free rep) out))
+          0))))
+  ;;; vk-save -- SET the envelope then EXPIRE the key to the session lifetime.
+  ;;;
+  ;;; A max-age of 0 ("until browser close") has no natural Valkey TTL, so the
+  ;;; key is given the documented __DEFAULT-TTL (24h) instead of living forever.
+  (defn vk-save [state : int id : cstr map : int ttl : int] : int
+    (let [key  (__vk-key (__vk-prefix state) id)
+          json (sessmap-encode (:: map :SessMap) ttl)
+          eff  (if (> ttl 0) ttl __DEFAULT-TTL)
+          secs (__itoa eff)]
+      (do
+        (__finish (cmd-set (:: (__vk-client state) :Client) key json))
+        (__finish (cmd-expire (:: (__vk-client state) :Client) key secs))
+        (__cstr-free json)
+        (__cstr-free secs)
+        (__cstr-free key)
+        0)))
+  ;;; vk-del -- DEL <prefix>:<id>.
+  (defn vk-del [state : int id : cstr] : int
+    (let [key (__vk-key (__vk-prefix state) id)]
+      (do
+        (__finish (cmd-del (:: (__vk-client state) :Client) key))
+        (__cstr-free key)
+        0)))
+  ;;; valkey-store-new -- a Valkey-backed Store.
+  ;;;
+  ;;; Keys are namespaced under `<prefix>:<session-id>`. The key TTL tracks the
+  ;;; session's `max-age` so expired sessions vacate on their own; a `max-age` of
+  ;;; 0 falls back to a 24h TTL (a Valkey key needs some expiry).
+  ;;;
+  ;;; Parameters:
+  ;;;   client  -- borrowed Valkey client (caller owns its lifecycle)
+  ;;;   prefix  -- key namespace, e.g. "sess"
+  ;;;   max-age -- session lifetime in seconds (match SessionConfig's max-age)
+  ;;;
+  ;;; Returns:
+  ;;;   Store -- install it via session-mw, exactly like memory-store-new /
+  ;;;            file-store-new.
+  ;;;
+  ;;; Example:
+  ;;;   (let [c     (ok-val (client-connect "127.0.0.1" 6379))
+  ;;;         store (valkey-store-new c "sess" 86400)]
+  ;;;     (tourist 3000
+  ;;;       (session-mw store (default-session-config))
+  ;;;       ...))
+  ;;;
+  ;;; Since: v0.1.0
+  (defn valkey-store-new [^borrow client : Client prefix : cstr max-age : int] : Store
+    (store-new vk-load
+      vk-save
+      vk-del
+      (__vk-state-new (:: client :int) prefix max-age)))) ;; end defmodule tourist-session-valkey/store

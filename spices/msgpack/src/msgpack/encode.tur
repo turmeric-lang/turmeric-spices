@@ -20,871 +20,880 @@
 ;; Like json's classes, EncodeMp / DecodeMp / DecodeMpChecked are deliberately
 ;; NOT in the export list below: a defclass resolves globally regardless, and
 ;; listing it would only suggest otherwise.
-
 (defmodule msgpack/encode
-  (export derive-msgpack derive-msgpack-encode derive-msgpack-decode
-          derive-msgpack-opaque derive-msgpack-opaque-encode
-          derive-msgpack-opaque-decode
-          derive-msgpack-sum derive-msgpack-sum-encode derive-msgpack-sum-decode
-          decode-mp-list
-          __mp-chain __mp-map-build __mp-arr-build __mp-tag __mp-nil-frag
-          __mp-field-node __mp-node-absent?
-          __mp-decode-field __mp-decode-fields __mp-decode-make-struct
-          __mp-sum-fnames __mp-sum-vchain __mp-sum-enc-arms
-          __mp-sum-dfields __mp-sum-dec-arms
-          MpDecodeErrors derive-mp-decoder __mp-derive-checks
-          __mp-errs-new __mp-errs-count __mp-errs-free
-          __mp-check-int __mp-check-cstr __mp-check-bool __mp-check-float
-          mp-decode-errors-count mp-decode-error-path mp-decode-error-expected
-          mp-decode-error-got mp-decode-errors-free)
-
-(import msgpack/buf    :refer [Buf buf-free])
-(import msgpack/decode :refer [MpTree MpNode mp-map-get mp-arr-size mp-arr-get
-                               mp-type-name mp-absent? mp-nil? mp-arr?
-                               mp-int? mp-str? mp-bool? mp-num?
-                               mp-get-int mp-get-bool mp-get-float mp-get-str])
-
-;; ---------------------------------------------------------------------------
-;; Fragment constructors. Each returns a FRESH owned Buf; see buf.tur for why
-;; the inline C hands back a bare `ptr<void>` that Turmeric then ascribes.
-;; ---------------------------------------------------------------------------
-
-;;; __mp-enc-int-raw -- internal: smallest integer format that fits.
-(defn __mp-enc-int-raw [x : int] : ptr<void>
-  ```c
-  extern void *mp_enc_int(int64_t);
+  (export derive-msgpack
+    derive-msgpack-encode
+    derive-msgpack-decode
+    derive-msgpack-opaque
+    derive-msgpack-opaque-encode
+    derive-msgpack-opaque-decode
+    derive-msgpack-sum
+    derive-msgpack-sum-encode
+    derive-msgpack-sum-decode
+    decode-mp-list
+    __mp-chain
+    __mp-map-build
+    __mp-arr-build
+    __mp-tag
+    __mp-nil-frag
+    __mp-field-node
+    __mp-node-absent?
+    __mp-decode-field
+    __mp-decode-fields
+    __mp-decode-make-struct
+    __mp-sum-fnames
+    __mp-sum-vchain
+    __mp-sum-enc-arms
+    __mp-sum-dfields
+    __mp-sum-dec-arms
+    MpDecodeErrors
+    derive-mp-decoder
+    __mp-derive-checks
+    __mp-errs-new
+    __mp-errs-count
+    __mp-errs-free
+    __mp-check-int
+    __mp-check-cstr
+    __mp-check-bool
+    __mp-check-float
+    mp-decode-errors-count
+    mp-decode-error-path
+    mp-decode-error-expected
+    mp-decode-error-got
+    mp-decode-errors-free)
+  (import msgpack/buf :refer [Buf buf-free])
+  (import msgpack/decode
+    :refer
+    [MpTree
+     MpNode
+     mp-map-get
+     mp-arr-size
+     mp-arr-get
+     mp-type-name
+     mp-absent?
+     mp-nil?
+     mp-arr?
+     mp-int?
+     mp-str?
+     mp-bool?
+     mp-num?
+     mp-get-int
+     mp-get-bool
+     mp-get-float
+     mp-get-str])
+  ;; ---------------------------------------------------------------------------
+  ;; Fragment constructors. Each returns a FRESH owned Buf; see buf.tur for why
+  ;; the inline C hands back a bare `ptr<void>` that Turmeric then ascribes.
+  ;; ---------------------------------------------------------------------------
+  ;;; __mp-enc-int-raw -- internal: smallest integer format that fits.
+  (defn __mp-enc-int-raw [x : int] : ptr<void>
+    ```c
+    extern void *mp_enc_int(int64_t);
   return mp_enc_int((int64_t)x);
   ```)
-
-;;; __mp-enc-bool-raw -- internal: 0xc2 / 0xc3.
-(defn __mp-enc-bool-raw [x : bool] : ptr<void>
-  ```c
-  extern void *mp_enc_bool(int);
+  ;;; __mp-enc-bool-raw -- internal: 0xc2 / 0xc3.
+  (defn __mp-enc-bool-raw [x : bool] : ptr<void>
+    ```c
+    extern void *mp_enc_bool(int);
   return mp_enc_bool(x ? 1 : 0);
   ```)
-
-;;; __mp-enc-float-raw -- internal: always float64 (0xcb).
-(defn __mp-enc-float-raw [x : float] : ptr<void>
-  ```c
-  extern void *mp_enc_double(double);
+  ;;; __mp-enc-float-raw -- internal: always float64 (0xcb).
+  (defn __mp-enc-float-raw [x : float] : ptr<void>
+    ```c
+    extern void *mp_enc_double(double);
   return mp_enc_double((double)x);
   ```)
-
-;;; __mp-enc-str-raw -- internal: fixstr / str8 / str16 / str32 by length.
-(defn __mp-enc-str-raw [x : cstr] : ptr<void>
-  ```c
-  extern void *mp_enc_str(const char *);
+  ;;; __mp-enc-str-raw -- internal: fixstr / str8 / str16 / str32 by length.
+  (defn __mp-enc-str-raw [x : cstr] : ptr<void>
+    ```c
+    extern void *mp_enc_str(const char *);
   return mp_enc_str((const char *)x);
   ```)
-
-;;; __mp-enc-nil-raw -- internal: the nil byte (0xc0).
-(defn __mp-enc-nil-raw [] : ptr<void>
-  ```c
-  extern void *mp_enc_nil(void);
+  ;;; __mp-enc-nil-raw -- internal: the nil byte (0xc0).
+  (defn __mp-enc-nil-raw [] : ptr<void>
+    ```c
+    extern void *mp_enc_nil(void);
   return mp_enc_nil();
   ```)
-
-;;; __mp-nil-frag -- the MessagePack `nil` byte as a fresh owned fragment, so
-;;; every fragment the derive plumbing consumes can be freed uniformly.
-(defn __mp-nil-frag [] : Buf
-  (:: (__mp-enc-nil-raw) Buf))
-
-;;; EncodeMp -- typeclass for serializing a Turmeric value to a MessagePack
-;;; fragment.
-;;;
-;;; A fragment is one complete MessagePack value (int, str, float, bool, nil,
-;;; array, map), not a framed document. MessagePack is concatenative, so a
-;;; container's encoding is just its header followed by its elements'
-;;; fragments back to back -- which is the whole of how the derive macros
-;;; build a struct.
-;;;
-;;; Method:
-;;;   encode-mp : a -> Buf     ;; owned; the caller frees it with buf-free
-;;;
-;;; Example:
-;;;   (encode-mp 42)      ;; => one byte, 0x2a
-;;;   (encode-mp "hi")    ;; => 0xa2 'h' 'i'
-;;;   (encode-mp true)    ;; => 0xc3
-;;;
-;;; Since: Phase MP1
-(defclass EncodeMp [a] (encode-mp [x] : Buf))
-
-;;; EncodeMp [int] -- the narrowest integer format the value fits in: positive
-;;; fixint, negative fixint, then int8/16/32/64 or uint8/16/32/64.
-(definstance EncodeMp [int] (encode-mp [x] : Buf
-  (:: (__mp-enc-int-raw x) Buf)))
-
-;;; EncodeMp [bool] -- 0xc3 for true, 0xc2 for false.
-(definstance EncodeMp [bool] (encode-mp [x] : Buf
-  (:: (__mp-enc-bool-raw x) Buf)))
-
-;;; EncodeMp [float] -- always float64 (0xcb). MessagePack has a float32 form
-;;; too, but narrowing a double to it is lossy, so v0 does not.
-(definstance EncodeMp [float] (encode-mp [x] : Buf
-  (:: (__mp-enc-float-raw x) Buf)))
-
-;;; EncodeMp [cstr] -- a msgpack `str` (never a `bin`), sized fixstr / str8 /
-;;; str16 / str32 by byte length. A NULL string encodes as `nil`, matching
-;;; json's "null for a missing field" stance rather than aborting.
-(definstance EncodeMp [cstr] (encode-mp [x] : Buf
-  (:: (__mp-enc-str-raw x) Buf)))
-
-;; ---------------------------------------------------------------------------
-;; Container instances.
-;; ---------------------------------------------------------------------------
-
-;;; __mp-arr-build -- internal: join a cons-list of element fragments under an
-;;; array header. Frees every fragment it consumes.
-(defn __mp-arr-build [lst : int] #fx{Unsafe} : Buf
-  (:: (__mp-arr-build-raw lst) Buf))
-
-(defn __mp-arr-build-raw [lst : int] #fx{Unsafe} : ptr<void>
-  ```c
-  extern void *mp_arr_build(int64_t);
+  ;;; __mp-nil-frag -- the MessagePack `nil` byte as a fresh owned fragment, so
+  ;;; every fragment the derive plumbing consumes can be freed uniformly.
+  (defn __mp-nil-frag [] : Buf (:: (__mp-enc-nil-raw) Buf))
+  ;;; EncodeMp -- typeclass for serializing a Turmeric value to a MessagePack
+  ;;; fragment.
+  ;;;
+  ;;; A fragment is one complete MessagePack value (int, str, float, bool, nil,
+  ;;; array, map), not a framed document. MessagePack is concatenative, so a
+  ;;; container's encoding is just its header followed by its elements'
+  ;;; fragments back to back -- which is the whole of how the derive macros
+  ;;; build a struct.
+  ;;;
+  ;;; Method:
+  ;;;   encode-mp : a -> Buf     ;; owned; the caller frees it with buf-free
+  ;;;
+  ;;; Example:
+  ;;;   (encode-mp 42)      ;; => one byte, 0x2a
+  ;;;   (encode-mp "hi")    ;; => 0xa2 'h' 'i'
+  ;;;   (encode-mp true)    ;; => 0xc3
+  ;;;
+  ;;; Since: Phase MP1
+  (defclass EncodeMp [a] (encode-mp [x] : Buf))
+  ;;; EncodeMp [int] -- the narrowest integer format the value fits in: positive
+  ;;; fixint, negative fixint, then int8/16/32/64 or uint8/16/32/64.
+  (definstance EncodeMp [int]
+    (encode-mp [x] : Buf (:: (__mp-enc-int-raw x) Buf)))
+  ;;; EncodeMp [bool] -- 0xc3 for true, 0xc2 for false.
+  (definstance EncodeMp [bool]
+    (encode-mp [x] : Buf (:: (__mp-enc-bool-raw x) Buf)))
+  ;;; EncodeMp [float] -- always float64 (0xcb). MessagePack has a float32 form
+  ;;; too, but narrowing a double to it is lossy, so v0 does not.
+  (definstance EncodeMp [float]
+    (encode-mp [x] : Buf (:: (__mp-enc-float-raw x) Buf)))
+  ;;; EncodeMp [cstr] -- a msgpack `str` (never a `bin`), sized fixstr / str8 /
+  ;;; str16 / str32 by byte length. A NULL string encodes as `nil`, matching
+  ;;; json's "null for a missing field" stance rather than aborting.
+  (definstance EncodeMp [cstr]
+    (encode-mp [x] : Buf (:: (__mp-enc-str-raw x) Buf)))
+  ;; ---------------------------------------------------------------------------
+  ;; Container instances.
+  ;; ---------------------------------------------------------------------------
+  ;;; __mp-arr-build -- internal: join a cons-list of element fragments under an
+  ;;; array header. Frees every fragment it consumes.
+  (defn __mp-arr-build [lst : int]
+    #fx{Unsafe}
+    : Buf
+    (:: (__mp-arr-build-raw lst) Buf))
+  (defn __mp-arr-build-raw [lst : int]
+    #fx{Unsafe}
+    : ptr<void>
+    ```c
+    extern void *mp_arr_build(int64_t);
   return mp_arr_build((int64_t)lst);
   ```)
-
-;; Encode each element of a `(Cons A)` into a fresh cons-list of fragments.
-;; A plain constrained `defn` rather than the instance body so the per-element
-;; `encode-mp` dispatches on the real A and the `.head`/`.tail` of the `:heap`
-;; Cons cell are read with the element ABI -- the same reason json's
-;; `__json-arr-frags` is not inlined into its instance.
-(defn __mp-arr-frags [A] [(EncodeMp A)] [cell : (Cons A)] : int
-  (if (tnil? cell)
-    0
-    (cons (encode-mp (.head cell))
-          (__mp-arr-frags (:: (.tail cell) (Cons A))))))
-
-;;; EncodeMp [Cons] -- a homogeneous list `(Cons A)` encodes as a msgpack
-;;; array, each element through its own `(EncodeMp A)` instance: `(Cons int)`
-;;; -> `[1,2,3]`, the empty list -> a bare `0x90`.
-;;;
-;;; NOTE: a `(Cons A)` is a heap pointer carried as `:int`, the same carrier as
-;;; `int`, so a bare `(encode-mp some-list)` is an ambiguous dispatch -- pin the
-;;; instance with `@Cons`, or call it from a statically `(Cons A)`-typed site
-;;; such as a derive-msgpack struct field.
-;;;
-;;; Since: Phase MP1
-(definstance EncodeMp [Cons]
-  [(EncodeMp A)]
-  (encode-mp [xs] : Buf
-    (unsafe (__mp-arr-build (__mp-arr-frags (:: xs (Cons A)))))))
-
-;;; EncodeMp [Option] -- a present value encodes as its element's fragment, an
-;;; absent one as msgpack `nil` (0xc0). Constrained on `(EncodeMp A)`, so the
-;;; element goes through its own instance and a derive-msgpack struct can carry
-;;; optional fields.
-;;;
-;;; Since: Phase MP1
-(definstance EncodeMp [Option]
-  [(EncodeMp A)]
-  (encode-mp [x] : Buf
-    (if (some? x)
-      (encode-mp (unwrap x))
-      (__mp-nil-frag))))
-
-;; ---------------------------------------------------------------------------
-;; derive-msgpack: EncodeMp for a defstruct product type. A struct encodes as
-;; a msgpack `map` with string keys -- the interop-friendly default, readable
-;; by any msgpack consumer without a schema. (The compact positional layout is
-;; a follow-up; it needs a schema on both ends.)
-;;
-;; The macro takes explicit `(field-name field-type)` pairs because Turmeric
-;; macros cannot introspect a defstruct's shape at expansion time. The
-;; field-type slot is parsed but unused on the encode side, reserved for the
-;; renaming / :skip policy both spices will eventually want.
-;; ---------------------------------------------------------------------------
-
-;;; __mp-map-build -- internal: walk a cons-list of alternating (key, fragment)
-;;; words and emit a msgpack map. Frees every fragment it consumes; keys are
-;;; static literals the macro produced with `symbol-name`, so they are not.
-(defn __mp-map-build [lst : int] #fx{Unsafe} : Buf
-  (:: (__mp-map-build-raw lst) Buf))
-
-(defn __mp-map-build-raw [lst : int] #fx{Unsafe} : ptr<void>
-  ```c
-  extern void *mp_map_build(int64_t);
+  ;; Encode each element of a `(Cons A)` into a fresh cons-list of fragments.
+  ;; A plain constrained `defn` rather than the instance body so the per-element
+  ;; `encode-mp` dispatches on the real A and the `.head`/`.tail` of the `:heap`
+  ;; Cons cell are read with the element ABI -- the same reason json's
+  ;; `__json-arr-frags` is not inlined into its instance.
+  (defn __mp-arr-frags [A] [(EncodeMp A)] [cell : (Cons A)] : int
+    (if (tnil? cell)
+      0
+      (cons (encode-mp (.head cell))
+        (__mp-arr-frags (:: (.tail cell) (Cons A))))))
+  ;;; EncodeMp [Cons] -- a homogeneous list `(Cons A)` encodes as a msgpack
+  ;;; array, each element through its own `(EncodeMp A)` instance: `(Cons int)`
+  ;;; -> `[1,2,3]`, the empty list -> a bare `0x90`.
+  ;;;
+  ;;; NOTE: a `(Cons A)` is a heap pointer carried as `:int`, the same carrier as
+  ;;; `int`, so a bare `(encode-mp some-list)` is an ambiguous dispatch -- pin the
+  ;;; instance with `@Cons`, or call it from a statically `(Cons A)`-typed site
+  ;;; such as a derive-msgpack struct field.
+  ;;;
+  ;;; Since: Phase MP1
+  (definstance EncodeMp [Cons]
+    [(EncodeMp A)]
+    (encode-mp [xs]
+      : Buf
+      (unsafe (__mp-arr-build (__mp-arr-frags (:: xs (Cons A)))))))
+  ;;; EncodeMp [Option] -- a present value encodes as its element's fragment, an
+  ;;; absent one as msgpack `nil` (0xc0). Constrained on `(EncodeMp A)`, so the
+  ;;; element goes through its own instance and a derive-msgpack struct can carry
+  ;;; optional fields.
+  ;;;
+  ;;; Since: Phase MP1
+  (definstance EncodeMp [Option]
+    [(EncodeMp A)]
+    (encode-mp [x] : Buf (if (some? x) (encode-mp (unwrap x)) (__mp-nil-frag))))
+  ;; ---------------------------------------------------------------------------
+  ;; derive-msgpack: EncodeMp for a defstruct product type. A struct encodes as
+  ;; a msgpack `map` with string keys -- the interop-friendly default, readable
+  ;; by any msgpack consumer without a schema. (The compact positional layout is
+  ;; a follow-up; it needs a schema on both ends.)
+  ;;
+  ;; The macro takes explicit `(field-name field-type)` pairs because Turmeric
+  ;; macros cannot introspect a defstruct's shape at expansion time. The
+  ;; field-type slot is parsed but unused on the encode side, reserved for the
+  ;; renaming / :skip policy both spices will eventually want.
+  ;; ---------------------------------------------------------------------------
+  ;;; __mp-map-build -- internal: walk a cons-list of alternating (key, fragment)
+  ;;; words and emit a msgpack map. Frees every fragment it consumes; keys are
+  ;;; static literals the macro produced with `symbol-name`, so they are not.
+  (defn __mp-map-build [lst : int]
+    #fx{Unsafe}
+    : Buf
+    (:: (__mp-map-build-raw lst) Buf))
+  (defn __mp-map-build-raw [lst : int]
+    #fx{Unsafe}
+    : ptr<void>
+    ```c
+    extern void *mp_map_build(int64_t);
   return mp_map_build((int64_t)lst);
   ```)
-
-;;; __mp-tag -- internal: wrap an already-encoded fragment in the one-entry map
-;;; `{"Tag": <inner>}`. This is the externally-tagged discriminator convention
-;;; `derive-msgpack-sum` uses, matching json's. Consumes `inner`.
-(defn __mp-tag [name : cstr inner : Buf] #fx{Unsafe} : Buf
-  (:: (__mp-tag-raw name inner) Buf))
-
-(defn __mp-tag-raw [name : cstr inner : Buf] #fx{Unsafe} : ptr<void>
-  ```c
-  extern void *mp_tag(const char *, void *);
+  ;;; __mp-tag -- internal: wrap an already-encoded fragment in the one-entry map
+  ;;; `{"Tag": <inner>}`. This is the externally-tagged discriminator convention
+  ;;; `derive-msgpack-sum` uses, matching json's. Consumes `inner`.
+  (defn __mp-tag [name : cstr inner : Buf]
+    #fx{Unsafe}
+    : Buf
+    (:: (__mp-tag-raw name inner) Buf))
+  (defn __mp-tag-raw [name : cstr inner : Buf]
+    #fx{Unsafe}
+    : ptr<void>
+    ```c
+    extern void *mp_tag(const char *, void *);
   return mp_tag((const char *)name, (void *)(intptr_t)inner);
   ```)
-
-;; Turn the cons-list of `(field-name field-type)` pairs into the chained
-;; (cons "k1" (cons <frag1> (cons "k2" ... 0))) that __mp-map-build walks.
-(defmacro __mp-chain [fields]
-  (if (empty? fields)
-    0
-    (let [fld   (first fields)
-          fname (first fld)
-          tail  (rest fields)]
-      `(cons ~(symbol-name fname)
-             (cons (encode-mp (~(dot-sym fname) x))
-                   (__mp-chain ~tail))))))
-
-;; ---------------------------------------------------------------------------
-;; DecodeMp typeclass + primitive instances.
-;;
-;; Method signature: `decode-mp : MpTree -> MpNode -> (Result a cstr)`. `a`
-;; appears only in the return type, so the dispatcher selects the instance from
-;; the call site's ascribed return type:
-;;
-;;   (:: (decode-mp t n) (Result int  cstr))   ; picks DecodeMp [int]
-;;   (:: (decode-mp t n) (Result cstr cstr))   ; picks DecodeMp [cstr]
-;;
-;; The instances are one-liners because msgpack/decode already returns a
-;; Result: the typed reads there are the honest API, and these just route the
-;; dispatch to them.
-;; ---------------------------------------------------------------------------
-
-;;; DecodeMp -- typeclass for reading a typed value out of a node tree.
-;;;
-;;; Method:
-;;;   decode-mp : MpTree -> MpNode -> (Result a cstr)
-;;;
-;;; Example:
-;;;   (:: (decode-mp t (mp-tree-root t)) (Result int cstr))
-;;;
-;;; Since: Phase MP2
-(defclass DecodeMp [a] (decode-mp [tree : MpTree  node : MpNode] : (Result a cstr)))
-
-;; The four primitive instances are one-line forwards to the typed reads
-;; `msgpack/decode` already exports. Those remain the non-dispatch API for
-;; callers who want a typed read without the class.
-
-;;; DecodeMp [int] -- every integer format; rejects floats, strings, bools,
-;;; nil, and a missing field. A uint64 above INT64_MAX is an error rather than
-;;; a wrapped negative.
-(definstance DecodeMp [int]   (decode-mp [tree node] (mp-get-int   tree node)))
-
-;;; DecodeMp [cstr] -- a msgpack `str`, copied out of the tree so the result
-;;; survives `mp-tree-free`. The caller owns the copy. A `bin` is not a string.
-(definstance DecodeMp [cstr]  (decode-mp [tree node] (mp-get-str   tree node)))
-
-;;; DecodeMp [bool] -- `true` / `false` only.
-(definstance DecodeMp [bool]  (decode-mp [tree node] (mp-get-bool  tree node)))
-
-;;; DecodeMp [float] -- float32 / float64, and the integer formats widened, so
-;;; an encoder that wrote `1` rather than `1.0` still decodes.
-(definstance DecodeMp [float] (decode-mp [tree node] (mp-get-float tree node)))
-
-;;; __mp-missing? -- internal: true when a slot is absent (no such key) or an
-;;; explicit msgpack `nil`. Both decode to `none` for an optional field.
-(defn __mp-missing? [tree : MpTree node : MpNode] : bool
-  (if (mp-absent? tree node)
-    true
-    (mp-nil? tree node)))
-
-;;; DecodeMp [Option] -- a missing slot or `nil` decodes to `none`; anything
-;;; else decodes through the element's own `(DecodeMp A)` instance and is
-;;; wrapped in `some`. The mirror of `EncodeMp [Option]`.
-;;;
-;;; Since: Phase MP2
-(definstance DecodeMp [Option]
-  [(DecodeMp A)]
-  (decode-mp [tree node]
-    (if (__mp-missing? tree node)
-      (ok (:: (none) (Option A)))
-      (ok (some (ok-val (:: (decode-mp tree node) (Result A cstr))))))))
-
-;; Decode array elements [i, n) into a (Cons A), head to tail, each through its
-;; own (DecodeMp A) instance. `i < n <= (mp-arr-size tree arr)`, so the
-;; `mp-arr-get` is always `some`.
-(defn __mp-arr-decode [A] [(DecodeMp A)] [tree : MpTree  arr : MpNode  i : int  n : int] : (Cons A)
-  (if (>= i n)
-    (:: (tnil) (Cons A))
-    (tcons-of (ok-val (:: (decode-mp tree (unwrap (mp-arr-get tree arr i))) (Result A cstr)))
-              (__mp-arr-decode tree arr (+ i 1) n))))
-
-;;; decode-mp-list -- decode a msgpack array into a `(Cons A)`, the mirror of
-;;; `EncodeMp [Cons]`. A non-array decodes to the empty list.
-;;;
-;;; A standalone function rather than a `DecodeMp [Cons]` instance, for the
-;;; same reason json's `decode-json-list` is one: a `(Cons A)` coerces to `:int`
-;;; inside a `(Result ...)`, which defeats the return-type dispatch that would
-;;; select the instance and breaks inferring `A` through the ascription. Call it
-;;; with a `(Cons T)` ascription so `A` is pinned:
-;;;
-;;;   (:: (decode-mp-list t root) (Cons int))
-;;;
-;;; Parameters:
-;;;   tree -- the owning tree
-;;;   node -- the array node
-;;;
-;;; Returns:
-;;;   (Cons A) -- the decoded elements, or the empty list.
-;;;
-;;; Example:
-;;;   (:: (decode-mp-list t (mp-tree-root t)) (Cons int))
-;;;
-;;; Since: Phase MP2
-(defn decode-mp-list [A] [(DecodeMp A)] [tree : MpTree  node : MpNode] : (Cons A)
-  (if (mp-arr? tree node)
-    (__mp-arr-decode tree node 0 (unwrap (mp-arr-size tree node)))
-    (:: (tnil) (Cons A))))
-
-;;; __mp-field-node -- internal: the value node for `key`, or the absent node.
-;;;
-;;; Offset -1 is not a value, so every predicate in msgpack/decode reports it
-;;; as absent and every typed read errors on it -- which is exactly what a
-;;; missing field should do. Keeping the absent case inside a MpNode (rather
-;;; than an Option) is what lets the derive macros splice one expression per
-;;; field without an unwrapping dance.
-;;; __mp-node-absent? -- internal: re-export of msgpack/decode's `mp-absent?`.
-;;; The sum decoder's expansion tests for a missing tag, and an expansion must
-;;; only name symbols this module exports -- otherwise every caller would have
-;;; to `:refer` msgpack/decode's predicates just to use `derive-msgpack-sum`.
-(defn __mp-node-absent? [tree : MpTree node : MpNode] : bool
-  (mp-absent? tree node))
-
-(defn __mp-field-node [tree : MpTree node : MpNode key : cstr] : MpNode
-  (let [o (mp-map-get tree node key)]
-    (if (some? o)
-      (unwrap o)
-      (:: -1 MpNode))))
-
-;; Expand one field into `(ok-val (:: (decode-mp tree <field node>) (Result T cstr)))`
-;; so the field's typed instance is dispatched through the ascription. Like
-;; json's `__decode-field`, a failed field decode is not propagated here -- that
-;; is what the DecodeMpChecked layer below is for.
-(defmacro __mp-decode-field [fname ftype]
-  `(ok-val
-     (:: (decode-mp tree (__mp-field-node tree node ~(symbol-name fname)))
-         (Result ~ftype cstr))))
-
-(defmacro __mp-decode-fields [fields]
-  (if (empty? fields)
-    0
-    (let [fld   (first fields)
-          fname (first fld)
-          ftype (first (rest fld))
-          tail  (rest fields)]
-      `(cons (__mp-decode-field ~fname ~ftype)
-             (__mp-decode-fields ~tail)))))
-
-;; The make-struct call with each field's decoded value as a positional arg.
-;; Variadic positional splicing is not available at macro time, so this is
-;; hand-unrolled for 1-5 fields, the same cap (and the same reason) as json's
-;; `__decode-make-struct`. For a wider struct, hand-write the DecodeMp instance.
-(defmacro __mp-decode-make-struct [type-name fields]
-  (if (empty? fields)
-    `(make-struct ~type-name)
-    (if (empty? (rest fields))
-      `(make-struct ~type-name
-         (__mp-decode-field ~(first (first fields)) ~(first (rest (first fields)))))
-      (if (empty? (rest (rest fields)))
+  ;; Turn the cons-list of `(field-name field-type)` pairs into the chained
+  ;; (cons "k1" (cons <frag1> (cons "k2" ... 0))) that __mp-map-build walks.
+  (defmacro __mp-chain [fields]
+    (if (empty? fields)
+      0
+      (let [fld   (first fields)
+            fname (first fld)
+            tail  (rest fields)]
+        `(cons ~(symbol-name fname)
+           (cons (encode-mp (~(dot-sym fname) x)) (__mp-chain ~tail))))))
+  ;; ---------------------------------------------------------------------------
+  ;; DecodeMp typeclass + primitive instances.
+  ;;
+  ;; Method signature: `decode-mp : MpTree -> MpNode -> (Result a cstr)`. `a`
+  ;; appears only in the return type, so the dispatcher selects the instance from
+  ;; the call site's ascribed return type:
+  ;;
+  ;;   (:: (decode-mp t n) (Result int  cstr))   ; picks DecodeMp [int]
+  ;;   (:: (decode-mp t n) (Result cstr cstr))   ; picks DecodeMp [cstr]
+  ;;
+  ;; The instances are one-liners because msgpack/decode already returns a
+  ;; Result: the typed reads there are the honest API, and these just route the
+  ;; dispatch to them.
+  ;; ---------------------------------------------------------------------------
+  ;;; DecodeMp -- typeclass for reading a typed value out of a node tree.
+  ;;;
+  ;;; Method:
+  ;;;   decode-mp : MpTree -> MpNode -> (Result a cstr)
+  ;;;
+  ;;; Example:
+  ;;;   (:: (decode-mp t (mp-tree-root t)) (Result int cstr))
+  ;;;
+  ;;; Since: Phase MP2
+  (defclass DecodeMp [a]
+    (decode-mp [tree : MpTree node : MpNode] : (Result a cstr)))
+  ;; The four primitive instances are one-line forwards to the typed reads
+  ;; `msgpack/decode` already exports. Those remain the non-dispatch API for
+  ;; callers who want a typed read without the class.
+  ;;; DecodeMp [int] -- every integer format; rejects floats, strings, bools,
+  ;;; nil, and a missing field. A uint64 above INT64_MAX is an error rather than
+  ;;; a wrapped negative.
+  (definstance DecodeMp [int] (decode-mp [tree node] (mp-get-int tree node)))
+  ;;; DecodeMp [cstr] -- a msgpack `str`, copied out of the tree so the result
+  ;;; survives `mp-tree-free`. The caller owns the copy. A `bin` is not a string.
+  (definstance DecodeMp [cstr] (decode-mp [tree node] (mp-get-str tree node)))
+  ;;; DecodeMp [bool] -- `true` / `false` only.
+  (definstance DecodeMp [bool] (decode-mp [tree node] (mp-get-bool tree node)))
+  ;;; DecodeMp [float] -- float32 / float64, and the integer formats widened, so
+  ;;; an encoder that wrote `1` rather than `1.0` still decodes.
+  (definstance DecodeMp [float]
+    (decode-mp [tree node] (mp-get-float tree node)))
+  ;;; __mp-missing? -- internal: true when a slot is absent (no such key) or an
+  ;;; explicit msgpack `nil`. Both decode to `none` for an optional field.
+  (defn __mp-missing? [tree : MpTree node : MpNode] : bool
+    (if (mp-absent? tree node) true (mp-nil? tree node)))
+  ;;; DecodeMp [Option] -- a missing slot or `nil` decodes to `none`; anything
+  ;;; else decodes through the element's own `(DecodeMp A)` instance and is
+  ;;; wrapped in `some`. The mirror of `EncodeMp [Option]`.
+  ;;;
+  ;;; Since: Phase MP2
+  (definstance DecodeMp [Option]
+    [(DecodeMp A)]
+    (decode-mp [tree node]
+      (if (__mp-missing? tree node)
+        (ok (:: (none) (Option A)))
+        (ok (some (ok-val (:: (decode-mp tree node) (Result A cstr))))))))
+  ;; Decode array elements [i, n) into a (Cons A), head to tail, each through its
+  ;; own (DecodeMp A) instance. `i < n <= (mp-arr-size tree arr)`, so the
+  ;; `mp-arr-get` is always `some`.
+  (defn __mp-arr-decode [A] [(DecodeMp A)] [tree : MpTree
+                                            arr : MpNode
+                                            i : int
+                                            n : int] : (Cons A)
+    (if (>= i n)
+      (:: (tnil) (Cons A))
+      (tcons-of (ok-val (:: (decode-mp tree (unwrap (mp-arr-get tree arr i)))
+                          (Result A cstr)))
+        (__mp-arr-decode tree arr (+ i 1) n))))
+  ;;; decode-mp-list -- decode a msgpack array into a `(Cons A)`, the mirror of
+  ;;; `EncodeMp [Cons]`. A non-array decodes to the empty list.
+  ;;;
+  ;;; A standalone function rather than a `DecodeMp [Cons]` instance, for the
+  ;;; same reason json's `decode-json-list` is one: a `(Cons A)` coerces to `:int`
+  ;;; inside a `(Result ...)`, which defeats the return-type dispatch that would
+  ;;; select the instance and breaks inferring `A` through the ascription. Call it
+  ;;; with a `(Cons T)` ascription so `A` is pinned:
+  ;;;
+  ;;;   (:: (decode-mp-list t root) (Cons int))
+  ;;;
+  ;;; Parameters:
+  ;;;   tree -- the owning tree
+  ;;;   node -- the array node
+  ;;;
+  ;;; Returns:
+  ;;;   (Cons A) -- the decoded elements, or the empty list.
+  ;;;
+  ;;; Example:
+  ;;;   (:: (decode-mp-list t (mp-tree-root t)) (Cons int))
+  ;;;
+  ;;; Since: Phase MP2
+  (defn decode-mp-list [A] [(DecodeMp A)] [tree : MpTree node : MpNode] : (Cons A)
+    (if (mp-arr? tree node)
+      (__mp-arr-decode tree node 0 (unwrap (mp-arr-size tree node)))
+      (:: (tnil) (Cons A))))
+  ;;; __mp-field-node -- internal: the value node for `key`, or the absent node.
+  ;;;
+  ;;; Offset -1 is not a value, so every predicate in msgpack/decode reports it
+  ;;; as absent and every typed read errors on it -- which is exactly what a
+  ;;; missing field should do. Keeping the absent case inside a MpNode (rather
+  ;;; than an Option) is what lets the derive macros splice one expression per
+  ;;; field without an unwrapping dance.
+  ;;; __mp-node-absent? -- internal: re-export of msgpack/decode's `mp-absent?`.
+  ;;; The sum decoder's expansion tests for a missing tag, and an expansion must
+  ;;; only name symbols this module exports -- otherwise every caller would have
+  ;;; to `:refer` msgpack/decode's predicates just to use `derive-msgpack-sum`.
+  (defn __mp-node-absent? [tree : MpTree node : MpNode] : bool
+    (mp-absent? tree node))
+  (defn __mp-field-node [tree : MpTree node : MpNode key : cstr] : MpNode
+    (let [o (mp-map-get tree node key)]
+      (if (some? o) (unwrap o) (:: -1 MpNode))))
+  ;; Expand one field into `(ok-val (:: (decode-mp tree <field node>) (Result T cstr)))`
+  ;; so the field's typed instance is dispatched through the ascription. Like
+  ;; json's `__decode-field`, a failed field decode is not propagated here -- that
+  ;; is what the DecodeMpChecked layer below is for.
+  (defmacro __mp-decode-field [fname ftype]
+    `(ok-val (:: (decode-mp tree
+                   (__mp-field-node tree node ~(symbol-name fname)))
+               (Result ~ftype cstr))))
+  (defmacro __mp-decode-fields [fields]
+    (if (empty? fields)
+      0
+      (let [fld   (first fields)
+            fname (first fld)
+            ftype (first (rest fld))
+            tail  (rest fields)]
+        `(cons (__mp-decode-field ~fname ~ftype) (__mp-decode-fields ~tail)))))
+  ;; The make-struct call with each field's decoded value as a positional arg.
+  ;; Variadic positional splicing is not available at macro time, so this is
+  ;; hand-unrolled for 1-5 fields, the same cap (and the same reason) as json's
+  ;; `__decode-make-struct`. For a wider struct, hand-write the DecodeMp instance.
+  (defmacro __mp-decode-make-struct [type-name fields]
+    (if (empty? fields)
+      `(make-struct ~type-name)
+      (if (empty? (rest fields))
         `(make-struct ~type-name
-           (__mp-decode-field ~(first (first fields))        ~(first (rest (first fields))))
-           (__mp-decode-field ~(first (first (rest fields))) ~(first (rest (first (rest fields))))))
-        (if (empty? (rest (rest (rest fields))))
+           (__mp-decode-field ~(first (first fields))
+             ~(first (rest (first fields)))))
+        (if (empty? (rest (rest fields)))
           `(make-struct ~type-name
-             (__mp-decode-field ~(first (first fields))                ~(first (rest (first fields))))
-             (__mp-decode-field ~(first (first (rest fields)))         ~(first (rest (first (rest fields)))))
-             (__mp-decode-field ~(first (first (rest (rest fields))))  ~(first (rest (first (rest (rest fields)))))))
-          (if (empty? (rest (rest (rest (rest fields)))))
+             (__mp-decode-field ~(first (first fields))
+               ~(first (rest (first fields))))
+             (__mp-decode-field ~(first (first (rest fields)))
+               ~(first (rest (first (rest fields))))))
+          (if (empty? (rest (rest (rest fields))))
             `(make-struct ~type-name
-               (__mp-decode-field ~(first (first fields))                        ~(first (rest (first fields))))
-               (__mp-decode-field ~(first (first (rest fields)))                 ~(first (rest (first (rest fields)))))
-               (__mp-decode-field ~(first (first (rest (rest fields))))          ~(first (rest (first (rest (rest fields))))))
-               (__mp-decode-field ~(first (first (rest (rest (rest fields)))))   ~(first (rest (first (rest (rest (rest fields))))))))
-            `(make-struct ~type-name
-               (__mp-decode-field ~(first (first fields))                                ~(first (rest (first fields))))
-               (__mp-decode-field ~(first (first (rest fields)))                         ~(first (rest (first (rest fields)))))
-               (__mp-decode-field ~(first (first (rest (rest fields))))                  ~(first (rest (first (rest (rest fields))))))
-               (__mp-decode-field ~(first (first (rest (rest (rest fields)))))           ~(first (rest (first (rest (rest (rest fields)))))))
-               (__mp-decode-field ~(first (first (rest (rest (rest (rest fields))))))    ~(first (rest (first (rest (rest (rest (rest fields)))))))))))))))
-
-;;; derive-msgpack -- emit both EncodeMp and DecodeMp instances for a
-;;; `defstruct` product type.
-;;;
-;;; Syntax:
-;;;   (derive-msgpack T (f1 t1) (f2 t2) ...)
-;;;
-;;; The struct encodes as a msgpack map with the field names as string keys,
-;;; in declaration order. Decoding looks each key up by name, so a producer
-;;; that reorders the map still decodes.
-;;;
-;;; Limitations (v0):
-;;;   - defstruct (product types) only; see derive-msgpack-sum for `defdata`
-;;;     and derive-msgpack-opaque for `defopaque`.
-;;;   - Field-name policy is identity -- no renaming or :skip yet.
-;;;   - At most 5 fields on the decode side (`__mp-decode-make-struct`).
-;;;   - A failed field decode is not propagated; reach for `derive-mp-decoder`
-;;;     when the input is untrusted.
-;;;
-;;; Example:
-;;;   (defstruct User [id : int  name : cstr  active : bool])
-;;;   (derive-msgpack User (id int) (name cstr) (active bool))
-;;;   ;; (encode-mp (make-struct User 7 "alice" true))
-;;;   ;;   =>  83 a2 69 64 07 a4 6e 61 6d 65 a5 61 6c 69 63 65 a6 61 63 74 69 76 65 c3
-;;;
-;;; Since: Phase MP3
-(defmacro derive-msgpack [type-name & fields]
-  `(do
-     (definstance EncodeMp [~type-name]
-       (encode-mp [x] (unsafe (__mp-map-build (__mp-chain ~fields)))))
-     (definstance DecodeMp [~type-name]
+               (__mp-decode-field ~(first (first fields))
+                 ~(first (rest (first fields))))
+               (__mp-decode-field ~(first (first (rest fields)))
+                 ~(first (rest (first (rest fields)))))
+               (__mp-decode-field ~(first (first (rest (rest fields))))
+                 ~(first (rest (first (rest (rest fields)))))))
+            (if (empty? (rest (rest (rest (rest fields)))))
+              `(make-struct ~type-name
+                 (__mp-decode-field ~(first (first fields))
+                   ~(first (rest (first fields))))
+                 (__mp-decode-field ~(first (first (rest fields)))
+                   ~(first (rest (first (rest fields)))))
+                 (__mp-decode-field ~(first (first (rest (rest fields))))
+                   ~(first (rest (first (rest (rest fields))))))
+                 (__mp-decode-field ~(first (first (rest (rest (rest fields)))))
+                   ~(first (rest (first (rest (rest (rest fields))))))))
+              `(make-struct ~type-name
+                 (__mp-decode-field ~(first (first fields))
+                   ~(first (rest (first fields))))
+                 (__mp-decode-field ~(first (first (rest fields)))
+                   ~(first (rest (first (rest fields)))))
+                 (__mp-decode-field ~(first (first (rest (rest fields))))
+                   ~(first (rest (first (rest (rest fields))))))
+                 (__mp-decode-field ~(first (first (rest (rest (rest fields)))))
+                   ~(first (rest (first (rest (rest (rest fields)))))))
+                 (__mp-decode-field ~(first (first (rest (rest (rest (rest fields))))))
+                   ~(first (rest (first (rest (rest (rest (rest fields)))))))))))))))
+  ;;; derive-msgpack -- emit both EncodeMp and DecodeMp instances for a
+  ;;; `defstruct` product type.
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-msgpack T (f1 t1) (f2 t2) ...)
+  ;;;
+  ;;; The struct encodes as a msgpack map with the field names as string keys,
+  ;;; in declaration order. Decoding looks each key up by name, so a producer
+  ;;; that reorders the map still decodes.
+  ;;;
+  ;;; Limitations (v0):
+  ;;;   - defstruct (product types) only; see derive-msgpack-sum for `defdata`
+  ;;;     and derive-msgpack-opaque for `defopaque`.
+  ;;;   - Field-name policy is identity -- no renaming or :skip yet.
+  ;;;   - At most 5 fields on the decode side (`__mp-decode-make-struct`).
+  ;;;   - A failed field decode is not propagated; reach for `derive-mp-decoder`
+  ;;;     when the input is untrusted.
+  ;;;
+  ;;; Example:
+  ;;;   (defstruct User [id : int  name : cstr  active : bool])
+  ;;;   (derive-msgpack User (id int) (name cstr) (active bool))
+  ;;;   ;; (encode-mp (make-struct User 7 "alice" true))
+  ;;;   ;;   =>  83 a2 69 64 07 a4 6e 61 6d 65 a5 61 6c 69 63 65 a6 61 63 74 69 76 65 c3
+  ;;;
+  ;;; Since: Phase MP3
+  (defmacro derive-msgpack [type-name & fields]
+    `(do
+       (definstance EncodeMp [~type-name]
+         (encode-mp [x] (unsafe (__mp-map-build (__mp-chain ~fields)))))
+       (definstance DecodeMp [~type-name]
+         (decode-mp [tree node]
+           (:: (ok (__mp-decode-make-struct ~type-name ~fields))
+             (Result ~type-name cstr))))))
+  ;;; derive-msgpack-encode -- emit only the EncodeMp instance for a defstruct.
+  ;;;
+  ;;; Useful when the type is produced but never read back from the wire
+  ;;; (telemetry frames, append-only logs), and when the canonical decode is
+  ;;; hand-written to honor a wire layout the macro cannot derive.
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-msgpack-encode T (f1 t1) (f2 t2) ...)
+  ;;;
+  ;;; Example:
+  ;;;   (defstruct LogEntry [level : cstr  msg : cstr])
+  ;;;   (derive-msgpack-encode LogEntry (level cstr) (msg cstr))
+  ;;;
+  ;;; Since: Phase MP3
+  (defmacro derive-msgpack-encode [type-name & fields]
+    `(definstance EncodeMp [~type-name]
+       (encode-mp [x] (unsafe (__mp-map-build (__mp-chain ~fields))))))
+  ;;; derive-msgpack-decode -- emit only the DecodeMp instance for a defstruct.
+  ;;;
+  ;;; Useful for read-only inbound records whose Turmeric value never goes back
+  ;;; out (config blobs, third-party payloads).
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-msgpack-decode T (f1 t1) (f2 t2) ...)
+  ;;;
+  ;;; Example:
+  ;;;   (defstruct Config [port : int  host : cstr])
+  ;;;   (derive-msgpack-decode Config (port int) (host cstr))
+  ;;;   ;; (:: (decode-mp t root) (Result Config cstr))
+  ;;;
+  ;;; Since: Phase MP3
+  (defmacro derive-msgpack-decode [type-name & fields]
+    `(definstance DecodeMp [~type-name]
        (decode-mp [tree node]
          (:: (ok (__mp-decode-make-struct ~type-name ~fields))
-             (Result ~type-name cstr))))))
-
-;;; derive-msgpack-encode -- emit only the EncodeMp instance for a defstruct.
-;;;
-;;; Useful when the type is produced but never read back from the wire
-;;; (telemetry frames, append-only logs), and when the canonical decode is
-;;; hand-written to honor a wire layout the macro cannot derive.
-;;;
-;;; Syntax:
-;;;   (derive-msgpack-encode T (f1 t1) (f2 t2) ...)
-;;;
-;;; Example:
-;;;   (defstruct LogEntry [level : cstr  msg : cstr])
-;;;   (derive-msgpack-encode LogEntry (level cstr) (msg cstr))
-;;;
-;;; Since: Phase MP3
-(defmacro derive-msgpack-encode [type-name & fields]
-  `(definstance EncodeMp [~type-name]
-     (encode-mp [x] (unsafe (__mp-map-build (__mp-chain ~fields))))))
-
-;;; derive-msgpack-decode -- emit only the DecodeMp instance for a defstruct.
-;;;
-;;; Useful for read-only inbound records whose Turmeric value never goes back
-;;; out (config blobs, third-party payloads).
-;;;
-;;; Syntax:
-;;;   (derive-msgpack-decode T (f1 t1) (f2 t2) ...)
-;;;
-;;; Example:
-;;;   (defstruct Config [port : int  host : cstr])
-;;;   (derive-msgpack-decode Config (port int) (host cstr))
-;;;   ;; (:: (decode-mp t root) (Result Config cstr))
-;;;
-;;; Since: Phase MP3
-(defmacro derive-msgpack-decode [type-name & fields]
-  `(definstance DecodeMp [~type-name]
-     (decode-mp [tree node]
-       (:: (ok (__mp-decode-make-struct ~type-name ~fields))
            (Result ~type-name cstr)))))
-
-;;; derive-msgpack-opaque -- emit EncodeMp + DecodeMp for a `defopaque`
-;;; newtype by delegating to its carrier's instances.
-;;;
-;;; A `defopaque` is nominally distinct but ABI-identical to its carrier, and
-;;; its wire form is NOT its carrier in the general case -- so deriving is
-;;; opt-in rather than automatic. This macro is that opt-in: the caller is
-;;; saying "yes, put this on the wire exactly as its underlying int / cstr /
-;;; bool / float." Use it for thin newtypes whose wire form genuinely matches
-;;; (`UserId :int` -> integer, `EmailAddr :cstr` -> string).
-;;;
-;;; Syntax:
-;;;   (derive-msgpack-opaque T :as int)
-;;;
-;;; Example:
-;;;   (defopaque UserId :int)
-;;;   (derive-msgpack-opaque UserId :as int)
-;;;   ;; (encode-mp (:: 42 UserId))                    => 0x2a
-;;;   ;; (:: (decode-mp t n) (Result UserId cstr))     => parses an int as UserId
-;;;
-;;; Since: Phase MP3
-(defmacro derive-msgpack-opaque [type-name _as carrier]
-  `(do
-     (definstance EncodeMp [~type-name]
-       (encode-mp [x] (encode-mp (:: x ~carrier))))
-     (definstance DecodeMp [~type-name]
-       (decode-mp [tree node]
-         (:: (ok (:: (ok-val (:: (decode-mp tree node) (Result ~carrier cstr)))
+  ;;; derive-msgpack-opaque -- emit EncodeMp + DecodeMp for a `defopaque`
+  ;;; newtype by delegating to its carrier's instances.
+  ;;;
+  ;;; A `defopaque` is nominally distinct but ABI-identical to its carrier, and
+  ;;; its wire form is NOT its carrier in the general case -- so deriving is
+  ;;; opt-in rather than automatic. This macro is that opt-in: the caller is
+  ;;; saying "yes, put this on the wire exactly as its underlying int / cstr /
+  ;;; bool / float." Use it for thin newtypes whose wire form genuinely matches
+  ;;; (`UserId :int` -> integer, `EmailAddr :cstr` -> string).
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-msgpack-opaque T :as int)
+  ;;;
+  ;;; Example:
+  ;;;   (defopaque UserId :int)
+  ;;;   (derive-msgpack-opaque UserId :as int)
+  ;;;   ;; (encode-mp (:: 42 UserId))                    => 0x2a
+  ;;;   ;; (:: (decode-mp t n) (Result UserId cstr))     => parses an int as UserId
+  ;;;
+  ;;; Since: Phase MP3
+  (defmacro derive-msgpack-opaque [type-name _as carrier]
+    `(do
+       (definstance EncodeMp [~type-name]
+         (encode-mp [x] (encode-mp (:: x ~carrier))))
+       (definstance DecodeMp [~type-name]
+         (decode-mp [tree node]
+           (:: (ok (:: (ok-val (:: (decode-mp tree node) (Result ~carrier cstr)))
                      ~type-name))
              (Result ~type-name cstr))))))
-
-;;; derive-msgpack-opaque-encode -- only the EncodeMp half of
-;;; `derive-msgpack-opaque`.
-;;;
-;;; Syntax:
-;;;   (derive-msgpack-opaque-encode T :as int)
-;;;
-;;; Since: Phase MP3
-(defmacro derive-msgpack-opaque-encode [type-name _as carrier]
-  `(definstance EncodeMp [~type-name]
-     (encode-mp [x] (encode-mp (:: x ~carrier)))))
-
-;;; derive-msgpack-opaque-decode -- only the DecodeMp half of
-;;; `derive-msgpack-opaque`.
-;;;
-;;; Syntax:
-;;;   (derive-msgpack-opaque-decode T :as int)
-;;;
-;;; Since: Phase MP3
-(defmacro derive-msgpack-opaque-decode [type-name _as carrier]
-  `(definstance DecodeMp [~type-name]
-     (decode-mp [tree node]
-       (:: (ok (:: (ok-val (:: (decode-mp tree node) (Result ~carrier cstr)))
+  ;;; derive-msgpack-opaque-encode -- only the EncodeMp half of
+  ;;; `derive-msgpack-opaque`.
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-msgpack-opaque-encode T :as int)
+  ;;;
+  ;;; Since: Phase MP3
+  (defmacro derive-msgpack-opaque-encode [type-name _as carrier]
+    `(definstance EncodeMp [~type-name]
+       (encode-mp [x] (encode-mp (:: x ~carrier)))))
+  ;;; derive-msgpack-opaque-decode -- only the DecodeMp half of
+  ;;; `derive-msgpack-opaque`.
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-msgpack-opaque-decode T :as int)
+  ;;;
+  ;;; Since: Phase MP3
+  (defmacro derive-msgpack-opaque-decode [type-name _as carrier]
+    `(definstance DecodeMp [~type-name]
+       (decode-mp [tree node]
+         (:: (ok (:: (ok-val (:: (decode-mp tree node) (Result ~carrier cstr)))
                    ~type-name))
            (Result ~type-name cstr)))))
-
-;; ---------------------------------------------------------------------------
-;; derive-msgpack-sum: EncodeMp/DecodeMp for `defdata` sum-of-products types,
-;; externally tagged as a one-entry map `{"Ctor": {...fields...}}` -- the same
-;; convention json uses, so the two spices agree on the shape of a sum.
-;;
-;; Turmeric macros cannot introspect a defdata's constructor list at expansion
-;; time, so the constructors are passed explicitly:
-;;
-;;   (defdata ^copy Event [] (Click :int :int) (Scroll :int))
-;;   (derive-msgpack-sum Event
-;;     (Click (x int) (y int))
-;;     (Scroll (dy int)))
-;;
-;; Each spec is `(CtorName (f1 t1) ...)`. defdata payloads are positional, so
-;; the field names are purely the wire keys and the match binders, but they
-;; must be listed in constructor order.
-;; ---------------------------------------------------------------------------
-
-;; Encode: splice the field names into a constructor `match` pattern --
-;; fields ((x int) (y int)) -> the binder list `x y` for `(Click x y)`.
-(defmacro __mp-sum-fnames [fields]
-  (if (empty? fields)
-    `()
-    `(~(first (first fields)) ~@(__mp-sum-fnames ~(rest fields)))))
-
-;; Encode: the (key, fragment) chain for one constructor's fields, encoding the
-;; match-bound binder rather than a struct field accessor.
-(defmacro __mp-sum-vchain [fields]
-  (if (empty? fields)
-    0
-    `(cons ~(symbol-name (first (first fields)))
-           (cons (encode-mp ~(first (first fields)))
-                 (__mp-sum-vchain ~(rest fields))))))
-
-;; Encode: the flat `match` arm list -- for each constructor a pattern
-;; `(Ctor f0 f1 ...)` followed by its tagged-map body.
-(defmacro __mp-sum-enc-arms [ctors]
-  (if (empty? ctors)
-    `()
-    `((~(first (first ctors)) ~@(__mp-sum-fnames ~(rest (first ctors))))
-      (unsafe (__mp-tag ~(symbol-name (first (first ctors)))
-                        (__mp-map-build (__mp-sum-vchain ~(rest (first ctors))))))
-      ~@(__mp-sum-enc-arms ~(rest ctors)))))
-
-;; Decode: the positional constructor arguments for one constructor, read out
-;; of the tag's inner map bound to `__obj`.
-(defmacro __mp-sum-dfields [fields]
-  (if (empty? fields)
-    `()
-    `((ok-val (:: (decode-mp tree (__mp-field-node tree __obj ~(symbol-name (first (first fields)))))
-                  (Result ~(first (rest (first fields))) cstr)))
-      ~@(__mp-sum-dfields ~(rest fields)))))
-
-;; Decode: chain `(if <tag present> (Ctor ...) <next>)` over the constructors.
-;; The last one is the unconditional fallthrough, matching the struct side's
-;; "no structured error propagation here" stance.
-(defmacro __mp-sum-dec-arms [ctors]
-  (if (empty? (rest ctors))
-    `(let [__obj (__mp-field-node tree node ~(symbol-name (first (first ctors))))]
-       (~(first (first ctors)) ~@(__mp-sum-dfields ~(rest (first ctors)))))
-    `(let [__obj (__mp-field-node tree node ~(symbol-name (first (first ctors))))]
-       (if (not (__mp-node-absent? tree __obj))
-         (~(first (first ctors)) ~@(__mp-sum-dfields ~(rest (first ctors))))
-         (__mp-sum-dec-arms ~(rest ctors))))))
-
-;;; derive-msgpack-sum-encode -- only the EncodeMp instance for a `defdata`
-;;; sum type, externally tagged.
-;;;
-;;; Syntax:
-;;;   (derive-msgpack-sum-encode T (Ctor1 (f t) ...) (Ctor2 (f t) ...) ...)
-;;;
-;;; Since: Phase MP3
-(defmacro derive-msgpack-sum-encode [type-name & ctors]
-  `(definstance EncodeMp [~type-name]
-     (encode-mp [__self] (match __self ~@(__mp-sum-enc-arms ~ctors)))))
-
-;;; derive-msgpack-sum-decode -- only the DecodeMp instance for a `defdata`
-;;; sum type. Reads the externally-tagged discriminator and dispatches to the
-;;; matching constructor.
-;;;
-;;; Syntax:
-;;;   (derive-msgpack-sum-decode T (Ctor1 (f t) ...) (Ctor2 (f t) ...) ...)
-;;;
-;;; Since: Phase MP3
-(defmacro derive-msgpack-sum-decode [type-name & ctors]
-  `(definstance DecodeMp [~type-name]
-     (decode-mp [tree node] (:: (ok (__mp-sum-dec-arms ~ctors)) (Result ~type-name cstr)))))
-
-;;; derive-msgpack-sum -- emit both EncodeMp and DecodeMp for a `defdata`
-;;; sum-of-products type, using the externally-tagged convention
-;;; `{"Ctor": {...fields...}}`.
-;;;
-;;; Syntax:
-;;;   (derive-msgpack-sum T (Ctor1 (f1 t1) ...) (Ctor2 (f1 t1) ...) ...)
-;;;
-;;; Example:
-;;;   (defdata ^copy Event [] (Click :int :int) (Scroll :int))
-;;;   (derive-msgpack-sum Event (Click (x int) (y int)) (Scroll (dy int)))
-;;;   ;; (encode-mp (Click 3 4))  => 81 a5 43 6c 69 63 6b 82 a1 78 03 a1 79 04
-;;;
-;;; Limitations (carried from the struct slice):
-;;;   - Field-name policy is identity.
-;;;   - Inner field decode does not accumulate structured errors.
-;;;   - A nullary constructor encodes as `{"Ctor":{}}` (an empty inner map).
-;;;
-;;; Since: Phase MP3
-(defmacro derive-msgpack-sum [type-name & ctors]
-  `(do
-     (definstance EncodeMp [~type-name]
-       (encode-mp [__self] (match __self ~@(__mp-sum-enc-arms ~ctors))))
-     (definstance DecodeMp [~type-name]
-       (decode-mp [tree node] (:: (ok (__mp-sum-dec-arms ~ctors)) (Result ~type-name cstr))))))
-
-;; ===========================================================================
-;; DecodeMpChecked -- the accumulating, shape-validating decoder.
-;;
-;; `DecodeMp` above fails fast, and through `__mp-decode-field` it takes
-;; `ok-val` of a failed field decode -- so a missing key or a wrong-typed value
-;; silently yields a garbage field rather than an error. That is the right
-;; trade for a trusted producer and the wrong one at a trust boundary.
-;;
-;; This layer is the other trade: it checks every declared field against its
-;; expected format, ACCUMULATES all violations rather than stopping at the
-;; first, and returns `(Result T MpDecodeErrors)` whose err carries every
-;; failure with its key, the type expected, and the type actually seen.
-;;
-;; The vocabulary (int / string / bool / float / null / array / object) mirrors
-;; `stdlib/schema.tur`, and msgpack `map` is reported as "object" on purpose:
-;; a violation on a given struct then reads identically whether it came through
-;; this spice or tur-json. A spice cannot extend stdlib and cannot reach into
-;; another spice's private modules, so this is a self-contained reimplementation
-;; of just the kernel -- the same duplication json's U3 layer carries.
-;; ===========================================================================
-
-;;; MpDecodeErrors -- opaque handle to an accumulated list of decode
-;;; violations. Returned in the `err` slot of a checked decode; read it with
-;;; `mp-decode-errors-count` + `mp-decode-error-path/expected/got`, then release
-;;; it with `mp-decode-errors-free`.
-;;;
-;;; Since: Phase MP4
-(defopaque MpDecodeErrors :ptr<void>)
-
-;;; __mp-errs-new-raw -- internal: a fresh accumulator, as a bare pointer.
-(defn __mp-errs-new-raw [] : ptr<void>
-  ```c
-  extern void *mp_errs_new(void);
+  ;; ---------------------------------------------------------------------------
+  ;; derive-msgpack-sum: EncodeMp/DecodeMp for `defdata` sum-of-products types,
+  ;; externally tagged as a one-entry map `{"Ctor": {...fields...}}` -- the same
+  ;; convention json uses, so the two spices agree on the shape of a sum.
+  ;;
+  ;; Turmeric macros cannot introspect a defdata's constructor list at expansion
+  ;; time, so the constructors are passed explicitly:
+  ;;
+  ;;   (defdata ^copy Event [] (Click :int :int) (Scroll :int))
+  ;;   (derive-msgpack-sum Event
+  ;;     (Click (x int) (y int))
+  ;;     (Scroll (dy int)))
+  ;;
+  ;; Each spec is `(CtorName (f1 t1) ...)`. defdata payloads are positional, so
+  ;; the field names are purely the wire keys and the match binders, but they
+  ;; must be listed in constructor order.
+  ;; ---------------------------------------------------------------------------
+  ;; Encode: splice the field names into a constructor `match` pattern --
+  ;; fields ((x int) (y int)) -> the binder list `x y` for `(Click x y)`.
+  (defmacro __mp-sum-fnames [fields]
+    (if (empty? fields)
+      `()
+      `(~(first (first fields)) ~@(__mp-sum-fnames ~(rest fields)))))
+  ;; Encode: the (key, fragment) chain for one constructor's fields, encoding the
+  ;; match-bound binder rather than a struct field accessor.
+  (defmacro __mp-sum-vchain [fields]
+    (if (empty? fields)
+      0
+      `(cons ~(symbol-name (first (first fields)))
+         (cons (encode-mp ~(first (first fields)))
+           (__mp-sum-vchain ~(rest fields))))))
+  ;; Encode: the flat `match` arm list -- for each constructor a pattern
+  ;; `(Ctor f0 f1 ...)` followed by its tagged-map body.
+  (defmacro __mp-sum-enc-arms [ctors]
+    (if (empty? ctors)
+      `()
+      `((~(first (first ctors)) ~@(__mp-sum-fnames ~(rest (first ctors)))) (unsafe (__mp-tag ~(symbol-name (first (first ctors)))
+                                                                                     (__mp-map-build (__mp-sum-vchain ~(rest (first ctors))))))
+         ~@(__mp-sum-enc-arms ~(rest ctors)))))
+  ;; Decode: the positional constructor arguments for one constructor, read out
+  ;; of the tag's inner map bound to `__obj`.
+  (defmacro __mp-sum-dfields [fields]
+    (if (empty? fields)
+      `()
+      `((ok-val (:: (decode-mp tree
+                      (__mp-field-node tree
+                        __obj
+                        ~(symbol-name (first (first fields)))))
+                  (Result ~(first (rest (first fields))) cstr))) ~@(__mp-sum-dfields ~(rest fields)))))
+  ;; Decode: chain `(if <tag present> (Ctor ...) <next>)` over the constructors.
+  ;; The last one is the unconditional fallthrough, matching the struct side's
+  ;; "no structured error propagation here" stance.
+  (defmacro __mp-sum-dec-arms [ctors]
+    (if (empty? (rest ctors))
+      `(let [__obj (__mp-field-node tree
+                     node
+                     ~(symbol-name (first (first ctors))))]
+         (~(first (first ctors)) ~@(__mp-sum-dfields ~(rest (first ctors)))))
+      `(let [__obj (__mp-field-node tree
+                     node
+                     ~(symbol-name (first (first ctors))))]
+         (if (not (__mp-node-absent? tree __obj))
+           (~(first (first ctors)) ~@(__mp-sum-dfields ~(rest (first ctors))))
+           (__mp-sum-dec-arms ~(rest ctors))))))
+  ;;; derive-msgpack-sum-encode -- only the EncodeMp instance for a `defdata`
+  ;;; sum type, externally tagged.
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-msgpack-sum-encode T (Ctor1 (f t) ...) (Ctor2 (f t) ...) ...)
+  ;;;
+  ;;; Since: Phase MP3
+  (defmacro derive-msgpack-sum-encode [type-name & ctors]
+    `(definstance EncodeMp [~type-name]
+       (encode-mp [__self] (match __self ~@(__mp-sum-enc-arms ~ctors)))))
+  ;;; derive-msgpack-sum-decode -- only the DecodeMp instance for a `defdata`
+  ;;; sum type. Reads the externally-tagged discriminator and dispatches to the
+  ;;; matching constructor.
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-msgpack-sum-decode T (Ctor1 (f t) ...) (Ctor2 (f t) ...) ...)
+  ;;;
+  ;;; Since: Phase MP3
+  (defmacro derive-msgpack-sum-decode [type-name & ctors]
+    `(definstance DecodeMp [~type-name]
+       (decode-mp [tree node]
+         (:: (ok (__mp-sum-dec-arms ~ctors)) (Result ~type-name cstr)))))
+  ;;; derive-msgpack-sum -- emit both EncodeMp and DecodeMp for a `defdata`
+  ;;; sum-of-products type, using the externally-tagged convention
+  ;;; `{"Ctor": {...fields...}}`.
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-msgpack-sum T (Ctor1 (f1 t1) ...) (Ctor2 (f1 t1) ...) ...)
+  ;;;
+  ;;; Example:
+  ;;;   (defdata ^copy Event [] (Click :int :int) (Scroll :int))
+  ;;;   (derive-msgpack-sum Event (Click (x int) (y int)) (Scroll (dy int)))
+  ;;;   ;; (encode-mp (Click 3 4))  => 81 a5 43 6c 69 63 6b 82 a1 78 03 a1 79 04
+  ;;;
+  ;;; Limitations (carried from the struct slice):
+  ;;;   - Field-name policy is identity.
+  ;;;   - Inner field decode does not accumulate structured errors.
+  ;;;   - A nullary constructor encodes as `{"Ctor":{}}` (an empty inner map).
+  ;;;
+  ;;; Since: Phase MP3
+  (defmacro derive-msgpack-sum [type-name & ctors]
+    `(do
+       (definstance EncodeMp [~type-name]
+         (encode-mp [__self] (match __self ~@(__mp-sum-enc-arms ~ctors))))
+       (definstance DecodeMp [~type-name]
+         (decode-mp [tree node]
+           (:: (ok (__mp-sum-dec-arms ~ctors)) (Result ~type-name cstr))))))
+  ;; ===========================================================================
+  ;; DecodeMpChecked -- the accumulating, shape-validating decoder.
+  ;;
+  ;; `DecodeMp` above fails fast, and through `__mp-decode-field` it takes
+  ;; `ok-val` of a failed field decode -- so a missing key or a wrong-typed value
+  ;; silently yields a garbage field rather than an error. That is the right
+  ;; trade for a trusted producer and the wrong one at a trust boundary.
+  ;;
+  ;; This layer is the other trade: it checks every declared field against its
+  ;; expected format, ACCUMULATES all violations rather than stopping at the
+  ;; first, and returns `(Result T MpDecodeErrors)` whose err carries every
+  ;; failure with its key, the type expected, and the type actually seen.
+  ;;
+  ;; The vocabulary (int / string / bool / float / null / array / object) mirrors
+  ;; `stdlib/schema.tur`, and msgpack `map` is reported as "object" on purpose:
+  ;; a violation on a given struct then reads identically whether it came through
+  ;; this spice or tur-json. A spice cannot extend stdlib and cannot reach into
+  ;; another spice's private modules, so this is a self-contained reimplementation
+  ;; of just the kernel -- the same duplication json's U3 layer carries.
+  ;; ===========================================================================
+  ;;; MpDecodeErrors -- opaque handle to an accumulated list of decode
+  ;;; violations. Returned in the `err` slot of a checked decode; read it with
+  ;;; `mp-decode-errors-count` + `mp-decode-error-path/expected/got`, then release
+  ;;; it with `mp-decode-errors-free`.
+  ;;;
+  ;;; Since: Phase MP4
+  (defopaque MpDecodeErrors :ptr<void>)
+  ;;; __mp-errs-new-raw -- internal: a fresh accumulator, as a bare pointer.
+  (defn __mp-errs-new-raw [] : ptr<void>
+    ```c
+    extern void *mp_errs_new(void);
   return mp_errs_new();
   ```)
-
-;;; __mp-errs-new -- internal: a fresh, empty violation accumulator.
-(defn __mp-errs-new [] : MpDecodeErrors
-  (:: (__mp-errs-new-raw) MpDecodeErrors))
-
-;;; __mp-errs-push -- internal: append one {path, expected, got} violation.
-(defn __mp-errs-push [e : MpDecodeErrors path : cstr expected : cstr got : cstr] : nil
-  ```c
-  extern void mp_errs_push(void *, const char *, const char *, const char *);
+  ;;; __mp-errs-new -- internal: a fresh, empty violation accumulator.
+  (defn __mp-errs-new [] : MpDecodeErrors
+    (:: (__mp-errs-new-raw) MpDecodeErrors))
+  ;;; __mp-errs-push -- internal: append one {path, expected, got} violation.
+  (defn __mp-errs-push [e : MpDecodeErrors
+                        path : cstr
+                        expected : cstr
+                        got : cstr] : nil
+    ```c
+    extern void mp_errs_push(void *, const char *, const char *, const char *);
   mp_errs_push((void *)(intptr_t)e, (const char *)path, (const char *)expected,
                (const char *)got);
   ```)
-
-;;; __mp-errs-count -- internal: how many violations have accumulated.
-(defn __mp-errs-count [e : MpDecodeErrors] : int
-  ```c
-  extern int64_t mp_errs_count(const void *);
+  ;;; __mp-errs-count -- internal: how many violations have accumulated.
+  (defn __mp-errs-count [e : MpDecodeErrors] : int
+    ```c
+    extern int64_t mp_errs_count(const void *);
   return mp_errs_count((const void *)(intptr_t)e);
   ```)
-
-;;; __mp-errs-free -- internal: release the accumulator and its owned strings.
-(defn __mp-errs-free [e : MpDecodeErrors] : nil
-  ```c
-  extern void mp_errs_free(void *);
+  ;;; __mp-errs-free -- internal: release the accumulator and its owned strings.
+  (defn __mp-errs-free [e : MpDecodeErrors] : nil
+    ```c
+    extern void mp_errs_free(void *);
   mp_errs_free((void *)(intptr_t)e);
   ```)
-
-;;; mp-decode-errors-count -- the number of accumulated violations.
-;;;
-;;; Parameters:
-;;;   e -- the accumulator from a failed checked decode
-;;;
-;;; Returns:
-;;;   int -- the violation count.
-;;;
-;;; Example:
-;;;   (mp-decode-errors-count (err-val r))   ; => 2
-;;;
-;;; Since: Phase MP4
-(defn mp-decode-errors-count [e : MpDecodeErrors] : int
-  (__mp-errs-count e))
-
-;;; mp-decode-error-path -- the map key of the i-th violation.
-;;;
-;;; Parameters:
-;;;   e -- the accumulator
-;;;   i -- zero-based violation index
-;;;
-;;; Returns:
-;;;   cstr -- a borrowed key name (the empty string when i is out of range).
-;;;
-;;; Example:
-;;;   (mp-decode-error-path errs 0)   ; => "age"
-;;;
-;;; Since: Phase MP4
-(defn mp-decode-error-path [e : MpDecodeErrors i : int] : cstr
-  ```c
-  extern const char *mp_errs_path(const void *, int64_t);
+  ;;; mp-decode-errors-count -- the number of accumulated violations.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the accumulator from a failed checked decode
+  ;;;
+  ;;; Returns:
+  ;;;   int -- the violation count.
+  ;;;
+  ;;; Example:
+  ;;;   (mp-decode-errors-count (err-val r))   ; => 2
+  ;;;
+  ;;; Since: Phase MP4
+  (defn mp-decode-errors-count [e : MpDecodeErrors] : int (__mp-errs-count e))
+  ;;; mp-decode-error-path -- the map key of the i-th violation.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the accumulator
+  ;;;   i -- zero-based violation index
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- a borrowed key name (the empty string when i is out of range).
+  ;;;
+  ;;; Example:
+  ;;;   (mp-decode-error-path errs 0)   ; => "age"
+  ;;;
+  ;;; Since: Phase MP4
+  (defn mp-decode-error-path [e : MpDecodeErrors i : int] : cstr
+    ```c
+    extern const char *mp_errs_path(const void *, int64_t);
   return (const char *)mp_errs_path((const void *)(intptr_t)e, (int64_t)i);
   ```)
-
-;;; mp-decode-error-expected -- the type the i-th violation's field wanted.
-;;;
-;;; Parameters:
-;;;   e -- the accumulator
-;;;   i -- zero-based violation index
-;;;
-;;; Returns:
-;;;   cstr -- a borrowed schema type name ("int", "string", ...).
-;;;
-;;; Example:
-;;;   (mp-decode-error-expected errs 0)   ; => "int"
-;;;
-;;; Since: Phase MP4
-(defn mp-decode-error-expected [e : MpDecodeErrors i : int] : cstr
-  ```c
-  extern const char *mp_errs_expected(const void *, int64_t);
+  ;;; mp-decode-error-expected -- the type the i-th violation's field wanted.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the accumulator
+  ;;;   i -- zero-based violation index
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- a borrowed schema type name ("int", "string", ...).
+  ;;;
+  ;;; Example:
+  ;;;   (mp-decode-error-expected errs 0)   ; => "int"
+  ;;;
+  ;;; Since: Phase MP4
+  (defn mp-decode-error-expected [e : MpDecodeErrors i : int] : cstr
+    ```c
+    extern const char *mp_errs_expected(const void *, int64_t);
   return (const char *)mp_errs_expected((const void *)(intptr_t)e, (int64_t)i);
   ```)
-
-;;; mp-decode-error-got -- the type actually present at the i-th violation.
-;;;
-;;; Parameters:
-;;;   e -- the accumulator
-;;;   i -- zero-based violation index
-;;;
-;;; Returns:
-;;;   cstr -- a borrowed schema type name, or "missing" when the key was absent.
-;;;
-;;; Example:
-;;;   (mp-decode-error-got errs 0)   ; => "string"
-;;;
-;;; Since: Phase MP4
-(defn mp-decode-error-got [e : MpDecodeErrors i : int] : cstr
-  ```c
-  extern const char *mp_errs_got(const void *, int64_t);
+  ;;; mp-decode-error-got -- the type actually present at the i-th violation.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the accumulator
+  ;;;   i -- zero-based violation index
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- a borrowed schema type name, or "missing" when the key was absent.
+  ;;;
+  ;;; Example:
+  ;;;   (mp-decode-error-got errs 0)   ; => "string"
+  ;;;
+  ;;; Since: Phase MP4
+  (defn mp-decode-error-got [e : MpDecodeErrors i : int] : cstr
+    ```c
+    extern const char *mp_errs_got(const void *, int64_t);
   return (const char *)mp_errs_got((const void *)(intptr_t)e, (int64_t)i);
   ```)
-
-;;; mp-decode-errors-free -- release the accumulator and its owned strings.
-;;;
-;;; Parameters:
-;;;   e -- the accumulator to release
-;;;
-;;; Example:
-;;;   (mp-decode-errors-free (err-val r))
-;;;
-;;; Since: Phase MP4
-(defn mp-decode-errors-free [e : MpDecodeErrors] : nil
-  (__mp-errs-free e))
-
-;; Per-type field checks: look the key up in the map, and when the slot is
-;; missing or the wrong format append a {key, expected, got} violation. Each
-;; takes the accumulator the macro threads.
-
-;;; __mp-check-int -- internal: the field must be an integer.
-(defn __mp-check-int [errs : MpDecodeErrors tree : MpTree node : MpNode key : cstr] : nil
-  (let [v (__mp-field-node tree node key)]
-    (if (mp-int? tree v)
-      nil
-      (__mp-errs-push errs key "int" (mp-type-name tree v)))))
-
-;;; __mp-check-cstr -- internal: the field must be a msgpack str.
-(defn __mp-check-cstr [errs : MpDecodeErrors tree : MpTree node : MpNode key : cstr] : nil
-  (let [v (__mp-field-node tree node key)]
-    (if (mp-str? tree v)
-      nil
-      (__mp-errs-push errs key "string" (mp-type-name tree v)))))
-
-;;; __mp-check-bool -- internal: the field must be a boolean.
-(defn __mp-check-bool [errs : MpDecodeErrors tree : MpTree node : MpNode key : cstr] : nil
-  (let [v (__mp-field-node tree node key)]
-    (if (mp-bool? tree v)
-      nil
-      (__mp-errs-push errs key "bool" (mp-type-name tree v)))))
-
-;;; __mp-check-float -- internal: the field must be numeric. An integer counts,
-;;; matching what `DecodeMp [float]` accepts.
-(defn __mp-check-float [errs : MpDecodeErrors tree : MpTree node : MpNode key : cstr] : nil
-  (let [v (__mp-field-node tree node key)]
-    (if (mp-num? tree v)
-      nil
-      (__mp-errs-push errs key "float" (mp-type-name tree v)))))
-
-;;; DecodeMpChecked -- typeclass for the accumulating shape validator. Like
-;;; `DecodeMp`, `a` appears only in the return type, so the instance is chosen
-;;; by the ascription at the call site:
-;;;
-;;;   (:: (decode-mp-checked t n) (Result User MpDecodeErrors))
-;;;
-;;; On success it returns `(ok value)`; on any violation `(err errors)` with
-;;; ALL of them, not just the first.
-;;;
-;;; Since: Phase MP4
-(defclass DecodeMpChecked [a]
-  (decode-mp-checked [tree : MpTree  node : MpNode] : (Result a MpDecodeErrors)))
-
-;; Expand the `(fname ftype)` list into a `do` of per-field
-;; `(__mp-check-<ftype> __errs tree node "fname")` calls. `ftype` must be a
-;; primitive (int / cstr / bool / float). Threads the let-bound `__errs` and the
-;; method params `tree` / `node` by the same non-hygienic capture `__mp-chain`
-;; uses for `x`.
-(defmacro __mp-derive-checks [fields]
-  (if (empty? fields)
-    `0
-    (let [fld   (first fields)
-          fname (first fld)
-          ftype (first (rest fld))
-          tail  (rest fields)]
-      `(do
-         (~(str->sym (str-append "__mp-check-" (symbol-name ftype))) __errs tree node ~(symbol-name fname))
-         (__mp-derive-checks ~tail)))))
-
-;;; derive-mp-decoder -- emit a `DecodeMpChecked` instance for a `defstruct` of
-;;; primitive fields.
-;;;
-;;; Validates every declared field against its expected MessagePack format,
-;;; accumulating all violations; on success it builds the struct through the
-;;; same typed per-field `DecodeMp` instances `derive-msgpack` uses.
-;;;
-;;; Syntax:
-;;;   (derive-mp-decoder T (f1 t1) (f2 t2) ...)    ;; ti in {int cstr bool float}
-;;;
-;;; Example:
-;;;   (defstruct Person [name : cstr  age : int])
-;;;   (derive-mp-decoder Person (name cstr) (age int))
-;;;   ;; (:: (decode-mp-checked t root) (Result Person MpDecodeErrors))
-;;;   ;;   {"name":"al","age":30}  => (ok <Person>)
-;;;   ;;   {"name":123}            => (err <2: name/string/int, age/int/missing>)
-;;;
-;;; Limitations (v0): primitive fields only (nested maps and arrays are a
-;;; follow-up), the path is the bare key with no dot-nesting, and the field cap
-;;; follows `__mp-decode-make-struct` (<=5). For a richer shape, hand-write the
-;;; DecodeMpChecked instance.
-;;;
-;;; Since: Phase MP4
-(defmacro derive-mp-decoder [type-name & fields]
-  `(definstance DecodeMpChecked [~type-name]
-     (decode-mp-checked [tree node]
-       (let [__errs (__mp-errs-new)]
-         (do
-           (__mp-derive-checks ~fields)
-           (if (= 0 (__mp-errs-count __errs))
-             (do (__mp-errs-free __errs)
+  ;;; mp-decode-errors-free -- release the accumulator and its owned strings.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the accumulator to release
+  ;;;
+  ;;; Example:
+  ;;;   (mp-decode-errors-free (err-val r))
+  ;;;
+  ;;; Since: Phase MP4
+  (defn mp-decode-errors-free [e : MpDecodeErrors] : nil (__mp-errs-free e))
+  ;; Per-type field checks: look the key up in the map, and when the slot is
+  ;; missing or the wrong format append a {key, expected, got} violation. Each
+  ;; takes the accumulator the macro threads.
+  ;;; __mp-check-int -- internal: the field must be an integer.
+  (defn __mp-check-int [errs : MpDecodeErrors
+                        tree : MpTree
+                        node : MpNode
+                        key : cstr] : nil
+    (let [v (__mp-field-node tree node key)]
+      (if (mp-int? tree v)
+        nil
+        (__mp-errs-push errs key "int" (mp-type-name tree v)))))
+  ;;; __mp-check-cstr -- internal: the field must be a msgpack str.
+  (defn __mp-check-cstr [errs : MpDecodeErrors
+                         tree : MpTree
+                         node : MpNode
+                         key : cstr] : nil
+    (let [v (__mp-field-node tree node key)]
+      (if (mp-str? tree v)
+        nil
+        (__mp-errs-push errs key "string" (mp-type-name tree v)))))
+  ;;; __mp-check-bool -- internal: the field must be a boolean.
+  (defn __mp-check-bool [errs : MpDecodeErrors
+                         tree : MpTree
+                         node : MpNode
+                         key : cstr] : nil
+    (let [v (__mp-field-node tree node key)]
+      (if (mp-bool? tree v)
+        nil
+        (__mp-errs-push errs key "bool" (mp-type-name tree v)))))
+  ;;; __mp-check-float -- internal: the field must be numeric. An integer counts,
+  ;;; matching what `DecodeMp [float]` accepts.
+  (defn __mp-check-float [errs : MpDecodeErrors
+                          tree : MpTree
+                          node : MpNode
+                          key : cstr] : nil
+    (let [v (__mp-field-node tree node key)]
+      (if (mp-num? tree v)
+        nil
+        (__mp-errs-push errs key "float" (mp-type-name tree v)))))
+  ;;; DecodeMpChecked -- typeclass for the accumulating shape validator. Like
+  ;;; `DecodeMp`, `a` appears only in the return type, so the instance is chosen
+  ;;; by the ascription at the call site:
+  ;;;
+  ;;;   (:: (decode-mp-checked t n) (Result User MpDecodeErrors))
+  ;;;
+  ;;; On success it returns `(ok value)`; on any violation `(err errors)` with
+  ;;; ALL of them, not just the first.
+  ;;;
+  ;;; Since: Phase MP4
+  (defclass DecodeMpChecked [a]
+    (decode-mp-checked [tree : MpTree node : MpNode]
+      : (Result a MpDecodeErrors)))
+  ;; Expand the `(fname ftype)` list into a `do` of per-field
+  ;; `(__mp-check-<ftype> __errs tree node "fname")` calls. `ftype` must be a
+  ;; primitive (int / cstr / bool / float). Threads the let-bound `__errs` and the
+  ;; method params `tree` / `node` by the same non-hygienic capture `__mp-chain`
+  ;; uses for `x`.
+  (defmacro __mp-derive-checks [fields]
+    (if (empty? fields)
+      `0
+      (let [fld   (first fields)
+            fname (first fld)
+            ftype (first (rest fld))
+            tail  (rest fields)]
+        `(do
+           (~(str->sym (str-append "__mp-check-" (symbol-name ftype))) __errs
+             tree
+             node
+             ~(symbol-name fname))
+           (__mp-derive-checks ~tail)))))
+  ;;; derive-mp-decoder -- emit a `DecodeMpChecked` instance for a `defstruct` of
+  ;;; primitive fields.
+  ;;;
+  ;;; Validates every declared field against its expected MessagePack format,
+  ;;; accumulating all violations; on success it builds the struct through the
+  ;;; same typed per-field `DecodeMp` instances `derive-msgpack` uses.
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-mp-decoder T (f1 t1) (f2 t2) ...)    ;; ti in {int cstr bool float}
+  ;;;
+  ;;; Example:
+  ;;;   (defstruct Person [name : cstr  age : int])
+  ;;;   (derive-mp-decoder Person (name cstr) (age int))
+  ;;;   ;; (:: (decode-mp-checked t root) (Result Person MpDecodeErrors))
+  ;;;   ;;   {"name":"al","age":30}  => (ok <Person>)
+  ;;;   ;;   {"name":123}            => (err <2: name/string/int, age/int/missing>)
+  ;;;
+  ;;; Limitations (v0): primitive fields only (nested maps and arrays are a
+  ;;; follow-up), the path is the bare key with no dot-nesting, and the field cap
+  ;;; follows `__mp-decode-make-struct` (<=5). For a richer shape, hand-write the
+  ;;; DecodeMpChecked instance.
+  ;;;
+  ;;; Since: Phase MP4
+  (defmacro derive-mp-decoder [type-name & fields]
+    `(definstance DecodeMpChecked [~type-name]
+       (decode-mp-checked [tree node]
+         (let [__errs (__mp-errs-new)]
+           (do
+             (__mp-derive-checks ~fields)
+             (if (= 0 (__mp-errs-count __errs))
+               (do
+                 (__mp-errs-free __errs)
                  (:: (ok (__mp-decode-make-struct ~type-name ~fields))
-                     (Result ~type-name MpDecodeErrors)))
-             (:: (err __errs)
-                 (Result ~type-name MpDecodeErrors))))))))
-
-) ;; end defmodule msgpack/encode
+                   (Result ~type-name MpDecodeErrors)))
+               (:: (err __errs) (Result ~type-name MpDecodeErrors))))))))) ;; end defmodule msgpack/encode

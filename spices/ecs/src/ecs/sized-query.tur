@@ -43,155 +43,148 @@
 ;;; Since: E2c slice 5 -- the payoff macro the sized-world plan calls
 ;;; out as "for-each -- the payoff". See
 ;;; docs/upcoming/ecs-sized-world-plan.md (turmeric repo).
-
 (defmodule ecs/sized-query
   (export sized-for-each
-          sized-world-tagged? sized-world-untagged?
-          sized-world-sparse-has? sized-world-sparse-get)
-
-(import ecs/sized-storage :refer [SizedDense sized-dense-cap
-                                   sized-dense-get sized-dense-has?])
-(import ecs/entity        :refer [Slot slot-new])
-(import ecs/sized-tag     :refer [SizedTag sized-tag-has?])
-(import ecs/sized-sparse  :refer [SizedSparse sized-sparse-has?
-                                   sized-sparse-get])
-
-;;; __sfe-storages -- recursive helper: wrap inner in nested `let`s
-;;; binding `__ss_<Comp>` to `(.<Comp> w)` for each component.
-;;;
-;;; Mirrors __fe-storages from ecs/query; the `__ss_` prefix
-;;; distinguishes the sized-flavored storage binding from the
-;;; unsized `__s_` so the two macros could (in principle) be nested
-;;; without binding-name collisions in the body.
-;;;
-;;; Since: E2c slice 5
-(defmacro __sfe-storages [w comps inner]
-  (if (empty? comps)
-    `~inner
-    (let [__c (first comps)
+    sized-world-tagged?
+    sized-world-untagged?
+    sized-world-sparse-has?
+    sized-world-sparse-get)
+  (import ecs/sized-storage
+    :refer
+    [SizedDense sized-dense-cap sized-dense-get sized-dense-has?])
+  (import ecs/entity :refer [Slot slot-new])
+  (import ecs/sized-tag :refer [SizedTag sized-tag-has?])
+  (import ecs/sized-sparse
+    :refer
+    [SizedSparse sized-sparse-has? sized-sparse-get])
+  ;;; __sfe-storages -- recursive helper: wrap inner in nested `let`s
+  ;;; binding `__ss_<Comp>` to `(.<Comp> w)` for each component.
+  ;;;
+  ;;; Mirrors __fe-storages from ecs/query; the `__ss_` prefix
+  ;;; distinguishes the sized-flavored storage binding from the
+  ;;; unsized `__s_` so the two macros could (in principle) be nested
+  ;;; without binding-name collisions in the body.
+  ;;;
+  ;;; Since: E2c slice 5
+  (defmacro __sfe-storages [w comps inner]
+    (if (empty? comps)
+      `~inner
+      (let [__c      (first comps)
+            __s-name (str->sym (str-append "__ss_" (symbol-name __c)))]
+        `(let [~__s-name (~(dot-sym __c) ~w)]
+           (__sfe-storages ~w ~(rest comps) ~inner)))))
+  ;;; __sfe-has-conj -- recursive helper: emit a chain of `if` short-
+  ;;; circuits over `sized-dense-has?` for each component at index `i`.
+  ;;; Equivalent to `(and (sized-dense-has? __ss_C1 i) ...)`.
+  ;;;
+  ;;; Since: E2c slice 5
+  (defmacro __sfe-has-conj [comps i]
+    (let [__c      (first comps)
           __s-name (str->sym (str-append "__ss_" (symbol-name __c)))]
-      `(let [~__s-name (~(dot-sym __c) ~w)]
-         (__sfe-storages ~w ~(rest comps) ~inner)))))
-
-;;; __sfe-has-conj -- recursive helper: emit a chain of `if` short-
-;;; circuits over `sized-dense-has?` for each component at index `i`.
-;;; Equivalent to `(and (sized-dense-has? __ss_C1 i) ...)`.
-;;;
-;;; Since: E2c slice 5
-(defmacro __sfe-has-conj [comps i]
-  (let [__c (first comps)
-        __s-name (str->sym (str-append "__ss_" (symbol-name __c)))]
-    (if (empty? (rest comps))
-      `(sized-dense-has? ~__s-name ~i)
-      `(if (sized-dense-has? ~__s-name ~i)
-         (__sfe-has-conj ~(rest comps) ~i)
-         false))))
-
-;;; __sfe-value-binds -- recursive helper: wrap inner in nested `let`s
-;;; binding each value name to `(sized-dense-get __ss_CN i)`. comps and
-;;; binds must zip pairwise.
-;;;
-;;; Since: E2c slice 5
-(defmacro __sfe-value-binds [comps binds i inner]
-  (if (empty? comps)
-    `~inner
-    (let [__c (first comps)
-          __s-name (str->sym (str-append "__ss_" (symbol-name __c)))
-          __vname (first binds)]
-      `(let [~__vname (sized-dense-get ~__s-name ~i)]
-         (__sfe-value-binds ~(rest comps) ~(rest binds) ~i ~inner)))))
-
-;;; sized-for-each -- bounded-capacity iteration over the intersection
-;;; of entity slots that have all listed components on a sized world.
-;;;
-;;; Surface:
-;;;   (sized-for-each world [Comp1 Comp2 ... CompN] [e v1 v2 ... vN] body)
-;;;
-;;; The body sees `e` bound to the entity slot index (int in [0, cap))
-;;; and each `vN` bound to the corresponding component value, typed at
-;;; that component's element type. The empty-comps form
-;;; `(sized-for-each w [] [e] body)` is not supported -- a sized world
-;;; without any component to anchor the cap probe would need to read
-;;; the cap off the world state cell, a different code path; callers
-;;; that want to walk every slot index should iterate
-;;; `0..(sized-cap (.state w))` directly.
-;;;
-;;; The loop bound is the static cap of the first component's storage,
-;;; reached via `sized-dense-cap`. Every storage in a (World n) shares
-;;; `n` structurally, so picking the first is a free expression-level
-;;; choice -- the SZ8 cross-parameter unifier already guarantees the
-;;; rectangularity at the world's defstruct field types.
-;;;
-;;; Since: E2c slice 5
-(defmacro sized-for-each [world comps binds body]
-  (let [__first-c (first comps)
-        __first-s-name (str->sym (str-append "__ss_" (symbol-name __first-c)))
-        __e-bind (first binds)
-        __v-binds (rest binds)]
-    `(__sfe-storages ~world ~comps
-       (let [^mut __i 0
-             __cap (sized-dense-cap ~__first-s-name)]
-         (while (< __i __cap)
-           (do
-             (let [__sfe-sl (slot-new __i)]
-               (when (__sfe-has-conj ~comps __sfe-sl)
-                 (let [~__e-bind __sfe-sl]
-                   (__sfe-value-binds ~comps ~__v-binds __sfe-sl ~body))))
-             (set! __i (+ __i 1))))))))
-
-;;; sized-world-tagged? -- true if entity slot `e` carries the named
-;;; SizedTag in the world's `.<Tag>` field. The sized counterpart of
-;;; ecs/query's `world-tagged?`; macro-only, expands to a direct
-;;; `sized-tag-has?` call.
-;;;
-;;; The world's `.<Tag>` field must hold a `(SizedTag n)` handle. Since
-;;; `sized-defworld` currently emits every component field as
-;;; `(SizedDense n Comp)`, mixing tag bitsets into a sized world means
-;;; hand-rolling the world's `defstruct` (the same constraint the
-;;; unsized `defworld` has today, see
-;;; `tests/filter-with-without.tur` for the unsized pattern).
-;;; `tests/sized-filter-with-without.tur` is the sized-side analogue.
-;;;
-;;; Composes with `sized-for-each` inside the body via `when`/`unless`
-;;; just like the unsized pair.
-;;;
-;;; Since: E2c slice 6
-(defmacro sized-world-tagged? [world Tag e]
-  `(sized-tag-has? (~(dot-sym Tag) ~world) ~e))
-
-;;; sized-world-untagged? -- inverse of sized-world-tagged?. Sugar for
-;;; "the entity does NOT carry this sized tag". Macro-only.
-;;;
-;;; Since: E2c slice 6
-(defmacro sized-world-untagged? [world Tag e]
-  `(not (sized-tag-has? (~(dot-sym Tag) ~world) ~e)))
-
-;;; sized-world-sparse-has? -- presence probe against a SizedSparse
-;;; component field on the world. The sparse counterpart of
-;;; sized-world-tagged?, with the same hand-rolled-world caveat:
-;;; sized-defworld emits dense fields only, so a sparse component is
-;;; declared by hand-rolling the world's defstruct and naming the
-;;; field after the component type. Macro-only.
-;;;
-;;; Composes with sized-for-each via when/unless to express the
-;;; "dense iterate + sparse lookup" pattern that mixed-shape worlds
-;;; need: walk the dense Pos backbone, branch on whether the entity
-;;; also has the sparser Hp component.
-;;;
-;;; Since: E2c slice 9
-(defmacro sized-world-sparse-has? [world Comp e]
-  `(sized-sparse-has? (~(dot-sym Comp) ~world) ~e))
-
-;;; sized-world-sparse-get -- read a SizedSparse component value off
-;;; the world for entity `e`. The element type is inferred from the
-;;; world's typed `.<Comp>` field, so a use-site like
-;;; `(sized-world-sparse-get w Hp e)` against a world whose `.Hp` is
-;;; `(SizedSparse n Hp)` returns an `Hp`. Caller should guard with
-;;; `sized-world-sparse-has?` first -- absent slots return unspecified
-;;; payload bytes (the sized-sparse-get contract).
-;;;
-;;; Since: E2c slice 9
-(defmacro sized-world-sparse-get [world Comp e]
-  `(sized-sparse-get (~(dot-sym Comp) ~world) ~e))
-
-) ;; end defmodule ecs/sized-query
+      (if (empty? (rest comps))
+        `(sized-dense-has? ~__s-name ~i)
+        `(if (sized-dense-has? ~__s-name ~i)
+           (__sfe-has-conj ~(rest comps) ~i)
+           false))))
+  ;;; __sfe-value-binds -- recursive helper: wrap inner in nested `let`s
+  ;;; binding each value name to `(sized-dense-get __ss_CN i)`. comps and
+  ;;; binds must zip pairwise.
+  ;;;
+  ;;; Since: E2c slice 5
+  (defmacro __sfe-value-binds [comps binds i inner]
+    (if (empty? comps)
+      `~inner
+      (let [__c      (first comps)
+            __s-name (str->sym (str-append "__ss_" (symbol-name __c)))
+            __vname  (first binds)]
+        `(let [~__vname (sized-dense-get ~__s-name ~i)]
+           (__sfe-value-binds ~(rest comps) ~(rest binds) ~i ~inner)))))
+  ;;; sized-for-each -- bounded-capacity iteration over the intersection
+  ;;; of entity slots that have all listed components on a sized world.
+  ;;;
+  ;;; Surface:
+  ;;;   (sized-for-each world [Comp1 Comp2 ... CompN] [e v1 v2 ... vN] body)
+  ;;;
+  ;;; The body sees `e` bound to the entity slot index (int in [0, cap))
+  ;;; and each `vN` bound to the corresponding component value, typed at
+  ;;; that component's element type. The empty-comps form
+  ;;; `(sized-for-each w [] [e] body)` is not supported -- a sized world
+  ;;; without any component to anchor the cap probe would need to read
+  ;;; the cap off the world state cell, a different code path; callers
+  ;;; that want to walk every slot index should iterate
+  ;;; `0..(sized-cap (.state w))` directly.
+  ;;;
+  ;;; The loop bound is the static cap of the first component's storage,
+  ;;; reached via `sized-dense-cap`. Every storage in a (World n) shares
+  ;;; `n` structurally, so picking the first is a free expression-level
+  ;;; choice -- the SZ8 cross-parameter unifier already guarantees the
+  ;;; rectangularity at the world's defstruct field types.
+  ;;;
+  ;;; Since: E2c slice 5
+  (defmacro sized-for-each [world comps binds body]
+    (let [__first-c      (first comps)
+          __first-s-name (str->sym (str-append "__ss_" (symbol-name __first-c)))
+          __e-bind       (first binds)
+          __v-binds      (rest binds)]
+      `(__sfe-storages ~world
+         ~comps
+         (let [^mut __i 0
+               __cap    (sized-dense-cap ~__first-s-name)]
+           (while (< __i __cap)
+             (do
+               (let [__sfe-sl (slot-new __i)]
+                 (when (__sfe-has-conj ~comps __sfe-sl)
+                   (let [~__e-bind __sfe-sl]
+                     (__sfe-value-binds ~comps ~__v-binds __sfe-sl ~body))))
+               (set! __i (+ __i 1))))))))
+  ;;; sized-world-tagged? -- true if entity slot `e` carries the named
+  ;;; SizedTag in the world's `.<Tag>` field. The sized counterpart of
+  ;;; ecs/query's `world-tagged?`; macro-only, expands to a direct
+  ;;; `sized-tag-has?` call.
+  ;;;
+  ;;; The world's `.<Tag>` field must hold a `(SizedTag n)` handle. Since
+  ;;; `sized-defworld` currently emits every component field as
+  ;;; `(SizedDense n Comp)`, mixing tag bitsets into a sized world means
+  ;;; hand-rolling the world's `defstruct` (the same constraint the
+  ;;; unsized `defworld` has today, see
+  ;;; `tests/filter-with-without.tur` for the unsized pattern).
+  ;;; `tests/sized-filter-with-without.tur` is the sized-side analogue.
+  ;;;
+  ;;; Composes with `sized-for-each` inside the body via `when`/`unless`
+  ;;; just like the unsized pair.
+  ;;;
+  ;;; Since: E2c slice 6
+  (defmacro sized-world-tagged? [world Tag e]
+    `(sized-tag-has? (~(dot-sym Tag) ~world) ~e))
+  ;;; sized-world-untagged? -- inverse of sized-world-tagged?. Sugar for
+  ;;; "the entity does NOT carry this sized tag". Macro-only.
+  ;;;
+  ;;; Since: E2c slice 6
+  (defmacro sized-world-untagged? [world Tag e]
+    `(not (sized-tag-has? (~(dot-sym Tag) ~world) ~e)))
+  ;;; sized-world-sparse-has? -- presence probe against a SizedSparse
+  ;;; component field on the world. The sparse counterpart of
+  ;;; sized-world-tagged?, with the same hand-rolled-world caveat:
+  ;;; sized-defworld emits dense fields only, so a sparse component is
+  ;;; declared by hand-rolling the world's defstruct and naming the
+  ;;; field after the component type. Macro-only.
+  ;;;
+  ;;; Composes with sized-for-each via when/unless to express the
+  ;;; "dense iterate + sparse lookup" pattern that mixed-shape worlds
+  ;;; need: walk the dense Pos backbone, branch on whether the entity
+  ;;; also has the sparser Hp component.
+  ;;;
+  ;;; Since: E2c slice 9
+  (defmacro sized-world-sparse-has? [world Comp e]
+    `(sized-sparse-has? (~(dot-sym Comp) ~world) ~e))
+  ;;; sized-world-sparse-get -- read a SizedSparse component value off
+  ;;; the world for entity `e`. The element type is inferred from the
+  ;;; world's typed `.<Comp>` field, so a use-site like
+  ;;; `(sized-world-sparse-get w Hp e)` against a world whose `.Hp` is
+  ;;; `(SizedSparse n Hp)` returns an `Hp`. Caller should guard with
+  ;;; `sized-world-sparse-has?` first -- absent slots return unspecified
+  ;;; payload bytes (the sized-sparse-get contract).
+  ;;;
+  ;;; Since: E2c slice 9
+  (defmacro sized-world-sparse-get [world Comp e]
+    `(sized-sparse-get (~(dot-sym Comp) ~world) ~e))) ;; end defmodule ecs/sized-query

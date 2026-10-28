@@ -7,28 +7,29 @@
 ;;; out-of-range set!/clear! abort.
 ;;;
 ;;; Since: E2c -- see docs/upcoming/ecs-sized-world-plan.md.
-
 (defmodule ecs/sized-tag
   (export SizedTag
-          sized-tag-new sized-tag-cap sized-tag-count
-          sized-tag-set! sized-tag-clear! sized-tag-has?
-          sized-tag-free
-          sized-tag-zip-cap)
-
-(import ecs/entity :refer [Slot])
-
-(defopaque SizedTag [n] :int)
-
-;; ===== Raw int-carried implementation (private) =====
-;;
-;; The raw helpers carry inline-C; the public surface wraps them with
-;; the (SizedTag n) defopaque. The control block layout matches
-;; ecs/tag's __ecs_tag (same word array + bit-count metadata) so that
-;; future helpers can be shared if desired.
-
-(defn __sized-tag-new-raw [k : int] #fx{Unsafe} : int
-  ```c
-  #include <stdlib.h>
+    sized-tag-new
+    sized-tag-cap
+    sized-tag-count
+    sized-tag-set!
+    sized-tag-clear!
+    sized-tag-has?
+    sized-tag-free
+    sized-tag-zip-cap)
+  (import ecs/entity :refer [Slot])
+  (defopaque SizedTag [n] :int)
+  ;; ===== Raw int-carried implementation (private) =====
+  ;;
+  ;; The raw helpers carry inline-C; the public surface wraps them with
+  ;; the (SizedTag n) defopaque. The control block layout matches
+  ;; ecs/tag's __ecs_tag (same word array + bit-count metadata) so that
+  ;; future helpers can be shared if desired.
+  (defn __sized-tag-new-raw [k : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
   typedef struct { uint64_t *words; size_t n_words; size_t cap_bits; } __ecs_tag;
@@ -39,17 +40,19 @@
   t->words    = (uint64_t *)calloc(nw ? nw : 1, sizeof(uint64_t));
   return (int64_t)(intptr_t)t;
   ```)
-
-(defn __sized-tag-cap-raw [t : int] #fx{Unsafe} : int
-  ```c
-  typedef struct { uint64_t *words; size_t n_words; size_t cap_bits; } __ecs_tag;
+  (defn __sized-tag-cap-raw [t : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    typedef struct { uint64_t *words; size_t n_words; size_t cap_bits; } __ecs_tag;
   __ecs_tag *tg = (__ecs_tag *)(intptr_t)t;
   return (int64_t)tg->cap_bits;
   ```)
-
-(defn __sized-tag-set!-raw [t : int idx : int] #fx{Unsafe} : nil
-  ```c
-  typedef struct { uint64_t *words; size_t n_words; size_t cap_bits; } __ecs_tag;
+  (defn __sized-tag-set!-raw [t : int idx : int]
+    #fx{Unsafe}
+    : nil
+    ```c
+    typedef struct { uint64_t *words; size_t n_words; size_t cap_bits; } __ecs_tag;
   __ecs_tag *tg = (__ecs_tag *)(intptr_t)t;
   if ((size_t)idx >= tg->cap_bits) {
     fprintf(stderr, "sized-tag-set!: index %lld out of range (cap=%zu)\n",
@@ -58,26 +61,29 @@
   }
   tg->words[(size_t)idx >> 6] |= ((uint64_t)1) << ((size_t)idx & 63);
   ```)
-
-(defn __sized-tag-clear!-raw [t : int idx : int] #fx{Unsafe} : nil
-  ```c
-  typedef struct { uint64_t *words; size_t n_words; size_t cap_bits; } __ecs_tag;
+  (defn __sized-tag-clear!-raw [t : int idx : int]
+    #fx{Unsafe}
+    : nil
+    ```c
+    typedef struct { uint64_t *words; size_t n_words; size_t cap_bits; } __ecs_tag;
   __ecs_tag *tg = (__ecs_tag *)(intptr_t)t;
   if ((size_t)idx >= tg->cap_bits) return;
   tg->words[(size_t)idx >> 6] &= ~(((uint64_t)1) << ((size_t)idx & 63));
   ```)
-
-(defn __sized-tag-has?-raw [t : int idx : int] #fx{Unsafe} : bool
-  ```c
-  typedef struct { uint64_t *words; size_t n_words; size_t cap_bits; } __ecs_tag;
+  (defn __sized-tag-has?-raw [t : int idx : int]
+    #fx{Unsafe}
+    : bool
+    ```c
+    typedef struct { uint64_t *words; size_t n_words; size_t cap_bits; } __ecs_tag;
   __ecs_tag *tg = (__ecs_tag *)(intptr_t)t;
   if ((size_t)idx >= tg->cap_bits) return false;
   return (tg->words[(size_t)idx >> 6] >> ((size_t)idx & 63)) & 1;
   ```)
-
-(defn __sized-tag-count-raw [t : int] #fx{Unsafe} : int
-  ```c
-  typedef struct { uint64_t *words; size_t n_words; size_t cap_bits; } __ecs_tag;
+  (defn __sized-tag-count-raw [t : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    typedef struct { uint64_t *words; size_t n_words; size_t cap_bits; } __ecs_tag;
   __ecs_tag *tg = (__ecs_tag *)(intptr_t)t;
   int64_t total = 0;
   for (size_t i = 0; i < tg->n_words; i++) {
@@ -85,60 +91,50 @@
   }
   return total;
   ```)
-
-(defn __sized-tag-free-raw [t : int] #fx{Unsafe} : nil
-  ```c
-  #include <stdlib.h>
+  (defn __sized-tag-free-raw [t : int]
+    #fx{Unsafe}
+    : nil
+    ```c
+    #include <stdlib.h>
   typedef struct { uint64_t *words; size_t n_words; size_t cap_bits; } __ecs_tag;
   __ecs_tag *tg = (__ecs_tag *)(intptr_t)t;
   if (tg) { free(tg->words); free(tg); }
   ```)
-
-;; ===== Public (SizedTag n) surface =====
-
-;;; sized-tag-new -- allocate a (SizedTag n) covering `k` bits.
-;;;
-;;; Since: E2c
-(defn sized-tag-new [n] [k : int] : (SizedTag n)
-  (:: (unsafe (__sized-tag-new-raw k)) :SizedTag))
-
-;;; sized-tag-cap -- physical capacity in bits (rounded up to word).
-;;; Since: E2c
-(defn sized-tag-cap [n] [t : (SizedTag n)] : int
-  (unsafe (__sized-tag-cap-raw (:: t :int))))
-
-;;; sized-tag-set! -- mark slot idx as tagged. Aborts on out-of-range.
-;;; Since: E2c
-(defn sized-tag-set! [n] [t : (SizedTag n) idx : Slot] : nil
-  (unsafe (__sized-tag-set!-raw (:: t :int) (:: idx :int))))
-
-;;; sized-tag-clear! -- mark slot idx as untagged. No-op out-of-range.
-;;; Since: E2c
-(defn sized-tag-clear! [n] [t : (SizedTag n) idx : Slot] : nil
-  (unsafe (__sized-tag-clear!-raw (:: t :int) (:: idx :int))))
-
-;;; sized-tag-has? -- is slot idx tagged?
-;;; Since: E2c
-(defn sized-tag-has? [n] [t : (SizedTag n) idx : Slot] : bool
-  (unsafe (__sized-tag-has?-raw (:: t :int) (:: idx :int))))
-
-;;; sized-tag-count -- popcount across the bitset.
-;;; Since: E2c
-(defn sized-tag-count [n] [t : (SizedTag n)] : int
-  (unsafe (__sized-tag-count-raw (:: t :int))))
-
-;;; sized-tag-free -- release the backing words.
-;;; Since: E2c
-(defn sized-tag-free [n] [t : (SizedTag n)] : nil
-  (unsafe (__sized-tag-free-raw (:: t :int))))
-
-;;; sized-tag-zip-cap -- cross-parameter unification probe.
-;;;
-;;; Two (SizedTag n) values sharing `n` are statically rectangular;
-;;; mismatched `n` is rejected at compile time with TUR-E0260.
-;;;
-;;; Since: E2c
-(defn sized-tag-zip-cap [n] [a : (SizedTag n) b : (SizedTag n)] : int
-  (sized-tag-cap a))
-
-) ;; end defmodule ecs/sized-tag
+  ;; ===== Public (SizedTag n) surface =====
+  ;;; sized-tag-new -- allocate a (SizedTag n) covering `k` bits.
+  ;;;
+  ;;; Since: E2c
+  (defn sized-tag-new [n] [k : int] : (SizedTag n)
+    (:: (unsafe (__sized-tag-new-raw k)) :SizedTag))
+  ;;; sized-tag-cap -- physical capacity in bits (rounded up to word).
+  ;;; Since: E2c
+  (defn sized-tag-cap [n] [t : (SizedTag n)] : int
+    (unsafe (__sized-tag-cap-raw (:: t :int))))
+  ;;; sized-tag-set! -- mark slot idx as tagged. Aborts on out-of-range.
+  ;;; Since: E2c
+  (defn sized-tag-set! [n] [t : (SizedTag n) idx : Slot] : nil
+    (unsafe (__sized-tag-set!-raw (:: t :int) (:: idx :int))))
+  ;;; sized-tag-clear! -- mark slot idx as untagged. No-op out-of-range.
+  ;;; Since: E2c
+  (defn sized-tag-clear! [n] [t : (SizedTag n) idx : Slot] : nil
+    (unsafe (__sized-tag-clear!-raw (:: t :int) (:: idx :int))))
+  ;;; sized-tag-has? -- is slot idx tagged?
+  ;;; Since: E2c
+  (defn sized-tag-has? [n] [t : (SizedTag n) idx : Slot] : bool
+    (unsafe (__sized-tag-has?-raw (:: t :int) (:: idx :int))))
+  ;;; sized-tag-count -- popcount across the bitset.
+  ;;; Since: E2c
+  (defn sized-tag-count [n] [t : (SizedTag n)] : int
+    (unsafe (__sized-tag-count-raw (:: t :int))))
+  ;;; sized-tag-free -- release the backing words.
+  ;;; Since: E2c
+  (defn sized-tag-free [n] [t : (SizedTag n)] : nil
+    (unsafe (__sized-tag-free-raw (:: t :int))))
+  ;;; sized-tag-zip-cap -- cross-parameter unification probe.
+  ;;;
+  ;;; Two (SizedTag n) values sharing `n` are statically rectangular;
+  ;;; mismatched `n` is rejected at compile time with TUR-E0260.
+  ;;;
+  ;;; Since: E2c
+  (defn sized-tag-zip-cap [n] [a : (SizedTag n) b : (SizedTag n)] : int
+    (sized-tag-cap a))) ;; end defmodule ecs/sized-tag

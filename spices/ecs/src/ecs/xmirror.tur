@@ -59,163 +59,213 @@
 ;;; `ecs/xworld` for every component referenced.
 ;;;
 ;;; Since: X4 (single-component); MULTI-MIR-V0 (`:components`)
-
 (defmodule ecs/xmirror
   (export defmirror)
-
-(import ecs/entity  :refer [Slot slot-new])
-(import ecs/xsystem :refer [defxsystem])
-
-;;; defmirror -- declare a cross-world copy system.
-;;;
-;;; Two option shapes are recognised:
-;;;
-;;;   :from From :to To              -- single-component, asymmetric
-;;;   :components [<entry> ...]      -- multi-component; entry is
-;;;                                     either C or [SrcC DstC]
-;;;   :component  <entry>            -- sugar for :components [<entry>]
-;;;
-;;; `:count N` is required. Opts may appear in any order. Mixing the
-;;; `:from`/`:to` shape with `:components`/`:component` in one call
-;;; is rejected by yielding an unbound sentinel name.
-;;;
-;;; Since: X4 (single-component); MULTI-MIR-V0 (`:components`)
-(defmacro defmirror [name worlds & opts]
-  (let [;; world bindings: [src SrcType dst DstType]
-        ws1   (rest worlds)
-        ws2   (rest ws1)
-        srcb  (first worlds)
-        dstb  (first ws2)
-        ;; Keyword-driven opts walk into a 5-slot vector:
-        ;; [count-expr from-comp to-comp comps-vec single-comp]
-        parse-opts
-        (letrec [go
-                 (fn [os acc-count acc-from acc-to acc-comps acc-comp]
-                   (if (empty? os)
-                     (vec acc-count acc-from acc-to acc-comps acc-comp)
-                     (let [k (first os)
-                           v (first (rest os))
-                           tl (rest (rest os))]
-                       (if (= k :count)
-                         (go tl v acc-from acc-to acc-comps acc-comp)
-                         (if (= k :from)
-                           (go tl acc-count v acc-to acc-comps acc-comp)
-                           (if (= k :to)
-                             (go tl acc-count acc-from v acc-comps acc-comp)
-                             (if (= k :components)
-                               (go tl acc-count acc-from acc-to v acc-comp)
-                               (if (= k :component)
-                                 (go tl acc-count acc-from acc-to acc-comps v)
-                                 (vec acc-count acc-from acc-to acc-comps
-                                      acc-comp
-                                      (str->sym
-                                        (str-append
-                                          "defmirror--unknown-option-"
-                                          (symbol-name k))))))))))))]
-          go)
-        parsed     (parse-opts opts nil nil nil nil nil)
-        count-expr (first parsed)
-        p1         (rest parsed)
-        from-comp  (first p1)
-        p2         (rest p1)
-        to-comp    (first p2)
-        p3         (rest p2)
-        comps-vec  (first p3)
-        p4         (rest p3)
-        single-comp (first p4)
-        ;; Resolve into a single `entries` vec for the multi path. An
-        ;; entry is either a bare symbol C (same name on both worlds)
-        ;; or a 2-element vec [SrcC DstC] (different names).
-        entries    (if (= comps-vec nil)
-                     (if (= single-comp nil)
-                       nil
-                       (vec single-comp))
-                     comps-vec)
-        multi?     (if (= entries nil) 0 1)]
-    ;; -----------------------------------------------------------------
-    ;; Asymmetric single-component path (the X4 original).
-    ;; -----------------------------------------------------------------
-    (if (= multi? 0)
-      (let [getter (str->sym (str-append "get-" (symbol-name from-comp)))
-            setter (str->sym (str-append "set-" (symbol-name to-comp) "!"))
-            rcap   (str->sym (str-append (symbol-name srcb) "-"
-                                         (symbol-name from-comp) "-read-cap"))
-            wcap   (str->sym (str-append (symbol-name dstb) "-"
-                                         (symbol-name to-comp) "-write-cap"))]
-        `(defxsystem ~name
-           ~worlds
-           :reads-from  ~srcb [~from-comp]
-           :writes-to   ~srcb []
-           :reads-from  ~dstb []
-           :writes-to   ~dstb [~to-comp]
-           (let [^mut i 0]
-             (while (< i ~count-expr)
-               (let [__sl (slot-new i)]
-                 (~setter ~wcap ~dstb __sl
-                   (:: (:: (~getter ~rcap ~srcb __sl) :int) ~to-comp)))
-               (set! i (+ i 1))))))
-      ;; ---------------------------------------------------------------
-      ;; Multi-component path. Each entry must be a [SrcC DstC] vec;
-      ;; bare-symbol entries are not supported because the existing
-      ;; xworld accessor namespace is component-name-keyed (see top
-      ;; docstring). Split entries into parallel src-comps / dst-comps
-      ;; vecs and a vec of per-component copy statements, then splice
-      ;; into one defxsystem.
-      ;; ---------------------------------------------------------------
-      ;; Three parallel CT walks over `entries` build the src-comps
-      ;; list, dst-comps list, and copy-stmts list. Each uses cons to
-      ;; prepend the head's contribution to the recursive tail, so the
-      ;; result preserves declaration order. The defxsystem clause
-      ;; walker and xsystem--with-{read,write}-caps consume the lists
-      ;; via first/rest/empty?, which work the same on cons-lists and
-      ;; vecs.
-      (letrec [src-of (fn [es]
-                        (if (empty? es)
-                          `()
-                          (cons (first (first es)) (src-of (rest es)))))
-               dst-of (fn [es]
-                        (if (empty? es)
-                          `()
-                          (cons (first (rest (first es)))
-                                (dst-of (rest es)))))
-               stmts-of (fn [es]
-                          (if (empty? es)
-                            `()
-                            (let [e     (first es)
-                                  src-c (first e)
-                                  dst-c (first (rest e))
-                                  getter (str->sym
-                                           (str-append "get-"
-                                                       (symbol-name src-c)))
-                                  setter (str->sym
-                                           (str-append "set-"
-                                                       (symbol-name dst-c)
-                                                       "!"))
-                                  rcap   (str->sym
-                                           (str-append (symbol-name srcb) "-"
-                                                       (symbol-name src-c)
-                                                       "-read-cap"))
-                                  wcap   (str->sym
-                                           (str-append (symbol-name dstb) "-"
-                                                       (symbol-name dst-c)
-                                                       "-write-cap"))
-                                  stmt   `(~setter ~wcap ~dstb __sl
-                                            (:: (:: (~getter ~rcap ~srcb __sl) :int)
-                                                ~dst-c))]
-                              (cons stmt (stmts-of (rest es))))))]
-        (let [src-comps  (src-of entries)
-              dst-comps  (dst-of entries)
-              copy-stmts (stmts-of entries)]
-        `(defxsystem ~name
-           ~worlds
-           :reads-from  ~srcb ~src-comps
-           :writes-to   ~srcb []
-           :reads-from  ~dstb []
-           :writes-to   ~dstb ~dst-comps
-           (let [^mut i 0]
-             (while (< i ~count-expr)
-               (let [__sl (slot-new i)]
-                 (do ~@copy-stmts))
-               (set! i (+ i 1))))))))))
-
-) ;; end defmodule ecs/xmirror
+  (import ecs/entity :refer [Slot slot-new])
+  (import ecs/xsystem :refer [defxsystem])
+  ;;; defmirror -- declare a cross-world copy system.
+  ;;;
+  ;;; Two option shapes are recognised:
+  ;;;
+  ;;;   :from From :to To              -- single-component, asymmetric
+  ;;;   :components [<entry> ...]      -- multi-component; entry is
+  ;;;                                     either C or [SrcC DstC]
+  ;;;   :component  <entry>            -- sugar for :components [<entry>]
+  ;;;
+  ;;; `:count N` is required. Opts may appear in any order. Mixing the
+  ;;; `:from`/`:to` shape with `:components`/`:component` in one call
+  ;;; is rejected by yielding an unbound sentinel name.
+  ;;;
+  ;;; Since: X4 (single-component); MULTI-MIR-V0 (`:components`)
+  (defmacro defmirror [name worlds & opts]
+    (let [ ;; world bindings: [src SrcType dst DstType]
+          ws1         (rest worlds)
+          ws2         (rest ws1)
+          srcb        (first worlds)
+          dstb        (first ws2)
+          ;; Keyword-driven opts walk into a 5-slot vector:
+          ;; [count-expr from-comp to-comp comps-vec single-comp]
+          parse-opts  (letrec [go
+                               (fn [os
+                                    acc-count
+                                    acc-from
+                                    acc-to
+                                    acc-comps
+                                    acc-comp]
+                                 (if (empty? os)
+                                   (vec acc-count
+                                     acc-from
+                                     acc-to
+                                     acc-comps
+                                     acc-comp)
+                                   (let [k  (first os)
+                                         v  (first (rest os))
+                                         tl (rest (rest os))]
+                                     (if (= k :count)
+                                       (go tl
+                                         v
+                                         acc-from
+                                         acc-to
+                                         acc-comps
+                                         acc-comp)
+                                       (if (= k :from)
+                                         (go tl
+                                           acc-count
+                                           v
+                                           acc-to
+                                           acc-comps
+                                           acc-comp)
+                                         (if (= k :to)
+                                           (go tl
+                                             acc-count
+                                             acc-from
+                                             v
+                                             acc-comps
+                                             acc-comp)
+                                           (if (= k :components)
+                                             (go tl
+                                               acc-count
+                                               acc-from
+                                               acc-to
+                                               v
+                                               acc-comp)
+                                             (if (= k :component)
+                                               (go tl
+                                                 acc-count
+                                                 acc-from
+                                                 acc-to
+                                                 acc-comps
+                                                 v)
+                                               (vec acc-count
+                                                 acc-from
+                                                 acc-to
+                                                 acc-comps
+                                                 acc-comp
+                                                 (str->sym (str-append "defmirror--unknown-option-"
+                                                             (symbol-name k))))))))))))]
+                        go)
+          parsed      (parse-opts opts nil nil nil nil nil)
+          count-expr  (first parsed)
+          p1          (rest parsed)
+          from-comp   (first p1)
+          p2          (rest p1)
+          to-comp     (first p2)
+          p3          (rest p2)
+          comps-vec   (first p3)
+          p4          (rest p3)
+          single-comp (first p4)
+          ;; Resolve into a single `entries` vec for the multi path. An
+          ;; entry is either a bare symbol C (same name on both worlds)
+          ;; or a 2-element vec [SrcC DstC] (different names).
+          entries     (if (= comps-vec nil)
+                        (if (= single-comp nil) nil (vec single-comp))
+                        comps-vec)
+          multi?      (if (= entries nil) 0 1)]
+      ;; -----------------------------------------------------------------
+      ;; Asymmetric single-component path (the X4 original).
+      ;; -----------------------------------------------------------------
+      (if (= multi? 0)
+        (let [getter (str->sym (str-append "get-" (symbol-name from-comp)))
+              setter (str->sym (str-append "set-" (symbol-name to-comp) "!"))
+              rcap   (str->sym (str-append (symbol-name srcb)
+                                 "-"
+                                 (symbol-name from-comp)
+                                 "-read-cap"))
+              wcap   (str->sym (str-append (symbol-name dstb)
+                                 "-"
+                                 (symbol-name to-comp)
+                                 "-write-cap"))]
+          `(defxsystem ~name
+             ~worlds
+             :reads-from
+             ~srcb
+             [~from-comp]
+             :writes-to
+             ~srcb
+             []
+             :reads-from
+             ~dstb
+             []
+             :writes-to
+             ~dstb
+             [~to-comp]
+             (let [^mut i 0]
+               (while (< i ~count-expr)
+                 (let [__sl (slot-new i)]
+                   (~setter ~wcap
+                     ~dstb
+                     __sl
+                     (:: (:: (~getter ~rcap ~srcb __sl) :int) ~to-comp)))
+                 (set! i (+ i 1))))))
+        ;; ---------------------------------------------------------------
+        ;; Multi-component path. Each entry must be a [SrcC DstC] vec;
+        ;; bare-symbol entries are not supported because the existing
+        ;; xworld accessor namespace is component-name-keyed (see top
+        ;; docstring). Split entries into parallel src-comps / dst-comps
+        ;; vecs and a vec of per-component copy statements, then splice
+        ;; into one defxsystem.
+        ;; ---------------------------------------------------------------
+        ;; Three parallel CT walks over `entries` build the src-comps
+        ;; list, dst-comps list, and copy-stmts list. Each uses cons to
+        ;; prepend the head's contribution to the recursive tail, so the
+        ;; result preserves declaration order. The defxsystem clause
+        ;; walker and xsystem--with-{read,write}-caps consume the lists
+        ;; via first/rest/empty?, which work the same on cons-lists and
+        ;; vecs.
+        (letrec [src-of
+                 (fn [es]
+                   (if (empty? es)
+                     `()
+                     (cons (first (first es)) (src-of (rest es)))))
+                 dst-of
+                 (fn [es]
+                   (if (empty? es)
+                     `()
+                     (cons (first (rest (first es))) (dst-of (rest es)))))
+                 stmts-of
+                 (fn [es]
+                   (if (empty? es)
+                     `()
+                     (let [e      (first es)
+                           src-c  (first e)
+                           dst-c  (first (rest e))
+                           getter (str->sym (str-append "get-"
+                                              (symbol-name src-c)))
+                           setter (str->sym (str-append "set-"
+                                              (symbol-name dst-c)
+                                              "!"))
+                           rcap   (str->sym (str-append (symbol-name srcb)
+                                              "-"
+                                              (symbol-name src-c)
+                                              "-read-cap"))
+                           wcap   (str->sym (str-append (symbol-name dstb)
+                                              "-"
+                                              (symbol-name dst-c)
+                                              "-write-cap"))
+                           stmt   `(~setter ~wcap
+                                     ~dstb
+                                     __sl
+                                     (:: (:: (~getter ~rcap ~srcb __sl) :int)
+                                       ~dst-c))]
+                       (cons stmt (stmts-of (rest es))))))]
+          (let [src-comps  (src-of entries)
+                dst-comps  (dst-of entries)
+                copy-stmts (stmts-of entries)]
+            `(defxsystem ~name
+               ~worlds
+               :reads-from
+               ~srcb
+               ~src-comps
+               :writes-to
+               ~srcb
+               []
+               :reads-from
+               ~dstb
+               []
+               :writes-to
+               ~dstb
+               ~dst-comps
+               (let [^mut i 0]
+                 (while (< i ~count-expr)
+                   (let [__sl (slot-new i)] (do ~@copy-stmts))
+                   (set! i (+ i 1))))))))))) ;; end defmodule ecs/xmirror

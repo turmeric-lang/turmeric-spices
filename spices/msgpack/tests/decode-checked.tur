@@ -9,140 +9,138 @@
 ;; The expected-type vocabulary is stdlib/schema.tur's, and a msgpack map is
 ;; reported as "object", so a violation on a given struct reads identically
 ;; whether it came through this spice or tur-json.
-
-(defmodule decode_checked_test (export)
-
-(import msgpack/buf    :refer [Buf buf-free hex->buf])
-(import msgpack/decode :refer [MpTree MpNode mp-parse mp-tree-root mp-tree-free])
-(import msgpack/encode :refer [derive-msgpack derive-mp-decoder MpDecodeErrors
-                               mp-decode-errors-count mp-decode-error-path
-                               mp-decode-error-expected mp-decode-error-got
-                               mp-decode-errors-free])
-(import test/suite     :refer [describe it])
-(import test/assert    :refer [assert-true assert-eq])
-(import test/runner    :refer [run-all-status])
-
-(defn cstr-eq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+(defmodule decode_checked_test
+  (export)
+  (import msgpack/buf :refer [Buf buf-free hex->buf])
+  (import msgpack/decode
+    :refer
+    [MpTree MpNode mp-parse mp-tree-root mp-tree-free])
+  (import msgpack/encode
+    :refer
+    [derive-msgpack
+     derive-mp-decoder
+     MpDecodeErrors
+     mp-decode-errors-count
+     mp-decode-error-path
+     mp-decode-error-expected
+     mp-decode-error-got
+     mp-decode-errors-free])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true assert-eq])
+  (import test/runner :refer [run-all-status])
+  (defn cstr-eq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn parse-hex [h : cstr] : MpTree
-  (let [b (hex->buf h)
-        r (mp-parse b)]
-    (buf-free b)
-    (ok-val r)))
-
-(defstruct Person [name : cstr  age : int])
-(derive-msgpack   Person (name cstr) (age int))
-(derive-mp-decoder Person (name cstr) (age int))
-
-(defstruct Gauge [ratio : float  on : bool])
-(derive-msgpack    Gauge (ratio float) (on bool))
-(derive-mp-decoder Gauge (ratio float) (on bool))
-
-;; n-errors -- how many violations does `h` produce for a Person?
-(defn n-errors [h : cstr] : int
-  (let [t (parse-hex h)
-        r (:: (decode-mp-checked t (mp-tree-root t)) (Result Person MpDecodeErrors))
-        n (if (ok? r) 0 (mp-decode-errors-count (err-val r)))]
-    (if (ok? r) nil (mp-decode-errors-free (err-val r)))
-    (mp-tree-free t)
-    n))
-
-;; err-triple=? -- does violation `i` of `h` read {path, expected, got}?
-(defn err-triple=? [h : cstr i : int path : cstr expected : cstr got : cstr] : bool
-  (let [t (parse-hex h)
-        r (:: (decode-mp-checked t (mp-tree-root t)) (Result Person MpDecodeErrors))]
-    (if (ok? r)
-      (do (mp-tree-free t) false)
-      (let [e  (err-val r)
-            ok (and (cstr-eq? path     (mp-decode-error-path e i))
-                    (and (cstr-eq? expected (mp-decode-error-expected e i))
-                         (cstr-eq? got      (mp-decode-error-got e i))))]
-        (mp-decode-errors-free e)
-        (mp-tree-free t)
-        ok))))
-
-(defn __happy-tests [] : void
-  (describe "msgpack derive-mp-decoder -- a well-shaped map decodes"
-
-    (it "a valid map yields ok"
-      ;; {"name":"al","age":30}
-      (let [t (parse-hex "82a46e616d65a2616ca36167651e")
-            r (:: (decode-mp-checked t (mp-tree-root t)) (Result Person MpDecodeErrors))
-            v (assert-true (ok? r))]
-        (mp-tree-free t)
-        v))
-
-    (it "the ok value carries the decoded fields"
-      (let [t (parse-hex "82a46e616d65a2616ca36167651e")
-            r (:: (decode-mp-checked t (mp-tree-root t)) (Result Person MpDecodeErrors))
-            p (ok-val r)
-            v (assert-true (and (cstr-eq? "al" (.name p)) (= 30 (.age p))))]
-        (mp-tree-free t)
-        v))
-
-    (it "an integer satisfies a float field -- the same rule DecodeMp uses"
-      ;; {"ratio":3,"on":true}
-      (let [t (parse-hex "82a5726174696f03a26f6ec3")
-            r (:: (decode-mp-checked t (mp-tree-root t)) (Result Gauge MpDecodeErrors))
-            v (assert-true (ok? r))]
-        (mp-tree-free t)
-        v))))
-
-(defn __violation-tests [] : void
-  (describe "msgpack derive-mp-decoder -- violations accumulate, they do not stop at the first"
-
-    (it "one wrong-typed field is one violation"
-      ;; {"name":123,"age":30}
-      (assert-eq 1 (n-errors "82a46e616d657ba36167651e")))
-
-    (it "a wrong type AND a missing key are TWO violations, not one"
-      ;; {"name":123}  -- name is an int, age is absent
-      (assert-eq 2 (n-errors "81a46e616d657b")))
-
-    (it "an empty map violates every declared field"
-      (assert-eq 2 (n-errors "80")))
-
-    (it "the violation names the key, the expected type, and what was there"
-      (assert-true (err-triple=? "82a46e616d657ba36167651e" 0 "name" "string" "int")))
-
-    (it "a missing key reports \"missing\" rather than a type"
-      (assert-true (err-triple=? "81a46e616d657b" 1 "age" "int" "missing")))
-
-    (it "violations come back in field-declaration order"
-      (assert-true (and (err-triple=? "80" 0 "name" "string" "missing")
-                        (err-triple=? "80" 1 "age" "int" "missing"))))
-
-    (it "a string where an int belongs"
-      ;; {"name":"al","age":"x"}
-      (assert-true (err-triple=? "82a46e616d65a2616ca3616765a178" 0 "age" "int" "string")))
-
-    (it "a non-map root violates every field, reporting the root's own type"
-      ;; a bare 7 -- not an object at all
-      (assert-eq 2 (n-errors "07")))
-
-    (it "float and bool fields are checked with their own vocabulary"
-      ;; {"ratio":"x","on":7}
-      (let [t (parse-hex "82a5726174696fa178a26f6e07")
-            r (:: (decode-mp-checked t (mp-tree-root t)) (Result Gauge MpDecodeErrors))
-            v (if (ok? r)
-                false
-                (let [e (err-val r)
-                      o (and (= 2 (mp-decode-errors-count e))
-                             (and (cstr-eq? "float"  (mp-decode-error-expected e 0))
-                                  (and (cstr-eq? "string" (mp-decode-error-got e 0))
-                                       (and (cstr-eq? "bool" (mp-decode-error-expected e 1))
-                                            (cstr-eq? "int"  (mp-decode-error-got e 1))))))]
-                  (mp-decode-errors-free e)
-                  o))]
-        (mp-tree-free t)
-        (assert-true v)))))
-
-(defn main [] : int
-  (__happy-tests)
-  (__violation-tests)
-  (run-all-status))
-)
+  (defn parse-hex [h : cstr] : MpTree
+    (let [b (hex->buf h)
+          r (mp-parse b)]
+      (buf-free b)
+      (ok-val r)))
+  (defstruct Person [name : cstr age : int])
+  (derive-msgpack Person (name cstr) (age int))
+  (derive-mp-decoder Person (name cstr) (age int))
+  (defstruct Gauge [ratio : float on : bool])
+  (derive-msgpack Gauge (ratio float) (on bool))
+  (derive-mp-decoder Gauge (ratio float) (on bool))
+  ;; n-errors -- how many violations does `h` produce for a Person?
+  (defn n-errors [h : cstr] : int
+    (let [t (parse-hex h)
+          r (:: (decode-mp-checked t (mp-tree-root t))
+              (Result Person MpDecodeErrors))
+          n (if (ok? r) 0 (mp-decode-errors-count (err-val r)))]
+      (if (ok? r) nil (mp-decode-errors-free (err-val r)))
+      (mp-tree-free t)
+      n))
+  ;; err-triple=? -- does violation `i` of `h` read {path, expected, got}?
+  (defn err-triple=? [h : cstr i : int path : cstr expected : cstr got : cstr] : bool
+    (let [t (parse-hex h)
+          r (:: (decode-mp-checked t (mp-tree-root t))
+              (Result Person MpDecodeErrors))]
+      (if (ok? r)
+        (do (mp-tree-free t) false)
+        (let [e  (err-val r)
+              ok (and (cstr-eq? path (mp-decode-error-path e i))
+                   (and (cstr-eq? expected (mp-decode-error-expected e i))
+                     (cstr-eq? got (mp-decode-error-got e i))))]
+          (mp-decode-errors-free e)
+          (mp-tree-free t)
+          ok))))
+  (defn __happy-tests [] : void
+    (describe "msgpack derive-mp-decoder -- a well-shaped map decodes"
+      (it "a valid map yields ok"
+        ;; {"name":"al","age":30}
+        (let [t (parse-hex "82a46e616d65a2616ca36167651e")
+              r (:: (decode-mp-checked t (mp-tree-root t))
+                  (Result Person MpDecodeErrors))
+              v (assert-true (ok? r))]
+          (mp-tree-free t)
+          v))
+      (it "the ok value carries the decoded fields"
+        (let [t (parse-hex "82a46e616d65a2616ca36167651e")
+              r (:: (decode-mp-checked t (mp-tree-root t))
+                  (Result Person MpDecodeErrors))
+              p (ok-val r)
+              v (assert-true (and (cstr-eq? "al" (.name p)) (= 30 (.age p))))]
+          (mp-tree-free t)
+          v))
+      (it "an integer satisfies a float field -- the same rule DecodeMp uses"
+        ;; {"ratio":3,"on":true}
+        (let [t (parse-hex "82a5726174696f03a26f6ec3")
+              r (:: (decode-mp-checked t (mp-tree-root t))
+                  (Result Gauge MpDecodeErrors))
+              v (assert-true (ok? r))]
+          (mp-tree-free t)
+          v))))
+  (defn __violation-tests [] : void
+    (describe "msgpack derive-mp-decoder -- violations accumulate, they do not stop at the first"
+      (it "one wrong-typed field is one violation"
+        ;; {"name":123,"age":30}
+        (assert-eq 1 (n-errors "82a46e616d657ba36167651e")))
+      (it "a wrong type AND a missing key are TWO violations, not one"
+        ;; {"name":123}  -- name is an int, age is absent
+        (assert-eq 2 (n-errors "81a46e616d657b")))
+      (it "an empty map violates every declared field"
+        (assert-eq 2 (n-errors "80")))
+      (it "the violation names the key, the expected type, and what was there"
+        (assert-true (err-triple=? "82a46e616d657ba36167651e"
+                       0
+                       "name"
+                       "string"
+                       "int")))
+      (it "a missing key reports \"missing\" rather than a type"
+        (assert-true (err-triple=? "81a46e616d657b" 1 "age" "int" "missing")))
+      (it "violations come back in field-declaration order"
+        (assert-true (and (err-triple=? "80" 0 "name" "string" "missing")
+                       (err-triple=? "80" 1 "age" "int" "missing"))))
+      (it "a string where an int belongs"
+        ;; {"name":"al","age":"x"}
+        (assert-true (err-triple=? "82a46e616d65a2616ca3616765a178"
+                       0
+                       "age"
+                       "int"
+                       "string")))
+      (it "a non-map root violates every field, reporting the root's own type"
+        ;; a bare 7 -- not an object at all
+        (assert-eq 2 (n-errors "07")))
+      (it "float and bool fields are checked with their own vocabulary"
+        ;; {"ratio":"x","on":7}
+        (let [t (parse-hex "82a5726174696fa178a26f6e07")
+              r (:: (decode-mp-checked t (mp-tree-root t))
+                  (Result Gauge MpDecodeErrors))
+              v (if (ok? r)
+                  false
+                  (let [e (err-val r)
+                        o (and (= 2 (mp-decode-errors-count e))
+                            (and (cstr-eq? "float"
+                                   (mp-decode-error-expected e 0))
+                              (and (cstr-eq? "string" (mp-decode-error-got e 0))
+                                (and (cstr-eq? "bool"
+                                       (mp-decode-error-expected e 1))
+                                  (cstr-eq? "int" (mp-decode-error-got e 1))))))]
+                    (mp-decode-errors-free e)
+                    o))]
+          (mp-tree-free t)
+          (assert-true v)))))
+  (defn main [] : int (__happy-tests) (__violation-tests) (run-all-status)))

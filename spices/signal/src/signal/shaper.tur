@@ -3,169 +3,143 @@
 ;; Pure (stateless) sample-wise transforms on a Signal Sample, plus the
 ;; Pair-consuming mixers (`mix`, `add`, `multiply`) that pull from a
 ;; `Signal (Pair Sample Sample)` produced by `pair-signals`.
-
 (defmodule signal/shaper
-  (export gain offset invert abs-sf scale
-          saturate-tanh hard-clip clip
-          mix add multiply)
-
-;;; __pair-fst-f / __pair-snd-f -- local readers for the float-pair shape
-;;; produced by signal/core's __sig-pair. stdlib/pair.tur's typed helpers
-;;; are not in scope under project-mode compilation.
-(defn __pair-fst-f [p : ptr<void>] : float
-  ```c struct { double fst; double snd; } *q = (void*)(intptr_t)p;
+  (export gain
+    offset
+    invert
+    abs-sf
+    scale
+    saturate-tanh
+    hard-clip
+    clip
+    mix
+    add
+    multiply)
+  ;;; __pair-fst-f / __pair-snd-f -- local readers for the float-pair shape
+  ;;; produced by signal/core's __sig-pair. stdlib/pair.tur's typed helpers
+  ;;; are not in scope under project-mode compilation.
+  (defn __pair-fst-f [p : ptr<void>] : float
+    ```c
+    struct { double fst; double snd; } *q = (void*)(intptr_t)p;
   return q->fst;
   ```)
-
-(defn __pair-snd-f [p : ptr<void>] : float
-  ```c struct { double fst; double snd; } *q = (void*)(intptr_t)p;
+  (defn __pair-snd-f [p : ptr<void>] : float
+    ```c
+    struct { double fst; double snd; } *q = (void*)(intptr_t)p;
   return q->snd;
   ```)
-
-;; =============================================================================
-;; libm bridges
-;; =============================================================================
-
-;;; __shaper_fabs -- absolute value of a float.
-;;;
-;;; The autolink directive links libm (-lm) for every program that pulls in
-;;; this module's shapers, so fabs/tanh resolve at link time.
-(defn __shaper_fabs [x :float] :float
-  ```c
-  /* __tur_autolink__: -lm */
+  ;; =============================================================================
+  ;; libm bridges
+  ;; =============================================================================
+  ;;; __shaper_fabs -- absolute value of a float.
+  ;;;
+  ;;; The autolink directive links libm (-lm) for every program that pulls in
+  ;;; this module's shapers, so fabs/tanh resolve at link time.
+  (defn __shaper_fabs [x :float] :float
+    ```c
+    /* __tur_autolink__: -lm */
   extern double fabs(double);
   return fabs(x);
   ```)
-
-;;; __shaper_tanh -- hyperbolic tangent.
-(defn __shaper_tanh [x :float] :float
-  ```c
-  extern double tanh(double);
+  ;;; __shaper_tanh -- hyperbolic tangent.
+  (defn __shaper_tanh [x :float] :float
+    ```c
+    extern double tanh(double);
   return tanh(x);
   ```)
-
-;; =============================================================================
-;; Scalar shapers
-;; =============================================================================
-
-;;; gain -- scale a signal by a constant factor.
-;;;
-;;; Example:
-;;;   ((gain 0.5) (sine 440.0 0.0))
-(defn gain [g :float]
-  (let [gv g]
+  ;; =============================================================================
+  ;; Scalar shapers
+  ;; =============================================================================
+  ;;; gain -- scale a signal by a constant factor.
+  ;;;
+  ;;; Example:
+  ;;;   ((gain 0.5) (sine 440.0 0.0))
+  (defn gain [g :float]
+    (let [gv g]
+      (fn [^fat sig : (fn [float] float)] (fn [t :float] :float (* gv (sig t))))))
+  ;;; offset -- shift a signal by a constant: y = x + c.
+  ;;;
+  ;;; Example:
+  ;;;   ((offset 0.5) (constant 0.25)) sampled at any t => 0.75
+  (defn offset [c :float]
+    (let [cv c]
+      (fn [^fat sig : (fn [float] float)] (fn [t :float] :float (+ cv (sig t))))))
+  ;;; invert -- negate a signal: y = -x.
+  (defn invert []
+    (fn [^fat sig : (fn [float] float)] (fn [t :float] :float (- 0.0 (sig t)))))
+  ;;; abs-sf -- absolute value of a signal sample-wise.
+  (defn abs-sf []
     (fn [^fat sig : (fn [float] float)]
-      (fn [t :float] :float
-        (* gv (sig t))))))
-
-;;; offset -- shift a signal by a constant: y = x + c.
-;;;
-;;; Example:
-;;;   ((offset 0.5) (constant 0.25)) sampled at any t => 0.75
-(defn offset [c :float]
-  (let [cv c]
-    (fn [^fat sig : (fn [float] float)]
-      (fn [t :float] :float
-        (+ cv (sig t))))))
-
-;;; invert -- negate a signal: y = -x.
-(defn invert []
-  (fn [^fat sig : (fn [float] float)]
-    (fn [t :float] :float
-      (- 0.0 (sig t)))))
-
-;;; abs-sf -- absolute value of a signal sample-wise.
-(defn abs-sf []
-  (fn [^fat sig : (fn [float] float)]
-    (fn [t :float] :float
-      (__shaper_fabs (sig t)))))
-
-;;; scale -- linear remap of a value from [in-lo, in-hi] to [out-lo, out-hi].
-;;;
-;;; Pure :float -> :float (not an SF). Lift with `map-signal` when you
-;;; need it sample-wise.
-;;;
-;;; Example:
-;;;   (scale 0.0 1.0 -1.0 1.0 0.75)  ; => 0.5
-(defn scale [in-lo :float in-hi :float out-lo :float out-hi :float x :float] :float
-  (+ out-lo
-     (* (- out-hi out-lo)
-        (/ (- x in-lo) (- in-hi in-lo)))))
-
-;;; saturate-tanh -- soft-saturate via tanh: y = tanh(drive*x) / tanh(drive).
-;;;
-;;; Parameters:
-;;;   drive -- > 0; higher values saturate harder. The denominator keeps
-;;;            the peak output near +/-1.0 regardless of drive.
-;;;
-;;; Example:
-;;;   ((saturate-tanh 3.0) some-oscillator)
-(defn saturate-tanh [drive :float]
-  (let [dv drive
-        peak (__shaper_tanh drive)]
-    (fn [^fat sig : (fn [float] float)]
-      (fn [t :float] :float
-        (/ (__shaper_tanh (* dv (sig t))) peak)))))
-
-;;; hard-clip -- symmetric clip to [-limit, +limit].
-;;;
-;;; Example:
-;;;   ((hard-clip 0.9) some-osc)
-(defn hard-clip [limit :float]
-  (let [lv limit]
-    (fn [^fat sig : (fn [float] float)]
-      (fn [t :float] :float
-        (let [x (sig t)]
-          (if (< x (- 0.0 lv)) (- 0.0 lv)
-            (if (< lv x) lv x)))))))
-
-;;; clip -- asymmetric hard-clip to [lo, hi].
-;;;
-;;; Example:
-;;;   ((clip -0.2 0.8) some-osc)
-(defn clip [lo :float hi :float]
-  (let [lv lo hv hi]
-    (fn [^fat sig : (fn [float] float)]
-      (fn [t :float] :float
-        (let [x (sig t)]
-          (if (< x lv) lv
-            (if (< hv x) hv x)))))))
-
-;; =============================================================================
-;; Pair-consuming mixers
-;; =============================================================================
-
-;;; mix -- weighted mix of a Pair signal: out = alpha*x + (1-alpha)*y.
-;;;
-;;; Consumes a `Signal (Pair Sample Sample)` (the shape produced by
-;;; `pair-signals` in signal/core).
-;;;
-;;; Example:
-;;;   ((mix 0.5) (pair-signals (sine 440.0 0.0) (sine 660.0 0.0)))
-(defn mix [alpha :float]
-  (let [av alpha]
+      (fn [t :float] :float (__shaper_fabs (sig t)))))
+  ;;; scale -- linear remap of a value from [in-lo, in-hi] to [out-lo, out-hi].
+  ;;;
+  ;;; Pure :float -> :float (not an SF). Lift with `map-signal` when you
+  ;;; need it sample-wise.
+  ;;;
+  ;;; Example:
+  ;;;   (scale 0.0 1.0 -1.0 1.0 0.75)  ; => 0.5
+  (defn scale [in-lo :float in-hi :float out-lo :float out-hi :float x :float] :float
+    (+ out-lo (* (- out-hi out-lo) (/ (- x in-lo) (- in-hi in-lo)))))
+  ;;; saturate-tanh -- soft-saturate via tanh: y = tanh(drive*x) / tanh(drive).
+  ;;;
+  ;;; Parameters:
+  ;;;   drive -- > 0; higher values saturate harder. The denominator keeps
+  ;;;            the peak output near +/-1.0 regardless of drive.
+  ;;;
+  ;;; Example:
+  ;;;   ((saturate-tanh 3.0) some-oscillator)
+  (defn saturate-tanh [drive :float]
+    (let [dv   drive
+          peak (__shaper_tanh drive)]
+      (fn [^fat sig : (fn [float] float)]
+        (fn [t :float] :float (/ (__shaper_tanh (* dv (sig t))) peak)))))
+  ;;; hard-clip -- symmetric clip to [-limit, +limit].
+  ;;;
+  ;;; Example:
+  ;;;   ((hard-clip 0.9) some-osc)
+  (defn hard-clip [limit :float]
+    (let [lv limit]
+      (fn [^fat sig : (fn [float] float)]
+        (fn [t :float] :float
+          (let [x (sig t)] (if (< x (- 0.0 lv)) (- 0.0 lv) (if (< lv x) lv x)))))))
+  ;;; clip -- asymmetric hard-clip to [lo, hi].
+  ;;;
+  ;;; Example:
+  ;;;   ((clip -0.2 0.8) some-osc)
+  (defn clip [lo :float hi :float]
+    (let [lv lo
+          hv hi]
+      (fn [^fat sig : (fn [float] float)]
+        (fn [t :float] :float
+          (let [x (sig t)] (if (< x lv) lv (if (< hv x) hv x)))))))
+  ;; =============================================================================
+  ;; Pair-consuming mixers
+  ;; =============================================================================
+  ;;; mix -- weighted mix of a Pair signal: out = alpha*x + (1-alpha)*y.
+  ;;;
+  ;;; Consumes a `Signal (Pair Sample Sample)` (the shape produced by
+  ;;; `pair-signals` in signal/core).
+  ;;;
+  ;;; Example:
+  ;;;   ((mix 0.5) (pair-signals (sine 440.0 0.0) (sine 660.0 0.0)))
+  (defn mix [alpha :float]
+    (let [av alpha]
+      (fn [^fat prod-sig : (fn [float] #fx{} ptr<void>)]
+        (fn [t :float] :float
+          (let [p (prod-sig t)
+                x (__pair-fst-f p)
+                y (__pair-snd-f p)]
+            (+ (* av x) (* (- 1.0 av) y)))))))
+  ;;; add -- sum a Pair signal sample-wise.
+  (defn add []
     (fn [^fat prod-sig : (fn [float] #fx{} ptr<void>)]
       (fn [t :float] :float
-        (let [p (prod-sig t)
-              x (__pair-fst-f p)
-              y (__pair-snd-f p)]
-          (+ (* av x) (* (- 1.0 av) y)))))))
-
-;;; add -- sum a Pair signal sample-wise.
-(defn add []
-  (fn [^fat prod-sig : (fn [float] #fx{} ptr<void>)]
-    (fn [t :float] :float
-      (let [p (prod-sig t)]
-        (+ (__pair-fst-f p) (__pair-snd-f p))))))
-
-;;; multiply -- product of a Pair signal sample-wise.
-;;;
-;;; Example:
-;;;   ((multiply) (pair-signals lfo carrier))
-(defn multiply []
-  (fn [^fat prod-sig : (fn [float] #fx{} ptr<void>)]
-    (fn [t :float] :float
-      (let [p (prod-sig t)]
-        (* (__pair-fst-f p) (__pair-snd-f p))))))
-
-) ;; end defmodule signal/shaper
+        (let [p (prod-sig t)] (+ (__pair-fst-f p) (__pair-snd-f p))))))
+  ;;; multiply -- product of a Pair signal sample-wise.
+  ;;;
+  ;;; Example:
+  ;;;   ((multiply) (pair-signals lfo carrier))
+  (defn multiply []
+    (fn [^fat prod-sig : (fn [float] #fx{} ptr<void>)]
+      (fn [t :float] :float
+        (let [p (prod-sig t)] (* (__pair-fst-f p) (__pair-snd-f p))))))) ;; end defmodule signal/shaper

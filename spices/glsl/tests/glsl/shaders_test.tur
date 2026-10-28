@@ -1,207 +1,182 @@
 ;; tests/glsl/shaders_test.tur -- tests for glsl/shaders, glsl/builtins, and glsl/stdlib.
 (defmodule glsl/tests/shaders
-  (import glsl/shaders  :refer [glsl-input glsl-output glsl-uniform
-                                 glsl-vertex-shader glsl-fragment-shader])
-  (import glsl/builtins :refer [glsl-dot cross normalize glsl-length mix clamp
-                                 vec2 vec3 vec4 swizzle texture
-                                 sin cos sqrt pow abs
-                                 dFdx dFdy glsl-call])
-  (import glsl/stdlib   :refer [phong-lighting fresnel gamma-correct])
-  (import glsl/codegen  :refer [glsl-stmts glsl-cat2])
-  (import glsl/core     :refer [glsl-let glsl-set! glsl-return glsl-discard])
-  (import test/assert   :refer [assert-true])
-  (import test/suite    :refer [describe it])
-  (import test/runner   :refer [run-all-status])
-
+  (import glsl/shaders
+    :refer
+    [glsl-input
+     glsl-output
+     glsl-uniform
+     glsl-vertex-shader
+     glsl-fragment-shader])
+  (import glsl/builtins
+    :refer
+    [glsl-dot
+     cross
+     normalize
+     glsl-length
+     mix
+     clamp
+     vec2
+     vec3
+     vec4
+     swizzle
+     texture
+     sin
+     cos
+     sqrt
+     pow
+     abs
+     dFdx
+     dFdy
+     glsl-call])
+  (import glsl/stdlib :refer [phong-lighting fresnel gamma-correct])
+  (import glsl/codegen :refer [glsl-stmts glsl-cat2])
+  (import glsl/core :refer [glsl-let glsl-set! glsl-return glsl-discard])
+  (import test/assert :refer [assert-true])
+  (import test/suite :refer [describe it])
+  (import test/runner :refer [run-all-status])
   ;;; cstr= -- compare two C strings for equality.
   (defn cstr= [a : cstr b : cstr] : bool
     ```c
     #include <string.h>
     return strcmp(a, b) == 0;
     ```)
-
   ;;; cstr-contains -- return true if haystack contains needle.
   (defn cstr-contains [haystack : cstr needle : cstr] : bool
     ```c
     #include <string.h>
     return strstr(haystack, needle) != NULL;
     ```)
-
   ;; describe/it register a test only when executed at runtime, so the suites
   ;; live inside `main` (like sized_test), not at top-level module scope.
   (defn main [] : int
-   (do
-
-  (describe "glsl/shaders -- declaration builders"
-
-    (it "glsl-input builds layout(location) in declaration"
-      (assert-true (cstr= (glsl-input "aPos" ":vec3" 0)
-                          "layout(location = 0) in vec3 aPos;")))
-
-    (it "glsl-input with location 1"
-      (assert-true (cstr= (glsl-input "aNormal" ":vec3" 1)
-                          "layout(location = 1) in vec3 aNormal;")))
-
-    (it "glsl-input with vec2 type"
-      (assert-true (cstr= (glsl-input "aTexCoord" ":vec2" 2)
-                          "layout(location = 2) in vec2 aTexCoord;")))
-
-    (it "glsl-output builds out declaration"
-      (assert-true (cstr= (glsl-output "FragColor" ":vec4")
-                          "out vec4 FragColor;")))
-
-    (it "glsl-output with vec3"
-      (assert-true (cstr= (glsl-output "ourColor" ":vec3")
-                          "out vec3 ourColor;")))
-
-    (it "glsl-uniform builds uniform declaration"
-      (assert-true (cstr= (glsl-uniform "model" ":mat4")
-                          "uniform mat4 model;")))
-
-    (it "glsl-uniform with sampler2D"
-      (assert-true (cstr= (glsl-uniform "diffuseMap" ":sampler-2d")
-                          "uniform sampler2D diffuseMap;"))))
-
-  (describe "glsl/shaders -- vertex shader assembly"
-
-    (it "glsl-vertex-shader produces #version line"
-      (let [src (glsl-vertex-shader "330 core" (vec-of) (glsl-return "0.0"))]
-        (assert-true (cstr-contains src "#version 330 core"))))
-
-    (it "glsl-vertex-shader produces void main"
-      (let [src (glsl-vertex-shader "330 core" (vec-of) (glsl-return "0.0"))]
-        (assert-true (cstr-contains src "void main()"))))
-
-    (it "glsl-vertex-shader includes main body"
-      (let [src (glsl-vertex-shader "330 core" (vec-of) (glsl-set! "gl_Position" "vec4(0.0)"))]
-        (assert-true (cstr-contains src "gl_Position = vec4(0.0);"))))
-
-    (it "glsl-vertex-shader includes input declarations"
-      (let [decls (vec-of (glsl-input "aPos" ":vec3" 0))
-            src   (glsl-vertex-shader "330 core" decls (glsl-return "0.0"))]
-        (assert-true (cstr-contains src "layout(location = 0) in vec3 aPos;"))))
-
-    (it "glsl-vertex-shader includes uniform declarations"
-      (let [decls (vec-of (glsl-uniform "model" ":mat4"))
-            src   (glsl-vertex-shader "330 core" decls (glsl-return "0.0"))]
-        (assert-true (cstr-contains src "uniform mat4 model;"))))
-
-    (it "complete minimal vertex shader contains all expected sections"
-      (let [decls (vec-of (glsl-input "aPos" ":vec3" 0)
-                          (glsl-uniform "model" ":mat4"))
-            body  (glsl-set! "gl_Position" "model * vec4(aPos, 1.0)")
-            src   (glsl-vertex-shader "330 core" decls body)
-            ok    (and (cstr-contains src "#version 330 core")
-                       (and (cstr-contains src "layout(location = 0) in vec3 aPos;")
-                            (and (cstr-contains src "uniform mat4 model;")
-                                 (and (cstr-contains src "void main()")
-                                      (cstr-contains src "gl_Position = model * vec4(aPos, 1.0);")))))]
-        (assert-true ok))))
-
-  (describe "glsl/shaders -- fragment shader assembly"
-
-    (it "glsl-fragment-shader produces #version line"
-      (let [src (glsl-fragment-shader "330 core" (vec-of) (glsl-return "0.0"))]
-        (assert-true (cstr-contains src "#version 330 core"))))
-
-    (it "glsl-fragment-shader includes output and body"
-      (let [decls (vec-of (glsl-output "FragColor" ":vec4"))
-            body  (glsl-set! "FragColor" "vec4(1.0, 0.0, 0.0, 1.0)")
-            src   (glsl-fragment-shader "330 core" decls body)]
-        (assert-true (cstr-contains src "out vec4 FragColor;"))
-        (assert-true (cstr-contains src "FragColor = vec4(1.0, 0.0, 0.0, 1.0);")))))
-
-  (describe "glsl/builtins -- math and vector functions"
-
-    (it "vec2 builds constructor"
-      (assert-true (cstr= (vec2 "1.0" "0.0") "vec2(1.0, 0.0)")))
-
-    (it "vec3 builds constructor"
-      (assert-true (cstr= (vec3 "1.0" "0.5" "0.0") "vec3(1.0, 0.5, 0.0)")))
-
-    (it "vec4 builds constructor"
-      (assert-true (cstr= (vec4 "pos" "1.0" "0.0" "0.0") "vec4(pos, 1.0, 0.0, 0.0)")))
-
-    (it "glsl-dot builds dot product call"
-      (assert-true (cstr= (glsl-dot "normal" "lightDir") "dot(normal, lightDir)")))
-
-    (it "cross builds cross product call"
-      (assert-true (cstr= (cross "a" "b") "cross(a, b)")))
-
-    (it "normalize builds normalize call"
-      (assert-true (cstr= (normalize "v") "normalize(v)")))
-
-    (it "glsl-length builds length call"
-      (assert-true (cstr= (glsl-length "v") "length(v)")))
-
-    (it "mix builds mix call"
-      (assert-true (cstr= (mix "a" "b" "0.5") "mix(a, b, 0.5)")))
-
-    (it "clamp builds clamp call"
-      (assert-true (cstr= (clamp "x" "0.0" "1.0") "clamp(x, 0.0, 1.0)")))
-
-    (it "sin builds call"
-      (assert-true (cstr= (sin "angle") "sin(angle)")))
-
-    (it "cos builds call"
-      (assert-true (cstr= (cos "angle") "cos(angle)")))
-
-    (it "sqrt builds call"
-      (assert-true (cstr= (sqrt "x") "sqrt(x)")))
-
-    (it "pow builds pow call"
-      (assert-true (cstr= (pow "base" "exp") "pow(base, exp)")))
-
-    (it "abs builds abs call"
-      (assert-true (cstr= (abs "x") "abs(x)")))
-
-    (it "dFdx builds derivative call"
-      (assert-true (cstr= (dFdx "x") "dFdx(x)")))
-
-    (it "dFdy builds derivative call"
-      (assert-true (cstr= (dFdy "x") "dFdy(x)")))
-
-    (it "swizzle strips leading colon from component keyword"
-      (assert-true (cstr= (swizzle "color" ":rgb") "color.rgb")))
-
-    (it "swizzle with single component"
-      (assert-true (cstr= (swizzle "color" ":a") "color.a")))
-
-    (it "texture builds texture call"
-      (assert-true (cstr= (texture "diffuseMap" "TexCoord")
-                          "texture(diffuseMap, TexCoord)")))
-
-    (it "glsl-call builds arbitrary function call"
-      (assert-true (cstr= (glsl-call "myFunc" (cons "a" (cons "b" 0)))
-                          "myFunc(a, b)"))))
-
-  (describe "glsl/stdlib -- standard lighting functions"
-
-    (it "phong-lighting returns a non-empty string"
-      (let [src (phong-lighting)]
-        (assert-true (cstr-contains src "phong_lighting"))))
-
-    (it "phong-lighting source contains ambient calculation"
-      (assert-true (cstr-contains (phong-lighting) "ambientColor")))
-
-    (it "phong-lighting source contains diffuse calculation"
-      (assert-true (cstr-contains (phong-lighting) "diffuseColor")))
-
-    (it "phong-lighting source contains specular calculation"
-      (assert-true (cstr-contains (phong-lighting) "specularColor")))
-
-    (it "fresnel returns a non-empty string"
-      (let [src (fresnel)]
-        (assert-true (cstr-contains src "fresnel"))))
-
-    (it "fresnel source uses Schlick approximation"
-      (assert-true (cstr-contains (fresnel) "pow(1.0 -")))
-
-    (it "gamma-correct returns a non-empty string"
-      (let [src (gamma-correct)]
-        (assert-true (cstr-contains src "gamma_correct"))))
-
-    (it "gamma-correct source uses invGamma"
-      (assert-true (cstr-contains (gamma-correct) "invGamma"))))
-
-    (run-all-status))))
+    (do
+      (describe "glsl/shaders -- declaration builders"
+        (it "glsl-input builds layout(location) in declaration"
+          (assert-true (cstr= (glsl-input "aPos" ":vec3" 0)
+                         "layout(location = 0) in vec3 aPos;")))
+        (it "glsl-input with location 1"
+          (assert-true (cstr= (glsl-input "aNormal" ":vec3" 1)
+                         "layout(location = 1) in vec3 aNormal;")))
+        (it "glsl-input with vec2 type"
+          (assert-true (cstr= (glsl-input "aTexCoord" ":vec2" 2)
+                         "layout(location = 2) in vec2 aTexCoord;")))
+        (it "glsl-output builds out declaration"
+          (assert-true (cstr= (glsl-output "FragColor" ":vec4")
+                         "out vec4 FragColor;")))
+        (it "glsl-output with vec3"
+          (assert-true (cstr= (glsl-output "ourColor" ":vec3")
+                         "out vec3 ourColor;")))
+        (it "glsl-uniform builds uniform declaration"
+          (assert-true (cstr= (glsl-uniform "model" ":mat4")
+                         "uniform mat4 model;")))
+        (it "glsl-uniform with sampler2D"
+          (assert-true (cstr= (glsl-uniform "diffuseMap" ":sampler-2d")
+                         "uniform sampler2D diffuseMap;"))))
+      (describe "glsl/shaders -- vertex shader assembly"
+        (it "glsl-vertex-shader produces #version line"
+          (let [src (glsl-vertex-shader "330 core" (vec-of) (glsl-return "0.0"))]
+            (assert-true (cstr-contains src "#version 330 core"))))
+        (it "glsl-vertex-shader produces void main"
+          (let [src (glsl-vertex-shader "330 core" (vec-of) (glsl-return "0.0"))]
+            (assert-true (cstr-contains src "void main()"))))
+        (it "glsl-vertex-shader includes main body"
+          (let [src (glsl-vertex-shader "330 core"
+                      (vec-of)
+                      (glsl-set! "gl_Position" "vec4(0.0)"))]
+            (assert-true (cstr-contains src "gl_Position = vec4(0.0);"))))
+        (it "glsl-vertex-shader includes input declarations"
+          (let [decls (vec-of (glsl-input "aPos" ":vec3" 0))
+                src   (glsl-vertex-shader "330 core" decls (glsl-return "0.0"))]
+            (assert-true (cstr-contains src
+                           "layout(location = 0) in vec3 aPos;"))))
+        (it "glsl-vertex-shader includes uniform declarations"
+          (let [decls (vec-of (glsl-uniform "model" ":mat4"))
+                src   (glsl-vertex-shader "330 core" decls (glsl-return "0.0"))]
+            (assert-true (cstr-contains src "uniform mat4 model;"))))
+        (it "complete minimal vertex shader contains all expected sections"
+          (let [decls (vec-of (glsl-input "aPos" ":vec3" 0)
+                        (glsl-uniform "model" ":mat4"))
+                body  (glsl-set! "gl_Position" "model * vec4(aPos, 1.0)")
+                src   (glsl-vertex-shader "330 core" decls body)
+                ok    (and (cstr-contains src "#version 330 core")
+                        (and (cstr-contains src
+                               "layout(location = 0) in vec3 aPos;")
+                          (and (cstr-contains src "uniform mat4 model;")
+                            (and (cstr-contains src "void main()")
+                              (cstr-contains src
+                                "gl_Position = model * vec4(aPos, 1.0);")))))]
+            (assert-true ok))))
+      (describe "glsl/shaders -- fragment shader assembly"
+        (it "glsl-fragment-shader produces #version line"
+          (let [src (glsl-fragment-shader "330 core"
+                      (vec-of)
+                      (glsl-return "0.0"))]
+            (assert-true (cstr-contains src "#version 330 core"))))
+        (it "glsl-fragment-shader includes output and body"
+          (let [decls (vec-of (glsl-output "FragColor" ":vec4"))
+                body  (glsl-set! "FragColor" "vec4(1.0, 0.0, 0.0, 1.0)")
+                src   (glsl-fragment-shader "330 core" decls body)]
+            (assert-true (cstr-contains src "out vec4 FragColor;"))
+            (assert-true (cstr-contains src
+                           "FragColor = vec4(1.0, 0.0, 0.0, 1.0);")))))
+      (describe "glsl/builtins -- math and vector functions"
+        (it "vec2 builds constructor"
+          (assert-true (cstr= (vec2 "1.0" "0.0") "vec2(1.0, 0.0)")))
+        (it "vec3 builds constructor"
+          (assert-true (cstr= (vec3 "1.0" "0.5" "0.0") "vec3(1.0, 0.5, 0.0)")))
+        (it "vec4 builds constructor"
+          (assert-true (cstr= (vec4 "pos" "1.0" "0.0" "0.0")
+                         "vec4(pos, 1.0, 0.0, 0.0)")))
+        (it "glsl-dot builds dot product call"
+          (assert-true (cstr= (glsl-dot "normal" "lightDir")
+                         "dot(normal, lightDir)")))
+        (it "cross builds cross product call"
+          (assert-true (cstr= (cross "a" "b") "cross(a, b)")))
+        (it "normalize builds normalize call"
+          (assert-true (cstr= (normalize "v") "normalize(v)")))
+        (it "glsl-length builds length call"
+          (assert-true (cstr= (glsl-length "v") "length(v)")))
+        (it "mix builds mix call"
+          (assert-true (cstr= (mix "a" "b" "0.5") "mix(a, b, 0.5)")))
+        (it "clamp builds clamp call"
+          (assert-true (cstr= (clamp "x" "0.0" "1.0") "clamp(x, 0.0, 1.0)")))
+        (it "sin builds call" (assert-true (cstr= (sin "angle") "sin(angle)")))
+        (it "cos builds call" (assert-true (cstr= (cos "angle") "cos(angle)")))
+        (it "sqrt builds call" (assert-true (cstr= (sqrt "x") "sqrt(x)")))
+        (it "pow builds pow call"
+          (assert-true (cstr= (pow "base" "exp") "pow(base, exp)")))
+        (it "abs builds abs call" (assert-true (cstr= (abs "x") "abs(x)")))
+        (it "dFdx builds derivative call"
+          (assert-true (cstr= (dFdx "x") "dFdx(x)")))
+        (it "dFdy builds derivative call"
+          (assert-true (cstr= (dFdy "x") "dFdy(x)")))
+        (it "swizzle strips leading colon from component keyword"
+          (assert-true (cstr= (swizzle "color" ":rgb") "color.rgb")))
+        (it "swizzle with single component"
+          (assert-true (cstr= (swizzle "color" ":a") "color.a")))
+        (it "texture builds texture call"
+          (assert-true (cstr= (texture "diffuseMap" "TexCoord")
+                         "texture(diffuseMap, TexCoord)")))
+        (it "glsl-call builds arbitrary function call"
+          (assert-true (cstr= (glsl-call "myFunc" (cons "a" (cons "b" 0)))
+                         "myFunc(a, b)"))))
+      (describe "glsl/stdlib -- standard lighting functions"
+        (it "phong-lighting returns a non-empty string"
+          (let [src (phong-lighting)]
+            (assert-true (cstr-contains src "phong_lighting"))))
+        (it "phong-lighting source contains ambient calculation"
+          (assert-true (cstr-contains (phong-lighting) "ambientColor")))
+        (it "phong-lighting source contains diffuse calculation"
+          (assert-true (cstr-contains (phong-lighting) "diffuseColor")))
+        (it "phong-lighting source contains specular calculation"
+          (assert-true (cstr-contains (phong-lighting) "specularColor")))
+        (it "fresnel returns a non-empty string"
+          (let [src (fresnel)] (assert-true (cstr-contains src "fresnel"))))
+        (it "fresnel source uses Schlick approximation"
+          (assert-true (cstr-contains (fresnel) "pow(1.0 -")))
+        (it "gamma-correct returns a non-empty string"
+          (let [src (gamma-correct)]
+            (assert-true (cstr-contains src "gamma_correct"))))
+        (it "gamma-correct source uses invGamma"
+          (assert-true (cstr-contains (gamma-correct) "invGamma"))))
+      (run-all-status))))

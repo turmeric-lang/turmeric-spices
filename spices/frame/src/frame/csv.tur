@@ -12,35 +12,39 @@
 ;; The parser materializes the entire input into an intermediate `__csv-table`
 ;; before column construction.  Streaming and chunked readers are tracked as
 ;; future-spice `tur-frame-stream`.
-
 (defmodule frame/csv
-  (export read-csv read-csv-string read-csv-typed
-          write-csv write-csv-string)
-
-  (import frame/type    :refer [type-int64 type-float64 type-bool type-utf8])
-  (import frame/schema  :refer [field schema schema-arity schema-field-at
-                                 schema-types])
-  (import frame/column  :refer [column-length column-type
-                                 column-int64-at column-float64-at
-                                 column-bool-at column-utf8-at
-                                 column-int32-at
-                                 column-builder builder-append-int64
-                                 builder-append-int32
-                                 builder-append-float64 builder-append-bool
-                                 builder-append-utf8 builder-append-null
-                                 builder-finish])
-  (import frame/frame   :refer [frame frame-nrows frame-ncols frame-schema
-                                 frame-column-at])
-
-;; ---------------------------------------------------------------------------
-;; Private cons helpers (namespaced per file to avoid C symbol collisions).
-;; ---------------------------------------------------------------------------
-
-(defn __c-nil [] : int ```c return 0; ```)
-
-(defn __c-cons [v : int n : int] : int
-  ```c
-  #include <stdlib.h>
+  (export read-csv read-csv-string read-csv-typed write-csv write-csv-string)
+  (import frame/type :refer [type-int64 type-float64 type-bool type-utf8])
+  (import frame/schema
+    :refer
+    [field schema schema-arity schema-field-at schema-types])
+  (import frame/column
+    :refer
+    [column-length
+     column-type
+     column-int64-at
+     column-float64-at
+     column-bool-at
+     column-utf8-at
+     column-int32-at
+     column-builder
+     builder-append-int64
+     builder-append-int32
+     builder-append-float64
+     builder-append-bool
+     builder-append-utf8
+     builder-append-null
+     builder-finish])
+  (import frame/frame
+    :refer
+    [frame frame-nrows frame-ncols frame-schema frame-column-at])
+  ;; ---------------------------------------------------------------------------
+  ;; Private cons helpers (namespaced per file to avoid C symbol collisions).
+  ;; ---------------------------------------------------------------------------
+  (defn __c-nil [] : int ```c return 0; ```)
+  (defn __c-cons [v : int n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   struct __cons *c = (struct __cons *)malloc(sizeof(*c));
@@ -48,34 +52,32 @@
   c->value = v; c->next = n;
   return (int64_t)(intptr_t)c;
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Intermediate parsed table.  All cells are heap-owned cstrs (or NULL for
-;; empty).  The whole thing is freed via __csv-table-free.
-;;
-;;   struct __csv_table {
-;;     int64_t n_rows;        // data rows only (excluding header)
-;;     int64_t n_cols;
-;;     char **headers;        // headers[c] or NULL when has_header = 0
-;;     char ***cells;         // cells[r][c]
-;;   };
-;; ---------------------------------------------------------------------------
-
-;;; __csv-parse-string -- parse a NUL-terminated CSV blob into a __csv_table.
-;;;
-;;; Parameters:
-;;;   src         -- :cstr input buffer (caller-owned; not freed)
-;;;   delim       -- :int field separator (codepoint; pass 0 for ',')
-;;;   quote       -- :int quote character (codepoint; pass 0 for '"')
-;;;   has-header  -- :int 0 or 1
-;;;
-;;; Returns:
-;;;   :int  opaque handle, or 0 on OOM / empty input.
-;;;
-;;; Since: FR3
-(defn __csv-parse-string [src : cstr delim : int quote : int has-header : int] : int
-  ```c
-  #include <stdlib.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Intermediate parsed table.  All cells are heap-owned cstrs (or NULL for
+  ;; empty).  The whole thing is freed via __csv-table-free.
+  ;;
+  ;;   struct __csv_table {
+  ;;     int64_t n_rows;        // data rows only (excluding header)
+  ;;     int64_t n_cols;
+  ;;     char **headers;        // headers[c] or NULL when has_header = 0
+  ;;     char ***cells;         // cells[r][c]
+  ;;   };
+  ;; ---------------------------------------------------------------------------
+  ;;; __csv-parse-string -- parse a NUL-terminated CSV blob into a __csv_table.
+  ;;;
+  ;;; Parameters:
+  ;;;   src         -- :cstr input buffer (caller-owned; not freed)
+  ;;;   delim       -- :int field separator (codepoint; pass 0 for ',')
+  ;;;   quote       -- :int quote character (codepoint; pass 0 for '"')
+  ;;;   has-header  -- :int 0 or 1
+  ;;;
+  ;;; Returns:
+  ;;;   :int  opaque handle, or 0 on OOM / empty input.
+  ;;;
+  ;;; Since: FR3
+  (defn __csv-parse-string [src : cstr delim : int quote : int has-header : int] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
   struct __csv_table {
@@ -229,33 +231,30 @@
   free(buf);
   return (int64_t)(intptr_t)tbl;
   ```)
-
-;;; __csv-table-rows -- number of data rows in a parsed table.
-(defn __csv-table-rows [tbl : int] : int
-  ```c
-  #include <stdint.h>
+  ;;; __csv-table-rows -- number of data rows in a parsed table.
+  (defn __csv-table-rows [tbl : int] : int
+    ```c
+    #include <stdint.h>
   struct __csv_table {
     int64_t n_rows; int64_t n_cols; char **headers; char ***cells;
   };
   if (!tbl) return 0;
   return ((struct __csv_table *)(intptr_t)tbl)->n_rows;
   ```)
-
-;;; __csv-table-cols -- number of columns in a parsed table.
-(defn __csv-table-cols [tbl : int] : int
-  ```c
-  #include <stdint.h>
+  ;;; __csv-table-cols -- number of columns in a parsed table.
+  (defn __csv-table-cols [tbl : int] : int
+    ```c
+    #include <stdint.h>
   struct __csv_table {
     int64_t n_rows; int64_t n_cols; char **headers; char ***cells;
   };
   if (!tbl) return 0;
   return ((struct __csv_table *)(intptr_t)tbl)->n_cols;
   ```)
-
-;;; __csv-table-cell -- cell at (row, col); empty cells return "".
-(defn __csv-table-cell [tbl : int r : int c : int] : cstr
-  ```c
-  #include <stdint.h>
+  ;;; __csv-table-cell -- cell at (row, col); empty cells return "".
+  (defn __csv-table-cell [tbl : int r : int c : int] : cstr
+    ```c
+    #include <stdint.h>
   struct __csv_table {
     int64_t n_rows; int64_t n_cols; char **headers; char ***cells;
   };
@@ -265,11 +264,10 @@
   const char *p = t->cells[r][c];
   return p ? (const char *)(intptr_t)p : (const char *)(intptr_t)"";
   ```)
-
-;;; __csv-table-header -- header for column c, or "col_N" if no header row.
-(defn __csv-table-header [tbl : int c : int] : cstr
-  ```c
-  #include <stdio.h>
+  ;;; __csv-table-header -- header for column c, or "col_N" if no header row.
+  (defn __csv-table-header [tbl : int c : int] : cstr
+    ```c
+    #include <stdio.h>
   #include <stdint.h>
   struct __csv_table {
     int64_t n_rows; int64_t n_cols; char **headers; char ***cells;
@@ -288,11 +286,10 @@
   snprintf(slot, 32, "col_%lld", (long long)c);
   return (const char *)(intptr_t)slot;
   ```)
-
-;;; __csv-table-free -- release a parsed table.
-(defn __csv-table-free [tbl : int] : void
-  ```c
-  #include <stdlib.h>
+  ;;; __csv-table-free -- release a parsed table.
+  (defn __csv-table-free [tbl : int] : void
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __csv_table {
     int64_t n_rows; int64_t n_cols; char **headers; char ***cells;
@@ -317,15 +314,13 @@
   }
   free(t);
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Cell parsing helpers.
-;; ---------------------------------------------------------------------------
-
-;;; __csv-is-null? -- true for empty, null-str match, NA/NaN/NULL (case-insensitive).
-(defn __csv-is-null? [s : cstr null-str : cstr] : bool
-  ```c
-  #include <string.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Cell parsing helpers.
+  ;; ---------------------------------------------------------------------------
+  ;;; __csv-is-null? -- true for empty, null-str match, NA/NaN/NULL (case-insensitive).
+  (defn __csv-is-null? [s : cstr null-str : cstr] : bool
+    ```c
+    #include <string.h>
   #include <stdint.h>
   const char *p = (const char *)(intptr_t)s;
   const char *q = (const char *)(intptr_t)null_str;
@@ -336,11 +331,10 @@
   if ((p[0] == 'N' || p[0] == 'n') && (p[1] == 'U' || p[1] == 'u') && (p[2] == 'L' || p[2] == 'l') && (p[3] == 'L' || p[3] == 'l') && p[4] == '\0') return true;
   return false;
   ```)
-
-;;; __csv-try-int64 -- parse s as int64; returns 1 if successful, 0 otherwise.
-(defn __csv-try-int64 [s : cstr] : bool
-  ```c
-  #include <stdlib.h>
+  ;;; __csv-try-int64 -- parse s as int64; returns 1 if successful, 0 otherwise.
+  (defn __csv-try-int64 [s : cstr] : bool
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   const char *p = (const char *)(intptr_t)s;
   if (!p || !*p) return false;
@@ -348,35 +342,31 @@
   (void)strtoll(p, &endp, 10);
   return endp != p && *endp == '\0';
   ```)
-
-(defn __csv-parse-int64 [s : cstr] : int
-  ```c
-  #include <stdlib.h>
+  (defn __csv-parse-int64 [s : cstr] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   const char *p = (const char *)(intptr_t)s;
   return (int64_t)strtoll(p, NULL, 10);
   ```)
-
-(defn __csv-try-float64 [s : cstr] : bool
-  ```c
-  #include <stdlib.h>
+  (defn __csv-try-float64 [s : cstr] : bool
+    ```c
+    #include <stdlib.h>
   const char *p = (const char *)(intptr_t)s;
   if (!p || !*p) return false;
   char *endp;
   (void)strtod(p, &endp);
   return endp != p && *endp == '\0';
   ```)
-
-(defn __csv-parse-float64 [s : cstr] : float
-  ```c
-  #include <stdlib.h>
+  (defn __csv-parse-float64 [s : cstr] : float
+    ```c
+    #include <stdlib.h>
   const char *p = (const char *)(intptr_t)s;
   return strtod(p, NULL);
   ```)
-
-(defn __csv-try-bool [s : cstr] : bool
-  ```c
-  #include <string.h>
+  (defn __csv-try-bool [s : cstr] : bool
+    ```c
+    #include <string.h>
   const char *p = (const char *)(intptr_t)s;
   if (!p || !*p) return false;
   size_t n = strlen(p);
@@ -392,23 +382,20 @@
   #undef LOWER_
   return false;
   ```)
-
-(defn __csv-parse-bool [s : cstr] : int
-  ```c
-  const char *p = (const char *)(intptr_t)s;
+  (defn __csv-parse-bool [s : cstr] : int
+    ```c
+    const char *p = (const char *)(intptr_t)s;
   if (!p) return 0;
   char c0 = p[0];
   return (c0 == 't' || c0 == 'T') ? 1 : 0;
   ```)
-
-;; ---------------------------------------------------------------------------
-;; FR9 -- ISO date / timestamp parsing.
-;; ---------------------------------------------------------------------------
-
-;;; __csv-try-date32 -- match strict "YYYY-MM-DD" (10 chars, all digits/dashes).
-(defn __csv-try-date32 [s : cstr] : bool
-  ```c
-  #include <string.h>
+  ;; ---------------------------------------------------------------------------
+  ;; FR9 -- ISO date / timestamp parsing.
+  ;; ---------------------------------------------------------------------------
+  ;;; __csv-try-date32 -- match strict "YYYY-MM-DD" (10 chars, all digits/dashes).
+  (defn __csv-try-date32 [s : cstr] : bool
+    ```c
+    #include <string.h>
   const char *p = (const char *)(intptr_t)s;
   if (!p || strlen(p) != 10) return false;
   for (int i = 0; i < 10; i++) {
@@ -417,12 +404,11 @@
   }
   return true;
   ```)
-
-;;; __csv-parse-date32 -- "YYYY-MM-DD" -> days since 1970-01-01 (Howard
-;;; Hinnant's days_from_civil).
-(defn __csv-parse-date32 [s : cstr] : int
-  ```c
-  #include <stdint.h>
+  ;;; __csv-parse-date32 -- "YYYY-MM-DD" -> days since 1970-01-01 (Howard
+  ;;; Hinnant's days_from_civil).
+  (defn __csv-parse-date32 [s : cstr] : int
+    ```c
+    #include <stdint.h>
   const char *p = (const char *)(intptr_t)s;
   int y = (p[0]-'0')*1000 + (p[1]-'0')*100 + (p[2]-'0')*10 + (p[3]-'0');
   int m = (p[5]-'0')*10 + (p[6]-'0');
@@ -434,11 +420,10 @@
   unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
   return (int64_t)era * 146097LL + (int64_t)doe - 719468LL;
   ```)
-
-;;; __csv-try-timestamp -- match "YYYY-MM-DD HH:MM:SS" (19 chars) or with 'T'.
-(defn __csv-try-timestamp [s : cstr] : bool
-  ```c
-  #include <string.h>
+  ;;; __csv-try-timestamp -- match "YYYY-MM-DD HH:MM:SS" (19 chars) or with 'T'.
+  (defn __csv-try-timestamp [s : cstr] : bool
+    ```c
+    #include <string.h>
   const char *p = (const char *)(intptr_t)s;
   if (!p || strlen(p) != 19) return false;
   for (int i = 0; i < 19; i++) {
@@ -449,11 +434,10 @@
   }
   return true;
   ```)
-
-;;; __csv-parse-timestamp -- "YYYY-MM-DD HH:MM:SS" -> microseconds since epoch.
-(defn __csv-parse-timestamp [s : cstr] : int
-  ```c
-  #include <stdint.h>
+  ;;; __csv-parse-timestamp -- "YYYY-MM-DD HH:MM:SS" -> microseconds since epoch.
+  (defn __csv-parse-timestamp [s : cstr] : int
+    ```c
+    #include <stdint.h>
   extern int64_t frame__csv___un_uncsv_hyparse_hydate32(const char *);
   const char *p = (const char *)(intptr_t)s;
   int64_t days = frame__csv___un_uncsv_hyparse_hydate32(p);
@@ -463,19 +447,17 @@
   int64_t secs = days * 86400LL + hh * 3600LL + mm * 60LL + ss;
   return secs * 1000000LL;
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Type inference.
-;; ---------------------------------------------------------------------------
-
-;;; __csv-infer-col-type -- infer the narrowest type for column c by scanning
-;;; up to n-scan data rows.  null-str is the user's null sentinel ("" by default).
-;;;
-;;; Order: int64 -> float64 -> date32 -> timestamp -> bool -> utf8.
-;;; Skipped cells (null) do not narrow.
-(defn __csv-infer-col-type [tbl : int c : int n-scan : int null-str : cstr] : int
-  ```c
-  #include <stdint.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Type inference.
+  ;; ---------------------------------------------------------------------------
+  ;;; __csv-infer-col-type -- infer the narrowest type for column c by scanning
+  ;;; up to n-scan data rows.  null-str is the user's null sentinel ("" by default).
+  ;;;
+  ;;; Order: int64 -> float64 -> date32 -> timestamp -> bool -> utf8.
+  ;;; Skipped cells (null) do not narrow.
+  (defn __csv-infer-col-type [tbl : int c : int n-scan : int null-str : cstr] : int
+    ```c
+    #include <stdint.h>
   struct __csv_table {
     int64_t n_rows; int64_t n_cols; char **headers; char ***cells;
   };
@@ -511,36 +493,41 @@
   if (can_bool)  return 5; /* bool */
   return 6;                /* utf8 */
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Build columns from a parsed table.
-;; ---------------------------------------------------------------------------
-
-(defn __csv-append-cell [b : int t : int s : cstr null-str : cstr] : void
-  (if (__csv-is-null? s null-str)
-    (builder-append-null b)
-    (if (= t 2)        (builder-append-int64   b (__csv-parse-int64   s))
-      (if (= t 4)      (builder-append-float64 b (__csv-parse-float64 s))
-        (if (= t 5)    (builder-append-bool    b (__csv-parse-bool    s))
-          (if (= t 7)  (builder-append-int32   b (__csv-parse-date32  s))
-            (if (= t 8) (builder-append-int64  b (__csv-parse-timestamp s))
-              (builder-append-utf8 b s))))))))
-
-(defn __csv-fill-builder [b : int t : int tbl : int c : int n : int r : int null-str : cstr] : void
-  (if (>= r n)
-    nil
-    (do
-      (__csv-append-cell b t (__csv-table-cell tbl r c) null-str)
-      (__csv-fill-builder b t tbl c n (+ r 1) null-str))))
-
-;; Map an inferred type tag to its underlying storage tag.
-;; date32 (7) -> int32 (1); timestamp (8) -> int64 (2); others pass through.
-(defn __csv-storage-tag [t : int] : int
-  (if (= t 7) 1 (if (= t 8) 2 t)))
-
-(defn __csv-retag [col : int t : int] : int
-  ```c
-  #include <stdint.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Build columns from a parsed table.
+  ;; ---------------------------------------------------------------------------
+  (defn __csv-append-cell [b : int t : int s : cstr null-str : cstr] : void
+    (if (__csv-is-null? s null-str)
+      (builder-append-null b)
+      (if (= t 2)
+        (builder-append-int64 b (__csv-parse-int64 s))
+        (if (= t 4)
+          (builder-append-float64 b (__csv-parse-float64 s))
+          (if (= t 5)
+            (builder-append-bool b (__csv-parse-bool s))
+            (if (= t 7)
+              (builder-append-int32 b (__csv-parse-date32 s))
+              (if (= t 8)
+                (builder-append-int64 b (__csv-parse-timestamp s))
+                (builder-append-utf8 b s))))))))
+  (defn __csv-fill-builder [b : int
+                            t : int
+                            tbl : int
+                            c : int
+                            n : int
+                            r : int
+                            null-str : cstr] : void
+    (if (>= r n)
+      nil
+      (do
+        (__csv-append-cell b t (__csv-table-cell tbl r c) null-str)
+        (__csv-fill-builder b t tbl c n (+ r 1) null-str))))
+  ;; Map an inferred type tag to its underlying storage tag.
+  ;; date32 (7) -> int32 (1); timestamp (8) -> int64 (2); others pass through.
+  (defn __csv-storage-tag [t : int] : int (if (= t 7) 1 (if (= t 8) 2 t)))
+  (defn __csv-retag [col : int t : int] : int
+    ```c
+    #include <stdint.h>
   struct __frame_col {
     int64_t type_tag; int64_t length; int64_t null_count; int64_t refcount;
     void *validity; void *values; void *offsets;
@@ -548,58 +535,77 @@
   if (col) ((struct __frame_col *)(intptr_t)col)->type_tag = t;
   return col;
   ```)
-
-(defn __csv-build-cols [tbl : int n-cols : int n-rows : int types : int i : int
-                        null-str : cstr acc : int] : int
-  ;; Walk columns high -> low; for each one build a builder, fill, finish; cons onto acc.
-  (if (< i 0)
-    acc
-    (let [t-tag    (__nth-int types i)
-          store-t  (__csv-storage-tag t-tag)
-          b        (column-builder store-t n-rows)]
-      (do
-        (__csv-fill-builder b t-tag tbl i n-rows 0 null-str)
-        (let [col (__csv-retag (builder-finish b) t-tag)]
-          (__csv-build-cols tbl n-cols n-rows types (- i 1) null-str
-                            (__c-cons col acc)))))))
-
-(defn __csv-build-fields [tbl : int n-cols : int types : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [nm (__csv-table-header tbl i)
-          tt (__nth-int types i)
-          fd (field nm tt 0)]
-      (__csv-build-fields tbl n-cols types (- i 1) (__c-cons fd acc)))))
-
-(defn __csv-build-types [tbl : int n-cols : int n-rows : int infer-rows : int
-                         null-str : cstr i : int acc : int] : int
-  ;; Walk columns high -> low; infer each type; cons onto acc (which is an int list).
-  (if (< i 0)
-    acc
-    (let [n-scan (if (< n-rows infer-rows) n-rows infer-rows)
-          t-tag  (__csv-infer-col-type tbl i n-scan null-str)]
-      (__csv-build-types tbl n-cols n-rows infer-rows null-str (- i 1)
-                         (__c-cons t-tag acc)))))
-
-(defn __csv-build-types-from-schema [s : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (__csv-build-types-from-schema s (- i 1)
-                                   (__c-cons (__field-type-at s i) acc))))
-
-(defn __field-type-at [s : int i : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __csv-build-cols [tbl : int
+                          n-cols : int
+                          n-rows : int
+                          types : int
+                          i : int
+                          null-str : cstr
+                          acc : int] : int
+    ;; Walk columns high -> low; for each one build a builder, fill, finish; cons onto acc.
+    (if (< i 0)
+      acc
+      (let [t-tag   (__nth-int types i)
+            store-t (__csv-storage-tag t-tag)
+            b       (column-builder store-t n-rows)]
+        (do
+          (__csv-fill-builder b t-tag tbl i n-rows 0 null-str)
+          (let [col (__csv-retag (builder-finish b) t-tag)]
+            (__csv-build-cols tbl
+              n-cols
+              n-rows
+              types
+              (- i 1)
+              null-str
+              (__c-cons col acc)))))))
+  (defn __csv-build-fields [tbl : int
+                            n-cols : int
+                            types : int
+                            i : int
+                            acc : int] : int
+    (if (< i 0)
+      acc
+      (let [nm (__csv-table-header tbl i)
+            tt (__nth-int types i)
+            fd (field nm tt 0)]
+        (__csv-build-fields tbl n-cols types (- i 1) (__c-cons fd acc)))))
+  (defn __csv-build-types [tbl : int
+                           n-cols : int
+                           n-rows : int
+                           infer-rows : int
+                           null-str : cstr
+                           i : int
+                           acc : int] : int
+    ;; Walk columns high -> low; infer each type; cons onto acc (which is an int list).
+    (if (< i 0)
+      acc
+      (let [n-scan (if (< n-rows infer-rows) n-rows infer-rows)
+            t-tag  (__csv-infer-col-type tbl i n-scan null-str)]
+        (__csv-build-types tbl
+          n-cols
+          n-rows
+          infer-rows
+          null-str
+          (- i 1)
+          (__c-cons t-tag acc)))))
+  (defn __csv-build-types-from-schema [s : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (__csv-build-types-from-schema s
+        (- i 1)
+        (__c-cons (__field-type-at s i) acc))))
+  (defn __field-type-at [s : int i : int] : int
+    ```c
+    #include <stdint.h>
   struct __frame_schema { int64_t n_fields; int64_t *fields; };
   struct __frame_field  { char *name; int64_t type_tag; int64_t nullable; };
   struct __frame_schema *sc = (struct __frame_schema *)(intptr_t)s;
   struct __frame_field  *fd = (struct __frame_field  *)(intptr_t)sc->fields[i];
   return fd->type_tag;
   ```)
-
-(defn __nth-int [xs : int i : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __nth-int [xs : int i : int] : int
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t k = 0;
   for (struct __cons *p = (struct __cons *)(intptr_t)xs; p; p = (struct __cons *)(intptr_t)p->next, k++) {
@@ -607,48 +613,62 @@
   }
   return 0;
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Public API
-;; ---------------------------------------------------------------------------
-
-;;; read-csv-string -- parse a CSV blob from memory into a frame.
-;;;
-;;; Parameters:
-;;;   src         -- :cstr NUL-terminated CSV text
-;;;   delim       -- :int  field separator codepoint (0 = ',')
-;;;   quote       -- :int  quote character codepoint (0 = '"')
-;;;   has-header  -- :int  0 or 1
-;;;   infer-rows  -- :int  rows to scan for type inference (0 = 100)
-;;;   null-str    -- :cstr cell value treated as null (pass "" for default)
-;;;
-;;; Returns:
-;;;   :int  frame handle, or 0 on parse failure / OOM.  Free with frame-free.
-;;;
-;;; Since: FR3
-(defn read-csv-string [src : cstr delim : int quote : int has-header : int
-                       infer-rows : int null-str : cstr] : int
-  (let [tbl     (__csv-parse-string src delim quote has-header)]
-    (if (= tbl 0)
-      0
-      (let [n-rows  (__csv-table-rows tbl)
-            n-cols  (__csv-table-cols tbl)
-            scan    (if (= infer-rows 0) 100 infer-rows)
-            types   (__csv-build-types tbl n-cols n-rows scan null-str
-                                       (- n-cols 1) (__c-nil))
-            cols    (__csv-build-cols tbl n-cols n-rows types
-                                      (- n-cols 1) null-str (__c-nil))
-            fields  (__csv-build-fields tbl n-cols types
-                                        (- n-cols 1) (__c-nil))
-            f       (frame (schema fields) cols)]
-        (__csv-table-free tbl)
-        f))))
-
-;;; read-csv -- read CSV from a file path.  Same options as read-csv-string.
-;;; Since: FR3
-(defn __slurp [path : cstr] : cstr
-  ```c
-  #include <stdio.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Public API
+  ;; ---------------------------------------------------------------------------
+  ;;; read-csv-string -- parse a CSV blob from memory into a frame.
+  ;;;
+  ;;; Parameters:
+  ;;;   src         -- :cstr NUL-terminated CSV text
+  ;;;   delim       -- :int  field separator codepoint (0 = ',')
+  ;;;   quote       -- :int  quote character codepoint (0 = '"')
+  ;;;   has-header  -- :int  0 or 1
+  ;;;   infer-rows  -- :int  rows to scan for type inference (0 = 100)
+  ;;;   null-str    -- :cstr cell value treated as null (pass "" for default)
+  ;;;
+  ;;; Returns:
+  ;;;   :int  frame handle, or 0 on parse failure / OOM.  Free with frame-free.
+  ;;;
+  ;;; Since: FR3
+  (defn read-csv-string [src : cstr
+                         delim : int
+                         quote : int
+                         has-header : int
+                         infer-rows : int
+                         null-str : cstr] : int
+    (let [tbl (__csv-parse-string src delim quote has-header)]
+      (if (= tbl 0)
+        0
+        (let [n-rows (__csv-table-rows tbl)
+              n-cols (__csv-table-cols tbl)
+              scan   (if (= infer-rows 0) 100 infer-rows)
+              types  (__csv-build-types tbl
+                       n-cols
+                       n-rows
+                       scan
+                       null-str
+                       (- n-cols 1)
+                       (__c-nil))
+              cols   (__csv-build-cols tbl
+                       n-cols
+                       n-rows
+                       types
+                       (- n-cols 1)
+                       null-str
+                       (__c-nil))
+              fields (__csv-build-fields tbl
+                       n-cols
+                       types
+                       (- n-cols 1)
+                       (__c-nil))
+              f      (frame (schema fields) cols)]
+          (__csv-table-free tbl)
+          f))))
+  ;;; read-csv -- read CSV from a file path.  Same options as read-csv-string.
+  ;;; Since: FR3
+  (defn __slurp [path : cstr] : cstr
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
@@ -666,24 +686,21 @@
   buf[got] = '\0';
   return (const char *)(intptr_t)buf;
   ```)
-
-(defn __cstr-free [s : cstr] : void
-  ```c
-  #include <stdlib.h>
+  (defn __cstr-free [s : cstr] : void
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   void *p = (void *)(intptr_t)s;
   if (p) free(p);
   ```)
-
-(defn __cstr-null? [s : cstr] : bool
-  ```c
-  #include <stdint.h>
+  (defn __cstr-null? [s : cstr] : bool
+    ```c
+    #include <stdint.h>
   return ((const void *)(intptr_t)s) == NULL;
   ```)
-
-(defn __write-file [path : cstr s : cstr] : int
-  ```c
-  #include <stdio.h>
+  (defn __write-file [path : cstr s : cstr] : int
+    ```c
+    #include <stdio.h>
   #include <string.h>
   #include <stdint.h>
   const char *p  = (const char *)(intptr_t)path;
@@ -695,57 +712,71 @@
   fclose(fp);
   return (wrote == len) ? 1 : 0;
   ```)
-
-(defn read-csv [path : cstr delim : int quote : int has-header : int
-                infer-rows : int null-str : cstr] : int
-  (let [src (__slurp path)]
-    (if (__cstr-null? src)
-      0
-      (let [f (read-csv-string src delim quote has-header infer-rows null-str)]
-        (do (__cstr-free src) f)))))
-
-;;; read-csv-typed -- parse a CSV blob with an explicit schema (skips inference).
-;;; The schema's field count must match the CSV's column count.
-;;; Since: FR3
-(defn read-csv-typed [src : cstr s : int delim : int quote : int has-header : int
-                      null-str : cstr] : int
-  (let [tbl (__csv-parse-string src delim quote has-header)]
-    (if (= tbl 0)
-      0
-      (let [n-rows (__csv-table-rows tbl)
-            n-cols (__csv-table-cols tbl)
-            arity  (schema-arity s)]
-        (if (not= n-cols arity)
-          (do (__csv-table-free tbl) 0)
-          (let [types  (__csv-build-types-from-schema s (- n-cols 1) (__c-nil))
-                cols   (__csv-build-cols tbl n-cols n-rows types
-                                         (- n-cols 1) null-str (__c-nil))
-                fields (__csv-build-fields tbl n-cols types
-                                           (- n-cols 1) (__c-nil))
-                f      (frame (schema fields) cols)]
-            (__csv-table-free tbl)
-            f))))))
-
-;; ---------------------------------------------------------------------------
-;; Writer.
-;; ---------------------------------------------------------------------------
-
-;;; write-csv-string -- render the frame as a CSV cstr (caller frees with the
-;;; runtime's cstr free / no-op for now; v0.1.0 returns a malloc'd buffer).
-;;;
-;;; Parameters:
-;;;   f          -- :int frame
-;;;   delim      -- :int separator (0 = ',')
-;;;   quote      -- :int quote char (0 = '"')
-;;;   has-header -- :int 0 or 1
-;;;
-;;; Returns:
-;;;   :cstr  newly-allocated NUL-terminated buffer.
-;;;
-;;; Since: FR3
-(defn write-csv-string [f : int delim : int quote : int has-header : int] : cstr
-  ```c
-  #include <stdio.h>
+  (defn read-csv [path : cstr
+                  delim : int
+                  quote : int
+                  has-header : int
+                  infer-rows : int
+                  null-str : cstr] : int
+    (let [src (__slurp path)]
+      (if (__cstr-null? src)
+        0
+        (let [f (read-csv-string src delim quote has-header infer-rows null-str)]
+          (do (__cstr-free src) f)))))
+  ;;; read-csv-typed -- parse a CSV blob with an explicit schema (skips inference).
+  ;;; The schema's field count must match the CSV's column count.
+  ;;; Since: FR3
+  (defn read-csv-typed [src : cstr
+                        s : int
+                        delim : int
+                        quote : int
+                        has-header : int
+                        null-str : cstr] : int
+    (let [tbl (__csv-parse-string src delim quote has-header)]
+      (if (= tbl 0)
+        0
+        (let [n-rows (__csv-table-rows tbl)
+              n-cols (__csv-table-cols tbl)
+              arity  (schema-arity s)]
+          (if (not= n-cols arity)
+            (do (__csv-table-free tbl) 0)
+            (let [types  (__csv-build-types-from-schema s
+                           (- n-cols 1)
+                           (__c-nil))
+                  cols   (__csv-build-cols tbl
+                           n-cols
+                           n-rows
+                           types
+                           (- n-cols 1)
+                           null-str
+                           (__c-nil))
+                  fields (__csv-build-fields tbl
+                           n-cols
+                           types
+                           (- n-cols 1)
+                           (__c-nil))
+                  f      (frame (schema fields) cols)]
+              (__csv-table-free tbl)
+              f))))))
+  ;; ---------------------------------------------------------------------------
+  ;; Writer.
+  ;; ---------------------------------------------------------------------------
+  ;;; write-csv-string -- render the frame as a CSV cstr (caller frees with the
+  ;;; runtime's cstr free / no-op for now; v0.1.0 returns a malloc'd buffer).
+  ;;;
+  ;;; Parameters:
+  ;;;   f          -- :int frame
+  ;;;   delim      -- :int separator (0 = ',')
+  ;;;   quote      -- :int quote char (0 = '"')
+  ;;;   has-header -- :int 0 or 1
+  ;;;
+  ;;; Returns:
+  ;;;   :cstr  newly-allocated NUL-terminated buffer.
+  ;;;
+  ;;; Since: FR3
+  (defn write-csv-string [f : int delim : int quote : int has-header : int] : cstr
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
@@ -901,13 +932,10 @@
   #undef ENSURE
   return (const char *)(intptr_t)out;
   ```)
-
-;;; write-csv -- render a frame as CSV and write to `path`.
-;;; Returns 1 on success, 0 on failure.  Since: FR3
-(defn write-csv [f : int path : cstr delim : int quote : int has-header : int] : int
-  (let [s   (write-csv-string f delim quote has-header)
-        ok  (__write-file path s)]
-    (__cstr-free s)
-    ok))
-
-) ;; end defmodule frame/csv
+  ;;; write-csv -- render a frame as CSV and write to `path`.
+  ;;; Returns 1 on success, 0 on failure.  Since: FR3
+  (defn write-csv [f : int path : cstr delim : int quote : int has-header : int] : int
+    (let [s  (write-csv-string f delim quote has-header)
+          ok (__write-file path s)]
+      (__cstr-free s)
+      ok))) ;; end defmodule frame/csv

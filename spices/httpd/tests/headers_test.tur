@@ -3,59 +3,53 @@
 ;; The handler reads the request header "X-Echo" and copies its value into
 ;; the response header "X-Echo-Reply"; the response body is a fixed string
 ;; so the test focuses on header round-tripping in both directions.
-
 (defmodule httpd/tests/headers
-  (import httpd/server   :refer [server-start server-stop])
-  (import httpd/request  :refer [req-header])
+  (import httpd/server :refer [server-start server-stop])
+  (import httpd/request :refer [req-header])
   (import httpd/response :refer [resp-ok with-header])
-  (import httpd/types    :refer [Request])
-  (import http/client    :refer [http-request http-result-free])
-  (import http/request   :refer [request])
-  (import http/response  :refer [response-status response-header])
-  (import test/suite     :refer [describe it])
-  (import test/assert    :refer [assert-eq assert-true])
-  (import test/runner    :refer [run-all-status])
-
+  (import httpd/types :refer [Request])
+  (import http/client :refer [http-request http-result-free])
+  (import http/request :refer [request])
+  (import http/response :refer [response-status response-header])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-eq assert-true])
+  (import test/runner :refer [run-all-status])
   ;; ---------------------------------------------------------------------
   ;; Helpers
   ;; ---------------------------------------------------------------------
-
   (defn __cr-ok? [r : ptr<void>] : bool
     ```c
     return tur_is_ok((int64_t)(intptr_t)r);
     ```)
-
   (defn __cr-val [r : ptr<void>] : int
     ```c
     return tur_ok_value((int64_t)(intptr_t)r);
     ```)
-
   (defn cstr-eq? [a : cstr b : cstr] : bool
     ```c
     #include <string.h>
     return strcmp((const char *)a, (const char *)b) == 0;
     ```)
-
   ;; ---------------------------------------------------------------------
   ;; Client result readers: read one thing, then free the result (the http
   ;; spice's http-result-free also frees the strings read from it).
   ;; ---------------------------------------------------------------------
-
   (defn status-of [r : ptr<void>] : int
     (let [s (if (__cr-ok? r) (response-status (__cr-val r)) -1)]
       (http-result-free r)
       s))
-
   (defn body-is? [r : ptr<void> want : cstr] : bool
-    (let [ok (if (__cr-ok? r) (cstr-eq? want (response-body (__cr-val r))) false)]
+    (let [ok (if (__cr-ok? r)
+               (cstr-eq? want (response-body (__cr-val r)))
+               false)]
       (http-result-free r)
       ok))
-
   (defn header-is? [r : ptr<void> name : cstr want : cstr] : bool
-    (let [ok (if (__cr-ok? r) (cstr-eq? want (response-header (__cr-val r) name)) false)]
+    (let [ok (if (__cr-ok? r)
+               (cstr-eq? want (response-header (__cr-val r) name))
+               false)]
       (http-result-free r)
       ok))
-
   ;; ok? / ok-val on the result<:cstr> that req-header returns.  We can't
   ;; rely on stdlib/result here because the type elaborator gets confused
   ;; when stdlib's polymorphic ok? meets a bare :int handle -- so read the
@@ -64,17 +58,14 @@
     ```c
     return tur_is_ok(r);
     ```)
-
   (defn __hdr-val [r : int] : cstr
     ```c
     return (const char *)(intptr_t)tur_ok_value(r);
     ```)
-
   (defn nil-cons [] : int
     ```c
     return (int64_t)0;
     ```)
-
   (defn cons-pair [k : cstr v : cstr next : int] : int
     ```c
     #include <stdlib.h>
@@ -87,7 +78,6 @@
     kc->next  = (int64_t)(intptr_t)vc;
     return (int64_t)(intptr_t)kc;
     ```)
-
   ;; Free the two cells cons-pair allocated (the strings are literals).
   (defn cons-pair-free [cell : int] : void
     ```c
@@ -98,7 +88,6 @@
     free((void *)(intptr_t)kc->next);
     free(kc);
     ```)
-
   ;; GET / with the given header list; frees the request record before
   ;; returning the client result (the caller frees that).
   (defn fetch [hdrs : int] : ptr<void>
@@ -106,53 +95,49 @@
           r   (http-request req)]
       (request-free req)
       r))
-
   ;; GET / carrying `X-Echo: v`, freeing the header cells.
   (defn fetch-echo [v : cstr] : ptr<void>
     (let [hdrs (cons-pair "X-Echo" v (nil-cons))
           r    (fetch hdrs)]
       (cons-pair-free hdrs)
       r))
-
   ;; ---------------------------------------------------------------------
   ;; Handler: copy X-Echo from request -> X-Echo-Reply on response.
   ;; ---------------------------------------------------------------------
-
-  (defn sleep-ms [ms : int] #fx{Unsafe} : void
+  (defn sleep-ms [ms : int]
+    #fx{Unsafe}
+    : void
     ```c
     #include <unistd.h>
     if (ms > 0) usleep((useconds_t)ms * 1000u);
     ```)
-
   (defn headers-handler [req : int] : int
     (let [r (:: req :Request)
           h (req-header r "X-Echo")]
       (if (__hdr-ok? h)
-        (:: (with-header (resp-ok "text/plain" "ok") "X-Echo-Reply" (__hdr-val h))
-            :int)
-        (:: (with-header (resp-ok "text/plain" "no-hdr") "X-Echo-Reply" "absent")
-            :int))))
-
+        (:: (with-header (resp-ok "text/plain" "ok")
+              "X-Echo-Reply"
+              (__hdr-val h))
+          :int)
+        (:: (with-header (resp-ok "text/plain" "no-hdr")
+              "X-Echo-Reply"
+              "absent")
+          :int))))
   ;; ---------------------------------------------------------------------
   ;; Test driver
   ;; ---------------------------------------------------------------------
-
   (defn main [] : int
     (let [srv (server-start 18082 headers-handler)]
       (do
         (unsafe (sleep-ms 50))
-
         (describe "httpd headers -- request/response round-trip"
-
           (it "echoes X-Echo back as X-Echo-Reply"
-            (assert-true (header-is? (fetch-echo "ping-pong") "X-Echo-Reply" "ping-pong")))
-
+            (assert-true (header-is? (fetch-echo "ping-pong")
+                           "X-Echo-Reply"
+                           "ping-pong")))
           (it "request without X-Echo gets 'absent'"
             (assert-true (header-is? (fetch (nil-cons)) "X-Echo-Reply" "absent")))
-
           (it "round-trip returns 200"
             (assert-eq 200 (status-of (fetch-echo "x")))))
-
-        (server-stop srv)
-        ))
+        (server-stop srv)))
     (run-all-status)))

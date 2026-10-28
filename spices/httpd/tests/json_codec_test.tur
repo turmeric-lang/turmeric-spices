@@ -6,136 +6,130 @@
 ;; bridge + default pool dispatcher, same as handler_test, but the body is
 ;; decoded/encoded through json's `DecodeJson`/`EncodeJson` typeclasses rather than
 ;; hand-rolled inline-C.
-
 (defmodule httpd/tests/json_codec
-  (import httpd/handler  :refer [serve req-decode json-ok json-resp with-json-body])
-  (import httpd/request  :refer [req-body])
+  (import httpd/handler
+    :refer
+    [serve req-decode json-ok json-resp with-json-body])
+  (import httpd/request :refer [req-body])
   (import httpd/response :refer [bad-request])
-  (import httpd/server   :refer [server-stop])
-  (import httpd/types    :refer [Request Response])
+  (import httpd/server :refer [server-stop])
+  (import httpd/types :refer [Request Response])
   ;; derive-json / EncodeJson / DecodeJson arrive transitively through httpd/handler.
-  (import http/client    :refer [http-post http-result-free])
-  (import http/response  :refer [response-status response-body response-header])
-  (import test/suite     :refer [describe it])
-  (import test/assert    :refer [assert-eq assert-true])
-  (import test/runner    :refer [run-all-status])
-
-;; This suite links stdlib httpd's libturi, so a Debug `tur` runs it under
-;; LeakSanitizer.  One leak is not httpd's and not this test's: a derived
-;; DecodeJson returns `(ok struct)` whose heap copy of the struct (and the
-;; strings decoded into it) nothing frees once with-json-body has read it --
-;; the dictionary-dispatched residue of turmeric's
-;; docs/reported/carrier-sum-option-boxes-have-no-owner.md.  Suppress the
-;; allocations made under this test's JsonEcho handler (the serve trampoline;
-;; the optimizer inlines the DecodeJson frames into it, so they cannot be named
-;; directly).  The server, the Request view and the client stay leak-checked,
-;; and echo_test / handler_test check the response constructors the handler
-;; also calls.  Delete this when that report closes.
-```c
-const char *__lsan_default_suppressions(void);
+  (import http/client :refer [http-post http-result-free])
+  (import http/response :refer [response-status response-body response-header])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-eq assert-true])
+  (import test/runner :refer [run-all-status])
+  ;; This suite links stdlib httpd's libturi, so a Debug `tur` runs it under
+  ;; LeakSanitizer.  One leak is not httpd's and not this test's: a derived
+  ;; DecodeJson returns `(ok struct)` whose heap copy of the struct (and the
+  ;; strings decoded into it) nothing frees once with-json-body has read it --
+  ;; the dictionary-dispatched residue of turmeric's
+  ;; docs/reported/carrier-sum-option-boxes-have-no-owner.md.  Suppress the
+  ;; allocations made under this test's JsonEcho handler (the serve trampoline;
+  ;; the optimizer inlines the DecodeJson frames into it, so they cannot be named
+  ;; directly).  The server, the Request view and the client stay leak-checked,
+  ;; and echo_test / handler_test check the response constructors the handler
+  ;; also calls.  Delete this when that report closes.
+  ```c
+  const char *__lsan_default_suppressions(void);
 const char *__lsan_default_suppressions(void) {
   return "leak:hytrampoline_hyJsonEcho\n";
 }
 ```
-
   ;; ---------------------------------------------------------------------
   ;; Helpers: unwrap http/client's result<:int> and compare cstr equality.
   ;; ---------------------------------------------------------------------
-
   (defn __cr-ok? [r : ptr<void>] : bool
     ```c
     return tur_is_ok((int64_t)(intptr_t)r);
     ```)
-
   (defn __cr-val [r : ptr<void>] : int
     ```c
     return tur_ok_value((int64_t)(intptr_t)r);
     ```)
-
   (defn cstr-eq? [a : cstr b : cstr] : bool
     ```c
     #include <string.h>
     return strcmp((const char *)a, (const char *)b) == 0;
     ```)
-
   ;; ---------------------------------------------------------------------
   ;; Client result readers: read one thing, then free the result (the http
   ;; spice's http-result-free also frees the strings read from it).
   ;; ---------------------------------------------------------------------
-
   (defn status-of [r : ptr<void>] : int
     (let [s (if (__cr-ok? r) (response-status (__cr-val r)) -1)]
       (http-result-free r)
       s))
-
   (defn body-is? [r : ptr<void> want : cstr] : bool
-    (let [ok (if (__cr-ok? r) (cstr-eq? want (response-body (__cr-val r))) false)]
+    (let [ok (if (__cr-ok? r)
+               (cstr-eq? want (response-body (__cr-val r)))
+               false)]
       (http-result-free r)
       ok))
-
   (defn header-is? [r : ptr<void> name : cstr want : cstr] : bool
-    (let [ok (if (__cr-ok? r) (cstr-eq? want (response-header (__cr-val r) name)) false)]
+    (let [ok (if (__cr-ok? r)
+               (cstr-eq? want (response-header (__cr-val r) name))
+               false)]
       (http-result-free r)
       ok))
-
   (defn __slen [s : cstr] : int
     ```c
     #include <string.h>
     return (int64_t)strlen((const char *)s);
     ```)
-
-  (defn sleep-ms [ms : int] #fx{Unsafe} : void
+  (defn sleep-ms [ms : int]
+    #fx{Unsafe}
+    : void
     ```c
     #include <unistd.h>
     if (ms > 0) usleep((useconds_t)ms * 1000u);
     ```)
-
   ;; ---------------------------------------------------------------------
   ;; Typed JSON request/response shapes.
   ;; ---------------------------------------------------------------------
-
-  (defstruct EchoReq  [msg : cstr])
-  (defstruct EchoResp [echo : cstr  len : int])
-  (derive-json EchoReq  (msg cstr))
+  (defstruct EchoReq [msg : cstr])
+  (defstruct EchoResp [echo : cstr len : int])
+  (derive-json EchoReq (msg cstr))
   (derive-json EchoResp (echo cstr) (len int))
-
   ;; ---------------------------------------------------------------------
   ;; Handler: decode the JSON body into EchoReq, reply with a JSON EchoResp.
   ;; A malformed body is rejected with 400 by with-json-body before `f` runs.
   ;; ---------------------------------------------------------------------
-
   (defopaque JsonEcho :int)
-
   (definstance Handler [JsonEcho]
     (respond [self req]
-      (with-json-body (:: req :Request) EchoReq
-        (fn [r : EchoReq] (json-ok (make-struct EchoResp (.msg r) (__slen (.msg r))))))))
-
+      (with-json-body (:: req :Request)
+        EchoReq
+        (fn [r : EchoReq]
+          (json-ok (make-struct EchoResp (.msg r) (__slen (.msg r))))))))
   ;; ---------------------------------------------------------------------
   ;; Test driver.
   ;; ---------------------------------------------------------------------
-
   (defn main [] : int
     (let [srv (serve 18087 JsonEcho)]
       (do
         (unsafe (sleep-ms 50))
-
         (describe "httpd Handler JSON codecs -- with-json-body / json-ok"
-
           (it "POST a typed JSON body round-trips to a typed JSON response"
-            (assert-true (body-is? (http-post "http://127.0.0.1:18087/echo" "{\"msg\":\"hi\"}") "{\"echo\":\"hi\",\"len\":2}")))
-
+            (assert-true (body-is? (http-post "http://127.0.0.1:18087/echo"
+                                     "{\"msg\":\"hi\"}")
+                           "{\"echo\":\"hi\",\"len\":2}")))
           (it "JSON response is 200"
-            (assert-eq 200 (status-of (http-post "http://127.0.0.1:18087/echo" "{\"msg\":\"hello\"}"))))
-
+            (assert-eq 200
+              (status-of (http-post "http://127.0.0.1:18087/echo"
+                           "{\"msg\":\"hello\"}"))))
           (it "Content-Type is application/json"
-            (assert-true (header-is? (http-post "http://127.0.0.1:18087/echo" "{\"msg\":\"x\"}") "Content-Type" "application/json")))
-
+            (assert-true (header-is? (http-post "http://127.0.0.1:18087/echo"
+                                       "{\"msg\":\"x\"}")
+                           "Content-Type"
+                           "application/json")))
           (it "len field reflects the decoded message length"
-            (assert-true (body-is? (http-post "http://127.0.0.1:18087/echo" "{\"msg\":\"hello\"}") "{\"echo\":\"hello\",\"len\":5}")))
-
+            (assert-true (body-is? (http-post "http://127.0.0.1:18087/echo"
+                                     "{\"msg\":\"hello\"}")
+                           "{\"echo\":\"hello\",\"len\":5}")))
           (it "a malformed JSON body is rejected with 400"
-            (assert-eq 400 (status-of (http-post "http://127.0.0.1:18087/echo" "not json")))))
-
+            (assert-eq 400
+              (status-of (http-post "http://127.0.0.1:18087/echo" "not json")))))
         (server-stop srv)
         (run-all-status)))))

@@ -10,59 +10,72 @@
 ;;   ok: name=alice age=30
 ;;   missing: 1 err | age expected int got missing
 ;;   mismatch: 2 errs | name expected string got int | age expected int got string
-
-(defmodule decode_checked_test (export)
-
-(import json/encode :refer [derive-json-decoder JsonDecodeErrors
-                            json-decode-errors-count json-decode-error-path
-                            json-decode-error-expected json-decode-error-got
-                            json-decode-errors-free])
-(import json/decode :refer [json-parse-doc json-doc-free json-doc-root])
-
-(defn p [s : cstr] #fx{Unsafe} : int ```c fputs((const char*)s, stdout); return 0; ```)
-(defn pln [] #fx{Unsafe} : int ```c fputc('\n', stdout); return 0; ```)
-(defn pint [n : int] #fx{Unsafe} : int ```c printf("%lld", (long long)n); return 0; ```)
-
-(defstruct Person [name : cstr  age : int])
-(derive-json-decoder Person (name cstr) (age int))
-
-;; Print " | <path> expected <expected> got <got>" for each accumulated error.
-(defn each-error [errs : JsonDecodeErrors  i : int  n : int] : int
-  (if (>= i n)
-    0
+(defmodule decode_checked_test
+  (export)
+  (import json/encode
+    :refer
+    [derive-json-decoder
+     JsonDecodeErrors
+     json-decode-errors-count
+     json-decode-error-path
+     json-decode-error-expected
+     json-decode-error-got
+     json-decode-errors-free])
+  (import json/decode :refer [json-parse-doc json-doc-free json-doc-root])
+  (defn p [s : cstr]
+    #fx{Unsafe}
+    : int
+    ```c fputs((const char*)s, stdout); return 0; ```)
+  (defn pln [] #fx{Unsafe} : int ```c fputc('\n', stdout); return 0; ```)
+  (defn pint [n : int]
+    #fx{Unsafe}
+    : int
+    ```c printf("%lld", (long long)n); return 0; ```)
+  (defstruct Person [name : cstr age : int])
+  (derive-json-decoder Person (name cstr) (age int))
+  ;; Print " | <path> expected <expected> got <got>" for each accumulated error.
+  (defn each-error [errs : JsonDecodeErrors i : int n : int] : int
+    (if (>= i n)
+      0
+      (do
+        (unsafe (p " | "))
+        (unsafe (p (json-decode-error-path errs i)))
+        (unsafe (p " expected "))
+        (unsafe (p (json-decode-error-expected errs i)))
+        (unsafe (p " got "))
+        (unsafe (p (json-decode-error-got errs i)))
+        (each-error errs (+ i 1) n))))
+  ;; Run a checked decode of `json` and print either the ok struct or every error.
+  (defn run [label : cstr json : cstr] : int
+    (let [doc  (unsafe (json-parse-doc json))
+          root (unsafe (json-doc-root doc))
+          r    (:: (decode-json-checked doc root)
+                 (Result Person JsonDecodeErrors))]
+      (do
+        (unsafe (p label))
+        (unsafe (p ": "))
+        (if (ok? r)
+          (let [person (ok-val r)]
+            (do
+              (unsafe (p "name="))
+              (unsafe (p (.name person)))
+              (unsafe (p " age="))
+              (unsafe (pint (.age person)))
+              (unsafe (pln))))
+          (let [errs (err-val r)
+                n    (json-decode-errors-count errs)]
+            (do
+              (unsafe (pint n))
+              (unsafe (p (if (= n 1) " err" " errs")))
+              (each-error errs 0 n)
+              (unsafe (pln))
+              (json-decode-errors-free errs)
+              0)))
+        (unsafe (json-doc-free doc))
+        0)))
+  (defn main [] : int
     (do
-      (unsafe (p " | ")) (unsafe (p (json-decode-error-path errs i)))
-      (unsafe (p " expected ")) (unsafe (p (json-decode-error-expected errs i)))
-      (unsafe (p " got ")) (unsafe (p (json-decode-error-got errs i)))
-      (each-error errs (+ i 1) n))))
-
-;; Run a checked decode of `json` and print either the ok struct or every error.
-(defn run [label : cstr  json : cstr] : int
-  (let [doc  (unsafe (json-parse-doc json))
-        root (unsafe (json-doc-root doc))
-        r    (:: (decode-json-checked doc root) (Result Person JsonDecodeErrors))]
-    (do
-      (unsafe (p label)) (unsafe (p ": "))
-      (if (ok? r)
-        (let [person (ok-val r)]
-          (do (unsafe (p "name=")) (unsafe (p (.name person)))
-              (unsafe (p " age=")) (unsafe (pint (.age person))) (unsafe (pln))))
-        (let [errs (err-val r)
-              n    (json-decode-errors-count errs)]
-          (do
-            (unsafe (pint n)) (unsafe (p (if (= n 1) " err" " errs")))
-            (each-error errs 0 n)
-            (unsafe (pln))
-            (json-decode-errors-free errs)
-            0)))
-      (unsafe (json-doc-free doc))
-      0)))
-
-(defn main [] : int
-  (do
-    (run "ok"       "{\"name\":\"alice\",\"age\":30}")
-    (run "missing"  "{\"name\":\"alice\"}")
-    (run "mismatch" "{\"name\":123,\"age\":\"x\"}")
-    0))
-
-) ;; end
+      (run "ok" "{\"name\":\"alice\",\"age\":30}")
+      (run "missing" "{\"name\":\"alice\"}")
+      (run "mismatch" "{\"name\":123,\"age\":\"x\"}")
+      0))) ;; end

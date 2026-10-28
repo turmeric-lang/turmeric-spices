@@ -19,23 +19,28 @@
 ;;     is unnecessary.  Its companion `ok-handle` had no callers at all.
 ;;   - `(assert-eq true (err? r))` fed a bool to an int-typed assertion.
 ;;   - every `it` ended on a destroy call, which is nil where `it` wants bool.
-
 (defmodule plutovg/tests/font
-  (import test/suite      :refer [describe it])
-  (import test/assert     :refer [assert-eq assert-true])
-  (import test/runner     :refer [run-all-status])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-eq assert-true])
+  (import test/runner :refer [run-all-status])
   (import plutovg/surface :refer [surface-create surface-destroy])
-  (import plutovg/canvas  :refer [canvas-create canvas-destroy])
-  (import plutovg/font    :refer [font-face-load-from-file font-face-destroy
-                                  font-face-ascent font-face-descent
-                                  font-face-line-gap font-face-text-extents
-                                  font-cache-create font-cache-destroy
-                                  font-cache-add-file font-cache-get
-                                  canvas-set-font canvas-text-extents])
-  (import plutovg/path    :refer [rect-destroy rect-w rect-h])
-
+  (import plutovg/canvas :refer [canvas-create canvas-destroy])
+  (import plutovg/font
+    :refer
+    [font-face-load-from-file
+     font-face-destroy
+     font-face-ascent
+     font-face-descent
+     font-face-line-gap
+     font-face-text-extents
+     font-cache-create
+     font-cache-destroy
+     font-cache-add-file
+     font-cache-get
+     canvas-set-font
+     canvas-text-extents])
+  (import plutovg/path :refer [rect-destroy rect-w rect-h])
   ;; -- Filesystem probing helpers --
-
   ;; Try a list of common font paths and return the first that exists,
   ;; or NULL.  Order: macOS system Helvetica, macOS supplemental Arial,
   ;; Linux DejaVu (common), Linux Liberation, generic fallback.
@@ -55,17 +60,15 @@
     }
     return NULL;
     ```)
-
   (defn have-font-path? [p : cstr] : bool
     ```c
     return p != NULL && ((const char *)(intptr_t)p)[0] != '\0';
     ```)
-
-  (defn >f  [a : float b : float] : bool
+  (defn >f [a : float b : float] : bool
     ```c
     return (double)a > (double)b;
     ```)
-  (defn <f  [a : float b : float] : bool
+  (defn <f [a : float b : float] : bool
     ```c
     return (double)a < (double)b;
     ```)
@@ -73,103 +76,93 @@
     ```c
     return (double)a >= (double)b;
     ```)
-
   (defn skip-no-font [] : bool
     (do (println "  (skipped: no system font available)") true))
-
-;;; noop -- void no-op, so a cleanup-only `if` can have void on both arms.
+  ;;; noop -- void no-op, so a cleanup-only `if` can have void on both arms.
   (defn noop [] : void
     ```c
     return;
     ```)
-
   (defn __all-tests [] : void
-   (describe "plutovg/font cache lifecycle"
-     (it "creates and destroys an empty cache"
-       (let [r (font-cache-create)
-             k (assert-true (ok? r))]
-         (if k (font-cache-destroy (ok-val r)) (noop))
-         k)))
-
-   (describe "plutovg/font rejection"
-     (it "returns err when loading a non-existent font path"
-       (assert-true (err? (font-face-load-from-file "/nonexistent/font.ttf" 0)))))
-
-   (describe "plutovg/font cache miss"
-     (it "returns err when getting an unregistered family"
-       (let [r (font-cache-create)]
-         (if (not (ok? r))
-           (assert-true false)
-           (let [fc   (ok-val r)
-                 miss (assert-true
-                        (err? (font-cache-get fc "Imaginary Font" ":regular" 12.0)))]
-             (font-cache-destroy fc)
-             miss)))))
-
-   ;; -- Conditional tests (require an available font on disk) --
-
-   (describe "plutovg/font face metrics (if a system font is available)"
-     (it "returns sensible ascent / descent / line-gap"
-       (let [path (probe-font-path)]
-         (if (not (have-font-path? path))
-           (skip-no-font)
-           (let [r (font-face-load-from-file path 0)]
-             (if (not (ok? r))
-               (assert-true false)
-               (let [ff (ok-val r)
-                     ;; At size 24, ascent should be a positive number;
-                     ;; descent is typically negative; line-gap non-negative.
-                     asc (assert-true (>f  (font-face-ascent   ff 24.0) 0.0))
-                     dsc (assert-true (<f  (font-face-descent  ff 24.0) 0.5))
-                     gap (assert-true (>=f (font-face-line-gap ff 24.0) 0.0))]
-                 (font-face-destroy ff)
-                 (and asc (and dsc gap)))))))))
-
-   (describe "plutovg/font face text extents (if a system font is available)"
-     (it "returns a positive-width rect for non-empty text"
-       (let [path (probe-font-path)]
-         (if (not (have-font-path? path))
-           (skip-no-font)
-           (let [r (font-face-load-from-file path 0)]
-             (if (not (ok? r))
-               (assert-true false)
-               (let [ff (ok-val r)
-                     er (font-face-text-extents ff 24.0 "Hello")
-                     ke (assert-true (ok? er))]
-                 (if (not ke)
-                   (do (font-face-destroy ff) false)
-                   (let [box (ok-val er)
-                         kw  (assert-true (>f (rect-w box) 0.0))
-                         kh  (assert-true (>f (rect-h box) 0.0))]
-                     (rect-destroy box)
-                     (font-face-destroy ff)
-                     (and kw kh))))))))))
-
-   (describe "plutovg/font canvas text bridge (if a system font is available)"
-     (it "set-font and text-extents work together"
-       (let [path (probe-font-path)]
-         (if (not (have-font-path? path))
-           (skip-no-font)
-           (let [sr (surface-create 64 32)
-                 fr (font-face-load-from-file path 0)]
-             (if (not (and (ok? sr) (ok? fr)))
-               (assert-true false)
-               (let [s  (ok-val sr)
-                     ff (ok-val fr)
-                     cr (canvas-create s)
-                     k  (assert-true (ok? cr))]
-                 (if (not k)
-                   (do (font-face-destroy ff) (surface-destroy s) false)
-                   (let [c (ok-val cr)]
-                     (canvas-set-font c ff 16.0)
-                     (let [er (canvas-text-extents c "Hi" ":utf8")
-                           ke (assert-true (ok? er))]
-                       (if ke (rect-destroy (ok-val er)) (noop))
-                       (font-face-destroy ff)
-                       (canvas-destroy c)
-                       (surface-destroy s)
-                       ke)))))))))))
-
-  (defn main [] : int
-    (__all-tests)
-    (run-all-status)))
+    (describe "plutovg/font cache lifecycle"
+      (it "creates and destroys an empty cache"
+        (let [r (font-cache-create)
+              k (assert-true (ok? r))]
+          (if k (font-cache-destroy (ok-val r)) (noop))
+          k)))
+    (describe "plutovg/font rejection"
+      (it "returns err when loading a non-existent font path"
+        (assert-true (err? (font-face-load-from-file "/nonexistent/font.ttf" 0)))))
+    (describe "plutovg/font cache miss"
+      (it "returns err when getting an unregistered family"
+        (let [r (font-cache-create)]
+          (if (not (ok? r))
+            (assert-true false)
+            (let [fc   (ok-val r)
+                  miss (assert-true (err? (font-cache-get fc
+                                            "Imaginary Font"
+                                            ":regular"
+                                            12.0)))]
+              (font-cache-destroy fc)
+              miss)))))
+    ;; -- Conditional tests (require an available font on disk) --
+    (describe "plutovg/font face metrics (if a system font is available)"
+      (it "returns sensible ascent / descent / line-gap"
+        (let [path (probe-font-path)]
+          (if (not (have-font-path? path))
+            (skip-no-font)
+            (let [r (font-face-load-from-file path 0)]
+              (if (not (ok? r))
+                (assert-true false)
+                (let [ff  (ok-val r)
+                      ;; At size 24, ascent should be a positive number;
+                      ;; descent is typically negative; line-gap non-negative.
+                      asc (assert-true (>f (font-face-ascent ff 24.0) 0.0))
+                      dsc (assert-true (<f (font-face-descent ff 24.0) 0.5))
+                      gap (assert-true (>=f (font-face-line-gap ff 24.0) 0.0))]
+                  (font-face-destroy ff)
+                  (and asc (and dsc gap)))))))))
+    (describe "plutovg/font face text extents (if a system font is available)"
+      (it "returns a positive-width rect for non-empty text"
+        (let [path (probe-font-path)]
+          (if (not (have-font-path? path))
+            (skip-no-font)
+            (let [r (font-face-load-from-file path 0)]
+              (if (not (ok? r))
+                (assert-true false)
+                (let [ff (ok-val r)
+                      er (font-face-text-extents ff 24.0 "Hello")
+                      ke (assert-true (ok? er))]
+                  (if (not ke)
+                    (do (font-face-destroy ff) false)
+                    (let [box (ok-val er)
+                          kw  (assert-true (>f (rect-w box) 0.0))
+                          kh  (assert-true (>f (rect-h box) 0.0))]
+                      (rect-destroy box)
+                      (font-face-destroy ff)
+                      (and kw kh))))))))))
+    (describe "plutovg/font canvas text bridge (if a system font is available)"
+      (it "set-font and text-extents work together"
+        (let [path (probe-font-path)]
+          (if (not (have-font-path? path))
+            (skip-no-font)
+            (let [sr (surface-create 64 32)
+                  fr (font-face-load-from-file path 0)]
+              (if (not (and (ok? sr) (ok? fr)))
+                (assert-true false)
+                (let [s  (ok-val sr)
+                      ff (ok-val fr)
+                      cr (canvas-create s)
+                      k  (assert-true (ok? cr))]
+                  (if (not k)
+                    (do (font-face-destroy ff) (surface-destroy s) false)
+                    (let [c (ok-val cr)]
+                      (canvas-set-font c ff 16.0)
+                      (let [er (canvas-text-extents c "Hi" ":utf8")
+                            ke (assert-true (ok? er))]
+                        (if ke (rect-destroy (ok-val er)) (noop))
+                        (font-face-destroy ff)
+                        (canvas-destroy c)
+                        (surface-destroy s)
+                        ke)))))))))))
+  (defn main [] : int (__all-tests) (run-all-status)))

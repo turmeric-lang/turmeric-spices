@@ -21,120 +21,132 @@
 ;;;   * read-only / untouched -> nothing (no needless writes or cookies)
 ;;;
 ;;; Since: v0.1.0
-
 (defmodule session/mw
-  (import session/store  :refer [Store store-save store-delete])
-  (import session/state  :refer [session-set-store! session-set-config!
-                                 session-get-store session-config-ptr
-                                 cfg-cookie-name cfg-path cfg-domain cfg-max-age
-                                 cfg-secure? cfg-http-only? cfg-same-site
-                                 cfg-rolling? cfg-signing-key])
+  (import session/store :refer [Store store-save store-delete])
+  (import session/state
+    :refer
+    [session-set-store!
+     session-set-config!
+     session-get-store
+     session-config-ptr
+     cfg-cookie-name
+     cfg-path
+     cfg-domain
+     cfg-max-age
+     cfg-secure?
+     cfg-http-only?
+     cfg-same-site
+     cfg-rolling?
+     cfg-signing-key])
   (import session/config :refer [SessionConfig])
   (import session/cookie :refer [cookie-sign])
   (import session/ownstr :refer [to-cstr release])
-  (import session/ctx    :refer [session-existing sess-id sess-map sess-dirty?
-                                 sess-destroy? sess-new? sess-rotate-from
-                                 sess-free])
-  (import tourist/request    :refer [set-cookie!])
+  (import session/ctx
+    :refer
+    [session-existing
+     sess-id
+     sess-map
+     sess-dirty?
+     sess-destroy?
+     sess-new?
+     sess-rotate-from
+     sess-free])
+  (import tourist/request :refer [set-cookie!])
   (import tourist/middleware :refer [use-after!])
-  (import tourist/types      :refer [Ctx])
-  (import httpd/types        :refer [Response])
+  (import tourist/types :refer [Ctx])
+  (import httpd/types :refer [Response])
   (export session-mw session-flush)
-
-(defn __cstr-null? [s : cstr] : bool
-  ```c
-  return ((const char *)s) == 0;
+  (defn __cstr-null? [s : cstr] : bool
+    ```c
+    return ((const char *)s) == 0;
   ```)
-
-
-
-;;; __should-persist? -- whether a non-destroyed session needs saving.
-;;;
-;;; Save when the handler wrote to the session, or when rolling sessions are
-;;; enabled for an already-established (non-new) session so its expiry window
-;;; slides forward. A freshly-minted but unwritten session is left alone so
-;;; read-only visitors are not handed a cookie they did not earn.
-(defn __should-persist? [p : int cfgp : int] : bool
-  (or (= (sess-dirty? p) 1)
+  ;;; __should-persist? -- whether a non-destroyed session needs saving.
+  ;;;
+  ;;; Save when the handler wrote to the session, or when rolling sessions are
+  ;;; enabled for an already-established (non-new) session so its expiry window
+  ;;; slides forward. A freshly-minted but unwritten session is left alone so
+  ;;; read-only visitors are not handed a cookie they did not earn.
+  (defn __should-persist? [p : int cfgp : int] : bool
+    (or (= (sess-dirty? p) 1)
       (and (= (cfg-rolling? cfgp) 1) (= (sess-new? p) 0))))
-
-;;; __flush-persist -- store-save/delete + Set-Cookie for one request.
-(defn __flush-persist [ctx : Ctx p : int] : void
-  (let [store (session-get-store)
-        cfgp  (session-config-ptr)
-        id    (sess-id p)
-        name  (cfg-cookie-name cfgp)
-        path  (cfg-path cfgp)
-        dom   (cfg-domain cfgp)]
-    (if (= (sess-destroy? p) 1)
-      (do
-        (store-delete store id)
-        ;; An empty value with Max-Age=0: the browser drops the cookie. Path
-        ;; and Domain must match the original for that to work.
-        (set-cookie! ctx (cookie-full name "" path dom 0 0 0 "")))
-      (when (__should-persist? p cfgp)
-        ;; cookie-sign returns an owned String; borrow its bytes for
-        ;; set-cookie! (which formats and queues its own copy) and release
-        ;; the String afterwards.
-        (let [val (cookie-sign (cfg-signing-key cfgp) id)]
-          (do
-            (store-save store id (sess-map p) (cfg-max-age cfgp))
-            ;; rotate (R0): the data now lives under the new ID, so drop the
-            ;; original entry. store-delete is fire-and-forget -- a backend
-            ;; failure cannot fail the request; the worst case is an orphan
-            ;; record that expires on its own TTL.
-            (__flush-rotate-delete store p)
-            (set-cookie! ctx (cookie-full name (to-cstr val) path dom
-                                          (cfg-max-age cfgp) (cfg-secure? cfgp)
-                                          (cfg-http-only? cfgp) (cfg-same-site cfgp)))
-            (release val)))))))
-
-;;; __flush-rotate-delete -- delete the pre-rotate store entry, if any.
-(defn __flush-rotate-delete [store : Store p : int] : void
-  (let [oldid (sess-rotate-from p)]
-    (when (not (__cstr-null? oldid))
-      (store-delete store oldid))))
-
-;;; session-flush -- the after-middleware: persist + free per-request state.
-;;;
-;;; Skips requests that never touched the session (no state attached). For
-;;; touched sessions, persists per policy then frees the session-state struct,
-;;; its map, and its ID. Returns the response unchanged.
-(defn session-flush [ctx : Ctx resp : Response] : Response
-  (let [p (session-existing ctx)]
-    (if (= p 0)
-      resp
-      (do
-        (__flush-persist ctx p)
-        (sess-free p)
-        resp))))
-
-;;; session-mw -- install a store + cookie config and return the middleware.
-;;;
-;;; Call once and drop the result into the tourist item list. The returned
-;;; handle is a tourist after-middleware; session loading happens lazily in
-;;; the session/ctx helpers, so no separate before-middleware is needed.
-;;;
-;;; Parameters:
-;;;   store -- a Store (memory-store-new, file-store-new, valkey-store-new, or
-;;;            a custom store-new)
-;;;   cfg   -- a SessionConfig (default-session-config / dev-session-config)
-;;;
-;;; Returns:
-;;;   :int -- a tourist item handle.
-;;;
-;;; Example:
-;;;   (tourist 3000
-;;;     (session-mw (memory-store-new) (dev-session-config))
-;;;     (get! "/" (fn [ctx] (text (session-id ctx)))))
-;;;
-;;; Since: v0.1.0
-(defn session-mw [store : Store cfg : SessionConfig] : int
-  (do
-    (session-set-store! store)
-    (session-set-config! (.cookie-name cfg) (.path cfg) (.domain cfg)
-                         (.same-site cfg) (.signing-key cfg) (.max-age cfg)
-                         (.secure? cfg) (.http-only? cfg) (.rolling? cfg))
-    (use-after! session-flush)))
-
-) ;; end defmodule session/mw
+  ;;; __flush-persist -- store-save/delete + Set-Cookie for one request.
+  (defn __flush-persist [ctx : Ctx p : int] : void
+    (let [store (session-get-store)
+          cfgp  (session-config-ptr)
+          id    (sess-id p)
+          name  (cfg-cookie-name cfgp)
+          path  (cfg-path cfgp)
+          dom   (cfg-domain cfgp)]
+      (if (= (sess-destroy? p) 1)
+        (do
+          (store-delete store id)
+          ;; An empty value with Max-Age=0: the browser drops the cookie. Path
+          ;; and Domain must match the original for that to work.
+          (set-cookie! ctx (cookie-full name "" path dom 0 0 0 "")))
+        (when (__should-persist? p cfgp)
+          ;; cookie-sign returns an owned String; borrow its bytes for
+          ;; set-cookie! (which formats and queues its own copy) and release
+          ;; the String afterwards.
+          (let [val (cookie-sign (cfg-signing-key cfgp) id)]
+            (do
+              (store-save store id (sess-map p) (cfg-max-age cfgp))
+              ;; rotate (R0): the data now lives under the new ID, so drop the
+              ;; original entry. store-delete is fire-and-forget -- a backend
+              ;; failure cannot fail the request; the worst case is an orphan
+              ;; record that expires on its own TTL.
+              (__flush-rotate-delete store p)
+              (set-cookie! ctx
+                (cookie-full name
+                  (to-cstr val)
+                  path
+                  dom
+                  (cfg-max-age cfgp)
+                  (cfg-secure? cfgp)
+                  (cfg-http-only? cfgp)
+                  (cfg-same-site cfgp)))
+              (release val)))))))
+  ;;; __flush-rotate-delete -- delete the pre-rotate store entry, if any.
+  (defn __flush-rotate-delete [store : Store p : int] : void
+    (let [oldid (sess-rotate-from p)]
+      (when (not (__cstr-null? oldid)) (store-delete store oldid))))
+  ;;; session-flush -- the after-middleware: persist + free per-request state.
+  ;;;
+  ;;; Skips requests that never touched the session (no state attached). For
+  ;;; touched sessions, persists per policy then frees the session-state struct,
+  ;;; its map, and its ID. Returns the response unchanged.
+  (defn session-flush [ctx : Ctx resp : Response] : Response
+    (let [p (session-existing ctx)]
+      (if (= p 0) resp (do (__flush-persist ctx p) (sess-free p) resp))))
+  ;;; session-mw -- install a store + cookie config and return the middleware.
+  ;;;
+  ;;; Call once and drop the result into the tourist item list. The returned
+  ;;; handle is a tourist after-middleware; session loading happens lazily in
+  ;;; the session/ctx helpers, so no separate before-middleware is needed.
+  ;;;
+  ;;; Parameters:
+  ;;;   store -- a Store (memory-store-new, file-store-new, valkey-store-new, or
+  ;;;            a custom store-new)
+  ;;;   cfg   -- a SessionConfig (default-session-config / dev-session-config)
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- a tourist item handle.
+  ;;;
+  ;;; Example:
+  ;;;   (tourist 3000
+  ;;;     (session-mw (memory-store-new) (dev-session-config))
+  ;;;     (get! "/" (fn [ctx] (text (session-id ctx)))))
+  ;;;
+  ;;; Since: v0.1.0
+  (defn session-mw [store : Store cfg : SessionConfig] : int
+    (do
+      (session-set-store! store)
+      (session-set-config! (.cookie-name cfg)
+        (.path cfg)
+        (.domain cfg)
+        (.same-site cfg)
+        (.signing-key cfg)
+        (.max-age cfg)
+        (.secure? cfg)
+        (.http-only? cfg)
+        (.rolling? cfg))
+      (use-after! session-flush)))) ;; end defmodule session/mw

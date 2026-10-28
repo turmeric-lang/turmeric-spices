@@ -2,180 +2,170 @@
 ;;;
 ;;; Since: Phase 2
 ;; -------------------------------------------------------------------------
-
 (defmodule color_test
   (export)
-
-(import sdf/colors :refer [colored-sphere colored-box colored-cylinder
-                            colored-union colored-intersection colored-difference
-                            colored-translate csdf-sdf csdf-free])
-(import sdf/eval   :refer [sdf-eval])
-(import mesh/extraction :refer [mc-extract-colored cmesh-vertex-count cmesh-free
-                                 cmesh-get-vx cmesh-get-vy cmesh-get-vz
-                                 cmesh-get-cr cmesh-get-cg cmesh-get-object-id])
-(import export/obj :refer [export-obj])
-
-;; ---- helpers ----
-
-(defn approx= [a : float b : float] : bool
-  ```c
-  double diff = a - b; if (diff < 0) diff = -diff;
+  (import sdf/colors
+    :refer
+    [colored-sphere
+     colored-box
+     colored-cylinder
+     colored-union
+     colored-intersection
+     colored-difference
+     colored-translate
+     csdf-sdf
+     csdf-free])
+  (import sdf/eval :refer [sdf-eval])
+  (import mesh/extraction
+    :refer
+    [mc-extract-colored
+     cmesh-vertex-count
+     cmesh-free
+     cmesh-get-vx
+     cmesh-get-vy
+     cmesh-get-vz
+     cmesh-get-cr
+     cmesh-get-cg
+     cmesh-get-object-id])
+  (import export/obj :refer [export-obj])
+  ;; ---- helpers ----
+  (defn approx= [a : float b : float] : bool
+    ```c
+    double diff = a - b; if (diff < 0) diff = -diff;
   return diff < 0.01;
   ```)
-
-
-;; Named check!, not assert!: stdlib's auto-loaded `contract` module defines a
-;; one-argument `assert!` MACRO, which wins at every call site and rejected
-;; these two-argument calls with "macro 'assert!' expects 1 arguments, got 2".
-(defn check! [cond : bool msg : cstr] : void
-  ```c
-  #include <stdio.h>
+  ;; Named check!, not assert!: stdlib's auto-loaded `contract` module defines a
+  ;; one-argument `assert!` MACRO, which wins at every call site and rejected
+  ;; these two-argument calls with "macro 'assert!' expects 1 arguments, got 2".
+  (defn check! [cond : bool msg : cstr] : void
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   if (!cond) {
     fprintf(stderr, "%s\n", (const char *)(intptr_t)msg);
     exit(1);
   }
   ```)
-
-;; ---- test 1: colored-sphere csdf-sdf evaluates correctly ----
-
-(defn test-colored-sphere [] : void
-  (let [cs (colored-sphere 0.0 0.0 0.0 1.0  1.0 0.0 0.0  1)
-        sdf (csdf-sdf cs)
-        ;; Point on surface (dist = 0)
-        d0 (sdf-eval sdf 1.0 0.0 0.0)
-        ;; Point inside (dist = -0.5)
-        di (sdf-eval sdf 0.5 0.0 0.0)
-        ;; Point outside (dist = 0.5)
-        do (sdf-eval sdf 1.5 0.0 0.0)]
-    (check! (approx= d0 0.0) "colored-sphere surface dist should be ~0")
-    (check! (approx= di -0.5) "colored-sphere inside dist should be ~-0.5")
-    (check! (approx= do 0.5) "colored-sphere outside dist should be ~0.5")
-    (csdf-free cs)))
-
-;; ---- test 2: colored-union combined SDF is correct ----
-
-(defn test-colored-union-sdf [] : void
-  (let [a  (colored-sphere -1.5 0.0 0.0 0.8  1.0 0.0 0.0  1)
-        b  (colored-sphere  1.5 0.0 0.0 0.8  0.0 0.0 1.0  2)
-        u  (colored-union a b)
-        sdf (csdf-sdf u)
-        ;; Midpoint should be outside both spheres (~0.7 from each centre)
-        dm (sdf-eval sdf 0.0 0.0 0.0)
-        ;; Near sphere a surface
-        da (sdf-eval sdf -1.5 0.8 0.0)
-        ;; Near sphere b surface
-        db (sdf-eval sdf  1.5 0.8 0.0)]
-    (check! (> dm 0.0) "union midpoint should be outside (dm > 0)")
-    (check! (approx= da 0.0) "union near sphere-a surface should be ~0")
-    (check! (approx= db 0.0) "union near sphere-b surface should be ~0")
-    (csdf-free u)))
-
-;; ---- test 3: colored-difference carves correctly ----
-
-(defn test-colored-difference-sdf [] : void
-  (let [base  (colored-box -2.0 -2.0 -2.0  2.0 2.0 2.0  0.8 0.8 0.8  1)
-        hole  (colored-sphere 0.0 0.0 0.0 1.0  0.0 0.0 0.0  2)
-        diff  (colored-difference base hole)
-        sdf   (csdf-sdf diff)
-        ;; Deep inside hole: should be outside the difference shape
-        dh   (sdf-eval sdf 0.0 0.0 0.0)
-        ;; Outside the box: still outside
-        do   (sdf-eval sdf 3.0 0.0 0.0)
-        ;; Inside box but outside hole: inside the difference shape
-        din  (sdf-eval sdf 1.5 0.0 0.0)]
-    (check! (> dh 0.0) "point inside hole should be outside difference (dh > 0)")
-    (check! (> do 0.0) "point outside box should be outside difference (do > 0)")
-    (check! (< din 0.0) "point in box but outside hole should be inside difference (din < 0)")
-    (csdf-free diff)))
-
-;; ---- test 4: mc-extract-colored produces a non-empty mesh ----
-
-(defn test-mc-extract-colored [] : void
-  (let [scene (colored-sphere 0.0 0.0 0.0 1.0  1.0 0.5 0.0  1)
-        mesh  (mc-extract-colored scene 16
-                                  -2.0 -2.0 -2.0
-                                   2.0  2.0  2.0)]
-    (check! (> mesh 0) "mc-extract-colored should return non-zero handle")
-    (let [n (cmesh-vertex-count mesh)]
-      (check! (> n 0) "mc-extract-colored should produce vertices")
-      ;; Spot-check: first vertex should have orange-ish color
-      (let [cr (cmesh-get-cr mesh 0)
-            cg (cmesh-get-cg mesh 0)
-            oi (cmesh-get-object-id mesh 0)]
-        (check! (approx= cr 1.0) "first vertex red channel should be ~1.0")
-        (check! (approx= cg 0.5) "first vertex green channel should be ~0.5")
-        (check! (= oi 1) "first vertex object ID should be 1")))
-    (cmesh-free mesh)
-    (csdf-free scene)))
-
-;; ---- test 5: two-object union has correct per-vertex attribution ----
-
-(defn test-colored-union-attribution [] : void
-  (let [red-sphere  (colored-sphere -1.5 0.0 0.0 0.8  1.0 0.0 0.0  1)
-        blue-sphere (colored-sphere  1.5 0.0 0.0 0.8  0.0 0.0 1.0  2)
-        scene       (colored-union red-sphere blue-sphere)
-        mesh        (mc-extract-colored scene 24
-                                        -3.0 -2.0 -2.0
-                                         3.0  2.0  2.0)]
-    (check! (> mesh 0) "union mesh should be non-zero")
-    (check! (> (cmesh-vertex-count mesh) 0) "union mesh should have vertices")
-    ;; Check that both object IDs appear in the mesh
-    (let [n    (cmesh-vertex-count mesh)]
-      (let [oi0 (cmesh-get-object-id mesh 0)
-            oi1 (cmesh-get-object-id mesh (/ n 2))]
-        (check! (if (= oi0 1) true (= oi0 2)) "vertex 0 should belong to obj 1 or 2")
-        (check! (if (= oi1 1) true (= oi1 2)) "midpoint vertex should belong to obj 1 or 2")))
-    (cmesh-free mesh)
-    (csdf-free scene)))
-
-;; ---- test 6: export-obj writes files (smoke test) ----
-
-(defn test-export-obj [] : void
-  (let [scene (colored-union
-                (colored-sphere -1.0 0.0 0.0 0.7  1.0 0.0 0.0  1)
-                (colored-sphere  1.0 0.0 0.0 0.7  0.0 1.0 0.0  2))
-        mesh  (mc-extract-colored scene 20
-                                  -2.5 -2.0 -2.0
-                                   2.5  2.0  2.0)
-        ret   (export-obj mesh "/tmp/tur_sdf_test")]
-    (check! (= ret 0) "export-obj should return 0 on success")
-    (cmesh-free mesh)
-    (csdf-free scene)))
-
-;; ---- test 7: colored-translate shifts the colored SDF ----
-
-(defn test-colored-translate [] : void
-  (let [s  (colored-sphere 0.0 0.0 0.0 1.0  0.0 1.0 0.0  3)
-        ts (colored-translate s 3.0 0.0 0.0)
-        sdf (csdf-sdf ts)
-        ;; Surface should now be at x=4
-        d4 (sdf-eval sdf 4.0 0.0 0.0)
-        ;; Old origin should be outside
-        d0 (sdf-eval sdf 0.0 0.0 0.0)]
-    (check! (approx= d4 0.0) "translated sphere surface at x=4 should be ~0")
-    (check! (> d0 0.0) "origin should now be outside translated sphere")
-    (csdf-free ts)))
-
-;; ---- main ----
-
-(defn main [] : int
-  (do
-    (test-colored-sphere)
-    (println "test-colored-sphere: PASS")
-    (test-colored-union-sdf)
-    (println "test-colored-union-sdf: PASS")
-    (test-colored-difference-sdf)
-    (println "test-colored-difference-sdf: PASS")
-    (test-mc-extract-colored)
-    (println "test-mc-extract-colored: PASS")
-    (test-colored-union-attribution)
-    (println "test-colored-union-attribution: PASS")
-    (test-export-obj)
-    (println "test-export-obj: PASS")
-    (test-colored-translate)
-    (println "test-colored-translate: PASS")
-    (println "All Phase 2 color tests passed.")
-    0))
-
-) ;; end defmodule color_test
+  ;; ---- test 1: colored-sphere csdf-sdf evaluates correctly ----
+  (defn test-colored-sphere [] : void
+    (let [cs  (colored-sphere 0.0 0.0 0.0 1.0 1.0 0.0 0.0 1)
+          sdf (csdf-sdf cs)
+          ;; Point on surface (dist = 0)
+          d0  (sdf-eval sdf 1.0 0.0 0.0)
+          ;; Point inside (dist = -0.5)
+          di  (sdf-eval sdf 0.5 0.0 0.0)
+          ;; Point outside (dist = 0.5)
+          do  (sdf-eval sdf 1.5 0.0 0.0)]
+      (check! (approx= d0 0.0) "colored-sphere surface dist should be ~0")
+      (check! (approx= di -0.5) "colored-sphere inside dist should be ~-0.5")
+      (check! (approx= do 0.5) "colored-sphere outside dist should be ~0.5")
+      (csdf-free cs)))
+  ;; ---- test 2: colored-union combined SDF is correct ----
+  (defn test-colored-union-sdf [] : void
+    (let [a   (colored-sphere -1.5 0.0 0.0 0.8 1.0 0.0 0.0 1)
+          b   (colored-sphere 1.5 0.0 0.0 0.8 0.0 0.0 1.0 2)
+          u   (colored-union a b)
+          sdf (csdf-sdf u)
+          ;; Midpoint should be outside both spheres (~0.7 from each centre)
+          dm  (sdf-eval sdf 0.0 0.0 0.0)
+          ;; Near sphere a surface
+          da  (sdf-eval sdf -1.5 0.8 0.0)
+          ;; Near sphere b surface
+          db  (sdf-eval sdf 1.5 0.8 0.0)]
+      (check! (> dm 0.0) "union midpoint should be outside (dm > 0)")
+      (check! (approx= da 0.0) "union near sphere-a surface should be ~0")
+      (check! (approx= db 0.0) "union near sphere-b surface should be ~0")
+      (csdf-free u)))
+  ;; ---- test 3: colored-difference carves correctly ----
+  (defn test-colored-difference-sdf [] : void
+    (let [base (colored-box -2.0 -2.0 -2.0 2.0 2.0 2.0 0.8 0.8 0.8 1)
+          hole (colored-sphere 0.0 0.0 0.0 1.0 0.0 0.0 0.0 2)
+          diff (colored-difference base hole)
+          sdf  (csdf-sdf diff)
+          ;; Deep inside hole: should be outside the difference shape
+          dh   (sdf-eval sdf 0.0 0.0 0.0)
+          ;; Outside the box: still outside
+          do   (sdf-eval sdf 3.0 0.0 0.0)
+          ;; Inside box but outside hole: inside the difference shape
+          din  (sdf-eval sdf 1.5 0.0 0.0)]
+      (check! (> dh 0.0)
+        "point inside hole should be outside difference (dh > 0)")
+      (check! (> do 0.0)
+        "point outside box should be outside difference (do > 0)")
+      (check! (< din 0.0)
+        "point in box but outside hole should be inside difference (din < 0)")
+      (csdf-free diff)))
+  ;; ---- test 4: mc-extract-colored produces a non-empty mesh ----
+  (defn test-mc-extract-colored [] : void
+    (let [scene (colored-sphere 0.0 0.0 0.0 1.0 1.0 0.5 0.0 1)
+          mesh  (mc-extract-colored scene 16 -2.0 -2.0 -2.0 2.0 2.0 2.0)]
+      (check! (> mesh 0) "mc-extract-colored should return non-zero handle")
+      (let [n (cmesh-vertex-count mesh)]
+        (check! (> n 0) "mc-extract-colored should produce vertices")
+        ;; Spot-check: first vertex should have orange-ish color
+        (let [cr (cmesh-get-cr mesh 0)
+              cg (cmesh-get-cg mesh 0)
+              oi (cmesh-get-object-id mesh 0)]
+          (check! (approx= cr 1.0) "first vertex red channel should be ~1.0")
+          (check! (approx= cg 0.5) "first vertex green channel should be ~0.5")
+          (check! (= oi 1) "first vertex object ID should be 1")))
+      (cmesh-free mesh)
+      (csdf-free scene)))
+  ;; ---- test 5: two-object union has correct per-vertex attribution ----
+  (defn test-colored-union-attribution [] : void
+    (let [red-sphere  (colored-sphere -1.5 0.0 0.0 0.8 1.0 0.0 0.0 1)
+          blue-sphere (colored-sphere 1.5 0.0 0.0 0.8 0.0 0.0 1.0 2)
+          scene       (colored-union red-sphere blue-sphere)
+          mesh        (mc-extract-colored scene 24 -3.0 -2.0 -2.0 3.0 2.0 2.0)]
+      (check! (> mesh 0) "union mesh should be non-zero")
+      (check! (> (cmesh-vertex-count mesh) 0) "union mesh should have vertices")
+      ;; Check that both object IDs appear in the mesh
+      (let [n (cmesh-vertex-count mesh)]
+        (let [oi0 (cmesh-get-object-id mesh 0)
+              oi1 (cmesh-get-object-id mesh (/ n 2))]
+          (check! (if (= oi0 1) true (= oi0 2))
+            "vertex 0 should belong to obj 1 or 2")
+          (check! (if (= oi1 1) true (= oi1 2))
+            "midpoint vertex should belong to obj 1 or 2")))
+      (cmesh-free mesh)
+      (csdf-free scene)))
+  ;; ---- test 6: export-obj writes files (smoke test) ----
+  (defn test-export-obj [] : void
+    (let [scene (colored-union (colored-sphere -1.0 0.0 0.0 0.7 1.0 0.0 0.0 1)
+                  (colored-sphere 1.0 0.0 0.0 0.7 0.0 1.0 0.0 2))
+          mesh  (mc-extract-colored scene 20 -2.5 -2.0 -2.0 2.5 2.0 2.0)
+          ret   (export-obj mesh "/tmp/tur_sdf_test")]
+      (check! (= ret 0) "export-obj should return 0 on success")
+      (cmesh-free mesh)
+      (csdf-free scene)))
+  ;; ---- test 7: colored-translate shifts the colored SDF ----
+  (defn test-colored-translate [] : void
+    (let [s   (colored-sphere 0.0 0.0 0.0 1.0 0.0 1.0 0.0 3)
+          ts  (colored-translate s 3.0 0.0 0.0)
+          sdf (csdf-sdf ts)
+          ;; Surface should now be at x=4
+          d4  (sdf-eval sdf 4.0 0.0 0.0)
+          ;; Old origin should be outside
+          d0  (sdf-eval sdf 0.0 0.0 0.0)]
+      (check! (approx= d4 0.0) "translated sphere surface at x=4 should be ~0")
+      (check! (> d0 0.0) "origin should now be outside translated sphere")
+      (csdf-free ts)))
+  ;; ---- main ----
+  (defn main [] : int
+    (do
+      (test-colored-sphere)
+      (println "test-colored-sphere: PASS")
+      (test-colored-union-sdf)
+      (println "test-colored-union-sdf: PASS")
+      (test-colored-difference-sdf)
+      (println "test-colored-difference-sdf: PASS")
+      (test-mc-extract-colored)
+      (println "test-mc-extract-colored: PASS")
+      (test-colored-union-attribution)
+      (println "test-colored-union-attribution: PASS")
+      (test-export-obj)
+      (println "test-export-obj: PASS")
+      (test-colored-translate)
+      (println "test-colored-translate: PASS")
+      (println "All Phase 2 color tests passed.")
+      0))) ;; end defmodule color_test

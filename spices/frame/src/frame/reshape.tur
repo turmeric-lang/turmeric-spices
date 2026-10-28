@@ -5,29 +5,44 @@
 ;; expected to stay out-of-tree (handle in PyArrow / Polars / DuckDB after
 ;; an arrow-export hop); pivot may return once we have a duplicate-key
 ;; reduction policy worth committing to.
-
 (defmodule frame/reshape
   (export melt)
-
-  (import frame/type   :refer [type-utf8])
-  (import frame/schema :refer [field field-name field-type field-nullable
-                                schema schema-arity schema-field-at
-                                schema-index-of])
-  (import frame/column :refer [column-length column-type column-builder
-                                builder-append-int64 builder-append-float64
-                                builder-append-bool builder-append-utf8
-                                builder-append-null builder-finish
-                                column-int64-at column-float64-at column-bool-at
-                                column-utf8-at column-valid?
-                                column-int32-at column-float32-at])
-  (import frame/frame  :refer [frame frame-nrows frame-ncols frame-schema
-                                frame-column-at])
-
-(defn __rh-nil [] : int ```c return 0; ```)
-
-(defn __rh-cons [v : int n : int] : int
-  ```c
-  #include <stdlib.h>
+  (import frame/type :refer [type-utf8])
+  (import frame/schema
+    :refer
+    [field
+     field-name
+     field-type
+     field-nullable
+     schema
+     schema-arity
+     schema-field-at
+     schema-index-of])
+  (import frame/column
+    :refer
+    [column-length
+     column-type
+     column-builder
+     builder-append-int64
+     builder-append-float64
+     builder-append-bool
+     builder-append-utf8
+     builder-append-null
+     builder-finish
+     column-int64-at
+     column-float64-at
+     column-bool-at
+     column-utf8-at
+     column-valid?
+     column-int32-at
+     column-float32-at])
+  (import frame/frame
+    :refer
+    [frame frame-nrows frame-ncols frame-schema frame-column-at])
+  (defn __rh-nil [] : int ```c return 0; ```)
+  (defn __rh-cons [v : int n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   struct __cons *c = (struct __cons *)malloc(sizeof(*c));
@@ -35,10 +50,9 @@
   c->value = v; c->next = n;
   return (int64_t)(intptr_t)c;
   ```)
-
-(defn __rh-list-has-cstr? [xs : int needle : cstr] : bool
-  ```c
-  #include <string.h>
+  (defn __rh-list-has-cstr? [xs : int needle : cstr] : bool
+    ```c
+    #include <string.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   const char *n = (const char *)(intptr_t)needle;
@@ -48,19 +62,17 @@
   }
   return false;
   ```)
-
-(defn __rh-list-length [xs : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __rh-list-length [xs : int] : int
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t n = 0;
   for (struct __cons *p = (struct __cons *)(intptr_t)xs; p; p = (struct __cons *)(intptr_t)p->next) n++;
   return n;
   ```)
-
-(defn __rh-list-nth-int [xs : int i : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __rh-list-nth-int [xs : int i : int] : int
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t k = 0;
   for (struct __cons *p = (struct __cons *)(intptr_t)xs; p; p = (struct __cons *)(intptr_t)p->next, k++) {
@@ -68,149 +80,180 @@
   }
   return 0;
   ```)
-
-(defn __rh-clone-field-at [s : int i : int] : int
-  (let [fd (schema-field-at s i)]
-    (field (field-name fd) (field-type fd) (field-nullable fd))))
-
-;; ---------------------------------------------------------------------------
-;; Compute non-id column indices in original column order.
-;; ---------------------------------------------------------------------------
-
-(defn __rh-non-id-ixs [s : int id-names : int ncols : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [fd (schema-field-at s i)
-          nm (field-name fd)]
-      (if (__rh-list-has-cstr? id-names nm)
-        (__rh-non-id-ixs s id-names ncols (- i 1) acc)
-        (__rh-non-id-ixs s id-names ncols (- i 1) (__rh-cons i acc))))))
-
-(defn __rh-id-ixs [s : int id-names : int ncols : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [fd (schema-field-at s i)
-          nm (field-name fd)]
-      (if (__rh-list-has-cstr? id-names nm)
-        (__rh-id-ixs s id-names ncols (- i 1) (__rh-cons i acc))
-        (__rh-id-ixs s id-names ncols (- i 1) acc)))))
-
-;; ---------------------------------------------------------------------------
-;; Per-cell appender: read row r of source column `src` and append to builder
-;; `b` whose type matches src.  Nulls handled.
-;; ---------------------------------------------------------------------------
-
-(defn __rh-append-cell [b : int src : int r : int t : int] : void
-  (if (not (column-valid? src r))
-    (builder-append-null b)
-    (if (= t 2)
-      (builder-append-int64   b (column-int64-at   src r))
-      (if (= t 4)
-        (builder-append-float64 b (column-float64-at src r))
-        (if (= t 5)
-          (builder-append-bool    b (column-bool-at    src r))
-          (if (= t 6)
-            (builder-append-utf8    b (column-utf8-at    src r))
-            (builder-append-null b)))))))
-
-;; ---------------------------------------------------------------------------
-;; Build output columns.
-;; ---------------------------------------------------------------------------
-
-;; For each id column ix, build an output column of length n_out = n_non_id * n_rows
-;; by reading row r%n_rows of src column for row r out.
-(defn __rh-build-id-col [f : int col-ix : int n-rows : int n-non-id : int
-                          out-row : int b : int n-out : int] : int
-  (if (>= out-row n-out)
-    (builder-finish b)
-    (let [r (__rh-mod out-row n-rows)]
-      (do
-        (__rh-append-cell b (frame-column-at f col-ix) r (column-type (frame-column-at f col-ix)))
-        (__rh-build-id-col f col-ix n-rows n-non-id (+ out-row 1) b n-out)))))
-
-(defn __rh-mod [a : int b : int] : int
-  ```c
-  return a % b;
+  (defn __rh-clone-field-at [s : int i : int] : int
+    (let [fd (schema-field-at s i)]
+      (field (field-name fd) (field-type fd) (field-nullable fd))))
+  ;; ---------------------------------------------------------------------------
+  ;; Compute non-id column indices in original column order.
+  ;; ---------------------------------------------------------------------------
+  (defn __rh-non-id-ixs [s : int id-names : int ncols : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (let [fd (schema-field-at s i)
+            nm (field-name fd)]
+        (if (__rh-list-has-cstr? id-names nm)
+          (__rh-non-id-ixs s id-names ncols (- i 1) acc)
+          (__rh-non-id-ixs s id-names ncols (- i 1) (__rh-cons i acc))))))
+  (defn __rh-id-ixs [s : int id-names : int ncols : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (let [fd (schema-field-at s i)
+            nm (field-name fd)]
+        (if (__rh-list-has-cstr? id-names nm)
+          (__rh-id-ixs s id-names ncols (- i 1) (__rh-cons i acc))
+          (__rh-id-ixs s id-names ncols (- i 1) acc)))))
+  ;; ---------------------------------------------------------------------------
+  ;; Per-cell appender: read row r of source column `src` and append to builder
+  ;; `b` whose type matches src.  Nulls handled.
+  ;; ---------------------------------------------------------------------------
+  (defn __rh-append-cell [b : int src : int r : int t : int] : void
+    (if (not (column-valid? src r))
+      (builder-append-null b)
+      (if (= t 2)
+        (builder-append-int64 b (column-int64-at src r))
+        (if (= t 4)
+          (builder-append-float64 b (column-float64-at src r))
+          (if (= t 5)
+            (builder-append-bool b (column-bool-at src r))
+            (if (= t 6)
+              (builder-append-utf8 b (column-utf8-at src r))
+              (builder-append-null b)))))))
+  ;; ---------------------------------------------------------------------------
+  ;; Build output columns.
+  ;; ---------------------------------------------------------------------------
+  ;; For each id column ix, build an output column of length n_out = n_non_id * n_rows
+  ;; by reading row r%n_rows of src column for row r out.
+  (defn __rh-build-id-col [f : int
+                           col-ix : int
+                           n-rows : int
+                           n-non-id : int
+                           out-row : int
+                           b : int
+                           n-out : int] : int
+    (if (>= out-row n-out)
+      (builder-finish b)
+      (let [r (__rh-mod out-row n-rows)]
+        (do
+          (__rh-append-cell b
+            (frame-column-at f col-ix)
+            r
+            (column-type (frame-column-at f col-ix)))
+          (__rh-build-id-col f col-ix n-rows n-non-id (+ out-row 1) b n-out)))))
+  (defn __rh-mod [a : int b : int] : int
+    ```c
+    return a % b;
   ```)
-
-(defn __rh-mul [a : int b : int] : int
-  ```c
-  return a * b;
+  (defn __rh-mul [a : int b : int] : int
+    ```c
+    return a * b;
   ```)
-
-(defn __rh-div [a : int b : int] : int
-  ```c
-  return a / b;
+  (defn __rh-div [a : int b : int] : int
+    ```c
+    return a / b;
   ```)
-
-;; var-name column: outer loop is non-id col, inner loop is original row.
-(defn __rh-build-var-col [f : int non-id-ixs : int n-non-id : int n-rows : int
-                           out-row : int b : int n-out : int] : int
-  (if (>= out-row n-out)
-    (builder-finish b)
-    (let [c-off (__rh-div out-row n-rows)
-          src-ix (__rh-list-nth-int non-id-ixs c-off)
-          nm     (field-name (schema-field-at (frame-schema f) src-ix))]
-      (do
-        (builder-append-utf8 b nm)
-        (__rh-build-var-col f non-id-ixs n-non-id n-rows (+ out-row 1) b n-out)))))
-
-;; value column: outer = non-id col, inner = original row.
-;; All non-id columns must share the same type tag.
-(defn __rh-build-val-col [f : int non-id-ixs : int n-non-id : int n-rows : int
-                           value-type : int out-row : int b : int n-out : int] : int
-  (if (>= out-row n-out)
-    (builder-finish b)
-    (let [c-off  (__rh-div out-row n-rows)
-          r      (__rh-mod out-row n-rows)
-          src-ix (__rh-list-nth-int non-id-ixs c-off)
-          src    (frame-column-at f src-ix)]
-      (do
-        (__rh-append-cell b src r value-type)
-        (__rh-build-val-col f non-id-ixs n-non-id n-rows value-type (+ out-row 1) b n-out)))))
-
-;; ---------------------------------------------------------------------------
-;; Check that all non-id columns share the same type.  Returns the common
-;; type tag, or 0 if non-id-ixs is empty / types differ.
-;; ---------------------------------------------------------------------------
-
-(defn __rh-common-type [f : int non-id-ixs : int n-non-id : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [src-ix (__rh-list-nth-int non-id-ixs i)
-          t      (column-type (frame-column-at f src-ix))]
-      (if (= acc 0)
-        (__rh-common-type f non-id-ixs n-non-id (- i 1) t)
-        (if (not= acc t)
-          -1
-          (__rh-common-type f non-id-ixs n-non-id (- i 1) acc))))))
-
-;; ---------------------------------------------------------------------------
-;; Build output schema fields: id fields + var (utf8) + value (common-type).
-;; ---------------------------------------------------------------------------
-
-(defn __rh-build-id-fields [f : int id-ixs : int n-id : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [src-ix (__rh-list-nth-int id-ixs i)
-          fd-i   (schema-field-at (frame-schema f) src-ix)
-          fd     (field (field-name fd-i) (field-type fd-i) (field-nullable fd-i))]
-      (__rh-build-id-fields f id-ixs n-id (- i 1) (__rh-cons fd acc)))))
-
-(defn __rh-build-id-cols [f : int id-ixs : int n-id : int n-rows : int n-non-id : int
-                           n-out : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [src-ix (__rh-list-nth-int id-ixs i)
-          t      (column-type (frame-column-at f src-ix))
-          b      (column-builder t n-out)
-          col    (__rh-build-id-col f src-ix n-rows n-non-id 0 b n-out)]
-      (__rh-build-id-cols f id-ixs n-id n-rows n-non-id n-out (- i 1)
-                           (__rh-cons col acc)))))
-
-(defn __rh-list-concat [a : int b : int] : int
-  ```c
-  #include <stdlib.h>
+  ;; var-name column: outer loop is non-id col, inner loop is original row.
+  (defn __rh-build-var-col [f : int
+                            non-id-ixs : int
+                            n-non-id : int
+                            n-rows : int
+                            out-row : int
+                            b : int
+                            n-out : int] : int
+    (if (>= out-row n-out)
+      (builder-finish b)
+      (let [c-off  (__rh-div out-row n-rows)
+            src-ix (__rh-list-nth-int non-id-ixs c-off)
+            nm     (field-name (schema-field-at (frame-schema f) src-ix))]
+        (do
+          (builder-append-utf8 b nm)
+          (__rh-build-var-col f
+            non-id-ixs
+            n-non-id
+            n-rows
+            (+ out-row 1)
+            b
+            n-out)))))
+  ;; value column: outer = non-id col, inner = original row.
+  ;; All non-id columns must share the same type tag.
+  (defn __rh-build-val-col [f : int
+                            non-id-ixs : int
+                            n-non-id : int
+                            n-rows : int
+                            value-type : int
+                            out-row : int
+                            b : int
+                            n-out : int] : int
+    (if (>= out-row n-out)
+      (builder-finish b)
+      (let [c-off  (__rh-div out-row n-rows)
+            r      (__rh-mod out-row n-rows)
+            src-ix (__rh-list-nth-int non-id-ixs c-off)
+            src    (frame-column-at f src-ix)]
+        (do
+          (__rh-append-cell b src r value-type)
+          (__rh-build-val-col f
+            non-id-ixs
+            n-non-id
+            n-rows
+            value-type
+            (+ out-row 1)
+            b
+            n-out)))))
+  ;; ---------------------------------------------------------------------------
+  ;; Check that all non-id columns share the same type.  Returns the common
+  ;; type tag, or 0 if non-id-ixs is empty / types differ.
+  ;; ---------------------------------------------------------------------------
+  (defn __rh-common-type [f : int
+                          non-id-ixs : int
+                          n-non-id : int
+                          i : int
+                          acc : int] : int
+    (if (< i 0)
+      acc
+      (let [src-ix (__rh-list-nth-int non-id-ixs i)
+            t      (column-type (frame-column-at f src-ix))]
+        (if (= acc 0)
+          (__rh-common-type f non-id-ixs n-non-id (- i 1) t)
+          (if (not= acc t)
+            -1
+            (__rh-common-type f non-id-ixs n-non-id (- i 1) acc))))))
+  ;; ---------------------------------------------------------------------------
+  ;; Build output schema fields: id fields + var (utf8) + value (common-type).
+  ;; ---------------------------------------------------------------------------
+  (defn __rh-build-id-fields [f : int id-ixs : int n-id : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (let [src-ix (__rh-list-nth-int id-ixs i)
+            fd-i   (schema-field-at (frame-schema f) src-ix)
+            fd     (field (field-name fd-i)
+                     (field-type fd-i)
+                     (field-nullable fd-i))]
+        (__rh-build-id-fields f id-ixs n-id (- i 1) (__rh-cons fd acc)))))
+  (defn __rh-build-id-cols [f : int
+                            id-ixs : int
+                            n-id : int
+                            n-rows : int
+                            n-non-id : int
+                            n-out : int
+                            i : int
+                            acc : int] : int
+    (if (< i 0)
+      acc
+      (let [src-ix (__rh-list-nth-int id-ixs i)
+            t      (column-type (frame-column-at f src-ix))
+            b      (column-builder t n-out)
+            col    (__rh-build-id-col f src-ix n-rows n-non-id 0 b n-out)]
+        (__rh-build-id-cols f
+          id-ixs
+          n-id
+          n-rows
+          n-non-id
+          n-out
+          (- i 1)
+          (__rh-cons col acc)))))
+  (defn __rh-list-concat [a : int b : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   struct __cons *head = NULL, *tail = NULL;
@@ -225,47 +268,67 @@
   tail->next = b;
   return (int64_t)(intptr_t)head;
   ```)
-
-;;; melt -- pivot a wide frame to long format.
-;;;
-;;; Parameters:
-;;;   f          -- :int source frame
-;;;   id-names   -- cons list of :cstr id-column names (stay as-is, replicated)
-;;;   var-name   -- :cstr name of the output column holding original column names
-;;;   value-name -- :cstr name of the output column holding cell values
-;;;
-;;; Returns:
-;;;   :int frame with (n_orig_rows * n_non_id_cols) rows and
-;;;   (n_id + 2) columns: id columns, then var-name (utf8), then value-name.
-;;;
-;;; Non-id columns must share a single type tag; returns 0 otherwise.
-;;;
-;;; Since: FR7
-(defn melt [f : int id-names : int var-name : cstr value-name : cstr] : int
-  (let [s        (frame-schema f)
-        ncols    (frame-ncols f)
-        n-rows   (frame-nrows f)
-        id-ixs   (__rh-id-ixs s id-names ncols (- ncols 1) (__rh-nil))
-        non-ixs  (__rh-non-id-ixs s id-names ncols (- ncols 1) (__rh-nil))
-        n-id     (__rh-list-length id-ixs)
-        n-non-id (__rh-list-length non-ixs)
-        n-out    (__rh-mul n-rows n-non-id)
-        v-type   (__rh-common-type f non-ixs n-non-id (- n-non-id 1) 0)]
-    (if (or (<= n-non-id 0) (= v-type -1))
-      0
-      (let [id-cols  (__rh-build-id-cols f id-ixs n-id n-rows n-non-id n-out
-                                          (- n-id 1) (__rh-nil))
-            var-b    (column-builder (type-utf8) n-out)
-            var-col  (__rh-build-var-col f non-ixs n-non-id n-rows 0 var-b n-out)
-            val-b    (column-builder v-type n-out)
-            val-col  (__rh-build-val-col f non-ixs n-non-id n-rows v-type 0 val-b n-out)
-            id-flds  (__rh-build-id-fields f id-ixs n-id (- n-id 1) (__rh-nil))
-            var-fld  (field var-name (type-utf8) 0)
-            val-fld  (field value-name v-type 0)
-            tail-cols   (__rh-cons var-col (__rh-cons val-col (__rh-nil)))
-            tail-fields (__rh-cons var-fld (__rh-cons val-fld (__rh-nil)))
-            all-cols    (__rh-list-concat id-cols tail-cols)
-            all-fields  (__rh-list-concat id-flds tail-fields)]
-        (frame (schema all-fields) all-cols)))))
-
-) ;; end defmodule frame/reshape
+  ;;; melt -- pivot a wide frame to long format.
+  ;;;
+  ;;; Parameters:
+  ;;;   f          -- :int source frame
+  ;;;   id-names   -- cons list of :cstr id-column names (stay as-is, replicated)
+  ;;;   var-name   -- :cstr name of the output column holding original column names
+  ;;;   value-name -- :cstr name of the output column holding cell values
+  ;;;
+  ;;; Returns:
+  ;;;   :int frame with (n_orig_rows * n_non_id_cols) rows and
+  ;;;   (n_id + 2) columns: id columns, then var-name (utf8), then value-name.
+  ;;;
+  ;;; Non-id columns must share a single type tag; returns 0 otherwise.
+  ;;;
+  ;;; Since: FR7
+  (defn melt [f : int id-names : int var-name : cstr value-name : cstr] : int
+    (let [s        (frame-schema f)
+          ncols    (frame-ncols f)
+          n-rows   (frame-nrows f)
+          id-ixs   (__rh-id-ixs s id-names ncols (- ncols 1) (__rh-nil))
+          non-ixs  (__rh-non-id-ixs s id-names ncols (- ncols 1) (__rh-nil))
+          n-id     (__rh-list-length id-ixs)
+          n-non-id (__rh-list-length non-ixs)
+          n-out    (__rh-mul n-rows n-non-id)
+          v-type   (__rh-common-type f non-ixs n-non-id (- n-non-id 1) 0)]
+      (if (or (<= n-non-id 0) (= v-type -1))
+        0
+        (let [id-cols     (__rh-build-id-cols f
+                            id-ixs
+                            n-id
+                            n-rows
+                            n-non-id
+                            n-out
+                            (- n-id 1)
+                            (__rh-nil))
+              var-b       (column-builder (type-utf8) n-out)
+              var-col     (__rh-build-var-col f
+                            non-ixs
+                            n-non-id
+                            n-rows
+                            0
+                            var-b
+                            n-out)
+              val-b       (column-builder v-type n-out)
+              val-col     (__rh-build-val-col f
+                            non-ixs
+                            n-non-id
+                            n-rows
+                            v-type
+                            0
+                            val-b
+                            n-out)
+              id-flds     (__rh-build-id-fields f
+                            id-ixs
+                            n-id
+                            (- n-id 1)
+                            (__rh-nil))
+              var-fld     (field var-name (type-utf8) 0)
+              val-fld     (field value-name v-type 0)
+              tail-cols   (__rh-cons var-col (__rh-cons val-col (__rh-nil)))
+              tail-fields (__rh-cons var-fld (__rh-cons val-fld (__rh-nil)))
+              all-cols    (__rh-list-concat id-cols tail-cols)
+              all-fields  (__rh-list-concat id-flds tail-fields)]
+          (frame (schema all-fields) all-cols)))))) ;; end defmodule frame/reshape

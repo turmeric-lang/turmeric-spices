@@ -15,96 +15,113 @@
 ;;   11
 ;;   22
 ;;   ok
-
 (defmodule xsystem_clause_flex_test
   (export)
-
-(import ecs/sized-storage :refer [SizedDense])
-(import ecs/sized-world   :refer [sized-defworld-mono])
-(import ecs/xworld        :refer [sized-defcomponent-accessors-xmono
-                                  defworld-box-helpers])
-(import ecs/xcap          :refer [XWriteCap XReadCap
-                                  make-write-cap make-read-cap use-cap!])
-(import ecs/xsystem       :refer [XSystem make-xsystem defxsystem])
-(import ecs/xstage        :refer [BoundXSystem bind-xsystem
-                                  XStage xstage-new xstage-add!
-                                  xstage-n-waves xstage-run! xstage-free!])
-
-(defopaque Pos       :int)
-(defopaque RenderPos :int)
-
-(sized-defworld-mono SimWorld    (Static 8) [Pos])
-(sized-defcomponent-accessors-xmono SimWorld Pos)
-(sized-defworld-mono RenderWorld (Static 8) [RenderPos])
-(sized-defcomponent-accessors-xmono RenderWorld RenderPos)
-
-(def Pos-cid       0)
-(def RenderPos-cid 0)
-
-(defworld-box-helpers SimWorld)
-(defworld-box-helpers RenderWorld)
-
-;; Variant A: omits empty clauses entirely, and orders writes-to before
-;; reads-from. The macro should still mint a SimWorld read-cap for `Pos`
-;; and a RenderWorld write-cap for `RenderPos`.
-(defxsystem extract-flex
-  [sim SimWorld  ren RenderWorld]
-  :writes-to   ren [RenderPos]
-  :reads-from  sim [Pos]
-  ;; multiple body forms -- the macro wraps these in (do ...).
-  (set-RenderPos! ren-RenderPos-write-cap ren (slot-new 0)
-    (:: (:: (get-Pos sim-Pos-read-cap sim (slot-new 0)) :int) :RenderPos))
-  (set-RenderPos! ren-RenderPos-write-cap ren (slot-new 1)
-    (:: (:: (get-Pos sim-Pos-read-cap sim (slot-new 1)) :int) :RenderPos)))
-
-;; Variant B: canonical 4-clause layout (with the now-unnecessary empties)
-;; -- proves the relaxed parser still accepts the original shape.
-(defxsystem extract-canonical
-  [sim SimWorld  ren RenderWorld]
-  :reads-from  sim [Pos]
-  :writes-to   sim []
-  :reads-from  ren []
-  :writes-to   ren [RenderPos]
-  (do
-    (set-RenderPos! ren-RenderPos-write-cap ren (slot-new 0)
+  (import ecs/sized-storage :refer [SizedDense])
+  (import ecs/sized-world :refer [sized-defworld-mono])
+  (import ecs/xworld
+    :refer
+    [sized-defcomponent-accessors-xmono defworld-box-helpers])
+  (import ecs/xcap
+    :refer
+    [XWriteCap XReadCap make-write-cap make-read-cap use-cap!])
+  (import ecs/xsystem :refer [XSystem make-xsystem defxsystem])
+  (import ecs/xstage
+    :refer
+    [BoundXSystem
+     bind-xsystem
+     XStage
+     xstage-new
+     xstage-add!
+     xstage-n-waves
+     xstage-run!
+     xstage-free!])
+  (defopaque Pos :int)
+  (defopaque RenderPos :int)
+  (sized-defworld-mono SimWorld (Static 8) [Pos])
+  (sized-defcomponent-accessors-xmono SimWorld Pos)
+  (sized-defworld-mono RenderWorld (Static 8) [RenderPos])
+  (sized-defcomponent-accessors-xmono RenderWorld RenderPos)
+  (def Pos-cid 0)
+  (def RenderPos-cid 0)
+  (defworld-box-helpers SimWorld)
+  (defworld-box-helpers RenderWorld)
+  ;; Variant A: omits empty clauses entirely, and orders writes-to before
+  ;; reads-from. The macro should still mint a SimWorld read-cap for `Pos`
+  ;; and a RenderWorld write-cap for `RenderPos`.
+  (defxsystem extract-flex
+    [sim SimWorld ren RenderWorld]
+    :writes-to
+    ren
+    [RenderPos]
+    :reads-from
+    sim
+    [Pos]
+    ;; multiple body forms -- the macro wraps these in (do ...).
+    (set-RenderPos! ren-RenderPos-write-cap
+      ren
+      (slot-new 0)
       (:: (:: (get-Pos sim-Pos-read-cap sim (slot-new 0)) :int) :RenderPos))
-    (set-RenderPos! ren-RenderPos-write-cap ren (slot-new 1)
-      (:: (:: (get-Pos sim-Pos-read-cap sim (slot-new 1)) :int) :RenderPos))))
-
-(defn populate-sim [^borrow sim : SimWorld] : nil
-  (let [c1 (:: (make-write-cap Pos-cid) (XWriteCap SimWorld Pos))]
-    (set-Pos! c1 sim (slot-new 0) (:: 11 :Pos))
-    (use-cap! c1))
-  (let [c2 (:: (make-write-cap Pos-cid) (XWriteCap SimWorld Pos))]
-    (set-Pos! c2 sim (slot-new 1) (:: 22 :Pos))
-    (use-cap! c2)))
-
-(defn drain-render [ren : RenderWorld] : nil
-  (let [rcap (:: (make-read-cap RenderPos-cid) (XReadCap RenderWorld RenderPos))
-        v0   (:: (get-RenderPos rcap ren (slot-new 0)) :int)
-        v1   (:: (get-RenderPos rcap ren (slot-new 1)) :int)]
-    (println v0)
-    (println v1)))
-
-(defn run-once [xs : XSystem] : nil
-  (let [sim : SimWorld   (make-SimWorld 8)
-        ren : RenderWorld (make-RenderWorld 8)]
-    (populate-sim sim)
-    (let [sp (box-SimWorld sim)
-          rp (box-RenderWorld ren)
-          st (xstage-new)
-          bs (bind-xsystem xs 0 sp 1 rp)]
-      (xstage-add! st bs)
-      (xstage-run! st)
-      (drain-render (load-RenderWorld rp))
-      (xstage-free! st)
-      (free-SimWorld-box sp)
-      (free-RenderWorld-box rp))))
-
-(defn main [] : int
-  (run-once extract-flex)
-  (run-once extract-canonical)
-  (println "ok")
-  0)
-
-) ;; end defmodule xsystem_clause_flex_test
+    (set-RenderPos! ren-RenderPos-write-cap
+      ren
+      (slot-new 1)
+      (:: (:: (get-Pos sim-Pos-read-cap sim (slot-new 1)) :int) :RenderPos)))
+  ;; Variant B: canonical 4-clause layout (with the now-unnecessary empties)
+  ;; -- proves the relaxed parser still accepts the original shape.
+  (defxsystem extract-canonical
+    [sim SimWorld ren RenderWorld]
+    :reads-from
+    sim
+    [Pos]
+    :writes-to
+    sim
+    []
+    :reads-from
+    ren
+    []
+    :writes-to
+    ren
+    [RenderPos]
+    (do
+      (set-RenderPos! ren-RenderPos-write-cap
+        ren
+        (slot-new 0)
+        (:: (:: (get-Pos sim-Pos-read-cap sim (slot-new 0)) :int) :RenderPos))
+      (set-RenderPos! ren-RenderPos-write-cap
+        ren
+        (slot-new 1)
+        (:: (:: (get-Pos sim-Pos-read-cap sim (slot-new 1)) :int) :RenderPos))))
+  (defn populate-sim [^borrow sim : SimWorld] : nil
+    (let [c1 (:: (make-write-cap Pos-cid) (XWriteCap SimWorld Pos))]
+      (set-Pos! c1 sim (slot-new 0) (:: 11 :Pos))
+      (use-cap! c1))
+    (let [c2 (:: (make-write-cap Pos-cid) (XWriteCap SimWorld Pos))]
+      (set-Pos! c2 sim (slot-new 1) (:: 22 :Pos))
+      (use-cap! c2)))
+  (defn drain-render [ren : RenderWorld] : nil
+    (let [rcap (:: (make-read-cap RenderPos-cid)
+                 (XReadCap RenderWorld RenderPos))
+          v0   (:: (get-RenderPos rcap ren (slot-new 0)) :int)
+          v1   (:: (get-RenderPos rcap ren (slot-new 1)) :int)]
+      (println v0)
+      (println v1)))
+  (defn run-once [xs : XSystem] : nil
+    (let [sim               : SimWorld
+          (make-SimWorld 8) ren
+          : RenderWorld     (make-RenderWorld 8)]
+      (populate-sim sim)
+      (let [sp (box-SimWorld sim)
+            rp (box-RenderWorld ren)
+            st (xstage-new)
+            bs (bind-xsystem xs 0 sp 1 rp)]
+        (xstage-add! st bs)
+        (xstage-run! st)
+        (drain-render (load-RenderWorld rp))
+        (xstage-free! st)
+        (free-SimWorld-box sp)
+        (free-RenderWorld-box rp))))
+  (defn main [] : int
+    (run-once extract-flex)
+    (run-once extract-canonical)
+    (println "ok")
+    0)) ;; end defmodule xsystem_clause_flex_test

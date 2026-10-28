@@ -44,130 +44,120 @@
 ;;   (waits on a BoundedIdx-style refinement at the bind/col call sites).
 ;;
 ;; Since: U3
-
 (defmodule sqlite/typed
   (export TStmt
-          tstmt-of tstmt-handle
-          tstmt-bind-int tstmt-bind-real tstmt-bind-text tstmt-bind-null
-          tstmt-step tstmt-reset tstmt-finalize
-          tcol-count tcol-name tcol-int tcol-real tcol-text tcol-type)
-
-  (import sqlite/db   :refer [Stmt])
-  (import sqlite/stmt :refer [stmt-step stmt-bind-int stmt-bind-real
-                              stmt-bind-text stmt-bind-null
-                              stmt-reset stmt-finalize])
-  (import sqlite/row  :refer [col-count col-name col-int col-real
-                              col-text col-type])
-
-;;; TStmt -- a phantom row-typed handle on a prepared sqlite statement,
-;;; parameterised by its bind-parameter row `params` and result-column
-;;; row `cols`. Both rows are erased at codegen; at runtime a `TStmt`
-;;; carries only the underlying :int statement handle.
-;;; Since: U3
-(defstruct TStmt [^&params ^&cols] (handle :int))
-
-;; Coerce an opaque Stmt into the raw :int the typed wrapper holds. Lives
-;; here so the typed surface is the only place the linear gate is
-;; bypassed; everything else stays on the typed path.
-(defn __stmt->int [s : Stmt] : int ```c return (int64_t)s; ```)
-
-;; Reconstitute an opaque Stmt from the raw :int so the underlying
-;; sqlite/stmt API can be called by ^borrow. The inverse of __stmt->int.
-(defn __int->stmt [h : int] : Stmt ```c return (int64_t)h; ```)
-
-;;; tstmt-of -- wrap an opaque `Stmt` as a row-typed `TStmt`. The bind /
-;;; column rows are inferred from the result type, so ascribe at the
-;;; call site:
-;;;
-;;;   (:: (tstmt-of s)
-;;;       (TStmt #row{} #row{id : int  name : cstr}))
-;;;
-;;; Ownership of the underlying handle is unchanged. The :linear gate on
-;;; `Stmt` is bypassed here -- linear-aware typed wrap is a follow-up.
-;;; Since: U3
-(defn tstmt-of [^&params ^&cols] [s : Stmt] : (TStmt params cols)
-  (make-struct TStmt (__stmt->int s)))
-
-;;; tstmt-handle -- unwrap a row-typed TStmt back to its raw :int handle.
-;;; Row-polymorphic. (To reach an opaque `Stmt` from here, pair with
-;;; `(__int->stmt (tstmt-handle s))` -- but in practice the typed
-;;; delegates below cover the surface.)
-;;; Since: U3
-(defn tstmt-handle [^&params ^&cols] [s : (TStmt params cols)] : int
-  (.handle s))
-
-;; --- typed binds ---------------------------------------------------------
-
-;;; tstmt-bind-int -- bind an int at parameter index `i`. Polymorphic
-;;; over both rows (the U3 P0 decision: name/index in/out membership is
-;;; runtime-checked; the type-level win is whole-shape distinctness).
-;;; Since: U3
-(defn tstmt-bind-int [^&params ^&cols]
-                     [s : (TStmt params cols)  i : int  v : int] : bool
-  (stmt-bind-int (__int->stmt (tstmt-handle s)) i v))
-
-;;; tstmt-bind-real -- bind a float at parameter index `i`. Since: U3
-(defn tstmt-bind-real [^&params ^&cols]
-                      [s : (TStmt params cols)  i : int  v : float] : bool
-  (stmt-bind-real (__int->stmt (tstmt-handle s)) i v))
-
-;;; tstmt-bind-text -- bind a cstr at parameter index `i`. Since: U3
-(defn tstmt-bind-text [^&params ^&cols]
-                      [s : (TStmt params cols)  i : int  v : cstr] : bool
-  (stmt-bind-text (__int->stmt (tstmt-handle s)) i v))
-
-;;; tstmt-bind-null -- bind null at parameter index `i`. Since: U3
-(defn tstmt-bind-null [^&params ^&cols]
-                      [s : (TStmt params cols)  i : int] : bool
-  (stmt-bind-null (__int->stmt (tstmt-handle s)) i))
-
-;; --- typed step / reset / finalize --------------------------------------
-
-;;; tstmt-step -- advance the statement (SQLITE_ROW = 100, SQLITE_DONE = 101).
-;;; Since: U3
-(defn tstmt-step [^&params ^&cols] [s : (TStmt params cols)] : int
-  (stmt-step (__int->stmt (tstmt-handle s))))
-
-;;; tstmt-reset -- reset to the start of the statement. Since: U3
-(defn tstmt-reset [^&params ^&cols] [s : (TStmt params cols)] : bool
-  (stmt-reset (__int->stmt (tstmt-handle s))))
-
-;;; tstmt-finalize -- release the underlying statement. The linear gate
-;;; on the inner `Stmt` is bypassed here; until the linear-aware
-;;; follow-up lands, callers must finalize exactly once.
-;;; Since: U3
-(defn tstmt-finalize [^&params ^&cols] [s : (TStmt params cols)] : bool
-  (stmt-finalize (__int->stmt (tstmt-handle s))))
-
-;; --- typed column accessors ---------------------------------------------
-
-;;; tcol-count -- number of result columns. Since: U3
-(defn tcol-count [^&params ^&cols] [s : (TStmt params cols)] : int
-  (col-count (__int->stmt (tstmt-handle s))))
-
-;;; tcol-name -- name of the column at index `i`. Since: U3
-(defn tcol-name [^&params ^&cols]
-                [s : (TStmt params cols)  i : int] : cstr
-  (col-name (__int->stmt (tstmt-handle s)) i))
-
-;;; tcol-int -- read the int column at index `i` of the current row. Since: U3
-(defn tcol-int [^&params ^&cols]
-               [s : (TStmt params cols)  i : int] : int
-  (col-int (__int->stmt (tstmt-handle s)) i))
-
-;;; tcol-real -- read the float column at index `i`. Since: U3
-(defn tcol-real [^&params ^&cols]
-                [s : (TStmt params cols)  i : int] : float
-  (col-real (__int->stmt (tstmt-handle s)) i))
-
-;;; tcol-text -- read the text column at index `i`. Since: U3
-(defn tcol-text [^&params ^&cols]
-                [s : (TStmt params cols)  i : int] : cstr
-  (col-text (__int->stmt (tstmt-handle s)) i))
-
-;;; tcol-type -- declared column type (sqlite3_column_type code). Since: U3
-(defn tcol-type [^&params ^&cols]
-                [s : (TStmt params cols)  i : int] : int
-  (col-type (__int->stmt (tstmt-handle s)) i))
-
-) ;; end defmodule sqlite/typed
+    tstmt-of
+    tstmt-handle
+    tstmt-bind-int
+    tstmt-bind-real
+    tstmt-bind-text
+    tstmt-bind-null
+    tstmt-step
+    tstmt-reset
+    tstmt-finalize
+    tcol-count
+    tcol-name
+    tcol-int
+    tcol-real
+    tcol-text
+    tcol-type)
+  (import sqlite/db :refer [Stmt])
+  (import sqlite/stmt
+    :refer
+    [stmt-step
+     stmt-bind-int
+     stmt-bind-real
+     stmt-bind-text
+     stmt-bind-null
+     stmt-reset
+     stmt-finalize])
+  (import sqlite/row
+    :refer
+    [col-count col-name col-int col-real col-text col-type])
+  ;;; TStmt -- a phantom row-typed handle on a prepared sqlite statement,
+  ;;; parameterised by its bind-parameter row `params` and result-column
+  ;;; row `cols`. Both rows are erased at codegen; at runtime a `TStmt`
+  ;;; carries only the underlying :int statement handle.
+  ;;; Since: U3
+  (defstruct TStmt [^&params ^&cols] (handle :int))
+  ;; Coerce an opaque Stmt into the raw :int the typed wrapper holds. Lives
+  ;; here so the typed surface is the only place the linear gate is
+  ;; bypassed; everything else stays on the typed path.
+  (defn __stmt->int [s : Stmt] : int ```c return (int64_t)s; ```)
+  ;; Reconstitute an opaque Stmt from the raw :int so the underlying
+  ;; sqlite/stmt API can be called by ^borrow. The inverse of __stmt->int.
+  (defn __int->stmt [h : int] : Stmt ```c return (int64_t)h; ```)
+  ;;; tstmt-of -- wrap an opaque `Stmt` as a row-typed `TStmt`. The bind /
+  ;;; column rows are inferred from the result type, so ascribe at the
+  ;;; call site:
+  ;;;
+  ;;;   (:: (tstmt-of s)
+  ;;;       (TStmt #row{} #row{id : int  name : cstr}))
+  ;;;
+  ;;; Ownership of the underlying handle is unchanged. The :linear gate on
+  ;;; `Stmt` is bypassed here -- linear-aware typed wrap is a follow-up.
+  ;;; Since: U3
+  (defn tstmt-of [^&params ^&cols] [s : Stmt] : (TStmt params cols)
+    (make-struct TStmt (__stmt->int s)))
+  ;;; tstmt-handle -- unwrap a row-typed TStmt back to its raw :int handle.
+  ;;; Row-polymorphic. (To reach an opaque `Stmt` from here, pair with
+  ;;; `(__int->stmt (tstmt-handle s))` -- but in practice the typed
+  ;;; delegates below cover the surface.)
+  ;;; Since: U3
+  (defn tstmt-handle [^&params ^&cols] [s : (TStmt params cols)] : int
+    (.handle s))
+  ;; --- typed binds ---------------------------------------------------------
+  ;;; tstmt-bind-int -- bind an int at parameter index `i`. Polymorphic
+  ;;; over both rows (the U3 P0 decision: name/index in/out membership is
+  ;;; runtime-checked; the type-level win is whole-shape distinctness).
+  ;;; Since: U3
+  (defn tstmt-bind-int [^&params ^&cols] [s : (TStmt params cols)
+                                          i : int
+                                          v : int] : bool
+    (stmt-bind-int (__int->stmt (tstmt-handle s)) i v))
+  ;;; tstmt-bind-real -- bind a float at parameter index `i`. Since: U3
+  (defn tstmt-bind-real [^&params ^&cols] [s : (TStmt params cols)
+                                           i : int
+                                           v : float] : bool
+    (stmt-bind-real (__int->stmt (tstmt-handle s)) i v))
+  ;;; tstmt-bind-text -- bind a cstr at parameter index `i`. Since: U3
+  (defn tstmt-bind-text [^&params ^&cols] [s : (TStmt params cols)
+                                           i : int
+                                           v : cstr] : bool
+    (stmt-bind-text (__int->stmt (tstmt-handle s)) i v))
+  ;;; tstmt-bind-null -- bind null at parameter index `i`. Since: U3
+  (defn tstmt-bind-null [^&params ^&cols] [s : (TStmt params cols) i : int] : bool
+    (stmt-bind-null (__int->stmt (tstmt-handle s)) i))
+  ;; --- typed step / reset / finalize --------------------------------------
+  ;;; tstmt-step -- advance the statement (SQLITE_ROW = 100, SQLITE_DONE = 101).
+  ;;; Since: U3
+  (defn tstmt-step [^&params ^&cols] [s : (TStmt params cols)] : int
+    (stmt-step (__int->stmt (tstmt-handle s))))
+  ;;; tstmt-reset -- reset to the start of the statement. Since: U3
+  (defn tstmt-reset [^&params ^&cols] [s : (TStmt params cols)] : bool
+    (stmt-reset (__int->stmt (tstmt-handle s))))
+  ;;; tstmt-finalize -- release the underlying statement. The linear gate
+  ;;; on the inner `Stmt` is bypassed here; until the linear-aware
+  ;;; follow-up lands, callers must finalize exactly once.
+  ;;; Since: U3
+  (defn tstmt-finalize [^&params ^&cols] [s : (TStmt params cols)] : bool
+    (stmt-finalize (__int->stmt (tstmt-handle s))))
+  ;; --- typed column accessors ---------------------------------------------
+  ;;; tcol-count -- number of result columns. Since: U3
+  (defn tcol-count [^&params ^&cols] [s : (TStmt params cols)] : int
+    (col-count (__int->stmt (tstmt-handle s))))
+  ;;; tcol-name -- name of the column at index `i`. Since: U3
+  (defn tcol-name [^&params ^&cols] [s : (TStmt params cols) i : int] : cstr
+    (col-name (__int->stmt (tstmt-handle s)) i))
+  ;;; tcol-int -- read the int column at index `i` of the current row. Since: U3
+  (defn tcol-int [^&params ^&cols] [s : (TStmt params cols) i : int] : int
+    (col-int (__int->stmt (tstmt-handle s)) i))
+  ;;; tcol-real -- read the float column at index `i`. Since: U3
+  (defn tcol-real [^&params ^&cols] [s : (TStmt params cols) i : int] : float
+    (col-real (__int->stmt (tstmt-handle s)) i))
+  ;;; tcol-text -- read the text column at index `i`. Since: U3
+  (defn tcol-text [^&params ^&cols] [s : (TStmt params cols) i : int] : cstr
+    (col-text (__int->stmt (tstmt-handle s)) i))
+  ;;; tcol-type -- declared column type (sqlite3_column_type code). Since: U3
+  (defn tcol-type [^&params ^&cols] [s : (TStmt params cols) i : int] : int
+    (col-type (__int->stmt (tstmt-handle s)) i))) ;; end defmodule sqlite/typed

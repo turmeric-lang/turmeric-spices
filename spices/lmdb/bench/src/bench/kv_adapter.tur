@@ -17,86 +17,84 @@
 ;;   - increment and put-if-absent are one write transaction each, and the
 ;;     map growing that a store wants is with-write-txn-growing.
 ;; Expiry is the adapter's business (LMDB has none).
-
 (defmodule bench/kv-adapter
-  (import lmdb/error  :refer [LmdbError])
-  (import lmdb/env    :refer [Env env-opts opts-map-size opts-sync SyncNone env-open env-close])
-  (import lmdb/txn    :refer [Txn with-read-txn with-write-txn with-write-txn-growing])
-  (import lmdb/dbi    :refer [Dbi dbi-main])
-  (import lmdb/ops    :refer [get has? put! put-new! del!])
+  (import lmdb/error :refer [LmdbError])
+  (import lmdb/env
+    :refer
+    [Env env-opts opts-map-size opts-sync SyncNone env-open env-close])
+  (import lmdb/txn
+    :refer
+    [Txn with-read-txn with-write-txn with-write-txn-growing])
+  (import lmdb/dbi :refer [Dbi dbi-main])
+  (import lmdb/ops :refer [get has? put! put-new! del!])
   (import lmdb/cursor :refer [Cursor with-cursor cursor-fold])
-
-(def max-map (* 1024 1048576))
-
-;;; kv-get -- the value under key.
-(defn kv-get [^borrow env : Env key : cstr] : (Result (Option cstr) LmdbError)
-  (with-read-txn env
-    (fn [^borrow t : Txn] : (Result (Option cstr) LmdbError)
-      (ok (get t (? (dbi-main t)) key)))))
-
-;;; kv-put -- store val under key, growing the map as needed.
-(defn kv-put [^borrow env : Env key : cstr val : cstr] : (Result nil LmdbError)
-  (with-write-txn-growing env max-map
-    (fn [^borrow t : Txn] : (Result nil LmdbError)
-      (put! t (? (dbi-main t)) key val))))
-
-;;; kv-put-new -- store val only if key is absent; true when stored.
-(defn kv-put-new [^borrow env : Env key : cstr val : cstr] : (Result bool LmdbError)
-  (with-write-txn-growing env max-map
-    (fn [^borrow t : Txn] : (Result bool LmdbError)
-      (put-new! t (? (dbi-main t)) key val))))
-
-;;; kv-delete -- remove key; true when it was there.
-(defn kv-delete [^borrow env : Env key : cstr] : (Result bool LmdbError)
-  (with-write-txn env
-    (fn [^borrow t : Txn] : (Result bool LmdbError)
-      (del! t (? (dbi-main t)) key))))
-
-;;; kv-has? -- is key present?
-(defn kv-has? [^borrow env : Env key : cstr] : (Result bool LmdbError)
-  (with-read-txn env
-    (fn [^borrow t : Txn] : (Result bool LmdbError)
-      (ok (has? t (? (dbi-main t)) key)))))
-
-;;; parse-int / int-str -- the counter encoding.
-(defn parse-int [s : cstr] : int
-  ```c
-  #include <stdlib.h>
+  (def max-map (* 1024 1048576))
+  ;;; kv-get -- the value under key.
+  (defn kv-get [^borrow env : Env key : cstr] : (Result (Option cstr) LmdbError)
+    (with-read-txn env
+      (fn [^borrow t : Txn] : (Result (Option cstr) LmdbError)
+        (ok (get t (? (dbi-main t)) key)))))
+  ;;; kv-put -- store val under key, growing the map as needed.
+  (defn kv-put [^borrow env : Env key : cstr val : cstr] : (Result nil
+                                                             LmdbError)
+    (with-write-txn-growing env
+      max-map
+      (fn [^borrow t : Txn] : (Result nil LmdbError)
+        (put! t (? (dbi-main t)) key val))))
+  ;;; kv-put-new -- store val only if key is absent; true when stored.
+  (defn kv-put-new [^borrow env : Env key : cstr val : cstr] : (Result bool
+                                                                 LmdbError)
+    (with-write-txn-growing env
+      max-map
+      (fn [^borrow t : Txn] : (Result bool LmdbError)
+        (put-new! t (? (dbi-main t)) key val))))
+  ;;; kv-delete -- remove key; true when it was there.
+  (defn kv-delete [^borrow env : Env key : cstr] : (Result bool LmdbError)
+    (with-write-txn env
+      (fn [^borrow t : Txn] : (Result bool LmdbError)
+        (del! t (? (dbi-main t)) key))))
+  ;;; kv-has? -- is key present?
+  (defn kv-has? [^borrow env : Env key : cstr] : (Result bool LmdbError)
+    (with-read-txn env
+      (fn [^borrow t : Txn] : (Result bool LmdbError)
+        (ok (has? t (? (dbi-main t)) key)))))
+  ;;; parse-int / int-str -- the counter encoding.
+  (defn parse-int [s : cstr] : int
+    ```c
+    #include <stdlib.h>
   return (int64_t)strtoll((const char *)s, NULL, 10);
   ```)
-(defn int-str [n : int] : cstr
-  ```c
-  #include <stdio.h>
+  (defn int-str [n : int] : cstr
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   char *p = (char *)malloc(24);
   snprintf(p, 24, "%lld", (long long)n);
   return p;
   ```)
-
-;;; kv-increment -- add by to the integer under key (absent = 0); the new value.
-(defn kv-increment [^borrow env : Env key : cstr by : int] : (Result int LmdbError)
-  (with-write-txn-growing env max-map
-    (fn [^borrow t : Txn] : (Result int LmdbError)
-      (let [d   (? (dbi-main t))
-            cur (get t d key)
-            n   (+ by (if (some? cur) (parse-int (unwrap cur)) 0))]
-        (do (? (put! t d key (int-str n)))
-            (ok n))))))
-
-;;; count-key -- a cursor-fold step: count the keys.
-(defn count-key [n : int k : cstr v : cstr] : int (+ n 1))
-
-;;; kv-count -- how many keys the store holds (the listing walk).
-(defn kv-count [^borrow env : Env] : (Result int LmdbError)
-  (with-read-txn env
-    (fn [^borrow t : Txn] : (Result int LmdbError)
-      (with-cursor t (? (dbi-main t))
-        (fn [^borrow c : Cursor] : (Result int LmdbError)
-          (ok (cursor-fold c 0 count-key)))))))
-
-(defn fresh-path [] : cstr
-  ```c
-  #include <stdio.h>
+  ;;; kv-increment -- add by to the integer under key (absent = 0); the new value.
+  (defn kv-increment [^borrow env : Env key : cstr by : int] : (Result int
+                                                                 LmdbError)
+    (with-write-txn-growing env
+      max-map
+      (fn [^borrow t : Txn] : (Result int LmdbError)
+        (let [d   (? (dbi-main t))
+              cur (get t d key)
+              n   (+ by (if (some? cur) (parse-int (unwrap cur)) 0))]
+          (do (? (put! t d key (int-str n))) (ok n))))))
+  ;;; count-key -- a cursor-fold step: count the keys.
+  (defn count-key [n : int k : cstr v : cstr] : int (+ n 1))
+  ;;; kv-count -- how many keys the store holds (the listing walk).
+  (defn kv-count [^borrow env : Env] : (Result int LmdbError)
+    (with-read-txn env
+      (fn [^borrow t : Txn] : (Result int LmdbError)
+        (with-cursor t
+          (? (dbi-main t))
+          (fn [^borrow c : Cursor] : (Result int LmdbError)
+            (ok (cursor-fold c 0 count-key)))))))
+  (defn fresh-path [] : cstr
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   #include <unistd.h>
   char *p = (char *)malloc(64);
@@ -104,33 +102,47 @@
   unlink(p);
   return p;
   ```)
-
-(defn same? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+  (defn same? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn main [] : int
-  (let [path (fresh-path)
-        env  (ok-val (env-open path (opts-sync (opts-map-size (env-opts) 1048576) (SyncNone))))
-        a    (kv-put env "greeting" "hello")
-        g    (kv-get env "greeting")
-        n1   (kv-put-new env "greeting" "again")
-        n2   (kv-put-new env "other" "x")
-        i1   (kv-increment env "hits" 1)
-        i2   (kv-increment env "hits" 41)
-        h    (kv-has? env "hits")
-        c    (kv-count env)
-        d    (kv-delete env "other")
-        h2   (kv-has? env "other")
-        good (and (ok? a) (ok? g) (some? (ok-val g)) (same? (unwrap (ok-val g)) "hello")
-                  (ok? n1) (not (ok-val n1)) (ok? n2) (ok-val n2)
-                  (ok? i2) (= (ok-val i2) 42) (ok? h) (ok-val h)
-                  (ok? c) (= (ok-val c) 3) (ok? d) (ok-val d) (ok? h2) (not (ok-val h2)))]
-    (do
-      (env-close env)
-      (println (if good "kv adapter review: every operation behaves" "kv adapter review: MISMATCH"))
-      (if good 0 1))))
-
-) ;; end defmodule bench/kv-adapter
+  (defn main [] : int
+    (let [path (fresh-path)
+          env  (ok-val (env-open path
+                         (opts-sync (opts-map-size (env-opts) 1048576)
+                           (SyncNone))))
+          a    (kv-put env "greeting" "hello")
+          g    (kv-get env "greeting")
+          n1   (kv-put-new env "greeting" "again")
+          n2   (kv-put-new env "other" "x")
+          i1   (kv-increment env "hits" 1)
+          i2   (kv-increment env "hits" 41)
+          h    (kv-has? env "hits")
+          c    (kv-count env)
+          d    (kv-delete env "other")
+          h2   (kv-has? env "other")
+          good (and (ok? a)
+                 (ok? g)
+                 (some? (ok-val g))
+                 (same? (unwrap (ok-val g)) "hello")
+                 (ok? n1)
+                 (not (ok-val n1))
+                 (ok? n2)
+                 (ok-val n2)
+                 (ok? i2)
+                 (= (ok-val i2) 42)
+                 (ok? h)
+                 (ok-val h)
+                 (ok? c)
+                 (= (ok-val c) 3)
+                 (ok? d)
+                 (ok-val d)
+                 (ok? h2)
+                 (not (ok-val h2)))]
+      (do
+        (env-close env)
+        (println (if good
+                   "kv adapter review: every operation behaves"
+                   "kv adapter review: MISMATCH"))
+        (if good 0 1))))) ;; end defmodule bench/kv-adapter

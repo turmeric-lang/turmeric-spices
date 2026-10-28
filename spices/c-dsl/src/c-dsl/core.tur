@@ -1,383 +1,375 @@
 ;; c-dsl/core.tur -- control flow, variable bindings, and expression forms.
-
 (defmodule c-dsl/core
-  (export c-let1 c-let1-uninit c-const1 c-set! c-return c-return-void
-          c-break c-continue c-inc! c-dec!
-          c-if c-if-only c-while c-do-while c-for1 c-for-raw
-          c-switch c-case c-default-case c-label c-goto
-          c-binop c-unop c-ternary)
-
-  (import c-dsl/codegen :refer [c-cat2 c-cat3 c-cat4 c-sprintf1 c-sprintf2
-                                 c-sprintf3 c-sprintf4 c-block c-indent
-                                 c-join])
-  (import c-dsl/types   :refer [c-type])
-
-;;; c-let1 -- declare a single initialized local variable.
-;;;
-;;; Parameters:
-;;;   name -- C identifier string
-;;;   type -- Turmeric type keyword or C type string
-;;;   init -- initializer expression string
-;;;
-;;; Returns:
-;;;   "type name = init;"
-;;;
-;;; Example:
-;;;   (c-let1 "x" ":int" "42")  ; => "int32_t x = 42;"
-;;;
-;;; Since: P1
-(defn c-let1 [name : cstr type : cstr init : cstr] : cstr
-  (c-sprintf3 "%s %s = %s;" (c-type type) name init))
-
-;;; c-let1-uninit -- declare a single uninitialized local variable.
-;;;
-;;; Parameters:
-;;;   name -- C identifier string
-;;;   type -- Turmeric type keyword or C type string
-;;;
-;;; Returns:
-;;;   "type name;"
-;;;
-;;; Example:
-;;;   (c-let1-uninit "ptr" ":[:int]")  ; => "int32_t* ptr;"
-;;;
-;;; Since: P1
-(defn c-let1-uninit [name : cstr type : cstr] : cstr
-  (c-sprintf2 "%s %s;" (c-type type) name))
-
-;;; c-const1 -- declare a single const variable.
-;;;
-;;; Parameters:
-;;;   name -- C identifier string
-;;;   type -- Turmeric type keyword or C type string
-;;;   init -- initializer expression string
-;;;
-;;; Returns:
-;;;   "const type name = init;"
-;;;
-;;; Example:
-;;;   (c-const1 "MAX_SIZE" ":int" "100")  ; => "const int32_t MAX_SIZE = 100;"
-;;;
-;;; Since: P1
-(defn c-const1 [name : cstr type : cstr init : cstr] : cstr
-  (c-sprintf3 "const %s %s = %s;" (c-type type) name init))
-
-;;; c-set! -- emit an assignment statement.
-;;;
-;;; Parameters:
-;;;   lhs -- left-hand side expression string
-;;;   rhs -- right-hand side expression string
-;;;
-;;; Returns:
-;;;   "lhs = rhs;"
-;;;
-;;; Example:
-;;;   (c-set! "x" "42")      ; => "x = 42;"
-;;;   (c-set! "arr[i]" "v")  ; => "arr[i] = v;"
-;;;
-;;; Since: P1
-(defn c-set! [lhs : cstr rhs : cstr] : cstr
-  (c-sprintf2 "%s = %s;" lhs rhs))
-
-;;; c-return -- emit a return statement.
-;;;
-;;; Parameters:
-;;;   expr -- expression to return
-;;;
-;;; Returns:
-;;;   "return expr;"
-;;;
-;;; Example:
-;;;   (c-return "x + 1")  ; => "return x + 1;"
-;;;
-;;; Since: P1
-(defn c-return [expr : cstr] : cstr
-  (c-sprintf1 "return %s;" expr))
-
-;;; c-return-void -- emit a bare "return;" statement.
-;;;
-;;; Returns:
-;;;   "return;"
-;;;
-;;; Since: P1
-(defn c-return-void [] : cstr "return;")
-
-;;; c-break -- emit a break statement.
-;;;
-;;; Returns:
-;;;   "break;"
-;;;
-;;; Since: P1
-(defn c-break [] : cstr "break;")
-
-;;; c-continue -- emit a continue statement.
-;;;
-;;; Returns:
-;;;   "continue;"
-;;;
-;;; Since: P1
-(defn c-continue [] : cstr "continue;")
-
-;;; c-inc! -- emit a post-increment statement.
-;;;
-;;; Parameters:
-;;;   var -- variable name string
-;;;
-;;; Returns:
-;;;   "var++;"
-;;;
-;;; Example:
-;;;   (c-inc! "i")  ; => "i++;"
-;;;
-;;; Since: P1
-(defn c-inc! [var : cstr] : cstr
-  (c-sprintf1 "%s++;" var))
-
-;;; c-dec! -- emit a post-decrement statement.
-;;;
-;;; Parameters:
-;;;   var -- variable name string
-;;;
-;;; Returns:
-;;;   "var--;"
-;;;
-;;; Since: P1
-(defn c-dec! [var : cstr] : cstr
-  (c-sprintf1 "%s--;" var))
-
-;;; c-if -- emit an if/else statement.
-;;;
-;;; Parameters:
-;;;   cond-expr -- condition expression string
-;;;   then-body -- body string for the true branch (one or more statements)
-;;;   else-body -- body string for the false branch (use "" to omit)
-;;;
-;;; Returns:
-;;;   "if (cond) {\n    then\n} else {\n    else\n}" or without else branch.
-;;;
-;;; Example:
-;;;   (c-if "x > 0" (c-set! "y" "1") (c-set! "y" "-1"))
-;;;   ; => "if (x > 0) {\n    y = 1;\n} else {\n    y = -1;\n}"
-;;;
-;;; Since: P1
-(defn c-if [cond-expr : cstr then-body : cstr else-body : cstr] : cstr
-  (c-sprintf3 "if (%s) {\n%s\n} else {\n%s\n}"
-              cond-expr
-              (c-indent then-body)
-              (c-indent else-body)))
-
-;;; c-if-only -- emit an if statement without an else branch.
-;;;
-;;; Parameters:
-;;;   cond-expr -- condition expression string
-;;;   then-body -- body string for the true branch
-;;;
-;;; Returns:
-;;;   "if (cond) {\n    body\n}"
-;;;
-;;; Since: P1
-(defn c-if-only [cond-expr : cstr then-body : cstr] : cstr
-  (c-sprintf2 "if (%s) {\n%s\n}"
-              cond-expr
-              (c-indent then-body)))
-
-;;; c-while -- emit a while loop.
-;;;
-;;; Parameters:
-;;;   cond-expr -- condition expression string
-;;;   body      -- body string (one or more statements)
-;;;
-;;; Returns:
-;;;   "while (cond) {\n    body\n}"
-;;;
-;;; Example:
-;;;   (c-while "i < len" (c-inc! "i"))
-;;;
-;;; Since: P1
-(defn c-while [cond-expr : cstr body : cstr] : cstr
-  (c-sprintf2 "while (%s) {\n%s\n}"
-              cond-expr
-              (c-indent body)))
-
-;;; c-do-while -- emit a do-while loop.
-;;;
-;;; Parameters:
-;;;   body      -- body string
-;;;   cond-expr -- condition expression string
-;;;
-;;; Returns:
-;;;   "do {\n    body\n} while (cond);"
-;;;
-;;; Since: P1
-(defn c-do-while [body : cstr cond-expr : cstr] : cstr
-  (c-sprintf2 "do {\n%s\n} while (%s);"
-              (c-indent body)
-              cond-expr))
-
-;;; c-for1 -- emit a for loop with a typed loop variable declaration.
-;;;
-;;; Parameters:
-;;;   var   -- loop variable name
-;;;   type  -- type keyword for the loop variable
-;;;   init  -- initial value expression string
-;;;   cond  -- condition expression string
-;;;   step  -- step expression string (e.g. "i++" or "i += 2")
-;;;   body  -- body string
-;;;
-;;; Returns:
-;;;   "for (type var = init; cond; step) {\n    body\n}"
-;;;
-;;; Example:
-;;;   (c-for1 "i" ":int" "0" "i < 10" "i++" (c-call "printf" ...))
-;;;
-;;; Since: P1
-;;
-;; `type` goes through `c-type`, the same as c-let1 / c-let1-uninit /
-;; c-const1.  It did not used to: the body was hand-rolled inline C that
-;; snprintf'd `type` in verbatim, so (c-for1 "i" ":int" ...) emitted
-;; `for (:int i = 0; ...)` -- a keyword where a C type belongs.  The
-;; "emits typed for loop" case in tests/c-dsl/core_test.tur has always
-;; asserted the right answer; it just never ran, because its `describe`
-;; sat at defmodule top level where the compiler drops it.
-;;
-;; Delegating the rest to c-for-raw also means the body is indented by
-;; `c-indent` like every other block form, rather than by a literal four
-;; spaces that only ever indented the first line of a multi-line body.
-(defn c-for1 [var : cstr type : cstr init : cstr cond : cstr step : cstr body : cstr] : cstr
-  (c-for-raw (c-sprintf3 "%s %s = %s" (c-type type) var init) cond step body))
-
-;;; c-for-raw -- emit a for loop with a raw (pre-formatted) init clause.
-;;;
-;;; Parameters:
-;;;   init -- full init clause string (e.g. "int32_t i = 0, j = n - 1")
-;;;   cond -- condition expression string
-;;;   step -- step expression string
-;;;   body -- body string
-;;;
-;;; Returns:
-;;;   "for (init; cond; step) {\n    body\n}"
-;;;
-;;; Since: P1
-(defn c-for-raw [init : cstr cond : cstr step : cstr body : cstr] : cstr
-  (c-sprintf4 "for (%s; %s; %s) {\n%s\n}" init cond step (c-indent body)))
-
-;;; c-case -- emit a single switch case fragment.
-;;;
-;;; Parameters:
-;;;   val  -- case value string (e.g. "1" or "RED")
-;;;   body -- body statements string
-;;;
-;;; Returns:
-;;;   "case val:\n    body"
-;;;
-;;; Example:
-;;;   (c-case "1" (c-break))  ; => "case 1:\n    break;"
-;;;
-;;; Since: P1
-(defn c-case [val : cstr body : cstr] : cstr
-  (c-sprintf2 "case %s:\n%s" val (c-indent body)))
-
-;;; c-default-case -- emit the default switch case.
-;;;
-;;; Parameters:
-;;;   body -- body statements string
-;;;
-;;; Returns:
-;;;   "default:\n    body"
-;;;
-;;; Since: P1
-(defn c-default-case [body : cstr] : cstr
-  (c-cat2 "default:\n" (c-indent body)))
-
-;;; c-switch -- emit a switch statement.
-;;;
-;;; Parameters:
-;;;   expr  -- expression to switch on
-;;;   cases -- cons list of case fragment strings (from c-case / c-default-case)
-;;;
-;;; Returns:
-;;;   "switch (expr) {\ncases\n}"
-;;;
-;;; Example:
-;;;   (c-switch "x" (cons (c-case "0" "break;") (cons (c-default-case "break;") 0)))
-;;;
-;;; Since: P1
-(defn c-switch [expr : cstr cases : int] : cstr
-  (c-sprintf2 "switch (%s) {\n%s\n}" expr (c-join cases "\n")))
-
-;;; c-label -- emit a C label.
-;;;
-;;; Parameters:
-;;;   name -- label identifier string
-;;;
-;;; Returns:
-;;;   "name:"
-;;;
-;;; Since: P1
-(defn c-label [name : cstr] : cstr
-  (c-sprintf1 "%s:" name))
-
-;;; c-goto -- emit a goto statement.
-;;;
-;;; Parameters:
-;;;   name -- target label string
-;;;
-;;; Returns:
-;;;   "goto name;"
-;;;
-;;; Since: P1
-(defn c-goto [name : cstr] : cstr
-  (c-sprintf1 "goto %s;" name))
-
-;;; c-binop -- emit a binary expression wrapped in parentheses.
-;;;
-;;; Parameters:
-;;;   op -- operator string (e.g. "+", "&&", "==")
-;;;   a  -- left operand string
-;;;   b  -- right operand string
-;;;
-;;; Returns:
-;;;   "(a op b)"
-;;;
-;;; Example:
-;;;   (c-binop "+" "a" "b")   ; => "(a + b)"
-;;;   (c-binop "<" "i" "10")  ; => "(i < 10)"
-;;;
-;;; Since: P1
-(defn c-binop [op : cstr a : cstr b : cstr] : cstr
-  (c-sprintf3 "(%s %s %s)" a op b))
-
-;;; c-unop -- emit a prefix unary expression.
-;;;
-;;; Parameters:
-;;;   op   -- operator string (e.g. "!", "-", "~")
-;;;   expr -- operand string
-;;;
-;;; Returns:
-;;;   "(op expr)"
-;;;
-;;; Example:
-;;;   (c-unop "!" "flag")  ; => "(!flag)"
-;;;
-;;; Since: P1
-(defn c-unop [op : cstr expr : cstr] : cstr
-  (c-sprintf2 "(%s%s)" op expr))
-
-;;; c-ternary -- emit a ternary conditional expression.
-;;;
-;;; Parameters:
-;;;   cond-expr -- condition expression string
-;;;   then-expr -- value when true
-;;;   else-expr -- value when false
-;;;
-;;; Returns:
-;;;   "(cond ? then : else)"
-;;;
-;;; Example:
-;;;   (c-ternary "x > 0" "1" "-1")  ; => "(x > 0 ? 1 : -1)"
-;;;
-;;; Since: P1
-(defn c-ternary [cond-expr : cstr then-expr : cstr else-expr : cstr] : cstr
-  (c-sprintf3 "(%s ? %s : %s)" cond-expr then-expr else-expr))
-
-) ;; end defmodule c-dsl/core
+  (export c-let1
+    c-let1-uninit
+    c-const1
+    c-set!
+    c-return
+    c-return-void
+    c-break
+    c-continue
+    c-inc!
+    c-dec!
+    c-if
+    c-if-only
+    c-while
+    c-do-while
+    c-for1
+    c-for-raw
+    c-switch
+    c-case
+    c-default-case
+    c-label
+    c-goto
+    c-binop
+    c-unop
+    c-ternary)
+  (import c-dsl/codegen
+    :refer
+    [c-cat2
+     c-cat3
+     c-cat4
+     c-sprintf1
+     c-sprintf2
+     c-sprintf3
+     c-sprintf4
+     c-block
+     c-indent
+     c-join])
+  (import c-dsl/types :refer [c-type])
+  ;;; c-let1 -- declare a single initialized local variable.
+  ;;;
+  ;;; Parameters:
+  ;;;   name -- C identifier string
+  ;;;   type -- Turmeric type keyword or C type string
+  ;;;   init -- initializer expression string
+  ;;;
+  ;;; Returns:
+  ;;;   "type name = init;"
+  ;;;
+  ;;; Example:
+  ;;;   (c-let1 "x" ":int" "42")  ; => "int32_t x = 42;"
+  ;;;
+  ;;; Since: P1
+  (defn c-let1 [name : cstr type : cstr init : cstr] : cstr
+    (c-sprintf3 "%s %s = %s;" (c-type type) name init))
+  ;;; c-let1-uninit -- declare a single uninitialized local variable.
+  ;;;
+  ;;; Parameters:
+  ;;;   name -- C identifier string
+  ;;;   type -- Turmeric type keyword or C type string
+  ;;;
+  ;;; Returns:
+  ;;;   "type name;"
+  ;;;
+  ;;; Example:
+  ;;;   (c-let1-uninit "ptr" ":[:int]")  ; => "int32_t* ptr;"
+  ;;;
+  ;;; Since: P1
+  (defn c-let1-uninit [name : cstr type : cstr] : cstr
+    (c-sprintf2 "%s %s;" (c-type type) name))
+  ;;; c-const1 -- declare a single const variable.
+  ;;;
+  ;;; Parameters:
+  ;;;   name -- C identifier string
+  ;;;   type -- Turmeric type keyword or C type string
+  ;;;   init -- initializer expression string
+  ;;;
+  ;;; Returns:
+  ;;;   "const type name = init;"
+  ;;;
+  ;;; Example:
+  ;;;   (c-const1 "MAX_SIZE" ":int" "100")  ; => "const int32_t MAX_SIZE = 100;"
+  ;;;
+  ;;; Since: P1
+  (defn c-const1 [name : cstr type : cstr init : cstr] : cstr
+    (c-sprintf3 "const %s %s = %s;" (c-type type) name init))
+  ;;; c-set! -- emit an assignment statement.
+  ;;;
+  ;;; Parameters:
+  ;;;   lhs -- left-hand side expression string
+  ;;;   rhs -- right-hand side expression string
+  ;;;
+  ;;; Returns:
+  ;;;   "lhs = rhs;"
+  ;;;
+  ;;; Example:
+  ;;;   (c-set! "x" "42")      ; => "x = 42;"
+  ;;;   (c-set! "arr[i]" "v")  ; => "arr[i] = v;"
+  ;;;
+  ;;; Since: P1
+  (defn c-set! [lhs : cstr rhs : cstr] : cstr (c-sprintf2 "%s = %s;" lhs rhs))
+  ;;; c-return -- emit a return statement.
+  ;;;
+  ;;; Parameters:
+  ;;;   expr -- expression to return
+  ;;;
+  ;;; Returns:
+  ;;;   "return expr;"
+  ;;;
+  ;;; Example:
+  ;;;   (c-return "x + 1")  ; => "return x + 1;"
+  ;;;
+  ;;; Since: P1
+  (defn c-return [expr : cstr] : cstr (c-sprintf1 "return %s;" expr))
+  ;;; c-return-void -- emit a bare "return;" statement.
+  ;;;
+  ;;; Returns:
+  ;;;   "return;"
+  ;;;
+  ;;; Since: P1
+  (defn c-return-void [] : cstr "return;")
+  ;;; c-break -- emit a break statement.
+  ;;;
+  ;;; Returns:
+  ;;;   "break;"
+  ;;;
+  ;;; Since: P1
+  (defn c-break [] : cstr "break;")
+  ;;; c-continue -- emit a continue statement.
+  ;;;
+  ;;; Returns:
+  ;;;   "continue;"
+  ;;;
+  ;;; Since: P1
+  (defn c-continue [] : cstr "continue;")
+  ;;; c-inc! -- emit a post-increment statement.
+  ;;;
+  ;;; Parameters:
+  ;;;   var -- variable name string
+  ;;;
+  ;;; Returns:
+  ;;;   "var++;"
+  ;;;
+  ;;; Example:
+  ;;;   (c-inc! "i")  ; => "i++;"
+  ;;;
+  ;;; Since: P1
+  (defn c-inc! [var : cstr] : cstr (c-sprintf1 "%s++;" var))
+  ;;; c-dec! -- emit a post-decrement statement.
+  ;;;
+  ;;; Parameters:
+  ;;;   var -- variable name string
+  ;;;
+  ;;; Returns:
+  ;;;   "var--;"
+  ;;;
+  ;;; Since: P1
+  (defn c-dec! [var : cstr] : cstr (c-sprintf1 "%s--;" var))
+  ;;; c-if -- emit an if/else statement.
+  ;;;
+  ;;; Parameters:
+  ;;;   cond-expr -- condition expression string
+  ;;;   then-body -- body string for the true branch (one or more statements)
+  ;;;   else-body -- body string for the false branch (use "" to omit)
+  ;;;
+  ;;; Returns:
+  ;;;   "if (cond) {\n    then\n} else {\n    else\n}" or without else branch.
+  ;;;
+  ;;; Example:
+  ;;;   (c-if "x > 0" (c-set! "y" "1") (c-set! "y" "-1"))
+  ;;;   ; => "if (x > 0) {\n    y = 1;\n} else {\n    y = -1;\n}"
+  ;;;
+  ;;; Since: P1
+  (defn c-if [cond-expr : cstr then-body : cstr else-body : cstr] : cstr
+    (c-sprintf3 "if (%s) {\n%s\n} else {\n%s\n}"
+      cond-expr
+      (c-indent then-body)
+      (c-indent else-body)))
+  ;;; c-if-only -- emit an if statement without an else branch.
+  ;;;
+  ;;; Parameters:
+  ;;;   cond-expr -- condition expression string
+  ;;;   then-body -- body string for the true branch
+  ;;;
+  ;;; Returns:
+  ;;;   "if (cond) {\n    body\n}"
+  ;;;
+  ;;; Since: P1
+  (defn c-if-only [cond-expr : cstr then-body : cstr] : cstr
+    (c-sprintf2 "if (%s) {\n%s\n}" cond-expr (c-indent then-body)))
+  ;;; c-while -- emit a while loop.
+  ;;;
+  ;;; Parameters:
+  ;;;   cond-expr -- condition expression string
+  ;;;   body      -- body string (one or more statements)
+  ;;;
+  ;;; Returns:
+  ;;;   "while (cond) {\n    body\n}"
+  ;;;
+  ;;; Example:
+  ;;;   (c-while "i < len" (c-inc! "i"))
+  ;;;
+  ;;; Since: P1
+  (defn c-while [cond-expr : cstr body : cstr] : cstr
+    (c-sprintf2 "while (%s) {\n%s\n}" cond-expr (c-indent body)))
+  ;;; c-do-while -- emit a do-while loop.
+  ;;;
+  ;;; Parameters:
+  ;;;   body      -- body string
+  ;;;   cond-expr -- condition expression string
+  ;;;
+  ;;; Returns:
+  ;;;   "do {\n    body\n} while (cond);"
+  ;;;
+  ;;; Since: P1
+  (defn c-do-while [body : cstr cond-expr : cstr] : cstr
+    (c-sprintf2 "do {\n%s\n} while (%s);" (c-indent body) cond-expr))
+  ;;; c-for1 -- emit a for loop with a typed loop variable declaration.
+  ;;;
+  ;;; Parameters:
+  ;;;   var   -- loop variable name
+  ;;;   type  -- type keyword for the loop variable
+  ;;;   init  -- initial value expression string
+  ;;;   cond  -- condition expression string
+  ;;;   step  -- step expression string (e.g. "i++" or "i += 2")
+  ;;;   body  -- body string
+  ;;;
+  ;;; Returns:
+  ;;;   "for (type var = init; cond; step) {\n    body\n}"
+  ;;;
+  ;;; Example:
+  ;;;   (c-for1 "i" ":int" "0" "i < 10" "i++" (c-call "printf" ...))
+  ;;;
+  ;;; Since: P1
+  ;;
+  ;; `type` goes through `c-type`, the same as c-let1 / c-let1-uninit /
+  ;; c-const1.  It did not used to: the body was hand-rolled inline C that
+  ;; snprintf'd `type` in verbatim, so (c-for1 "i" ":int" ...) emitted
+  ;; `for (:int i = 0; ...)` -- a keyword where a C type belongs.  The
+  ;; "emits typed for loop" case in tests/c-dsl/core_test.tur has always
+  ;; asserted the right answer; it just never ran, because its `describe`
+  ;; sat at defmodule top level where the compiler drops it.
+  ;;
+  ;; Delegating the rest to c-for-raw also means the body is indented by
+  ;; `c-indent` like every other block form, rather than by a literal four
+  ;; spaces that only ever indented the first line of a multi-line body.
+  (defn c-for1 [var : cstr
+                type : cstr
+                init : cstr
+                cond : cstr
+                step : cstr
+                body : cstr] : cstr
+    (c-for-raw (c-sprintf3 "%s %s = %s" (c-type type) var init) cond step body))
+  ;;; c-for-raw -- emit a for loop with a raw (pre-formatted) init clause.
+  ;;;
+  ;;; Parameters:
+  ;;;   init -- full init clause string (e.g. "int32_t i = 0, j = n - 1")
+  ;;;   cond -- condition expression string
+  ;;;   step -- step expression string
+  ;;;   body -- body string
+  ;;;
+  ;;; Returns:
+  ;;;   "for (init; cond; step) {\n    body\n}"
+  ;;;
+  ;;; Since: P1
+  (defn c-for-raw [init : cstr cond : cstr step : cstr body : cstr] : cstr
+    (c-sprintf4 "for (%s; %s; %s) {\n%s\n}" init cond step (c-indent body)))
+  ;;; c-case -- emit a single switch case fragment.
+  ;;;
+  ;;; Parameters:
+  ;;;   val  -- case value string (e.g. "1" or "RED")
+  ;;;   body -- body statements string
+  ;;;
+  ;;; Returns:
+  ;;;   "case val:\n    body"
+  ;;;
+  ;;; Example:
+  ;;;   (c-case "1" (c-break))  ; => "case 1:\n    break;"
+  ;;;
+  ;;; Since: P1
+  (defn c-case [val : cstr body : cstr] : cstr
+    (c-sprintf2 "case %s:\n%s" val (c-indent body)))
+  ;;; c-default-case -- emit the default switch case.
+  ;;;
+  ;;; Parameters:
+  ;;;   body -- body statements string
+  ;;;
+  ;;; Returns:
+  ;;;   "default:\n    body"
+  ;;;
+  ;;; Since: P1
+  (defn c-default-case [body : cstr] : cstr
+    (c-cat2 "default:\n" (c-indent body)))
+  ;;; c-switch -- emit a switch statement.
+  ;;;
+  ;;; Parameters:
+  ;;;   expr  -- expression to switch on
+  ;;;   cases -- cons list of case fragment strings (from c-case / c-default-case)
+  ;;;
+  ;;; Returns:
+  ;;;   "switch (expr) {\ncases\n}"
+  ;;;
+  ;;; Example:
+  ;;;   (c-switch "x" (cons (c-case "0" "break;") (cons (c-default-case "break;") 0)))
+  ;;;
+  ;;; Since: P1
+  (defn c-switch [expr : cstr cases : int] : cstr
+    (c-sprintf2 "switch (%s) {\n%s\n}" expr (c-join cases "\n")))
+  ;;; c-label -- emit a C label.
+  ;;;
+  ;;; Parameters:
+  ;;;   name -- label identifier string
+  ;;;
+  ;;; Returns:
+  ;;;   "name:"
+  ;;;
+  ;;; Since: P1
+  (defn c-label [name : cstr] : cstr (c-sprintf1 "%s:" name))
+  ;;; c-goto -- emit a goto statement.
+  ;;;
+  ;;; Parameters:
+  ;;;   name -- target label string
+  ;;;
+  ;;; Returns:
+  ;;;   "goto name;"
+  ;;;
+  ;;; Since: P1
+  (defn c-goto [name : cstr] : cstr (c-sprintf1 "goto %s;" name))
+  ;;; c-binop -- emit a binary expression wrapped in parentheses.
+  ;;;
+  ;;; Parameters:
+  ;;;   op -- operator string (e.g. "+", "&&", "==")
+  ;;;   a  -- left operand string
+  ;;;   b  -- right operand string
+  ;;;
+  ;;; Returns:
+  ;;;   "(a op b)"
+  ;;;
+  ;;; Example:
+  ;;;   (c-binop "+" "a" "b")   ; => "(a + b)"
+  ;;;   (c-binop "<" "i" "10")  ; => "(i < 10)"
+  ;;;
+  ;;; Since: P1
+  (defn c-binop [op : cstr a : cstr b : cstr] : cstr
+    (c-sprintf3 "(%s %s %s)" a op b))
+  ;;; c-unop -- emit a prefix unary expression.
+  ;;;
+  ;;; Parameters:
+  ;;;   op   -- operator string (e.g. "!", "-", "~")
+  ;;;   expr -- operand string
+  ;;;
+  ;;; Returns:
+  ;;;   "(op expr)"
+  ;;;
+  ;;; Example:
+  ;;;   (c-unop "!" "flag")  ; => "(!flag)"
+  ;;;
+  ;;; Since: P1
+  (defn c-unop [op : cstr expr : cstr] : cstr (c-sprintf2 "(%s%s)" op expr))
+  ;;; c-ternary -- emit a ternary conditional expression.
+  ;;;
+  ;;; Parameters:
+  ;;;   cond-expr -- condition expression string
+  ;;;   then-expr -- value when true
+  ;;;   else-expr -- value when false
+  ;;;
+  ;;; Returns:
+  ;;;   "(cond ? then : else)"
+  ;;;
+  ;;; Example:
+  ;;;   (c-ternary "x > 0" "1" "-1")  ; => "(x > 0 ? 1 : -1)"
+  ;;;
+  ;;; Since: P1
+  (defn c-ternary [cond-expr : cstr then-expr : cstr else-expr : cstr] : cstr
+    (c-sprintf3 "(%s ? %s : %s)" cond-expr then-expr else-expr))) ;; end defmodule c-dsl/core

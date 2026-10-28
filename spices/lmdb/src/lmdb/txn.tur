@@ -26,242 +26,230 @@
 ;;;
 ;;; Since: 0.1.0
 ;; lmdb/txn
-
 (defmodule lmdb/txn
   (import lmdb/error :refer [LmdbError lmdb-error-of lmdb-error-map-full?])
-  (import lmdb/env   :refer [Env])
-  (export Txn txn-begin txn-begin-nested txn-commit txn-abort txn-read-only?
-          txn-id with-read-txn with-write-txn with-write-txn-growing
-          with-nested-txn)
-
-;;; Txn -- an open transaction (an `MDB_txn *`).
-;;;
-;;; `:linear`: a Txn from `txn-begin` must end exactly once, in `txn-commit`
-;;; or `txn-abort`. Reads and writes borrow it. A Txn handed to a scoped
-;;; form's callback is borrowed and ended by the form.
-;;;
-;;; Since: 0.1.0
-(defopaque ^linear Txn :int)
-
-;; -------------------------------------------------------------------------
-;; Private: raw C over the bare MDB_txn pointer
-;;
-;; The scoped forms below work on the pointer as a plain word, so their
-;; abort-on-panic `defer` and their commit-or-abort branch do not have to
-;; thread a linear value through both. The callback still only ever sees a
-;; borrowed Txn.
-;; -------------------------------------------------------------------------
-
-;;; begin-raw -- mdb_txn_begin; ok: the MDB_txn pointer, err: the code.
-;;; parent is 0 for a top-level transaction.
-(defn begin-raw [env : int parent : int read-only : bool] : (Result int int)
-  ```c
-  #include <lmdb.h>
+  (import lmdb/env :refer [Env])
+  (export Txn
+    txn-begin
+    txn-begin-nested
+    txn-commit
+    txn-abort
+    txn-read-only?
+    txn-id
+    with-read-txn
+    with-write-txn
+    with-write-txn-growing
+    with-nested-txn)
+  ;;; Txn -- an open transaction (an `MDB_txn *`).
+  ;;;
+  ;;; `:linear`: a Txn from `txn-begin` must end exactly once, in `txn-commit`
+  ;;; or `txn-abort`. Reads and writes borrow it. A Txn handed to a scoped
+  ;;; form's callback is borrowed and ended by the form.
+  ;;;
+  ;;; Since: 0.1.0
+  (defopaque ^linear Txn :int)
+  ;; -------------------------------------------------------------------------
+  ;; Private: raw C over the bare MDB_txn pointer
+  ;;
+  ;; The scoped forms below work on the pointer as a plain word, so their
+  ;; abort-on-panic `defer` and their commit-or-abort branch do not have to
+  ;; thread a linear value through both. The callback still only ever sees a
+  ;; borrowed Txn.
+  ;; -------------------------------------------------------------------------
+  ;;; begin-raw -- mdb_txn_begin; ok: the MDB_txn pointer, err: the code.
+  ;;; parent is 0 for a top-level transaction.
+  (defn begin-raw [env : int parent : int read-only : bool] : (Result int int)
+    ```c
+    #include <lmdb.h>
   MDB_txn *txn = NULL;
   int rc = mdb_txn_begin((MDB_env *)(intptr_t)env, (MDB_txn *)(intptr_t)parent,
                          read_only ? MDB_RDONLY : 0, &txn);
   if (rc) return tur_err_int(rc);
   return tur_ok_int((int64_t)(intptr_t)txn);
   ```)
-
-;;; commit-raw -- mdb_txn_commit; the code. The txn is freed either way.
-(defn commit-raw [txn : int] : int
-  ```c
-  #include <lmdb.h>
+  ;;; commit-raw -- mdb_txn_commit; the code. The txn is freed either way.
+  (defn commit-raw [txn : int] : int
+    ```c
+    #include <lmdb.h>
   return (int64_t)mdb_txn_commit((MDB_txn *)(intptr_t)txn);
   ```)
-
-;;; abort-raw -- mdb_txn_abort.
-(defn abort-raw [txn : int] : nil
-  ```c
-  #include <lmdb.h>
+  ;;; abort-raw -- mdb_txn_abort.
+  (defn abort-raw [txn : int] : nil
+    ```c
+    #include <lmdb.h>
   mdb_txn_abort((MDB_txn *)(intptr_t)txn);
   ```)
-
-;;; env-word -- the Env's pointer as a word, without spending the Env.
-(defn env-word [^borrow env : Env] : int
-  ```c
-  return env;
+  ;;; env-word -- the Env's pointer as a word, without spending the Env.
+  (defn env-word [^borrow env : Env] : int
+    ```c
+    return env;
   ```)
-
-;;; txn-word -- the Txn's pointer as a word, without spending the Txn.
-(defn txn-word [^borrow txn : Txn] : int
-  ```c
-  return txn;
+  ;;; txn-word -- the Txn's pointer as a word, without spending the Txn.
+  (defn txn-word [^borrow txn : Txn] : int
+    ```c
+    return txn;
   ```)
-
-;;; txn-of-word -- view a raw pointer as a Txn. Private: the only mint.
-(defn txn-of-word [w : int] : Txn
-  ```c
-  return w;
+  ;;; txn-of-word -- view a raw pointer as a Txn. Private: the only mint.
+  (defn txn-of-word [w : int] : Txn
+    ```c
+    return w;
   ```)
-
-;;; txn-release-view -- spend a Txn minted by txn-of-word for a scoped
-;;; callback, whose owner ends the real transaction separately.
-(defn txn-release-view [txn : Txn] : nil
-  ```c
-  (void)txn;
+  ;;; txn-release-view -- spend a Txn minted by txn-of-word for a scoped
+  ;;; callback, whose owner ends the real transaction separately.
+  (defn txn-release-view [txn : Txn] : nil
+    ```c
+    (void)txn;
   ```)
-
-;;; guard-new -- an armed abort guard for txn: a malloc'd { txn, armed }.
-;;; The scoped forms' `defer` fires it, so a panic in the callback still ends
-;;; the transaction (and so releases the writer lock); the normal path
-;;; disarms it first and commits or aborts itself. Kept in C rather than a
-;;; `^mut` local so the scope allocates nothing that outlives it.
-(defn guard-new [txn : int] : ptr<void>
-  ```c
-  #include <stdlib.h>
+  ;;; guard-new -- an armed abort guard for txn: a malloc'd { txn, armed }.
+  ;;; The scoped forms' `defer` fires it, so a panic in the callback still ends
+  ;;; the transaction (and so releases the writer lock); the normal path
+  ;;; disarms it first and commits or aborts itself. Kept in C rather than a
+  ;;; `^mut` local so the scope allocates nothing that outlives it.
+  (defn guard-new [txn : int] : ptr<void>
+    ```c
+    #include <stdlib.h>
   int64_t *g = (int64_t *)malloc(2 * sizeof(int64_t));
   g[0] = txn; g[1] = 1;
   return g;
   ```)
-
-;;; guard-disarm -- the callback returned: the form ends the txn itself.
-(defn guard-disarm [g : ptr<void>] : nil
-  ```c
-  ((int64_t *)g)[1] = 0;
+  ;;; guard-disarm -- the callback returned: the form ends the txn itself.
+  (defn guard-disarm [g : ptr<void>] : nil
+    ```c
+    ((int64_t *)g)[1] = 0;
   ```)
-
-;;; guard-fire -- abort the txn if the guard is still armed; free the guard.
-(defn guard-fire [g : ptr<void>] : nil
-  ```c
-  #include <lmdb.h>
+  ;;; guard-fire -- abort the txn if the guard is still armed; free the guard.
+  (defn guard-fire [g : ptr<void>] : nil
+    ```c
+    #include <lmdb.h>
   #include <stdlib.h>
   int64_t *c = (int64_t *)g;
   if (c[1]) mdb_txn_abort((MDB_txn *)(intptr_t)c[0]);
   free(c);
   ```)
-
-;;; call-guarded -- run f on the transaction w; if f panics, abort w.
-(defn call-guarded [A] [w : int f : (fn [^borrow Txn] (Result A LmdbError))]
-                       : (Result A LmdbError)
-  (let [g (guard-new w)]
-    (do
-      (defer (guard-fire g))
-      (let [t (txn-of-word w)
-            r (f t)]
-        (do (txn-release-view t) (guard-disarm g) r)))))
-
-;;; scoped -- run f on a fresh transaction and end it.
-;;; commit? true: commit if f returned Ok, abort otherwise (a write txn).
-;;; commit? false: always abort (a read txn).
-;;; A panic in f aborts through call-guarded's defer.
-(defn scoped [A] [env : int parent : int read-only : bool commit? : bool
-                  f : (fn [^borrow Txn] (Result A LmdbError))]
-                 : (Result A LmdbError)
-  (let [b (begin-raw env parent read-only)]
-    (if (err? b)
-      (err (lmdb-error-of (err-val b)))
-      (let [w (ok-val b)
-            r (call-guarded w f)]
-        (if (and commit? (ok? r))
-          (let [rc (commit-raw w)]
-            (if (= rc 0) r (err (lmdb-error-of rc))))
-          (do (abort-raw w) r))))))
-
-;; -------------------------------------------------------------------------
-;; Raw transactions
-;; -------------------------------------------------------------------------
-
-;;; txn-begin -- begin a transaction on env.
-;;;
-;;; Parameters:
-;;;   env       -- the Env, borrowed
-;;;   read-only -- true for a read (snapshot) transaction
-;;;
-;;; Returns:
-;;;   (Result Txn LmdbError) -- ok carries a Txn to end with txn-commit or
-;;;   txn-abort; `ReadersFull` when the reader table is full, `ReadOnly` for
-;;;   a write transaction on a read-only env.
-;;;
-;;; Example:
-;;;   (let [r (txn-begin env true)]
-;;;     (if (ok? r) (let [t (ok-val r)] (do (get t dbi "k") (txn-abort t))) ...))
-;;;
-;;; Since: 0.1.0
-(defn txn-begin [^borrow env : Env read-only : bool] : (Result Txn LmdbError)
-  (let [b (begin-raw (env-word env) 0 read-only)]
-    (if (ok? b)
-      (ok (txn-of-word (ok-val b)))
-      (err (lmdb-error-of (err-val b))))))
-
-;;; txn-begin-nested -- begin a child of a write transaction: a savepoint.
-;;;
-;;; While the child is open the parent must not be used. Committing the
-;;; child folds its writes into the parent; aborting it drops only them.
-;;;
-;;; Parameters:
-;;;   parent -- an open write Txn, borrowed
-;;;
-;;; Returns:
-;;;   (Result Txn LmdbError) -- the child, to commit or abort before the
-;;;   parent ends.
-;;;
-;;; Example:
-;;;   (let [c (ok-val (txn-begin-nested t))] (do (put! c dbi "k" "v") (txn-abort c)))
-;;;
-;;; Since: 0.1.0
-(defn txn-begin-nested [^borrow parent : Txn] : (Result Txn LmdbError)
-  (let [b (begin-raw (txn-env-word parent) (txn-word parent) false)]
-    (if (ok? b)
-      (ok (txn-of-word (ok-val b)))
-      (err (lmdb-error-of (err-val b))))))
-
-;;; txn-env-word -- the env a transaction belongs to, as a word.
-(defn txn-env-word [^borrow txn : Txn] : int
-  ```c
-  #include <lmdb.h>
+  ;;; call-guarded -- run f on the transaction w; if f panics, abort w.
+  (defn call-guarded [A] [w : int f : (fn [^borrow Txn] (Result A LmdbError))] : (Result A
+                                                                                   LmdbError)
+    (let [g (guard-new w)]
+      (do
+        (defer (guard-fire g))
+        (let [t (txn-of-word w)
+              r (f t)]
+          (do (txn-release-view t) (guard-disarm g) r)))))
+  ;;; scoped -- run f on a fresh transaction and end it.
+  ;;; commit? true: commit if f returned Ok, abort otherwise (a write txn).
+  ;;; commit? false: always abort (a read txn).
+  ;;; A panic in f aborts through call-guarded's defer.
+  (defn scoped [A] [env : int
+                    parent : int
+                    read-only : bool
+                    commit? : bool
+                    f : (fn [^borrow Txn] (Result A LmdbError))] : (Result A
+                                                                     LmdbError)
+    (let [b (begin-raw env parent read-only)]
+      (if (err? b)
+        (err (lmdb-error-of (err-val b)))
+        (let [w (ok-val b)
+              r (call-guarded w f)]
+          (if (and commit? (ok? r))
+            (let [rc (commit-raw w)] (if (= rc 0) r (err (lmdb-error-of rc))))
+            (do (abort-raw w) r))))))
+  ;; -------------------------------------------------------------------------
+  ;; Raw transactions
+  ;; -------------------------------------------------------------------------
+  ;;; txn-begin -- begin a transaction on env.
+  ;;;
+  ;;; Parameters:
+  ;;;   env       -- the Env, borrowed
+  ;;;   read-only -- true for a read (snapshot) transaction
+  ;;;
+  ;;; Returns:
+  ;;;   (Result Txn LmdbError) -- ok carries a Txn to end with txn-commit or
+  ;;;   txn-abort; `ReadersFull` when the reader table is full, `ReadOnly` for
+  ;;;   a write transaction on a read-only env.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (txn-begin env true)]
+  ;;;     (if (ok? r) (let [t (ok-val r)] (do (get t dbi "k") (txn-abort t))) ...))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn txn-begin [^borrow env : Env read-only : bool] : (Result Txn LmdbError)
+    (let [b (begin-raw (env-word env) 0 read-only)]
+      (if (ok? b)
+        (ok (txn-of-word (ok-val b)))
+        (err (lmdb-error-of (err-val b))))))
+  ;;; txn-begin-nested -- begin a child of a write transaction: a savepoint.
+  ;;;
+  ;;; While the child is open the parent must not be used. Committing the
+  ;;; child folds its writes into the parent; aborting it drops only them.
+  ;;;
+  ;;; Parameters:
+  ;;;   parent -- an open write Txn, borrowed
+  ;;;
+  ;;; Returns:
+  ;;;   (Result Txn LmdbError) -- the child, to commit or abort before the
+  ;;;   parent ends.
+  ;;;
+  ;;; Example:
+  ;;;   (let [c (ok-val (txn-begin-nested t))] (do (put! c dbi "k" "v") (txn-abort c)))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn txn-begin-nested [^borrow parent : Txn] : (Result Txn LmdbError)
+    (let [b (begin-raw (txn-env-word parent) (txn-word parent) false)]
+      (if (ok? b)
+        (ok (txn-of-word (ok-val b)))
+        (err (lmdb-error-of (err-val b))))))
+  ;;; txn-env-word -- the env a transaction belongs to, as a word.
+  (defn txn-env-word [^borrow txn : Txn] : int
+    ```c
+    #include <lmdb.h>
   return (int64_t)(intptr_t)mdb_txn_env((MDB_txn *)(intptr_t)txn);
   ```)
-
-;;; txn-commit -- commit a transaction, ending it.
-;;;
-;;; Parameters:
-;;;   txn -- the Txn; consumed whether or not the commit succeeds
-;;;
-;;; Returns:
-;;;   (Result nil LmdbError) -- `MapFull` when the writes did not fit.
-;;;
-;;; Example:
-;;;   (txn-commit t)
-;;;
-;;; Since: 0.1.0
-(defn txn-commit [txn : Txn] : (Result nil LmdbError)
-  (let [rc (commit-raw (txn-word txn))]
-    (do
-      (txn-release-view txn)
-      (if (= rc 0) (Ok nil) (err (lmdb-error-of rc))))))
-
-;;; txn-abort -- abort a transaction, discarding its writes and ending it.
-;;;
-;;; Parameters:
-;;;   txn -- the Txn; consumed
-;;;
-;;; Example:
-;;;   (txn-abort t)
-;;;
-;;; Since: 0.1.0
-(defn txn-abort [txn : Txn] : nil
-  ```c
-  #include <lmdb.h>
+  ;;; txn-commit -- commit a transaction, ending it.
+  ;;;
+  ;;; Parameters:
+  ;;;   txn -- the Txn; consumed whether or not the commit succeeds
+  ;;;
+  ;;; Returns:
+  ;;;   (Result nil LmdbError) -- `MapFull` when the writes did not fit.
+  ;;;
+  ;;; Example:
+  ;;;   (txn-commit t)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn txn-commit [txn : Txn] : (Result nil LmdbError)
+    (let [rc (commit-raw (txn-word txn))]
+      (do
+        (txn-release-view txn)
+        (if (= rc 0) (Ok nil) (err (lmdb-error-of rc))))))
+  ;;; txn-abort -- abort a transaction, discarding its writes and ending it.
+  ;;;
+  ;;; Parameters:
+  ;;;   txn -- the Txn; consumed
+  ;;;
+  ;;; Example:
+  ;;;   (txn-abort t)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn txn-abort [txn : Txn] : nil
+    ```c
+    #include <lmdb.h>
   mdb_txn_abort((MDB_txn *)(intptr_t)txn);
   ```)
-
-;;; txn-read-only? -- is this a read transaction?
-;;;
-;;; Parameters:
-;;;   txn -- the Txn, borrowed
-;;;
-;;; Returns:
-;;;   true for a transaction begun read-only (or on a read-only env).
-;;;
-;;; Example:
-;;;   (txn-read-only? t)  ; => true
-;;;
-;;; Since: 0.1.0
-(defn txn-read-only? [^borrow txn : Txn] : bool
-  ```c
-  #include <lmdb.h>
+  ;;; txn-read-only? -- is this a read transaction?
+  ;;;
+  ;;; Parameters:
+  ;;;   txn -- the Txn, borrowed
+  ;;;
+  ;;; Returns:
+  ;;;   true for a transaction begun read-only (or on a read-only env).
+  ;;;
+  ;;; Example:
+  ;;;   (txn-read-only? t)  ; => true
+  ;;;
+  ;;; Since: 0.1.0
+  (defn txn-read-only? [^borrow txn : Txn] : bool
+    ```c
+    #include <lmdb.h>
   MDB_txn *t = (MDB_txn *)(intptr_t)txn;
   unsigned int f = 0;
   mdb_env_get_flags(mdb_txn_env(t), &f);
@@ -273,144 +261,137 @@
   mdb_env_info(mdb_txn_env(t), &info);
   return mdb_txn_id(t) <= info.me_last_txnid;
   ```)
-
-;;; txn-id -- the transaction's id: the snapshot a reader sees, or the
-;;; commit a writer will make.
-;;;
-;;; Parameters:
-;;;   txn -- the Txn, borrowed
-;;;
-;;; Returns:
-;;;   The id as an int.
-;;;
-;;; Example:
-;;;   (txn-id t)  ; => 7
-;;;
-;;; Since: 0.1.0
-(defn txn-id [^borrow txn : Txn] : int
-  ```c
-  #include <lmdb.h>
+  ;;; txn-id -- the transaction's id: the snapshot a reader sees, or the
+  ;;; commit a writer will make.
+  ;;;
+  ;;; Parameters:
+  ;;;   txn -- the Txn, borrowed
+  ;;;
+  ;;; Returns:
+  ;;;   The id as an int.
+  ;;;
+  ;;; Example:
+  ;;;   (txn-id t)  ; => 7
+  ;;;
+  ;;; Since: 0.1.0
+  (defn txn-id [^borrow txn : Txn] : int
+    ```c
+    #include <lmdb.h>
   return (int64_t)mdb_txn_id((MDB_txn *)(intptr_t)txn);
   ```)
-
-;; -------------------------------------------------------------------------
-;; Scoped transactions
-;; -------------------------------------------------------------------------
-
-;;; with-read-txn -- run f in a read transaction, then end it.
-;;;
-;;; Parameters:
-;;;   env -- the Env, borrowed
-;;;   f   -- (fn [^borrow Txn] (Result A LmdbError)), run once
-;;;
-;;; Returns:
-;;;   f's result, or the error beginning the transaction.
-;;;
-;;; Example:
-;;;   (with-read-txn env
-;;;     (fn [^borrow t : Txn] : (Result (Option cstr) LmdbError)
-;;;       (ok (get t dbi "k"))))
-;;;
-;;; Since: 0.1.0
-(defn with-read-txn [A] [^borrow env : Env f : (fn [^borrow Txn] (Result A LmdbError))]
-                        : (Result A LmdbError)
-  (scoped (env-word env) 0 true false f))
-
-;;; with-write-txn -- run f in a write transaction; commit on Ok.
-;;;
-;;; The transaction aborts if f returns Err or panics, so nothing f wrote
-;;; is left behind. A commit that fails (MapFull, an I/O error) returns
-;;; its error in place of f's Ok.
-;;;
-;;; Parameters:
-;;;   env -- the Env, borrowed
-;;;   f   -- (fn [^borrow Txn] (Result A LmdbError)), run once
-;;;
-;;; Returns:
-;;;   f's result once committed, or the first error.
-;;;
-;;; Example:
-;;;   (with-write-txn env
-;;;     (fn [^borrow t : Txn] : (Result nil LmdbError) (put! t dbi "k" "v")))
-;;;
-;;; Since: 0.1.0
-(defn with-write-txn [A] [^borrow env : Env f : (fn [^borrow Txn] (Result A LmdbError))]
-                         : (Result A LmdbError)
-  (scoped (env-word env) 0 false true f))
-
-;;; with-nested-txn -- run f in a child of a write transaction; commit the
-;;; child into its parent on Ok, abort only the child on Err or panic.
-;;;
-;;; Parameters:
-;;;   parent -- an open write Txn, borrowed (do not use it inside f)
-;;;   f      -- (fn [^borrow Txn] (Result A LmdbError)), run once
-;;;
-;;; Returns:
-;;;   f's result, or the first error.
-;;;
-;;; Example:
-;;;   (with-nested-txn t (fn [^borrow c : Txn] : (Result nil LmdbError) (put! c dbi "k" "v")))
-;;;
-;;; Since: 0.1.0
-(defn with-nested-txn [A] [^borrow parent : Txn f : (fn [^borrow Txn] (Result A LmdbError))]
-                          : (Result A LmdbError)
-  (scoped (txn-env-word parent) (txn-word parent) false true f))
-
-;;; grow-loop -- rerun with-write-txn, doubling the map up to max on MapFull.
-(defn grow-loop [A] [env : int max : int f : (fn [^borrow Txn] (Result A LmdbError))]
-                    : (Result A LmdbError)
-  (let [r (scoped env 0 false true f)]
-    (if (and (err? r) (lmdb-error-map-full? (err-val r)))
-      (let [cur (map-size-of-word env)]
-        (if (>= cur max)
-          r
-          (let [next (if (> (* 2 cur) max) max (* 2 cur))
-                rc   (set-map-size-word env next)]
-            (if (= rc 0)
-              (grow-loop env max f)
-              (err (lmdb-error-of rc))))))
-      r)))
-
-;;; map-size-of-word -- mdb_env_info's map size, for a raw env pointer.
-(defn map-size-of-word [env : int] : int
-  ```c
-  #include <lmdb.h>
+  ;; -------------------------------------------------------------------------
+  ;; Scoped transactions
+  ;; -------------------------------------------------------------------------
+  ;;; with-read-txn -- run f in a read transaction, then end it.
+  ;;;
+  ;;; Parameters:
+  ;;;   env -- the Env, borrowed
+  ;;;   f   -- (fn [^borrow Txn] (Result A LmdbError)), run once
+  ;;;
+  ;;; Returns:
+  ;;;   f's result, or the error beginning the transaction.
+  ;;;
+  ;;; Example:
+  ;;;   (with-read-txn env
+  ;;;     (fn [^borrow t : Txn] : (Result (Option cstr) LmdbError)
+  ;;;       (ok (get t dbi "k"))))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn with-read-txn [A] [^borrow env : Env
+                           f : (fn [^borrow Txn] (Result A LmdbError))] : (Result A
+                                                                            LmdbError)
+    (scoped (env-word env) 0 true false f))
+  ;;; with-write-txn -- run f in a write transaction; commit on Ok.
+  ;;;
+  ;;; The transaction aborts if f returns Err or panics, so nothing f wrote
+  ;;; is left behind. A commit that fails (MapFull, an I/O error) returns
+  ;;; its error in place of f's Ok.
+  ;;;
+  ;;; Parameters:
+  ;;;   env -- the Env, borrowed
+  ;;;   f   -- (fn [^borrow Txn] (Result A LmdbError)), run once
+  ;;;
+  ;;; Returns:
+  ;;;   f's result once committed, or the first error.
+  ;;;
+  ;;; Example:
+  ;;;   (with-write-txn env
+  ;;;     (fn [^borrow t : Txn] : (Result nil LmdbError) (put! t dbi "k" "v")))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn with-write-txn [A] [^borrow env : Env
+                            f : (fn [^borrow Txn] (Result A LmdbError))] : (Result A
+                                                                             LmdbError)
+    (scoped (env-word env) 0 false true f))
+  ;;; with-nested-txn -- run f in a child of a write transaction; commit the
+  ;;; child into its parent on Ok, abort only the child on Err or panic.
+  ;;;
+  ;;; Parameters:
+  ;;;   parent -- an open write Txn, borrowed (do not use it inside f)
+  ;;;   f      -- (fn [^borrow Txn] (Result A LmdbError)), run once
+  ;;;
+  ;;; Returns:
+  ;;;   f's result, or the first error.
+  ;;;
+  ;;; Example:
+  ;;;   (with-nested-txn t (fn [^borrow c : Txn] : (Result nil LmdbError) (put! c dbi "k" "v")))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn with-nested-txn [A] [^borrow parent : Txn
+                             f : (fn [^borrow Txn] (Result A LmdbError))] : (Result A
+                                                                              LmdbError)
+    (scoped (txn-env-word parent) (txn-word parent) false true f))
+  ;;; grow-loop -- rerun with-write-txn, doubling the map up to max on MapFull.
+  (defn grow-loop [A] [env : int
+                       max : int
+                       f : (fn [^borrow Txn] (Result A LmdbError))] : (Result A
+                                                                        LmdbError)
+    (let [r (scoped env 0 false true f)]
+      (if (and (err? r) (lmdb-error-map-full? (err-val r)))
+        (let [cur (map-size-of-word env)]
+          (if (>= cur max)
+            r
+            (let [next (if (> (* 2 cur) max) max (* 2 cur))
+                  rc   (set-map-size-word env next)]
+              (if (= rc 0) (grow-loop env max f) (err (lmdb-error-of rc))))))
+        r)))
+  ;;; map-size-of-word -- mdb_env_info's map size, for a raw env pointer.
+  (defn map-size-of-word [env : int] : int
+    ```c
+    #include <lmdb.h>
   MDB_envinfo info;
   if (mdb_env_info((MDB_env *)(intptr_t)env, &info)) return 0;
   return (int64_t)info.me_mapsize;
   ```)
-
-;;; set-map-size-word -- mdb_env_set_mapsize for a raw env pointer.
-(defn set-map-size-word [env : int n : int] : int
-  ```c
-  #include <lmdb.h>
+  ;;; set-map-size-word -- mdb_env_set_mapsize for a raw env pointer.
+  (defn set-map-size-word [env : int n : int] : int
+    ```c
+    #include <lmdb.h>
   return (int64_t)mdb_env_set_mapsize((MDB_env *)(intptr_t)env, (size_t)n);
   ```)
-
-;;; with-write-txn-growing -- with-write-txn that grows the map on MapFull.
-;;;
-;;; When the transaction (or its commit) fails with MapFull, the map is
-;;; doubled -- never past max -- and f is run again from the start in a new
-;;; transaction. So f may run more than once: keep it free of effects
-;;; outside the transaction. Growing needs this process to have no other
-;;; transaction open on env.
-;;;
-;;; Parameters:
-;;;   env -- the Env, borrowed
-;;;   max -- the largest map size to grow to, in bytes
-;;;   f   -- (fn [^borrow Txn] (Result A LmdbError))
-;;;
-;;; Returns:
-;;;   f's committed result; `MapFull` if it still does not fit at max.
-;;;
-;;; Example:
-;;;   (with-write-txn-growing env (* 1024 1048576)
-;;;     (fn [^borrow t : Txn] : (Result nil LmdbError) (put! t dbi k big-value)))
-;;;
-;;; Since: 0.1.0
-(defn with-write-txn-growing [A] [^borrow env : Env max : int
-                                  f : (fn [^borrow Txn] (Result A LmdbError))]
-                                 : (Result A LmdbError)
-  (grow-loop (env-word env) max f))
-
-) ;; end defmodule lmdb/txn
+  ;;; with-write-txn-growing -- with-write-txn that grows the map on MapFull.
+  ;;;
+  ;;; When the transaction (or its commit) fails with MapFull, the map is
+  ;;; doubled -- never past max -- and f is run again from the start in a new
+  ;;; transaction. So f may run more than once: keep it free of effects
+  ;;; outside the transaction. Growing needs this process to have no other
+  ;;; transaction open on env.
+  ;;;
+  ;;; Parameters:
+  ;;;   env -- the Env, borrowed
+  ;;;   max -- the largest map size to grow to, in bytes
+  ;;;   f   -- (fn [^borrow Txn] (Result A LmdbError))
+  ;;;
+  ;;; Returns:
+  ;;;   f's committed result; `MapFull` if it still does not fit at max.
+  ;;;
+  ;;; Example:
+  ;;;   (with-write-txn-growing env (* 1024 1048576)
+  ;;;     (fn [^borrow t : Txn] : (Result nil LmdbError) (put! t dbi k big-value)))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn with-write-txn-growing [A] [^borrow env : Env
+                                    max : int
+                                    f : (fn [^borrow Txn] (Result A LmdbError))] : (Result A
+                                                                                     LmdbError)
+    (grow-loop (env-word env) max f))) ;; end defmodule lmdb/txn

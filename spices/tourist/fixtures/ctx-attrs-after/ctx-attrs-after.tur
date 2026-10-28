@@ -12,38 +12,33 @@
 ;; ctx-attr-get returns a concrete (Option int), which is passed by value:
 ;; read it with some? / unwrap, not as an int carrier in inline C (which is
 ;; what broke this fixture's compile).
-
 (defmodule tourist/tests/ctx-attrs-after
-  (import tourist/app        :refer [tourist])
-  (import tourist/dsl        :refer [get!])
-  (import tourist/helpers    :refer [text])
+  (import tourist/app :refer [tourist])
+  (import tourist/dsl :refer [get!])
+  (import tourist/helpers :refer [text])
   (import tourist/middleware :refer [use! use-after!])
-  (import tourist/param      :refer [ctx-attr-get ctx-attr-set! ctx-add-header!])
-  (import tourist/types      :refer [Ctx])
-  (import httpd/types        :refer [Response])
-  (import httpd/server       :refer [server-port server-stop])
-  (import http/client        :refer [http-get http-result-free])
-  (import http/response      :refer [response-status response-body response-header])
-  (import test/suite         :refer [describe it])
-  (import test/assert        :refer [assert-eq assert-true])
-  (import test/runner        :refer [run-all-status])
-
+  (import tourist/param :refer [ctx-attr-get ctx-attr-set! ctx-add-header!])
+  (import tourist/types :refer [Ctx])
+  (import httpd/types :refer [Response])
+  (import httpd/server :refer [server-port server-stop])
+  (import http/client :refer [http-get http-result-free])
+  (import http/response :refer [response-status response-body response-header])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-eq assert-true])
+  (import test/runner :refer [run-all-status])
   (defn __cr-ok? [r : ptr<void>] : bool
     ```c
     return tur_is_ok((int64_t)(intptr_t)r);
     ```)
-
   (defn __cr-val [r : ptr<void>] : int
     ```c
     return tur_ok_value((int64_t)(intptr_t)r);
     ```)
-
   (defn cstr-eq? [a : cstr b : cstr] : bool
     ```c
     #include <string.h>
     return a && strcmp((const char *)a, (const char *)b) == 0;
     ```)
-
   (defn url-for [port : int] : cstr
     ```c
     #include <stdio.h>
@@ -51,7 +46,6 @@
     snprintf(u, sizeof u, "http://127.0.0.1:%d/", (int)port);
     return u;
     ```)
-
   ;; "id=<int>" in a per-thread buffer; text and ctx-add-header! copy it.
   (defn __body-of-id [id : int] : cstr
     ```c
@@ -60,63 +54,54 @@
     snprintf(buf, sizeof buf, "id=%lld", (long long)id);
     return buf;
     ```)
-
   (defn __attr-or [o : (Option int) fallback : int] : int
     (if (some? o) (unwrap o) fallback))
-
   ;; -- Pre middleware: stamp request-id=4242 in ctx attrs. ----------------
   (defn stamp-id [ctx : Ctx] : (Option Response)
-    (do
-      (ctx-attr-set! ctx "request-id" 4242)
-      (none)))
-
+    (do (ctx-attr-set! ctx "request-id" 4242) (none)))
   ;; -- Route handler: reads request-id back and renders "id=<value>". -----
   (defn route-root [ctx : Ctx] : Response
     (text (__body-of-id (__attr-or (ctx-attr-get ctx "request-id") 0))))
-
   ;; -- After middleware: read the id again and inject as a response header.
   ;; Demonstrates that an after-mw observing ctx queued via ctx-add-header!
   ;; lands on the outgoing response.
   (defn inject-header [ctx : Ctx resp : Response] : Response
     (do
-      (ctx-add-header! ctx "X-Request-Id"
-                       (__body-of-id (__attr-or (ctx-attr-get ctx "request-id") 0)))
+      (ctx-add-header! ctx
+        "X-Request-Id"
+        (__body-of-id (__attr-or (ctx-attr-get ctx "request-id") 0)))
       resp))
-
   ;; -- Probes: each frees its client result. -----------------------------
   (defn body-is? [port : int want : cstr] : bool
     (let [r  (http-get (url-for port))
-          ok (if (__cr-ok? r) (cstr-eq? want (response-body (__cr-val r))) false)]
+          ok (if (__cr-ok? r)
+               (cstr-eq? want (response-body (__cr-val r)))
+               false)]
       (http-result-free r)
       ok))
-
   (defn status-of [port : int] : int
     (let [r  (http-get (url-for port))
           st (if (__cr-ok? r) (response-status (__cr-val r)) 0)]
       (http-result-free r)
       st))
-
   (defn header-is? [port : int name : cstr want : cstr] : bool
     (let [r  (http-get (url-for port))
-          ok (if (__cr-ok? r) (cstr-eq? want (response-header (__cr-val r) name)) false)]
+          ok (if (__cr-ok? r)
+               (cstr-eq? want (response-header (__cr-val r) name))
+               false)]
       (http-result-free r)
       ok))
-
   (defn __all-tests [] : void
     (let [srv  (tourist 0
-                 (use!       stamp-id)
+                 (use! stamp-id)
                  (use-after! inject-header)
                  (get! "/" route-root))
           port (server-port srv)]
       (describe "tourist ctx attrs + use-after!"
         (it "GET / round-trips request-id through ctx-attr-set!/get"
           (assert-true (body-is? port "id=4242")))
-        (it "GET / status is 200"
-          (assert-eq 200 (status-of port)))
+        (it "GET / status is 200" (assert-eq 200 (status-of port)))
         (it "after-middleware ctx-add-header! lands on the response"
           (assert-true (header-is? port "X-Request-Id" "id=4242"))))
       (server-stop srv)))
-
-  (defn main [] : int
-    (__all-tests)
-    (run-all-status)))
+  (defn main [] : int (__all-tests) (run-all-status)))

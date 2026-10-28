@@ -2,140 +2,121 @@
 ;;;
 ;;; Since: Phase 4
 ;; -------------------------------------------------------------------------
-
 (defmodule dc_test
   (export)
-
-(import sdf/colors :refer [colored-sphere colored-box colored-union
-                            colored-translate csdf-free])
-(import mesh/extraction   :refer [dc-extract-colored
-                                   cmesh-vertex-count cmesh-free
-                                   cmesh-get-cr cmesh-get-cg cmesh-get-cb
-                                   cmesh-get-object-id])
-(import mesh/optimization :refer [cmesh-weld
-                                   imesh-vertex-count imesh-triangle-count
-                                   imesh-free])
-(import export/gltf       :refer [export-glb])
-
-;; ---- helpers ----
-
-(defn approx= [a : float b : float] : bool
-  ```c
-  double diff = a - b; if (diff < 0) diff = -diff;
+  (import sdf/colors
+    :refer
+    [colored-sphere colored-box colored-union colored-translate csdf-free])
+  (import mesh/extraction
+    :refer
+    [dc-extract-colored
+     cmesh-vertex-count
+     cmesh-free
+     cmesh-get-cr
+     cmesh-get-cg
+     cmesh-get-cb
+     cmesh-get-object-id])
+  (import mesh/optimization
+    :refer
+    [cmesh-weld imesh-vertex-count imesh-triangle-count imesh-free])
+  (import export/gltf :refer [export-glb])
+  ;; ---- helpers ----
+  (defn approx= [a : float b : float] : bool
+    ```c
+    double diff = a - b; if (diff < 0) diff = -diff;
   return diff < 0.02;
   ```)
-
-
-;; Named check!, not assert!: stdlib's auto-loaded `contract` module defines a
-;; one-argument `assert!` MACRO, which wins at every call site and rejected
-;; these two-argument calls with "macro 'assert!' expects 1 arguments, got 2".
-(defn check! [cond : bool msg : cstr] : void
-  ```c
-  #include <stdio.h>
+  ;; Named check!, not assert!: stdlib's auto-loaded `contract` module defines a
+  ;; one-argument `assert!` MACRO, which wins at every call site and rejected
+  ;; these two-argument calls with "macro 'assert!' expects 1 arguments, got 2".
+  (defn check! [cond : bool msg : cstr] : void
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   if (!cond) {
     fprintf(stderr, "%s\n", (const char *)(intptr_t)msg);
     exit(1);
   }
   ```)
-
-;; ---- test 1: dc-extract-colored on a single colored sphere ----
-
-(defn test-dc-sphere [] : void
-  (let [scene (colored-sphere 0.0 0.0 0.0 1.0  1.0 0.5 0.0  1)
-        mesh  (dc-extract-colored scene 24
-                                  -2.0 -2.0 -2.0
-                                   2.0  2.0  2.0)]
-    (check! (> mesh 0) "dc-extract-colored sphere: handle should be non-zero")
-    (let [n (cmesh-vertex-count mesh)]
-      (check! (> n 0) "dc-extract-colored sphere: should produce vertices")
-      (let [cr (cmesh-get-cr mesh 0)
-            cg (cmesh-get-cg mesh 0)
-            oi (cmesh-get-object-id mesh 0)]
-        (check! (approx= cr 1.0) "dc sphere: first vertex red should be ~1.0")
-        (check! (approx= cg 0.5) "dc sphere: first vertex green should be ~0.5")
-        (check! (= oi 1) "dc sphere: first vertex object ID should be 1")))
-    (cmesh-free mesh)
-    (csdf-free scene)))
-
-;; ---- test 2: dc-extract-colored on a two-sphere colored union ----
-
-(defn test-dc-union [] : void
-  (let [red  (colored-sphere -1.5 0.0 0.0 0.8  1.0 0.0 0.0  1)
-        blue (colored-sphere  1.5 0.0 0.0 0.8  0.0 0.0 1.0  2)
-        scene (colored-union red blue)
-        mesh  (dc-extract-colored scene 24
-                                  -3.0 -2.0 -2.0
-                                   3.0  2.0  2.0)]
-    (check! (> mesh 0) "dc union: handle should be non-zero")
-    (check! (> (cmesh-vertex-count mesh) 0) "dc union: should produce vertices")
-    (let [n    (cmesh-vertex-count mesh)
-          oi0  (cmesh-get-object-id mesh 0)
-          oiM  (cmesh-get-object-id mesh (/ n 2))]
-      (check! (if (= oi0 1) true (= oi0 2)) "dc union: vertex 0 should be obj 1 or 2")
-      (check! (if (= oiM 1) true (= oiM 2)) "dc union: mid vertex should be obj 1 or 2"))
-    (cmesh-free mesh)
-    (csdf-free scene)))
-
-;; ---- test 3: dc produces non-zero vertices for a box (feature preservation) ----
-
-(defn test-dc-vs-mc-sharpness [] : void
-  (let [scene (colored-box -1.0 -1.0 -1.0  1.0 1.0 1.0  0.8 0.8 0.2  1)
-        mesh  (dc-extract-colored scene 24
-                                  -2.0 -2.0 -2.0
-                                   2.0  2.0  2.0)]
-    (check! (> mesh 0) "dc box: handle should be non-zero")
-    (check! (> (cmesh-vertex-count mesh) 0) "dc box: should produce vertices")
-    (cmesh-free mesh)
-    (csdf-free scene)))
-
-;; ---- test 4: cmesh-weld reduces vertex count ----
-
-(defn test-cmesh-weld [] : void
-  (let [scene  (colored-sphere 0.0 0.0 0.0 1.0  0.0 1.0 0.0  1)
-        raw    (dc-extract-colored scene 20
-                                   -2.0 -2.0 -2.0
-                                    2.0  2.0  2.0)
-        n-raw  (cmesh-vertex-count raw)
-        welded (cmesh-weld raw 1.0e-4)
-        n-weld (imesh-vertex-count welded)]
-    (check! (> welded 0) "weld: imesh handle should be non-zero")
-    (check! (> n-weld 0) "weld: should have unique vertices")
-    (check! (< n-weld n-raw) "weld: unique vertex count should be less than raw count")
-    (check! (> (imesh-triangle-count welded) 0) "weld: should have triangles")
-    (imesh-free welded)
-    (cmesh-free raw)
-    (csdf-free scene)))
-
-;; ---- test 5: export-glb smoke test ----
-
-(defn test-export-glb [] : void
-  (let [scene  (colored-sphere 0.0 0.0 0.0 1.0  0.3 0.6 1.0  1)
-        raw    (dc-extract-colored scene 20
-                                   -2.0 -2.0 -2.0
-                                    2.0  2.0  2.0)
-        welded (cmesh-weld raw 1.0e-4)
-        ret    (export-glb welded "/tmp/tur_dc_test")]
-    (check! (= ret 0) "export-glb: should return 0 on success")
-    (imesh-free welded)
-    (cmesh-free raw)
-    (csdf-free scene)))
-
-;; ---- main ----
-
-(defn main [] : int
-  (do
-    (test-dc-sphere)
-    (println "test-dc-sphere: PASS")
-    (test-dc-union)
-    (println "test-dc-union: PASS")
-    (test-dc-vs-mc-sharpness)
-    (println "test-dc-vs-mc-sharpness: PASS")
-    (test-cmesh-weld)
-    (println "test-cmesh-weld: PASS")
-    (test-export-glb)
-    (println "test-export-glb: PASS")
-    (println "All Phase 4 DC tests passed.")
-    0))
-
-) ;; end defmodule dc_test
+  ;; ---- test 1: dc-extract-colored on a single colored sphere ----
+  (defn test-dc-sphere [] : void
+    (let [scene (colored-sphere 0.0 0.0 0.0 1.0 1.0 0.5 0.0 1)
+          mesh  (dc-extract-colored scene 24 -2.0 -2.0 -2.0 2.0 2.0 2.0)]
+      (check! (> mesh 0) "dc-extract-colored sphere: handle should be non-zero")
+      (let [n (cmesh-vertex-count mesh)]
+        (check! (> n 0) "dc-extract-colored sphere: should produce vertices")
+        (let [cr (cmesh-get-cr mesh 0)
+              cg (cmesh-get-cg mesh 0)
+              oi (cmesh-get-object-id mesh 0)]
+          (check! (approx= cr 1.0) "dc sphere: first vertex red should be ~1.0")
+          (check! (approx= cg 0.5)
+            "dc sphere: first vertex green should be ~0.5")
+          (check! (= oi 1) "dc sphere: first vertex object ID should be 1")))
+      (cmesh-free mesh)
+      (csdf-free scene)))
+  ;; ---- test 2: dc-extract-colored on a two-sphere colored union ----
+  (defn test-dc-union [] : void
+    (let [red   (colored-sphere -1.5 0.0 0.0 0.8 1.0 0.0 0.0 1)
+          blue  (colored-sphere 1.5 0.0 0.0 0.8 0.0 0.0 1.0 2)
+          scene (colored-union red blue)
+          mesh  (dc-extract-colored scene 24 -3.0 -2.0 -2.0 3.0 2.0 2.0)]
+      (check! (> mesh 0) "dc union: handle should be non-zero")
+      (check! (> (cmesh-vertex-count mesh) 0)
+        "dc union: should produce vertices")
+      (let [n   (cmesh-vertex-count mesh)
+            oi0 (cmesh-get-object-id mesh 0)
+            oiM (cmesh-get-object-id mesh (/ n 2))]
+        (check! (if (= oi0 1) true (= oi0 2))
+          "dc union: vertex 0 should be obj 1 or 2")
+        (check! (if (= oiM 1) true (= oiM 2))
+          "dc union: mid vertex should be obj 1 or 2"))
+      (cmesh-free mesh)
+      (csdf-free scene)))
+  ;; ---- test 3: dc produces non-zero vertices for a box (feature preservation) ----
+  (defn test-dc-vs-mc-sharpness [] : void
+    (let [scene (colored-box -1.0 -1.0 -1.0 1.0 1.0 1.0 0.8 0.8 0.2 1)
+          mesh  (dc-extract-colored scene 24 -2.0 -2.0 -2.0 2.0 2.0 2.0)]
+      (check! (> mesh 0) "dc box: handle should be non-zero")
+      (check! (> (cmesh-vertex-count mesh) 0) "dc box: should produce vertices")
+      (cmesh-free mesh)
+      (csdf-free scene)))
+  ;; ---- test 4: cmesh-weld reduces vertex count ----
+  (defn test-cmesh-weld [] : void
+    (let [scene  (colored-sphere 0.0 0.0 0.0 1.0 0.0 1.0 0.0 1)
+          raw    (dc-extract-colored scene 20 -2.0 -2.0 -2.0 2.0 2.0 2.0)
+          n-raw  (cmesh-vertex-count raw)
+          welded (cmesh-weld raw 0.0001)
+          n-weld (imesh-vertex-count welded)]
+      (check! (> welded 0) "weld: imesh handle should be non-zero")
+      (check! (> n-weld 0) "weld: should have unique vertices")
+      (check! (< n-weld n-raw)
+        "weld: unique vertex count should be less than raw count")
+      (check! (> (imesh-triangle-count welded) 0) "weld: should have triangles")
+      (imesh-free welded)
+      (cmesh-free raw)
+      (csdf-free scene)))
+  ;; ---- test 5: export-glb smoke test ----
+  (defn test-export-glb [] : void
+    (let [scene  (colored-sphere 0.0 0.0 0.0 1.0 0.3 0.6 1.0 1)
+          raw    (dc-extract-colored scene 20 -2.0 -2.0 -2.0 2.0 2.0 2.0)
+          welded (cmesh-weld raw 0.0001)
+          ret    (export-glb welded "/tmp/tur_dc_test")]
+      (check! (= ret 0) "export-glb: should return 0 on success")
+      (imesh-free welded)
+      (cmesh-free raw)
+      (csdf-free scene)))
+  ;; ---- main ----
+  (defn main [] : int
+    (do
+      (test-dc-sphere)
+      (println "test-dc-sphere: PASS")
+      (test-dc-union)
+      (println "test-dc-union: PASS")
+      (test-dc-vs-mc-sharpness)
+      (println "test-dc-vs-mc-sharpness: PASS")
+      (test-cmesh-weld)
+      (println "test-cmesh-weld: PASS")
+      (test-export-glb)
+      (println "test-export-glb: PASS")
+      (println "All Phase 4 DC tests passed.")
+      0))) ;; end defmodule dc_test

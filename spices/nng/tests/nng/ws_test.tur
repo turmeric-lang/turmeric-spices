@@ -15,33 +15,41 @@
 ;; as an :optional test dep, puts its mbedTLS :cmake-deps into this spice's
 ;; native build. The hand-rolled client is also the more honest stand-in for a
 ;; browser -- every byte it sends is on the page.
-
-(defmodule nng/tests/ws (export)
-
-(import nng/socket  :refer [Socket
-                            req-open rep-open pub-open push-open pull-open
-                            pair-open bus-open
-                            dial listen listen-bound-port close
-                            set-recv-timeout-ms set-send-timeout-ms timed-out?])
-(import nng/payload :refer [Payload payload-free payload=?])
-(import nng/msg     :refer [send-str recv-str send-payload recv-payload])
-(import test/suite  :refer [describe it])
-(import test/assert :refer [assert-true assert-false])
-(import test/runner :refer [run-all-status])
-
-(def recv-timeout-ms 2000)
-
-;; nng error codes the cases branch on (nng.h `enum nng_errno_enum`).
-(def nng-enotsup    9)
-(def nng-eaddrinuse 10)
-(def nng-eproto     13)
-
-;; ---------------------------------------------------------------------------
-;; file-scope C: a minimal RFC 6455 client over a blocking POSIX socket.
-;; Masked frames out, unmasked frames in, binary payloads up to 64 KiB.
-;; ---------------------------------------------------------------------------
-```c
-#include <stdint.h>
+(defmodule nng/tests/ws
+  (export)
+  (import nng/socket
+    :refer
+    [Socket
+     req-open
+     rep-open
+     pub-open
+     push-open
+     pull-open
+     pair-open
+     bus-open
+     dial
+     listen
+     listen-bound-port
+     close
+     set-recv-timeout-ms
+     set-send-timeout-ms
+     timed-out?])
+  (import nng/payload :refer [Payload payload-free payload=?])
+  (import nng/msg :refer [send-str recv-str send-payload recv-payload])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true assert-false])
+  (import test/runner :refer [run-all-status])
+  (def recv-timeout-ms 2000)
+  ;; nng error codes the cases branch on (nng.h `enum nng_errno_enum`).
+  (def nng-enotsup 9)
+  (def nng-eaddrinuse 10)
+  (def nng-eproto 13)
+  ;; ---------------------------------------------------------------------------
+  ;; file-scope C: a minimal RFC 6455 client over a blocking POSIX socket.
+  ;; Masked frames out, unmasked frames in, binary payloads up to 64 KiB.
+  ;; ---------------------------------------------------------------------------
+  ```c
+  #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -199,29 +207,26 @@ static char *rawws_recv_hex(int fd, int ms) {
   return o;
 }
 ```
-
-;; RawWs -- an upgraded connection from the inline-C client above.
-(defopaque RawWs :int)
-
-;; raw-ws-open -- connect and upgrade, offering `subproto` ("" offers none).
-;; err carries the HTTP status the server answered with, or 0 for no answer.
-(defn raw-ws-open [port : int path : cstr subproto : cstr] : (Result RawWs int)
-  ```c
-  int64_t r = rawws_connect((int)port, (const char *)path, (const char *)subproto);
+  ;; RawWs -- an upgraded connection from the inline-C client above.
+  (defopaque RawWs :int)
+  ;; raw-ws-open -- connect and upgrade, offering `subproto` ("" offers none).
+  ;; err carries the HTTP status the server answered with, or 0 for no answer.
+  (defn raw-ws-open [port : int path : cstr subproto : cstr] : (Result RawWs
+                                                                 int)
+    ```c
+    int64_t r = rawws_connect((int)port, (const char *)path, (const char *)subproto);
   if (r < 0) return tur_err_int(r == -1 ? 0 : -r);
   return tur_ok_int(r);
   ```)
-
-;; raw-ws-send-str -- one BINARY frame carrying the string's bytes, no NUL.
-(defn raw-ws-send-str [c : RawWs msg : cstr] : bool
-  ```c
-  return rawws_send((int)c, 0x2, (const unsigned char *)msg, strlen((const char *)msg));
+  ;; raw-ws-send-str -- one BINARY frame carrying the string's bytes, no NUL.
+  (defn raw-ws-send-str [c : RawWs msg : cstr] : bool
+    ```c
+    return rawws_send((int)c, 0x2, (const unsigned char *)msg, strlen((const char *)msg));
   ```)
-
-;; raw-ws-send-hex -- one BINARY frame from "de ad be ef"-style hex.
-(defn raw-ws-send-hex [c : RawWs hex : cstr] : bool
-  ```c
-  unsigned char buf[256];
+  ;; raw-ws-send-hex -- one BINARY frame from "de ad be ef"-style hex.
+  (defn raw-ws-send-hex [c : RawWs hex : cstr] : bool
+    ```c
+    unsigned char buf[256];
   size_t n = 0;
   const char *s = (const char *)hex;
   unsigned int byte;
@@ -232,348 +237,336 @@ static char *rawws_recv_hex(int fd, int ms) {
   }
   return rawws_send((int)c, 0x2, buf, n);
   ```)
-
-;; raw-ws-send-text -- one TEXT frame, which an SP peer must refuse.
-(defn raw-ws-send-text [c : RawWs msg : cstr] : bool
-  ```c
-  return rawws_send((int)c, 0x1, (const unsigned char *)msg, strlen((const char *)msg));
+  ;; raw-ws-send-text -- one TEXT frame, which an SP peer must refuse.
+  (defn raw-ws-send-text [c : RawWs msg : cstr] : bool
+    ```c
+    return rawws_send((int)c, 0x1, (const unsigned char *)msg, strlen((const char *)msg));
   ```)
-
-(defn raw-ws-recv-hex [c : RawWs ms : int] : cstr
-  ```c
-  return rawws_recv_hex((int)c, (int)ms);
+  (defn raw-ws-recv-hex [c : RawWs ms : int] : cstr
+    ```c
+    return rawws_recv_hex((int)c, (int)ms);
   ```)
-
-(defn raw-ws-close [c : RawWs] : nil
-  ```c
-  close((int)c);
+  (defn raw-ws-close [c : RawWs] : nil
+    ```c
+    close((int)c);
   ```)
-
-(defn cstr-eq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+  (defn cstr-eq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn cstr-free [p : cstr] : nil
-  ```c
-  free((void *)(intptr_t)p);
+  (defn cstr-free [p : cstr] : nil
+    ```c
+    free((void *)(intptr_t)p);
   ```)
-
-;; url-of -- "<scheme>://127.0.0.1:<port><path>", freshly malloc'd.
-(defn url-of [scheme : cstr port : int path : cstr] : cstr
-  ```c
-  #include <stdio.h>
+  ;; url-of -- "<scheme>://127.0.0.1:<port><path>", freshly malloc'd.
+  (defn url-of [scheme : cstr port : int path : cstr] : cstr
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   char *b = malloc(160);
   snprintf(b, 160, "%s://127.0.0.1:%d%s", (const char *)scheme, (int)port, (const char *)path);
   return b;
   ```)
-
-(defn dial-port [^borrow s : Socket scheme : cstr port : int path : cstr] : (Result nil int)
-  (let [url (url-of scheme port path)
-        r   (dial s url)]
-    (cstr-free url)
-    r))
-
-(defn listen-port [^borrow s : Socket scheme : cstr port : int path : cstr] : (Result nil int)
-  (let [url (url-of scheme port path)
-        r   (listen s url)]
-    (cstr-free url)
-    r))
-
-;; bound-port -- the port listen-bound-port reported, or 0 when it failed (no
-;; dial to port 0 can succeed, so a failed bind fails the case downstream).
-(defn bound-port [r : (Result int int)] : int
-  (if (ok? r) (ok-val r) 0))
-
-(defn err-is? [r : (Result nil int) code : int] : bool
-  (if (err? r) (= (err-val r) code) false))
-
-(defn recv-str=? [^borrow s : Socket expect : cstr] : bool
-  (let [r (recv-str s)]
-    (if (ok? r)
-      (let [got (ok-val r)
-            eq  (cstr-eq? expect got)]
-        (cstr-free got)
-        eq)
-      false)))
-
-(defn timed-out-on-recv? [^borrow s : Socket] : bool
-  (let [r (recv-str s)]
-    (if (ok? r)
-      (do (cstr-free (ok-val r)) false)
-      (timed-out? (err-val r)))))
-
-(defn raw-recv-hex=? [c : RawWs ms : int expect : cstr] : bool
-  (let [got (raw-ws-recv-hex c ms)
-        eq  (cstr-eq? expect got)]
-    (cstr-free got)
-    eq))
-
-;; PUSH and PAIR park a send until a peer is attached, so the cases that send
-;; on them set a send timeout too: a failed upgrade then fails the case
-;; instead of hanging it.
-
-;; reaches-raw? -- PUB and BUS drop a message for a pipe nng has not attached
-;; yet, and the server side attaches the pipe just after the 101 goes out. So
-;; re-send until one arrives: 20 x 100ms.
-(defn reaches-raw? [^borrow s : Socket c : RawWs msg : cstr expect-hex : cstr tries : int] : bool
-  (if (= tries 0)
-    false
-    (do
-      (send-str s msg)
-      (if (raw-recv-hex=? c 100 expect-hex)
-        true
-        (reaches-raw? s c msg expect-hex (- tries 1))))))
-
-(defn opened? [r : (Result RawWs int)] : bool
-  (ok? r))
-
-(defn refused-with? [r : (Result RawWs int) status : int] : bool
-  (if (err? r) (= (err-val r) status) false))
-
-(defn __bin-raw [] : ptr<void>
-  ```c
-  extern void *turnng_payload_of_bytes(const void *, int64_t);
+  (defn dial-port [^borrow s : Socket scheme : cstr port : int path : cstr] : (Result nil
+                                                                                int)
+    (let [url (url-of scheme port path)
+          r   (dial s url)]
+      (cstr-free url)
+      r))
+  (defn listen-port [^borrow s : Socket scheme : cstr port : int path : cstr] : (Result nil
+                                                                                  int)
+    (let [url (url-of scheme port path)
+          r   (listen s url)]
+      (cstr-free url)
+      r))
+  ;; bound-port -- the port listen-bound-port reported, or 0 when it failed (no
+  ;; dial to port 0 can succeed, so a failed bind fails the case downstream).
+  (defn bound-port [r : (Result int int)] : int (if (ok? r) (ok-val r) 0))
+  (defn err-is? [r : (Result nil int) code : int] : bool
+    (if (err? r) (= (err-val r) code) false))
+  (defn recv-str=? [^borrow s : Socket expect : cstr] : bool
+    (let [r (recv-str s)]
+      (if (ok? r)
+        (let [got (ok-val r)
+              eq  (cstr-eq? expect got)]
+          (cstr-free got)
+          eq)
+        false)))
+  (defn timed-out-on-recv? [^borrow s : Socket] : bool
+    (let [r (recv-str s)]
+      (if (ok? r) (do (cstr-free (ok-val r)) false) (timed-out? (err-val r)))))
+  (defn raw-recv-hex=? [c : RawWs ms : int expect : cstr] : bool
+    (let [got (raw-ws-recv-hex c ms)
+          eq  (cstr-eq? expect got)]
+      (cstr-free got)
+      eq))
+  ;; PUSH and PAIR park a send until a peer is attached, so the cases that send
+  ;; on them set a send timeout too: a failed upgrade then fails the case
+  ;; instead of hanging it.
+  ;; reaches-raw? -- PUB and BUS drop a message for a pipe nng has not attached
+  ;; yet, and the server side attaches the pipe just after the 101 goes out. So
+  ;; re-send until one arrives: 20 x 100ms.
+  (defn reaches-raw? [^borrow s : Socket
+                      c : RawWs
+                      msg : cstr
+                      expect-hex : cstr
+                      tries : int] : bool
+    (if (= tries 0)
+      false
+      (do
+        (send-str s msg)
+        (if (raw-recv-hex=? c 100 expect-hex)
+          true
+          (reaches-raw? s c msg expect-hex (- tries 1))))))
+  (defn opened? [r : (Result RawWs int)] : bool (ok? r))
+  (defn refused-with? [r : (Result RawWs int) status : int] : bool
+    (if (err? r) (= (err-val r) status) false))
+  (defn __bin-raw [] : ptr<void>
+    ```c
+    extern void *turnng_payload_of_bytes(const void *, int64_t);
   static const unsigned char p[5] = { 0x00, 0xff, 0x00, 0x80, 0x0a };
   return turnng_payload_of_bytes(p, 5);
   ```)
-
-(defn __all-tests [] : void
-  (describe "nng/socket -- listen-bound-port"
-
-    (it "binds an ephemeral tcp:// port and reports it"
-      (let [s (ok-val (pair-open))
-            r (listen-bound-port s "tcp://127.0.0.1:0")
-            v (assert-true (> (bound-port r) 0))]
-        (close s)
-        v))
-
-    (it "binds an ephemeral ws:// port and reports it"
-      (let [s (ok-val (pair-open))
-            r (listen-bound-port s "ws://127.0.0.1:0/ngws-bind")
-            v (assert-true (> (bound-port r) 0))]
-        (close s)
-        v))
-
-    (it "reports a port a peer can dial"
-      (let [srv  (ok-val (pair-open))
-            cli  (ok-val (pair-open))
-            port (bound-port (listen-bound-port srv "tcp://127.0.0.1:0"))
-            _    (dial-port cli "tcp" port "")
-            _    (set-recv-timeout-ms srv recv-timeout-ms)
-            _    (send-str cli "over-tcp")
-            v    (assert-true (recv-str=? srv "over-tcp"))]
-        (close cli)
-        (close srv)
-        v))
-
-    (it "is NNG_ENOTSUP on a transport with no port"
-      (let [s (ok-val (pair-open))
-            r (listen-bound-port s "inproc://ngws-noport")
-            v (assert-true (if (err? r) (= (err-val r) nng-enotsup) false))]
-        (close s)
-        v))
-
-    (it "leaves nothing bound when it fails"
-      (let [a (ok-val (pair-open))
-            b (ok-val (pair-open))
-            _ (listen-bound-port a "inproc://ngws-unbound")
-            v (assert-true (ok? (listen b "inproc://ngws-unbound")))]
-        (close b)
-        (close a)
-        v)))
-
-  (describe "ws:// -- nng to nng"
-
-    (it "round-trips a request and its reply"
-      (let [rep  (ok-val (rep-open))
-            req  (ok-val (req-open))
-            port (bound-port (listen-bound-port rep "ws://127.0.0.1:0/rpc"))
-            _    (dial-port req "ws" port "/rpc")
-            _    (set-recv-timeout-ms rep recv-timeout-ms)
-            _    (set-recv-timeout-ms req recv-timeout-ms)
-            _    (send-str req "ping")
-            hb   (recv-str=? rep "ping")
-            _    (send-str rep "pong")
-            hr   (recv-str=? req "pong")
-            v    (assert-true (and hb hr))]
-        (close req)
-        (close rep)
-        v))
-
-    (it "carries a binary payload with NUL bytes intact"
-      (let [srv  (ok-val (pair-open))
-            cli  (ok-val (pair-open))
-            port (bound-port (listen-bound-port srv "ws://127.0.0.1:0/bin"))
-            _    (dial-port cli "ws" port "/bin")
-            _    (set-recv-timeout-ms srv recv-timeout-ms)
-            out  (:: (__bin-raw) Payload)
-            _    (send-payload cli out)
-            got  (recv-payload srv)
-            eq   (if (ok? got)
-                   (let [g (ok-val got)
-                         e (payload=? g out)]
-                     (payload-free g)
-                     e)
-                   false)
-            v    (assert-true eq)]
-        (payload-free out)
-        (close cli)
-        (close srv)
-        v))
-
-    (it "serves two sockets on one port, one per path"
-      (let [a    (ok-val (pull-open))
-            b    (ok-val (pull-open))
-            ca   (ok-val (push-open))
-            cb   (ok-val (push-open))
-            port (bound-port (listen-bound-port a "ws://127.0.0.1:0/a"))
-            lb   (listen-port b "ws" port "/b")
-            _    (dial-port ca "ws" port "/a")
-            _    (dial-port cb "ws" port "/b")
-            _    (set-recv-timeout-ms a recv-timeout-ms)
-            _    (set-recv-timeout-ms b recv-timeout-ms)
-            _    (send-str ca "to-a")
-            _    (send-str cb "to-b")
-            ga   (recv-str=? a "to-a")
-            gb   (recv-str=? b "to-b")
-            v    (assert-true (and (ok? lb) (and ga gb)))]
-        (close cb)
-        (close ca)
-        (close b)
-        (close a)
-        v))
-
-    (it "refuses a second listener on the same path"
-      (let [a    (ok-val (pair-open))
-            b    (ok-val (pair-open))
-            port (bound-port (listen-bound-port a "ws://127.0.0.1:0/taken"))
-            v    (assert-true (err-is? (listen-port b "ws" port "/taken") nng-eaddrinuse))]
-        (close b)
-        (close a)
-        v))
-
-    (it "refuses a peer speaking the wrong protocol"
-      (let [srv  (ok-val (pair-open))
-            cli  (ok-val (req-open))
-            port (bound-port (listen-bound-port srv "ws://127.0.0.1:0/mismatch"))
-            v    (assert-true (err-is? (dial-port cli "ws" port "/mismatch") nng-eproto))]
-        (close cli)
-        (close srv)
-        v))
-
-    (it "has no wss:// -- TLS is not compiled in"
-      (let [s (ok-val (pair-open))
-            v (assert-true (err-is? (listen s "wss://127.0.0.1:0/tls") nng-enotsup))]
-        (close s)
-        v)))
-
-  (describe "ws:// -- a plain WebSocket client (what a browser sends)"
-
-    (it "pushes into a PULL listener, offering pull.sp.nanomsg.org"
-      (let [pull (ok-val (pull-open))
-            port (bound-port (listen-bound-port pull "ws://127.0.0.1:0/in"))
-            _    (set-recv-timeout-ms pull recv-timeout-ms)
-            r    (raw-ws-open port "/in" "pull.sp.nanomsg.org")
-            sent (if (ok? r) (raw-ws-send-str (ok-val r) "from-browser") false)
-            got  (recv-str=? pull "from-browser")
-            v    (assert-true (and sent got))]
-        (when (ok? r) (raw-ws-close (ok-val r)))
-        (close pull)
-        v))
-
-    (it "pulls from a PUSH listener, offering push.sp.nanomsg.org"
-      (let [push (ok-val (push-open))
-            port (bound-port (listen-bound-port push "ws://127.0.0.1:0/out"))
-            _    (set-send-timeout-ms push recv-timeout-ms)
-            r    (raw-ws-open port "/out" "push.sp.nanomsg.org")
-            _    (send-str push "job:42")
-            got  (if (ok? r) (raw-recv-hex=? (ok-val r) recv-timeout-ms "6a 6f 62 3a 34 32") false)
-            v    (assert-true got)]
-        (when (ok? r) (raw-ws-close (ok-val r)))
-        (close push)
-        v))
-
-    (it "is refused with HTTP 400 when it offers no subprotocol"
-      (let [pull (ok-val (pull-open))
-            port (bound-port (listen-bound-port pull "ws://127.0.0.1:0/strict"))
-            v    (assert-true (refused-with? (raw-ws-open port "/strict" "") 400))]
-        (close pull)
-        v))
-
-    (it "must offer the LISTENER's protocol name, not its own"
-      (let [pull (ok-val (pull-open))
-            port (bound-port (listen-bound-port pull "ws://127.0.0.1:0/name"))
-            v    (assert-true (refused-with? (raw-ws-open port "/name" "push.sp.nanomsg.org") 400))]
-        (close pull)
-        v))
-
-    (it "receives PUB messages with no SP header"
-      (let [pub  (ok-val (pub-open))
-            port (bound-port (listen-bound-port pub "ws://127.0.0.1:0/feed"))
-            r    (raw-ws-open port "/feed" "pub.sp.nanomsg.org")
-            got  (if (ok? r) (reaches-raw? pub (ok-val r) "tick" "74 69 63 6b" 20) false)
-            v    (assert-true got)]
-        (when (ok? r) (raw-ws-close (ok-val r)))
-        (close pub)
-        v))
-
-    (it "exchanges BUS messages with no SP header, both ways"
-      (let [bus  (ok-val (bus-open))
-            port (bound-port (listen-bound-port bus "ws://127.0.0.1:0/bus"))
-            _    (set-recv-timeout-ms bus recv-timeout-ms)
-            r    (raw-ws-open port "/bus" "bus.sp.nanomsg.org")
-            down (if (ok? r) (reaches-raw? bus (ok-val r) "hi" "68 69" 20) false)
-            sent (if (ok? r) (raw-ws-send-str (ok-val r) "up") false)
-            up   (recv-str=? bus "up")
-            v    (assert-true (and down (and sent up)))]
-        (when (ok? r) (raw-ws-close (ok-val r)))
-        (close bus)
-        v))
-
-    (it "frames PAIR messages with a 4-byte hop count"
-      (let [pair (ok-val (pair-open))
-            port (bound-port (listen-bound-port pair "ws://127.0.0.1:0/pair"))
-            _    (set-recv-timeout-ms pair recv-timeout-ms)
-            _    (set-send-timeout-ms pair recv-timeout-ms)
-            r    (raw-ws-open port "/pair" "pair1.sp.nanomsg.org")
-            _    (send-str pair "x")
-            down (if (ok? r) (raw-recv-hex=? (ok-val r) recv-timeout-ms "00 00 00 01 78") false)
-            sent (if (ok? r) (raw-ws-send-hex (ok-val r) "00 00 00 01 68 69") false)
-            up   (recv-str=? pair "hi")
-            v    (assert-true (and down (and sent up)))]
-        (when (ok? r) (raw-ws-close (ok-val r)))
-        (close pair)
-        v))
-
-    (it "frames REQ messages with a 4-byte request id that REP echoes"
-      (let [rep  (ok-val (rep-open))
-            port (bound-port (listen-bound-port rep "ws://127.0.0.1:0/req"))
-            _    (set-recv-timeout-ms rep recv-timeout-ms)
-            r    (raw-ws-open port "/req" "rep.sp.nanomsg.org")
-            sent (if (ok? r) (raw-ws-send-hex (ok-val r) "80 00 00 2a 70 69 6e 67") false)
-            asked (recv-str=? rep "ping")
-            _    (send-str rep "pong")
-            back (if (ok? r) (raw-recv-hex=? (ok-val r) recv-timeout-ms "80 00 00 2a 70 6f 6e 67") false)
-            v    (assert-true (and sent (and asked back)))]
-        (when (ok? r) (raw-ws-close (ok-val r)))
-        (close rep)
-        v))
-
-    (it "never delivers a TEXT frame"
-      (let [pull (ok-val (pull-open))
-            port (bound-port (listen-bound-port pull "ws://127.0.0.1:0/text"))
-            _    (set-recv-timeout-ms pull 300)
-            r    (raw-ws-open port "/text" "pull.sp.nanomsg.org")
-            _    (if (ok? r) (raw-ws-send-text (ok-val r) "as-text") false)
-            v    (assert-true (and (opened? r) (timed-out-on-recv? pull)))]
-        (when (ok? r) (raw-ws-close (ok-val r)))
-        (close pull)
-        v))))
-
-(defn main [] : int
-  (__all-tests)
-  (run-all-status))
-)
+  (defn __all-tests [] : void
+    (describe "nng/socket -- listen-bound-port"
+      (it "binds an ephemeral tcp:// port and reports it"
+        (let [s (ok-val (pair-open))
+              r (listen-bound-port s "tcp://127.0.0.1:0")
+              v (assert-true (> (bound-port r) 0))]
+          (close s)
+          v))
+      (it "binds an ephemeral ws:// port and reports it"
+        (let [s (ok-val (pair-open))
+              r (listen-bound-port s "ws://127.0.0.1:0/ngws-bind")
+              v (assert-true (> (bound-port r) 0))]
+          (close s)
+          v))
+      (it "reports a port a peer can dial"
+        (let [srv  (ok-val (pair-open))
+              cli  (ok-val (pair-open))
+              port (bound-port (listen-bound-port srv "tcp://127.0.0.1:0"))
+              _    (dial-port cli "tcp" port "")
+              _    (set-recv-timeout-ms srv recv-timeout-ms)
+              _    (send-str cli "over-tcp")
+              v    (assert-true (recv-str=? srv "over-tcp"))]
+          (close cli)
+          (close srv)
+          v))
+      (it "is NNG_ENOTSUP on a transport with no port"
+        (let [s (ok-val (pair-open))
+              r (listen-bound-port s "inproc://ngws-noport")
+              v (assert-true (if (err? r) (= (err-val r) nng-enotsup) false))]
+          (close s)
+          v))
+      (it "leaves nothing bound when it fails"
+        (let [a (ok-val (pair-open))
+              b (ok-val (pair-open))
+              _ (listen-bound-port a "inproc://ngws-unbound")
+              v (assert-true (ok? (listen b "inproc://ngws-unbound")))]
+          (close b)
+          (close a)
+          v)))
+    (describe "ws:// -- nng to nng"
+      (it "round-trips a request and its reply"
+        (let [rep  (ok-val (rep-open))
+              req  (ok-val (req-open))
+              port (bound-port (listen-bound-port rep "ws://127.0.0.1:0/rpc"))
+              _    (dial-port req "ws" port "/rpc")
+              _    (set-recv-timeout-ms rep recv-timeout-ms)
+              _    (set-recv-timeout-ms req recv-timeout-ms)
+              _    (send-str req "ping")
+              hb   (recv-str=? rep "ping")
+              _    (send-str rep "pong")
+              hr   (recv-str=? req "pong")
+              v    (assert-true (and hb hr))]
+          (close req)
+          (close rep)
+          v))
+      (it "carries a binary payload with NUL bytes intact"
+        (let [srv  (ok-val (pair-open))
+              cli  (ok-val (pair-open))
+              port (bound-port (listen-bound-port srv "ws://127.0.0.1:0/bin"))
+              _    (dial-port cli "ws" port "/bin")
+              _    (set-recv-timeout-ms srv recv-timeout-ms)
+              out  (:: (__bin-raw) Payload)
+              _    (send-payload cli out)
+              got  (recv-payload srv)
+              eq   (if (ok? got)
+                     (let [g (ok-val got)
+                           e (payload=? g out)]
+                       (payload-free g)
+                       e)
+                     false)
+              v    (assert-true eq)]
+          (payload-free out)
+          (close cli)
+          (close srv)
+          v))
+      (it "serves two sockets on one port, one per path"
+        (let [a    (ok-val (pull-open))
+              b    (ok-val (pull-open))
+              ca   (ok-val (push-open))
+              cb   (ok-val (push-open))
+              port (bound-port (listen-bound-port a "ws://127.0.0.1:0/a"))
+              lb   (listen-port b "ws" port "/b")
+              _    (dial-port ca "ws" port "/a")
+              _    (dial-port cb "ws" port "/b")
+              _    (set-recv-timeout-ms a recv-timeout-ms)
+              _    (set-recv-timeout-ms b recv-timeout-ms)
+              _    (send-str ca "to-a")
+              _    (send-str cb "to-b")
+              ga   (recv-str=? a "to-a")
+              gb   (recv-str=? b "to-b")
+              v    (assert-true (and (ok? lb) (and ga gb)))]
+          (close cb)
+          (close ca)
+          (close b)
+          (close a)
+          v))
+      (it "refuses a second listener on the same path"
+        (let [a    (ok-val (pair-open))
+              b    (ok-val (pair-open))
+              port (bound-port (listen-bound-port a "ws://127.0.0.1:0/taken"))
+              v    (assert-true (err-is? (listen-port b "ws" port "/taken")
+                                  nng-eaddrinuse))]
+          (close b)
+          (close a)
+          v))
+      (it "refuses a peer speaking the wrong protocol"
+        (let [srv  (ok-val (pair-open))
+              cli  (ok-val (req-open))
+              port (bound-port (listen-bound-port srv
+                                 "ws://127.0.0.1:0/mismatch"))
+              v    (assert-true (err-is? (dial-port cli "ws" port "/mismatch")
+                                  nng-eproto))]
+          (close cli)
+          (close srv)
+          v))
+      (it "has no wss:// -- TLS is not compiled in"
+        (let [s (ok-val (pair-open))
+              v (assert-true (err-is? (listen s "wss://127.0.0.1:0/tls")
+                               nng-enotsup))]
+          (close s)
+          v)))
+    (describe "ws:// -- a plain WebSocket client (what a browser sends)"
+      (it "pushes into a PULL listener, offering pull.sp.nanomsg.org"
+        (let [pull (ok-val (pull-open))
+              port (bound-port (listen-bound-port pull "ws://127.0.0.1:0/in"))
+              _    (set-recv-timeout-ms pull recv-timeout-ms)
+              r    (raw-ws-open port "/in" "pull.sp.nanomsg.org")
+              sent (if (ok? r)
+                     (raw-ws-send-str (ok-val r) "from-browser")
+                     false)
+              got  (recv-str=? pull "from-browser")
+              v    (assert-true (and sent got))]
+          (when (ok? r) (raw-ws-close (ok-val r)))
+          (close pull)
+          v))
+      (it "pulls from a PUSH listener, offering push.sp.nanomsg.org"
+        (let [push (ok-val (push-open))
+              port (bound-port (listen-bound-port push "ws://127.0.0.1:0/out"))
+              _    (set-send-timeout-ms push recv-timeout-ms)
+              r    (raw-ws-open port "/out" "push.sp.nanomsg.org")
+              _    (send-str push "job:42")
+              got  (if (ok? r)
+                     (raw-recv-hex=? (ok-val r)
+                       recv-timeout-ms
+                       "6a 6f 62 3a 34 32")
+                     false)
+              v    (assert-true got)]
+          (when (ok? r) (raw-ws-close (ok-val r)))
+          (close push)
+          v))
+      (it "is refused with HTTP 400 when it offers no subprotocol"
+        (let [pull (ok-val (pull-open))
+              port (bound-port (listen-bound-port pull
+                                 "ws://127.0.0.1:0/strict"))
+              v    (assert-true (refused-with? (raw-ws-open port "/strict" "")
+                                  400))]
+          (close pull)
+          v))
+      (it "must offer the LISTENER's protocol name, not its own"
+        (let [pull (ok-val (pull-open))
+              port (bound-port (listen-bound-port pull "ws://127.0.0.1:0/name"))
+              v    (assert-true (refused-with? (raw-ws-open port
+                                                 "/name"
+                                                 "push.sp.nanomsg.org")
+                                  400))]
+          (close pull)
+          v))
+      (it "receives PUB messages with no SP header"
+        (let [pub  (ok-val (pub-open))
+              port (bound-port (listen-bound-port pub "ws://127.0.0.1:0/feed"))
+              r    (raw-ws-open port "/feed" "pub.sp.nanomsg.org")
+              got  (if (ok? r)
+                     (reaches-raw? pub (ok-val r) "tick" "74 69 63 6b" 20)
+                     false)
+              v    (assert-true got)]
+          (when (ok? r) (raw-ws-close (ok-val r)))
+          (close pub)
+          v))
+      (it "exchanges BUS messages with no SP header, both ways"
+        (let [bus  (ok-val (bus-open))
+              port (bound-port (listen-bound-port bus "ws://127.0.0.1:0/bus"))
+              _    (set-recv-timeout-ms bus recv-timeout-ms)
+              r    (raw-ws-open port "/bus" "bus.sp.nanomsg.org")
+              down (if (ok? r)
+                     (reaches-raw? bus (ok-val r) "hi" "68 69" 20)
+                     false)
+              sent (if (ok? r) (raw-ws-send-str (ok-val r) "up") false)
+              up   (recv-str=? bus "up")
+              v    (assert-true (and down (and sent up)))]
+          (when (ok? r) (raw-ws-close (ok-val r)))
+          (close bus)
+          v))
+      (it "frames PAIR messages with a 4-byte hop count"
+        (let [pair (ok-val (pair-open))
+              port (bound-port (listen-bound-port pair "ws://127.0.0.1:0/pair"))
+              _    (set-recv-timeout-ms pair recv-timeout-ms)
+              _    (set-send-timeout-ms pair recv-timeout-ms)
+              r    (raw-ws-open port "/pair" "pair1.sp.nanomsg.org")
+              _    (send-str pair "x")
+              down (if (ok? r)
+                     (raw-recv-hex=? (ok-val r)
+                       recv-timeout-ms
+                       "00 00 00 01 78")
+                     false)
+              sent (if (ok? r)
+                     (raw-ws-send-hex (ok-val r) "00 00 00 01 68 69")
+                     false)
+              up   (recv-str=? pair "hi")
+              v    (assert-true (and down (and sent up)))]
+          (when (ok? r) (raw-ws-close (ok-val r)))
+          (close pair)
+          v))
+      (it "frames REQ messages with a 4-byte request id that REP echoes"
+        (let [rep   (ok-val (rep-open))
+              port  (bound-port (listen-bound-port rep "ws://127.0.0.1:0/req"))
+              _     (set-recv-timeout-ms rep recv-timeout-ms)
+              r     (raw-ws-open port "/req" "rep.sp.nanomsg.org")
+              sent  (if (ok? r)
+                      (raw-ws-send-hex (ok-val r) "80 00 00 2a 70 69 6e 67")
+                      false)
+              asked (recv-str=? rep "ping")
+              _     (send-str rep "pong")
+              back  (if (ok? r)
+                      (raw-recv-hex=? (ok-val r)
+                        recv-timeout-ms
+                        "80 00 00 2a 70 6f 6e 67")
+                      false)
+              v     (assert-true (and sent (and asked back)))]
+          (when (ok? r) (raw-ws-close (ok-val r)))
+          (close rep)
+          v))
+      (it "never delivers a TEXT frame"
+        (let [pull (ok-val (pull-open))
+              port (bound-port (listen-bound-port pull "ws://127.0.0.1:0/text"))
+              _    (set-recv-timeout-ms pull 300)
+              r    (raw-ws-open port "/text" "pull.sp.nanomsg.org")
+              _    (if (ok? r) (raw-ws-send-text (ok-val r) "as-text") false)
+              v    (assert-true (and (opened? r) (timed-out-on-recv? pull)))]
+          (when (ok? r) (raw-ws-close (ok-val r)))
+          (close pull)
+          v))))
+  (defn main [] : int (__all-tests) (run-all-status)))

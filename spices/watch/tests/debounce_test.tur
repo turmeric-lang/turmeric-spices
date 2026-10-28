@@ -3,25 +3,34 @@
 ;; Covers batch push/len/event accessors and coalesce-by-path semantics.
 ;; A separate integration test (watch_drain_test.tur) verifies that
 ;; watch-drain produces a single-element batch on an atomic-save flow.
-
 (defmodule watch/tests/debounce
-  (import watch/event :refer [watch-kind-write watch-kind-rename
-                              watch-event-make watch-event-free
-                              watch-event-path])
-  (import watch/debounce :refer [debounce-batch-make debounce-batch-free
-                                 debounce-batch-push debounce-batch-len
-                                 debounce-batch-event
-                                 debounce-batch-coalesce])
-
-  (defn tap-record [idx : int name : cstr ok : bool] #fx{Unsafe} : void
+  (import watch/event
+    :refer
+    [watch-kind-write
+     watch-kind-rename
+     watch-event-make
+     watch-event-free
+     watch-event-path])
+  (import watch/debounce
+    :refer
+    [debounce-batch-make
+     debounce-batch-free
+     debounce-batch-push
+     debounce-batch-len
+     debounce-batch-event
+     debounce-batch-coalesce])
+  (defn tap-record [idx : int name : cstr ok : bool]
+    #fx{Unsafe}
+    : void
     ```c
     /* __tur_include__: static int g_debounce_fails = 0; */
     if (!ok) g_debounce_fails++;
     printf("%s %lld - %s\n", ok ? "ok" : "not ok",
            (long long)idx, (const char *)(intptr_t)name);
     ```)
-
-  (defn tap-finish [count : int] #fx{Unsafe} : int
+  (defn tap-finish [count : int]
+    #fx{Unsafe}
+    : int
     ```c
     printf("1..%lld\n", (long long)count);
     if (g_debounce_fails == 0) {
@@ -33,28 +42,31 @@
             g_debounce_fails, (long long)count);
     return 1;
     ```)
-
-  (defn cstr-eq? [a : cstr b : cstr] #fx{Unsafe} : bool
+  (defn cstr-eq? [a : cstr b : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *sa = (const char *)(intptr_t)a;
     const char *sb = (const char *)(intptr_t)b;
     return strcmp(sa ? sa : "", sb ? sb : "") == 0;
     ```)
-
-  (defn make-evt [path : cstr kind : int] #fx{Unsafe} : int
+  (defn make-evt [path : cstr kind : int]
+    #fx{Unsafe}
+    : int
     (watch-event-make "/tmp" path "/tmp" kind 0 0))
-
-  (defn main [] #fx{Unsafe} : int
+  (defn main []
+    #fx{Unsafe}
+    : int
     (do
       ;; Empty batch invariants.
       (let [b (debounce-batch-make)]
         (do
           (tap-record 1 "empty batch len = 0" (= (debounce-batch-len b) 0))
-          (tap-record 2 "event idx 0 on empty = 0"
-                      (= (debounce-batch-event b 0) 0))
+          (tap-record 2
+            "event idx 0 on empty = 0"
+            (= (debounce-batch-event b 0) 0))
           (debounce-batch-free b)
           (tap-record 3 "free empty batch is safe" true)))
-
       ;; Push + accessors.
       (let [b (debounce-batch-make)]
         (do
@@ -62,14 +74,16 @@
           (debounce-batch-push b (make-evt "b" (watch-kind-write)))
           (debounce-batch-push b (make-evt "c" (watch-kind-write)))
           (tap-record 4 "len after 3 pushes" (= (debounce-batch-len b) 3))
-          (tap-record 5 "event 0 path = a"
-                      (cstr-eq? (watch-event-path (debounce-batch-event b 0)) "a"))
-          (tap-record 6 "event 2 path = c"
-                      (cstr-eq? (watch-event-path (debounce-batch-event b 2)) "c"))
-          (tap-record 7 "out-of-range idx returns 0"
-                      (= (debounce-batch-event b 99) 0))
+          (tap-record 5
+            "event 0 path = a"
+            (cstr-eq? (watch-event-path (debounce-batch-event b 0)) "a"))
+          (tap-record 6
+            "event 2 path = c"
+            (cstr-eq? (watch-event-path (debounce-batch-event b 2)) "c"))
+          (tap-record 7
+            "out-of-range idx returns 0"
+            (= (debounce-batch-event b 99) 0))
           (debounce-batch-free b)))
-
       ;; Coalesce duplicates: ['a','a','a','b','a'] -> ['b','a'] (later wins).
       (let [b (debounce-batch-make)]
         (do
@@ -80,27 +94,27 @@
           (debounce-batch-push b (make-evt "a" (watch-kind-rename)))
           (let [n (debounce-batch-coalesce b)]
             (do
-              (tap-record  8 "coalesce returns 2"  (= n 2))
-              (tap-record  9 "len after coalesce"  (= (debounce-batch-len b) 2))
-              (tap-record 10 "kept event 0 path = b"
-                          (cstr-eq? (watch-event-path (debounce-batch-event b 0)) "b"))
-              (tap-record 11 "kept event 1 path = a (last seen)"
-                          (cstr-eq? (watch-event-path (debounce-batch-event b 1)) "a"))))
+              (tap-record 8 "coalesce returns 2" (= n 2))
+              (tap-record 9 "len after coalesce" (= (debounce-batch-len b) 2))
+              (tap-record 10
+                "kept event 0 path = b"
+                (cstr-eq? (watch-event-path (debounce-batch-event b 0)) "b"))
+              (tap-record 11
+                "kept event 1 path = a (last seen)"
+                (cstr-eq? (watch-event-path (debounce-batch-event b 1)) "a"))))
           (debounce-batch-free b)))
-
       ;; Coalesce is idempotent.
       (let [b (debounce-batch-make)]
         (do
           (debounce-batch-push b (make-evt "x" (watch-kind-write)))
           (debounce-batch-push b (make-evt "y" (watch-kind-write)))
           (debounce-batch-coalesce b)
-          (tap-record 12 "len after coalesce of distinct paths"
-                      (= (debounce-batch-len b) 2))
+          (tap-record 12
+            "len after coalesce of distinct paths"
+            (= (debounce-batch-len b) 2))
           (debounce-batch-coalesce b)
-          (tap-record 13 "coalesce is idempotent"
-                      (= (debounce-batch-len b) 2))
+          (tap-record 13 "coalesce is idempotent" (= (debounce-batch-len b) 2))
           (debounce-batch-free b)))
-
       ;; Coalesce single-element batch is a no-op.
       (let [b (debounce-batch-make)]
         (do
@@ -108,7 +122,4 @@
           (let [n (debounce-batch-coalesce b)]
             (tap-record 14 "coalesce 1-element batch returns 1" (= n 1)))
           (debounce-batch-free b)))
-
-      (tap-finish 14)))
-
-) ;; end defmodule
+      (tap-finish 14)))) ;; end defmodule

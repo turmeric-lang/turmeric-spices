@@ -37,18 +37,23 @@
 ;; with-header / with-body / with-status mutate the struct in place and
 ;; return the same handle.  The chainable form is purely a convenience --
 ;; there is no copy-on-write semantics.
-
 (defmodule httpd/response
   (import httpd/types :refer [Response])
-  (export response resp-ok not-found bad-request
-          with-header with-header-set resp-header
-          with-body with-body-bytes with-status
-          free-response)
-
-;; file-scope-c-block: system headers contain static inline function
-;; definitions illegal inside function bodies on macOS 14+ / Xcode 15+.
-```c
-#include <stdlib.h>
+  (export response
+    resp-ok
+    not-found
+    bad-request
+    with-header
+    with-header-set
+    resp-header
+    with-body
+    with-body-bytes
+    with-status
+    free-response)
+  ;; file-scope-c-block: system headers contain static inline function
+  ;; definitions illegal inside function bodies on macOS 14+ / Xcode 15+.
+  ```c
+  #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
@@ -57,12 +62,10 @@ struct __httpd_resp {
   char **hdr_keys; char **hdr_vals; int hdr_count; int hdr_cap;
 };
 ```
-
-;; -- Internal: allocate an empty Response with a given status -----------
-
-(defn __resp-new [status : int body : cstr] : Response
-  ```c
-  struct __httpd_resp *r = malloc(sizeof(*r));
+  ;; -- Internal: allocate an empty Response with a given status -----------
+  (defn __resp-new [status : int body : cstr] : Response
+    ```c
+    struct __httpd_resp *r = malloc(sizeof(*r));
   r->status   = (int)status;
   size_t bl   = body ? strlen((const char *)body) : 0;
   r->body     = malloc(bl + 1);
@@ -75,27 +78,25 @@ struct __httpd_resp {
   r->hdr_vals  = malloc(sizeof(char *) * (size_t)r->hdr_cap);
   return (int64_t)(intptr_t)r;
   ```)
-
-;; -- Modifiers (return the same handle for chaining) --------------------
-
-;;; with-header -- append a header to a Response (mutates in place).
-;;;
-;;; Parameters:
-;;;   resp -- :int Response handle
-;;;   key  -- header name
-;;;   val  -- header value
-;;;
-;;; Returns:
-;;;   :int -- the same Response handle (for chaining)
-;;;
-;;; Example:
-;;;   (-> (ok "text/plain" "hi")
-;;;       (with-header "X-Hello" "world"))
-;;;
-;;; Since: H4
-(defn with-header [resp : Response key : cstr val : cstr] : Response
-  ```c
-  struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
+  ;; -- Modifiers (return the same handle for chaining) --------------------
+  ;;; with-header -- append a header to a Response (mutates in place).
+  ;;;
+  ;;; Parameters:
+  ;;;   resp -- :int Response handle
+  ;;;   key  -- header name
+  ;;;   val  -- header value
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- the same Response handle (for chaining)
+  ;;;
+  ;;; Example:
+  ;;;   (-> (ok "text/plain" "hi")
+  ;;;       (with-header "X-Hello" "world"))
+  ;;;
+  ;;; Since: H4
+  (defn with-header [resp : Response key : cstr val : cstr] : Response
+    ```c
+    struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
   if (r->hdr_count >= r->hdr_cap) {
     int new_cap = r->hdr_cap * 2;
     r->hdr_keys = realloc(r->hdr_keys, sizeof(char *) * (size_t)new_cap);
@@ -112,28 +113,27 @@ struct __httpd_resp {
   r->hdr_count++;
   return resp;
   ```)
-
-;;; with-header-set -- set a header on a Response, replacing any existing
-;;; header of the same name (case-insensitive); appends when there is none.
-;;;
-;;; Use for single-valued headers (`Content-Type`, `Cache-Control`, ...);
-;;; with-header appends, which is what `Set-Cookie` and `Vary` want.
-;;;
-;;; Parameters:
-;;;   resp -- Response handle
-;;;   key  -- header name
-;;;   val  -- header value
-;;;
-;;; Returns:
-;;;   Response -- the same handle (for chaining)
-;;;
-;;; Example:
-;;;   (with-header-set (resp-ok "text/plain" "{}") "Content-Type" "application/json")
-;;;
-;;; Since: tourist-on-stdlib-httpd H2
-(defn with-header-set [resp : Response key : cstr val : cstr] : Response
-  ```c
-  struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
+  ;;; with-header-set -- set a header on a Response, replacing any existing
+  ;;; header of the same name (case-insensitive); appends when there is none.
+  ;;;
+  ;;; Use for single-valued headers (`Content-Type`, `Cache-Control`, ...);
+  ;;; with-header appends, which is what `Set-Cookie` and `Vary` want.
+  ;;;
+  ;;; Parameters:
+  ;;;   resp -- Response handle
+  ;;;   key  -- header name
+  ;;;   val  -- header value
+  ;;;
+  ;;; Returns:
+  ;;;   Response -- the same handle (for chaining)
+  ;;;
+  ;;; Example:
+  ;;;   (with-header-set (resp-ok "text/plain" "{}") "Content-Type" "application/json")
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H2
+  (defn with-header-set [resp : Response key : cstr val : cstr] : Response
+    ```c
+    struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
   const char *k = (const char *)key;
   const char *v = (const char *)val;
   int kept = -1, out = 0;
@@ -154,49 +154,47 @@ struct __httpd_resp {
   if (kept >= 0) return resp;
   return httpd__response__with_hyheader(resp, key, val);
   ```)
-
-;;; resp-header -- read a header of a Response by name (case-insensitive).
-;;;
-;;; Middleware that decorates a response uses this to see what the route
-;;; already set.  Returns the first match.
-;;;
-;;; Parameters:
-;;;   resp -- Response handle
-;;;   name -- header name
-;;;
-;;; Returns:
-;;;   (Option cstr) -- some(value), or none when the header is absent.  The
-;;;   value belongs to the Response.
-;;;
-;;; Example:
-;;;   (resp-header (resp-ok "text/plain" "hi") "Content-Type")  ; => some("text/plain")
-;;;
-;;; Since: tourist-on-stdlib-httpd H2
-(defn resp-header [resp : Response name : cstr] : (Option cstr)
-  ```c
-  struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
+  ;;; resp-header -- read a header of a Response by name (case-insensitive).
+  ;;;
+  ;;; Middleware that decorates a response uses this to see what the route
+  ;;; already set.  Returns the first match.
+  ;;;
+  ;;; Parameters:
+  ;;;   resp -- Response handle
+  ;;;   name -- header name
+  ;;;
+  ;;; Returns:
+  ;;;   (Option cstr) -- some(value), or none when the header is absent.  The
+  ;;;   value belongs to the Response.
+  ;;;
+  ;;; Example:
+  ;;;   (resp-header (resp-ok "text/plain" "hi") "Content-Type")  ; => some("text/plain")
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H2
+  (defn resp-header [resp : Response name : cstr] : (Option cstr)
+    ```c
+    struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
   for (int i = 0; i < r->hdr_count; i++)
     if (strcasecmp(r->hdr_keys[i], (const char *)name) == 0)
       return tur_some_ptr(r->hdr_vals[i]);
   return tur_none();
   ```)
-
-;;; with-body -- replace the body of a Response (mutates in place).
-;;;
-;;; Parameters:
-;;;   resp -- :int Response handle
-;;;   body -- new body string
-;;;
-;;; Returns:
-;;;   :int -- the same Response handle
-;;;
-;;; Example:
-;;;   (-> (ok "text/plain" "") (with-body "later"))
-;;;
-;;; Since: H4
-(defn with-body [resp : Response body : cstr] : Response
-  ```c
-  struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
+  ;;; with-body -- replace the body of a Response (mutates in place).
+  ;;;
+  ;;; Parameters:
+  ;;;   resp -- :int Response handle
+  ;;;   body -- new body string
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- the same Response handle
+  ;;;
+  ;;; Example:
+  ;;;   (-> (ok "text/plain" "") (with-body "later"))
+  ;;;
+  ;;; Since: H4
+  (defn with-body [resp : Response body : cstr] : Response
+    ```c
+    struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
   free(r->body);
   const char *b = (const char *)body;
   size_t bl = b ? strlen(b) : 0;
@@ -206,27 +204,26 @@ struct __httpd_resp {
   r->body_len = (int)bl;
   return resp;
   ```)
-
-;;; with-body-bytes -- replace the body of a Response with raw bytes.
-;;;
-;;; Binary-safe: copies exactly `len` bytes, NULs included (an image, gzip
-;;; output, ...), where with-body stops at the first NUL.
-;;;
-;;; Parameters:
-;;;   resp  -- Response handle
-;;;   bytes -- source buffer
-;;;   len   -- byte count
-;;;
-;;; Returns:
-;;;   Response -- the same handle
-;;;
-;;; Example:
-;;;   (with-body-bytes (resp-ok "image/png" "") png-data png-len)
-;;;
-;;; Since: tourist-on-stdlib-httpd H2
-(defn with-body-bytes [resp : Response bytes : ptr<void> len : int] : Response
-  ```c
-  struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
+  ;;; with-body-bytes -- replace the body of a Response with raw bytes.
+  ;;;
+  ;;; Binary-safe: copies exactly `len` bytes, NULs included (an image, gzip
+  ;;; output, ...), where with-body stops at the first NUL.
+  ;;;
+  ;;; Parameters:
+  ;;;   resp  -- Response handle
+  ;;;   bytes -- source buffer
+  ;;;   len   -- byte count
+  ;;;
+  ;;; Returns:
+  ;;;   Response -- the same handle
+  ;;;
+  ;;; Example:
+  ;;;   (with-body-bytes (resp-ok "image/png" "") png-data png-len)
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H2
+  (defn with-body-bytes [resp : Response bytes : ptr<void> len : int] : Response
+    ```c
+    struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
   size_t bl = (bytes && len > 0) ? (size_t)len : 0;
   char *nb = malloc(bl + 1);
   if (!nb) return resp;
@@ -237,42 +234,40 @@ struct __httpd_resp {
   r->body_len = (int)bl;
   return resp;
   ```)
-
-;;; with-status -- replace the status code of a Response (mutates in place).
-;;;
-;;; Parameters:
-;;;   resp   -- :int Response handle
-;;;   status -- new HTTP status code
-;;;
-;;; Returns:
-;;;   :int -- the same Response handle
-;;;
-;;; Example:
-;;;   (-> (ok "text/plain" "no") (with-status 503))
-;;;
-;;; Since: H4
-(defn with-status [resp : Response status : int] : Response
-  ```c
-  struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
+  ;;; with-status -- replace the status code of a Response (mutates in place).
+  ;;;
+  ;;; Parameters:
+  ;;;   resp   -- :int Response handle
+  ;;;   status -- new HTTP status code
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- the same Response handle
+  ;;;
+  ;;; Example:
+  ;;;   (-> (ok "text/plain" "no") (with-status 503))
+  ;;;
+  ;;; Since: H4
+  (defn with-status [resp : Response status : int] : Response
+    ```c
+    struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
   r->status = (int)status;
   return resp;
   ```)
-
-;;; free-response -- release a Response handle and all owned storage.
-;;;
-;;; Parameters:
-;;;   resp -- :int Response handle, or 0 (no-op)
-;;;
-;;; Returns:
-;;;   :void
-;;;
-;;; Example:
-;;;   (free-response r)
-;;;
-;;; Since: H4
-(defn free-response [resp : Response] : void
-  ```c
-  if (resp == 0) return;
+  ;;; free-response -- release a Response handle and all owned storage.
+  ;;;
+  ;;; Parameters:
+  ;;;   resp -- :int Response handle, or 0 (no-op)
+  ;;;
+  ;;; Returns:
+  ;;;   :void
+  ;;;
+  ;;; Example:
+  ;;;   (free-response r)
+  ;;;
+  ;;; Since: H4
+  (defn free-response [resp : Response] : void
+    ```c
+    if (resp == 0) return;
   struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
   free(r->body);
   for (int i = 0; i < r->hdr_count; i++) {
@@ -283,74 +278,65 @@ struct __httpd_resp {
   free(r->hdr_vals);
   free(r);
   ```)
-
-;; -- Constructors --------------------------------------------------------
-
-;;; response -- build an HTTP response with an arbitrary status code.
-;;;
-;;; Parameters:
-;;;   status       -- HTTP status code, e.g. 200, 201, 500
-;;;   content-type -- value for the Content-Type header, e.g. "text/html"
-;;;   body         -- response body string ("" for no body)
-;;;
-;;; Returns:
-;;;   :int -- Response handle.  Free with free-response, or hand to the
-;;;           server which takes ownership on send.
-;;;
-;;; Example:
-;;;   (response 201 "application/json" "{\"id\":1}")
-;;;
-;;; Since: H4
-(defn response [status : int content-type : cstr body : cstr] : Response
-  (with-header (__resp-new status body) "Content-Type" content-type))
-
-;;; resp-ok -- build a 200 OK response.
-;;;
-;;; Named resp-ok rather than ok because stdlib/result already binds ok
-;;; (the Result success constructor) as an auto-loaded top-level definition.
-;;;
-;;; Parameters:
-;;;   content-type -- value for the Content-Type header
-;;;   body         -- response body string
-;;;
-;;; Returns:
-;;;   :int -- Response handle with status 200
-;;;
-;;; Example:
-;;;   (resp-ok "text/plain" "Hello, world!")
-;;;
-;;; Since: H4
-(defn resp-ok [content-type : cstr body : cstr] : Response
-  (response 200 content-type body))
-
-;;; not-found -- build a 404 Not Found response with a text/plain body.
-;;;
-;;; Parameters:
-;;;   body -- body string (typically a short message)
-;;;
-;;; Returns:
-;;;   :int -- Response handle with status 404
-;;;
-;;; Example:
-;;;   (not-found "no such resource")
-;;;
-;;; Since: H4
-(defn not-found [body : cstr] : Response
-  (response 404 "text/plain" body))
-
-;;; bad-request -- build a 400 Bad Request response with a text/plain body.
-;;;
-;;; Parameters:
-;;;   body -- body string (typically a short error message)
-;;;
-;;; Returns:
-;;;   :int -- Response handle with status 400
-;;;
-;;; Example:
-;;;   (bad-request "missing id parameter")
-;;;
-;;; Since: H4
-(defn bad-request [body : cstr] : Response
-  (response 400 "text/plain" body))
-
-) ;; end defmodule httpd/response
+  ;; -- Constructors --------------------------------------------------------
+  ;;; response -- build an HTTP response with an arbitrary status code.
+  ;;;
+  ;;; Parameters:
+  ;;;   status       -- HTTP status code, e.g. 200, 201, 500
+  ;;;   content-type -- value for the Content-Type header, e.g. "text/html"
+  ;;;   body         -- response body string ("" for no body)
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- Response handle.  Free with free-response, or hand to the
+  ;;;           server which takes ownership on send.
+  ;;;
+  ;;; Example:
+  ;;;   (response 201 "application/json" "{\"id\":1}")
+  ;;;
+  ;;; Since: H4
+  (defn response [status : int content-type : cstr body : cstr] : Response
+    (with-header (__resp-new status body) "Content-Type" content-type))
+  ;;; resp-ok -- build a 200 OK response.
+  ;;;
+  ;;; Named resp-ok rather than ok because stdlib/result already binds ok
+  ;;; (the Result success constructor) as an auto-loaded top-level definition.
+  ;;;
+  ;;; Parameters:
+  ;;;   content-type -- value for the Content-Type header
+  ;;;   body         -- response body string
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- Response handle with status 200
+  ;;;
+  ;;; Example:
+  ;;;   (resp-ok "text/plain" "Hello, world!")
+  ;;;
+  ;;; Since: H4
+  (defn resp-ok [content-type : cstr body : cstr] : Response
+    (response 200 content-type body))
+  ;;; not-found -- build a 404 Not Found response with a text/plain body.
+  ;;;
+  ;;; Parameters:
+  ;;;   body -- body string (typically a short message)
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- Response handle with status 404
+  ;;;
+  ;;; Example:
+  ;;;   (not-found "no such resource")
+  ;;;
+  ;;; Since: H4
+  (defn not-found [body : cstr] : Response (response 404 "text/plain" body))
+  ;;; bad-request -- build a 400 Bad Request response with a text/plain body.
+  ;;;
+  ;;; Parameters:
+  ;;;   body -- body string (typically a short error message)
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- Response handle with status 400
+  ;;;
+  ;;; Example:
+  ;;;   (bad-request "missing id parameter")
+  ;;;
+  ;;; Since: H4
+  (defn bad-request [body : cstr] : Response (response 400 "text/plain" body))) ;; end defmodule httpd/response

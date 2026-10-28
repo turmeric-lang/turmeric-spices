@@ -25,118 +25,141 @@
 ;;   1
 ;;   2
 ;;   ok
-
 (defmodule xworld_3world_test
   (export)
-
-(import ecs/sized-storage :refer [SizedDense])
-(import ecs/sized-world   :refer [sized-defworld-mono])
-(import ecs/xworld        :refer [sized-defcomponent-accessors-xmono
-                                  defworld-box-helpers])
-(import ecs/xcap          :refer [XWriteCap XReadCap
-                                  make-write-cap make-read-cap use-cap!])
-(import ecs/xsystem       :refer [XSystemN make-xsystem-n defxsystem
-                                  xsm-alloc xsm-set! xsm-get xsm-free])
-(import ecs/xstage        :refer [BoundXSystemN make-bound-xsystem-n bind-xsystem-n
-                                  XStage xstage-new xstage-add-n!
-                                  xstage-n-waves xstage-run! xstage-free!])
-
-(defopaque Pos       :int)
-(defopaque PredPos   :int)
-(defopaque RenderPos :int)
-
-;; Three distinct world types. Component ids are world-local; all use
-;; bit 0 without colliding because the conflict key is (world-id, bit).
-(sized-defworld-mono AuthWorld   (Static 8) [Pos])
-(sized-defcomponent-accessors-xmono AuthWorld Pos)
-
-(sized-defworld-mono PredWorld   (Static 8) [PredPos])
-(sized-defcomponent-accessors-xmono PredWorld PredPos)
-
-(sized-defworld-mono RenderWorld (Static 8) [RenderPos])
-(sized-defcomponent-accessors-xmono RenderWorld RenderPos)
-
-(def Pos-cid       0)
-(def PredPos-cid   0)
-(def RenderPos-cid 0)
-
-;; Per-world box/load/free (referenced by the C struct name, like the
-;; two-world fixtures). The N-world `defxsystem` calls `load-<Wtype>`
-;; for each declared world.
-(defworld-box-helpers AuthWorld)
-(defworld-box-helpers PredWorld)
-(defworld-box-helpers RenderWorld)
-
-;; The 3-world projection system. Worlds in declaration order:
-;; slot 0 = auth, slot 1 = pred, slot 2 = ren. Reads Pos from auth,
-;; writes PredPos into pred and RenderPos into ren. `auth` omits its
-;; (empty) writes clause; `pred` / `ren` omit their (empty) reads
-;; clauses -- exercised by CLAUSE-V0 + the N-world clause parser.
-(defxsystem project
-  [auth AuthWorld  pred PredWorld  ren RenderWorld]
-  :reads-from auth [Pos]
-  :writes-to  pred [PredPos]
-  :writes-to  ren  [RenderPos]
-  (do
-    (set-PredPos! pred-PredPos-write-cap pred (slot-new 0)
-      (:: (:: (get-Pos auth-Pos-read-cap auth (slot-new 0)) :int) :PredPos))
-    (set-RenderPos! ren-RenderPos-write-cap ren (slot-new 0)
-      (:: (:: (get-Pos auth-Pos-read-cap auth (slot-new 0)) :int) :RenderPos))
-    (set-PredPos! pred-PredPos-write-cap pred (slot-new 1)
-      (:: (:: (get-Pos auth-Pos-read-cap auth (slot-new 1)) :int) :PredPos))
-    (set-RenderPos! ren-RenderPos-write-cap ren (slot-new 1)
-      (:: (:: (get-Pos auth-Pos-read-cap auth (slot-new 1)) :int) :RenderPos))))
-
-(defn main [] : int
-  (let [auth : AuthWorld   (make-AuthWorld 8)
-        pred : PredWorld    (make-PredWorld 8)
-        ren  : RenderWorld  (make-RenderWorld 8)
-        ;; seed the auth world directly via the world-keyed setter.
-        acap (:: (make-write-cap Pos-cid) (XWriteCap AuthWorld Pos))]
-    (set-Pos! acap auth (slot-new 0) (:: 11 :Pos))
-    (set-Pos! acap auth (slot-new 1) (:: 22 :Pos))
-    (use-cap! acap)
-    (let [ap (box-AuthWorld   auth)
-          pp (box-PredWorld   pred)
-          rp (box-RenderWorld ren)
-          ;; Stage 1: a single 3-world system -> one wave.
-          xs (xstage-new)
-          bs (bind-xsystem-n project  0 ap  1 pp  2 rp)]
-      (xstage-add-n! xs bs)
-      (xstage-run! xs)
-      (let [n1    (xstage-n-waves xs)
-            pred2 : PredWorld   (load-PredWorld pp)
-            ren2  : RenderWorld (load-RenderWorld rp)
-            prcap (:: (make-read-cap PredPos-cid)   (XReadCap PredWorld PredPos))
-            rrcap (:: (make-read-cap RenderPos-cid) (XReadCap RenderWorld RenderPos))
-            p0 (:: (get-PredPos   prcap pred2 (slot-new 0)) :int)
-            p1 (:: (get-PredPos   prcap pred2 (slot-new 1)) :int)
-            r0 (:: (get-RenderPos rrcap ren2  (slot-new 0)) :int)
-            r1 (:: (get-RenderPos rrcap ren2  (slot-new 1)) :int)]
-        (println p0)   ;; 11  (pred[0] <- auth[0])
-        (println r0)   ;; 11  (ren[0]  <- auth[0])
-        (println p1)   ;; 22  (pred[1] <- auth[1])
-        (println r1)   ;; 22  (ren[1]  <- auth[1])
-        ;; Stage 2: two bindings of `project` sharing all three worlds
-        ;; conflict (both write pred.PredPos and ren.RenderPos) -> the
-        ;; ragged scheduler must put them in separate waves.
-        (let [xs2 (xstage-new)
-              b1  (bind-xsystem-n project  0 ap  1 pp  2 rp)
-              b2  (bind-xsystem-n project  0 ap  1 pp  2 rp)]
-          (xstage-add-n! xs2 b1)
-          (xstage-add-n! xs2 b2)
-          (xstage-run! xs2)
-          (let [n2 (xstage-n-waves xs2)
-                ok (and (= p0 11) (and (= r0 11)
-                        (and (= p1 22) (and (= r1 22)
-                        (and (= n1 1) (= n2 2))))))]
-            (println n1)   ;; 1
-            (println n2)   ;; 2
-            (xstage-free! xs)
-            (xstage-free! xs2)
-            (free-AuthWorld-box   ap)
-            (free-PredWorld-box   pp)
-            (free-RenderWorld-box rp)
-            (if ok (do (println "ok") 0) (do (println "FAIL") 1))))))))
-
-) ;; end defmodule xworld_3world_test
+  (import ecs/sized-storage :refer [SizedDense])
+  (import ecs/sized-world :refer [sized-defworld-mono])
+  (import ecs/xworld
+    :refer
+    [sized-defcomponent-accessors-xmono defworld-box-helpers])
+  (import ecs/xcap
+    :refer
+    [XWriteCap XReadCap make-write-cap make-read-cap use-cap!])
+  (import ecs/xsystem
+    :refer
+    [XSystemN make-xsystem-n defxsystem xsm-alloc xsm-set! xsm-get xsm-free])
+  (import ecs/xstage
+    :refer
+    [BoundXSystemN
+     make-bound-xsystem-n
+     bind-xsystem-n
+     XStage
+     xstage-new
+     xstage-add-n!
+     xstage-n-waves
+     xstage-run!
+     xstage-free!])
+  (defopaque Pos :int)
+  (defopaque PredPos :int)
+  (defopaque RenderPos :int)
+  ;; Three distinct world types. Component ids are world-local; all use
+  ;; bit 0 without colliding because the conflict key is (world-id, bit).
+  (sized-defworld-mono AuthWorld (Static 8) [Pos])
+  (sized-defcomponent-accessors-xmono AuthWorld Pos)
+  (sized-defworld-mono PredWorld (Static 8) [PredPos])
+  (sized-defcomponent-accessors-xmono PredWorld PredPos)
+  (sized-defworld-mono RenderWorld (Static 8) [RenderPos])
+  (sized-defcomponent-accessors-xmono RenderWorld RenderPos)
+  (def Pos-cid 0)
+  (def PredPos-cid 0)
+  (def RenderPos-cid 0)
+  ;; Per-world box/load/free (referenced by the C struct name, like the
+  ;; two-world fixtures). The N-world `defxsystem` calls `load-<Wtype>`
+  ;; for each declared world.
+  (defworld-box-helpers AuthWorld)
+  (defworld-box-helpers PredWorld)
+  (defworld-box-helpers RenderWorld)
+  ;; The 3-world projection system. Worlds in declaration order:
+  ;; slot 0 = auth, slot 1 = pred, slot 2 = ren. Reads Pos from auth,
+  ;; writes PredPos into pred and RenderPos into ren. `auth` omits its
+  ;; (empty) writes clause; `pred` / `ren` omit their (empty) reads
+  ;; clauses -- exercised by CLAUSE-V0 + the N-world clause parser.
+  (defxsystem project
+    [auth AuthWorld pred PredWorld ren RenderWorld]
+    :reads-from
+    auth
+    [Pos]
+    :writes-to
+    pred
+    [PredPos]
+    :writes-to
+    ren
+    [RenderPos]
+    (do
+      (set-PredPos! pred-PredPos-write-cap
+        pred
+        (slot-new 0)
+        (:: (:: (get-Pos auth-Pos-read-cap auth (slot-new 0)) :int) :PredPos))
+      (set-RenderPos! ren-RenderPos-write-cap
+        ren
+        (slot-new 0)
+        (:: (:: (get-Pos auth-Pos-read-cap auth (slot-new 0)) :int) :RenderPos))
+      (set-PredPos! pred-PredPos-write-cap
+        pred
+        (slot-new 1)
+        (:: (:: (get-Pos auth-Pos-read-cap auth (slot-new 1)) :int) :PredPos))
+      (set-RenderPos! ren-RenderPos-write-cap
+        ren
+        (slot-new 1)
+        (:: (:: (get-Pos auth-Pos-read-cap auth (slot-new 1)) :int) :RenderPos))))
+  (defn main [] : int
+    (let [auth                                                    : AuthWorld
+          (make-AuthWorld 8)                                      pred
+          : PredWorld                                             (make-PredWorld 8)
+          ren                                                     : RenderWorld
+          (make-RenderWorld 8)
+          ;; seed the auth world directly via the world-keyed setter.
+                                                                  acap
+          (:: (make-write-cap Pos-cid) (XWriteCap AuthWorld Pos))]
+      (set-Pos! acap auth (slot-new 0) (:: 11 :Pos))
+      (set-Pos! acap auth (slot-new 1) (:: 22 :Pos))
+      (use-cap! acap)
+      (let [ap (box-AuthWorld auth)
+            pp (box-PredWorld pred)
+            rp (box-RenderWorld ren)
+            ;; Stage 1: a single 3-world system -> one wave.
+            xs (xstage-new)
+            bs (bind-xsystem-n project 0 ap 1 pp 2 rp)]
+        (xstage-add-n! xs bs)
+        (xstage-run! xs)
+        (let [n1                  (xstage-n-waves xs)
+              pred2               : PredWorld
+              (load-PredWorld pp) ren2
+              : RenderWorld       (load-RenderWorld rp)
+              prcap               (:: (make-read-cap PredPos-cid)
+                                    (XReadCap PredWorld PredPos))
+              rrcap               (:: (make-read-cap RenderPos-cid)
+                                    (XReadCap RenderWorld RenderPos))
+              p0                  (:: (get-PredPos prcap pred2 (slot-new 0))
+                                    :int)
+              p1                  (:: (get-PredPos prcap pred2 (slot-new 1))
+                                    :int)
+              r0                  (:: (get-RenderPos rrcap ren2 (slot-new 0))
+                                    :int)
+              r1                  (:: (get-RenderPos rrcap ren2 (slot-new 1))
+                                    :int)]
+          (println p0) ;; 11  (pred[0] <- auth[0])
+          (println r0) ;; 11  (ren[0]  <- auth[0])
+          (println p1) ;; 22  (pred[1] <- auth[1])
+          (println r1) ;; 22  (ren[1]  <- auth[1])
+          ;; Stage 2: two bindings of `project` sharing all three worlds
+          ;; conflict (both write pred.PredPos and ren.RenderPos) -> the
+          ;; ragged scheduler must put them in separate waves.
+          (let [xs2 (xstage-new)
+                b1  (bind-xsystem-n project 0 ap 1 pp 2 rp)
+                b2  (bind-xsystem-n project 0 ap 1 pp 2 rp)]
+            (xstage-add-n! xs2 b1)
+            (xstage-add-n! xs2 b2)
+            (xstage-run! xs2)
+            (let [n2 (xstage-n-waves xs2)
+                  ok (and (= p0 11)
+                       (and (= r0 11)
+                         (and (= p1 22) (and (= r1 22) (and (= n1 1) (= n2 2))))))]
+              (println n1) ;; 1
+              (println n2) ;; 2
+              (xstage-free! xs)
+              (xstage-free! xs2)
+              (free-AuthWorld-box ap)
+              (free-PredWorld-box pp)
+              (free-RenderWorld-box rp)
+              (if ok (do (println "ok") 0) (do (println "FAIL") 1))))))))) ;; end defmodule xworld_3world_test

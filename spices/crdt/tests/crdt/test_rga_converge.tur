@@ -34,204 +34,209 @@
 ;; seed, which is the whole repro.
 ;;
 ;; main returns the failure count so `tur test` reports a non-zero exit.
-
 (defmodule crdt/tests/test_rga_converge
   (import crdt/replica :refer [ReplicaId replica replica-sym])
   (import crdt/rga :refer [Rga rga-new rga-len rga-get rga-insert rga-delete])
-
-;;; __lcg -- internal: one step of a linear congruential generator.
-;;
-;; Numerical Recipes constants, mod 2^31 -- the same generator test_converge
-;; uses, so a seed means the same kind of thing in both files.
-(defn __lcg [s : int] : int
-  (mod (+ (* 1103515245 s) 12345) 2147483648))
-
-;;; __nth-replica -- internal: replica alphabet, indexed.
-(defn __nth-replica [i : int] : ReplicaId
-  (replica (if (= i 0) (quote r0) (if (= i 1) (quote r1) (quote r2)))))
-
-;;; __keep -- internal: identity on an Rga.
-;;
-;; Not redundant.  A by-value struct PARAMETER used directly as an `if` arm is
-;; dereferenced by the emitter and cc rejects it, while `tur check` is clean
-;; -- see the same helper in test_converge and
-;; docs/reported/byvalue-struct-param-as-if-arm-derefs.md in the turmeric
-;; repo.  Routing the pass-through arm through any call compiles.
-(defn __keep [s : Rga] : Rga s)
-
-;;; __do-op -- internal: apply one operation to this replica's document.
-;;
-;; `pos` is reduced modulo the CURRENT length, so a position generated for a
-;; longer document still lands somewhere real -- which keeps the op stream
-;; meaningful for a replica that has deleted more than its peers.
-;; `k` is drawn mod 3 and only 2 deletes, so two thirds of the operations
-;; insert.  An even split leaves the merged document averaging three
-;; characters over 100 seeds -- measured -- which is too short for the
-;; integration scan to have anything to walk past.  At two thirds it averages
-;; nine.
-(defn __do-op [acc : Rga k : int pos : int ch : int r : ReplicaId ins-only : bool] : Rga
-  (let [n (rga-len acc)
-        p (if (= n 0) 0 (mod pos (+ n 1)))]
-    (if (or ins-only (< k 2))
-      (rga-insert acc r p ch)
-      (if (= n 0) (__keep acc) (rga-delete acc (mod pos n))))))
-
-;;; __apply -- internal: apply the op only if it belongs to this replica.
-(defn __apply [acc : Rga mine : bool k : int pos : int ch : int r : ReplicaId
-               ins-only : bool] : Rga
-  (if mine (__do-op acc k pos ch r ins-only) (__keep acc)))
-
-;;; __build -- internal: replay `n` ops from `seed`, keeping those for `me`.
-;;
-;; Every replica derives the SAME op stream and applies only its own ops, so
-;; the streams are causally independent and the merges below are genuinely
-;; concurrent rather than a replayed log.
-;;
-;; The character code is `100*r + step`, which makes every character in the
-;; run unique and says which replica produced it -- sweep 2 leans on that.
-(defn __build [seed : int me : int n : int step : int acc : Rga
-               ins-only : bool] : Rga
-  (if (= n 0)
-    (__keep acc)
-    (let [s1  (__lcg seed)
-          s2  (__lcg s1)
-          s3  (__lcg s2)
-          r   (mod s1 3)
-          k   (mod s2 3)
-          pos (mod s3 17)]
-      (__build s3 me (- n 1) (+ step 1)
-               (__apply acc (= r me) k pos (+ (* 100 r) step) (__nth-replica r)
-                        ins-only)
-               ins-only))))
-
-;;; __replica -- internal: replica `me`'s document after replaying `n` ops.
-(defn __replica [seed : int me : int n : int ins-only : bool] : Rga
-  (__build seed me n 0 (rga-new) ins-only))
-
-;;; __order-abc -- internal: deliver a, then b, then c.
-(defn __order-abc [seed : int n : int io : bool] : Rga
-  (join (join (__replica seed 0 n io) (__replica seed 1 n io))
-        (__replica seed 2 n io)))
-
-;;; __order-cba -- internal: the reverse delivery order.
-(defn __order-cba [seed : int n : int io : bool] : Rga
-  (join (join (__replica seed 2 n io) (__replica seed 1 n io))
-        (__replica seed 0 n io)))
-
-;;; __order-nested -- internal: a different association, a(bc) not (ab)c.
-(defn __order-nested [seed : int n : int io : bool] : Rga
-  (join (__replica seed 0 n io)
-        (join (__replica seed 1 n io) (__replica seed 2 n io))))
-
-;;; __order-dup -- internal: b delivered TWICE, and a re-delivered at the end.
-;;
-;; Duplicate delivery is the normal case over a real link, and it is what
-;; idempotence buys.  An implementation that appended rather than integrated
-;; would pass every other order here and duplicate the whole document in this
-;; one.
-(defn __order-dup [seed : int n : int io : bool] : Rga
-  (join (join (join (join (__replica seed 0 n io) (__replica seed 1 n io))
-                    (__replica seed 1 n io))
-              (__replica seed 2 n io))
-        (__replica seed 0 n io)))
-
-;;; __case -- internal: one seed; 0 on convergence, 1 on divergence.
-;;
-;; `eq?` on an Rga compares the visible values IN ORDER -- structural, not
-;; size-only, unlike Eq [GSet] and Eq [ORSet].  For a sequence that is the
-;; whole point: two documents with the same characters in a different order
-;; are exactly the divergence this file exists to catch, and a size-only
-;; comparison would call them equal.
-(defn __case [seed : int n : int] : int
-  (let [base (__order-abc seed n false)
-        ok1  (eq? base (__order-cba seed n false))
-        ok2  (eq? base (__order-nested seed n false))
-        ok3  (eq? base (__order-dup seed n false))]
-    (if (and ok1 (and ok2 ok3))
-      0
-      (do (println "RGA DIVERGED at seed:") (println seed) 1))))
-
-;; ---------------------------------------------------------------------------
-;; Sweep 2: inserts only, with a COUNTING oracle.
-;;
-;; Sweep 1 checks that the orders agree; it cannot tell whether they agree on
-;; the right document.  With deletes switched off the answer is knowable
-;; without a second implementation: every operation inserts exactly one
-;; character, so the merged length must be the operation count, no more and
-;; no less.  That catches a merge that drops nodes and a merge that
-;; duplicates them -- both of which can be perfectly order-independent.
-
-;;; __insert-count -- internal: how many of the n ops belong to any replica.
-;;
-;; All of them: every op is assigned to some replica, and with deletes off
-;; every op inserts.  Written out rather than returning `n` so the intent
-;; survives a later change to the op mix.
-(defn __insert-count [n : int] : int n)
-
-;;; __ins-case -- internal: one seed of the insert-only sweep.
-(defn __ins-case [seed : int n : int] : int
-  (let [m    (__order-abc seed n true)
-        want (__insert-count n)
-        got  (rga-len m)
-        ok2  (eq? (__order-abc seed n true) (__order-dup seed n true))]
-    (if (and (= got want) ok2)
-      0
-      (do (println (if ok2 "WRONG LENGTH at seed:" "DUP-ORDER DIVERGED at seed:"))
+  ;;; __lcg -- internal: one step of a linear congruential generator.
+  ;;
+  ;; Numerical Recipes constants, mod 2^31 -- the same generator test_converge
+  ;; uses, so a seed means the same kind of thing in both files.
+  (defn __lcg [s : int] : int (mod (+ (* 1103515245 s) 12345) 2147483648))
+  ;;; __nth-replica -- internal: replica alphabet, indexed.
+  (defn __nth-replica [i : int] : ReplicaId
+    (replica (if (= i 0) (quote r0) (if (= i 1) (quote r1) (quote r2)))))
+  ;;; __keep -- internal: identity on an Rga.
+  ;;
+  ;; Not redundant.  A by-value struct PARAMETER used directly as an `if` arm is
+  ;; dereferenced by the emitter and cc rejects it, while `tur check` is clean
+  ;; -- see the same helper in test_converge and
+  ;; docs/reported/byvalue-struct-param-as-if-arm-derefs.md in the turmeric
+  ;; repo.  Routing the pass-through arm through any call compiles.
+  (defn __keep [s : Rga] : Rga s)
+  ;;; __do-op -- internal: apply one operation to this replica's document.
+  ;;
+  ;; `pos` is reduced modulo the CURRENT length, so a position generated for a
+  ;; longer document still lands somewhere real -- which keeps the op stream
+  ;; meaningful for a replica that has deleted more than its peers.
+  ;; `k` is drawn mod 3 and only 2 deletes, so two thirds of the operations
+  ;; insert.  An even split leaves the merged document averaging three
+  ;; characters over 100 seeds -- measured -- which is too short for the
+  ;; integration scan to have anything to walk past.  At two thirds it averages
+  ;; nine.
+  (defn __do-op [acc : Rga
+                 k : int
+                 pos : int
+                 ch : int
+                 r : ReplicaId
+                 ins-only : bool] : Rga
+    (let [n (rga-len acc)
+          p (if (= n 0) 0 (mod pos (+ n 1)))]
+      (if (or ins-only (< k 2))
+        (rga-insert acc r p ch)
+        (if (= n 0) (__keep acc) (rga-delete acc (mod pos n))))))
+  ;;; __apply -- internal: apply the op only if it belongs to this replica.
+  (defn __apply [acc : Rga
+                 mine : bool
+                 k : int
+                 pos : int
+                 ch : int
+                 r : ReplicaId
+                 ins-only : bool] : Rga
+    (if mine (__do-op acc k pos ch r ins-only) (__keep acc)))
+  ;;; __build -- internal: replay `n` ops from `seed`, keeping those for `me`.
+  ;;
+  ;; Every replica derives the SAME op stream and applies only its own ops, so
+  ;; the streams are causally independent and the merges below are genuinely
+  ;; concurrent rather than a replayed log.
+  ;;
+  ;; The character code is `100*r + step`, which makes every character in the
+  ;; run unique and says which replica produced it -- sweep 2 leans on that.
+  (defn __build [seed : int
+                 me : int
+                 n : int
+                 step : int
+                 acc : Rga
+                 ins-only : bool] : Rga
+    (if (= n 0)
+      (__keep acc)
+      (let [s1  (__lcg seed)
+            s2  (__lcg s1)
+            s3  (__lcg s2)
+            r   (mod s1 3)
+            k   (mod s2 3)
+            pos (mod s3 17)]
+        (__build s3
+          me
+          (- n 1)
+          (+ step 1)
+          (__apply acc
+            (= r me)
+            k
+            pos
+            (+ (* 100 r) step)
+            (__nth-replica r)
+            ins-only)
+          ins-only))))
+  ;;; __replica -- internal: replica `me`'s document after replaying `n` ops.
+  (defn __replica [seed : int me : int n : int ins-only : bool] : Rga
+    (__build seed me n 0 (rga-new) ins-only))
+  ;;; __order-abc -- internal: deliver a, then b, then c.
+  (defn __order-abc [seed : int n : int io : bool] : Rga
+    (join (join (__replica seed 0 n io) (__replica seed 1 n io))
+      (__replica seed 2 n io)))
+  ;;; __order-cba -- internal: the reverse delivery order.
+  (defn __order-cba [seed : int n : int io : bool] : Rga
+    (join (join (__replica seed 2 n io) (__replica seed 1 n io))
+      (__replica seed 0 n io)))
+  ;;; __order-nested -- internal: a different association, a(bc) not (ab)c.
+  (defn __order-nested [seed : int n : int io : bool] : Rga
+    (join (__replica seed 0 n io)
+      (join (__replica seed 1 n io) (__replica seed 2 n io))))
+  ;;; __order-dup -- internal: b delivered TWICE, and a re-delivered at the end.
+  ;;
+  ;; Duplicate delivery is the normal case over a real link, and it is what
+  ;; idempotence buys.  An implementation that appended rather than integrated
+  ;; would pass every other order here and duplicate the whole document in this
+  ;; one.
+  (defn __order-dup [seed : int n : int io : bool] : Rga
+    (join (join (join (join (__replica seed 0 n io) (__replica seed 1 n io))
+                  (__replica seed 1 n io))
+            (__replica seed 2 n io))
+      (__replica seed 0 n io)))
+  ;;; __case -- internal: one seed; 0 on convergence, 1 on divergence.
+  ;;
+  ;; `eq?` on an Rga compares the visible values IN ORDER -- structural, not
+  ;; size-only, unlike Eq [GSet] and Eq [ORSet].  For a sequence that is the
+  ;; whole point: two documents with the same characters in a different order
+  ;; are exactly the divergence this file exists to catch, and a size-only
+  ;; comparison would call them equal.
+  (defn __case [seed : int n : int] : int
+    (let [base (__order-abc seed n false)
+          ok1  (eq? base (__order-cba seed n false))
+          ok2  (eq? base (__order-nested seed n false))
+          ok3  (eq? base (__order-dup seed n false))]
+      (if (and ok1 (and ok2 ok3))
+        0
+        (do (println "RGA DIVERGED at seed:") (println seed) 1))))
+  ;; ---------------------------------------------------------------------------
+  ;; Sweep 2: inserts only, with a COUNTING oracle.
+  ;;
+  ;; Sweep 1 checks that the orders agree; it cannot tell whether they agree on
+  ;; the right document.  With deletes switched off the answer is knowable
+  ;; without a second implementation: every operation inserts exactly one
+  ;; character, so the merged length must be the operation count, no more and
+  ;; no less.  That catches a merge that drops nodes and a merge that
+  ;; duplicates them -- both of which can be perfectly order-independent.
+  ;;; __insert-count -- internal: how many of the n ops belong to any replica.
+  ;;
+  ;; All of them: every op is assigned to some replica, and with deletes off
+  ;; every op inserts.  Written out rather than returning `n` so the intent
+  ;; survives a later change to the op mix.
+  (defn __insert-count [n : int] : int n)
+  ;;; __ins-case -- internal: one seed of the insert-only sweep.
+  (defn __ins-case [seed : int n : int] : int
+    (let [m    (__order-abc seed n true)
+          want (__insert-count n)
+          got  (rga-len m)
+          ok2  (eq? (__order-abc seed n true) (__order-dup seed n true))]
+      (if (and (= got want) ok2)
+        0
+        (do
+          (println (if ok2
+                     "WRONG LENGTH at seed:"
+                     "DUP-ORDER DIVERGED at seed:"))
           (println seed)
           1))))
-
-;; ---------------------------------------------------------------------------
-;; Sweep 3: replicas that SYNC mid-stream.
-;;
-;; Sweep 1 never merges until the end, so no replica ever inserts after a
-;; node it received from another -- and a cross-replica origin is exactly
-;; what the integration scan has to get right.  Here replica 1 merges
-;; replica 0's document partway through and then keeps editing, so its
-;; origins can be replica 0's nodes.  That is the shape test_rga's
-;; `test-causal-chain` pins by hand.
-
-;;; __synced -- internal: replica 1 after observing replica 0, then editing.
-(defn __synced [seed : int n : int] : Rga
-  (__build (__lcg (__lcg seed)) 1 n 0
-           (join (__replica seed 1 n false) (__replica seed 0 n false))
-           false))
-
-;;; __sync-case -- internal: one seed of the mid-stream-sync sweep.
-(defn __sync-case [seed : int n : int] : int
-  (let [a (join (__synced seed n) (__replica seed 2 n false))
-        b (join (__replica seed 2 n false) (__synced seed n))
-        c (join (join (__synced seed n) (__replica seed 2 n false))
-                (__synced seed n))]
-    (if (and (eq? a b) (eq? a c))
+  ;; ---------------------------------------------------------------------------
+  ;; Sweep 3: replicas that SYNC mid-stream.
+  ;;
+  ;; Sweep 1 never merges until the end, so no replica ever inserts after a
+  ;; node it received from another -- and a cross-replica origin is exactly
+  ;; what the integration scan has to get right.  Here replica 1 merges
+  ;; replica 0's document partway through and then keeps editing, so its
+  ;; origins can be replica 0's nodes.  That is the shape test_rga's
+  ;; `test-causal-chain` pins by hand.
+  ;;; __synced -- internal: replica 1 after observing replica 0, then editing.
+  (defn __synced [seed : int n : int] : Rga
+    (__build (__lcg (__lcg seed))
+      1
+      n
       0
-      (do (println "RGA SYNC DIVERGED at seed:") (println seed) 1))))
-
-;;; __sweep -- internal: run `f`-style cases for seeds [i, hi).
-(defn __sweep [i : int hi : int n : int acc : int] : int
-  (if (>= i hi) acc (__sweep (+ i 1) hi n (+ acc (__case (* i 7919) n)))))
-
-;;; __ins-sweep -- internal.
-(defn __ins-sweep [i : int hi : int n : int acc : int] : int
-  (if (>= i hi) acc (__ins-sweep (+ i 1) hi n (+ acc (__ins-case (* i 7919) n)))))
-
-;;; __sync-sweep -- internal.
-(defn __sync-sweep [i : int hi : int n : int acc : int] : int
-  (if (>= i hi) acc (__sync-sweep (+ i 1) hi n (+ acc (__sync-case (* i 7919) n)))))
-
-(defn main [] : int
-  ;; 100 seeds x 24 operations across 3 replicas, three ways.  Fewer seeds
-  ;; than test_converge's 200 because a sequence merge is O(n*m) rather than
-  ;; O(n) -- see the complexity note in crdt/rga's header -- and more
-  ;; operations each because a sequence needs a document long enough for the
-  ;; integration scan to have something to walk past.
-  (let [f1 (__sweep 1 101 24 0)
-        f2 (__ins-sweep 1 101 24 0)
-        f3 (__sync-sweep 1 101 24 0)
-        fails (+ f1 f2 f3)]
-    (if (= fails 0)
-      (println
-        "test_rga_converge: ok (100 mixed, 100 insert-only, 100 synced seeds)")
-      (do (println "test_rga_converge: FAILURES") (println fails)))
-    fails))
-
-) ;; end defmodule
+      (join (__replica seed 1 n false) (__replica seed 0 n false))
+      false))
+  ;;; __sync-case -- internal: one seed of the mid-stream-sync sweep.
+  (defn __sync-case [seed : int n : int] : int
+    (let [a (join (__synced seed n) (__replica seed 2 n false))
+          b (join (__replica seed 2 n false) (__synced seed n))
+          c (join (join (__synced seed n) (__replica seed 2 n false))
+              (__synced seed n))]
+      (if (and (eq? a b) (eq? a c))
+        0
+        (do (println "RGA SYNC DIVERGED at seed:") (println seed) 1))))
+  ;;; __sweep -- internal: run `f`-style cases for seeds [i, hi).
+  (defn __sweep [i : int hi : int n : int acc : int] : int
+    (if (>= i hi) acc (__sweep (+ i 1) hi n (+ acc (__case (* i 7919) n)))))
+  ;;; __ins-sweep -- internal.
+  (defn __ins-sweep [i : int hi : int n : int acc : int] : int
+    (if (>= i hi)
+      acc
+      (__ins-sweep (+ i 1) hi n (+ acc (__ins-case (* i 7919) n)))))
+  ;;; __sync-sweep -- internal.
+  (defn __sync-sweep [i : int hi : int n : int acc : int] : int
+    (if (>= i hi)
+      acc
+      (__sync-sweep (+ i 1) hi n (+ acc (__sync-case (* i 7919) n)))))
+  (defn main [] : int
+    ;; 100 seeds x 24 operations across 3 replicas, three ways.  Fewer seeds
+    ;; than test_converge's 200 because a sequence merge is O(n*m) rather than
+    ;; O(n) -- see the complexity note in crdt/rga's header -- and more
+    ;; operations each because a sequence needs a document long enough for the
+    ;; integration scan to have something to walk past.
+    (let [f1    (__sweep 1 101 24 0)
+          f2    (__ins-sweep 1 101 24 0)
+          f3    (__sync-sweep 1 101 24 0)
+          fails (+ f1 f2 f3)]
+      (if (= fails 0)
+        (println "test_rga_converge: ok (100 mixed, 100 insert-only, 100 synced seeds)")
+        (do (println "test_rga_converge: FAILURES") (println fails)))
+      fails))) ;; end defmodule

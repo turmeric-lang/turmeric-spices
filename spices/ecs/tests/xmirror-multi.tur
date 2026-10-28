@@ -12,120 +12,122 @@
 ;;
 ;; Expected output:
 ;;   ok
-
 (defmodule xmirror_multi_test
   (export)
-
-(import ecs/sized-storage :refer [SizedDense])
-(import ecs/sized-world   :refer [sized-defworld-mono])
-(import ecs/xworld        :refer [sized-defcomponent-accessors-xmono
-                                  defworld-box-helpers])
-(import ecs/xcap          :refer [XWriteCap XReadCap
-                                  make-write-cap make-read-cap use-cap!])
-(import ecs/xstage        :refer [BoundXSystem bind-xsystem
-                                  XStage xstage-new xstage-add!
-                                  xstage-run! xstage-free!])
-(import ecs/xmirror       :refer [defmirror])
-
-(defopaque Pos     :int)
-(defopaque Sprite  :int)
-(defopaque Color   :int)
-(defopaque RPos    :int)
-(defopaque RSprite :int)
-(defopaque RColor  :int)
-
-(sized-defworld-mono SimWorld    (Static 8) [Pos Sprite Color])
-(sized-defcomponent-accessors-xmono SimWorld Pos)
-(sized-defcomponent-accessors-xmono SimWorld Sprite)
-(sized-defcomponent-accessors-xmono SimWorld Color)
-
-(sized-defworld-mono RenderWorld (Static 8) [RPos RSprite RColor])
-(sized-defcomponent-accessors-xmono RenderWorld RPos)
-(sized-defcomponent-accessors-xmono RenderWorld RSprite)
-(sized-defcomponent-accessors-xmono RenderWorld RColor)
-
-;; Component ids are world-local; each world numbers from 0 in
-;; declared component order.
-(def Pos-cid     0)
-(def Sprite-cid  1)
-(def Color-cid   2)
-(def RPos-cid    0)
-(def RSprite-cid 1)
-(def RColor-cid  2)
-
-(defworld-box-helpers SimWorld)
-(defworld-box-helpers RenderWorld)
-
-;; One-line multi-component render extract. Each [Src Dst] pair maps a
-;; source-world component to a target-world component. Lowers to one
-;; defxsystem with `:reads-from sim [Pos Sprite Color]` and
-;; `:writes-to ren [RPos RSprite RColor]` -- the scheduler sees one
-;; system holding three read caps and three write caps.
-(defmirror extract-all
-  [sim SimWorld  ren RenderWorld]
-  :count 2
-  :components [[Pos RPos] [Sprite RSprite] [Color RColor]])
-
-(defn main [] : int
-  (let [sim : SimWorld    (make-SimWorld 8)
-        ren : RenderWorld (make-RenderWorld 8)
-        ;; Seed sim with two slots of (Pos, Sprite, Color). Caps are
-        ;; linear, so a fresh one per call. Slot 0:
-        pcap0 (:: (make-write-cap Pos-cid)    (XWriteCap SimWorld Pos))]
-    (set-Pos! pcap0 sim (slot-new 0) (:: 11 :Pos))
-    (use-cap! pcap0)
-    (let [scap0 (:: (make-write-cap Sprite-cid) (XWriteCap SimWorld Sprite))]
-      (set-Sprite! scap0 sim (slot-new 0) (:: 101 :Sprite))
-      (use-cap! scap0)
-      (let [ccap0 (:: (make-write-cap Color-cid)  (XWriteCap SimWorld Color))]
-        (set-Color! ccap0 sim (slot-new 0) (:: 201 :Color))
-        (use-cap! ccap0)
-        ;; Slot 1:
-        (let [pcap1 (:: (make-write-cap Pos-cid)    (XWriteCap SimWorld Pos))]
-          (set-Pos! pcap1 sim (slot-new 1) (:: 22 :Pos))
-          (use-cap! pcap1)
-          (let [scap1 (:: (make-write-cap Sprite-cid) (XWriteCap SimWorld Sprite))]
-            (set-Sprite! scap1 sim (slot-new 1) (:: 102 :Sprite))
-            (use-cap! scap1)
-            (let [ccap1 (:: (make-write-cap Color-cid)  (XWriteCap SimWorld Color))]
-              (set-Color! ccap1 sim (slot-new 1) (:: 202 :Color))
-              (use-cap! ccap1)
-              (let [sp (box-SimWorld sim)
-                    rp (box-RenderWorld ren)
-                    xs (xstage-new)
-                    ws (bind-xsystem extract-all 0 sp 1 rp)]
-                (xstage-add! xs ws)
-                (xstage-run! xs)
-                (let [ren2 : RenderWorld (load-RenderWorld rp)
-                      rcap0 (:: (make-read-cap RPos-cid)
-                                (XReadCap RenderWorld RPos))
-                      rcap1 (:: (make-read-cap RSprite-cid)
-                                (XReadCap RenderWorld RSprite))
-                      rcap2 (:: (make-read-cap RColor-cid)
-                                (XReadCap RenderWorld RColor))
-                      p0    (:: (get-RPos    rcap0 ren2 (slot-new 0)) :int)
-                      s0    (:: (get-RSprite rcap1 ren2 (slot-new 0)) :int)
-                      c0    (:: (get-RColor  rcap2 ren2 (slot-new 0)) :int)]
-                  (let [ren3 : RenderWorld (load-RenderWorld rp)
-                        rcap3 (:: (make-read-cap RPos-cid)
-                                  (XReadCap RenderWorld RPos))
-                        rcap4 (:: (make-read-cap RSprite-cid)
-                                  (XReadCap RenderWorld RSprite))
-                        rcap5 (:: (make-read-cap RColor-cid)
-                                  (XReadCap RenderWorld RColor))
-                        p1    (:: (get-RPos    rcap3 ren3 (slot-new 1)) :int)
-                        s1    (:: (get-RSprite rcap4 ren3 (slot-new 1)) :int)
-                        c1    (:: (get-RColor  rcap5 ren3 (slot-new 1)) :int)
-                        ok    (and (= p0 11)
-                                (and (= s0 101)
-                                  (and (= c0 201)
-                                    (and (= p1 22)
-                                      (and (= s1 102) (= c1 202))))))]
-                    (xstage-free! xs)
-                    (free-SimWorld-box sp)
-                    (free-RenderWorld-box rp)
-                    (if ok
-                      (do (println "ok") 0)
-                      (do (println "FAIL") 1))))))))))))
-
-) ;; end defmodule xmirror_multi_test
+  (import ecs/sized-storage :refer [SizedDense])
+  (import ecs/sized-world :refer [sized-defworld-mono])
+  (import ecs/xworld
+    :refer
+    [sized-defcomponent-accessors-xmono defworld-box-helpers])
+  (import ecs/xcap
+    :refer
+    [XWriteCap XReadCap make-write-cap make-read-cap use-cap!])
+  (import ecs/xstage
+    :refer
+    [BoundXSystem
+     bind-xsystem
+     XStage
+     xstage-new
+     xstage-add!
+     xstage-run!
+     xstage-free!])
+  (import ecs/xmirror :refer [defmirror])
+  (defopaque Pos :int)
+  (defopaque Sprite :int)
+  (defopaque Color :int)
+  (defopaque RPos :int)
+  (defopaque RSprite :int)
+  (defopaque RColor :int)
+  (sized-defworld-mono SimWorld (Static 8) [Pos Sprite Color])
+  (sized-defcomponent-accessors-xmono SimWorld Pos)
+  (sized-defcomponent-accessors-xmono SimWorld Sprite)
+  (sized-defcomponent-accessors-xmono SimWorld Color)
+  (sized-defworld-mono RenderWorld (Static 8) [RPos RSprite RColor])
+  (sized-defcomponent-accessors-xmono RenderWorld RPos)
+  (sized-defcomponent-accessors-xmono RenderWorld RSprite)
+  (sized-defcomponent-accessors-xmono RenderWorld RColor)
+  ;; Component ids are world-local; each world numbers from 0 in
+  ;; declared component order.
+  (def Pos-cid 0)
+  (def Sprite-cid 1)
+  (def Color-cid 2)
+  (def RPos-cid 0)
+  (def RSprite-cid 1)
+  (def RColor-cid 2)
+  (defworld-box-helpers SimWorld)
+  (defworld-box-helpers RenderWorld)
+  ;; One-line multi-component render extract. Each [Src Dst] pair maps a
+  ;; source-world component to a target-world component. Lowers to one
+  ;; defxsystem with `:reads-from sim [Pos Sprite Color]` and
+  ;; `:writes-to ren [RPos RSprite RColor]` -- the scheduler sees one
+  ;; system holding three read caps and three write caps.
+  (defmirror extract-all
+    [sim SimWorld ren RenderWorld]
+    :count
+    2
+    :components
+    [[Pos RPos] [Sprite RSprite] [Color RColor]])
+  (defn main [] : int
+    (let [sim               : SimWorld
+          (make-SimWorld 8) ren
+          : RenderWorld     (make-RenderWorld 8)
+          ;; Seed sim with two slots of (Pos, Sprite, Color). Caps are
+          ;; linear, so a fresh one per call. Slot 0:
+          pcap0             (:: (make-write-cap Pos-cid)
+                              (XWriteCap SimWorld Pos))]
+      (set-Pos! pcap0 sim (slot-new 0) (:: 11 :Pos))
+      (use-cap! pcap0)
+      (let [scap0 (:: (make-write-cap Sprite-cid) (XWriteCap SimWorld Sprite))]
+        (set-Sprite! scap0 sim (slot-new 0) (:: 101 :Sprite))
+        (use-cap! scap0)
+        (let [ccap0 (:: (make-write-cap Color-cid) (XWriteCap SimWorld Color))]
+          (set-Color! ccap0 sim (slot-new 0) (:: 201 :Color))
+          (use-cap! ccap0)
+          ;; Slot 1:
+          (let [pcap1 (:: (make-write-cap Pos-cid) (XWriteCap SimWorld Pos))]
+            (set-Pos! pcap1 sim (slot-new 1) (:: 22 :Pos))
+            (use-cap! pcap1)
+            (let [scap1 (:: (make-write-cap Sprite-cid)
+                          (XWriteCap SimWorld Sprite))]
+              (set-Sprite! scap1 sim (slot-new 1) (:: 102 :Sprite))
+              (use-cap! scap1)
+              (let [ccap1 (:: (make-write-cap Color-cid)
+                            (XWriteCap SimWorld Color))]
+                (set-Color! ccap1 sim (slot-new 1) (:: 202 :Color))
+                (use-cap! ccap1)
+                (let [sp (box-SimWorld sim)
+                      rp (box-RenderWorld ren)
+                      xs (xstage-new)
+                      ws (bind-xsystem extract-all 0 sp 1 rp)]
+                  (xstage-add! xs ws)
+                  (xstage-run! xs)
+                  (let [ren2                                                            : RenderWorld
+                        (load-RenderWorld rp)                                           rcap0
+                        (:: (make-read-cap RPos-cid)
+                          (XReadCap RenderWorld RPos))                                  rcap1
+                        (:: (make-read-cap RSprite-cid)
+                          (XReadCap RenderWorld RSprite))                               rcap2
+                        (:: (make-read-cap RColor-cid)
+                          (XReadCap RenderWorld RColor))                                p0
+                        (:: (get-RPos rcap0 ren2 (slot-new 0)) :int)                    s0
+                        (:: (get-RSprite rcap1 ren2 (slot-new 0)) :int)                 c0
+                        (:: (get-RColor rcap2 ren2 (slot-new 0)) :int)]
+                    (let [ren3                                                                                          : RenderWorld
+                          (load-RenderWorld rp)                                                                         rcap3
+                          (:: (make-read-cap RPos-cid)
+                            (XReadCap RenderWorld RPos))                                                                rcap4
+                          (:: (make-read-cap RSprite-cid)
+                            (XReadCap RenderWorld RSprite))                                                             rcap5
+                          (:: (make-read-cap RColor-cid)
+                            (XReadCap RenderWorld RColor))                                                              p1
+                          (:: (get-RPos rcap3 ren3 (slot-new 1)) :int)                                                  s1
+                          (:: (get-RSprite rcap4 ren3 (slot-new 1)) :int)                                               c1
+                          (:: (get-RColor rcap5 ren3 (slot-new 1)) :int)                                                ok
+                          (and (= p0 11)
+                            (and (= s0 101)
+                              (and (= c0 201)
+                                (and (= p1 22) (and (= s1 102) (= c1 202))))))]
+                      (xstage-free! xs)
+                      (free-SimWorld-box sp)
+                      (free-RenderWorld-box rp)
+                      (if ok (do (println "ok") 0) (do (println "FAIL") 1))))))))))))) ;; end defmodule xmirror_multi_test

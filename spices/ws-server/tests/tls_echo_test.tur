@@ -17,28 +17,30 @@
 ;; handshake, the Sec-WebSocket-Accept handshake over TLS, and both framing
 ;; directions over the encrypted transport. This is a flat tests/*.tur so CI's
 ;; `tur test tests` picks it up.
-
 (defmodule ws-server/tests/tls-echo
-  (import httpd/types    :refer [Conn Request])
-  (import httpd/tls      :refer [server-start-tls-conn server-stop-tls])
+  (import httpd/types :refer [Conn Request])
+  (import httpd/tls :refer [server-start-tls-conn server-stop-tls])
   (import httpd/response :refer [resp-ok bad-request])
   (import ws-server/server
-    :refer [ws-upgrade
-            ws-server-recv ws-server-send ws-server-close
-            ws-set-server-timeout])
-  (import ws-core/conn  :refer [WsConn])
-  (import ws-core/frame :refer [ws-frame-text ws-text? ws-binary?
-                                ws-closed? ws-error? ws-timeout?])
-  (import test/suite  :refer [describe it])
+    :refer
+    [ws-upgrade
+     ws-server-recv
+     ws-server-send
+     ws-server-close
+     ws-set-server-timeout])
+  (import ws-core/conn :refer [WsConn])
+  (import ws-core/frame
+    :refer
+    [ws-frame-text ws-text? ws-binary? ws-closed? ws-error? ws-timeout?])
+  (import test/suite :refer [describe it])
   (import test/assert :refer [assert-true])
   (import test/runner :refer [run-all-status])
-
-;; ---------------------------------------------------------------------------
-;; file-scope C: embedded throwaway cert/key + a tiny raw mbedTLS WebSocket
-;; client used to drive the server over TLS.
-;; ---------------------------------------------------------------------------
-```c
-#include <stdint.h>
+  ;; ---------------------------------------------------------------------------
+  ;; file-scope C: embedded throwaway cert/key + a tiny raw mbedTLS WebSocket
+  ;; client used to drive the server over TLS.
+  ;; ---------------------------------------------------------------------------
+  ```c
+  #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -328,20 +330,14 @@ static char *wssc__recv_text(wssc_t *c) {
   return buf;
 }
 ```
-
   ;; ---------------------------------------------------------------------
   ;; Cert provisioning + client driver helpers (thin wrappers over the C).
   ;; ---------------------------------------------------------------------
-
   (defn write-test-certs [cert : cstr key : cstr] : int
     ```c return (int64_t)wssc__write_certs((const char *)cert, (const char *)key); ```)
-
   (defn wsc-connect [port : int] : int
     ```c return (int64_t)(intptr_t)wssc__connect((int)port); ```)
-
-  (defn wsc-close [h : int] : void
-    ```c wssc__free((wssc_t *)(intptr_t)h); ```)
-
+  (defn wsc-close [h : int] : void ```c wssc__free((wssc_t *)(intptr_t)h); ```)
   ;; Send `msg` over TLS, read the echo, and report whether it came back
   ;; byte-identical.
   (defn wsc-echoes? [h : int msg : cstr] : bool
@@ -355,23 +351,21 @@ static char *wssc__recv_text(wssc_t *c) {
     free(got);
     return ok;
     ```)
-
   ;; Plain HTTPS GET over the TLS listener -> response status code. Drives the
   ;; non-upgraded httpd/tls path (TLS request read + serialize + TLS write).
   (defn wsc-http-status [port : int path : cstr] : int
     ```c return (int64_t)wssc__http_status((int)port, (const char *)path); ```)
-
-  (defn sleep-ms [ms : int] #fx{Unsafe} : void
+  (defn sleep-ms [ms : int]
+    #fx{Unsafe}
+    : void
     ```c
     #include <unistd.h>
     if (ms > 0) usleep((useconds_t)ms * 1000u);
     ```)
-
   ;; ---------------------------------------------------------------------
   ;; Server side: echo every data frame until the client closes (or the
   ;; receive idle-timeout fires, as a safety valve so a stuck worker exits).
   ;; ---------------------------------------------------------------------
-
   (defn ws-echo-loop [ws : WsConn] : void
     (let [f (ws-server-recv ws)]
       (if (or (ws-closed? f) (ws-error? f) (ws-timeout? f))
@@ -380,25 +374,22 @@ static char *wssc__recv_text(wssc_t *c) {
           (when (or (ws-text? f) (ws-binary? f))
             (ws-server-send ws (ws-frame-text f)))
           (ws-echo-loop ws)))))
-
   ;; Two-arg httpd handler: upgrade /ws over TLS, otherwise 400.
   (defn ws-echo-handler [conn : int req : int] : int
     (let [c (:: conn Conn)
           r (:: req Request)]
-      (if (ok? (ws-upgrade c r
+      (if (ok? (ws-upgrade c
+                 r
                  (fn [ws : WsConn] : void
-                   (do (ws-set-server-timeout ws 5000)
-                       (ws-echo-loop ws)))))
+                   (do (ws-set-server-timeout ws 5000) (ws-echo-loop ws)))))
         (:: (resp-ok "text/plain" "") :int)
         (:: (bad-request "not a websocket request") :int))))
-
   ;; ---------------------------------------------------------------------
   ;; Test driver
   ;; ---------------------------------------------------------------------
-
   (defn main [] : int
-    (let [cert "/tmp/tur-wss-test-cert.pem"
-          key  "/tmp/tur-wss-test-key.pem"
+    (let [cert  "/tmp/tur-wss-test-cert.pem"
+          key   "/tmp/tur-wss-test-key.pem"
           wrote (write-test-certs cert key)]
       (if (not (= wrote 0))
         (do
@@ -408,25 +399,21 @@ static char *wssc__recv_text(wssc_t *c) {
         (let [srv (server-start-tls-conn 18790 cert key ws-echo-handler)]
           (do
             (unsafe (sleep-ms 200))
-
             (describe "ws-server wss echo -- server-start-tls-conn + ws-upgrade over TLS"
-
               (it "TLS handshake + WS handshake succeed (101 + RFC 6455 accept)"
-                (let [h (wsc-connect 18790)
+                (let [h  (wsc-connect 18790)
                       ok (not (= h 0))]
                   (do (wsc-close h) (assert-true ok))))
-
               (it "echoes five text messages over one TLS connection"
                 (let [h (wsc-connect 18790)]
                   (if (= h 0)
                     (assert-true false)
                     (let [r (and (wsc-echoes? h "message one")
-                                 (wsc-echoes? h "message two")
-                                 (wsc-echoes? h "message three")
-                                 (wsc-echoes? h "message four")
-                                 (wsc-echoes? h "message five"))]
+                              (wsc-echoes? h "message two")
+                              (wsc-echoes? h "message three")
+                              (wsc-echoes? h "message four")
+                              (wsc-echoes? h "message five"))]
                       (do (wsc-close h) (assert-true r))))))
-
               (it "echoes a payload past 125 bytes (16-bit length path) over TLS"
                 (let [h (wsc-connect 18790)]
                   (if (= h 0)
@@ -434,11 +421,7 @@ static char *wssc__recv_text(wssc_t *c) {
                     (let [r (wsc-echoes? h
                               "the quick brown fox jumps over the lazy dog, and then the quick brown fox jumps over the lazy dog again, for a total well past one hundred and twenty five bytes")]
                       (do (wsc-close h) (assert-true r))))))
-
               (it "serves a normal HTTPS response on the non-upgrade path (400)"
                 (assert-true (= (wsc-http-status 18790 "/not-ws") 400))))
-
             (server-stop-tls srv)
-            (run-all-status))))))
-
-) ;; end defmodule ws-server/tests/tls-echo
+            (run-all-status))))))) ;; end defmodule ws-server/tests/tls-echo

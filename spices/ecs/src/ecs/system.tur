@@ -19,326 +19,309 @@
 ;;; docs/archive/history/macro-cannot-emit-multiple-top-level-forms.md).
 ;;;
 ;;; Since: E2 (initial); I3 (cap-binding rewrite)
-
 (defmodule ecs/system
-  (export System make-system system-reads-mask system-writes-mask
-          system-run-fn system-run! system-conflicts?
-          cid-bit defsystem defsystem-world
-          ;; Internal helpers used by `defsystem` lowering; exported so
-          ;; the macro expansion can resolve them at the call site.
-          defsystem--mask
-          defsystem--with-read-caps
-          defsystem--with-write-caps
-          defsystem--consume-write-caps)
-
-;;; System -- a runnable bundle (reads-mask, writes-mask, run-fn).
-;;; :copy so it flows through Turmeric values cleanly.
-;;; Since: E2
-(defstruct ^copy System
-  [reads-mask  : int
-   writes-mask : int
-   run-fn      : ptr<void>])
-
-;;; make-system -- bundle a top-level defn with its read/write masks.
-;;;
-;;; Parameters:
-;;;   reads-mask  -- OR of component-id bits the system reads
-;;;   writes-mask -- OR of component-id bits the system writes
-;;;   run-fn      -- ptr<void> to a top-level defn (signature `[w : int] : nil`)
-;;;
-;;; Returns:
-;;;   A System value.
-;;;
-;;; Example:
-;;;   (def physics
-;;;     (make-system
-;;;       (bit-or (cid-bit POS-CID) (cid-bit VEL-CID))   ;; reads
-;;;       (cid-bit POS-CID)                                ;; writes
-;;;       physics-impl))                                  ;; defn ptr
-;;;
-;;; Since: E2
-(defn make-system [reads-mask : int writes-mask : int run-fn : ptr<void>] : System
-  (make-struct System reads-mask writes-mask run-fn))
-
-;;; system-reads-mask -- accessor for the System's reads bitmask.
-;;; Since: E2
-(defn system-reads-mask [s : System] : int (.reads-mask s))
-
-;;; system-writes-mask -- accessor for the System's writes bitmask.
-;;; Since: E2
-(defn system-writes-mask [s : System] : int (.writes-mask s))
-
-;;; system-run-fn -- accessor for the System's run-fn pointer.
-;;; Since: E2
-(defn system-run-fn [s : System] : ptr<void> (.run-fn s))
-
-;;; system-run! -- invoke the System's run-fn against a world handle.
-;;;
-;;; The fn pointer carries the void-returning `[w : int] : nil` shape;
-;;; we cast it explicitly here so callers don't have to write inline-C.
-;;;
-;;; Parameters:
-;;;   s -- System value
-;;;   w -- world handle (an :int that the system's run-fn understands)
-;;;
-;;; Since: E2
-(defn system-run! [s : System w : int] : nil
-  ```c
-  void (*fn)(int64_t) = (void (*)(int64_t))(uintptr_t)s.run_fn;
+  (export System
+    make-system
+    system-reads-mask
+    system-writes-mask
+    system-run-fn
+    system-run!
+    system-conflicts?
+    cid-bit
+    defsystem
+    defsystem-world
+    ;; Internal helpers used by `defsystem` lowering; exported so
+    ;; the macro expansion can resolve them at the call site.
+    defsystem--mask
+    defsystem--with-read-caps
+    defsystem--with-write-caps
+    defsystem--consume-write-caps)
+  ;;; System -- a runnable bundle (reads-mask, writes-mask, run-fn).
+  ;;; :copy so it flows through Turmeric values cleanly.
+  ;;; Since: E2
+  (defstruct ^copy System
+    [reads-mask : int writes-mask : int run-fn : ptr<void>])
+  ;;; make-system -- bundle a top-level defn with its read/write masks.
+  ;;;
+  ;;; Parameters:
+  ;;;   reads-mask  -- OR of component-id bits the system reads
+  ;;;   writes-mask -- OR of component-id bits the system writes
+  ;;;   run-fn      -- ptr<void> to a top-level defn (signature `[w : int] : nil`)
+  ;;;
+  ;;; Returns:
+  ;;;   A System value.
+  ;;;
+  ;;; Example:
+  ;;;   (def physics
+  ;;;     (make-system
+  ;;;       (bit-or (cid-bit POS-CID) (cid-bit VEL-CID))   ;; reads
+  ;;;       (cid-bit POS-CID)                                ;; writes
+  ;;;       physics-impl))                                  ;; defn ptr
+  ;;;
+  ;;; Since: E2
+  (defn make-system [reads-mask : int writes-mask : int run-fn : ptr<void>] : System
+    (make-struct System reads-mask writes-mask run-fn))
+  ;;; system-reads-mask -- accessor for the System's reads bitmask.
+  ;;; Since: E2
+  (defn system-reads-mask [s : System] : int (.reads-mask s))
+  ;;; system-writes-mask -- accessor for the System's writes bitmask.
+  ;;; Since: E2
+  (defn system-writes-mask [s : System] : int (.writes-mask s))
+  ;;; system-run-fn -- accessor for the System's run-fn pointer.
+  ;;; Since: E2
+  (defn system-run-fn [s : System] : ptr<void> (.run-fn s))
+  ;;; system-run! -- invoke the System's run-fn against a world handle.
+  ;;;
+  ;;; The fn pointer carries the void-returning `[w : int] : nil` shape;
+  ;;; we cast it explicitly here so callers don't have to write inline-C.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- System value
+  ;;;   w -- world handle (an :int that the system's run-fn understands)
+  ;;;
+  ;;; Since: E2
+  (defn system-run! [s : System w : int] : nil
+    ```c
+    void (*fn)(int64_t) = (void (*)(int64_t))(uintptr_t)s.run_fn;
   fn(w);
   ```)
-
-;;; system-conflicts? -- true if two systems cannot run concurrently.
-;;;
-;;; The Robin Hood / dataflow rule: a write/read or write/write overlap
-;;; on any component bit forces sequential ordering. Pure read/read is
-;;; safe.
-;;;
-;;; Parameters:
-;;;   a -- System value
-;;;   b -- System value
-;;;
-;;; Returns:
-;;;   true if either system's writes-mask overlaps the other's
-;;;   reads-or-writes mask; false if both systems can run in parallel.
-;;;
-;;; Example:
-;;;   (system-conflicts? physics render)  ;; physics writes Pos, render reads Pos -> true
-;;;
-;;; Since: E2
-(defn system-conflicts? [a : System b : System] : bool
-  ```c
-  int64_t aw = a.writes_mask;
+  ;;; system-conflicts? -- true if two systems cannot run concurrently.
+  ;;;
+  ;;; The Robin Hood / dataflow rule: a write/read or write/write overlap
+  ;;; on any component bit forces sequential ordering. Pure read/read is
+  ;;; safe.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- System value
+  ;;;   b -- System value
+  ;;;
+  ;;; Returns:
+  ;;;   true if either system's writes-mask overlaps the other's
+  ;;;   reads-or-writes mask; false if both systems can run in parallel.
+  ;;;
+  ;;; Example:
+  ;;;   (system-conflicts? physics render)  ;; physics writes Pos, render reads Pos -> true
+  ;;;
+  ;;; Since: E2
+  (defn system-conflicts? [a : System b : System] : bool
+    ```c
+    int64_t aw = a.writes_mask;
   int64_t ar = a.reads_mask;
   int64_t bw = b.writes_mask;
   int64_t br = b.reads_mask;
   return (aw & (br | bw)) != 0 || (bw & (ar | aw)) != 0;
   ```)
-
-;;; cid-bit -- pack a component ID (0..62) into its single-bit mask.
-;;;
-;;; Example:
-;;;   (def POS-CID 0)
-;;;   (def VEL-CID 1)
-;;;   (def physics-reads (bit-or (cid-bit POS-CID) (cid-bit VEL-CID)))
-;;;
-;;; Since: E2
-(defn cid-bit [cid : int] : int
-  ```c
-  return (int64_t)((uint64_t)1 << (uint64_t)cid);
+  ;;; cid-bit -- pack a component ID (0..62) into its single-bit mask.
+  ;;;
+  ;;; Example:
+  ;;;   (def POS-CID 0)
+  ;;;   (def VEL-CID 1)
+  ;;;   (def physics-reads (bit-or (cid-bit POS-CID) (cid-bit VEL-CID)))
+  ;;;
+  ;;; Since: E2
+  (defn cid-bit [cid : int] : int
+    ```c
+    return (int64_t)((uint64_t)1 << (uint64_t)cid);
   ```)
-
-;;; defsystem--mask -- internal helper.  Build the bit-or'd cid-bit
-;;; expression for a comp-name vector.  Empty vector -> 0.
-;;; Takes the whole comps collection as one arg (the macro-time `~@`
-;;; splice does not flatten F_VEC; recurse on the rest-list instead).
-;;; Output is wrapped in quasiquote so CT-eval treats `do`/`let` heads
-;;; as data, not special-form heads -- otherwise the body forms get
-;;; collapsed to their last expression and the println vanishes.
-(defmacro defsystem--mask [comps]
-  (if (empty? comps)
-    0
-    (if (empty? (rest comps))
-      `(cid-bit ~(str->sym (str-append (symbol-name (first comps)) "-cid")))
-      `(bit-or
-         (cid-bit ~(str->sym (str-append (symbol-name (first comps)) "-cid")))
-         (defsystem--mask ~(rest comps))))))
-
-;;; defsystem--with-write-caps -- internal helper.  Wrap `body` in a
-;;; let-chain that binds `<Comp>-write-cap` to a freshly-minted, type-
-;;; ascribed `WriteCap<Comp>` for each comp in `comps`.
-(defmacro defsystem--with-write-caps [body comps]
-  (if (empty? comps)
-    ;; Empty-comps base: wrap in quasiquote so CT-eval treats the body
-    ;; as data, not as a special form that would collapse `(do a b)` to
-    ;; just `b` and drop the user's body forms.
-    `~body
-    (let [comp       (first comps)
-          rest-comps (rest comps)
-          cap-name   (str->sym (str-append (symbol-name comp) "-write-cap"))
-          cid-name   (str->sym (str-append (symbol-name comp) "-cid"))]
-      `(let [~cap-name (:: (make-write-cap ~cid-name) (WriteCap ~comp))]
-         (defsystem--with-write-caps ~body ~rest-comps)))))
-
-;;; defsystem--with-read-caps -- internal helper.  Wrap `body` in a
-;;; let-chain that binds `<Comp>-read-cap` to a freshly-minted, type-
-;;; ascribed `ReadCap<Comp>` for each comp in `comps`.  ReadCap is not
-;;; linear, so no auto-consume needed.
-(defmacro defsystem--with-read-caps [body comps]
-  (if (empty? comps)
-    `~body
-    (let [comp       (first comps)
-          rest-comps (rest comps)
-          cap-name   (str->sym (str-append (symbol-name comp) "-read-cap"))
-          cid-name   (str->sym (str-append (symbol-name comp) "-cid"))]
-      `(let [~cap-name (:: (make-read-cap ~cid-name) (ReadCap ~comp))]
-         (defsystem--with-read-caps ~body ~rest-comps)))))
-
-;;; defsystem--consume-write-caps -- internal helper.  Emit `(use-cap!
-;;; <Comp>-write-cap)` for each comp in `comps`, sequenced via nested
-;;; `do`.  Auto-consume runs at body end so the user is not forced to
-;;; call use-cap! themselves; phase I4 will route writes through
-;;; ^borrow-consuming set-Comp! accessors, at which point this auto-
-;;; consume becomes the single legal consumption.
-(defmacro defsystem--consume-write-caps [comps]
-  (if (empty? comps)
-    nil
-    (let [comp       (first comps)
-          rest-comps (rest comps)
-          cap-name   (str->sym (str-append (symbol-name comp) "-write-cap"))]
+  ;;; defsystem--mask -- internal helper.  Build the bit-or'd cid-bit
+  ;;; expression for a comp-name vector.  Empty vector -> 0.
+  ;;; Takes the whole comps collection as one arg (the macro-time `~@`
+  ;;; splice does not flatten F_VEC; recurse on the rest-list instead).
+  ;;; Output is wrapped in quasiquote so CT-eval treats `do`/`let` heads
+  ;;; as data, not special-form heads -- otherwise the body forms get
+  ;;; collapsed to their last expression and the println vanishes.
+  (defmacro defsystem--mask [comps]
+    (if (empty? comps)
+      0
+      (if (empty? (rest comps))
+        `(cid-bit ~(str->sym (str-append (symbol-name (first comps)) "-cid")))
+        `(bit-or (cid-bit ~(str->sym (str-append (symbol-name (first comps))
+                                       "-cid")))
+           (defsystem--mask ~(rest comps))))))
+  ;;; defsystem--with-write-caps -- internal helper.  Wrap `body` in a
+  ;;; let-chain that binds `<Comp>-write-cap` to a freshly-minted, type-
+  ;;; ascribed `WriteCap<Comp>` for each comp in `comps`.
+  (defmacro defsystem--with-write-caps [body comps]
+    (if (empty? comps)
+      ;; Empty-comps base: wrap in quasiquote so CT-eval treats the body
+      ;; as data, not as a special form that would collapse `(do a b)` to
+      ;; just `b` and drop the user's body forms.
+      `~body
+      (let [comp       (first comps)
+            rest-comps (rest comps)
+            cap-name   (str->sym (str-append (symbol-name comp) "-write-cap"))
+            cid-name   (str->sym (str-append (symbol-name comp) "-cid"))]
+        `(let [~cap-name (:: (make-write-cap ~cid-name) (WriteCap ~comp))]
+           (defsystem--with-write-caps ~body ~rest-comps)))))
+  ;;; defsystem--with-read-caps -- internal helper.  Wrap `body` in a
+  ;;; let-chain that binds `<Comp>-read-cap` to a freshly-minted, type-
+  ;;; ascribed `ReadCap<Comp>` for each comp in `comps`.  ReadCap is not
+  ;;; linear, so no auto-consume needed.
+  (defmacro defsystem--with-read-caps [body comps]
+    (if (empty? comps)
+      `~body
+      (let [comp       (first comps)
+            rest-comps (rest comps)
+            cap-name   (str->sym (str-append (symbol-name comp) "-read-cap"))
+            cid-name   (str->sym (str-append (symbol-name comp) "-cid"))]
+        `(let [~cap-name (:: (make-read-cap ~cid-name) (ReadCap ~comp))]
+           (defsystem--with-read-caps ~body ~rest-comps)))))
+  ;;; defsystem--consume-write-caps -- internal helper.  Emit `(use-cap!
+  ;;; <Comp>-write-cap)` for each comp in `comps`, sequenced via nested
+  ;;; `do`.  Auto-consume runs at body end so the user is not forced to
+  ;;; call use-cap! themselves; phase I4 will route writes through
+  ;;; ^borrow-consuming set-Comp! accessors, at which point this auto-
+  ;;; consume becomes the single legal consumption.
+  (defmacro defsystem--consume-write-caps [comps]
+    (if (empty? comps)
+      nil
+      (let [comp       (first comps)
+            rest-comps (rest comps)
+            cap-name   (str->sym (str-append (symbol-name comp) "-write-cap"))]
+        `(do (use-cap! ~cap-name) (defsystem--consume-write-caps ~rest-comps)))))
+  ;;; defsystem -- declare a System and its implementation in one form.
+  ;;;
+  ;;; Syntax (I3, BREAKING -- replaces the prior bitmask-int form):
+  ;;;   (defsystem name [reads-comp ...] [writes-comp ...] body)
+  ;;;
+  ;;; Expands to two top-level forms (via top-level `do` splicing):
+  ;;;
+  ;;;   (defn name-impl [w : int] : nil
+  ;;;     ;; one let per read-comp:   binds <Comp>-read-cap  : (ReadCap  Comp)
+  ;;;     ;; one let per write-comp:  binds <Comp>-write-cap : (WriteCap Comp)
+  ;;;     (do
+  ;;;       body
+  ;;;       ;; auto-consume each linear write-cap so the body type-checks
+  ;;;       ;; even before I4 wires set-Comp! accessors to consume them.
+  ;;;       (use-cap! <Comp>-write-cap) ...))
+  ;;;
+  ;;;   (def name (make-system READS-MASK WRITES-MASK name-impl))
+  ;;;
+  ;;; Convention: for each comp name `Comp` referenced in :reads or
+  ;;; :writes, a `<Comp>-cid` binding (matching the comp name verbatim
+  ;;; with a `-cid` suffix) must be in scope at the macro call site.
+  ;;; The macro looks up `<Comp>-cid` to build the scheduler bitmasks and
+  ;;; threads it into the cap mints.  This is what replaces the prior
+  ;;; lowercase `pos-cid` convention; migrate `(def pos-cid 0)` to
+  ;;; `(def Pos-cid 0)` when porting to the new form.
+  ;;;
+  ;;; Required imports at the call site:
+  ;;;   (import ecs/cap :refer [WriteCap ReadCap make-write-cap make-read-cap use-cap!])
+  ;;;
+  ;;; Example:
+  ;;;   (def Pos-cid 0)
+  ;;;   (def Vel-cid 1)
+  ;;;   (defsystem physics
+  ;;;     [Pos Vel]                  ;; :reads  -- binds Pos-read-cap, Vel-read-cap
+  ;;;     [Pos]                      ;; :writes -- binds Pos-write-cap (linear)
+  ;;;     (println "physics tick"))
+  ;;;   ;; physics-impl and physics both exist at top level.
+  ;;;
+  ;;; Since: E2 (initial); I3 (cap-binding rewrite)
+  (defmacro defsystem [name reads-vec writes-vec body]
+    (let [impl-name (str->sym (str-append (symbol-name name) "-impl"))]
       `(do
-         (use-cap! ~cap-name)
-         (defsystem--consume-write-caps ~rest-comps)))))
-
-;;; defsystem -- declare a System and its implementation in one form.
-;;;
-;;; Syntax (I3, BREAKING -- replaces the prior bitmask-int form):
-;;;   (defsystem name [reads-comp ...] [writes-comp ...] body)
-;;;
-;;; Expands to two top-level forms (via top-level `do` splicing):
-;;;
-;;;   (defn name-impl [w : int] : nil
-;;;     ;; one let per read-comp:   binds <Comp>-read-cap  : (ReadCap  Comp)
-;;;     ;; one let per write-comp:  binds <Comp>-write-cap : (WriteCap Comp)
-;;;     (do
-;;;       body
-;;;       ;; auto-consume each linear write-cap so the body type-checks
-;;;       ;; even before I4 wires set-Comp! accessors to consume them.
-;;;       (use-cap! <Comp>-write-cap) ...))
-;;;
-;;;   (def name (make-system READS-MASK WRITES-MASK name-impl))
-;;;
-;;; Convention: for each comp name `Comp` referenced in :reads or
-;;; :writes, a `<Comp>-cid` binding (matching the comp name verbatim
-;;; with a `-cid` suffix) must be in scope at the macro call site.
-;;; The macro looks up `<Comp>-cid` to build the scheduler bitmasks and
-;;; threads it into the cap mints.  This is what replaces the prior
-;;; lowercase `pos-cid` convention; migrate `(def pos-cid 0)` to
-;;; `(def Pos-cid 0)` when porting to the new form.
-;;;
-;;; Required imports at the call site:
-;;;   (import ecs/cap :refer [WriteCap ReadCap make-write-cap make-read-cap use-cap!])
-;;;
-;;; Example:
-;;;   (def Pos-cid 0)
-;;;   (def Vel-cid 1)
-;;;   (defsystem physics
-;;;     [Pos Vel]                  ;; :reads  -- binds Pos-read-cap, Vel-read-cap
-;;;     [Pos]                      ;; :writes -- binds Pos-write-cap (linear)
-;;;     (println "physics tick"))
-;;;   ;; physics-impl and physics both exist at top level.
-;;;
-;;; Since: E2 (initial); I3 (cap-binding rewrite)
-(defmacro defsystem [name reads-vec writes-vec body]
-  (let [impl-name (str->sym (str-append (symbol-name name) "-impl"))]
-    `(do
-       (defn ~impl-name [w : int] : nil
-         (defsystem--with-read-caps
-           (defsystem--with-write-caps
-             (do
-               ~body
-               (defsystem--consume-write-caps ~writes-vec))
-             ~writes-vec)
-           ~reads-vec))
-       (def ~name (make-system
-                    (defsystem--mask ~reads-vec)
-                    (defsystem--mask ~writes-vec)
-                    ~impl-name)))))
-
-;;; defsystem-world -- declare a System whose body reaches its world at
-;;; the world's real type, rather than through the untyped `:int`
-;;; carrier `defsystem` binds.
-;;;
-;;; Syntax:
-;;;   (defsystem-world name WorldName [reads-comp ...] [writes-comp ...] body)
-;;;
-;;; `defsystem` is never told which world it runs against, so it binds
-;;; `w : int` and a body that wants a typed accessor has to bridge with
-;;; `(:: w WorldName)`. That bridge stopped working when worlds became
-;;; by-value aggregates -- `TUR-E0295: cannot reinterpret by-value
-;;; aggregate as a one-word carrier` -- leaving a plain `defsystem` body
-;;; with no route to its own world (see the resolved report
-;;; `docs/ecs-unsized-defsystem-cannot-reach-its-world.md`).
-;;;
-;;; This macro is the unsized counterpart of `sized-defsystem-scheduled`
-;;; and lowers identically: a typed impl, an int-carrier wrapper that
-;;; loads the boxed world, and the `System` value the scheduler runs.
-;;; `defsystem` is left exactly as it was -- every existing call site
-;;; keeps working, and bodies that only want the int carrier (as the
-;;; `stage-*` tests do) should keep using it.
-;;;
-;;; Pre-condition: a `load-<WorldName>` function must be in scope at the
-;;; macro call site. `(defworld-box-helpers WorldName)` from `ecs/xworld`
-;;; emits it along with the matching `box-<WorldName>` /
-;;; `free-<WorldName>-box` the *caller* needs to hand a world to
-;;; `system-run!` / `stage-run!`.
-;;;
-;;; Expands to three top-level forms:
-;;;
-;;;   (defn name-impl [^borrow w : WorldName] : nil
-;;;     ;; cap-binding lets per :reads / :writes, body, auto-consume
-;;;     ;; -- the same lowering `defsystem` emits, but typed in w.
-;;;     ...)
-;;;
-;;;   (defn name-fn [wp : int] : nil
-;;;     (let [w : WorldName (load-WorldName wp)]
-;;;       (name-impl w)))
-;;;
-;;;   (def name (make-system READS-MASK WRITES-MASK name-fn))
-;;;
-;;; Cap-binding rules and auto-consume semantics match `defsystem`
-;;; exactly: read caps are non-linear and bound as `<Comp>-read-cap`;
-;;; write caps are linear, bound as `<Comp>-write-cap`, and auto-consumed
-;;; once at body end. A `<Comp>-cid` binding must be in scope for each
-;;; declared comp -- `(defcomponent-cids [...])` emits them.
-;;;
-;;; Parameters:
-;;;   name       -- the System value's name (also prefixes -impl / -fn)
-;;;   world-name -- the world type the body is typed against
-;;;   reads-vec  -- vector of component names the system reads
-;;;   writes-vec -- vector of component names the system writes
-;;;   body       -- the system body; `w` is bound at `world-name`
-;;;
-;;; Returns:
-;;;   Nothing at runtime -- expands to three top-level declarations.
-;;;
-;;; Required imports at the call site:
-;;;   (import ecs/cap    :refer [WriteCap ReadCap make-write-cap make-read-cap use-cap!])
-;;;   (import ecs/xworld :refer [defworld-box-helpers])
-;;;
-;;; Example:
-;;;   (defworld GameWorld [Pos Vel])
-;;;   (defcomponent-accessors GameWorld Pos)
-;;;   (defcomponent-cids [Pos Vel])
-;;;   (defworld-box-helpers GameWorld)
-;;;
-;;;   (defsystem-world physics GameWorld
-;;;     [Pos]                     ;; :reads
-;;;     [Pos]                     ;; :writes
-;;;     (set-Pos! Pos-write-cap w (slot-new 0) (make-struct Pos 42 0)))
-;;;
-;;;   (system-run! physics (box-GameWorld world))
-;;;
-;;; Since: GEN-V1
-(defmacro defsystem-world [name world-name reads-vec writes-vec body]
-  (let [impl-name (str->sym (str-append (symbol-name name) "-impl"))
-        fn-name   (str->sym (str-append (symbol-name name) "-fn"))
-        load-name (str->sym (str-append "load-" (symbol-name world-name)))]
-    `(do
-       (defn ~impl-name [^borrow w : ~world-name] : nil
-         (defsystem--with-read-caps
-           (defsystem--with-write-caps
-             (do
-               ~body
-               (defsystem--consume-write-caps ~writes-vec))
-             ~writes-vec)
-           ~reads-vec))
-       (defn ~fn-name [wp : int] : nil
-         (let [w : ~world-name (~load-name wp)]
-           (~impl-name w)))
-       (def ~name (make-system
-                    (defsystem--mask ~reads-vec)
-                    (defsystem--mask ~writes-vec)
-                    ~fn-name)))))
-
-) ;; end defmodule ecs/system
+         (defn ~impl-name [w : int] : nil
+           (defsystem--with-read-caps (defsystem--with-write-caps (do
+                                                                    ~body
+                                                                    (defsystem--consume-write-caps ~writes-vec))
+                                        ~writes-vec)
+             ~reads-vec))
+         (def ~name
+           (make-system (defsystem--mask ~reads-vec)
+             (defsystem--mask ~writes-vec)
+             ~impl-name)))))
+  ;;; defsystem-world -- declare a System whose body reaches its world at
+  ;;; the world's real type, rather than through the untyped `:int`
+  ;;; carrier `defsystem` binds.
+  ;;;
+  ;;; Syntax:
+  ;;;   (defsystem-world name WorldName [reads-comp ...] [writes-comp ...] body)
+  ;;;
+  ;;; `defsystem` is never told which world it runs against, so it binds
+  ;;; `w : int` and a body that wants a typed accessor has to bridge with
+  ;;; `(:: w WorldName)`. That bridge stopped working when worlds became
+  ;;; by-value aggregates -- `TUR-E0295: cannot reinterpret by-value
+  ;;; aggregate as a one-word carrier` -- leaving a plain `defsystem` body
+  ;;; with no route to its own world (see the resolved report
+  ;;; `docs/ecs-unsized-defsystem-cannot-reach-its-world.md`).
+  ;;;
+  ;;; This macro is the unsized counterpart of `sized-defsystem-scheduled`
+  ;;; and lowers identically: a typed impl, an int-carrier wrapper that
+  ;;; loads the boxed world, and the `System` value the scheduler runs.
+  ;;; `defsystem` is left exactly as it was -- every existing call site
+  ;;; keeps working, and bodies that only want the int carrier (as the
+  ;;; `stage-*` tests do) should keep using it.
+  ;;;
+  ;;; Pre-condition: a `load-<WorldName>` function must be in scope at the
+  ;;; macro call site. `(defworld-box-helpers WorldName)` from `ecs/xworld`
+  ;;; emits it along with the matching `box-<WorldName>` /
+  ;;; `free-<WorldName>-box` the *caller* needs to hand a world to
+  ;;; `system-run!` / `stage-run!`.
+  ;;;
+  ;;; Expands to three top-level forms:
+  ;;;
+  ;;;   (defn name-impl [^borrow w : WorldName] : nil
+  ;;;     ;; cap-binding lets per :reads / :writes, body, auto-consume
+  ;;;     ;; -- the same lowering `defsystem` emits, but typed in w.
+  ;;;     ...)
+  ;;;
+  ;;;   (defn name-fn [wp : int] : nil
+  ;;;     (let [w : WorldName (load-WorldName wp)]
+  ;;;       (name-impl w)))
+  ;;;
+  ;;;   (def name (make-system READS-MASK WRITES-MASK name-fn))
+  ;;;
+  ;;; Cap-binding rules and auto-consume semantics match `defsystem`
+  ;;; exactly: read caps are non-linear and bound as `<Comp>-read-cap`;
+  ;;; write caps are linear, bound as `<Comp>-write-cap`, and auto-consumed
+  ;;; once at body end. A `<Comp>-cid` binding must be in scope for each
+  ;;; declared comp -- `(defcomponent-cids [...])` emits them.
+  ;;;
+  ;;; Parameters:
+  ;;;   name       -- the System value's name (also prefixes -impl / -fn)
+  ;;;   world-name -- the world type the body is typed against
+  ;;;   reads-vec  -- vector of component names the system reads
+  ;;;   writes-vec -- vector of component names the system writes
+  ;;;   body       -- the system body; `w` is bound at `world-name`
+  ;;;
+  ;;; Returns:
+  ;;;   Nothing at runtime -- expands to three top-level declarations.
+  ;;;
+  ;;; Required imports at the call site:
+  ;;;   (import ecs/cap    :refer [WriteCap ReadCap make-write-cap make-read-cap use-cap!])
+  ;;;   (import ecs/xworld :refer [defworld-box-helpers])
+  ;;;
+  ;;; Example:
+  ;;;   (defworld GameWorld [Pos Vel])
+  ;;;   (defcomponent-accessors GameWorld Pos)
+  ;;;   (defcomponent-cids [Pos Vel])
+  ;;;   (defworld-box-helpers GameWorld)
+  ;;;
+  ;;;   (defsystem-world physics GameWorld
+  ;;;     [Pos]                     ;; :reads
+  ;;;     [Pos]                     ;; :writes
+  ;;;     (set-Pos! Pos-write-cap w (slot-new 0) (make-struct Pos 42 0)))
+  ;;;
+  ;;;   (system-run! physics (box-GameWorld world))
+  ;;;
+  ;;; Since: GEN-V1
+  (defmacro defsystem-world [name world-name reads-vec writes-vec body]
+    (let [impl-name (str->sym (str-append (symbol-name name) "-impl"))
+          fn-name   (str->sym (str-append (symbol-name name) "-fn"))
+          load-name (str->sym (str-append "load-" (symbol-name world-name)))]
+      `(do
+         (defn ~impl-name [^borrow w : ~world-name] : nil
+           (defsystem--with-read-caps (defsystem--with-write-caps (do
+                                                                    ~body
+                                                                    (defsystem--consume-write-caps ~writes-vec))
+                                        ~writes-vec)
+             ~reads-vec))
+         (defn ~fn-name [wp : int] : nil
+           (let [w               : ~world-name
+                 (~load-name wp)]
+             (~impl-name w)))
+         (def ~name
+           (make-system (defsystem--mask ~reads-vec)
+             (defsystem--mask ~writes-vec)
+             ~fn-name)))))) ;; end defmodule ecs/system

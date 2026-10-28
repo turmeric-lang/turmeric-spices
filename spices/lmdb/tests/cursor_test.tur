@@ -2,36 +2,70 @@
 ;;
 ;; lmdb-spice-plan section 6. Every case works in its own temporary
 ;; directory, closes every env it opens, and removes the directory.
-
 (defmodule lmdb/tests/cursor
-  (import test/suite  :refer [describe it])
+  (import test/suite :refer [describe it])
   (import test/assert :refer [assert-true])
   (import test/runner :refer [run-all-status])
-  (import lmdb/error  :refer [LmdbError MapFull Incompatible])
-  (import lmdb/env    :refer [Env env-opts opts-map-size opts-max-dbs opts-sync
-                              SyncNone env-open env-close])
-  (import lmdb/txn    :refer [Txn with-read-txn with-write-txn])
-  (import lmdb/dbi    :refer [Dbi DbiFlags dbi-no-flags dbi-create dbi-dup-sort
-                              dbi-reverse-key dbi-flags+ dbi-open dbi-main dbi-stat dbi-drop dbi-delete
-                              dbi-dup-sort?])
-  (import lmdb/ops    :refer [get put! del! del-dup!])
-  (import lmdb/cursor :refer [Cursor with-cursor cursor-open cursor-close
-                              cursor-first cursor-last cursor-next cursor-prev
-                              cursor-seek cursor-seek-exact cursor-current
-                              cursor-next-dup cursor-prev-dup cursor-next-nodup
-                              cursor-first-dup cursor-last-dup cursor-seek-dup
-                              cursor-dup-count cursor-fold cursor-fold-from
-                              cursor-put! cursor-del!
-                              cursor-del-all-dups!])
-
-;; -------------------------------------------------------------------------
-;; Helpers
-;; -------------------------------------------------------------------------
-
-;;; tmp-dir -- a fresh empty directory under $TMPDIR (or /tmp).
-(defn tmp-dir [] : cstr
-  ```c
-  #include <stdio.h>
+  (import lmdb/error :refer [LmdbError MapFull Incompatible])
+  (import lmdb/env
+    :refer
+    [Env
+     env-opts
+     opts-map-size
+     opts-max-dbs
+     opts-sync
+     SyncNone
+     env-open
+     env-close])
+  (import lmdb/txn :refer [Txn with-read-txn with-write-txn])
+  (import lmdb/dbi
+    :refer
+    [Dbi
+     DbiFlags
+     dbi-no-flags
+     dbi-create
+     dbi-dup-sort
+     dbi-reverse-key
+     dbi-flags+
+     dbi-open
+     dbi-main
+     dbi-stat
+     dbi-drop
+     dbi-delete
+     dbi-dup-sort?])
+  (import lmdb/ops :refer [get put! del! del-dup!])
+  (import lmdb/cursor
+    :refer
+    [Cursor
+     with-cursor
+     cursor-open
+     cursor-close
+     cursor-first
+     cursor-last
+     cursor-next
+     cursor-prev
+     cursor-seek
+     cursor-seek-exact
+     cursor-current
+     cursor-next-dup
+     cursor-prev-dup
+     cursor-next-nodup
+     cursor-first-dup
+     cursor-last-dup
+     cursor-seek-dup
+     cursor-dup-count
+     cursor-fold
+     cursor-fold-from
+     cursor-put!
+     cursor-del!
+     cursor-del-all-dups!])
+  ;; -------------------------------------------------------------------------
+  ;; Helpers
+  ;; -------------------------------------------------------------------------
+  ;;; tmp-dir -- a fresh empty directory under $TMPDIR (or /tmp).
+  (defn tmp-dir [] : cstr
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   #include <string.h>
   #include <unistd.h>
@@ -43,11 +77,10 @@
   if (!mkdtemp(p)) { perror("mkdtemp"); exit(1); }
   return p;
   ```)
-
-;;; db-path -- dir/c.mdb.
-(defn db-path [dir : cstr] : cstr
-  ```c
-  #include <stdio.h>
+  ;;; db-path -- dir/c.mdb.
+  (defn db-path [dir : cstr] : cstr
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   #include <string.h>
   size_t n = strlen((const char *)dir) + 16;
@@ -55,11 +88,10 @@
   snprintf(p, n, "%s/c.mdb", (const char *)dir);
   return p;
   ```)
-
-;;; cleanup -- remove dir/c.mdb, its lock file and dir.
-(defn cleanup [dir : cstr] : bool
-  ```c
-  #include <stdio.h>
+  ;;; cleanup -- remove dir/c.mdb, its lock file and dir.
+  (defn cleanup [dir : cstr] : bool
+    ```c
+    #include <stdio.h>
   #include <unistd.h>
   char p[4096];
   snprintf(p, sizeof p, "%s/c.mdb", (const char *)dir);
@@ -68,25 +100,22 @@
   ok = (unlink(p) == 0) && ok;
   return (rmdir((const char *)dir) == 0) && ok;
   ```)
-
-;;; same? -- strcmp equality.
-(defn same? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+  ;;; same? -- strcmp equality.
+  (defn same? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-;;; prefix? -- does s start with p?
-(defn prefix? [p : cstr s : cstr] : bool
-  ```c
-  #include <string.h>
+  ;;; prefix? -- does s start with p?
+  (defn prefix? [p : cstr s : cstr] : bool
+    ```c
+    #include <string.h>
   return strncmp((const char *)s, (const char *)p, strlen((const char *)p)) == 0;
   ```)
-
-;;; str3 -- a ^ b ^ c.
-(defn str3 [a : cstr b : cstr c : cstr] : cstr
-  ```c
-  #include <stdio.h>
+  ;;; str3 -- a ^ b ^ c.
+  (defn str3 [a : cstr b : cstr c : cstr] : cstr
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   #include <string.h>
   size_t n = strlen((const char *)a) + strlen((const char *)b) + strlen((const char *)c) + 1;
@@ -94,466 +123,448 @@
   snprintf(p, n, "%s%s%s", (const char *)a, (const char *)b, (const char *)c);
   return p;
   ```)
-
-;;; open-test -- an env with room for named databases, no fsync.
-(defn open-test [dir : cstr] : (Result Env LmdbError)
-  (env-open (db-path dir)
-            (opts-sync (opts-max-dbs (opts-map-size (env-opts) (* 8 1048576)) 8)
-                       (SyncNone))))
-
-;;; entry-is? -- is o (some (pair k v))?
-(defn entry-is? [o : (Option (Pair cstr cstr)) k : cstr v : cstr] : bool
-  (and (some? o)
-       (same? (pair-fst (unwrap o)) k)
-       (same? (pair-snd (unwrap o)) v)))
-
-;;; key-is? -- is o an entry with key k?
-(defn key-is? [o : (Option (Pair cstr cstr)) k : cstr] : bool
-  (and (some? o) (same? (pair-fst (unwrap o)) k)))
-
-;;; walk-fwd -- the keys from the cursor's current entry onward, concatenated.
-(defn walk-fwd [^borrow c : Cursor o : (Option (Pair cstr cstr)) acc : cstr] : cstr
-  (if (none? o)
-    acc
-    (let [k (pair-fst (unwrap o))]
-      (walk-fwd c (cursor-next c) (str3 acc k ",")))))
-
-;;; walk-back -- the keys from the cursor's current entry backward.
-(defn walk-back [^borrow c : Cursor o : (Option (Pair cstr cstr)) acc : cstr] : cstr
-  (if (none? o)
-    acc
-    (let [k (pair-fst (unwrap o))]
-      (walk-back c (cursor-prev c) (str3 acc k ",")))))
-
-;;; walk-dups -- the values of the current key, from o onward.
-(defn walk-dups [^borrow c : Cursor o : (Option (Pair cstr cstr)) acc : cstr] : cstr
-  (if (none? o)
-    acc
-    (let [v (pair-snd (unwrap o))]
-      (walk-dups c (cursor-next-dup c) (str3 acc v ",")))))
-
-;;; walk-prefix -- the keys starting with p, from o onward.
-(defn walk-prefix [^borrow c : Cursor p : cstr o : (Option (Pair cstr cstr)) acc : cstr] : cstr
-  (if (or (none? o) (not (prefix? p (pair-fst (unwrap o)))))
-    acc
-    (let [k (pair-fst (unwrap o))]
-      (walk-prefix c p (cursor-next c) (str3 acc k ",")))))
-
-;;; put-all -- put each of the five sample keys into d.
-(defn put-sample [^borrow t : Txn d : Dbi] : (Result nil LmdbError)
-  (do
-    (? (put! t d "user:carol" "3"))
-    (? (put! t d "apple" "a"))
-    (? (put! t d "user:alice" "1"))
-    (? (put! t d "zebra" "z"))
-    (put! t d "user:bob" "2")))
-
-;; -------------------------------------------------------------------------
-;; Named databases
-;; -------------------------------------------------------------------------
-
-;;; t-named-independent -- two named databases in one env do not share keys.
-(defn t-named-independent [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            w   (with-write-txn env
-                  (fn [^borrow t : Txn] : (Result bool LmdbError)
-                    (let [a (? (dbi-open t (some "a") (dbi-create)))
-                          b (? (dbi-open t (some "b") (dbi-create)))]
-                      (do
-                        (? (put! t a "k" "in-a"))
-                        (? (put! t b "k" "in-b"))
-                        (? (put! t a "only-a" "1"))
-                        (let [ga (get t a "k")
-                              gb (get t b "k")
-                              nb (get t b "only-a")]
-                          (ok (and (some? ga) (same? (unwrap ga) "in-a")
-                                   (some? gb) (same? (unwrap gb) "in-b")
-                                   (none? nb))))))))
-            ;; reopened in a later read txn, the names still resolve
-            g   (with-read-txn env
-                  (fn [^borrow t : Txn] : (Result bool LmdbError)
-                    (let [a (? (dbi-open t (some "a") (dbi-no-flags)))
-                          s (? (dbi-stat t a))]
-                      (ok (= (.entries s) 2)))))]
-        (do
-          (env-close env)
-          (and (ok? w) (ok-val w) (ok? g) (ok-val g) (cleanup dir)))))))
-
-;;; t-named-missing -- a named database opened without DbiCreate is an error.
-(defn t-named-missing [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            g   (with-read-txn env
-                  (fn [^borrow t : Txn] : (Result Dbi LmdbError)
-                    (dbi-open t (some "nope") (dbi-no-flags))))]
-        (do
-          (env-close env)
-          (and (err? g) (cleanup dir)))))))
-
-;;; t-incompatible -- a name that is a plain key of the main db is not a database.
-(defn t-incompatible [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            w   (with-write-txn env
-                  (fn [^borrow t : Txn] : (Result nil LmdbError)
-                    (put! t (? (dbi-main t)) "users" "not a database")))
-            g   (with-write-txn env
-                  (fn [^borrow t : Txn] : (Result Dbi LmdbError)
-                    (dbi-open t (some "users") (dbi-create))))
-            inc (and (err? g)
-                     (match (err-val g)
-                       (Incompatible) true
-                       _              false))]
-        (do
-          (env-close env)
-          (and (ok? w) inc (cleanup dir)))))))
-
-;;; t-flags-stick -- a database keeps the flags it was created with.
-(defn t-flags-stick [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            w   (with-write-txn env
-                  (fn [^borrow t : Txn] : (Result nil LmdbError)
-                    (let [d (? (dbi-open t (some "tags") (dbi-flags+ (dbi-create) (dbi-dup-sort))))]
-                      (do
-                        (? (put! t d "post" "b"))
-                        (put! t d "post" "a")))))
-            g   (with-read-txn env
-                  (fn [^borrow t : Txn] : (Result bool LmdbError)
-                    (let [d (? (dbi-open t (some "tags") (dbi-no-flags)))]
-                      (ok (dbi-dup-sort? t d)))))]
-        (do
-          (env-close env)
-          (and (ok? w) (ok? g) (ok-val g) (cleanup dir)))))))
-
-;;; t-drop-delete -- dbi-drop empties a database, dbi-delete removes it.
-(defn t-drop-delete [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            w   (with-write-txn env
-                  (fn [^borrow t : Txn] : (Result bool LmdbError)
-                    (let [a (? (dbi-open t (some "a") (dbi-create)))
-                          b (? (dbi-open t (some "b") (dbi-create)))]
-                      (do
-                        (? (put! t a "k" "v"))
-                        (? (put! t b "k" "v"))
-                        (? (dbi-drop t a))
-                        (? (dbi-delete t b))
-                        (ok (= (.entries (? (dbi-stat t a))) 0))))))
-            g   (with-read-txn env
-                  (fn [^borrow t : Txn] : (Result bool LmdbError)
-                    (let [a (dbi-open t (some "a") (dbi-no-flags))
-                          b (dbi-open t (some "b") (dbi-no-flags))]
-                      (ok (and (ok? a) (err? b))))))]
-        (do
-          (env-close env)
-          (and (ok? w) (ok-val w) (ok? g) (ok-val g) (cleanup dir)))))))
-
-;; -------------------------------------------------------------------------
-;; Dup-sort
-;; -------------------------------------------------------------------------
-
-;;; t-dup-sort -- a dup-sort key holds several values, visited in order;
-;;; del-dup! removes one, del! all.
-(defn t-dup-sort [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            w   (with-write-txn env
-                  (fn [^borrow t : Txn] : (Result cstr LmdbError)
-                    (let [d (? (dbi-open t (some "tags") (dbi-flags+ (dbi-create) (dbi-dup-sort))))]
-                      (do
-                        (? (put! t d "post-1" "rust"))
-                        (? (put! t d "post-1" "lisp"))
-                        (? (put! t d "post-1" "c"))
-                        (? (put! t d "post-1" "lisp"))       ;; already there: no-op
-                        (? (put! t d "post-2" "go"))
-                        (with-cursor t d
-                          (fn [^borrow c : Cursor] : (Result cstr LmdbError)
-                            (let [s   (cursor-seek-exact c "post-1")
-                                  n   (? (cursor-dup-count c))
-                                  all (walk-dups c (cursor-first-dup c) "")
-                                  rem (? (del-dup! t d "post-1" "lisp"))
-                                  gon (? (del-dup! t d "post-1" "nope"))]
-                              (if (and (= n 3) rem (not gon))
-                                (ok all)
-                                (err (MapFull))))))))))
-            after (with-read-txn env
-                    (fn [^borrow t : Txn] : (Result cstr LmdbError)
+  ;;; open-test -- an env with room for named databases, no fsync.
+  (defn open-test [dir : cstr] : (Result Env LmdbError)
+    (env-open (db-path dir)
+      (opts-sync (opts-max-dbs (opts-map-size (env-opts) (* 8 1048576)) 8)
+        (SyncNone))))
+  ;;; entry-is? -- is o (some (pair k v))?
+  (defn entry-is? [o : (Option (Pair cstr cstr)) k : cstr v : cstr] : bool
+    (and (some? o)
+      (same? (pair-fst (unwrap o)) k)
+      (same? (pair-snd (unwrap o)) v)))
+  ;;; key-is? -- is o an entry with key k?
+  (defn key-is? [o : (Option (Pair cstr cstr)) k : cstr] : bool
+    (and (some? o) (same? (pair-fst (unwrap o)) k)))
+  ;;; walk-fwd -- the keys from the cursor's current entry onward, concatenated.
+  (defn walk-fwd [^borrow c : Cursor o : (Option (Pair cstr cstr)) acc : cstr] : cstr
+    (if (none? o)
+      acc
+      (let [k (pair-fst (unwrap o))]
+        (walk-fwd c (cursor-next c) (str3 acc k ",")))))
+  ;;; walk-back -- the keys from the cursor's current entry backward.
+  (defn walk-back [^borrow c : Cursor o : (Option (Pair cstr cstr)) acc : cstr] : cstr
+    (if (none? o)
+      acc
+      (let [k (pair-fst (unwrap o))]
+        (walk-back c (cursor-prev c) (str3 acc k ",")))))
+  ;;; walk-dups -- the values of the current key, from o onward.
+  (defn walk-dups [^borrow c : Cursor o : (Option (Pair cstr cstr)) acc : cstr] : cstr
+    (if (none? o)
+      acc
+      (let [v (pair-snd (unwrap o))]
+        (walk-dups c (cursor-next-dup c) (str3 acc v ",")))))
+  ;;; walk-prefix -- the keys starting with p, from o onward.
+  (defn walk-prefix [^borrow c : Cursor
+                     p : cstr
+                     o : (Option (Pair cstr cstr))
+                     acc : cstr] : cstr
+    (if (or (none? o) (not (prefix? p (pair-fst (unwrap o)))))
+      acc
+      (let [k (pair-fst (unwrap o))]
+        (walk-prefix c p (cursor-next c) (str3 acc k ",")))))
+  ;;; put-all -- put each of the five sample keys into d.
+  (defn put-sample [^borrow t : Txn d : Dbi] : (Result nil LmdbError)
+    (do
+      (? (put! t d "user:carol" "3"))
+      (? (put! t d "apple" "a"))
+      (? (put! t d "user:alice" "1"))
+      (? (put! t d "zebra" "z"))
+      (put! t d "user:bob" "2")))
+  ;; -------------------------------------------------------------------------
+  ;; Named databases
+  ;; -------------------------------------------------------------------------
+  ;;; t-named-independent -- two named databases in one env do not share keys.
+  (defn t-named-independent [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env (ok-val r)
+              w   (with-write-txn env
+                    (fn [^borrow t : Txn] : (Result bool LmdbError)
+                      (let [a (? (dbi-open t (some "a") (dbi-create)))
+                            b (? (dbi-open t (some "b") (dbi-create)))]
+                        (do
+                          (? (put! t a "k" "in-a"))
+                          (? (put! t b "k" "in-b"))
+                          (? (put! t a "only-a" "1"))
+                          (let [ga (get t a "k")
+                                gb (get t b "k")
+                                nb (get t b "only-a")]
+                            (ok (and (some? ga)
+                                  (same? (unwrap ga) "in-a")
+                                  (some? gb)
+                                  (same? (unwrap gb) "in-b")
+                                  (none? nb))))))))
+              ;; reopened in a later read txn, the names still resolve
+              g   (with-read-txn env
+                    (fn [^borrow t : Txn] : (Result bool LmdbError)
+                      (let [a (? (dbi-open t (some "a") (dbi-no-flags)))
+                            s (? (dbi-stat t a))]
+                        (ok (= (.entries s) 2)))))]
+          (do
+            (env-close env)
+            (and (ok? w) (ok-val w) (ok? g) (ok-val g) (cleanup dir)))))))
+  ;;; t-named-missing -- a named database opened without DbiCreate is an error.
+  (defn t-named-missing [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env (ok-val r)
+              g   (with-read-txn env
+                    (fn [^borrow t : Txn] : (Result Dbi LmdbError)
+                      (dbi-open t (some "nope") (dbi-no-flags))))]
+          (do (env-close env) (and (err? g) (cleanup dir)))))))
+  ;;; t-incompatible -- a name that is a plain key of the main db is not a database.
+  (defn t-incompatible [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env (ok-val r)
+              w   (with-write-txn env
+                    (fn [^borrow t : Txn] : (Result nil LmdbError)
+                      (put! t (? (dbi-main t)) "users" "not a database")))
+              g   (with-write-txn env
+                    (fn [^borrow t : Txn] : (Result Dbi LmdbError)
+                      (dbi-open t (some "users") (dbi-create))))
+              inc (and (err? g) (match (err-val g) (Incompatible) true _ false))]
+          (do (env-close env) (and (ok? w) inc (cleanup dir)))))))
+  ;;; t-flags-stick -- a database keeps the flags it was created with.
+  (defn t-flags-stick [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env (ok-val r)
+              w   (with-write-txn env
+                    (fn [^borrow t : Txn] : (Result nil LmdbError)
+                      (let [d (? (dbi-open t
+                                   (some "tags")
+                                   (dbi-flags+ (dbi-create) (dbi-dup-sort))))]
+                        (do (? (put! t d "post" "b")) (put! t d "post" "a")))))
+              g   (with-read-txn env
+                    (fn [^borrow t : Txn] : (Result bool LmdbError)
                       (let [d (? (dbi-open t (some "tags") (dbi-no-flags)))]
-                        (with-cursor t d
-                          (fn [^borrow c : Cursor] : (Result cstr LmdbError)
-                            (ok (walk-dups c (cursor-seek-exact c "post-1") "")))))))
-            del-all (with-write-txn env
-                      (fn [^borrow t : Txn] : (Result bool LmdbError)
-                        (let [d (? (dbi-open t (some "tags") (dbi-no-flags)))]
-                          (do
-                            (? (del! t d "post-1"))
-                            (ok (none? (get t d "post-1")))))))]
-        (do
-          (env-close env)
-          (and (ok? w) (same? (ok-val w) "c,lisp,rust,")
-               (ok? after) (same? (ok-val after) "c,rust,")
-               (ok? del-all) (ok-val del-all)
-               (cleanup dir)))))))
-
-;;; t-dup-nav -- next-nodup, prev-dup, last-dup and seek-dup on dup-sort data.
-(defn t-dup-nav [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            w   (with-write-txn env
-                  (fn [^borrow t : Txn] : (Result bool LmdbError)
-                    (let [d (? (dbi-open t (some "idx") (dbi-flags+ (dbi-create) (dbi-dup-sort))))]
-                      (do
-                        (? (put! t d "a" "1"))
-                        (? (put! t d "a" "2"))
-                        (? (put! t d "a" "3"))
-                        (? (put! t d "b" "9"))
-                        (with-cursor t d
-                          (fn [^borrow c : Cursor] : (Result bool LmdbError)
-                            (let [f  (cursor-first c)
-                                  nd (cursor-next-nodup c)
-                                  ld (do (cursor-seek-exact c "a") (cursor-last-dup c))
-                                  pd (cursor-prev-dup c)
-                                  sd (cursor-seek-dup c "a" "15")
-                                  no (cursor-seek-dup c "a" "4")]
-                              (ok (and (entry-is? f "a" "1")
-                                       (entry-is? nd "b" "9")
-                                       (entry-is? ld "a" "3")
-                                       (entry-is? pd "a" "2")
-                                       (entry-is? sd "a" "2")
-                                       (none? no))))))))))]
-        (do
-          (env-close env)
-          (and (ok? w) (ok-val w) (cleanup dir)))))))
-
-;; -------------------------------------------------------------------------
-;; Cursors
-;; -------------------------------------------------------------------------
-
-;;; t-walk -- first/next and last/prev walk the sorted order both ways.
-(defn t-walk [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            w   (with-write-txn env
-                  (fn [^borrow t : Txn] : (Result nil LmdbError)
-                    (put-sample t (? (dbi-main t)))))
-            g   (with-read-txn env
-                  (fn [^borrow t : Txn] : (Result bool LmdbError)
-                    (with-cursor t (? (dbi-main t))
-                      (fn [^borrow c : Cursor] : (Result bool LmdbError)
-                        (let [fwd  (walk-fwd c (cursor-first c) "")
-                              back (walk-back c (cursor-last c) "")
-                              cur  (do (cursor-first c) (cursor-current c))]
-                          (ok (and (same? fwd "apple,user:alice,user:bob,user:carol,zebra,")
-                                   (same? back "zebra,user:carol,user:bob,user:alice,apple,")
-                                   (key-is? cur "apple"))))))))]
-        (do
-          (env-close env)
-          (and (ok? w) (ok? g) (ok-val g) (cleanup dir)))))))
-
-;;; t-prefix-scan -- cursor-seek lands on the first key >= its argument.
-(defn t-prefix-scan [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            w   (with-write-txn env
-                  (fn [^borrow t : Txn] : (Result nil LmdbError)
-                    (put-sample t (? (dbi-main t)))))
-            g   (with-read-txn env
-                  (fn [^borrow t : Txn] : (Result bool LmdbError)
-                    (with-cursor t (? (dbi-main t))
-                      (fn [^borrow c : Cursor] : (Result bool LmdbError)
-                        (let [users (walk-prefix c "user:" (cursor-seek c "user:") "")
-                              mid   (cursor-seek c "user:b")
-                              past  (cursor-seek c "zzz")
-                              start (cursor-seek c "")
-                              exact (cursor-seek-exact c "user:bo")
-                              hit   (cursor-seek-exact c "user:bob")]
-                          (ok (and (same? users "user:alice,user:bob,user:carol,")
-                                   (entry-is? mid "user:bob" "2")
-                                   (none? past)
-                                   (key-is? start "apple")
-                                   (none? exact)
-                                   (entry-is? hit "user:bob" "2"))))))))]
-        (do
-          (env-close env)
-          (and (ok? w) (ok? g) (ok-val g) (cleanup dir)))))))
-
-;;; count-entry -- a cursor-fold step: count, freeing the copies.
-(defn count-entry [n : int k : cstr v : cstr] : int
-  ```c
-  #include <stdlib.h>
+                        (ok (dbi-dup-sort? t d)))))]
+          (do (env-close env) (and (ok? w) (ok? g) (ok-val g) (cleanup dir)))))))
+  ;;; t-drop-delete -- dbi-drop empties a database, dbi-delete removes it.
+  (defn t-drop-delete [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env (ok-val r)
+              w   (with-write-txn env
+                    (fn [^borrow t : Txn] : (Result bool LmdbError)
+                      (let [a (? (dbi-open t (some "a") (dbi-create)))
+                            b (? (dbi-open t (some "b") (dbi-create)))]
+                        (do
+                          (? (put! t a "k" "v"))
+                          (? (put! t b "k" "v"))
+                          (? (dbi-drop t a))
+                          (? (dbi-delete t b))
+                          (ok (= (.entries (? (dbi-stat t a))) 0))))))
+              g   (with-read-txn env
+                    (fn [^borrow t : Txn] : (Result bool LmdbError)
+                      (let [a (dbi-open t (some "a") (dbi-no-flags))
+                            b (dbi-open t (some "b") (dbi-no-flags))]
+                        (ok (and (ok? a) (err? b))))))]
+          (do
+            (env-close env)
+            (and (ok? w) (ok-val w) (ok? g) (ok-val g) (cleanup dir)))))))
+  ;; -------------------------------------------------------------------------
+  ;; Dup-sort
+  ;; -------------------------------------------------------------------------
+  ;;; t-dup-sort -- a dup-sort key holds several values, visited in order;
+  ;;; del-dup! removes one, del! all.
+  (defn t-dup-sort [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env     (ok-val r)
+              w       (with-write-txn env
+                        (fn [^borrow t : Txn] : (Result cstr LmdbError)
+                          (let [d (? (dbi-open t
+                                       (some "tags")
+                                       (dbi-flags+ (dbi-create) (dbi-dup-sort))))]
+                            (do
+                              (? (put! t d "post-1" "rust"))
+                              (? (put! t d "post-1" "lisp"))
+                              (? (put! t d "post-1" "c"))
+                              (? (put! t d "post-1" "lisp")) ;; already there: no-op
+                              (? (put! t d "post-2" "go"))
+                              (with-cursor t
+                                d
+                                (fn [^borrow c : Cursor] : (Result cstr
+                                                             LmdbError)
+                                  (let [s   (cursor-seek-exact c "post-1")
+                                        n   (? (cursor-dup-count c))
+                                        all (walk-dups c
+                                              (cursor-first-dup c)
+                                              "")
+                                        rem (? (del-dup! t d "post-1" "lisp"))
+                                        gon (? (del-dup! t d "post-1" "nope"))]
+                                    (if (and (= n 3) rem (not gon))
+                                      (ok all)
+                                      (err (MapFull))))))))))
+              after   (with-read-txn env
+                        (fn [^borrow t : Txn] : (Result cstr LmdbError)
+                          (let [d (? (dbi-open t (some "tags") (dbi-no-flags)))]
+                            (with-cursor t
+                              d
+                              (fn [^borrow c : Cursor] : (Result cstr LmdbError)
+                                (ok (walk-dups c
+                                      (cursor-seek-exact c "post-1")
+                                      "")))))))
+              del-all (with-write-txn env
+                        (fn [^borrow t : Txn] : (Result bool LmdbError)
+                          (let [d (? (dbi-open t (some "tags") (dbi-no-flags)))]
+                            (do
+                              (? (del! t d "post-1"))
+                              (ok (none? (get t d "post-1")))))))]
+          (do
+            (env-close env)
+            (and (ok? w)
+              (same? (ok-val w) "c,lisp,rust,")
+              (ok? after)
+              (same? (ok-val after) "c,rust,")
+              (ok? del-all)
+              (ok-val del-all)
+              (cleanup dir)))))))
+  ;;; t-dup-nav -- next-nodup, prev-dup, last-dup and seek-dup on dup-sort data.
+  (defn t-dup-nav [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env (ok-val r)
+              w   (with-write-txn env
+                    (fn [^borrow t : Txn] : (Result bool LmdbError)
+                      (let [d (? (dbi-open t
+                                   (some "idx")
+                                   (dbi-flags+ (dbi-create) (dbi-dup-sort))))]
+                        (do
+                          (? (put! t d "a" "1"))
+                          (? (put! t d "a" "2"))
+                          (? (put! t d "a" "3"))
+                          (? (put! t d "b" "9"))
+                          (with-cursor t
+                            d
+                            (fn [^borrow c : Cursor] : (Result bool LmdbError)
+                              (let [f  (cursor-first c)
+                                    nd (cursor-next-nodup c)
+                                    ld (do
+                                         (cursor-seek-exact c "a")
+                                         (cursor-last-dup c))
+                                    pd (cursor-prev-dup c)
+                                    sd (cursor-seek-dup c "a" "15")
+                                    no (cursor-seek-dup c "a" "4")]
+                                (ok (and (entry-is? f "a" "1")
+                                      (entry-is? nd "b" "9")
+                                      (entry-is? ld "a" "3")
+                                      (entry-is? pd "a" "2")
+                                      (entry-is? sd "a" "2")
+                                      (none? no))))))))))]
+          (do (env-close env) (and (ok? w) (ok-val w) (cleanup dir)))))))
+  ;; -------------------------------------------------------------------------
+  ;; Cursors
+  ;; -------------------------------------------------------------------------
+  ;;; t-walk -- first/next and last/prev walk the sorted order both ways.
+  (defn t-walk [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env (ok-val r)
+              w   (with-write-txn env
+                    (fn [^borrow t : Txn] : (Result nil LmdbError)
+                      (put-sample t (? (dbi-main t)))))
+              g   (with-read-txn env
+                    (fn [^borrow t : Txn] : (Result bool LmdbError)
+                      (with-cursor t
+                        (? (dbi-main t))
+                        (fn [^borrow c : Cursor] : (Result bool LmdbError)
+                          (let [fwd  (walk-fwd c (cursor-first c) "")
+                                back (walk-back c (cursor-last c) "")
+                                cur  (do (cursor-first c) (cursor-current c))]
+                            (ok (and (same? fwd
+                                       "apple,user:alice,user:bob,user:carol,zebra,")
+                                  (same? back
+                                    "zebra,user:carol,user:bob,user:alice,apple,")
+                                  (key-is? cur "apple"))))))))]
+          (do (env-close env) (and (ok? w) (ok? g) (ok-val g) (cleanup dir)))))))
+  ;;; t-prefix-scan -- cursor-seek lands on the first key >= its argument.
+  (defn t-prefix-scan [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env (ok-val r)
+              w   (with-write-txn env
+                    (fn [^borrow t : Txn] : (Result nil LmdbError)
+                      (put-sample t (? (dbi-main t)))))
+              g   (with-read-txn env
+                    (fn [^borrow t : Txn] : (Result bool LmdbError)
+                      (with-cursor t
+                        (? (dbi-main t))
+                        (fn [^borrow c : Cursor] : (Result bool LmdbError)
+                          (let [users (walk-prefix c
+                                        "user:"
+                                        (cursor-seek c "user:")
+                                        "")
+                                mid   (cursor-seek c "user:b")
+                                past  (cursor-seek c "zzz")
+                                start (cursor-seek c "")
+                                exact (cursor-seek-exact c "user:bo")
+                                hit   (cursor-seek-exact c "user:bob")]
+                            (ok (and (same? users
+                                       "user:alice,user:bob,user:carol,")
+                                  (entry-is? mid "user:bob" "2")
+                                  (none? past)
+                                  (key-is? start "apple")
+                                  (none? exact)
+                                  (entry-is? hit "user:bob" "2"))))))))]
+          (do (env-close env) (and (ok? w) (ok? g) (ok-val g) (cleanup dir)))))))
+  ;;; count-entry -- a cursor-fold step: count, freeing the copies.
+  (defn count-entry [n : int k : cstr v : cstr] : int
+    ```c
+    #include <stdlib.h>
   free((void *)k); free((void *)v);
   return n + 1;
   ```)
-
-;;; t-fold -- cursor-fold visits every entry; cursor-fold-from starts at a key.
-(defn t-fold [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            w   (with-write-txn env
-                  (fn [^borrow t : Txn] : (Result nil LmdbError)
-                    (put-sample t (? (dbi-main t)))))
-            g   (with-read-txn env
-                  (fn [^borrow t : Txn] : (Result bool LmdbError)
-                    (with-cursor t (? (dbi-main t))
-                      (fn [^borrow c : Cursor] : (Result bool LmdbError)
-                        (let [all  (cursor-fold c 0 count-entry)
-                              keys (cursor-fold-from c "user:" "" (fn [acc : cstr k : cstr v : cstr] : cstr (str3 acc k ",")))
-                              none (cursor-fold-from c "zzz" 0 count-entry)]
-                          (ok (and (= all 5)
-                                   (same? keys "user:alice,user:bob,user:carol,zebra,")
-                                   (= none 0))))))))]
-        (do
-          (env-close env)
-          (and (ok? w) (ok? g) (ok-val g) (cleanup dir)))))))
-
-;;; t-reverse-key -- DbiReverseKey compares keys from the last byte.
-(defn t-reverse-key [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            g   (with-write-txn env
-                  (fn [^borrow t : Txn] : (Result cstr LmdbError)
-                    (let [d (? (dbi-open t (some "rev") (dbi-flags+ (dbi-create) (dbi-reverse-key))))]
-                      (do
-                        (? (put! t d "ab" "1"))
-                        (? (put! t d "ba" "2"))
-                        (? (put! t d "ca" "3"))
-                        (with-cursor t d
-                          (fn [^borrow c : Cursor] : (Result cstr LmdbError)
-                            (ok (walk-fwd c (cursor-first c) ""))))))))]
-        (do
-          (env-close env)
-          (and (ok? g) (same? (ok-val g) "ba,ca,ab,") (cleanup dir)))))))
-
-;;; t-cursor-write -- cursor-put! and cursor-del! edit through the cursor.
-(defn t-cursor-write [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            w   (with-write-txn env
-                  (fn [^borrow t : Txn] : (Result nil LmdbError)
-                    (with-cursor t (? (dbi-main t))
-                      (fn [^borrow c : Cursor] : (Result nil LmdbError)
+  ;;; t-fold -- cursor-fold visits every entry; cursor-fold-from starts at a key.
+  (defn t-fold [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env (ok-val r)
+              w   (with-write-txn env
+                    (fn [^borrow t : Txn] : (Result nil LmdbError)
+                      (put-sample t (? (dbi-main t)))))
+              g   (with-read-txn env
+                    (fn [^borrow t : Txn] : (Result bool LmdbError)
+                      (with-cursor t
+                        (? (dbi-main t))
+                        (fn [^borrow c : Cursor] : (Result bool LmdbError)
+                          (let [all  (cursor-fold c 0 count-entry)
+                                keys (cursor-fold-from c
+                                       "user:"
+                                       ""
+                                       (fn [acc : cstr k : cstr v : cstr] : cstr
+                                         (str3 acc k ",")))
+                                none (cursor-fold-from c "zzz" 0 count-entry)]
+                            (ok (and (= all 5)
+                                  (same? keys
+                                    "user:alice,user:bob,user:carol,zebra,")
+                                  (= none 0))))))))]
+          (do (env-close env) (and (ok? w) (ok? g) (ok-val g) (cleanup dir)))))))
+  ;;; t-reverse-key -- DbiReverseKey compares keys from the last byte.
+  (defn t-reverse-key [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env (ok-val r)
+              g   (with-write-txn env
+                    (fn [^borrow t : Txn] : (Result cstr LmdbError)
+                      (let [d (? (dbi-open t
+                                   (some "rev")
+                                   (dbi-flags+ (dbi-create) (dbi-reverse-key))))]
                         (do
-                          (? (cursor-put! c "a" "1"))
-                          (? (cursor-put! c "b" "2"))
-                          (? (cursor-put! c "c" "3"))
-                          (cursor-seek-exact c "b")
-                          (cursor-del! c))))))
-            g   (with-read-txn env
-                  (fn [^borrow t : Txn] : (Result cstr LmdbError)
-                    (with-cursor t (? (dbi-main t))
-                      (fn [^borrow c : Cursor] : (Result cstr LmdbError)
-                        (ok (walk-fwd c (cursor-first c) ""))))))]
-        (do
-          (env-close env)
-          (and (ok? w) (ok? g) (same? (ok-val g) "a,c,") (cleanup dir)))))))
-
-;;; t-raw-cursor -- cursor-open / cursor-close by hand; empty db has no first.
-(defn t-raw-cursor [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env (ok-val r)
-            g   (with-read-txn env
-                  (fn [^borrow t : Txn] : (Result bool LmdbError)
-                    (let [c     (? (cursor-open t (? (dbi-main t))))
-                          empty (none? (cursor-first c))
-                          nxt   (none? (cursor-next c))]
-                      (do
-                        (cursor-close c)
-                        (ok (and empty nxt))))))]
-        (do
-          (env-close env)
-          (and (ok? g) (ok-val g) (cleanup dir)))))))
-
-;;; t-cursor-panic -- with-cursor closes its cursor when the callback panics,
-;;; and the read txn around it still ends.
-(defn panicky-scan [^borrow env : Env] : int
-  (let [g (with-read-txn env
-            (fn [^borrow t : Txn] : (Result nil LmdbError)
-              (with-cursor t (? (dbi-main t))
-                (fn [^borrow c : Cursor] : (Result nil LmdbError)
-                  (let [f (cursor-first c)]
-                    (panic "deliberate"))))))]
-    0))
-
-(defn t-cursor-panic [] : bool
-  (let [dir (tmp-dir)
-        r   (open-test dir)]
-    (if (err? r)
-      false
-      (let [env    (ok-val r)
-            caught (catch-unwind (fn [] : int (panicky-scan env)))
-            w      (with-write-txn env
-                     (fn [^borrow t : Txn] : (Result nil LmdbError)
-                       (put! t (? (dbi-main t)) "after" "ok")))]
-        (do
-          (env-close env)
-          (and (err? caught) (ok? w) (cleanup dir)))))))
-
-;; -------------------------------------------------------------------------
-
-(defn __all-tests [] : void
-  (describe "named databases"
-    (it "two named databases are independent"            (t-named-independent))
-    (it "opening a missing name without DbiCreate fails" (t-named-missing))
-    (it "a name that is a plain key is Incompatible"     (t-incompatible))
-    (it "a database keeps the flags it was created with" (t-flags-stick))
-    (it "dbi-drop empties, dbi-delete removes"           (t-drop-delete)))
-
-  (describe "dup-sort"
-    (it "values visited in order; del-dup! removes one"  (t-dup-sort))
-    (it "nodup, prev-dup, last-dup and seek-dup"         (t-dup-nav)))
-
-  (describe "cursors"
-    (it "first/next and last/prev walk both ways"        (t-walk))
-    (it "cursor-seek is a range/prefix scan"             (t-prefix-scan))
-    (it "cursor-fold and cursor-fold-from"               (t-fold))
-    (it "DbiReverseKey sorts from the last byte"         (t-reverse-key))
-    (it "cursor-put! and cursor-del!"                    (t-cursor-write))
-    (it "cursor-open / cursor-close by hand"             (t-raw-cursor))
-    (it "with-cursor closes on panic"                    (t-cursor-panic))))
-
-(defn main [] : int
-  (__all-tests)
-  (run-all-status))
-
-) ;; end defmodule lmdb/tests/cursor
+                          (? (put! t d "ab" "1"))
+                          (? (put! t d "ba" "2"))
+                          (? (put! t d "ca" "3"))
+                          (with-cursor t
+                            d
+                            (fn [^borrow c : Cursor] : (Result cstr LmdbError)
+                              (ok (walk-fwd c (cursor-first c) ""))))))))]
+          (do
+            (env-close env)
+            (and (ok? g) (same? (ok-val g) "ba,ca,ab,") (cleanup dir)))))))
+  ;;; t-cursor-write -- cursor-put! and cursor-del! edit through the cursor.
+  (defn t-cursor-write [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env (ok-val r)
+              w   (with-write-txn env
+                    (fn [^borrow t : Txn] : (Result nil LmdbError)
+                      (with-cursor t
+                        (? (dbi-main t))
+                        (fn [^borrow c : Cursor] : (Result nil LmdbError)
+                          (do
+                            (? (cursor-put! c "a" "1"))
+                            (? (cursor-put! c "b" "2"))
+                            (? (cursor-put! c "c" "3"))
+                            (cursor-seek-exact c "b")
+                            (cursor-del! c))))))
+              g   (with-read-txn env
+                    (fn [^borrow t : Txn] : (Result cstr LmdbError)
+                      (with-cursor t
+                        (? (dbi-main t))
+                        (fn [^borrow c : Cursor] : (Result cstr LmdbError)
+                          (ok (walk-fwd c (cursor-first c) ""))))))]
+          (do
+            (env-close env)
+            (and (ok? w) (ok? g) (same? (ok-val g) "a,c,") (cleanup dir)))))))
+  ;;; t-raw-cursor -- cursor-open / cursor-close by hand; empty db has no first.
+  (defn t-raw-cursor [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env (ok-val r)
+              g   (with-read-txn env
+                    (fn [^borrow t : Txn] : (Result bool LmdbError)
+                      (let [c     (? (cursor-open t (? (dbi-main t))))
+                            empty (none? (cursor-first c))
+                            nxt   (none? (cursor-next c))]
+                        (do (cursor-close c) (ok (and empty nxt))))))]
+          (do (env-close env) (and (ok? g) (ok-val g) (cleanup dir)))))))
+  ;;; t-cursor-panic -- with-cursor closes its cursor when the callback panics,
+  ;;; and the read txn around it still ends.
+  (defn panicky-scan [^borrow env : Env] : int
+    (let [g (with-read-txn env
+              (fn [^borrow t : Txn] : (Result nil LmdbError)
+                (with-cursor t
+                  (? (dbi-main t))
+                  (fn [^borrow c : Cursor] : (Result nil LmdbError)
+                    (let [f (cursor-first c)] (panic "deliberate"))))))]
+      0))
+  (defn t-cursor-panic [] : bool
+    (let [dir (tmp-dir)
+          r   (open-test dir)]
+      (if (err? r)
+        false
+        (let [env    (ok-val r)
+              caught (catch-unwind (fn [] : int (panicky-scan env)))
+              w      (with-write-txn env
+                       (fn [^borrow t : Txn] : (Result nil LmdbError)
+                         (put! t (? (dbi-main t)) "after" "ok")))]
+          (do (env-close env) (and (err? caught) (ok? w) (cleanup dir)))))))
+  ;; -------------------------------------------------------------------------
+  (defn __all-tests [] : void
+    (describe "named databases"
+      (it "two named databases are independent" (t-named-independent))
+      (it "opening a missing name without DbiCreate fails" (t-named-missing))
+      (it "a name that is a plain key is Incompatible" (t-incompatible))
+      (it "a database keeps the flags it was created with" (t-flags-stick))
+      (it "dbi-drop empties, dbi-delete removes" (t-drop-delete)))
+    (describe "dup-sort"
+      (it "values visited in order; del-dup! removes one" (t-dup-sort))
+      (it "nodup, prev-dup, last-dup and seek-dup" (t-dup-nav)))
+    (describe "cursors"
+      (it "first/next and last/prev walk both ways" (t-walk))
+      (it "cursor-seek is a range/prefix scan" (t-prefix-scan))
+      (it "cursor-fold and cursor-fold-from" (t-fold))
+      (it "DbiReverseKey sorts from the last byte" (t-reverse-key))
+      (it "cursor-put! and cursor-del!" (t-cursor-write))
+      (it "cursor-open / cursor-close by hand" (t-raw-cursor))
+      (it "with-cursor closes on panic" (t-cursor-panic))))
+  (defn main [] : int (__all-tests) (run-all-status))) ;; end defmodule lmdb/tests/cursor

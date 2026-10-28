@@ -7,122 +7,98 @@
 ;; cookie-sign now returns an owned String and cookie-unsign an owned ok-value
 ;; String (v0.3.0); the helpers below borrow with ownstr/to-cstr and release.
 (defmodule session/tests/cookie-signing
-  (import test/suite  :refer [describe it])
+  (import test/suite :refer [describe it])
   (import test/assert :refer [assert-true])
   (import test/runner :refer [run-all-status])
   (import session/cookie :refer [cookie-sign cookie-unsign])
   (import session/ownstr :refer [String to-cstr release])
-  (import session/hmac   :refer [hmac-sign ct-eq?])
-
-(defn seq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+  (import session/hmac :refer [hmac-sign ct-eq?])
+  (defn seq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn has-dot? [s : cstr] : bool
-  ```c
-  #include <string.h>
+  (defn has-dot? [s : cstr] : bool
+    ```c
+    #include <string.h>
   return strchr((const char *)s, '.') != 0;
   ```)
-
-(defn __free [s : cstr] : void
-  ```c
-  #include <stdlib.h>
+  (defn __free [s : cstr] : void
+    ```c
+    #include <stdlib.h>
   free((void *)(intptr_t)s);
   ```)
-
-;; flip the last character of a string (in place on a fresh copy) to forge a MAC.
-(defn tamper [s : cstr] : cstr
-  ```c
-  #include <stdlib.h>
+  ;; flip the last character of a string (in place on a fresh copy) to forge a MAC.
+  (defn tamper [s : cstr] : cstr
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   char *out = strdup((const char *)s);
   size_t n = strlen(out);
   if (n) out[n-1] = (out[n-1] == 'A') ? 'B' : 'A';
   return (const char *)out;
   ```)
-
-;; -- String-aware wrappers around the owned returns --------------------------
-
-;; unsign a cstr value; true iff it recovers to `want`. Releases the ok String.
-(defn unsign-ok-is? [key : cstr value : cstr want : cstr] : bool
-  (let [r (cookie-unsign key value)]
-    (if (ok? r)
-      (let [id (ok-val r)
-            eq (seq? (to-cstr id) want)]
-        (do (release id) eq))
-      false)))
-
-;; unsign a cstr value; true iff it is rejected. Releases any (unexpected) ok.
-(defn unsign-rejects? [key : cstr value : cstr] : bool
-  (let [r (cookie-unsign key value)]
-    (if (ok? r)
-      (do (release (ok-val r)) false)
-      true)))
-
-;; sign under `key`; true iff the signed value contains a '.'.
-(defn signed-has-dot? [key : cstr id : cstr] : bool
-  (let [s (cookie-sign key id)
-        r (has-dot? (to-cstr s))]
-    (do (release s) r)))
-
-;; sign under `key`; true iff the signed value equals `want` verbatim.
-(defn signed-eq? [key : cstr id : cstr want : cstr] : bool
-  (let [s (cookie-sign key id)
-        r (seq? (to-cstr s) want)]
-    (do (release s) r)))
-
-;; sign then unsign under the same key; true iff it round-trips to `want`.
-(defn sign-roundtrips? [key : cstr id : cstr want : cstr] : bool
-  (let [s (cookie-sign key id)
-        r (unsign-ok-is? key (to-cstr s) want)]
-    (do (release s) r)))
-
-;; sign under `sign-key`, unsign under `verify-key`; true iff rejected.
-(defn crosskey-rejected? [sign-key : cstr verify-key : cstr id : cstr] : bool
-  (let [s (cookie-sign sign-key id)
-        r (unsign-rejects? verify-key (to-cstr s))]
-    (do (release s) r)))
-
-;; sign, tamper the value, unsign the tampered copy; true iff rejected.
-(defn tampered-rejected? [key : cstr id : cstr] : bool
-  (let [s (cookie-sign key id)
-        t (tamper (to-cstr s))
-        r (unsign-rejects? key t)]
-    (do (release s) (__free t) r)))
-
-(defn main [] : int
- (do
-  (describe "session/cookie-signing"
-    (it "signed value is <id>.<mac>"
-      (assert-true (signed-has-dot? "secret" "abc123")))
-
-    (it "off-by-default leaves the value unchanged"
-      (assert-true (signed-eq? "" "abc123" "abc123")))
-
-    (it "round-trips a signed value back to the id"
-      (assert-true (sign-roundtrips? "secret" "abc123" "abc123")))
-
-    (it "unsign with no key passes the value through"
-      (assert-true (unsign-ok-is? "" "abc123" "abc123")))
-
-    (it "rejects a tampered MAC (treated as unknown id)"
-      (assert-true (tampered-rejected? "secret" "abc123")))
-
-    (it "rejects a value with no signature when a key is set"
-      (assert-true (unsign-rejects? "secret" "abc123")))
-
-    (it "rejects a signature made under a different key"
-      (assert-true (crosskey-rejected? "other-key" "secret" "abc123")))
-
-    (it "hmac handles an empty key without crashing"
-      (assert-true (ct-eq? (hmac-sign "" "msg") (hmac-sign "" "msg"))))
-
-    (it "hmac handles a long (>64 byte) key"
-      (assert-true (ct-eq?
-        (hmac-sign "0123456789012345678901234567890123456789012345678901234567890123456789" "m")
-        (hmac-sign "0123456789012345678901234567890123456789012345678901234567890123456789" "m")))))
-  (run-all-status)))
-
-) ;; end module
+  ;; -- String-aware wrappers around the owned returns --------------------------
+  ;; unsign a cstr value; true iff it recovers to `want`. Releases the ok String.
+  (defn unsign-ok-is? [key : cstr value : cstr want : cstr] : bool
+    (let [r (cookie-unsign key value)]
+      (if (ok? r)
+        (let [id (ok-val r)
+              eq (seq? (to-cstr id) want)]
+          (do (release id) eq))
+        false)))
+  ;; unsign a cstr value; true iff it is rejected. Releases any (unexpected) ok.
+  (defn unsign-rejects? [key : cstr value : cstr] : bool
+    (let [r (cookie-unsign key value)]
+      (if (ok? r) (do (release (ok-val r)) false) true)))
+  ;; sign under `key`; true iff the signed value contains a '.'.
+  (defn signed-has-dot? [key : cstr id : cstr] : bool
+    (let [s (cookie-sign key id)
+          r (has-dot? (to-cstr s))]
+      (do (release s) r)))
+  ;; sign under `key`; true iff the signed value equals `want` verbatim.
+  (defn signed-eq? [key : cstr id : cstr want : cstr] : bool
+    (let [s (cookie-sign key id)
+          r (seq? (to-cstr s) want)]
+      (do (release s) r)))
+  ;; sign then unsign under the same key; true iff it round-trips to `want`.
+  (defn sign-roundtrips? [key : cstr id : cstr want : cstr] : bool
+    (let [s (cookie-sign key id)
+          r (unsign-ok-is? key (to-cstr s) want)]
+      (do (release s) r)))
+  ;; sign under `sign-key`, unsign under `verify-key`; true iff rejected.
+  (defn crosskey-rejected? [sign-key : cstr verify-key : cstr id : cstr] : bool
+    (let [s (cookie-sign sign-key id)
+          r (unsign-rejects? verify-key (to-cstr s))]
+      (do (release s) r)))
+  ;; sign, tamper the value, unsign the tampered copy; true iff rejected.
+  (defn tampered-rejected? [key : cstr id : cstr] : bool
+    (let [s (cookie-sign key id)
+          t (tamper (to-cstr s))
+          r (unsign-rejects? key t)]
+      (do (release s) (__free t) r)))
+  (defn main [] : int
+    (do
+      (describe "session/cookie-signing"
+        (it "signed value is <id>.<mac>"
+          (assert-true (signed-has-dot? "secret" "abc123")))
+        (it "off-by-default leaves the value unchanged"
+          (assert-true (signed-eq? "" "abc123" "abc123")))
+        (it "round-trips a signed value back to the id"
+          (assert-true (sign-roundtrips? "secret" "abc123" "abc123")))
+        (it "unsign with no key passes the value through"
+          (assert-true (unsign-ok-is? "" "abc123" "abc123")))
+        (it "rejects a tampered MAC (treated as unknown id)"
+          (assert-true (tampered-rejected? "secret" "abc123")))
+        (it "rejects a value with no signature when a key is set"
+          (assert-true (unsign-rejects? "secret" "abc123")))
+        (it "rejects a signature made under a different key"
+          (assert-true (crosskey-rejected? "other-key" "secret" "abc123")))
+        (it "hmac handles an empty key without crashing"
+          (assert-true (ct-eq? (hmac-sign "" "msg") (hmac-sign "" "msg"))))
+        (it "hmac handles a long (>64 byte) key"
+          (assert-true (ct-eq? (hmac-sign "0123456789012345678901234567890123456789012345678901234567890123456789"
+                                 "m")
+                         (hmac-sign "0123456789012345678901234567890123456789012345678901234567890123456789"
+                           "m")))))
+      (run-all-status)))) ;; end module

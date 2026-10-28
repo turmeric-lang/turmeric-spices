@@ -4,71 +4,63 @@
 ;; tests/fixtures/vec-typed-fat-closure-readback/ in the turmeric repo
 ;; (the regression that shipped with PR #288 closing five interacting
 ;; closure/fat-dispatch gaps that previously blocked this exact shape).
-
 (defmodule signal/compose
   (export effects-chain)
-
-;;; __apply-sf -- apply one SF to a signal, returning the resulting signal.
-;;;
-;;; The SF parameter type is spelled as the carrier shape
-;;; `(fn [ptr<void>] ptr<void>)` rather than the higher-order
-;;; `(fn [(fn [float] float)] (fn [float] float))`: the fat-dispatch ABI
-;;; casts slot 0 to the SF's declared parameter ABI (a closure box pointer),
-;;; not to the inner :float thunk signature. Trying to spell the
-;;; higher-order shape directly would mis-declare the call site.
-(defn __apply-sf
-  [^fat sf  : (fn [ptr<void>] #fx{} ptr<void>)
-   ^fat sig : (fn [float]     #fx{} float)] : ptr<void>
-  (sf sig))
-
-;;; The Vec is read with stdlib's `vec-get` / `vec-len` through a
-;;; `(Vec ptr<void>)` ascription, NOT with a typed element.  Spelling the
-;;; parameter as `(Vec (fn [(fn [float] float)] (fn [float] float)))` and
-;;; letting `vec-get` return the element type compiles clean and then takes
-;;; SIGBUS at run time before printing anything -- the elements are fat
-;;; closure boxes, and the typed readback is the shape the module header's
-;;; PR #288 note is about.  The carrier ascription hands `__apply-sf` the
-;;; same `ptr<void>` the hand-rolled reader used to.
-;;; __chain-loop -- threading recursion for effects-chain.
-;;;
-;;; The self-call's result is ascribed `:ptr<void>` so the `if`-branch
-;;; type-unifier sees both arms as fat boxes (matching the PR #288 fix);
-;;; without the ascription a forward-reference into the same defmodule
-;;; widens the recursion's inferred return to `int`, breaking the
-;;; unification.
-(defn __chain-loop
-  [effects  : int
-   ^fat sig : (fn [float] #fx{} float)
-   i : int
-   n : int] : ptr<void>
-  (if (>= i n)
-    sig
-    (:: (__chain-loop effects
-                      (__apply-sf (vec-get (:: effects (Vec ptr<void>)) i) sig)
-                      (+ i 1)
-                      n) :ptr<void>)))
-
-;;; effects-chain -- apply a vector of effects in order to an input signal.
-;;;
-;;; Parameters:
-;;;   effects -- Vec of SF (Sample Sample) processors, applied left-to-right
-;;;   input   -- source Signal Sample
-;;;
-;;; Returns:
-;;;   Signal Sample with each effect applied in order.
-;;;
-;;; Callers wanting to invoke the result as a closure should re-bind it
-;;; with `^fat`, e.g.
-;;;   (let [^fat out : (fn [float] #{} float)
-;;;              (effects-chain (vec-of (gain 0.5) (low-pass 0.3)) my-osc)]
-;;;     (out 0.0))
-;;;
-;;; Example:
-;;;   (let [chain (effects-chain (vec-of (gain 0.5) (low-pass 0.3))
-;;;                              (sine 440.0 0.0))]
-;;;     chain)
-(defn effects-chain
-  [effects : int ^fat input : (fn [float] #fx{} float)] : ptr<void>
-  (__chain-loop effects input 0 (vec-len (:: effects (Vec ptr<void>)))))
-
-) ;; end defmodule signal/compose
+  ;;; __apply-sf -- apply one SF to a signal, returning the resulting signal.
+  ;;;
+  ;;; The SF parameter type is spelled as the carrier shape
+  ;;; `(fn [ptr<void>] ptr<void>)` rather than the higher-order
+  ;;; `(fn [(fn [float] float)] (fn [float] float))`: the fat-dispatch ABI
+  ;;; casts slot 0 to the SF's declared parameter ABI (a closure box pointer),
+  ;;; not to the inner :float thunk signature. Trying to spell the
+  ;;; higher-order shape directly would mis-declare the call site.
+  (defn __apply-sf [^fat sf : (fn [ptr<void>] #fx{} ptr<void>)
+                    ^fat sig : (fn [float] #fx{} float)] : ptr<void>
+    (sf sig))
+  ;;; The Vec is read with stdlib's `vec-get` / `vec-len` through a
+  ;;; `(Vec ptr<void>)` ascription, NOT with a typed element.  Spelling the
+  ;;; parameter as `(Vec (fn [(fn [float] float)] (fn [float] float)))` and
+  ;;; letting `vec-get` return the element type compiles clean and then takes
+  ;;; SIGBUS at run time before printing anything -- the elements are fat
+  ;;; closure boxes, and the typed readback is the shape the module header's
+  ;;; PR #288 note is about.  The carrier ascription hands `__apply-sf` the
+  ;;; same `ptr<void>` the hand-rolled reader used to.
+  ;;; __chain-loop -- threading recursion for effects-chain.
+  ;;;
+  ;;; The self-call's result is ascribed `:ptr<void>` so the `if`-branch
+  ;;; type-unifier sees both arms as fat boxes (matching the PR #288 fix);
+  ;;; without the ascription a forward-reference into the same defmodule
+  ;;; widens the recursion's inferred return to `int`, breaking the
+  ;;; unification.
+  (defn __chain-loop [effects : int
+                      ^fat sig : (fn [float] #fx{} float)
+                      i : int
+                      n : int] : ptr<void>
+    (if (>= i n)
+      sig
+      (:: (__chain-loop effects
+            (__apply-sf (vec-get (:: effects (Vec ptr<void>)) i) sig)
+            (+ i 1)
+            n)
+        :ptr<void>)))
+  ;;; effects-chain -- apply a vector of effects in order to an input signal.
+  ;;;
+  ;;; Parameters:
+  ;;;   effects -- Vec of SF (Sample Sample) processors, applied left-to-right
+  ;;;   input   -- source Signal Sample
+  ;;;
+  ;;; Returns:
+  ;;;   Signal Sample with each effect applied in order.
+  ;;;
+  ;;; Callers wanting to invoke the result as a closure should re-bind it
+  ;;; with `^fat`, e.g.
+  ;;;   (let [^fat out : (fn [float] #{} float)
+  ;;;              (effects-chain (vec-of (gain 0.5) (low-pass 0.3)) my-osc)]
+  ;;;     (out 0.0))
+  ;;;
+  ;;; Example:
+  ;;;   (let [chain (effects-chain (vec-of (gain 0.5) (low-pass 0.3))
+  ;;;                              (sine 440.0 0.0))]
+  ;;;     chain)
+  (defn effects-chain [effects : int ^fat input : (fn [float] #fx{} float)] : ptr<void>
+    (__chain-loop effects input 0 (vec-len (:: effects (Vec ptr<void>)))))) ;; end defmodule signal/compose

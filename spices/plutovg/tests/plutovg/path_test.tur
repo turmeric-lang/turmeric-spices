@@ -10,19 +10,24 @@
 ;; the destroy calls.  Ending the block on `(surface-destroy s)` -- which is
 ;; how these cases used to read -- hands `it` a nil where it wants a bool,
 ;; and the file does not compile.
-
 (defmodule plutovg/tests/path
-  (import test/suite      :refer [describe it])
-  (import test/assert     :refer [assert-eq assert-true])
-  (import test/runner     :refer [run-all-status])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-eq assert-true])
+  (import test/runner :refer [run-all-status])
   (import plutovg/surface :refer [surface-create surface-destroy])
-  (import plutovg/canvas  :refer [canvas-create canvas-destroy
-                                  canvas-set-source-color
-                                  canvas-move-to canvas-line-to
-                                  canvas-close-path canvas-fill
-                                  canvas-rect canvas-stroke
-                                  canvas-circle canvas-clip])
-
+  (import plutovg/canvas
+    :refer
+    [canvas-create
+     canvas-destroy
+     canvas-set-source-color
+     canvas-move-to
+     canvas-line-to
+     canvas-close-path
+     canvas-fill
+     canvas-rect
+     canvas-stroke
+     canvas-circle
+     canvas-clip])
   ;; Read byte at offset n from a plutovg surface's pixel buffer.
   (defn surface-byte [s : int n : int] : int
     ```c
@@ -30,19 +35,17 @@
     unsigned char *p = plutovg_surface_get_data((plutovg_surface_t *)(intptr_t)s);
     return (int64_t)p[(int)n];
     ```)
-
-;;; px-is? -- are the four bytes at `off` the given B, G, R, A?
-;;;
-;;; All four comparisons are bound before being combined so a failure
-;;; reports every wrong channel, not just the first: `and` short-circuits.
+  ;;; px-is? -- are the four bytes at `off` the given B, G, R, A?
+  ;;;
+  ;;; All four comparisons are bound before being combined so a failure
+  ;;; reports every wrong channel, not just the first: `and` short-circuits.
   (defn px-is? [s : int off : int b : int g : int r : int a : int] : bool
     (let [kb (assert-eq b (surface-byte s off))
           kg (assert-eq g (surface-byte s (+ off 1)))
           kr (assert-eq r (surface-byte s (+ off 2)))
           ka (assert-eq a (surface-byte s (+ off 3)))]
       (and kb (and kg (and kr ka)))))
-
-;;; any-nonzero? -- is any byte in the first `n` of the surface non-zero?
+  ;;; any-nonzero? -- is any byte in the first `n` of the surface non-zero?
   (defn any-nonzero? [s : int n : int] : bool
     ```c
     #include <plutovg.h>
@@ -50,99 +53,93 @@
     for (int i = 0; i < (int)n; i++) if (p[i]) return 1;
     return 0;
     ```)
-
   (defn __all-tests [] : void
-   (describe "plutovg/canvas path recording"
-     (it "fills a triangle traced with move-to + line-to + close-path"
-       (let [sr (surface-create 4 4)
-             k1 (assert-true (ok? sr))]
-         (if (not k1)
-           false
-           (let [s  (ok-val sr)
-                 cr (canvas-create s)
-                 k2 (assert-true (ok? cr))]
-             (if (not k2)
-               (do (surface-destroy s) false)
-               (let [c (ok-val cr)]
-                 (canvas-set-source-color c 1.0 0.0 0.0 1.0)
-                 ;; Triangle covering (0,0)-(0,3)-(3,3); the (0,0) pixel is the
-                 ;; only one we sample as "inside" with confidence.  Pixel (3,0)
-                 ;; is on the opposite corner, outside the triangle.
-                 (canvas-move-to c 0.0 0.0)
-                 (canvas-line-to c 0.0 4.0)
-                 (canvas-line-to c 4.0 4.0)
-                 (canvas-close-path c)
-                 (canvas-fill c)
-                 (let [;; Inside pixel (0,3) -- column 0 of the last row, byte
-                       ;; offset 3*16 + 0 = 48.  Its centre (0.5, 3.5) is well
-                       ;; inside x <= y, so it is fully covered: premultiplied
-                       ;; 0xFFFF0000 -> B G R A = 0 0 255 255.
-                       ;;
-                       ;; NOT pixel (0,0), which is what this case used to
-                       ;; sample.  The hypotenuse runs (0,0)->(4,4), straight
-                       ;; through the middle of that pixel, so plutovg
-                       ;; antialiases it to half coverage and the R and A bytes
-                       ;; come back 128.  The old comment called (0,0) "the only
-                       ;; one we sample as inside with confidence"; it is in fact
-                       ;; the one pixel on the edge.
-                       inside  (px-is? s 48 0 0 255 255)
-                       ;; Outside pixel (3,0): row stride 16; byte offset 12..15.
-                       ;; Centre (3.5, 0.5) has x > y, outside the triangle.
-                       outside (px-is? s 12 0 0 0 0)]
-                   (canvas-destroy c)
-                   (surface-destroy s)
-                   (and inside outside)))))))))
-
-   (describe "plutovg/canvas shape helpers"
-     (it "fills a rect helper-traced subpath"
-       (let [sr (surface-create 4 4)
-             k1 (assert-true (ok? sr))]
-         (if (not k1)
-           false
-           (let [s  (ok-val sr)
-                 cr (canvas-create s)
-                 k2 (assert-true (ok? cr))]
-             (if (not k2)
-               (do (surface-destroy s) false)
-               (let [c (ok-val cr)]
-                 (canvas-set-source-color c 0.0 1.0 0.0 1.0)  ; opaque green
-                 (canvas-rect c 0.0 0.0 4.0 4.0)
-                 (canvas-fill c)
-                 ;; 0xFF00FF00 -> B G R A in memory: 0, 255, 0, 255
-                 (let [green (px-is? s 0 0 255 0 255)]
-                   (canvas-destroy c)
-                   (surface-destroy s)
-                   green))))))))
-
-   (describe "plutovg/canvas stroke and clip"
-     (it "strokes a thin rect outline and clips to a circle"
-       ;; Exact pixel layout depends on plutovg's stroke rasterization, so
-       ;; this checks the weaker property the original comment already
-       ;; claimed and never tested: the operations leave marks on the
-       ;; surface.  A clip that swallowed everything, or a stroke that drew
-       ;; nothing, would leave the buffer all-zero and fail here.
-       (let [sr (surface-create 8 8)
-             k1 (assert-true (ok? sr))]
-         (if (not k1)
-           false
-           (let [s  (ok-val sr)
-                 cr (canvas-create s)
-                 k2 (assert-true (ok? cr))]
-             (if (not k2)
-               (do (surface-destroy s) false)
-               (let [c (ok-val cr)]
-                 (canvas-set-source-color c 0.0 0.0 1.0 1.0)  ; opaque blue
-                 ;; Clip to a circle covering the center
-                 (canvas-circle c 4.0 4.0 3.0)
-                 (canvas-clip c)
-                 ;; Stroke an inset rect; the stroke should be clipped to the circle.
-                 (canvas-rect c 1.0 1.0 6.0 6.0)
-                 (canvas-stroke c)
-                 (let [drew (assert-true (any-nonzero? s 256))]
-                   (canvas-destroy c)
-                   (surface-destroy s)
-                   drew)))))))))
-
-  (defn main [] : int
-    (__all-tests)
-    (run-all-status)))
+    (describe "plutovg/canvas path recording"
+      (it "fills a triangle traced with move-to + line-to + close-path"
+        (let [sr (surface-create 4 4)
+              k1 (assert-true (ok? sr))]
+          (if (not k1)
+            false
+            (let [s  (ok-val sr)
+                  cr (canvas-create s)
+                  k2 (assert-true (ok? cr))]
+              (if (not k2)
+                (do (surface-destroy s) false)
+                (let [c (ok-val cr)]
+                  (canvas-set-source-color c 1.0 0.0 0.0 1.0)
+                  ;; Triangle covering (0,0)-(0,3)-(3,3); the (0,0) pixel is the
+                  ;; only one we sample as "inside" with confidence.  Pixel (3,0)
+                  ;; is on the opposite corner, outside the triangle.
+                  (canvas-move-to c 0.0 0.0)
+                  (canvas-line-to c 0.0 4.0)
+                  (canvas-line-to c 4.0 4.0)
+                  (canvas-close-path c)
+                  (canvas-fill c)
+                  (let [ ;; Inside pixel (0,3) -- column 0 of the last row, byte
+                        ;; offset 3*16 + 0 = 48.  Its centre (0.5, 3.5) is well
+                        ;; inside x <= y, so it is fully covered: premultiplied
+                        ;; 0xFFFF0000 -> B G R A = 0 0 255 255.
+                        ;;
+                        ;; NOT pixel (0,0), which is what this case used to
+                        ;; sample.  The hypotenuse runs (0,0)->(4,4), straight
+                        ;; through the middle of that pixel, so plutovg
+                        ;; antialiases it to half coverage and the R and A bytes
+                        ;; come back 128.  The old comment called (0,0) "the only
+                        ;; one we sample as inside with confidence"; it is in fact
+                        ;; the one pixel on the edge.
+                        inside  (px-is? s 48 0 0 255 255)
+                        ;; Outside pixel (3,0): row stride 16; byte offset 12..15.
+                        ;; Centre (3.5, 0.5) has x > y, outside the triangle.
+                        outside (px-is? s 12 0 0 0 0)]
+                    (canvas-destroy c)
+                    (surface-destroy s)
+                    (and inside outside)))))))))
+    (describe "plutovg/canvas shape helpers"
+      (it "fills a rect helper-traced subpath"
+        (let [sr (surface-create 4 4)
+              k1 (assert-true (ok? sr))]
+          (if (not k1)
+            false
+            (let [s  (ok-val sr)
+                  cr (canvas-create s)
+                  k2 (assert-true (ok? cr))]
+              (if (not k2)
+                (do (surface-destroy s) false)
+                (let [c (ok-val cr)]
+                  (canvas-set-source-color c 0.0 1.0 0.0 1.0) ; opaque green
+                  (canvas-rect c 0.0 0.0 4.0 4.0)
+                  (canvas-fill c)
+                  ;; 0xFF00FF00 -> B G R A in memory: 0, 255, 0, 255
+                  (let [green (px-is? s 0 0 255 0 255)]
+                    (canvas-destroy c)
+                    (surface-destroy s)
+                    green))))))))
+    (describe "plutovg/canvas stroke and clip"
+      (it "strokes a thin rect outline and clips to a circle"
+        ;; Exact pixel layout depends on plutovg's stroke rasterization, so
+        ;; this checks the weaker property the original comment already
+        ;; claimed and never tested: the operations leave marks on the
+        ;; surface.  A clip that swallowed everything, or a stroke that drew
+        ;; nothing, would leave the buffer all-zero and fail here.
+        (let [sr (surface-create 8 8)
+              k1 (assert-true (ok? sr))]
+          (if (not k1)
+            false
+            (let [s  (ok-val sr)
+                  cr (canvas-create s)
+                  k2 (assert-true (ok? cr))]
+              (if (not k2)
+                (do (surface-destroy s) false)
+                (let [c (ok-val cr)]
+                  (canvas-set-source-color c 0.0 0.0 1.0 1.0) ; opaque blue
+                  ;; Clip to a circle covering the center
+                  (canvas-circle c 4.0 4.0 3.0)
+                  (canvas-clip c)
+                  ;; Stroke an inset rect; the stroke should be clipped to the circle.
+                  (canvas-rect c 1.0 1.0 6.0 6.0)
+                  (canvas-stroke c)
+                  (let [drew (assert-true (any-nonzero? s 256))]
+                    (canvas-destroy c)
+                    (surface-destroy s)
+                    drew)))))))))
+  (defn main [] : int (__all-tests) (run-all-status)))

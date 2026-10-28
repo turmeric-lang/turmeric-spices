@@ -26,446 +26,443 @@
 ;;;
 ;;; Since: 0.2.0
 ;; Writer over c/dom/turdom.c's turdom_writer_* entry points.
-
 (defmodule dom/writer
-  (export SaxWriter WriteError Rejected IoFailed write-error-message
-          TransformError InputError OutputError transform-error-message
-          transform-error-release
-          sax-writer-new sax-writer-to-file sax-write! sax-write-all!
-          sax-writer-finish! sax-writer-free
-          sax-transform-handler sax-keep)
-
-(import dom/ownstr :refer [String adopt-cstr to-cstr])
-(import dom/core   :refer [ParseError parse-error-message parse-error-release])
-(import dom/event  :refer [SaxEvent SaxControl Attr StartElement EndElement
-                           Chars Comment Pi StartCdata EndCdata Doctype
-                           Continue Stop sax-event-retain sax-event-release])
-(import dom/edit   :refer [DomFlavor XmlFlavor HtmlFlavor EditError
-                           BadPlacement WrongKind BadName BadContent
-                           OutOfMemory edit-error-message])
-
-;;; SaxWriter -- a streaming serializer. Release with `sax-writer-free`.
-(defopaque SaxWriter :ptr<void>)
-
-;;; WriteError -- why a SaxWriter refused, or could not deliver its output.
-;;;   (Rejected e) -- the event would not come back as written; e is
-;;;                   BadName, BadContent or OutOfMemory, or BadPlacement for
-;;;                   a structural problem: an end tag that does not match, a
-;;;                   second root, text outside the root, an element or CDATA
-;;;                   section still open at the end, an attribute after
-;;;                   content, a CDATA section or PI in HTML, or any event
-;;;                   after `sax-writer-finish!`
-;;;   (IoFailed)   -- the output file could not be created or written
-(defdata ^copy WriteError
-  (Rejected EditError)
-  (IoFailed))
-
-;;; write-error-message -- a one-line description of a WriteError.
-;;;
-;;; Parameters:
-;;;   e -- the error
-;;;
-;;; Returns:
-;;;   cstr -- a static message.
-;;;
-;;; Example:
-;;;   (write-error-message (IoFailed))   ; => "could not write the output file"
-;;;
-;;; Since: 0.2.0
-(defn write-error-message [e : WriteError] : cstr
-  (match e
-    (Rejected (BadPlacement)) "an event out of place (unbalanced or misplaced markup)"
-    (Rejected k)              (edit-error-message k)
-    (IoFailed)                "could not write the output file"))
-
-;;; TransformError -- why a transform stopped.
-;;;   (InputError e)  -- the source did not parse; release e with
-;;;                      `transform-error-release`
-;;;   (OutputError e) -- the writer refused what the transform produced
-(defdata ^copy TransformError
-  (InputError ParseError)
-  (OutputError WriteError))
-
-;;; transform-error-message -- a one-line description of a TransformError.
-;;;
-;;; Parameters:
-;;;   e -- the error
-;;;
-;;; Returns:
-;;;   cstr -- borrowed from e (an InputError's message) or static.
-;;;
-;;; Example:
-;;;   (transform-error-message (OutputError (IoFailed)))
-;;;   ; => "could not write the output file"
-;;;
-;;; Since: 0.2.0
-(defn transform-error-message [e : TransformError] : cstr
-  (match e
-    (InputError p)  (parse-error-message p)
-    (OutputError w) (write-error-message w)))
-
-;;; transform-error-release -- release what a TransformError owns.
-;;;
-;;; Parameters:
-;;;   e -- the error, not used afterwards
-;;;
-;;; Example:
-;;;   (transform-error-release e)
-;;;
-;;; Since: 0.2.0
-(defn transform-error-release [e : TransformError] : nil
-  (match e
-    (InputError p)  (parse-error-release p)
-    (OutputError _) nil))
-
-;; ---------------------------------------------------------------------------
-;; C bridge. Only cstrs and the handle cross it: an event node handed to an
-;; inline-C body would be noted as escaping and keep the SAX driver's
-;; per-chunk region from rewinding.
-;; ---------------------------------------------------------------------------
-
-;;; __wr-error -- internal: a turdom error code as a WriteError.
-(defn __wr-error [rc : int] : WriteError
-  (cond
-    (= rc 4)  (Rejected (BadPlacement))
-    (= rc 6)  (Rejected (WrongKind))
-    (= rc 8)  (Rejected (BadName))
-    (= rc 9)  (Rejected (BadContent))
-    (= rc 10) (IoFailed)
-    :else     (Rejected (OutOfMemory))))
-
-;;; __wr-done -- internal: a turdom error code as a Result.
-(defn __wr-done [rc : int] : (Result nil WriteError)
-  (if (= rc 0) (Ok nil) (Err (__wr-error rc))))
-
-;;; __wr-nullp -- internal: is this a null pointer?
-(defn __wr-nullp [p : ptr<void>] : bool
-  ```c
-  return p == NULL;
+  (export SaxWriter
+    WriteError
+    Rejected
+    IoFailed
+    write-error-message
+    TransformError
+    InputError
+    OutputError
+    transform-error-message
+    transform-error-release
+    sax-writer-new
+    sax-writer-to-file
+    sax-write!
+    sax-write-all!
+    sax-writer-finish!
+    sax-writer-free
+    sax-transform-handler
+    sax-keep)
+  (import dom/ownstr :refer [String adopt-cstr to-cstr])
+  (import dom/core :refer [ParseError parse-error-message parse-error-release])
+  (import dom/event
+    :refer
+    [SaxEvent
+     SaxControl
+     Attr
+     StartElement
+     EndElement
+     Chars
+     Comment
+     Pi
+     StartCdata
+     EndCdata
+     Doctype
+     Continue
+     Stop
+     sax-event-retain
+     sax-event-release])
+  (import dom/edit
+    :refer
+    [DomFlavor
+     XmlFlavor
+     HtmlFlavor
+     EditError
+     BadPlacement
+     WrongKind
+     BadName
+     BadContent
+     OutOfMemory
+     edit-error-message])
+  ;;; SaxWriter -- a streaming serializer. Release with `sax-writer-free`.
+  (defopaque SaxWriter :ptr<void>)
+  ;;; WriteError -- why a SaxWriter refused, or could not deliver its output.
+  ;;;   (Rejected e) -- the event would not come back as written; e is
+  ;;;                   BadName, BadContent or OutOfMemory, or BadPlacement for
+  ;;;                   a structural problem: an end tag that does not match, a
+  ;;;                   second root, text outside the root, an element or CDATA
+  ;;;                   section still open at the end, an attribute after
+  ;;;                   content, a CDATA section or PI in HTML, or any event
+  ;;;                   after `sax-writer-finish!`
+  ;;;   (IoFailed)   -- the output file could not be created or written
+  (defdata ^copy WriteError (Rejected EditError) (IoFailed))
+  ;;; write-error-message -- a one-line description of a WriteError.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the error
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- a static message.
+  ;;;
+  ;;; Example:
+  ;;;   (write-error-message (IoFailed))   ; => "could not write the output file"
+  ;;;
+  ;;; Since: 0.2.0
+  (defn write-error-message [e : WriteError] : cstr
+    (match e
+      (Rejected (BadPlacement))
+      "an event out of place (unbalanced or misplaced markup)"
+      (Rejected k)
+      (edit-error-message k)
+      (IoFailed)
+      "could not write the output file"))
+  ;;; TransformError -- why a transform stopped.
+  ;;;   (InputError e)  -- the source did not parse; release e with
+  ;;;                      `transform-error-release`
+  ;;;   (OutputError e) -- the writer refused what the transform produced
+  (defdata ^copy TransformError
+    (InputError ParseError)
+    (OutputError WriteError))
+  ;;; transform-error-message -- a one-line description of a TransformError.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the error
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- borrowed from e (an InputError's message) or static.
+  ;;;
+  ;;; Example:
+  ;;;   (transform-error-message (OutputError (IoFailed)))
+  ;;;   ; => "could not write the output file"
+  ;;;
+  ;;; Since: 0.2.0
+  (defn transform-error-message [e : TransformError] : cstr
+    (match e
+      (InputError p)
+      (parse-error-message p)
+      (OutputError w)
+      (write-error-message w)))
+  ;;; transform-error-release -- release what a TransformError owns.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the error, not used afterwards
+  ;;;
+  ;;; Example:
+  ;;;   (transform-error-release e)
+  ;;;
+  ;;; Since: 0.2.0
+  (defn transform-error-release [e : TransformError] : nil
+    (match e (InputError p) (parse-error-release p) (OutputError _) nil))
+  ;; ---------------------------------------------------------------------------
+  ;; C bridge. Only cstrs and the handle cross it: an event node handed to an
+  ;; inline-C body would be noted as escaping and keep the SAX driver's
+  ;; per-chunk region from rewinding.
+  ;; ---------------------------------------------------------------------------
+  ;;; __wr-error -- internal: a turdom error code as a WriteError.
+  (defn __wr-error [rc : int] : WriteError
+    (cond (= rc 4)  (Rejected (BadPlacement))
+          (= rc 6)  (Rejected (WrongKind))
+          (= rc 8)  (Rejected (BadName))
+          (= rc 9)  (Rejected (BadContent))
+          (= rc 10) (IoFailed)
+          :else     (Rejected (OutOfMemory))))
+  ;;; __wr-done -- internal: a turdom error code as a Result.
+  (defn __wr-done [rc : int] : (Result nil WriteError)
+    (if (= rc 0) (Ok nil) (Err (__wr-error rc))))
+  ;;; __wr-nullp -- internal: is this a null pointer?
+  (defn __wr-nullp [p : ptr<void>] : bool
+    ```c
+    return p == NULL;
   ```)
-
-;;; __wr-new-raw -- internal.
-(defn __wr-new-raw [html : bool] : ptr<void>
-  ```c
-  extern void *turdom_writer_new(int);
+  ;;; __wr-new-raw -- internal.
+  (defn __wr-new-raw [html : bool] : ptr<void>
+    ```c
+    extern void *turdom_writer_new(int);
   return turdom_writer_new(html ? 1 : 0);
   ```)
-
-;;; __wr-to-file-raw -- internal.
-(defn __wr-to-file-raw [w : SaxWriter path : cstr] : int
-  ```c
-  extern int turdom_writer_to_file(void *, const char *);
+  ;;; __wr-to-file-raw -- internal.
+  (defn __wr-to-file-raw [w : SaxWriter path : cstr] : int
+    ```c
+    extern int turdom_writer_to_file(void *, const char *);
   return (int64_t)turdom_writer_to_file((void *)(intptr_t)w, (const char *)path);
   ```)
-
-;;; __wr-err-raw -- internal: the sticky error, 0 when none.
-(defn __wr-err-raw [w : SaxWriter] : int
-  ```c
-  extern int turdom_writer_error(const void *);
+  ;;; __wr-err-raw -- internal: the sticky error, 0 when none.
+  (defn __wr-err-raw [w : SaxWriter] : int
+    ```c
+    extern int turdom_writer_error(const void *);
   return (int64_t)turdom_writer_error((const void *)(intptr_t)w);
   ```)
-
-;;; __wr-start -- internal.
-(defn __wr-start [w : SaxWriter name : cstr] : int
-  ```c
-  extern int turdom_writer_start(void *, const char *);
+  ;;; __wr-start -- internal.
+  (defn __wr-start [w : SaxWriter name : cstr] : int
+    ```c
+    extern int turdom_writer_start(void *, const char *);
   return (int64_t)turdom_writer_start((void *)(intptr_t)w, (const char *)name);
   ```)
-
-;;; __wr-attr -- internal.
-(defn __wr-attr [w : SaxWriter name : cstr value : cstr] : int
-  ```c
-  extern int turdom_writer_attr(void *, const char *, const char *, size_t);
+  ;;; __wr-attr -- internal.
+  (defn __wr-attr [w : SaxWriter name : cstr value : cstr] : int
+    ```c
+    extern int turdom_writer_attr(void *, const char *, const char *, size_t);
   return (int64_t)turdom_writer_attr((void *)(intptr_t)w, (const char *)name,
                                      (const char *)value, strlen((const char *)value));
   ```)
-
-;;; __wr-end -- internal.
-(defn __wr-end [w : SaxWriter name : cstr] : int
-  ```c
-  extern int turdom_writer_end(void *, const char *);
+  ;;; __wr-end -- internal.
+  (defn __wr-end [w : SaxWriter name : cstr] : int
+    ```c
+    extern int turdom_writer_end(void *, const char *);
   return (int64_t)turdom_writer_end((void *)(intptr_t)w, (const char *)name);
   ```)
-
-;;; __wr-chars -- internal.
-(defn __wr-chars [w : SaxWriter s : cstr] : int
-  ```c
-  extern int turdom_writer_chars(void *, const char *, size_t);
+  ;;; __wr-chars -- internal.
+  (defn __wr-chars [w : SaxWriter s : cstr] : int
+    ```c
+    extern int turdom_writer_chars(void *, const char *, size_t);
   return (int64_t)turdom_writer_chars((void *)(intptr_t)w, (const char *)s,
                                       strlen((const char *)s));
   ```)
-
-;;; __wr-comment -- internal.
-(defn __wr-comment [w : SaxWriter s : cstr] : int
-  ```c
-  extern int turdom_writer_comment(void *, const char *, size_t);
+  ;;; __wr-comment -- internal.
+  (defn __wr-comment [w : SaxWriter s : cstr] : int
+    ```c
+    extern int turdom_writer_comment(void *, const char *, size_t);
   return (int64_t)turdom_writer_comment((void *)(intptr_t)w, (const char *)s,
                                         strlen((const char *)s));
   ```)
-
-;;; __wr-pi -- internal.
-(defn __wr-pi [w : SaxWriter target : cstr data : cstr] : int
-  ```c
-  extern int turdom_writer_pi(void *, const char *, const char *);
+  ;;; __wr-pi -- internal.
+  (defn __wr-pi [w : SaxWriter target : cstr data : cstr] : int
+    ```c
+    extern int turdom_writer_pi(void *, const char *, const char *);
   return (int64_t)turdom_writer_pi((void *)(intptr_t)w, (const char *)target,
                                    (const char *)data);
   ```)
-
-;;; __wr-cdata -- internal.
-(defn __wr-cdata [w : SaxWriter start : bool] : int
-  ```c
-  extern int turdom_writer_cdata(void *, int);
+  ;;; __wr-cdata -- internal.
+  (defn __wr-cdata [w : SaxWriter start : bool] : int
+    ```c
+    extern int turdom_writer_cdata(void *, int);
   return (int64_t)turdom_writer_cdata((void *)(intptr_t)w, start ? 1 : 0);
   ```)
-
-;;; __wr-doctype -- internal.
-(defn __wr-doctype [w : SaxWriter name : cstr pub : cstr sys : cstr] : int
-  ```c
-  extern int turdom_writer_doctype(void *, const char *, const char *, const char *);
+  ;;; __wr-doctype -- internal.
+  (defn __wr-doctype [w : SaxWriter name : cstr pub : cstr sys : cstr] : int
+    ```c
+    extern int turdom_writer_doctype(void *, const char *, const char *, const char *);
   return (int64_t)turdom_writer_doctype((void *)(intptr_t)w, (const char *)name,
                                         (const char *)pub, (const char *)sys);
   ```)
-
-;;; __wr-finish-raw -- internal: the output (malloc'd), or NULL on a refusal.
-(defn __wr-finish-raw [w : SaxWriter] : cstr
-  ```c
-  extern char *turdom_writer_finish(void *, size_t *, int *);
+  ;;; __wr-finish-raw -- internal: the output (malloc'd), or NULL on a refusal.
+  (defn __wr-finish-raw [w : SaxWriter] : cstr
+    ```c
+    extern char *turdom_writer_finish(void *, size_t *, int *);
   int rc = 0;
   return turdom_writer_finish((void *)(intptr_t)w, NULL, &rc);
   ```)
-
-;;; __wr-null-cstr? -- internal.
-(defn __wr-null-cstr? [s : cstr] : bool
-  ```c
-  return s == NULL;
+  ;;; __wr-null-cstr? -- internal.
+  (defn __wr-null-cstr? [s : cstr] : bool
+    ```c
+    return s == NULL;
   ```)
-
-;;; __wr-free-raw -- internal.
-(defn __wr-free-raw [w : SaxWriter] : nil
-  ```c
-  extern void turdom_writer_free(void *);
+  ;;; __wr-free-raw -- internal.
+  (defn __wr-free-raw [w : SaxWriter] : nil
+    ```c
+    extern void turdom_writer_free(void *);
   turdom_writer_free((void *)(intptr_t)w);
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Writers
-;; ---------------------------------------------------------------------------
-
-;;; __wr-html? -- internal.
-(defn __wr-html? [flavor : DomFlavor] : bool
-  (match flavor (XmlFlavor) false (HtmlFlavor) true))
-
-;;; sax-writer-new -- a writer that keeps its output in memory.
-;;;
-;;; Parameters:
-;;;   flavor -- `(XmlFlavor)` or `(HtmlFlavor)`: whose escaping and checks
-;;;
-;;; Returns:
-;;;   (Option SaxWriter) -- none only when out of memory. Release with
-;;;   `sax-writer-free`.
-;;;
-;;; Example:
-;;;   (match (sax-writer-new (XmlFlavor)) (Some w) ... (None) ...)
-;;;
-;;; Since: 0.2.0
-(defn sax-writer-new [flavor : DomFlavor] : (Option SaxWriter)
-  (let [p (__wr-new-raw (__wr-html? flavor))]
-    (if (__wr-nullp p) (None) (Some (:: p SaxWriter)))))
-
-;;; sax-writer-to-file -- a writer that streams its output to a file.
-;;;
-;;; The output goes out in 64 KiB writes, so memory stays at the open
-;;; elements, the current start tag and an open `<script>`'s text. If the
-;;; writer refuses, or the source fails, the file is left incomplete.
-;;;
-;;; Parameters:
-;;;   flavor -- `(XmlFlavor)` or `(HtmlFlavor)`
-;;;   path   -- the file to create (truncated if it exists)
-;;;
-;;; Returns:
-;;;   (Result SaxWriter WriteError) -- IoFailed when the file cannot be
-;;;   created. Release the writer with `sax-writer-free`.
-;;;
-;;; Example:
-;;;   (sax-writer-to-file (XmlFlavor) "out.xml")
-;;;
-;;; Since: 0.2.0
-(defn sax-writer-to-file [flavor : DomFlavor path : cstr]
-  : (Result SaxWriter WriteError)
-  (match (sax-writer-new flavor)
-    (None)   (Err (Rejected (OutOfMemory)))
-    (Some w) (let [rc (__wr-to-file-raw w path)]
-               (if (= rc 0)
-                 (Ok w)
-                 (do (__wr-free-raw w)
-                     (Err (__wr-error rc)))))))
-
-;;; __wr-attrs -- internal: write a start tag's attributes, stopping at the
-;;; first refusal. A loop: one tag may carry thousands.
-(defn __wr-attrs [w : SaxWriter xs : (Cons Attr)] : int
-  (let [^mut rest xs
-        ^mut rc   0]
-    (while (and (= rc 0) (not (tnil? rest)))
-      (let [a (thead rest)]
-        (set! rc (__wr-attr w (to-cstr (.name a)) (to-cstr (.value a))))
-        (set! rest (ttail rest))))
-    rc))
-
-;;; __wr-event -- internal: write one event; the turdom code.
-(defn __wr-event [w : SaxWriter ev : SaxEvent] : int
-  (match ev
-    (StartElement n as) (let [rc (__wr-start w (to-cstr n))]
-                          (if (= rc 0) (__wr-attrs w as) rc))
-    (EndElement n)      (__wr-end w (to-cstr n))
-    (Chars t)           (__wr-chars w (to-cstr t))
-    (Comment t)         (__wr-comment w (to-cstr t))
-    (Pi t d)            (__wr-pi w (to-cstr t) (to-cstr d))
-    (StartCdata)        (__wr-cdata w true)
-    (EndCdata)          (__wr-cdata w false)
-    (Doctype n p s)     (__wr-doctype w (to-cstr n) (to-cstr p) (to-cstr s))))
-
-;;; sax-write! -- write one event.
-;;;
-;;; The event is borrowed: the writer copies what it needs.
-;;;
-;;; Parameters:
-;;;   w  -- the writer
-;;;   ev -- the event
-;;;
-;;; Returns:
-;;;   (Result nil WriteError) -- the writer's first refusal, again on every
-;;;   later call.
-;;;
-;;; Example:
-;;;   (sax-write! w (StartElement (from-cstr "a") (tnil)))
-;;;
-;;; Since: 0.2.0
-(defn sax-write! [w : SaxWriter ev : SaxEvent] : (Result nil WriteError)
-  (__wr-done (__wr-event w ev)))
-
-;;; __wr-list -- internal: write events in order; the first refusal's code.
-(defn __wr-list [w : SaxWriter evs : (Cons SaxEvent)] : int
-  (let [^mut rest evs
-        ^mut rc   0]
-    (while (and (= rc 0) (not (tnil? rest)))
-      (set! rc (__wr-event w (thead rest)))
-      (set! rest (ttail rest)))
-    rc))
-
-;;; sax-write-all! -- write a list of events in order.
-;;;
-;;; Parameters:
-;;;   w   -- the writer
-;;;   evs -- the events, borrowed
-;;;
-;;; Returns:
-;;;   (Result nil WriteError) -- stops at the first refusal.
-;;;
-;;; Example:
-;;;   (sax-write-all! w (tcons-of (StartElement (from-cstr "a") (tnil))
-;;;                               (tcons-of (EndElement (from-cstr "a")) (tnil))))
-;;;
-;;; Since: 0.2.0
-(defn sax-write-all! [w : SaxWriter evs : (Cons SaxEvent)] : (Result nil WriteError)
-  (__wr-done (__wr-list w evs)))
-
-;;; sax-writer-finish! -- end the output and take it.
-;;;
-;;; Closes a pending start tag, checks that an XML document is complete
-;;; (one root, nothing left open) and, for a file writer, flushes and closes
-;;; the file. Later events are refused; finishing again returns the same
-;;; output.
-;;;
-;;; Parameters:
-;;;   w -- the writer
-;;;
-;;; Returns:
-;;;   (Result String WriteError) -- the document, owned by the caller (empty
-;;;   for a file writer). An Err is the writer's first refusal.
-;;;
-;;; Example:
-;;;   (match (sax-writer-finish! w) (Ok s) (println (to-cstr s)) (Err e) ...)
-;;;
-;;; Since: 0.2.0
-(defn sax-writer-finish! [w : SaxWriter] : (Result String WriteError)
-  (let [s (__wr-finish-raw w)]
-    (if (__wr-null-cstr? s)
-      (let [rc (__wr-err-raw w)]
-        (Err (__wr-error (if (= rc 0) 7 rc))))
-      (Ok (adopt-cstr s)))))
-
-;;; sax-writer-free -- release a writer (closing its file, if any).
-;;;
-;;; Parameters:
-;;;   w -- the writer, not used afterwards
-;;;
-;;; Example:
-;;;   (sax-writer-free w)
-;;;
-;;; Since: 0.2.0
-(defn sax-writer-free [w : SaxWriter] : nil
-  (__wr-free-raw w))
-
-;; ---------------------------------------------------------------------------
-;; Transforms
-;; ---------------------------------------------------------------------------
-
-;;; __wr-drain -- internal: write the events a transform returned, release
-;;; each one, and say whether to go on.
-(defn __wr-drain [w : SaxWriter evs : (Cons SaxEvent)] : SaxControl
-  (let [^mut rest evs
-        ^mut rc   (__wr-err-raw w)]
-    (while (not (tnil? rest))
-      (let [ev (thead rest)]
-        (if (= rc 0) (set! rc (__wr-event w ev)) nil)
-        (sax-event-release ev)
-        (set! rest (ttail rest))))
-    (if (= rc 0) (Continue) (Stop))))
-
-;;; sax-transform-handler -- a SAX handler that runs each event through f
-;;; and writes the result.
-;;;
-;;; f OWNS the event it is given: it returns it (in the list) to write it,
-;;; or releases it with `sax-event-release` to drop it. Every event f
-;;; returns is written and then released, so an event built from the input
-;;; reuses its Strings without copying -- and returning one event twice
-;;; needs a `sax-event-retain` for the second. The handler stops the parse
-;;; at the writer's first refusal; check `sax-writer-finish!` afterwards.
-;;;
-;;; Parameters:
-;;;   w -- the writer the output goes to
-;;;   f -- the transform: one event in, zero or more out
-;;;
-;;; Returns:
-;;;   (fn [SaxEvent] SaxControl) -- for any tur-xml or tur-html SAX entry
-;;;   point, including the push parsers.
-;;;
-;;; Example:
-;;;   (sax-parser-new (sax-transform-handler w sax-keep))   ; identity
-;;;
-;;; Since: 0.2.0
-(defn sax-transform-handler [w : SaxWriter f : (fn [SaxEvent] (Cons SaxEvent))]
-  : (fn [SaxEvent] SaxControl)
-  (fn [ev : SaxEvent] : SaxControl
-    (if (= (__wr-err-raw w) 0)
-      (__wr-drain w (f (sax-event-retain ev)))
-      (Stop))))
-
-;;; sax-keep -- the identity transform: the event, unchanged.
-;;;
-;;; Also the fall-through arm of a transform that changes a few events.
-;;;
-;;; Parameters:
-;;;   ev -- the event (owned, per `sax-transform-handler`)
-;;;
-;;; Returns:
-;;;   (Cons SaxEvent) -- a one-element list holding ev.
-;;;
-;;; Example:
-;;;   (sax-transform src sax-keep)   ; => src, re-serialized
-;;;
-;;; Since: 0.2.0
-(defn sax-keep [ev : SaxEvent] : (Cons SaxEvent)
-  (tcons-of ev (tnil)))
-
-) ;; end defmodule dom/writer
+  ;; ---------------------------------------------------------------------------
+  ;; Writers
+  ;; ---------------------------------------------------------------------------
+  ;;; __wr-html? -- internal.
+  (defn __wr-html? [flavor : DomFlavor] : bool
+    (match flavor (XmlFlavor) false (HtmlFlavor) true))
+  ;;; sax-writer-new -- a writer that keeps its output in memory.
+  ;;;
+  ;;; Parameters:
+  ;;;   flavor -- `(XmlFlavor)` or `(HtmlFlavor)`: whose escaping and checks
+  ;;;
+  ;;; Returns:
+  ;;;   (Option SaxWriter) -- none only when out of memory. Release with
+  ;;;   `sax-writer-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (match (sax-writer-new (XmlFlavor)) (Some w) ... (None) ...)
+  ;;;
+  ;;; Since: 0.2.0
+  (defn sax-writer-new [flavor : DomFlavor] : (Option SaxWriter)
+    (let [p (__wr-new-raw (__wr-html? flavor))]
+      (if (__wr-nullp p) (None) (Some (:: p SaxWriter)))))
+  ;;; sax-writer-to-file -- a writer that streams its output to a file.
+  ;;;
+  ;;; The output goes out in 64 KiB writes, so memory stays at the open
+  ;;; elements, the current start tag and an open `<script>`'s text. If the
+  ;;; writer refuses, or the source fails, the file is left incomplete.
+  ;;;
+  ;;; Parameters:
+  ;;;   flavor -- `(XmlFlavor)` or `(HtmlFlavor)`
+  ;;;   path   -- the file to create (truncated if it exists)
+  ;;;
+  ;;; Returns:
+  ;;;   (Result SaxWriter WriteError) -- IoFailed when the file cannot be
+  ;;;   created. Release the writer with `sax-writer-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (sax-writer-to-file (XmlFlavor) "out.xml")
+  ;;;
+  ;;; Since: 0.2.0
+  (defn sax-writer-to-file [flavor : DomFlavor path : cstr] : (Result SaxWriter
+                                                                WriteError)
+    (match (sax-writer-new flavor)
+      (None)
+      (Err (Rejected (OutOfMemory)))
+      (Some w)
+      (let [rc (__wr-to-file-raw w path)]
+        (if (= rc 0) (Ok w) (do (__wr-free-raw w) (Err (__wr-error rc)))))))
+  ;;; __wr-attrs -- internal: write a start tag's attributes, stopping at the
+  ;;; first refusal. A loop: one tag may carry thousands.
+  (defn __wr-attrs [w : SaxWriter xs : (Cons Attr)] : int
+    (let [^mut rest xs
+          ^mut rc   0]
+      (while (and (= rc 0) (not (tnil? rest)))
+        (let [a (thead rest)]
+          (set! rc (__wr-attr w (to-cstr (.name a)) (to-cstr (.value a))))
+          (set! rest (ttail rest))))
+      rc))
+  ;;; __wr-event -- internal: write one event; the turdom code.
+  (defn __wr-event [w : SaxWriter ev : SaxEvent] : int
+    (match ev
+      (StartElement n as)
+      (let [rc (__wr-start w (to-cstr n))] (if (= rc 0) (__wr-attrs w as) rc))
+      (EndElement n)
+      (__wr-end w (to-cstr n))
+      (Chars t)
+      (__wr-chars w (to-cstr t))
+      (Comment t)
+      (__wr-comment w (to-cstr t))
+      (Pi t d)
+      (__wr-pi w (to-cstr t) (to-cstr d))
+      (StartCdata)
+      (__wr-cdata w true)
+      (EndCdata)
+      (__wr-cdata w false)
+      (Doctype n p s)
+      (__wr-doctype w (to-cstr n) (to-cstr p) (to-cstr s))))
+  ;;; sax-write! -- write one event.
+  ;;;
+  ;;; The event is borrowed: the writer copies what it needs.
+  ;;;
+  ;;; Parameters:
+  ;;;   w  -- the writer
+  ;;;   ev -- the event
+  ;;;
+  ;;; Returns:
+  ;;;   (Result nil WriteError) -- the writer's first refusal, again on every
+  ;;;   later call.
+  ;;;
+  ;;; Example:
+  ;;;   (sax-write! w (StartElement (from-cstr "a") (tnil)))
+  ;;;
+  ;;; Since: 0.2.0
+  (defn sax-write! [w : SaxWriter ev : SaxEvent] : (Result nil WriteError)
+    (__wr-done (__wr-event w ev)))
+  ;;; __wr-list -- internal: write events in order; the first refusal's code.
+  (defn __wr-list [w : SaxWriter evs : (Cons SaxEvent)] : int
+    (let [^mut rest evs
+          ^mut rc   0]
+      (while (and (= rc 0) (not (tnil? rest)))
+        (set! rc (__wr-event w (thead rest)))
+        (set! rest (ttail rest)))
+      rc))
+  ;;; sax-write-all! -- write a list of events in order.
+  ;;;
+  ;;; Parameters:
+  ;;;   w   -- the writer
+  ;;;   evs -- the events, borrowed
+  ;;;
+  ;;; Returns:
+  ;;;   (Result nil WriteError) -- stops at the first refusal.
+  ;;;
+  ;;; Example:
+  ;;;   (sax-write-all! w (tcons-of (StartElement (from-cstr "a") (tnil))
+  ;;;                               (tcons-of (EndElement (from-cstr "a")) (tnil))))
+  ;;;
+  ;;; Since: 0.2.0
+  (defn sax-write-all! [w : SaxWriter evs : (Cons SaxEvent)] : (Result nil
+                                                                 WriteError)
+    (__wr-done (__wr-list w evs)))
+  ;;; sax-writer-finish! -- end the output and take it.
+  ;;;
+  ;;; Closes a pending start tag, checks that an XML document is complete
+  ;;; (one root, nothing left open) and, for a file writer, flushes and closes
+  ;;; the file. Later events are refused; finishing again returns the same
+  ;;; output.
+  ;;;
+  ;;; Parameters:
+  ;;;   w -- the writer
+  ;;;
+  ;;; Returns:
+  ;;;   (Result String WriteError) -- the document, owned by the caller (empty
+  ;;;   for a file writer). An Err is the writer's first refusal.
+  ;;;
+  ;;; Example:
+  ;;;   (match (sax-writer-finish! w) (Ok s) (println (to-cstr s)) (Err e) ...)
+  ;;;
+  ;;; Since: 0.2.0
+  (defn sax-writer-finish! [w : SaxWriter] : (Result String WriteError)
+    (let [s (__wr-finish-raw w)]
+      (if (__wr-null-cstr? s)
+        (let [rc (__wr-err-raw w)] (Err (__wr-error (if (= rc 0) 7 rc))))
+        (Ok (adopt-cstr s)))))
+  ;;; sax-writer-free -- release a writer (closing its file, if any).
+  ;;;
+  ;;; Parameters:
+  ;;;   w -- the writer, not used afterwards
+  ;;;
+  ;;; Example:
+  ;;;   (sax-writer-free w)
+  ;;;
+  ;;; Since: 0.2.0
+  (defn sax-writer-free [w : SaxWriter] : nil (__wr-free-raw w))
+  ;; ---------------------------------------------------------------------------
+  ;; Transforms
+  ;; ---------------------------------------------------------------------------
+  ;;; __wr-drain -- internal: write the events a transform returned, release
+  ;;; each one, and say whether to go on.
+  (defn __wr-drain [w : SaxWriter evs : (Cons SaxEvent)] : SaxControl
+    (let [^mut rest evs
+          ^mut rc   (__wr-err-raw w)]
+      (while (not (tnil? rest))
+        (let [ev (thead rest)]
+          (if (= rc 0) (set! rc (__wr-event w ev)) nil)
+          (sax-event-release ev)
+          (set! rest (ttail rest))))
+      (if (= rc 0) (Continue) (Stop))))
+  ;;; sax-transform-handler -- a SAX handler that runs each event through f
+  ;;; and writes the result.
+  ;;;
+  ;;; f OWNS the event it is given: it returns it (in the list) to write it,
+  ;;; or releases it with `sax-event-release` to drop it. Every event f
+  ;;; returns is written and then released, so an event built from the input
+  ;;; reuses its Strings without copying -- and returning one event twice
+  ;;; needs a `sax-event-retain` for the second. The handler stops the parse
+  ;;; at the writer's first refusal; check `sax-writer-finish!` afterwards.
+  ;;;
+  ;;; Parameters:
+  ;;;   w -- the writer the output goes to
+  ;;;   f -- the transform: one event in, zero or more out
+  ;;;
+  ;;; Returns:
+  ;;;   (fn [SaxEvent] SaxControl) -- for any tur-xml or tur-html SAX entry
+  ;;;   point, including the push parsers.
+  ;;;
+  ;;; Example:
+  ;;;   (sax-parser-new (sax-transform-handler w sax-keep))   ; identity
+  ;;;
+  ;;; Since: 0.2.0
+  (defn sax-transform-handler [w : SaxWriter
+                               f : (fn [SaxEvent] (Cons SaxEvent))] : (fn [SaxEvent]
+                                                                        SaxControl)
+    (fn [ev : SaxEvent] : SaxControl
+      (if (= (__wr-err-raw w) 0)
+        (__wr-drain w (f (sax-event-retain ev)))
+        (Stop))))
+  ;;; sax-keep -- the identity transform: the event, unchanged.
+  ;;;
+  ;;; Also the fall-through arm of a transform that changes a few events.
+  ;;;
+  ;;; Parameters:
+  ;;;   ev -- the event (owned, per `sax-transform-handler`)
+  ;;;
+  ;;; Returns:
+  ;;;   (Cons SaxEvent) -- a one-element list holding ev.
+  ;;;
+  ;;; Example:
+  ;;;   (sax-transform src sax-keep)   ; => src, re-serialized
+  ;;;
+  ;;; Since: 0.2.0
+  (defn sax-keep [ev : SaxEvent] : (Cons SaxEvent) (tcons-of ev (tnil)))) ;; end defmodule dom/writer

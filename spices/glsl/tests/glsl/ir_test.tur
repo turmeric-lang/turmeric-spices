@@ -6,134 +6,143 @@
 ;; output against either the original builder applied to the same operands or
 ;; the literal string that builder is documented to emit.
 (defmodule glsl/tests/ir
-  (import glsl/ir       :refer [ge-raw ge-var ge-lit ge-binop ge-swizzle
-                                gs-raw gs-expr gs-set gs-return gs-discard
-                                gs-inc gs-dec gs-if gs-if-only gs-for gs-seq
-                                node->c node-size])
-  (import glsl/core     :refer [glsl-binop glsl-set! glsl-return glsl-discard
-                                glsl-inc! glsl-dec! glsl-if glsl-if-only
-                                glsl-for])
+  (import glsl/ir
+    :refer
+    [ge-raw
+     ge-var
+     ge-lit
+     ge-binop
+     ge-swizzle
+     gs-raw
+     gs-expr
+     gs-set
+     gs-return
+     gs-discard
+     gs-inc
+     gs-dec
+     gs-if
+     gs-if-only
+     gs-for
+     gs-seq
+     node->c
+     node-size])
+  (import glsl/core
+    :refer
+    [glsl-binop
+     glsl-set!
+     glsl-return
+     glsl-discard
+     glsl-inc!
+     glsl-dec!
+     glsl-if
+     glsl-if-only
+     glsl-for])
   (import glsl/builtins :refer [swizzle])
-  (import test/assert   :refer [assert-true])
-  (import test/suite    :refer [describe it])
-  (import test/runner   :refer [run-all-status])
-
+  (import test/assert :refer [assert-true])
+  (import test/suite :refer [describe it])
+  (import test/runner :refer [run-all-status])
   (defn cstr= [a : cstr b : cstr] : bool
     ```c
     #include <string.h>
     return strcmp((const char*)(intptr_t)a, (const char*)(intptr_t)b) == 0;
     ```)
-
   (defn int= [a : int b : int] : bool (= a b))
-
   ;; describe/it register a test only when executed at runtime, so the suites
   ;; live inside `main` (like sized_test), not at top-level module scope.
   (defn main [] : int
-   (do
-
-  ;; --- expression folds: byte-identical to the flat builders --------------
-
-  (describe "glsl node->c expressions"
-    (it "raw leaf passes through verbatim"
-      (assert-true (cstr= (node->c (ge-var "x")) "x")))
-
-    (it "binop matches glsl-binop"
-      (assert-true (cstr= (node->c (ge-binop "+" (ge-var "a") (ge-var "b")))
-                          (glsl-binop "+" "a" "b"))))
-
-    (it "swizzle matches swizzle builder"
-      (assert-true (cstr= (node->c (ge-swizzle (ge-var "color") ":rgb"))
-                          (swizzle "color" ":rgb"))))
-
-    (it "swizzle strips the leading colon"
-      (assert-true (cstr= (node->c (ge-swizzle (ge-var "v") ":xy")) "v.xy")))
-
-    ;; nested trees fold without per-node scaffolding
-    (it "nested binop folds recursively"
-      (assert-true
-        (cstr= (node->c (ge-binop "*"
-                          (ge-binop "+" (ge-var "a") (ge-var "b"))
-                          (ge-var "c")))
-               "((a + b) * c)")))
-
-    (it "swizzle of a binop result"
-      (assert-true
-        (cstr= (node->c (ge-swizzle
-                          (ge-binop "+" (ge-var "a") (ge-var "b")) ":xyz"))
-               "(a + b).xyz"))))
-
-  ;; --- statement folds: byte-identical to the flat builders ---------------
-
-  (describe "glsl node->c statements"
-    (it "set matches glsl-set!"
-      (assert-true (cstr= (node->c (gs-set (ge-var "fragColor") (ge-lit "vec4(1.0)")))
-                          (glsl-set! "fragColor" "vec4(1.0)"))))
-
-    (it "return matches glsl-return"
-      (assert-true (cstr= (node->c (gs-return (ge-binop "*" (ge-var "x") (ge-var "x"))))
-                          (glsl-return "(x * x)"))))
-
-    (it "discard"
-      (assert-true (cstr= (node->c (gs-discard)) "discard;")))
-
-    (it "inc matches glsl-inc!"
-      (assert-true (cstr= (node->c (gs-inc (ge-var "i"))) (glsl-inc! "i"))))
-
-    (it "dec matches glsl-dec!"
-      (assert-true (cstr= (node->c (gs-dec (ge-var "i"))) (glsl-dec! "i"))))
-
-    (it "expr statement appends semicolon"
-      (assert-true (cstr= (node->c (gs-expr (ge-var "x"))) "x;")))
-
-    (it "raw statement passes through"
-      (assert-true (cstr= (node->c (gs-raw "foo();")) "foo();")))
-
-    (it "if/else matches glsl-if"
-      (assert-true
-        (cstr= (node->c (gs-if (ge-binop ">" (ge-var "x") (ge-lit "0.0"))
-                               (gs-return (ge-lit "1.0"))
-                               (gs-return (ge-lit "-1.0"))))
-               (glsl-if "(x > 0.0)" "return 1.0;" "return -1.0;"))))
-
-    (it "if-only matches glsl-if-only"
-      (assert-true
-        (cstr= (node->c (gs-if-only (ge-binop "<" (ge-var "alpha") (ge-lit "0.01"))
-                                    (gs-discard)))
-               (glsl-if-only "(alpha < 0.01)" "discard;"))))
-
-    (it "for matches glsl-for"
-      (assert-true
-        (cstr= (node->c (gs-for "int i = 0" "i < 4" "i++"
-                          (gs-set (ge-var "sum") (ge-binop "+" (ge-var "sum") (ge-var "i")))))
-               (glsl-for "int i = 0" "i < 4" "i++" "sum = (sum + i);"))))
-
-    (it "seq joins statements with a newline"
-      (assert-true
-        (cstr= (node->c (gs-seq (gs-raw "a();") (gs-raw "b();")))
-               "a();\nb();")))
-
-    ;; a for-loop whose body is a sequence -- the cata indents the folded body
-    ;; exactly as glsl-for would.
-    (it "for with a multi-statement body"
-      (assert-true
-        (cstr= (node->c (gs-for "int i = 0" "i < 2" "i++"
-                          (gs-seq (gs-raw "a();") (gs-raw "b();"))))
-               (glsl-for "int i = 0" "i < 2" "i++" "a();\nb();")))))
-
-  ;; --- a second fold over the same driver ---------------------------------
-
-  (describe "glsl node-size"
-    (it "counts a single leaf as one"
-      (assert-true (int= (node-size (ge-var "x")) 1)))
-
-    (it "counts nested expression nodes"
-      ;; (a + b) * c  ->  GBinF, GBinF, GRawF, GRawF, GRawF = 5
-      (assert-true (int= (node-size (ge-binop "*"
-                                      (ge-binop "+" (ge-var "a") (ge-var "b"))
-                                      (ge-var "c")))
+    (do
+      ;; --- expression folds: byte-identical to the flat builders --------------
+      (describe "glsl node->c expressions"
+        (it "raw leaf passes through verbatim"
+          (assert-true (cstr= (node->c (ge-var "x")) "x")))
+        (it "binop matches glsl-binop"
+          (assert-true (cstr= (node->c (ge-binop "+" (ge-var "a") (ge-var "b")))
+                         (glsl-binop "+" "a" "b"))))
+        (it "swizzle matches swizzle builder"
+          (assert-true (cstr= (node->c (ge-swizzle (ge-var "color") ":rgb"))
+                         (swizzle "color" ":rgb"))))
+        (it "swizzle strips the leading colon"
+          (assert-true (cstr= (node->c (ge-swizzle (ge-var "v") ":xy")) "v.xy")))
+        ;; nested trees fold without per-node scaffolding
+        (it "nested binop folds recursively"
+          (assert-true (cstr= (node->c (ge-binop "*"
+                                         (ge-binop "+"
+                                           (ge-var "a")
+                                           (ge-var "b"))
+                                         (ge-var "c")))
+                         "((a + b) * c)")))
+        (it "swizzle of a binop result"
+          (assert-true (cstr= (node->c (ge-swizzle (ge-binop "+"
+                                                     (ge-var "a")
+                                                     (ge-var "b"))
+                                         ":xyz"))
+                         "(a + b).xyz"))))
+      ;; --- statement folds: byte-identical to the flat builders ---------------
+      (describe "glsl node->c statements"
+        (it "set matches glsl-set!"
+          (assert-true (cstr= (node->c (gs-set (ge-var "fragColor")
+                                         (ge-lit "vec4(1.0)")))
+                         (glsl-set! "fragColor" "vec4(1.0)"))))
+        (it "return matches glsl-return"
+          (assert-true (cstr= (node->c (gs-return (ge-binop "*"
+                                                    (ge-var "x")
+                                                    (ge-var "x"))))
+                         (glsl-return "(x * x)"))))
+        (it "discard" (assert-true (cstr= (node->c (gs-discard)) "discard;")))
+        (it "inc matches glsl-inc!"
+          (assert-true (cstr= (node->c (gs-inc (ge-var "i"))) (glsl-inc! "i"))))
+        (it "dec matches glsl-dec!"
+          (assert-true (cstr= (node->c (gs-dec (ge-var "i"))) (glsl-dec! "i"))))
+        (it "expr statement appends semicolon"
+          (assert-true (cstr= (node->c (gs-expr (ge-var "x"))) "x;")))
+        (it "raw statement passes through"
+          (assert-true (cstr= (node->c (gs-raw "foo();")) "foo();")))
+        (it "if/else matches glsl-if"
+          (assert-true (cstr= (node->c (gs-if (ge-binop ">"
+                                                (ge-var "x")
+                                                (ge-lit "0.0"))
+                                         (gs-return (ge-lit "1.0"))
+                                         (gs-return (ge-lit "-1.0"))))
+                         (glsl-if "(x > 0.0)" "return 1.0;" "return -1.0;"))))
+        (it "if-only matches glsl-if-only"
+          (assert-true (cstr= (node->c (gs-if-only (ge-binop "<"
+                                                     (ge-var "alpha")
+                                                     (ge-lit "0.01"))
+                                         (gs-discard)))
+                         (glsl-if-only "(alpha < 0.01)" "discard;"))))
+        (it "for matches glsl-for"
+          (assert-true (cstr= (node->c (gs-for "int i = 0"
+                                         "i < 4"
+                                         "i++"
+                                         (gs-set (ge-var "sum")
+                                           (ge-binop "+"
+                                             (ge-var "sum")
+                                             (ge-var "i")))))
+                         (glsl-for "int i = 0" "i < 4" "i++" "sum = (sum + i);"))))
+        (it "seq joins statements with a newline"
+          (assert-true (cstr= (node->c (gs-seq (gs-raw "a();") (gs-raw "b();")))
+                         "a();\nb();")))
+        ;; a for-loop whose body is a sequence -- the cata indents the folded body
+        ;; exactly as glsl-for would.
+        (it "for with a multi-statement body"
+          (assert-true (cstr= (node->c (gs-for "int i = 0"
+                                         "i < 2"
+                                         "i++"
+                                         (gs-seq (gs-raw "a();")
+                                           (gs-raw "b();"))))
+                         (glsl-for "int i = 0" "i < 2" "i++" "a();\nb();")))))
+      ;; --- a second fold over the same driver ---------------------------------
+      (describe "glsl node-size"
+        (it "counts a single leaf as one"
+          (assert-true (int= (node-size (ge-var "x")) 1)))
+        (it "counts nested expression nodes"
+          ;; (a + b) * c  ->  GBinF, GBinF, GRawF, GRawF, GRawF = 5
+          (assert-true (int= (node-size (ge-binop "*"
+                                          (ge-binop "+"
+                                            (ge-var "a")
+                                            (ge-var "b"))
+                                          (ge-var "c")))
                          5)))
-
-    (it "counts a swizzle node plus its child"
-      (assert-true (int= (node-size (ge-swizzle (ge-var "v") ":xyz")) 2))))
-
-    (run-all-status))))
+        (it "counts a swizzle node plus its child"
+          (assert-true (int= (node-size (ge-swizzle (ge-var "v") ":xyz")) 2))))
+      (run-all-status))))

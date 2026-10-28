@@ -25,281 +25,266 @@
   ;; Imported for the ambient DeltaCRDT methods (C4); a defclass is not an
   ;; exportable name, so the import anchor is `join-all`.
   (import crdt/lattice :refer [join-all])
-  (export GSet gset-new gset-add gset-has? gset-count gset-delta-add
-          TwoPSet twopset-new twopset-add twopset-remove twopset-has?
-          twopset-count twopset-size twopset-delta-add twopset-delta-remove)
-
-;;; GSet -- grow-only set of interned names.
-;;;
-;;; Since: crdt-spice-plan C2
-(defstruct GSet [elems : int])
-
-;;; gset-new -- an empty G-Set.
-;;;
-;;; Returns:
-;;;   A G-Set with no elements.
-;;;
-;;; Example:
-;;;   (gset-new)
-;;;
-;;; Since: crdt-spice-plan C2
-(defn gset-new [] : GSet (GSet (:: (set-new) int)))
-
-;;; gset-add -- add an element.
-;;;
-;;; Parameters:
-;;;   s -- the set
-;;;   x -- the element
-;;;
-;;; Returns:
-;;;   A new G-Set containing x; the old one remains valid.
-;;;
-;;; Example:
-;;;   (gset-add (gset-new) (quote apple))
-;;;
-;;; Since: crdt-spice-plan C2
-;;
-;; `set-add1` is the typed insert: it hashes through Hash[Sym] and refuses an
-;; element that is not the set's type.  Membership still takes the explicit
-;; hash (`set-member?`), as stdlib has no typed lookup; the two agree since
-;; turmeric's set-add-elem-hash-disagrees-with-set-member fix (2026-09-16).
-(defn gset-add [s : GSet x : Sym] : GSet
-  (GSet (:: (set-add1 (:: (.elems s) (Set Sym)) x) int)))
-
-;;; gset-has? -- is x in the set?
-;;;
-;;; Parameters:
-;;;   s -- the set
-;;;   x -- the element
-;;;
-;;; Returns:
-;;;   true when x has been added.
-;;;
-;;; Example:
-;;;   (gset-has? s (quote apple))
-;;;
-;;; Since: crdt-spice-plan C2
-(defn gset-has? [^borrow s : GSet x : Sym] : bool
-  (set-member? (:: (.elems s) (Set Sym)) (hash x) x))
-
-;;; gset-count -- how many elements.
-;;;
-;;; Parameters:
-;;;   s -- the set
-;;;
-;;; Returns:
-;;;   The element count.
-;;;
-;;; Example:
-;;;   (gset-count s)   ; => 3
-;;;
-;;; Since: crdt-spice-plan C2
-(defn gset-count [^borrow s : GSet] : int
-  (set-count (:: (.elems s) (Set Sym))))
-
-;;; JoinSemilattice [GSet] -- union.
-;;
-;; The join a G-Set was named for.  Union is associative, commutative and
-;; idempotent without anything being arranged, which is why this is the type
-;; every other set CRDT is compared against.
-(definstance JoinSemilattice [GSet]
-  (join [x y]
-    (GSet (:: (set-union (:: (.elems x) (Set Sym)) (:: (.elems y) (Set Sym))) int))))
-
-;;; BoundedJoin [GSet] -- the empty set is the least element.
-(definstance BoundedJoin [GSet]
-  (bottom [] (gset-new)))
-
-;;; Eq [GSet] -- same size.
-;;
-;; Size-only, and that is a real limitation: two sets of equal size with
-;; different members compare equal.  An element-wise comparison needs a set
-;; iterator the stdlib Set API does not expose the way the HAMT one does.
-;; Recorded rather than papered over -- the law functions that use this are
-;; correspondingly weaker for GSet than for the counters.
-(definstance Eq [GSet]
-  (eq? [^borrow x ^borrow y] (= (gset-count x) (gset-count y))))
-
-;;; gset-delta-add -- the DELTA of adding an element.
-;;;
-;;; Parameters:
-;;;   x -- the element
-;;;
-;;; Returns:
-;;;   A one-element G-Set.
-;;;
-;;; Example:
-;;;   (gset-delta-add (quote apple))
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; Takes no state at all, because a G-Set's join is union: the delta of an add
-;; does not depend on what is already there.  Every other delta mutator in the
-;; spice reads its state; this is the one that does not, and that is a property
-;; of union rather than an oversight.
-(defn gset-delta-add [x : Sym] : GSet (gset-add (gset-new) x))
-
-;;; DeltaCRDT [GSet] -- the delta is a one-element G-Set.
-(definstance DeltaCRDT [GSet]
-  (type Delta = GSet)
-  (delta-bottom [x] (gset-new))
-  (delta-join   [x d e] (join d e))
-  (apply-delta  [x d] (join x d)))
-
-;;; TwoPSet -- add-once, remove-once set: elements plus tombstones.
-;;;
-;;; Since: crdt-spice-plan C2
-(defstruct TwoPSet [adds : GSet dels : GSet])
-
-;;; twopset-new -- an empty 2P-Set.
-;;;
-;;; Returns:
-;;;   A 2P-Set with no elements and no tombstones.
-;;;
-;;; Example:
-;;;   (twopset-new)
-;;;
-;;; Since: crdt-spice-plan C2
-(defn twopset-new [] : TwoPSet (TwoPSet (gset-new) (gset-new)))
-
-;;; twopset-add -- add an element.
-;;;
-;;; Parameters:
-;;;   s -- the set
-;;;   x -- the element
-;;;
-;;; Returns:
-;;;   A new 2P-Set.  If x has already been removed this has NO effect on
-;;;   membership -- the tombstone wins, permanently.
-;;;
-;;; Example:
-;;;   (twopset-add (twopset-new) (quote apple))
-;;;
-;;; Since: crdt-spice-plan C2
-(defn twopset-add [s : TwoPSet x : Sym] : TwoPSet
-  (TwoPSet (gset-add (.adds s) x) (.dels s)))
-
-;;; twopset-remove -- remove an element, permanently.
-;;;
-;;; Parameters:
-;;;   s -- the set
-;;;   x -- the element
-;;;
-;;; Returns:
-;;;   A new 2P-Set in which x can never again be present.
-;;;
-;;; Example:
-;;;   (twopset-remove s (quote apple))
-;;;
-;;; Since: crdt-spice-plan C2
-(defn twopset-remove [s : TwoPSet x : Sym] : TwoPSet
-  (TwoPSet (.adds s) (gset-add (.dels s) x)))
-
-;;; twopset-has? -- is x present?
-;;;
-;;; Parameters:
-;;;   s -- the set
-;;;   x -- the element
-;;;
-;;; Returns:
-;;;   true when x was added and never removed.
-;;;
-;;; Example:
-;;;   (twopset-has? s (quote apple))
-;;;
-;;; Since: crdt-spice-plan C2
-(defn twopset-has? [^borrow s : TwoPSet x : Sym] : bool
-  (and (gset-has? (.adds s) x) (not (gset-has? (.dels s) x))))
-
-;;; twopset-count -- how many elements are present.
-;;;
-;;; Parameters:
-;;;   s -- the set
-;;;
-;;; Returns:
-;;;   adds minus tombstones.  Exact only while every tombstone corresponds to
-;;;   an added element, which twopset-remove does not enforce.
-;;;
-;;; Example:
-;;;   (twopset-count s)   ; => 2
-;;;
-;;; Since: crdt-spice-plan C2
-(defn twopset-count [^borrow s : TwoPSet] : int
-  (- (gset-count (.adds s)) (gset-count (.dels s))))
-
-;;; JoinSemilattice [TwoPSet] -- join each side.
-(definstance JoinSemilattice [TwoPSet]
-  (join [x y]
-    (TwoPSet (join (.adds x) (.adds y)) (join (.dels x) (.dels y)))))
-
-;;; BoundedJoin [TwoPSet] -- both sides empty.
-(definstance BoundedJoin [TwoPSet]
-  (bottom [] (twopset-new)))
-
-;;; Eq [TwoPSet] -- equal on both sides.
-(definstance Eq [TwoPSet]
-  (eq? [^borrow x ^borrow y]
-    (and (eq? (.adds x) (.adds y)) (eq? (.dels x) (.dels y)))))
-
-;;; twopset-size -- how much state this set is carrying.
-;;;
-;;; Parameters:
-;;;   s -- the set
-;;;
-;;; Returns:
-;;;   adds PLUS tombstones -- what a full-state send would cost, as distinct
-;;;   from `twopset-count`, which is what a reader sees.
-;;;
-;;; Example:
-;;;   (twopset-size s)   ; => 5
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; The two readings diverge under churn, which is the standing 2P-Set
-;; complaint: a set that has had 1000 elements added and 1000 removed reads
-;; `twopset-count` 0 and `twopset-size` 2000, and it is the second number that
-;; crosses the wire.
-(defn twopset-size [^borrow s : TwoPSet] : int
-  (+ (gset-count (.adds s)) (gset-count (.dels s))))
-
-;;; twopset-delta-add -- the DELTA of adding an element.
-;;;
-;;; Parameters:
-;;;   x -- the element
-;;;
-;;; Returns:
-;;;   A 2P-Set with one add and no tombstone.
-;;;
-;;; Example:
-;;;   (twopset-delta-add (quote apple))
-;;;
-;;; Since: crdt-spice-plan C4
-(defn twopset-delta-add [x : Sym] : TwoPSet
-  (TwoPSet (gset-delta-add x) (gset-new)))
-
-;;; twopset-delta-remove -- the DELTA of removing an element.
-;;;
-;;; Parameters:
-;;;   x -- the element
-;;;
-;;; Returns:
-;;;   A 2P-Set with one tombstone and no add.
-;;;
-;;; Example:
-;;;   (twopset-delta-remove (quote apple))
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; Stateless for the same reason `gset-delta-add` is, and with the same
-;; permanence: the tombstone this ships can never be withdrawn.
-(defn twopset-delta-remove [x : Sym] : TwoPSet
-  (TwoPSet (gset-new) (gset-delta-add x)))
-
-;;; DeltaCRDT [TwoPSet] -- the delta is a 2P-Set with one side empty.
-(definstance DeltaCRDT [TwoPSet]
-  (type Delta = TwoPSet)
-  (delta-bottom [x] (twopset-new))
-  (delta-join   [x d e] (join d e))
-  (apply-delta  [x d] (join x d)))
-
-) ;; end defmodule crdt/set
+  (export GSet
+    gset-new
+    gset-add
+    gset-has?
+    gset-count
+    gset-delta-add
+    TwoPSet
+    twopset-new
+    twopset-add
+    twopset-remove
+    twopset-has?
+    twopset-count
+    twopset-size
+    twopset-delta-add
+    twopset-delta-remove)
+  ;;; GSet -- grow-only set of interned names.
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defstruct GSet [elems : int])
+  ;;; gset-new -- an empty G-Set.
+  ;;;
+  ;;; Returns:
+  ;;;   A G-Set with no elements.
+  ;;;
+  ;;; Example:
+  ;;;   (gset-new)
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn gset-new [] : GSet (GSet (:: (set-new) int)))
+  ;;; gset-add -- add an element.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the set
+  ;;;   x -- the element
+  ;;;
+  ;;; Returns:
+  ;;;   A new G-Set containing x; the old one remains valid.
+  ;;;
+  ;;; Example:
+  ;;;   (gset-add (gset-new) (quote apple))
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  ;;
+  ;; `set-add1` is the typed insert: it hashes through Hash[Sym] and refuses an
+  ;; element that is not the set's type.  Membership still takes the explicit
+  ;; hash (`set-member?`), as stdlib has no typed lookup; the two agree since
+  ;; turmeric's set-add-elem-hash-disagrees-with-set-member fix (2026-09-16).
+  (defn gset-add [s : GSet x : Sym] : GSet
+    (GSet (:: (set-add1 (:: (.elems s) (Set Sym)) x) int)))
+  ;;; gset-has? -- is x in the set?
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the set
+  ;;;   x -- the element
+  ;;;
+  ;;; Returns:
+  ;;;   true when x has been added.
+  ;;;
+  ;;; Example:
+  ;;;   (gset-has? s (quote apple))
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn gset-has? [^borrow s : GSet x : Sym] : bool
+    (set-member? (:: (.elems s) (Set Sym)) (hash x) x))
+  ;;; gset-count -- how many elements.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the set
+  ;;;
+  ;;; Returns:
+  ;;;   The element count.
+  ;;;
+  ;;; Example:
+  ;;;   (gset-count s)   ; => 3
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn gset-count [^borrow s : GSet] : int
+    (set-count (:: (.elems s) (Set Sym))))
+  ;;; JoinSemilattice [GSet] -- union.
+  ;;
+  ;; The join a G-Set was named for.  Union is associative, commutative and
+  ;; idempotent without anything being arranged, which is why this is the type
+  ;; every other set CRDT is compared against.
+  (definstance JoinSemilattice [GSet]
+    (join [x y]
+      (GSet (:: (set-union (:: (.elems x) (Set Sym)) (:: (.elems y) (Set Sym)))
+              int))))
+  ;;; BoundedJoin [GSet] -- the empty set is the least element.
+  (definstance BoundedJoin [GSet] (bottom [] (gset-new)))
+  ;;; Eq [GSet] -- same size.
+  ;;
+  ;; Size-only, and that is a real limitation: two sets of equal size with
+  ;; different members compare equal.  An element-wise comparison needs a set
+  ;; iterator the stdlib Set API does not expose the way the HAMT one does.
+  ;; Recorded rather than papered over -- the law functions that use this are
+  ;; correspondingly weaker for GSet than for the counters.
+  (definstance Eq [GSet]
+    (eq? [^borrow x ^borrow y] (= (gset-count x) (gset-count y))))
+  ;;; gset-delta-add -- the DELTA of adding an element.
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- the element
+  ;;;
+  ;;; Returns:
+  ;;;   A one-element G-Set.
+  ;;;
+  ;;; Example:
+  ;;;   (gset-delta-add (quote apple))
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; Takes no state at all, because a G-Set's join is union: the delta of an add
+  ;; does not depend on what is already there.  Every other delta mutator in the
+  ;; spice reads its state; this is the one that does not, and that is a property
+  ;; of union rather than an oversight.
+  (defn gset-delta-add [x : Sym] : GSet (gset-add (gset-new) x))
+  ;;; DeltaCRDT [GSet] -- the delta is a one-element G-Set.
+  (definstance DeltaCRDT [GSet]
+    (type Delta = GSet)
+    (delta-bottom [x] (gset-new))
+    (delta-join [x d e] (join d e))
+    (apply-delta [x d] (join x d)))
+  ;;; TwoPSet -- add-once, remove-once set: elements plus tombstones.
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defstruct TwoPSet [adds : GSet dels : GSet])
+  ;;; twopset-new -- an empty 2P-Set.
+  ;;;
+  ;;; Returns:
+  ;;;   A 2P-Set with no elements and no tombstones.
+  ;;;
+  ;;; Example:
+  ;;;   (twopset-new)
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn twopset-new [] : TwoPSet (TwoPSet (gset-new) (gset-new)))
+  ;;; twopset-add -- add an element.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the set
+  ;;;   x -- the element
+  ;;;
+  ;;; Returns:
+  ;;;   A new 2P-Set.  If x has already been removed this has NO effect on
+  ;;;   membership -- the tombstone wins, permanently.
+  ;;;
+  ;;; Example:
+  ;;;   (twopset-add (twopset-new) (quote apple))
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn twopset-add [s : TwoPSet x : Sym] : TwoPSet
+    (TwoPSet (gset-add (.adds s) x) (.dels s)))
+  ;;; twopset-remove -- remove an element, permanently.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the set
+  ;;;   x -- the element
+  ;;;
+  ;;; Returns:
+  ;;;   A new 2P-Set in which x can never again be present.
+  ;;;
+  ;;; Example:
+  ;;;   (twopset-remove s (quote apple))
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn twopset-remove [s : TwoPSet x : Sym] : TwoPSet
+    (TwoPSet (.adds s) (gset-add (.dels s) x)))
+  ;;; twopset-has? -- is x present?
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the set
+  ;;;   x -- the element
+  ;;;
+  ;;; Returns:
+  ;;;   true when x was added and never removed.
+  ;;;
+  ;;; Example:
+  ;;;   (twopset-has? s (quote apple))
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn twopset-has? [^borrow s : TwoPSet x : Sym] : bool
+    (and (gset-has? (.adds s) x) (not (gset-has? (.dels s) x))))
+  ;;; twopset-count -- how many elements are present.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the set
+  ;;;
+  ;;; Returns:
+  ;;;   adds minus tombstones.  Exact only while every tombstone corresponds to
+  ;;;   an added element, which twopset-remove does not enforce.
+  ;;;
+  ;;; Example:
+  ;;;   (twopset-count s)   ; => 2
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn twopset-count [^borrow s : TwoPSet] : int
+    (- (gset-count (.adds s)) (gset-count (.dels s))))
+  ;;; JoinSemilattice [TwoPSet] -- join each side.
+  (definstance JoinSemilattice [TwoPSet]
+    (join [x y] (TwoPSet (join (.adds x) (.adds y)) (join (.dels x) (.dels y)))))
+  ;;; BoundedJoin [TwoPSet] -- both sides empty.
+  (definstance BoundedJoin [TwoPSet] (bottom [] (twopset-new)))
+  ;;; Eq [TwoPSet] -- equal on both sides.
+  (definstance Eq [TwoPSet]
+    (eq? [^borrow x ^borrow y]
+      (and (eq? (.adds x) (.adds y)) (eq? (.dels x) (.dels y)))))
+  ;;; twopset-size -- how much state this set is carrying.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the set
+  ;;;
+  ;;; Returns:
+  ;;;   adds PLUS tombstones -- what a full-state send would cost, as distinct
+  ;;;   from `twopset-count`, which is what a reader sees.
+  ;;;
+  ;;; Example:
+  ;;;   (twopset-size s)   ; => 5
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; The two readings diverge under churn, which is the standing 2P-Set
+  ;; complaint: a set that has had 1000 elements added and 1000 removed reads
+  ;; `twopset-count` 0 and `twopset-size` 2000, and it is the second number that
+  ;; crosses the wire.
+  (defn twopset-size [^borrow s : TwoPSet] : int
+    (+ (gset-count (.adds s)) (gset-count (.dels s))))
+  ;;; twopset-delta-add -- the DELTA of adding an element.
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- the element
+  ;;;
+  ;;; Returns:
+  ;;;   A 2P-Set with one add and no tombstone.
+  ;;;
+  ;;; Example:
+  ;;;   (twopset-delta-add (quote apple))
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  (defn twopset-delta-add [x : Sym] : TwoPSet
+    (TwoPSet (gset-delta-add x) (gset-new)))
+  ;;; twopset-delta-remove -- the DELTA of removing an element.
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- the element
+  ;;;
+  ;;; Returns:
+  ;;;   A 2P-Set with one tombstone and no add.
+  ;;;
+  ;;; Example:
+  ;;;   (twopset-delta-remove (quote apple))
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; Stateless for the same reason `gset-delta-add` is, and with the same
+  ;; permanence: the tombstone this ships can never be withdrawn.
+  (defn twopset-delta-remove [x : Sym] : TwoPSet
+    (TwoPSet (gset-new) (gset-delta-add x)))
+  ;;; DeltaCRDT [TwoPSet] -- the delta is a 2P-Set with one side empty.
+  (definstance DeltaCRDT [TwoPSet]
+    (type Delta = TwoPSet)
+    (delta-bottom [x] (twopset-new))
+    (delta-join [x d e] (join d e))
+    (apply-delta [x d] (join x d)))) ;; end defmodule crdt/set

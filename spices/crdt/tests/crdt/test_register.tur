@@ -16,76 +16,69 @@
 ;; from different replicas, every run.
 ;;
 ;; main returns the failure count so `tur test` reports a non-zero exit.
-
 (defmodule crdt/tests/test_register
   (import crdt/replica :refer [ReplicaId replica replica-sym])
-  (import crdt/register :refer [LwwRegister lww-new lww-set lww-value
-                                MvRegister mv-new mv-set mv-values])
-
-(defn fail-if [cond : bool label : cstr] : int
-  (if cond (do (println label) 1) 0))
-
-;; A later write beats an earlier one -- and does so from either merge
-;; direction.  This is the easy case, and the one a broken comparison still
-;; passes half of, which is why both orders are checked.
-(defn test-lww-later-wins [] : int
-  (let [early (lww-set (lww-new (replica (quote alice))) 11 1000)
-        late  (lww-set (lww-new (replica (quote alice))) 22 2000)
-        ab    (lww-value (join early late))
-        ba    (lww-value (join late early))]
-    (+ (fail-if (not (= ab 22)) "FAIL lww: later write lost (a,b)")
-       (fail-if (not (= ba 22)) "FAIL lww: later write lost (b,a)"))))
-
-;; The real case: two replicas write at the SAME instant.  Neither happened
-;; first, so the only thing that can decide is the replica tiebreak -- and both
-;; replicas have to reach the same decision from opposite merge orders, or they
-;; have diverged.
-(defn test-lww-concurrent-agrees [] : int
-  (let [a  (lww-set (lww-new (replica (quote alice))) 11 1000)
-        b  (lww-set (lww-new (replica (quote bob))) 22 1000)
-        ab (lww-value (join a b))
-        ba (lww-value (join b a))]
-    (+ (fail-if (not (= ab ba))
-                "FAIL lww: concurrent writes converge to DIFFERENT values -- divergence")
-       ;; Pinned, not merely consistent: `bob` sorts after `alice`, so bob's
-       ;; write is the one that survives.  Asserting the actual winner is what
-       ;; catches a tiebreak that silently stops comparing.
-       (fail-if (not (= ab 22)) "FAIL lww: replica tiebreak picked the wrong winner"))))
-
-;; Idempotence: re-delivering a message must not change the answer.
-(defn test-lww-idempotent [] : int
-  (let [a (lww-set (lww-new (replica (quote alice))) 11 1000)
-        b (lww-set (lww-new (replica (quote bob))) 22 1000)
-        m (join a b)]
-    (fail-if (not (= (lww-value (join m m)) (lww-value m)))
-             "FAIL lww: join is not idempotent")))
-
-;; MV, sequential: a write supersedes what this replica has already seen, so
-;; two writes in a row leave ONE value, not two.  An MV register that
-;; accumulated its own sequential writes would be unusable.
-(defn test-mv-sequential [] : int
-  (let [g (mv-set (mv-set (mv-new (replica (quote alice))) 11 1000) 22 2000)]
-    (fail-if (not (= (mv-values g) 1)) "FAIL mv: sequential writes accumulated")))
-
-;; MV, concurrent: BOTH survive.  This is the case LWW deliberately loses, and
-;; the reason to reach for this type instead.
-(defn test-mv-concurrent [] : int
-  (let [a (mv-set (mv-new (replica (quote alice))) 11 1000)
-        b (mv-set (mv-new (replica (quote bob))) 22 1000)]
-    (+ (fail-if (not (= (mv-values (join a b)) 2))
-                "FAIL mv: concurrent write was discarded (a,b)")
-       (+ (fail-if (not (= (mv-values (join b a)) 2))
-                   "FAIL mv: concurrent write was discarded (b,a)")
+  (import crdt/register
+    :refer
+    [LwwRegister lww-new lww-set lww-value MvRegister mv-new mv-set mv-values])
+  (defn fail-if [cond : bool label : cstr] : int
+    (if cond (do (println label) 1) 0))
+  ;; A later write beats an earlier one -- and does so from either merge
+  ;; direction.  This is the easy case, and the one a broken comparison still
+  ;; passes half of, which is why both orders are checked.
+  (defn test-lww-later-wins [] : int
+    (let [early (lww-set (lww-new (replica (quote alice))) 11 1000)
+          late  (lww-set (lww-new (replica (quote alice))) 22 2000)
+          ab    (lww-value (join early late))
+          ba    (lww-value (join late early))]
+      (+ (fail-if (not (= ab 22)) "FAIL lww: later write lost (a,b)")
+        (fail-if (not (= ba 22)) "FAIL lww: later write lost (b,a)"))))
+  ;; The real case: two replicas write at the SAME instant.  Neither happened
+  ;; first, so the only thing that can decide is the replica tiebreak -- and both
+  ;; replicas have to reach the same decision from opposite merge orders, or they
+  ;; have diverged.
+  (defn test-lww-concurrent-agrees [] : int
+    (let [a  (lww-set (lww-new (replica (quote alice))) 11 1000)
+          b  (lww-set (lww-new (replica (quote bob))) 22 1000)
+          ab (lww-value (join a b))
+          ba (lww-value (join b a))]
+      (+ (fail-if (not (= ab ba))
+           "FAIL lww: concurrent writes converge to DIFFERENT values -- divergence")
+        ;; Pinned, not merely consistent: `bob` sorts after `alice`, so bob's
+        ;; write is the one that survives.  Asserting the actual winner is what
+        ;; catches a tiebreak that silently stops comparing.
+        (fail-if (not (= ab 22))
+          "FAIL lww: replica tiebreak picked the wrong winner"))))
+  ;; Idempotence: re-delivering a message must not change the answer.
+  (defn test-lww-idempotent [] : int
+    (let [a (lww-set (lww-new (replica (quote alice))) 11 1000)
+          b (lww-set (lww-new (replica (quote bob))) 22 1000)
+          m (join a b)]
+      (fail-if (not (= (lww-value (join m m)) (lww-value m)))
+        "FAIL lww: join is not idempotent")))
+  ;; MV, sequential: a write supersedes what this replica has already seen, so
+  ;; two writes in a row leave ONE value, not two.  An MV register that
+  ;; accumulated its own sequential writes would be unusable.
+  (defn test-mv-sequential [] : int
+    (let [g (mv-set (mv-set (mv-new (replica (quote alice))) 11 1000) 22 2000)]
+      (fail-if (not (= (mv-values g) 1))
+        "FAIL mv: sequential writes accumulated")))
+  ;; MV, concurrent: BOTH survive.  This is the case LWW deliberately loses, and
+  ;; the reason to reach for this type instead.
+  (defn test-mv-concurrent [] : int
+    (let [a (mv-set (mv-new (replica (quote alice))) 11 1000)
+          b (mv-set (mv-new (replica (quote bob))) 22 1000)]
+      (+ (fail-if (not (= (mv-values (join a b)) 2))
+           "FAIL mv: concurrent write was discarded (a,b)")
+        (+ (fail-if (not (= (mv-values (join b a)) 2))
+             "FAIL mv: concurrent write was discarded (b,a)")
           ;; And re-delivery must not inflate the count.
           (fail-if (not (= (mv-values (join (join a b) (join b a))) 2))
-                   "FAIL mv: re-merge inflated the value set")))))
-
-(defn main [] : int
-  (let [f (+ (test-lww-later-wins)
-             (+ (test-lww-concurrent-agrees)
+            "FAIL mv: re-merge inflated the value set")))))
+  (defn main [] : int
+    (let [f (+ (test-lww-later-wins)
+              (+ (test-lww-concurrent-agrees)
                 (+ (test-lww-idempotent)
-                   (+ (test-mv-sequential) (test-mv-concurrent)))))]
-    (if (= f 0) (println "register: ok") (println "register: FAILURES"))
-    f))
-
-) ;; end defmodule
+                  (+ (test-mv-sequential) (test-mv-concurrent)))))]
+      (if (= f 0) (println "register: ok") (println "register: FAILURES"))
+      f))) ;; end defmodule

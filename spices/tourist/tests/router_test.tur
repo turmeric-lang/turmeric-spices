@@ -7,40 +7,37 @@
 ;;
 ;; Each case frees its Captures and Pattern; the handles are plain opaques
 ;; over malloc'd structs, so nothing enforces that for us.
-
 (defmodule tourist/tests/router
-  (import tourist/router :refer [router-compile pattern-free router-match
-                                 captures-get captures-count captures-free])
-  (import tourist/types  :refer [Captures Pattern])
-  (import test/suite     :refer [describe it])
-  (import test/assert    :refer [assert-true assert-eq])
+  (import tourist/router
+    :refer
+    [router-compile
+     pattern-free
+     router-match
+     captures-get
+     captures-count
+     captures-free])
+  (import tourist/types :refer [Captures Pattern])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true assert-eq])
   ;; run-all-status, not run-all: run-all returns void and the conventional
   ;; `(... (run-all) 0)` main hardcodes a 0 exit, so a failing `it` prints
   ;; `not ok` and `tur test` still calls the file a pass. Returning the
   ;; status is what makes these assertions load-bearing in CI.
-  (import test/runner    :refer [run-all-status])
-
+  (import test/runner :refer [run-all-status])
   (defn cstr-eq? [a : cstr b : cstr] : bool
     ```c
     #include <string.h>
     return strcmp((const char *)a, (const char *)b) == 0;
     ```)
-
   ;;; matched? -- router-match reports no-match as a null Captures handle.
-  (defn matched? [caps : Captures] : bool
-    (not (= (:: caps :int) 0)))
-
+  (defn matched? [caps : Captures] : bool (not (= (:: caps :int) 0)))
   ;;; match-of -- compile `pat`, match `path`, and report whether it matched.
   ;;; Frees both handles.
   (defn match-of [pat : cstr path : cstr] : bool
     (let [p    (router-compile pat)
           caps (router-match p path)
           hit  (matched? caps)]
-      (do
-        (when hit (captures-free caps))
-        (pattern-free p)
-        hit)))
-
+      (do (when hit (captures-free caps)) (pattern-free p) hit)))
   ;;; capture-is? -- did `pat` match `path` and capture `want` under `key`?
   ;;;
   ;;; The comparison happens BEFORE captures-free, and that is not incidental:
@@ -56,7 +53,6 @@
               hit (if (ok? r) (cstr-eq? want (ok-val r)) false)]
           (do (captures-free caps) (pattern-free p) hit))
         (do (pattern-free p) false))))
-
   ;;; has-capture? -- did `pat` match `path` and bind anything under `key`?
   (defn has-capture? [pat : cstr path : cstr key : cstr] : bool
     (let [p    (router-compile pat)
@@ -65,7 +61,6 @@
         (let [hit (ok? (captures-get caps key))]
           (do (captures-free caps) (pattern-free p) hit))
         (do (pattern-free p) false))))
-
   ;;; count-of -- how many segments the pattern captured. -1 on no-match, so a
   ;;; miss can never be mistaken for "matched with zero captures".
   (defn count-of [pat : cstr path : cstr] : int
@@ -75,73 +70,60 @@
         (let [n (captures-count caps)]
           (do (captures-free caps) (pattern-free p) n))
         (do (pattern-free p) -1))))
-
   (defn main [] : int
     (describe "tourist/router -- pattern compilation and matching"
-
       ;; -- literal segments ---------------------------------------------
       (it "matches a literal path exactly"
         (assert-true (match-of "/health" "/health")))
-
       (it "does not match a literal prefix of a longer segment"
         (assert-true (not (match-of "/health" "/healthz"))))
-
       (it "does not match when a literal segment differs"
         (assert-true (not (match-of "/health" "/status"))))
-
-      (it "matches the root pattern"
-        (assert-true (match-of "/" "/")))
-
+      (it "matches the root pattern" (assert-true (match-of "/" "/")))
       ;; -- named captures ------------------------------------------------
       (it "captures a named segment"
         (assert-true (capture-is? "/user/:id" "/user/42" "id" "42")))
-
       (it "captures each of several named segments"
-        (assert-true
-          (and (capture-is? "/u/:uid/post/:pid" "/u/7/post/99" "uid" "7")
-               (capture-is? "/u/:uid/post/:pid" "/u/7/post/99" "pid" "99"))))
-
+        (assert-true (and (capture-is? "/u/:uid/post/:pid"
+                            "/u/7/post/99"
+                            "uid"
+                            "7")
+                       (capture-is? "/u/:uid/post/:pid"
+                         "/u/7/post/99"
+                         "pid"
+                         "99"))))
       (it "reports one capture for a single-capture pattern"
         (assert-eq 1 (count-of "/user/:id" "/user/42")))
-
       (it "reports no captures for an all-literal pattern"
         (assert-eq 0 (count-of "/health" "/health")))
-
       ;; A capture binds one segment, so a path with an extra segment is a
       ;; miss rather than a partial match.
       (it "does not let a capture span a '/'"
         (assert-eq -1 (count-of "/user/:id" "/user/42/posts")))
-
       ;; An empty segment is not a capture -- "/user/" must not bind id="".
       (it "rejects an empty capture segment"
         (assert-eq -1 (count-of "/user/:id" "/user/")))
-
       (it "returns err for a capture name the pattern does not declare"
         (assert-true (not (has-capture? "/user/:id" "/user/42" "nope"))))
-
       ;; -- wildcard ------------------------------------------------------
       (it "captures the remainder of the path under '*'"
-        (assert-true (capture-is? "/static/*" "/static/css/site.css" "*" "css/site.css")))
-
+        (assert-true (capture-is? "/static/*"
+                       "/static/css/site.css"
+                       "*"
+                       "css/site.css")))
       (it "lets '*' match a single segment"
         (assert-true (capture-is? "/static/*" "/static/logo.png" "*" "logo.png")))
-
       ;; The wildcard is greedy and matches the rest, including nothing.
       (it "lets '*' match an empty remainder"
         (assert-true (match-of "/static/*" "/static/")))
-
       ;; -- trailing slash ------------------------------------------------
       (it "accepts a trailing slash on a literal pattern"
         (assert-true (match-of "/health" "/health/")))
-
       (it "accepts a trailing slash after a capture"
         (assert-true (capture-is? "/user/:id" "/user/42/" "id" "42")))
-
       ;; -- arity mismatch ------------------------------------------------
       (it "does not match a path with fewer segments than the pattern"
         (assert-true (not (match-of "/u/:uid/post/:pid" "/u/7"))))
-
       (it "does not match a path with more segments than the pattern"
         (assert-true (not (match-of "/health" "/health/extra")))))
-
     (run-all-status)))

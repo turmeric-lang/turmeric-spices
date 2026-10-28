@@ -10,72 +10,95 @@
 ;; externally-tagged `derive-json-sum` have all landed. The remaining design
 ;; questions from the uplift plan (field-name renaming, missing-field policy,
 ;; `:skip` annotations, structured decode errors) are still open follow-ups.
-
 (defmodule json/encode
-  (export derive-json derive-json-encode derive-json-decode
-          derive-json-opaque derive-json-opaque-encode derive-json-opaque-decode
-          derive-json-sum derive-json-sum-encode derive-json-sum-decode
-          encode-json-string
-          decode-json-list
-          __json-chain __json-obj-build __json-tag
-          __decode-field __decode-fields __decode-make-struct
-          __sum-fnames __sum-vchain __sum-enc-arms
-          __sum-dfields __sum-dec-arms
-          ;; U3 object-shape validating decoder (accumulating errors).
-          ;; (DecodeJsonChecked is a class -- like EncodeJson/DecodeJson it resolves
-          ;; globally and is intentionally NOT in the export list.)
-          JsonDecodeErrors derive-json-decoder __derive-checks
-          __errs-new __errs-count __errs-free
-          __check-int __check-cstr __check-bool __check-float
-          json-decode-errors-count json-decode-error-path json-decode-error-expected
-          json-decode-error-got json-decode-errors-free)
-
-(import json/decode :refer [json-obj-get])
-(import json/ownstr :refer [String adopt-cstr])
-
-;;; EncodeJson -- typeclass for serializing a Turmeric value to a JSON
-;;; fragment.  The fragment is a self-contained JSON value (number,
-;;; string, bool, null, object, or array), not a full document; the
-;;; caller composes fragments into the final payload.
-;;;
-;;; Method:
-;;;   encode-json : a -> cstr     ;; malloc'd JSON fragment, caller owns
-;;;
-;;; Example:
-;;;   (encode-json 42)            ;; => "42"
-;;;   (encode-json "hi")          ;; => "\"hi\""
-;;;   (encode-json true)          ;; => "true"
-;;;
-;;; Since: P2a (minimal slice, 2026-06-12)
-(defclass EncodeJson [a] (encode-json [x] : cstr))
-
-;;; EncodeJson [int] -- decimal integer.
-(definstance EncodeJson [int] (encode-json [x] : cstr
-  ```c
-  /* snprintf into a heap buffer; INT64_MIN is 20 chars + sign + NUL. */
+  (export derive-json
+    derive-json-encode
+    derive-json-decode
+    derive-json-opaque
+    derive-json-opaque-encode
+    derive-json-opaque-decode
+    derive-json-sum
+    derive-json-sum-encode
+    derive-json-sum-decode
+    encode-json-string
+    decode-json-list
+    __json-chain
+    __json-obj-build
+    __json-tag
+    __decode-field
+    __decode-fields
+    __decode-make-struct
+    __sum-fnames
+    __sum-vchain
+    __sum-enc-arms
+    __sum-dfields
+    __sum-dec-arms
+    ;; U3 object-shape validating decoder (accumulating errors).
+    ;; (DecodeJsonChecked is a class -- like EncodeJson/DecodeJson it resolves
+    ;; globally and is intentionally NOT in the export list.)
+    JsonDecodeErrors
+    derive-json-decoder
+    __derive-checks
+    __errs-new
+    __errs-count
+    __errs-free
+    __check-int
+    __check-cstr
+    __check-bool
+    __check-float
+    json-decode-errors-count
+    json-decode-error-path
+    json-decode-error-expected
+    json-decode-error-got
+    json-decode-errors-free)
+  (import json/decode :refer [json-obj-get])
+  (import json/ownstr :refer [String adopt-cstr])
+  ;;; EncodeJson -- typeclass for serializing a Turmeric value to a JSON
+  ;;; fragment.  The fragment is a self-contained JSON value (number,
+  ;;; string, bool, null, object, or array), not a full document; the
+  ;;; caller composes fragments into the final payload.
+  ;;;
+  ;;; Method:
+  ;;;   encode-json : a -> cstr     ;; malloc'd JSON fragment, caller owns
+  ;;;
+  ;;; Example:
+  ;;;   (encode-json 42)            ;; => "42"
+  ;;;   (encode-json "hi")          ;; => "\"hi\""
+  ;;;   (encode-json true)          ;; => "true"
+  ;;;
+  ;;; Since: P2a (minimal slice, 2026-06-12)
+  (defclass EncodeJson [a] (encode-json [x] : cstr))
+  ;;; EncodeJson [int] -- decimal integer.
+  (definstance EncodeJson [int]
+    (encode-json [x]
+      : cstr
+      ```c
+      /* snprintf into a heap buffer; INT64_MIN is 20 chars + sign + NUL. */
   char *buf = (char *)malloc(24);
   snprintf(buf, 24, "%lld", (long long)x);
   return buf;
   ```))
-
-;;; EncodeJson [bool] -- the literals "true" / "false".  The returned buffer
-;;; is malloc'd so the caller can free uniformly regardless of payload.
-(definstance EncodeJson [bool] (encode-json [x] : cstr
-  ```c
-  const char *s = x ? "true" : "false";
+  ;;; EncodeJson [bool] -- the literals "true" / "false".  The returned buffer
+  ;;; is malloc'd so the caller can free uniformly regardless of payload.
+  (definstance EncodeJson [bool]
+    (encode-json [x]
+      : cstr
+      ```c
+      const char *s = x ? "true" : "false";
   size_t n = strlen(s);
   char *buf = (char *)malloc(n + 1);
   memcpy(buf, s, n + 1);
   return buf;
   ```))
-
-;;; EncodeJson [cstr] -- JSON string literal: surrounded by `"`, with the
-;;; minimal RFC 8259 escape set (`"`, `\`, control chars < 0x20).
-;;; Returns "null" for a NULL input rather than aborting -- mirrors
-;;; the behavior of `json-emit` on a missing field.
-(definstance EncodeJson [cstr] (encode-json [x] : cstr
-  ```c
-  if (x == NULL) {
+  ;;; EncodeJson [cstr] -- JSON string literal: surrounded by `"`, with the
+  ;;; minimal RFC 8259 escape set (`"`, `\`, control chars < 0x20).
+  ;;; Returns "null" for a NULL input rather than aborting -- mirrors
+  ;;; the behavior of `json-emit` on a missing field.
+  (definstance EncodeJson [cstr]
+    (encode-json [x]
+      : cstr
+      ```c
+      if (x == NULL) {
     char *buf = (char *)malloc(5);
     memcpy(buf, "null", 5);
     return buf;
@@ -112,17 +135,18 @@
   buf[w] = '\0';
   return buf;
   ```))
-
-;;; EncodeJson [float] -- a JSON number for an IEEE-754 double.  The mirror of
-;;; `DecodeJson [float]`, so a float survives a decode -> encode round-trip.
-;;; JSON has no NaN / Infinity, so non-finite values emit "null" (matching
-;;; `EncodeJson [cstr]`'s null-for-missing stance) rather than producing an
-;;; invalid fragment.  Finite values use the shortest %g representation that
-;;; re-parses to the same double, so `3.14` stays `3.14` rather than widening
-;;; to `3.1400000000000001`.
-(definstance EncodeJson [float] (encode-json [x] : cstr
-  ```c
-  /* (x - x) is 0 for every finite double and NaN for both NaN and
+  ;;; EncodeJson [float] -- a JSON number for an IEEE-754 double.  The mirror of
+  ;;; `DecodeJson [float]`, so a float survives a decode -> encode round-trip.
+  ;;; JSON has no NaN / Infinity, so non-finite values emit "null" (matching
+  ;;; `EncodeJson [cstr]`'s null-for-missing stance) rather than producing an
+  ;;; invalid fragment.  Finite values use the shortest %g representation that
+  ;;; re-parses to the same double, so `3.14` stays `3.14` rather than widening
+  ;;; to `3.1400000000000001`.
+  (definstance EncodeJson [float]
+    (encode-json [x]
+      : cstr
+      ```c
+      /* (x - x) is 0 for every finite double and NaN for both NaN and
    * Infinity, so the inequality flags exactly the non-finite cases
    * without pulling in <math.h>/<float.h>. */
   if ((x - x) != 0.0) {
@@ -140,67 +164,64 @@
   memcpy(buf, tmp, n + 1);
   return buf;
   ```))
-
-;;; encode-json-string -- serialize any Encodable value to an owned String.
-;;;
-;;; The owned-return counterpart of `encode-json`: where `encode-json` hands back a
-;;; malloc'd cstr fragment the caller must free, `encode-json-string` returns a
-;;; `String` that owns its bytes (release it, or hand it to a consumer that
-;;; takes ownership). Reach for it when the serialized document is stored or
-;;; returned; keep `encode-json` for the compose-then-free fragment path.
-;;;
-;;; (Defined after the base EncodeJson instances: a polymorphic wrapper over a
-;;; typeclass method must follow at least one instance of that class, or method
-;;; resolution fails with "no typeclass method found".)
-;;;
-;;; Parameters:
-;;;   x -- any value whose type has an EncodeJson instance
-;;;
-;;; Returns:
-;;;   String -- owned serialized JSON.
-;;;
-;;; Example:
-;;;   (let [s (encode-json-string 42)] ... (release s))   ;; owned "42"
-;;;
-;;; Since: 0.3.0
-(defn encode-json-string [^EncodeJson A] [x : A] : String
-  (adopt-cstr (encode-json x)))
-
-;;; __json-null-frag -- the JSON `null` literal as a fresh malloc'd cstr, so
-;;; callers can free it uniformly like any other EncodeJson fragment.
-(defn __json-null-frag [] : cstr
-  ```c
-  char *buf = (char *)malloc(5);
+  ;;; encode-json-string -- serialize any Encodable value to an owned String.
+  ;;;
+  ;;; The owned-return counterpart of `encode-json`: where `encode-json` hands back a
+  ;;; malloc'd cstr fragment the caller must free, `encode-json-string` returns a
+  ;;; `String` that owns its bytes (release it, or hand it to a consumer that
+  ;;; takes ownership). Reach for it when the serialized document is stored or
+  ;;; returned; keep `encode-json` for the compose-then-free fragment path.
+  ;;;
+  ;;; (Defined after the base EncodeJson instances: a polymorphic wrapper over a
+  ;;; typeclass method must follow at least one instance of that class, or method
+  ;;; resolution fails with "no typeclass method found".)
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- any value whose type has an EncodeJson instance
+  ;;;
+  ;;; Returns:
+  ;;;   String -- owned serialized JSON.
+  ;;;
+  ;;; Example:
+  ;;;   (let [s (encode-json-string 42)] ... (release s))   ;; owned "42"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn encode-json-string [^EncodeJson A] [x : A] : String
+    (adopt-cstr (encode-json x)))
+  ;;; __json-null-frag -- the JSON `null` literal as a fresh malloc'd cstr, so
+  ;;; callers can free it uniformly like any other EncodeJson fragment.
+  (defn __json-null-frag [] : cstr
+    ```c
+    char *buf = (char *)malloc(5);
   memcpy(buf, "null", 5);
   return buf;
   ```)
-
-;;; EncodeJson [Option] -- a present value encodes as its element's fragment; an
-;;; absent value (`none`) encodes as JSON `null`. Constrained on `(EncodeJson A)`,
-;;; so the element is serialized by its own instance: `(Option int)` emits
-;;; `42` / `null`, `(Option cstr)` emits `"s"` / `null`, and so on -- letting a
-;;; derive-json struct carry optional fields.
-;;;
-;;; The body dispatches `encode-json` directly on `(unwrap x)`; recovering the
-;;; concrete element type through that field extraction needs turmeric main
-;;; #475 (constrained instance method dispatch on pointer-carried elements).
-;;;
-;;; Since: U2 (Track C container instances)
-(definstance EncodeJson [Option]
-  [(EncodeJson A)]
-  (encode-json [x] : cstr
-    (if (some? x)
-      (encode-json (unwrap x))
-      (__json-null-frag))))
-
-;; Runtime helper: join a cons-list of element fragments into `[e1,e2,...]`.
-;; Each list node's head is a malloc'd cstr fragment (from `encode-json`); the
-;; fragments AND the cells are freed as they are consumed, mirroring
-;; __json-obj-build -- the list is always one __json-arr-frags built for this
-;; call.
-(defn __json-arr-build [lst : int] #fx{Unsafe} : cstr
-  ```c
-  typedef struct __c { int64_t head; int64_t tail; } cons_t;
+  ;;; EncodeJson [Option] -- a present value encodes as its element's fragment; an
+  ;;; absent value (`none`) encodes as JSON `null`. Constrained on `(EncodeJson A)`,
+  ;;; so the element is serialized by its own instance: `(Option int)` emits
+  ;;; `42` / `null`, `(Option cstr)` emits `"s"` / `null`, and so on -- letting a
+  ;;; derive-json struct carry optional fields.
+  ;;;
+  ;;; The body dispatches `encode-json` directly on `(unwrap x)`; recovering the
+  ;;; concrete element type through that field extraction needs turmeric main
+  ;;; #475 (constrained instance method dispatch on pointer-carried elements).
+  ;;;
+  ;;; Since: U2 (Track C container instances)
+  (definstance EncodeJson [Option]
+    [(EncodeJson A)]
+    (encode-json [x]
+      : cstr
+      (if (some? x) (encode-json (unwrap x)) (__json-null-frag))))
+  ;; Runtime helper: join a cons-list of element fragments into `[e1,e2,...]`.
+  ;; Each list node's head is a malloc'd cstr fragment (from `encode-json`); the
+  ;; fragments AND the cells are freed as they are consumed, mirroring
+  ;; __json-obj-build -- the list is always one __json-arr-frags built for this
+  ;; call.
+  (defn __json-arr-build [lst : int]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    typedef struct __c { int64_t head; int64_t tail; } cons_t;
   size_t total = 2; /* [ ] */
   cons_t *q = (cons_t *)(intptr_t)lst;
   while (q) {
@@ -227,53 +248,52 @@
   out[w] = '\0';
   return out;
   ```)
-
-;; Encode each element of a `(Cons A)` into a fresh cons-list of cstr fragments.
-;; A plain constrained `defn` (not the instance body) so the per-element
-;; `encode-json` dispatches on the real A and the `.head`/`.tail` of the `:heap`
-;; Cons cell are read with the element ABI (turmeric main #475 + #479).
-(defn __json-arr-frags [A] [(EncodeJson A)] [cell : (Cons A)] : int
-  (if (tnil? cell)
-    0
-    (cons (encode-json (.head cell))
-          (__json-arr-frags (:: (.tail cell) (Cons A))))))
-
-;;; EncodeJson [Cons] -- a homogeneous list `(Cons A)` encodes as a JSON array, each
-;;; element via its own `(EncodeJson A)` instance: `(Cons int)` -> `[1,2,3]`,
-;;; `(Cons cstr)` -> `["a","b"]`, the empty list -> `[]`.
-;;;
-;;; NOTE: a `(Cons A)` is a heap pointer carried as `:int`, the same carrier as
-;;; `int`, so a bare `(encode-json some-list)` is an ambiguous dispatch -- pin the
-;;; instance with `@Cons` (or rely on a statically `(Cons A)`-typed call site,
-;;; e.g. a derive-json struct field). Needs #475/#479 for the per-element
-;;; dispatch and `:heap` head extraction.
-;;;
-;;; Since: U2 (Track C container instances)
-(definstance EncodeJson [Cons]
-  [(EncodeJson A)]
-  (encode-json [xs] : cstr
-    (unsafe (__json-arr-build (__json-arr-frags (:: xs (Cons A)))))))
-
-;; ---------------------------------------------------------------------------
-;; derive-json: emit an EncodeJson instance for a defstruct product type. Lives
-;; in this module (alongside EncodeJson) so the orphan-instance check sees the
-;; macro-emitted definstance as same-module-as-class. The macro takes
-;; explicit `(field-name field-type)` pairs because Turmeric macros cannot
-;; introspect a defstruct's shape at expansion time; the field-type slot is
-;; parsed but currently unused (reserved for future :skip/:as overrides).
-;; ---------------------------------------------------------------------------
-
-;; Runtime helper: walk a cons-list of alternating (key, fragment) cstrs and
-;; emit `{"k1":v1,"k2":v2,...}` into a fresh malloc'd cstr. Frees every
-;; fragment buffer it consumes -- each `(encode-json ...)` call returns malloc'd
-;; memory the caller is expected to free -- and every cell of the list, which
-;; is always one __json-chain / __sum-vchain built for this call (the cells
-;; used to leak, two per field per encode). Keys must be static string
-;; literals (the macro guarantees this from `symbol-name`), so they are NOT
-;; freed.
-(defn __json-obj-build [lst : int] #fx{Unsafe} : cstr
-  ```c
-  typedef struct __c { int64_t head; int64_t tail; } cons_t;
+  ;; Encode each element of a `(Cons A)` into a fresh cons-list of cstr fragments.
+  ;; A plain constrained `defn` (not the instance body) so the per-element
+  ;; `encode-json` dispatches on the real A and the `.head`/`.tail` of the `:heap`
+  ;; Cons cell are read with the element ABI (turmeric main #475 + #479).
+  (defn __json-arr-frags [A] [(EncodeJson A)] [cell : (Cons A)] : int
+    (if (tnil? cell)
+      0
+      (cons (encode-json (.head cell))
+        (__json-arr-frags (:: (.tail cell) (Cons A))))))
+  ;;; EncodeJson [Cons] -- a homogeneous list `(Cons A)` encodes as a JSON array, each
+  ;;; element via its own `(EncodeJson A)` instance: `(Cons int)` -> `[1,2,3]`,
+  ;;; `(Cons cstr)` -> `["a","b"]`, the empty list -> `[]`.
+  ;;;
+  ;;; NOTE: a `(Cons A)` is a heap pointer carried as `:int`, the same carrier as
+  ;;; `int`, so a bare `(encode-json some-list)` is an ambiguous dispatch -- pin the
+  ;;; instance with `@Cons` (or rely on a statically `(Cons A)`-typed call site,
+  ;;; e.g. a derive-json struct field). Needs #475/#479 for the per-element
+  ;;; dispatch and `:heap` head extraction.
+  ;;;
+  ;;; Since: U2 (Track C container instances)
+  (definstance EncodeJson [Cons]
+    [(EncodeJson A)]
+    (encode-json [xs]
+      : cstr
+      (unsafe (__json-arr-build (__json-arr-frags (:: xs (Cons A)))))))
+  ;; ---------------------------------------------------------------------------
+  ;; derive-json: emit an EncodeJson instance for a defstruct product type. Lives
+  ;; in this module (alongside EncodeJson) so the orphan-instance check sees the
+  ;; macro-emitted definstance as same-module-as-class. The macro takes
+  ;; explicit `(field-name field-type)` pairs because Turmeric macros cannot
+  ;; introspect a defstruct's shape at expansion time; the field-type slot is
+  ;; parsed but currently unused (reserved for future :skip/:as overrides).
+  ;; ---------------------------------------------------------------------------
+  ;; Runtime helper: walk a cons-list of alternating (key, fragment) cstrs and
+  ;; emit `{"k1":v1,"k2":v2,...}` into a fresh malloc'd cstr. Frees every
+  ;; fragment buffer it consumes -- each `(encode-json ...)` call returns malloc'd
+  ;; memory the caller is expected to free -- and every cell of the list, which
+  ;; is always one __json-chain / __sum-vchain built for this call (the cells
+  ;; used to leak, two per field per encode). Keys must be static string
+  ;; literals (the macro guarantees this from `symbol-name`), so they are NOT
+  ;; freed.
+  (defn __json-obj-build [lst : int]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    typedef struct __c { int64_t head; int64_t tail; } cons_t;
   cons_t *p = (cons_t *)(intptr_t)lst;
   size_t total = 2; /* { } */
   cons_t *q = p;
@@ -321,16 +341,17 @@
   out[w] = '\0';
   return out;
   ```)
-
-;; Runtime helper: wrap an already-encoded JSON fragment in a single-key
-;; object `{"Tag": <inner>}`. This is the externally-tagged discriminator
-;; convention used by `derive-json-sum` for `defdata` sum types: a value
-;; built with constructor `Click` encodes as `{"Click": {...fields...}}`.
-;; Frees the `inner` buffer it consumes (each arm's `__json-obj-build`
-;; result is malloc'd and owned here); the static tag literal is not freed.
-(defn __json-tag [name : cstr inner : cstr] #fx{Unsafe} : cstr
-  ```c
-  size_t kn = name ? strlen((const char *)name) : 0;
+  ;; Runtime helper: wrap an already-encoded JSON fragment in a single-key
+  ;; object `{"Tag": <inner>}`. This is the externally-tagged discriminator
+  ;; convention used by `derive-json-sum` for `defdata` sum types: a value
+  ;; built with constructor `Click` encodes as `{"Click": {...fields...}}`.
+  ;; Frees the `inner` buffer it consumes (each arm's `__json-obj-build`
+  ;; result is malloc'd and owned here); the static tag literal is not freed.
+  (defn __json-tag [name : cstr inner : cstr]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    size_t kn = name ? strlen((const char *)name) : 0;
   size_t vn = inner ? strlen((const char *)inner) : 4 /* "null" */;
   char *out = (char *)malloc(kn + vn + 6);
   size_t w = 0;
@@ -351,44 +372,41 @@
   out[w] = '\0';
   return out;
   ```)
-
-;; Recursive helper macro: turn the cons-list of `(field-name field-type)`
-;; pairs into a chained (cons "k1" (cons (encode-json (.k1 x)) (cons "k2" ... 0))).
-(defmacro __json-chain [fields]
-  (if (empty? fields)
-    0
-    (let [fld   (first fields)
-          fname (first fld)
-          tail  (rest fields)]
-      `(cons ~(symbol-name fname)
-             (cons (encode-json (~(dot-sym fname) x))
-                   (__json-chain ~tail))))))
-
-;; -----------------------------------------------------------------------------
-;; DecodeJson typeclass + primitive instances.
-;;
-;; Method signature: `decode-json : doc -> val-offset -> (Result a cstr)`.
-;; `a` appears only in the return type, so the dispatcher selects the
-;; instance from the call site's ascribed return type:
-;;
-;;   (:: (decode-json doc off) (Result int  cstr))   ; picks DecodeJson [int]
-;;   (:: (decode-json doc off) (Result cstr cstr))   ; picks DecodeJson [cstr]
-;;
-;; The DecodeJson class + instances live HERE alongside EncodeJson and
-;; derive-json so the macro-emitted (definstance DecodeJson [T] ...) form
-;; lands in the same module as the class definition (orphan-instance
-;; check passes). The actual scanner functions stay in json/decode and
-;; are imported above.
-;; -----------------------------------------------------------------------------
-
-(defclass DecodeJson [a] (decode-json [doc : int  val : int] : (Result a cstr)))
-
-;;; DecodeJson [int] -- read the value at `val` as a 64-bit integer. Accepts
-;;; integer JSON numbers; rejects floats, strings, booleans, null, and a
-;;; null val handle (missing field).
-(definstance DecodeJson [int] (decode-json [doc val]
-  ```c
-  #include <yyjson.h>
+  ;; Recursive helper macro: turn the cons-list of `(field-name field-type)`
+  ;; pairs into a chained (cons "k1" (cons (encode-json (.k1 x)) (cons "k2" ... 0))).
+  (defmacro __json-chain [fields]
+    (if (empty? fields)
+      0
+      (let [fld   (first fields)
+            fname (first fld)
+            tail  (rest fields)]
+        `(cons ~(symbol-name fname)
+           (cons (encode-json (~(dot-sym fname) x)) (__json-chain ~tail))))))
+  ;; -----------------------------------------------------------------------------
+  ;; DecodeJson typeclass + primitive instances.
+  ;;
+  ;; Method signature: `decode-json : doc -> val-offset -> (Result a cstr)`.
+  ;; `a` appears only in the return type, so the dispatcher selects the
+  ;; instance from the call site's ascribed return type:
+  ;;
+  ;;   (:: (decode-json doc off) (Result int  cstr))   ; picks DecodeJson [int]
+  ;;   (:: (decode-json doc off) (Result cstr cstr))   ; picks DecodeJson [cstr]
+  ;;
+  ;; The DecodeJson class + instances live HERE alongside EncodeJson and
+  ;; derive-json so the macro-emitted (definstance DecodeJson [T] ...) form
+  ;; lands in the same module as the class definition (orphan-instance
+  ;; check passes). The actual scanner functions stay in json/decode and
+  ;; are imported above.
+  ;; -----------------------------------------------------------------------------
+  (defclass DecodeJson [a]
+    (decode-json [doc : int val : int] : (Result a cstr)))
+  ;;; DecodeJson [int] -- read the value at `val` as a 64-bit integer. Accepts
+  ;;; integer JSON numbers; rejects floats, strings, booleans, null, and a
+  ;;; null val handle (missing field).
+  (definstance DecodeJson [int]
+    (decode-json [doc val]
+      ```c
+      #include <yyjson.h>
   (void)doc;
   yyjson_val *v = (yyjson_val *)(intptr_t)val;
   if (!v) return tur_box_err((int64_t)(intptr_t)"decode int: missing field");
@@ -397,13 +415,13 @@
   }
   return tur_box_ok((int64_t)yyjson_get_sint(v));
   ```))
-
-;;; DecodeJson [cstr] -- read the value at `val` as a JSON string. Returns a
-;;; freshly malloc'd cstr (caller owns it) so it survives `json-doc-free`.
-;;; Full RFC 8259 escapes + UTF-8 are supported by yyjson's decoder.
-(definstance DecodeJson [cstr] (decode-json [doc val]
-  ```c
-  #include <yyjson.h>
+  ;;; DecodeJson [cstr] -- read the value at `val` as a JSON string. Returns a
+  ;;; freshly malloc'd cstr (caller owns it) so it survives `json-doc-free`.
+  ;;; Full RFC 8259 escapes + UTF-8 are supported by yyjson's decoder.
+  (definstance DecodeJson [cstr]
+    (decode-json [doc val]
+      ```c
+      #include <yyjson.h>
   (void)doc;
   yyjson_val *v = (yyjson_val *)(intptr_t)val;
   if (!v) return tur_box_err((int64_t)(intptr_t)"decode cstr: missing field");
@@ -416,26 +434,26 @@
   out[n] = '\0';
   return tur_box_ok((int64_t)(intptr_t)out);
   ```))
-
-;;; DecodeJson [bool] -- accept JSON `true` / `false` only. Rejects numbers,
-;;; strings, and a null val handle (missing field).
-(definstance DecodeJson [bool] (decode-json [doc val]
-  ```c
-  #include <yyjson.h>
+  ;;; DecodeJson [bool] -- accept JSON `true` / `false` only. Rejects numbers,
+  ;;; strings, and a null val handle (missing field).
+  (definstance DecodeJson [bool]
+    (decode-json [doc val]
+      ```c
+      #include <yyjson.h>
   (void)doc;
   yyjson_val *v = (yyjson_val *)(intptr_t)val;
   if (!v) return tur_box_err((int64_t)(intptr_t)"decode bool: missing field");
   if (!yyjson_is_bool(v)) return tur_box_err((int64_t)(intptr_t)"decode bool: not a boolean");
   return tur_box_ok((int64_t)(yyjson_get_bool(v) ? 1 : 0));
   ```))
-
-;;; DecodeJson [float] -- read the value at `val` as an IEEE-754 double. Accepts
-;;; both JSON ints (widened to double) and floats; rejects non-numerics.
-;;; The double is returned via the same int64 carrier slot; the result-type
-;;; ascription `(Result float cstr)` selects this instance.
-(definstance DecodeJson [float] (decode-json [doc val]
-  ```c
-  #include <yyjson.h>
+  ;;; DecodeJson [float] -- read the value at `val` as an IEEE-754 double. Accepts
+  ;;; both JSON ints (widened to double) and floats; rejects non-numerics.
+  ;;; The double is returned via the same int64 carrier slot; the result-type
+  ;;; ascription `(Result float cstr)` selects this instance.
+  (definstance DecodeJson [float]
+    (decode-json [doc val]
+      ```c
+      #include <yyjson.h>
   (void)doc;
   yyjson_val *v = (yyjson_val *)(intptr_t)val;
   if (!v) return tur_box_err((int64_t)(intptr_t)"decode float: missing field");
@@ -445,454 +463,462 @@
   memcpy(&bits, &d, sizeof(bits));
   return tur_box_ok(bits);
   ```))
-
-;;; __json-absent? -- true when a value slot is missing (null handle, e.g. a
-;;; field absent from the object) or an explicit JSON `null`. Both decode to
-;;; `none` for an optional field.
-(defn __json-absent? [val : int] #fx{Unsafe} : bool
-  ```c
-  #include <yyjson.h>
+  ;;; __json-absent? -- true when a value slot is missing (null handle, e.g. a
+  ;;; field absent from the object) or an explicit JSON `null`. Both decode to
+  ;;; `none` for an optional field.
+  (defn __json-absent? [val : int]
+    #fx{Unsafe}
+    : bool
+    ```c
+    #include <yyjson.h>
   yyjson_val *v = (yyjson_val *)(intptr_t)val;
   return (!v || yyjson_is_null(v));
   ```)
-
-;;; DecodeJson [Option] -- a missing slot or JSON `null` decodes to `none`; anything
-;;; else decodes the element by its own `(DecodeJson A)` instance and wraps it in
-;;; `some`. The mirror of `EncodeJson [Option]`, so an optional field round-trips.
-;;; Like the primitive DecodeJson instances and `__decode-field`, a failing inner
-;;; decode is not propagated -- structured decode errors are a follow-up.
-;;;
-;;; Building the nested `(Result (Option A) cstr)` for a pointer-carried element
-;;; needs turmeric main #480 (nested generic construct in constrained instance
-;;; bodies); before it, the `some` payload read back as `none` for cstr/float.
-;;;
-;;; Since: U2 (Track C container instances)
-(definstance DecodeJson [Option]
-  [(DecodeJson A)]
-  (decode-json [doc val]
-    (if (unsafe (__json-absent? val))
-      (ok (:: (none) (Option A)))
-      (ok (some (ok-val (:: (decode-json doc val) (Result A cstr))))))))
-
-;;; __json-is-arr? -- true when the value is a JSON array.
-(defn __json-is-arr? [val : int] #fx{Unsafe} : bool
-  ```c
-  #include <yyjson.h>
+  ;;; DecodeJson [Option] -- a missing slot or JSON `null` decodes to `none`; anything
+  ;;; else decodes the element by its own `(DecodeJson A)` instance and wraps it in
+  ;;; `some`. The mirror of `EncodeJson [Option]`, so an optional field round-trips.
+  ;;; Like the primitive DecodeJson instances and `__decode-field`, a failing inner
+  ;;; decode is not propagated -- structured decode errors are a follow-up.
+  ;;;
+  ;;; Building the nested `(Result (Option A) cstr)` for a pointer-carried element
+  ;;; needs turmeric main #480 (nested generic construct in constrained instance
+  ;;; bodies); before it, the `some` payload read back as `none` for cstr/float.
+  ;;;
+  ;;; Since: U2 (Track C container instances)
+  (definstance DecodeJson [Option]
+    [(DecodeJson A)]
+    (decode-json [doc val]
+      (if (unsafe (__json-absent? val))
+        (ok (:: (none) (Option A)))
+        (ok (some (ok-val (:: (decode-json doc val) (Result A cstr))))))))
+  ;;; __json-is-arr? -- true when the value is a JSON array.
+  (defn __json-is-arr? [val : int]
+    #fx{Unsafe}
+    : bool
+    ```c
+    #include <yyjson.h>
   yyjson_val *v = (yyjson_val *)(intptr_t)val;
   return (v && yyjson_is_arr(v));
   ```)
-
-;;; __json-arr-size -- element count of a JSON array value.
-(defn __json-arr-size [val : int] #fx{Unsafe} : int
-  ```c
-  #include <yyjson.h>
+  ;;; __json-arr-size -- element count of a JSON array value.
+  (defn __json-arr-size [val : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    #include <yyjson.h>
   return (int)yyjson_arr_size((yyjson_val *)(intptr_t)val);
   ```)
-
-;;; __json-arr-get -- the i-th element value of a JSON array, as a yyjson_val
-;;; handle (carried as :int), to feed back into `decode-json`.
-(defn __json-arr-get [val : int  i : int] #fx{Unsafe} : int
-  ```c
-  #include <yyjson.h>
+  ;;; __json-arr-get -- the i-th element value of a JSON array, as a yyjson_val
+  ;;; handle (carried as :int), to feed back into `decode-json`.
+  (defn __json-arr-get [val : int i : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    #include <yyjson.h>
   return (int64_t)(intptr_t)yyjson_arr_get((yyjson_val *)(intptr_t)val, (size_t)i);
   ```)
-
-;; Decode array elements [i, size) into a (Cons A), head-to-tail, each element
-;; by its own (DecodeJson A) instance. A self-recursive constrained generic
-;; returning a parametric container; correct monomorphization of this shape
-;; (and of decode-json-list calling it) needs turmeric main #481.
-(defn __json-arr-decode [A] [(DecodeJson A)] [doc : int  arr : int  i : int  size : int] : (Cons A)
-  (if (>= i size)
-    (:: (tnil) (Cons A))
-    (tcons-of (ok-val (:: (decode-json doc (unsafe (__json-arr-get arr i))) (Result A cstr)))
-              (__json-arr-decode doc arr (+ i 1) size))))
-
-;;; decode-json-list -- decode a JSON array into a `(Cons A)`, the mirror of
-;;; `EncodeJson [Cons]`. A non-array decodes to the empty list. Like the other
-;;; DecodeJson paths a failing inner element decode is not propagated -- structured
-;;; errors are a follow-up.
-;;;
-;;; A standalone function rather than a `DecodeJson [Cons]` instance, returning
-;;; `(Cons A)` directly rather than `(Result (Cons A) cstr)`: a `(Cons A)`
-;;; coerces to `:int` inside a `(Result ...)`, which both defeats the return-type
-;;; dispatch that would select a `DecodeJson [Cons]` instance and breaks inferring
-;;; `A` through a `(Result (Cons A) cstr)` ascription. Call it with a `(Cons T)`
-;;; ascription so `A` is pinned:
-;;;   (:: (decode-json-list doc v) (Cons int))
-;;;
-;;; Since: U2 (Track C container instances)
-(defn decode-json-list [A] [(DecodeJson A)] [doc : int  val : int] : (Cons A)
-  (if (unsafe (__json-is-arr? val))
-    (__json-arr-decode doc val 0 (unsafe (__json-arr-size val)))
-    (:: (tnil) (Cons A))))
-
-;; Recursive helper for derive-json's DecodeJson side: turn the field list
-;; into a chain of positional arguments to `make-struct`. Each entry
-;; expands to `(ok-val (:: (decode-json doc (json-obj-get doc val "fname"))
-;; (Result <ftype> cstr)))` so that the field's typed DecodeJson instance
-;; is dispatched via the return-type ascription. No error propagation
-;; yet -- a failed field decode returns the err's int64 as the field
-;; value, which the user can detect via err? if they care; structured
-;; error reporting lands as a follow-up.
-(defmacro __decode-field [fname ftype]
-  `(ok-val
-     (:: (decode-json doc (unsafe (json-obj-get doc val ~(symbol-name fname))))
-         (Result ~ftype cstr))))
-
-(defmacro __decode-fields [fields]
-  (if (empty? fields)
-    0
-    (let [fld   (first fields)
-          fname (first fld)
-          ftype (first (rest fld))
-          tail  (rest fields)]
-      `(cons (__decode-field ~fname ~ftype)
-             (__decode-fields ~tail)))))
-
-;; The make-struct call with each field's decoded value as a positional
-;; arg. Variadic positional splicing isn't supported at macro time, so
-;; we manually unroll for 1-5 fields (mirroring stdlib's defworld
-;; idiom). For >5 fields, hand-write the DecodeJson instance.
-;;
-;; (Reserved for the Decode-side of derive-json, which is currently
-;; deferred -- see the note above `derive-json` below.)
-(defmacro __decode-make-struct [type-name fields]
-  (if (empty? fields)
-    `(make-struct ~type-name)
-    (if (empty? (rest fields))
-      ;; 1 field
-      `(make-struct ~type-name
-         (__decode-field ~(first (first fields)) ~(first (rest (first fields)))))
-      (if (empty? (rest (rest fields)))
-        ;; 2 fields
+  ;; Decode array elements [i, size) into a (Cons A), head-to-tail, each element
+  ;; by its own (DecodeJson A) instance. A self-recursive constrained generic
+  ;; returning a parametric container; correct monomorphization of this shape
+  ;; (and of decode-json-list calling it) needs turmeric main #481.
+  (defn __json-arr-decode [A] [(DecodeJson A)] [doc : int
+                                                arr : int
+                                                i : int
+                                                size : int] : (Cons A)
+    (if (>= i size)
+      (:: (tnil) (Cons A))
+      (tcons-of (ok-val (:: (decode-json doc (unsafe (__json-arr-get arr i)))
+                          (Result A cstr)))
+        (__json-arr-decode doc arr (+ i 1) size))))
+  ;;; decode-json-list -- decode a JSON array into a `(Cons A)`, the mirror of
+  ;;; `EncodeJson [Cons]`. A non-array decodes to the empty list. Like the other
+  ;;; DecodeJson paths a failing inner element decode is not propagated -- structured
+  ;;; errors are a follow-up.
+  ;;;
+  ;;; A standalone function rather than a `DecodeJson [Cons]` instance, returning
+  ;;; `(Cons A)` directly rather than `(Result (Cons A) cstr)`: a `(Cons A)`
+  ;;; coerces to `:int` inside a `(Result ...)`, which both defeats the return-type
+  ;;; dispatch that would select a `DecodeJson [Cons]` instance and breaks inferring
+  ;;; `A` through a `(Result (Cons A) cstr)` ascription. Call it with a `(Cons T)`
+  ;;; ascription so `A` is pinned:
+  ;;;   (:: (decode-json-list doc v) (Cons int))
+  ;;;
+  ;;; Since: U2 (Track C container instances)
+  (defn decode-json-list [A] [(DecodeJson A)] [doc : int val : int] : (Cons A)
+    (if (unsafe (__json-is-arr? val))
+      (__json-arr-decode doc val 0 (unsafe (__json-arr-size val)))
+      (:: (tnil) (Cons A))))
+  ;; Recursive helper for derive-json's DecodeJson side: turn the field list
+  ;; into a chain of positional arguments to `make-struct`. Each entry
+  ;; expands to `(ok-val (:: (decode-json doc (json-obj-get doc val "fname"))
+  ;; (Result <ftype> cstr)))` so that the field's typed DecodeJson instance
+  ;; is dispatched via the return-type ascription. No error propagation
+  ;; yet -- a failed field decode returns the err's int64 as the field
+  ;; value, which the user can detect via err? if they care; structured
+  ;; error reporting lands as a follow-up.
+  (defmacro __decode-field [fname ftype]
+    `(ok-val (:: (decode-json doc
+                   (unsafe (json-obj-get doc val ~(symbol-name fname))))
+               (Result ~ftype cstr))))
+  (defmacro __decode-fields [fields]
+    (if (empty? fields)
+      0
+      (let [fld   (first fields)
+            fname (first fld)
+            ftype (first (rest fld))
+            tail  (rest fields)]
+        `(cons (__decode-field ~fname ~ftype) (__decode-fields ~tail)))))
+  ;; The make-struct call with each field's decoded value as a positional
+  ;; arg. Variadic positional splicing isn't supported at macro time, so
+  ;; we manually unroll for 1-5 fields (mirroring stdlib's defworld
+  ;; idiom). For >5 fields, hand-write the DecodeJson instance.
+  ;;
+  ;; (Reserved for the Decode-side of derive-json, which is currently
+  ;; deferred -- see the note above `derive-json` below.)
+  (defmacro __decode-make-struct [type-name fields]
+    (if (empty? fields)
+      `(make-struct ~type-name)
+      (if (empty? (rest fields))
+        ;; 1 field
         `(make-struct ~type-name
-           (__decode-field ~(first (first fields))         ~(first (rest (first fields))))
-           (__decode-field ~(first (first (rest fields)))  ~(first (rest (first (rest fields))))))
-        (if (empty? (rest (rest (rest fields))))
-          ;; 3 fields
+           (__decode-field ~(first (first fields))
+             ~(first (rest (first fields)))))
+        (if (empty? (rest (rest fields)))
+          ;; 2 fields
           `(make-struct ~type-name
-             (__decode-field ~(first (first fields))                       ~(first (rest (first fields))))
-             (__decode-field ~(first (first (rest fields)))                ~(first (rest (first (rest fields)))))
-             (__decode-field ~(first (first (rest (rest fields))))         ~(first (rest (first (rest (rest fields)))))))
-          (if (empty? (rest (rest (rest (rest fields)))))
-            ;; 4 fields
+             (__decode-field ~(first (first fields))
+               ~(first (rest (first fields))))
+             (__decode-field ~(first (first (rest fields)))
+               ~(first (rest (first (rest fields))))))
+          (if (empty? (rest (rest (rest fields))))
+            ;; 3 fields
             `(make-struct ~type-name
-               (__decode-field ~(first (first fields))                               ~(first (rest (first fields))))
-               (__decode-field ~(first (first (rest fields)))                        ~(first (rest (first (rest fields)))))
-               (__decode-field ~(first (first (rest (rest fields))))                 ~(first (rest (first (rest (rest fields))))))
-               (__decode-field ~(first (first (rest (rest (rest fields)))))          ~(first (rest (first (rest (rest (rest fields))))))))
-            ;; 5 fields (cap)
-            `(make-struct ~type-name
-               (__decode-field ~(first (first fields))                                       ~(first (rest (first fields))))
-               (__decode-field ~(first (first (rest fields)))                                ~(first (rest (first (rest fields)))))
-               (__decode-field ~(first (first (rest (rest fields))))                         ~(first (rest (first (rest (rest fields))))))
-               (__decode-field ~(first (first (rest (rest (rest fields)))))                  ~(first (rest (first (rest (rest (rest fields)))))))
-               (__decode-field ~(first (first (rest (rest (rest (rest fields))))))           ~(first (rest (first (rest (rest (rest (rest fields)))))))))))))))
-
-;;; derive-json -- emit an `EncodeJson` instance for a `defstruct` product
-;;; type. (The matching DecodeJson side is plumbed in macro form below but
-;;; not yet emitted -- see the comment on the macro body for the
-;;; remaining boxing-helper gap.)
-;;;
-;;; Syntax:
-;;;   (derive-json T (f1 t1) (f2 t2) ...)
-;;;
-;;; Decoding a `defstruct` works today via the DecodeJson typeclass's
-;;; primitive instances + a hand-written `(definstance DecodeJson [T] ...)`
-;;; using inline-C to allocate the struct and wrap it via tur_ok.
-;;;
-;;; Limitations (P2a minimal slice):
-;;;   - defstruct (product) only; defdata sums and defopaque opt-in
-;;;     land in follow-ups.
-;;;   - Field-name policy is identity. `:rename-fields` not honored yet.
-;;;
-;;; Example:
-;;;   (defstruct User [id : int  name : cstr  active : bool])
-;;;   (derive-json User (id int) (name cstr) (active bool))
-;;;   ;; (encode-json (make-struct User 7 "alice" true))
-;;;   ;;   =>  {"id":7,"name":"alice","active":true}
-(defmacro derive-json [type-name & fields]
-  ;; Direction (1) of the open report landed 2026-06-13: Result__T__B's
-  ;; ok_val slot is now a heap pointer to T when T is a value-struct,
-  ;; matching the carrier-box layout byte-for-byte. Both standalone
-  ;; `(ok user)` and instance-method `(ok (make-struct User ...))`
-  ;; compile cleanly. derive-json finally emits both sides.
-  `(do
-     (definstance EncodeJson [~type-name]
-       (encode-json [x] (unsafe (__json-obj-build (__json-chain ~fields)))))
-     (definstance DecodeJson [~type-name]
+               (__decode-field ~(first (first fields))
+                 ~(first (rest (first fields))))
+               (__decode-field ~(first (first (rest fields)))
+                 ~(first (rest (first (rest fields)))))
+               (__decode-field ~(first (first (rest (rest fields))))
+                 ~(first (rest (first (rest (rest fields)))))))
+            (if (empty? (rest (rest (rest (rest fields)))))
+              ;; 4 fields
+              `(make-struct ~type-name
+                 (__decode-field ~(first (first fields))
+                   ~(first (rest (first fields))))
+                 (__decode-field ~(first (first (rest fields)))
+                   ~(first (rest (first (rest fields)))))
+                 (__decode-field ~(first (first (rest (rest fields))))
+                   ~(first (rest (first (rest (rest fields))))))
+                 (__decode-field ~(first (first (rest (rest (rest fields)))))
+                   ~(first (rest (first (rest (rest (rest fields))))))))
+              ;; 5 fields (cap)
+              `(make-struct ~type-name
+                 (__decode-field ~(first (first fields))
+                   ~(first (rest (first fields))))
+                 (__decode-field ~(first (first (rest fields)))
+                   ~(first (rest (first (rest fields)))))
+                 (__decode-field ~(first (first (rest (rest fields))))
+                   ~(first (rest (first (rest (rest fields))))))
+                 (__decode-field ~(first (first (rest (rest (rest fields)))))
+                   ~(first (rest (first (rest (rest (rest fields)))))))
+                 (__decode-field ~(first (first (rest (rest (rest (rest fields))))))
+                   ~(first (rest (first (rest (rest (rest (rest fields)))))))))))))))
+  ;;; derive-json -- emit an `EncodeJson` instance for a `defstruct` product
+  ;;; type. (The matching DecodeJson side is plumbed in macro form below but
+  ;;; not yet emitted -- see the comment on the macro body for the
+  ;;; remaining boxing-helper gap.)
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-json T (f1 t1) (f2 t2) ...)
+  ;;;
+  ;;; Decoding a `defstruct` works today via the DecodeJson typeclass's
+  ;;; primitive instances + a hand-written `(definstance DecodeJson [T] ...)`
+  ;;; using inline-C to allocate the struct and wrap it via tur_ok.
+  ;;;
+  ;;; Limitations (P2a minimal slice):
+  ;;;   - defstruct (product) only; defdata sums and defopaque opt-in
+  ;;;     land in follow-ups.
+  ;;;   - Field-name policy is identity. `:rename-fields` not honored yet.
+  ;;;
+  ;;; Example:
+  ;;;   (defstruct User [id : int  name : cstr  active : bool])
+  ;;;   (derive-json User (id int) (name cstr) (active bool))
+  ;;;   ;; (encode-json (make-struct User 7 "alice" true))
+  ;;;   ;;   =>  {"id":7,"name":"alice","active":true}
+  (defmacro derive-json [type-name & fields]
+    ;; Direction (1) of the open report landed 2026-06-13: Result__T__B's
+    ;; ok_val slot is now a heap pointer to T when T is a value-struct,
+    ;; matching the carrier-box layout byte-for-byte. Both standalone
+    ;; `(ok user)` and instance-method `(ok (make-struct User ...))`
+    ;; compile cleanly. derive-json finally emits both sides.
+    `(do
+       (definstance EncodeJson [~type-name]
+         (encode-json [x] (unsafe (__json-obj-build (__json-chain ~fields)))))
+       (definstance DecodeJson [~type-name]
+         (decode-json [doc val]
+           (:: (ok (__decode-make-struct ~type-name ~fields))
+             (Result ~type-name cstr))))))
+  ;;; derive-json-encode -- emit only the EncodeJson instance for a defstruct,
+  ;;; matching the `(derive-json T ... :only [:encode])` shape from the
+  ;;; uplift plan. Useful when the type is produced by the program but
+  ;;; never parsed back from wire (logging, telemetry, write-only audit
+  ;;; records). Avoids the DecodeJson side's `(:: ... (Result T cstr))`
+  ;;; carrier ascription, which can be expensive at elaboration time for
+  ;;; deep record nests, and keeps the DecodeJson dispatch table smaller.
+  ;;;
+  ;;; Syntax mirrors `derive-json`:
+  ;;;   (derive-json-encode T (f1 t1) (f2 t2) ...)
+  ;;;
+  ;;; Example:
+  ;;;   (defstruct LogEntry [level : cstr  msg : cstr])
+  ;;;   (derive-json-encode LogEntry (level cstr) (msg cstr))
+  ;;;   ;; (encode-json (make-struct LogEntry "info" "hi"))
+  ;;;   ;;   =>  {"level":"info","msg":"hi"}
+  (defmacro derive-json-encode [type-name & fields]
+    `(definstance EncodeJson [~type-name]
+       (encode-json [x] (unsafe (__json-obj-build (__json-chain ~fields))))))
+  ;;; derive-json-decode -- emit only the DecodeJson instance for a defstruct,
+  ;;; matching the `(derive-json T ... :only [:decode])` shape. Useful for
+  ;;; read-only inbound records whose Turmeric value never gets serialized
+  ;;; back (config blobs, third-party API responses), or when the
+  ;;; canonical EncodeJson is hand-written to honor a non-derivable wire
+  ;;; layout (custom field order, computed fields).
+  ;;;
+  ;;; Syntax mirrors `derive-json`:
+  ;;;   (derive-json-decode T (f1 t1) (f2 t2) ...)
+  ;;;
+  ;;; Example:
+  ;;;   (defstruct Config [port : int  host : cstr])
+  ;;;   (derive-json-decode Config (port int) (host cstr))
+  ;;;   ;; (:: (decode-json doc root) (Result Config cstr))
+  ;;;   ;;   parses {"port":8080,"host":"localhost"} into a Config.
+  (defmacro derive-json-decode [type-name & fields]
+    `(definstance DecodeJson [~type-name]
        (decode-json [doc val]
          (:: (ok (__decode-make-struct ~type-name ~fields))
-             (Result ~type-name cstr))))))
-
-;;; derive-json-encode -- emit only the EncodeJson instance for a defstruct,
-;;; matching the `(derive-json T ... :only [:encode])` shape from the
-;;; uplift plan. Useful when the type is produced by the program but
-;;; never parsed back from wire (logging, telemetry, write-only audit
-;;; records). Avoids the DecodeJson side's `(:: ... (Result T cstr))`
-;;; carrier ascription, which can be expensive at elaboration time for
-;;; deep record nests, and keeps the DecodeJson dispatch table smaller.
-;;;
-;;; Syntax mirrors `derive-json`:
-;;;   (derive-json-encode T (f1 t1) (f2 t2) ...)
-;;;
-;;; Example:
-;;;   (defstruct LogEntry [level : cstr  msg : cstr])
-;;;   (derive-json-encode LogEntry (level cstr) (msg cstr))
-;;;   ;; (encode-json (make-struct LogEntry "info" "hi"))
-;;;   ;;   =>  {"level":"info","msg":"hi"}
-(defmacro derive-json-encode [type-name & fields]
-  `(definstance EncodeJson [~type-name]
-     (encode-json [x] (unsafe (__json-obj-build (__json-chain ~fields))))))
-
-;;; derive-json-decode -- emit only the DecodeJson instance for a defstruct,
-;;; matching the `(derive-json T ... :only [:decode])` shape. Useful for
-;;; read-only inbound records whose Turmeric value never gets serialized
-;;; back (config blobs, third-party API responses), or when the
-;;; canonical EncodeJson is hand-written to honor a non-derivable wire
-;;; layout (custom field order, computed fields).
-;;;
-;;; Syntax mirrors `derive-json`:
-;;;   (derive-json-decode T (f1 t1) (f2 t2) ...)
-;;;
-;;; Example:
-;;;   (defstruct Config [port : int  host : cstr])
-;;;   (derive-json-decode Config (port int) (host cstr))
-;;;   ;; (:: (decode-json doc root) (Result Config cstr))
-;;;   ;;   parses {"port":8080,"host":"localhost"} into a Config.
-(defmacro derive-json-decode [type-name & fields]
-  `(definstance DecodeJson [~type-name]
-     (decode-json [doc val]
-       (:: (ok (__decode-make-struct ~type-name ~fields))
            (Result ~type-name cstr)))))
-
-;;; derive-json-opaque -- emit EncodeJson + DecodeJson instances for a `defopaque`
-;;; newtype by delegating to the carrier's typeclass instances.
-;;;
-;;; `(defopaque T :int)` (and the other carrier shapes) tags `T` as
-;;; nominally distinct but ABI-identical to its carrier. The plan's
-;;; default is to refuse to derive a JSON instance for an opaque -- its
-;;; wire representation is *not* its carrier in the general case. This
-;;; macro is the explicit `:as :carrier` opt-in: the caller is saying
-;;; "yes, encode/decode this opaque exactly as its underlying int / cstr
-;;; / bool / float." Use it for thin newtypes whose wire form genuinely
-;;; matches the carrier (`UserId :int` -> integer, `EmailAddr :cstr` ->
-;;; string).
-;;;
-;;; Syntax:
-;;;   (derive-json-opaque T :as int)         ;; both directions
-;;;
-;;; Example:
-;;;   (defopaque UserId :int)
-;;;   (derive-json-opaque UserId :as int)
-;;;   ;; (encode-json (:: 42 UserId))                      => "42"
-;;;   ;; (:: (decode-json doc val) (Result UserId cstr))   => parses int as UserId
-;;;
-;;; Carriers supported: any type with `EncodeJson` / `DecodeJson` instances --
-;;; `int`, `bool`, `cstr`, `float` ship in this module; user-defined
-;;; carriers work if their instances are in scope at the derive site.
-(defmacro derive-json-opaque [type-name _as carrier]
-  `(do
-     (definstance EncodeJson [~type-name]
-       (encode-json [x] (encode-json (:: x ~carrier))))
-     (definstance DecodeJson [~type-name]
-       (decode-json [doc val]
-         (:: (ok (:: (ok-val (:: (decode-json doc val) (Result ~carrier cstr)))
+  ;;; derive-json-opaque -- emit EncodeJson + DecodeJson instances for a `defopaque`
+  ;;; newtype by delegating to the carrier's typeclass instances.
+  ;;;
+  ;;; `(defopaque T :int)` (and the other carrier shapes) tags `T` as
+  ;;; nominally distinct but ABI-identical to its carrier. The plan's
+  ;;; default is to refuse to derive a JSON instance for an opaque -- its
+  ;;; wire representation is *not* its carrier in the general case. This
+  ;;; macro is the explicit `:as :carrier` opt-in: the caller is saying
+  ;;; "yes, encode/decode this opaque exactly as its underlying int / cstr
+  ;;; / bool / float." Use it for thin newtypes whose wire form genuinely
+  ;;; matches the carrier (`UserId :int` -> integer, `EmailAddr :cstr` ->
+  ;;; string).
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-json-opaque T :as int)         ;; both directions
+  ;;;
+  ;;; Example:
+  ;;;   (defopaque UserId :int)
+  ;;;   (derive-json-opaque UserId :as int)
+  ;;;   ;; (encode-json (:: 42 UserId))                      => "42"
+  ;;;   ;; (:: (decode-json doc val) (Result UserId cstr))   => parses int as UserId
+  ;;;
+  ;;; Carriers supported: any type with `EncodeJson` / `DecodeJson` instances --
+  ;;; `int`, `bool`, `cstr`, `float` ship in this module; user-defined
+  ;;; carriers work if their instances are in scope at the derive site.
+  (defmacro derive-json-opaque [type-name _as carrier]
+    `(do
+       (definstance EncodeJson [~type-name]
+         (encode-json [x] (encode-json (:: x ~carrier))))
+       (definstance DecodeJson [~type-name]
+         (decode-json [doc val]
+           (:: (ok (:: (ok-val (:: (decode-json doc val) (Result ~carrier cstr)))
                      ~type-name))
              (Result ~type-name cstr))))))
-
-;;; derive-json-opaque-encode -- emit only the EncodeJson instance for a
-;;; defopaque newtype, delegating to its carrier's EncodeJson. Mirrors
-;;; `derive-json-encode` for product types: useful when the opaque is
-;;; produced by the program but never parsed back from the wire (log
-;;; tokens, telemetry IDs, write-only audit handles).
-;;;
-;;; Syntax:
-;;;   (derive-json-opaque-encode T :as int)
-(defmacro derive-json-opaque-encode [type-name _as carrier]
-  `(definstance EncodeJson [~type-name]
-     (encode-json [x] (encode-json (:: x ~carrier)))))
-
-;;; derive-json-opaque-decode -- emit only the DecodeJson instance for a
-;;; defopaque newtype, delegating to its carrier's DecodeJson and wrapping
-;;; the result back into the opaque. Mirrors `derive-json-decode` for
-;;; product types: useful for read-only inbound IDs whose Turmeric
-;;; value never gets serialized back.
-;;;
-;;; Syntax:
-;;;   (derive-json-opaque-decode T :as int)
-(defmacro derive-json-opaque-decode [type-name _as carrier]
-  `(definstance DecodeJson [~type-name]
-     (decode-json [doc val]
-       (:: (ok (:: (ok-val (:: (decode-json doc val) (Result ~carrier cstr)))
+  ;;; derive-json-opaque-encode -- emit only the EncodeJson instance for a
+  ;;; defopaque newtype, delegating to its carrier's EncodeJson. Mirrors
+  ;;; `derive-json-encode` for product types: useful when the opaque is
+  ;;; produced by the program but never parsed back from the wire (log
+  ;;; tokens, telemetry IDs, write-only audit handles).
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-json-opaque-encode T :as int)
+  (defmacro derive-json-opaque-encode [type-name _as carrier]
+    `(definstance EncodeJson [~type-name]
+       (encode-json [x] (encode-json (:: x ~carrier)))))
+  ;;; derive-json-opaque-decode -- emit only the DecodeJson instance for a
+  ;;; defopaque newtype, delegating to its carrier's DecodeJson and wrapping
+  ;;; the result back into the opaque. Mirrors `derive-json-decode` for
+  ;;; product types: useful for read-only inbound IDs whose Turmeric
+  ;;; value never gets serialized back.
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-json-opaque-decode T :as int)
+  (defmacro derive-json-opaque-decode [type-name _as carrier]
+    `(definstance DecodeJson [~type-name]
+       (decode-json [doc val]
+         (:: (ok (:: (ok-val (:: (decode-json doc val) (Result ~carrier cstr)))
                    ~type-name))
            (Result ~type-name cstr)))))
-
-;; ---------------------------------------------------------------------------
-;; derive-json-sum: EncodeJson/DecodeJson for `defdata` sum-of-products types, using
-;; the externally-tagged discriminator convention `{"Ctor": {...fields...}}`.
-;;
-;; Turmeric macros cannot introspect a `defdata`'s constructor list at
-;; expansion time, so the constructors are passed explicitly, mirroring the
-;; `(field-name field-type)` shape `derive-json` uses for structs:
-;;
-;;   (defdata ^copy Event [] (Click :int :int) (Scroll :int))
-;;   (derive-json-sum Event
-;;     (Click (x int) (y int))
-;;     (Scroll (dy int)))
-;;
-;; Each constructor spec is `(CtorName (f1 t1) (f2 t2) ...)`; the field names
-;; double as the inner-object JSON keys and as the `match`/constructor binders
-;; (defdata payloads are positional, so the names are purely cosmetic on the
-;; wire but must be listed in constructor order).
-;;
-;; Encoding `(Click 3 4)` yields `{"Click":{"x":3,"y":4}}`. Decoding looks up
-;; each known tag in order and, on the first present one, decodes that inner
-;; object's fields; the last constructor is the unconditional fallthrough.
-;; Like the struct `derive-json`, field decode does not yet accumulate
-;; structured errors -- a failed inner field surfaces via the field's own
-;; `Result` (see the `__decode-field` note above).
-;; ---------------------------------------------------------------------------
-
-;; EncodeJson: splice the field names into a constructor `match` pattern,
-;; e.g. fields ((x int) (y int)) -> the binder list `x y` for `(Click x y)`.
-(defmacro __sum-fnames [fields]
-  (if (empty? fields)
-    `()
-    `(~(first (first fields)) ~@(__sum-fnames ~(rest fields)))))
-
-;; EncodeJson: build the `__json-obj-build` (key, fragment) chain for one
-;; constructor's fields, binding each fragment to the match-bound field var.
-;; Mirrors `__json-chain` but encodes the bare binder `nm` instead of `(.nm x)`.
-(defmacro __sum-vchain [fields]
-  (if (empty? fields)
-    0
-    `(cons ~(symbol-name (first (first fields)))
-           (cons (encode-json ~(first (first fields)))
-                 (__sum-vchain ~(rest fields))))))
-
-;; EncodeJson: emit the flat `match` arm list -- for each constructor a pattern
-;; `(Ctor f0 f1 ...)` followed by its tagged-object body -- then recurse.
-(defmacro __sum-enc-arms [ctors]
-  (if (empty? ctors)
-    `()
-    `((~(first (first ctors)) ~@(__sum-fnames ~(rest (first ctors))))
-      (unsafe (__json-tag ~(symbol-name (first (first ctors)))
-                          (__json-obj-build (__sum-vchain ~(rest (first ctors))))))
-      ~@(__sum-enc-arms ~(rest ctors)))))
-
-;; DecodeJson: build the positional constructor arguments for one constructor,
-;; reading each field from the tag's inner object bound to `__obj`.
-(defmacro __sum-dfields [fields]
-  (if (empty? fields)
-    `()
-    `((ok-val (:: (decode-json doc (unsafe (json-obj-get doc __obj ~(symbol-name (first (first fields))))))
-                  (Result ~(first (rest (first fields))) cstr)))
-      ~@(__sum-dfields ~(rest fields)))))
-
-;; DecodeJson: chain `(if <tag present> (Ctor ...) <next>)` over the constructors.
-;; The last constructor is the unconditional fallthrough (no guard), matching
-;; the struct side's "no structured error propagation yet" stance.
-(defmacro __sum-dec-arms [ctors]
-  (if (empty? (rest ctors))
-    `(let [__obj (unsafe (json-obj-get doc val ~(symbol-name (first (first ctors)))))]
-       (~(first (first ctors)) ~@(__sum-dfields ~(rest (first ctors)))))
-    `(let [__obj (unsafe (json-obj-get doc val ~(symbol-name (first (first ctors)))))]
-       (if (not (= __obj 0))
-         (~(first (first ctors)) ~@(__sum-dfields ~(rest (first ctors))))
-         (__sum-dec-arms ~(rest ctors))))))
-
-;;; derive-json-sum-encode -- emit only the `EncodeJson` instance for a
-;;; `defdata` sum type, using the externally-tagged convention. Useful when
-;;; the sum is produced but never parsed back (event logs, telemetry unions).
-;;;
-;;; Syntax:
-;;;   (derive-json-sum-encode T (Ctor1 (f t) ...) (Ctor2 (f t) ...) ...)
-(defmacro derive-json-sum-encode [type-name & ctors]
-  `(definstance EncodeJson [~type-name]
-     (encode-json [__self] (match __self ~@(__sum-enc-arms ~ctors)))))
-
-;;; derive-json-sum-decode -- emit only the `DecodeJson` instance for a `defdata`
-;;; sum type. Reads the externally-tagged discriminator and dispatches to the
-;;; matching constructor. Useful for read-only inbound unions.
-;;;
-;;; Syntax:
-;;;   (derive-json-sum-decode T (Ctor1 (f t) ...) (Ctor2 (f t) ...) ...)
-;;;
-;;; The constructed `(ok <adt>)` is boxed into the `(Result T cstr)` carrier
-;;; directly in the method body. (This previously had to be routed through a
-;;; generated standalone helper `defn` because a typeclass method whose tail was
-;;; a bare `(ok <adt-value>)` mis-boxed the ADT-typed result slot -- the
-;;; value-struct case was fixed first, the sum/ADT case later; turmeric main now
-;;; boxes the ADT handle correctly inline, so the delegation is gone.)
-(defmacro derive-json-sum-decode [type-name & ctors]
-  `(definstance DecodeJson [~type-name]
-     (decode-json [doc val] (:: (ok (__sum-dec-arms ~ctors)) (Result ~type-name cstr)))))
-
-;;; derive-json-sum -- emit both EncodeJson and DecodeJson instances for a `defdata`
-;;; sum-of-products type using the externally-tagged convention
-;;; `{"Ctor": {...fields...}}`.
-;;;
-;;; Syntax:
-;;;   (derive-json-sum T (Ctor1 (f1 t1) ...) (Ctor2 (f1 t1) ...) ...)
-;;;
-;;; Example:
-;;;   (defdata ^copy Event [] (Click :int :int) (Scroll :int))
-;;;   (derive-json-sum Event (Click (x int) (y int)) (Scroll (dy int)))
-;;;   ;; (encode-json (Click 3 4))                          => {"Click":{"x":3,"y":4}}
-;;;   ;; (:: (decode-json doc root) (Result Event cstr))    parses it back
-;;;
-;;; Limitations (carried from the struct slice):
-;;;   - Field-name policy is identity; `:rename-fields` not honored yet.
-;;;   - Inner field decode does not accumulate structured errors yet.
-;;;   - Nullary constructors encode as `{"Ctor":{}}` (empty inner object).
-(defmacro derive-json-sum [type-name & ctors]
-  `(do
-     (definstance EncodeJson [~type-name]
-       (encode-json [__self] (match __self ~@(__sum-enc-arms ~ctors))))
-     (definstance DecodeJson [~type-name]
-       (decode-json [doc val] (:: (ok (__sum-dec-arms ~ctors)) (Result ~type-name cstr))))))
-
-;; ===========================================================================
-;; U3 -- object-shape validating decoder (Track C / U3 target 5).
-;;
-;; The `DecodeJson` typeclass above fails fast and, through `__decode-field`, takes
-;; `ok-val` of a failed field decode -- so a missing key or wrong-typed value
-;; silently yields a garbage field rather than an error. This section adds the
-;; row/object-shape decoder the U3 plan calls for: it checks every declared
-;; field of an object against its expected JSON type, ACCUMULATES all
-;; violations (it does not stop at the first), and returns
-;; `(Result T JsonDecodeErrors)` -- `err` carrying every per-field failure with its
-;; key path, expected type, and the type actually seen.
-;;
-;; The primitive vocabulary (int / string / bool / float) and the
-;; "accumulate all failures with field paths" model mirror `stdlib/schema.tur`
-;; in spirit (a spice cannot extend stdlib, so this is a self-contained
-;; reimplementation of just the kernel U3 needs). Nested-object field paths
-;; (dot-separated) and array-element validation are follow-ups; v1 validates a
-;; flat object of primitive fields, which is the "rejecting missing keys at the
-;; boundary" deliverable.
-;; ===========================================================================
-
-;;; JsonDecodeErrors -- opaque handle to an accumulated list of decode violations.
-;;; Returned in the `err` slot of a checked decode; inspect with
-;;; `json-decode-errors-count` + `decode-error-path/expected/got`, then release with
-;;; `json-decode-errors-free`.
-(defopaque JsonDecodeErrors :int)
-
-;; Growable error buffer: each entry is {path, expected, got}, all owned cstrs.
-(defn __errs-new [] #fx{Unsafe} : int
-  ```c
-  struct __jderr  { char *path; char *expected; char *got; };
+  ;; ---------------------------------------------------------------------------
+  ;; derive-json-sum: EncodeJson/DecodeJson for `defdata` sum-of-products types, using
+  ;; the externally-tagged discriminator convention `{"Ctor": {...fields...}}`.
+  ;;
+  ;; Turmeric macros cannot introspect a `defdata`'s constructor list at
+  ;; expansion time, so the constructors are passed explicitly, mirroring the
+  ;; `(field-name field-type)` shape `derive-json` uses for structs:
+  ;;
+  ;;   (defdata ^copy Event [] (Click :int :int) (Scroll :int))
+  ;;   (derive-json-sum Event
+  ;;     (Click (x int) (y int))
+  ;;     (Scroll (dy int)))
+  ;;
+  ;; Each constructor spec is `(CtorName (f1 t1) (f2 t2) ...)`; the field names
+  ;; double as the inner-object JSON keys and as the `match`/constructor binders
+  ;; (defdata payloads are positional, so the names are purely cosmetic on the
+  ;; wire but must be listed in constructor order).
+  ;;
+  ;; Encoding `(Click 3 4)` yields `{"Click":{"x":3,"y":4}}`. Decoding looks up
+  ;; each known tag in order and, on the first present one, decodes that inner
+  ;; object's fields; the last constructor is the unconditional fallthrough.
+  ;; Like the struct `derive-json`, field decode does not yet accumulate
+  ;; structured errors -- a failed inner field surfaces via the field's own
+  ;; `Result` (see the `__decode-field` note above).
+  ;; ---------------------------------------------------------------------------
+  ;; EncodeJson: splice the field names into a constructor `match` pattern,
+  ;; e.g. fields ((x int) (y int)) -> the binder list `x y` for `(Click x y)`.
+  (defmacro __sum-fnames [fields]
+    (if (empty? fields)
+      `()
+      `(~(first (first fields)) ~@(__sum-fnames ~(rest fields)))))
+  ;; EncodeJson: build the `__json-obj-build` (key, fragment) chain for one
+  ;; constructor's fields, binding each fragment to the match-bound field var.
+  ;; Mirrors `__json-chain` but encodes the bare binder `nm` instead of `(.nm x)`.
+  (defmacro __sum-vchain [fields]
+    (if (empty? fields)
+      0
+      `(cons ~(symbol-name (first (first fields)))
+         (cons (encode-json ~(first (first fields)))
+           (__sum-vchain ~(rest fields))))))
+  ;; EncodeJson: emit the flat `match` arm list -- for each constructor a pattern
+  ;; `(Ctor f0 f1 ...)` followed by its tagged-object body -- then recurse.
+  (defmacro __sum-enc-arms [ctors]
+    (if (empty? ctors)
+      `()
+      `((~(first (first ctors)) ~@(__sum-fnames ~(rest (first ctors)))) (unsafe (__json-tag ~(symbol-name (first (first ctors)))
+                                                                                  (__json-obj-build (__sum-vchain ~(rest (first ctors))))))
+         ~@(__sum-enc-arms ~(rest ctors)))))
+  ;; DecodeJson: build the positional constructor arguments for one constructor,
+  ;; reading each field from the tag's inner object bound to `__obj`.
+  (defmacro __sum-dfields [fields]
+    (if (empty? fields)
+      `()
+      `((ok-val (:: (decode-json doc
+                      (unsafe (json-obj-get doc
+                                __obj
+                                ~(symbol-name (first (first fields))))))
+                  (Result ~(first (rest (first fields))) cstr))) ~@(__sum-dfields ~(rest fields)))))
+  ;; DecodeJson: chain `(if <tag present> (Ctor ...) <next>)` over the constructors.
+  ;; The last constructor is the unconditional fallthrough (no guard), matching
+  ;; the struct side's "no structured error propagation yet" stance.
+  (defmacro __sum-dec-arms [ctors]
+    (if (empty? (rest ctors))
+      `(let [__obj (unsafe (json-obj-get doc
+                             val
+                             ~(symbol-name (first (first ctors)))))]
+         (~(first (first ctors)) ~@(__sum-dfields ~(rest (first ctors)))))
+      `(let [__obj (unsafe (json-obj-get doc
+                             val
+                             ~(symbol-name (first (first ctors)))))]
+         (if (not (= __obj 0))
+           (~(first (first ctors)) ~@(__sum-dfields ~(rest (first ctors))))
+           (__sum-dec-arms ~(rest ctors))))))
+  ;;; derive-json-sum-encode -- emit only the `EncodeJson` instance for a
+  ;;; `defdata` sum type, using the externally-tagged convention. Useful when
+  ;;; the sum is produced but never parsed back (event logs, telemetry unions).
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-json-sum-encode T (Ctor1 (f t) ...) (Ctor2 (f t) ...) ...)
+  (defmacro derive-json-sum-encode [type-name & ctors]
+    `(definstance EncodeJson [~type-name]
+       (encode-json [__self] (match __self ~@(__sum-enc-arms ~ctors)))))
+  ;;; derive-json-sum-decode -- emit only the `DecodeJson` instance for a `defdata`
+  ;;; sum type. Reads the externally-tagged discriminator and dispatches to the
+  ;;; matching constructor. Useful for read-only inbound unions.
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-json-sum-decode T (Ctor1 (f t) ...) (Ctor2 (f t) ...) ...)
+  ;;;
+  ;;; The constructed `(ok <adt>)` is boxed into the `(Result T cstr)` carrier
+  ;;; directly in the method body. (This previously had to be routed through a
+  ;;; generated standalone helper `defn` because a typeclass method whose tail was
+  ;;; a bare `(ok <adt-value>)` mis-boxed the ADT-typed result slot -- the
+  ;;; value-struct case was fixed first, the sum/ADT case later; turmeric main now
+  ;;; boxes the ADT handle correctly inline, so the delegation is gone.)
+  (defmacro derive-json-sum-decode [type-name & ctors]
+    `(definstance DecodeJson [~type-name]
+       (decode-json [doc val]
+         (:: (ok (__sum-dec-arms ~ctors)) (Result ~type-name cstr)))))
+  ;;; derive-json-sum -- emit both EncodeJson and DecodeJson instances for a `defdata`
+  ;;; sum-of-products type using the externally-tagged convention
+  ;;; `{"Ctor": {...fields...}}`.
+  ;;;
+  ;;; Syntax:
+  ;;;   (derive-json-sum T (Ctor1 (f1 t1) ...) (Ctor2 (f1 t1) ...) ...)
+  ;;;
+  ;;; Example:
+  ;;;   (defdata ^copy Event [] (Click :int :int) (Scroll :int))
+  ;;;   (derive-json-sum Event (Click (x int) (y int)) (Scroll (dy int)))
+  ;;;   ;; (encode-json (Click 3 4))                          => {"Click":{"x":3,"y":4}}
+  ;;;   ;; (:: (decode-json doc root) (Result Event cstr))    parses it back
+  ;;;
+  ;;; Limitations (carried from the struct slice):
+  ;;;   - Field-name policy is identity; `:rename-fields` not honored yet.
+  ;;;   - Inner field decode does not accumulate structured errors yet.
+  ;;;   - Nullary constructors encode as `{"Ctor":{}}` (empty inner object).
+  (defmacro derive-json-sum [type-name & ctors]
+    `(do
+       (definstance EncodeJson [~type-name]
+         (encode-json [__self] (match __self ~@(__sum-enc-arms ~ctors))))
+       (definstance DecodeJson [~type-name]
+         (decode-json [doc val]
+           (:: (ok (__sum-dec-arms ~ctors)) (Result ~type-name cstr))))))
+  ;; ===========================================================================
+  ;; U3 -- object-shape validating decoder (Track C / U3 target 5).
+  ;;
+  ;; The `DecodeJson` typeclass above fails fast and, through `__decode-field`, takes
+  ;; `ok-val` of a failed field decode -- so a missing key or wrong-typed value
+  ;; silently yields a garbage field rather than an error. This section adds the
+  ;; row/object-shape decoder the U3 plan calls for: it checks every declared
+  ;; field of an object against its expected JSON type, ACCUMULATES all
+  ;; violations (it does not stop at the first), and returns
+  ;; `(Result T JsonDecodeErrors)` -- `err` carrying every per-field failure with its
+  ;; key path, expected type, and the type actually seen.
+  ;;
+  ;; The primitive vocabulary (int / string / bool / float) and the
+  ;; "accumulate all failures with field paths" model mirror `stdlib/schema.tur`
+  ;; in spirit (a spice cannot extend stdlib, so this is a self-contained
+  ;; reimplementation of just the kernel U3 needs). Nested-object field paths
+  ;; (dot-separated) and array-element validation are follow-ups; v1 validates a
+  ;; flat object of primitive fields, which is the "rejecting missing keys at the
+  ;; boundary" deliverable.
+  ;; ===========================================================================
+  ;;; JsonDecodeErrors -- opaque handle to an accumulated list of decode violations.
+  ;;; Returned in the `err` slot of a checked decode; inspect with
+  ;;; `json-decode-errors-count` + `decode-error-path/expected/got`, then release with
+  ;;; `json-decode-errors-free`.
+  (defopaque JsonDecodeErrors :int)
+  ;; Growable error buffer: each entry is {path, expected, got}, all owned cstrs.
+  (defn __errs-new []
+    #fx{Unsafe}
+    : int
+    ```c
+    struct __jderr  { char *path; char *expected; char *got; };
   struct __jderrs { int64_t count; int64_t cap; struct __jderr *items; };
   struct __jderrs *e = malloc(sizeof(*e));
   e->count = 0; e->cap = 0; e->items = NULL;
   return (int64_t)(intptr_t)e;
   ```)
-
-(defn __errs-push [errs : int path : cstr expected : cstr got : cstr] #fx{Unsafe} : nil
-  ```c
-  struct __jderr  { char *path; char *expected; char *got; };
+  (defn __errs-push [errs : int path : cstr expected : cstr got : cstr]
+    #fx{Unsafe}
+    : nil
+    ```c
+    struct __jderr  { char *path; char *expected; char *got; };
   struct __jderrs { int64_t count; int64_t cap; struct __jderr *items; };
   struct __jderrs *e = (void *)(intptr_t)errs;
   if (e->count >= e->cap) {
@@ -904,42 +930,47 @@
   e->items[e->count].got      = strdup((const char *)got);
   e->count++;
   ```)
-
-(defn __errs-count [errs : int] #fx{Unsafe} : int
-  ```c
-  struct __jderr  { char *path; char *expected; char *got; };
+  (defn __errs-count [errs : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    struct __jderr  { char *path; char *expected; char *got; };
   struct __jderrs { int64_t count; int64_t cap; struct __jderr *items; };
   struct __jderrs *e = (void *)(intptr_t)errs;
   return (int)e->count;
   ```)
-
-(defn __errs-path [errs : int i : int] #fx{Unsafe} : cstr
-  ```c
-  struct __jderr  { char *path; char *expected; char *got; };
+  (defn __errs-path [errs : int i : int]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    struct __jderr  { char *path; char *expected; char *got; };
   struct __jderrs { int64_t count; int64_t cap; struct __jderr *items; };
   struct __jderrs *e = (void *)(intptr_t)errs;
   return (i >= 0 && i < e->count) ? e->items[i].path : (char *)"";
   ```)
-
-(defn __errs-expected [errs : int i : int] #fx{Unsafe} : cstr
-  ```c
-  struct __jderr  { char *path; char *expected; char *got; };
+  (defn __errs-expected [errs : int i : int]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    struct __jderr  { char *path; char *expected; char *got; };
   struct __jderrs { int64_t count; int64_t cap; struct __jderr *items; };
   struct __jderrs *e = (void *)(intptr_t)errs;
   return (i >= 0 && i < e->count) ? e->items[i].expected : (char *)"";
   ```)
-
-(defn __errs-got [errs : int i : int] #fx{Unsafe} : cstr
-  ```c
-  struct __jderr  { char *path; char *expected; char *got; };
+  (defn __errs-got [errs : int i : int]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    struct __jderr  { char *path; char *expected; char *got; };
   struct __jderrs { int64_t count; int64_t cap; struct __jderr *items; };
   struct __jderrs *e = (void *)(intptr_t)errs;
   return (i >= 0 && i < e->count) ? e->items[i].got : (char *)"";
   ```)
-
-(defn __errs-free [errs : int] #fx{Unsafe} : nil
-  ```c
-  struct __jderr  { char *path; char *expected; char *got; };
+  (defn __errs-free [errs : int]
+    #fx{Unsafe}
+    : nil
+    ```c
+    struct __jderr  { char *path; char *expected; char *got; };
   struct __jderrs { int64_t count; int64_t cap; struct __jderr *items; };
   struct __jderrs *e = (void *)(intptr_t)errs;
   if (!e) return;
@@ -949,13 +980,14 @@
   if (e->items) free(e->items);
   free(e);
   ```)
-
-;; Name the JSON type actually present at a value handle (or "missing" for an
-;; absent field), for the `got` slot of an error -- vocabulary aligned with
-;; stdlib/schema.tur (string / int / float / bool / null).
-(defn __jtype-name [val : int] #fx{Unsafe} : cstr
-  ```c
-  #include <yyjson.h>
+  ;; Name the JSON type actually present at a value handle (or "missing" for an
+  ;; absent field), for the `got` slot of an error -- vocabulary aligned with
+  ;; stdlib/schema.tur (string / int / float / bool / null).
+  (defn __jtype-name [val : int]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    #include <yyjson.h>
   yyjson_val *v = (yyjson_val *)(intptr_t)val;
   if (!v) return (char *)"missing";
   if (yyjson_is_str(v))  return (char *)"string";
@@ -967,132 +999,134 @@
   if (yyjson_is_arr(v))  return (char *)"array";
   return (char *)"unknown";
   ```)
-
-;; Primitive type predicates over a value handle (false for a 0/missing handle).
-(defn __jis-int? [val : int] #fx{Unsafe} : bool
-  ```c
-  #include <yyjson.h>
+  ;; Primitive type predicates over a value handle (false for a 0/missing handle).
+  (defn __jis-int? [val : int]
+    #fx{Unsafe}
+    : bool
+    ```c
+    #include <yyjson.h>
   yyjson_val *v = (yyjson_val *)(intptr_t)val;
   return v && (yyjson_is_int(v) || yyjson_is_uint(v) || yyjson_is_sint(v));
   ```)
-(defn __jis-str? [val : int] #fx{Unsafe} : bool
-  ```c
-  #include <yyjson.h>
+  (defn __jis-str? [val : int]
+    #fx{Unsafe}
+    : bool
+    ```c
+    #include <yyjson.h>
   yyjson_val *v = (yyjson_val *)(intptr_t)val;
   return v && yyjson_is_str(v);
   ```)
-(defn __jis-bool? [val : int] #fx{Unsafe} : bool
-  ```c
-  #include <yyjson.h>
+  (defn __jis-bool? [val : int]
+    #fx{Unsafe}
+    : bool
+    ```c
+    #include <yyjson.h>
   yyjson_val *v = (yyjson_val *)(intptr_t)val;
   return v && yyjson_is_bool(v);
   ```)
-;; floats accept any JSON number (int widens to double), matching DecodeJson [float].
-(defn __jis-num? [val : int] #fx{Unsafe} : bool
-  ```c
-  #include <yyjson.h>
+  ;; floats accept any JSON number (int widens to double), matching DecodeJson [float].
+  (defn __jis-num? [val : int]
+    #fx{Unsafe}
+    : bool
+    ```c
+    #include <yyjson.h>
   yyjson_val *v = (yyjson_val *)(intptr_t)val;
   return v && yyjson_is_num(v);
   ```)
-
-;; Per-type field checks: look up `key` in the object `objval`, and if the slot
-;; is missing or the wrong type, append a {key, expected, got} violation to the
-;; accumulator. Each accepts the raw :int error handle (the macro threads it).
-(defn __check-int [errs : int doc : int objval : int key : cstr] : nil
-  (let [v (unsafe (json-obj-get doc objval key))]
-    (if (unsafe (__jis-int? v))
-      nil
-      (unsafe (__errs-push errs key "int" (__jtype-name v))))))
-
-(defn __check-cstr [errs : int doc : int objval : int key : cstr] : nil
-  (let [v (unsafe (json-obj-get doc objval key))]
-    (if (unsafe (__jis-str? v))
-      nil
-      (unsafe (__errs-push errs key "string" (__jtype-name v))))))
-
-(defn __check-bool [errs : int doc : int objval : int key : cstr] : nil
-  (let [v (unsafe (json-obj-get doc objval key))]
-    (if (unsafe (__jis-bool? v))
-      nil
-      (unsafe (__errs-push errs key "bool" (__jtype-name v))))))
-
-(defn __check-float [errs : int doc : int objval : int key : cstr] : nil
-  (let [v (unsafe (json-obj-get doc objval key))]
-    (if (unsafe (__jis-num? v))
-      nil
-      (unsafe (__errs-push errs key "float" (__jtype-name v))))))
-
-;;; JsonDecodeErrors reporting surface.
-;;; json-decode-errors-count -- number of accumulated violations.
-(defn json-decode-errors-count [e : JsonDecodeErrors] : int
-  (unsafe (__errs-count (:: e :int))))
-;;; json-decode-error-path -- the object key of the i-th violation.
-(defn json-decode-error-path [e : JsonDecodeErrors i : int] : cstr
-  (unsafe (__errs-path (:: e :int) i)))
-;;; json-decode-error-expected -- the expected JSON type of the i-th violation.
-(defn json-decode-error-expected [e : JsonDecodeErrors i : int] : cstr
-  (unsafe (__errs-expected (:: e :int) i)))
-;;; json-decode-error-got -- the JSON type actually seen for the i-th violation.
-(defn json-decode-error-got [e : JsonDecodeErrors i : int] : cstr
-  (unsafe (__errs-got (:: e :int) i)))
-;;; json-decode-errors-free -- release the accumulator and its owned strings.
-(defn json-decode-errors-free [e : JsonDecodeErrors] : nil
-  (unsafe (__errs-free (:: e :int))))
-
-;;; DecodeJsonChecked -- typeclass for the accumulating object-shape decoder. Like
-;;; `DecodeJson`, `a` appears only in the return type, so the instance is selected
-;;; from the ascribed result type:
-;;;   (:: (decode-json-checked doc val) (Result User JsonDecodeErrors))
-;;; On success returns `(ok value)`; on any field violation returns
-;;; `(err errors)` carrying *all* violations (call json-decode-errors-count etc.).
-(defclass DecodeJsonChecked [a] (decode-json-checked [doc : int  val : int] : (Result a JsonDecodeErrors)))
-
-;; Recursive helper macro: expand the `(fname ftype)` field list into a `do`
-;; of per-field `(__check-<ftype> __errs doc val "fname")` calls. `ftype` must
-;; be a primitive (int / cstr / bool / float). Threads the let-bound `__errs`,
-;; method params `doc`/`val` -- the same non-hygienic capture `__json-chain`
-;; uses for `x`.
-(defmacro __derive-checks [fields]
-  (if (empty? fields)
-    `0
-    (let [fld   (first fields)
-          fname (first fld)
-          ftype (first (rest fld))
-          tail  (rest fields)]
-      `(do
-         (~(str->sym (str-append "__check-" (symbol-name ftype))) __errs doc val ~(symbol-name fname))
-         (__derive-checks ~tail)))))
-
-;;; derive-json-decoder -- emit a `DecodeJsonChecked` instance for a `defstruct` of
-;;; primitive fields. Validates every declared field against its expected JSON
-;;; type, accumulating all violations; on success builds the struct (reusing
-;;; the typed per-field `DecodeJson` instances via `__decode-make-struct`).
-;;;
-;;; Syntax mirrors `derive-json`:
-;;;   (derive-json-decoder T (f1 t1) (f2 t2) ...)        ;; ti in {int cstr bool float}
-;;;
-;;; Example:
-;;;   (defstruct Person [name : cstr  age : int])
-;;;   (derive-json-decoder Person (name cstr) (age int))
-;;;   ;; (:: (decode-json-checked doc root) (Result Person JsonDecodeErrors))
-;;;   ;;   {"name":"al","age":30}   => (ok <Person>)
-;;;   ;;   {"name":123}             => (err <2 violations: name/string/int, age/int/missing>)
-;;;
-;;; Limitations (v1): primitive fields only (nested objects / arrays are a
-;;; follow-up), field paths are the bare key (no dot-nesting yet), and the
-;;; field cap follows `__decode-make-struct` (<=5). For richer shapes, hand-write
-;;; the DecodeJsonChecked instance.
-(defmacro derive-json-decoder [type-name & fields]
-  `(definstance DecodeJsonChecked [~type-name]
-     (decode-json-checked [doc val]
-       (let [__errs (unsafe (__errs-new))]
-         (do
-           (__derive-checks ~fields)
-           (if (= 0 (unsafe (__errs-count __errs)))
-             (do (unsafe (__errs-free __errs))
+  ;; Per-type field checks: look up `key` in the object `objval`, and if the slot
+  ;; is missing or the wrong type, append a {key, expected, got} violation to the
+  ;; accumulator. Each accepts the raw :int error handle (the macro threads it).
+  (defn __check-int [errs : int doc : int objval : int key : cstr] : nil
+    (let [v (unsafe (json-obj-get doc objval key))]
+      (if (unsafe (__jis-int? v))
+        nil
+        (unsafe (__errs-push errs key "int" (__jtype-name v))))))
+  (defn __check-cstr [errs : int doc : int objval : int key : cstr] : nil
+    (let [v (unsafe (json-obj-get doc objval key))]
+      (if (unsafe (__jis-str? v))
+        nil
+        (unsafe (__errs-push errs key "string" (__jtype-name v))))))
+  (defn __check-bool [errs : int doc : int objval : int key : cstr] : nil
+    (let [v (unsafe (json-obj-get doc objval key))]
+      (if (unsafe (__jis-bool? v))
+        nil
+        (unsafe (__errs-push errs key "bool" (__jtype-name v))))))
+  (defn __check-float [errs : int doc : int objval : int key : cstr] : nil
+    (let [v (unsafe (json-obj-get doc objval key))]
+      (if (unsafe (__jis-num? v))
+        nil
+        (unsafe (__errs-push errs key "float" (__jtype-name v))))))
+  ;;; JsonDecodeErrors reporting surface.
+  ;;; json-decode-errors-count -- number of accumulated violations.
+  (defn json-decode-errors-count [e : JsonDecodeErrors] : int
+    (unsafe (__errs-count (:: e :int))))
+  ;;; json-decode-error-path -- the object key of the i-th violation.
+  (defn json-decode-error-path [e : JsonDecodeErrors i : int] : cstr
+    (unsafe (__errs-path (:: e :int) i)))
+  ;;; json-decode-error-expected -- the expected JSON type of the i-th violation.
+  (defn json-decode-error-expected [e : JsonDecodeErrors i : int] : cstr
+    (unsafe (__errs-expected (:: e :int) i)))
+  ;;; json-decode-error-got -- the JSON type actually seen for the i-th violation.
+  (defn json-decode-error-got [e : JsonDecodeErrors i : int] : cstr
+    (unsafe (__errs-got (:: e :int) i)))
+  ;;; json-decode-errors-free -- release the accumulator and its owned strings.
+  (defn json-decode-errors-free [e : JsonDecodeErrors] : nil
+    (unsafe (__errs-free (:: e :int))))
+  ;;; DecodeJsonChecked -- typeclass for the accumulating object-shape decoder. Like
+  ;;; `DecodeJson`, `a` appears only in the return type, so the instance is selected
+  ;;; from the ascribed result type:
+  ;;;   (:: (decode-json-checked doc val) (Result User JsonDecodeErrors))
+  ;;; On success returns `(ok value)`; on any field violation returns
+  ;;; `(err errors)` carrying *all* violations (call json-decode-errors-count etc.).
+  (defclass DecodeJsonChecked [a]
+    (decode-json-checked [doc : int val : int] : (Result a JsonDecodeErrors)))
+  ;; Recursive helper macro: expand the `(fname ftype)` field list into a `do`
+  ;; of per-field `(__check-<ftype> __errs doc val "fname")` calls. `ftype` must
+  ;; be a primitive (int / cstr / bool / float). Threads the let-bound `__errs`,
+  ;; method params `doc`/`val` -- the same non-hygienic capture `__json-chain`
+  ;; uses for `x`.
+  (defmacro __derive-checks [fields]
+    (if (empty? fields)
+      `0
+      (let [fld   (first fields)
+            fname (first fld)
+            ftype (first (rest fld))
+            tail  (rest fields)]
+        `(do
+           (~(str->sym (str-append "__check-" (symbol-name ftype))) __errs
+             doc
+             val
+             ~(symbol-name fname))
+           (__derive-checks ~tail)))))
+  ;;; derive-json-decoder -- emit a `DecodeJsonChecked` instance for a `defstruct` of
+  ;;; primitive fields. Validates every declared field against its expected JSON
+  ;;; type, accumulating all violations; on success builds the struct (reusing
+  ;;; the typed per-field `DecodeJson` instances via `__decode-make-struct`).
+  ;;;
+  ;;; Syntax mirrors `derive-json`:
+  ;;;   (derive-json-decoder T (f1 t1) (f2 t2) ...)        ;; ti in {int cstr bool float}
+  ;;;
+  ;;; Example:
+  ;;;   (defstruct Person [name : cstr  age : int])
+  ;;;   (derive-json-decoder Person (name cstr) (age int))
+  ;;;   ;; (:: (decode-json-checked doc root) (Result Person JsonDecodeErrors))
+  ;;;   ;;   {"name":"al","age":30}   => (ok <Person>)
+  ;;;   ;;   {"name":123}             => (err <2 violations: name/string/int, age/int/missing>)
+  ;;;
+  ;;; Limitations (v1): primitive fields only (nested objects / arrays are a
+  ;;; follow-up), field paths are the bare key (no dot-nesting yet), and the
+  ;;; field cap follows `__decode-make-struct` (<=5). For richer shapes, hand-write
+  ;;; the DecodeJsonChecked instance.
+  (defmacro derive-json-decoder [type-name & fields]
+    `(definstance DecodeJsonChecked [~type-name]
+       (decode-json-checked [doc val]
+         (let [__errs (unsafe (__errs-new))]
+           (do
+             (__derive-checks ~fields)
+             (if (= 0 (unsafe (__errs-count __errs)))
+               (do
+                 (unsafe (__errs-free __errs))
                  (:: (ok (__decode-make-struct ~type-name ~fields))
-                     (Result ~type-name JsonDecodeErrors)))
-             (:: (err (:: __errs JsonDecodeErrors))
-                 (Result ~type-name JsonDecodeErrors))))))))
-
-) ;; end defmodule json/encode
+                   (Result ~type-name JsonDecodeErrors)))
+               (:: (err (:: __errs JsonDecodeErrors))
+                 (Result ~type-name JsonDecodeErrors))))))))) ;; end defmodule json/encode

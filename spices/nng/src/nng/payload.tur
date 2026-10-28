@@ -21,220 +21,209 @@
 ;;;
 ;;; Since: Phase NG2
 ;; Owned byte buffer for nng message payloads.
-
 (defmodule nng/payload
-  (export Payload payload-alloc payload-len payload-data payload-free
-          payload-byte payload-empty? payload=?
-          payload-of-cstr payload->cstr payload->hex)
-
-;;; Payload -- an owned length-prefixed byte buffer (ABI: ptr<void>).
-(defopaque Payload :ptr<void>)
-
-;; The raw producers below declare `ptr<void>`, not `Payload`, and the Turmeric
-;; wrapper does the `(:: p Payload)`.  Written as one function the inline C would
-;; have to `return` a value of whatever C type the compiler chose to lower
-;; `(defopaque Payload :ptr<void>)` to -- and that choice is not stable across
-;; compiler versions.  Where it lowers to `int64_t`, `return (void *)p;` is a
-;; pointer returned from an integer-typed function: gcc calls that
-;; -Wint-conversion and carries on, AppleClang 21 rejects it outright, which is
-;; how four spices came to fail on macOS CI and pass on Linux.  Handing the
-;; carrier to `::` lets the compiler emit whichever conversion its own
-;; lowering needs.  Same reasoning as msgpack/buf and json/ownstr.
-
-;;; __payload-alloc-raw -- internal: allocate a zeroed buffer, as a bare pointer.
-(defn __payload-alloc-raw [n : int] : ptr<void>
-  ```c
-  extern void *turnng_payload_alloc(int64_t);
+  (export Payload
+    payload-alloc
+    payload-len
+    payload-data
+    payload-free
+    payload-byte
+    payload-empty?
+    payload=?
+    payload-of-cstr
+    payload->cstr
+    payload->hex)
+  ;;; Payload -- an owned length-prefixed byte buffer (ABI: ptr<void>).
+  (defopaque Payload :ptr<void>)
+  ;; The raw producers below declare `ptr<void>`, not `Payload`, and the Turmeric
+  ;; wrapper does the `(:: p Payload)`.  Written as one function the inline C would
+  ;; have to `return` a value of whatever C type the compiler chose to lower
+  ;; `(defopaque Payload :ptr<void>)` to -- and that choice is not stable across
+  ;; compiler versions.  Where it lowers to `int64_t`, `return (void *)p;` is a
+  ;; pointer returned from an integer-typed function: gcc calls that
+  ;; -Wint-conversion and carries on, AppleClang 21 rejects it outright, which is
+  ;; how four spices came to fail on macOS CI and pass on Linux.  Handing the
+  ;; carrier to `::` lets the compiler emit whichever conversion its own
+  ;; lowering needs.  Same reasoning as msgpack/buf and json/ownstr.
+  ;;; __payload-alloc-raw -- internal: allocate a zeroed buffer, as a bare pointer.
+  (defn __payload-alloc-raw [n : int] : ptr<void>
+    ```c
+    extern void *turnng_payload_alloc(int64_t);
   return turnng_payload_alloc((int64_t)n);
   ```)
-
-;;; __payload-of-cstr-raw -- internal: copy a cstr's bytes, as a bare pointer.
-(defn __payload-of-cstr-raw [s : cstr] : ptr<void>
-  ```c
-  extern void *turnng_payload_of_bytes(const void *, int64_t);
+  ;;; __payload-of-cstr-raw -- internal: copy a cstr's bytes, as a bare pointer.
+  (defn __payload-of-cstr-raw [s : cstr] : ptr<void>
+    ```c
+    extern void *turnng_payload_of_bytes(const void *, int64_t);
   const char *p = (const char *)s;
   if (!p) return turnng_payload_of_bytes("", 0);
   return turnng_payload_of_bytes(p, (int64_t)strlen(p));
   ```)
-
-;;; payload-alloc -- allocate a zeroed buffer of `n` bytes.
-;;;
-;;; Parameters:
-;;;   n -- number of data bytes (not counting the 8-byte length prefix)
-;;;
-;;; Returns:
-;;;   A fresh owned Payload; release it with payload-free.
-;;;
-;;; Example:
-;;;   (let [b (payload-alloc 4)] (payload-len b))  ; => 4
-;;;
-;;; Since: Phase NG2
-(defn payload-alloc [n : int] : Payload
-  (:: (__payload-alloc-raw n) Payload))
-
-;;; payload-of-cstr -- copy a NUL-terminated string into a fresh buffer.
-;;;
-;;; The NUL terminator is NOT part of the payload: the buffer's length is
-;;; strlen(s), so `(payload->cstr (payload-of-cstr "hi"))` round-trips to "hi".
-;;;
-;;; Parameters:
-;;;   s -- the string to copy (borrowed; the caller keeps ownership)
-;;;
-;;; Returns:
-;;;   A fresh owned Payload; release it with payload-free.
-;;;
-;;; Example:
-;;;   (let [b (payload-of-cstr "job:42")] (payload-len b))  ; => 6
-;;;
-;;; Since: Phase NG2
-(defn payload-of-cstr [s : cstr] : Payload
-  (:: (__payload-of-cstr-raw s) Payload))
-
-;;; payload-len -- the number of data bytes the buffer holds.
-;;;
-;;; Parameters:
-;;;   b -- the buffer to measure
-;;;
-;;; Returns:
-;;;   int -- the byte length (0 for a null handle).
-;;;
-;;; Example:
-;;;   (payload-len (payload-of-cstr "abc"))  ; => 3
-;;;
-;;; Since: Phase NG2
-(defn payload-len [b : Payload] : int
-  ```c
-  extern int64_t turnng_payload_len(const void *);
+  ;;; payload-alloc -- allocate a zeroed buffer of `n` bytes.
+  ;;;
+  ;;; Parameters:
+  ;;;   n -- number of data bytes (not counting the 8-byte length prefix)
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh owned Payload; release it with payload-free.
+  ;;;
+  ;;; Example:
+  ;;;   (let [b (payload-alloc 4)] (payload-len b))  ; => 4
+  ;;;
+  ;;; Since: Phase NG2
+  (defn payload-alloc [n : int] : Payload (:: (__payload-alloc-raw n) Payload))
+  ;;; payload-of-cstr -- copy a NUL-terminated string into a fresh buffer.
+  ;;;
+  ;;; The NUL terminator is NOT part of the payload: the buffer's length is
+  ;;; strlen(s), so `(payload->cstr (payload-of-cstr "hi"))` round-trips to "hi".
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the string to copy (borrowed; the caller keeps ownership)
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh owned Payload; release it with payload-free.
+  ;;;
+  ;;; Example:
+  ;;;   (let [b (payload-of-cstr "job:42")] (payload-len b))  ; => 6
+  ;;;
+  ;;; Since: Phase NG2
+  (defn payload-of-cstr [s : cstr] : Payload
+    (:: (__payload-of-cstr-raw s) Payload))
+  ;;; payload-len -- the number of data bytes the buffer holds.
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer to measure
+  ;;;
+  ;;; Returns:
+  ;;;   int -- the byte length (0 for a null handle).
+  ;;;
+  ;;; Example:
+  ;;;   (payload-len (payload-of-cstr "abc"))  ; => 3
+  ;;;
+  ;;; Since: Phase NG2
+  (defn payload-len [b : Payload] : int
+    ```c
+    extern int64_t turnng_payload_len(const void *);
   return turnng_payload_len((const void *)(intptr_t)b);
   ```)
-
-;;; payload-data -- a borrowed pointer to the buffer's first data byte.
-;;;
-;;; Valid only while the Payload is alive; do not use after payload-free.
-;;;
-;;; Parameters:
-;;;   b -- the buffer to borrow from
-;;;
-;;; Returns:
-;;;   ptr<void> -- the data region (past the length prefix).
-;;;
-;;; Example:
-;;;   (let [b (payload-alloc 8)] (payload-data b))
-;;;
-;;; Since: Phase NG2
-(defn payload-data [b : Payload] : ptr<void>
-  ```c
-  extern void *turnng_payload_data(void *);
+  ;;; payload-data -- a borrowed pointer to the buffer's first data byte.
+  ;;;
+  ;;; Valid only while the Payload is alive; do not use after payload-free.
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer to borrow from
+  ;;;
+  ;;; Returns:
+  ;;;   ptr<void> -- the data region (past the length prefix).
+  ;;;
+  ;;; Example:
+  ;;;   (let [b (payload-alloc 8)] (payload-data b))
+  ;;;
+  ;;; Since: Phase NG2
+  (defn payload-data [b : Payload] : ptr<void>
+    ```c
+    extern void *turnng_payload_data(void *);
   return turnng_payload_data((void *)(intptr_t)b);
   ```)
-
-;;; payload-free -- release the buffer.
-;;;
-;;; Parameters:
-;;;   b -- the buffer whose owning handle is being dropped
-;;;
-;;; Example:
-;;;   (payload-free (ok-val (recv-payload s)))
-;;;
-;;; Since: Phase NG2
-(defn payload-free [b : Payload] : nil
-  ```c
-  extern void turnng_payload_free(void *);
+  ;;; payload-free -- release the buffer.
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer whose owning handle is being dropped
+  ;;;
+  ;;; Example:
+  ;;;   (payload-free (ok-val (recv-payload s)))
+  ;;;
+  ;;; Since: Phase NG2
+  (defn payload-free [b : Payload] : nil
+    ```c
+    extern void turnng_payload_free(void *);
   turnng_payload_free((void *)(intptr_t)b);
   ```)
-
-;;; payload-byte -- the byte at index i, or -1 when out of range.
-;;;
-;;; Parameters:
-;;;   b -- the buffer to read
-;;;   i -- zero-based byte index
-;;;
-;;; Returns:
-;;;   int -- 0..255, or -1 if i is outside [0, len).
-;;;
-;;; Example:
-;;;   (payload-byte (payload-of-cstr "A") 0)  ; => 65
-;;;
-;;; Since: Phase NG2
-(defn payload-byte [b : Payload i : int] : int
-  ```c
-  extern int64_t turnng_payload_byte(const void *, int64_t);
+  ;;; payload-byte -- the byte at index i, or -1 when out of range.
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer to read
+  ;;;   i -- zero-based byte index
+  ;;;
+  ;;; Returns:
+  ;;;   int -- 0..255, or -1 if i is outside [0, len).
+  ;;;
+  ;;; Example:
+  ;;;   (payload-byte (payload-of-cstr "A") 0)  ; => 65
+  ;;;
+  ;;; Since: Phase NG2
+  (defn payload-byte [b : Payload i : int] : int
+    ```c
+    extern int64_t turnng_payload_byte(const void *, int64_t);
   return turnng_payload_byte((const void *)(intptr_t)b, (int64_t)i);
   ```)
-
-;;; payload-empty? -- true when the buffer carries no data bytes.
-;;;
-;;; Parameters:
-;;;   b -- the buffer to test
-;;;
-;;; Returns:
-;;;   bool -- true for a zero-length buffer (and for a null handle).
-;;;
-;;; Example:
-;;;   (payload-empty? (payload-alloc 0))  ; => true
-;;;
-;;; Since: Phase NG2
-(defn payload-empty? [b : Payload] : bool
-  (= (payload-len b) 0))
-
-;;; payload=? -- byte-wise equality.
-;;;
-;;; Parameters:
-;;;   a -- the first buffer
-;;;   b -- the second buffer
-;;;
-;;; Returns:
-;;;   bool -- true when both hold the same bytes.
-;;;
-;;; Example:
-;;;   (payload=? (payload-of-cstr "x") (payload-of-cstr "x"))  ; => true
-;;;
-;;; Since: Phase NG2
-(defn payload=? [a : Payload b : Payload] : bool
-  ```c
-  extern int turnng_payload_eq(const void *, const void *);
+  ;;; payload-empty? -- true when the buffer carries no data bytes.
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer to test
+  ;;;
+  ;;; Returns:
+  ;;;   bool -- true for a zero-length buffer (and for a null handle).
+  ;;;
+  ;;; Example:
+  ;;;   (payload-empty? (payload-alloc 0))  ; => true
+  ;;;
+  ;;; Since: Phase NG2
+  (defn payload-empty? [b : Payload] : bool (= (payload-len b) 0))
+  ;;; payload=? -- byte-wise equality.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the first buffer
+  ;;;   b -- the second buffer
+  ;;;
+  ;;; Returns:
+  ;;;   bool -- true when both hold the same bytes.
+  ;;;
+  ;;; Example:
+  ;;;   (payload=? (payload-of-cstr "x") (payload-of-cstr "x"))  ; => true
+  ;;;
+  ;;; Since: Phase NG2
+  (defn payload=? [a : Payload b : Payload] : bool
+    ```c
+    extern int turnng_payload_eq(const void *, const void *);
   return turnng_payload_eq((const void *)(intptr_t)a,
                        (const void *)(intptr_t)b) ? true : false;
   ```)
-
-;;; payload->cstr -- a fresh NUL-terminated copy of the payload.
-;;;
-;;; A payload containing embedded NUL bytes truncates at the first one; that
-;;; is the documented limit of the cstr conveniences, and the reason recv-payload
-;;; exists alongside recv-str.
-;;;
-;;; Parameters:
-;;;   b -- the buffer to copy from (borrowed)
-;;;
-;;; Returns:
-;;;   cstr -- a malloc'd string the caller owns.
-;;;
-;;; Example:
-;;;   (payload->cstr (payload-of-cstr "pong"))  ; => "pong"
-;;;
-;;; Since: Phase NG2
-(defn payload->cstr [b : Payload] : cstr
-  ```c
-  extern char *turnng_payload_to_cstr(const void *);
+  ;;; payload->cstr -- a fresh NUL-terminated copy of the payload.
+  ;;;
+  ;;; A payload containing embedded NUL bytes truncates at the first one; that
+  ;;; is the documented limit of the cstr conveniences, and the reason recv-payload
+  ;;; exists alongside recv-str.
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer to copy from (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- a malloc'd string the caller owns.
+  ;;;
+  ;;; Example:
+  ;;;   (payload->cstr (payload-of-cstr "pong"))  ; => "pong"
+  ;;;
+  ;;; Since: Phase NG2
+  (defn payload->cstr [b : Payload] : cstr
+    ```c
+    extern char *turnng_payload_to_cstr(const void *);
   return turnng_payload_to_cstr((const void *)(intptr_t)b);
   ```)
-
-;;; payload->hex -- lowercase hex rendering of the payload, for tests and logs.
-;;;
-;;; Parameters:
-;;;   b -- the buffer to render (borrowed)
-;;;
-;;; Returns:
-;;;   cstr -- a malloc'd string the caller owns; "" for an empty buffer.
-;;;
-;;; Example:
-;;;   (payload->hex (payload-of-cstr "A"))  ; => "41"
-;;;
-;;; Since: Phase NG2
-(defn payload->hex [b : Payload] : cstr
-  ```c
-  extern char *turnng_payload_to_hex(const void *);
+  ;;; payload->hex -- lowercase hex rendering of the payload, for tests and logs.
+  ;;;
+  ;;; Parameters:
+  ;;;   b -- the buffer to render (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- a malloc'd string the caller owns; "" for an empty buffer.
+  ;;;
+  ;;; Example:
+  ;;;   (payload->hex (payload-of-cstr "A"))  ; => "41"
+  ;;;
+  ;;; Since: Phase NG2
+  (defn payload->hex [b : Payload] : cstr
+    ```c
+    extern char *turnng_payload_to_hex(const void *);
   return turnng_payload_to_hex((const void *)(intptr_t)b);
-  ```)
-
-) ;; end defmodule nng/payload
+  ```)) ;; end defmodule nng/payload

@@ -30,357 +30,420 @@
 ;; because both sides lost the same elements.
 ;;
 ;; main returns the failure count so `tur test` reports a non-zero exit.
-
 (defmodule crdt/tests/test_delta
   (import crdt/replica :refer [ReplicaId replica replica-sym])
   (import crdt/lattice :refer [join-all])
-  (import crdt/counter :refer [GCounter gcounter-new gcounter-bump
-                               gcounter-value gcounter-replicas
-                               gcounter-delta-bump
-                               PNCounter pncounter-new pncounter-inc
-                               pncounter-dec pncounter-value
-                               pncounter-replicas pncounter-delta-inc
-                               pncounter-delta-dec])
-  (import crdt/set :refer [GSet gset-new gset-add gset-has? gset-count
-                           gset-delta-add
-                           TwoPSet twopset-new twopset-add twopset-remove
-                           twopset-has? twopset-count twopset-size
-                           twopset-delta-add twopset-delta-remove])
-  (import crdt/orset :refer [ORSet orset-new orset-add orset-remove orset-has?
-                             orset-count orset-dots orset-ctx-size
-                             OrsetDelta orset-delta-new orset-delta-add
-                             orset-delta-remove orset-delta-dots
-                             orset-delta-retracts])
-  (import crdt/register :refer [LwwRegister lww-new lww-set lww-value
-                                lww-delta-set
-                                MvRegister mv-new mv-set mv-values
-                                mv-delta-set])
-  (import crdt/ormap :refer [ORMap ormap-new ormap-put ormap-get ormap-has?
-                             ormap-remove ormap-count
-                             OrmapDelta ormap-delta-new ormap-delta-put
-                             ormap-delta-remove ormap-delta-count
-                             ormap-delta-retracts ormap-apply])
-
-(defn fail-if [cond : bool label : cstr] : int
-  (if cond (do (println label) 1) 0))
-
-;; Every CRDT state here holds a Map or Vec handle, so `join` and every
-;; mutator CONSUME their argument.  States are therefore REBUILT by a nullary
-;; builder per assertion rather than bound once and reused -- the same shape
-;; test_counter and test_converge use, and the honest one: a replica does not
-;; hand its state away and keep using it either.
-
-;; ---------------------------------------------------------------------------
-;; G-Counter.  alice bumps twice; bob has his own total.
-
-(defn g-alice0 [] : GCounter (gcounter-new))
-(defn g-alice1 [] : GCounter (gcounter-bump (g-alice0) (replica (quote alice)) 3))
-(defn g-alice2 [] : GCounter (gcounter-bump (g-alice1) (replica (quote alice)) 2))
-(defn g-bob    [] : GCounter (gcounter-bump (gcounter-new) (replica (quote bob)) 7))
-
-;; The delta of each bump, minted from the state that bump was applied to.
-(defn g-d1 [] : GCounter (gcounter-delta-bump (g-alice0) (replica (quote alice)) 3))
-(defn g-d2 [] : GCounter (gcounter-delta-bump (g-alice1) (replica (quote alice)) 2))
-
-(defn test-gcounter [] : int
-  (let [;; Deltas in order, onto bob's state.
-        seq  (gcounter-value (apply-delta (apply-delta (g-bob) (g-d1)) (g-d2)))
-        ;; The full-state join.
-        full (gcounter-value (join (g-bob) (g-alice2)))
-        ;; Buffer the two deltas, then apply once.
-        buf  (gcounter-value (apply-delta (g-bob) (join (g-d1) (g-d2))))
-        ;; Re-deliver d1 after both: the counter must not move.
-        idem (gcounter-value
-               (apply-delta (apply-delta (apply-delta (g-bob) (g-d1)) (g-d2)) (g-d1)))
-        dsz  (gcounter-replicas (g-d2))
-        ssz  (gcounter-replicas (join (g-bob) (g-alice2)))]
-    (+ (fail-if (not (= seq 12))   "FAIL gcounter delta: sequence != 12")
-       (fail-if (not (= seq full))  "FAIL gcounter delta: sequence != full-state join")
-       (fail-if (not (= buf full))  "FAIL gcounter delta: buffered != full-state join")
-       (fail-if (not (= idem full)) "FAIL gcounter delta: not idempotent")
-       ;; The whole point: one entry on the wire, two in the state.
-       (fail-if (not (< dsz ssz))
-                "FAIL gcounter delta: delta is not smaller than the state"))))
-
-;; ---------------------------------------------------------------------------
-;; PN-Counter.  An increment and a decrement travel in different halves.
-
-(defn p-alice0 [] : PNCounter (pncounter-new))
-(defn p-alice1 [] : PNCounter (pncounter-inc (p-alice0) (replica (quote alice)) 5))
-(defn p-alice2 [] : PNCounter (pncounter-dec (p-alice1) (replica (quote alice)) 2))
-(defn p-bob    [] : PNCounter (pncounter-inc (pncounter-new) (replica (quote bob)) 4))
-
-(defn p-d1 [] : PNCounter (pncounter-delta-inc (p-alice0) (replica (quote alice)) 5))
-(defn p-d2 [] : PNCounter (pncounter-delta-dec (p-alice1) (replica (quote alice)) 2))
-
-(defn test-pncounter [] : int
-  (let [seq  (pncounter-value (apply-delta (apply-delta (p-bob) (p-d1)) (p-d2)))
-        full (pncounter-value (join (p-bob) (p-alice2)))
-        buf  (pncounter-value (apply-delta (p-bob) (join (p-d1) (p-d2))))
-        idem (pncounter-value
-               (apply-delta (apply-delta (apply-delta (p-bob) (p-d1)) (p-d2)) (p-d2)))
-        dsz  (pncounter-replicas (p-d2))
-        ssz  (pncounter-replicas (join (p-bob) (p-alice2)))]
-    (+ (fail-if (not (= seq 7))    "FAIL pncounter delta: sequence != 7")
-       (fail-if (not (= seq full))  "FAIL pncounter delta: sequence != full-state join")
-       (fail-if (not (= buf full))  "FAIL pncounter delta: buffered != full-state join")
-       (fail-if (not (= idem full)) "FAIL pncounter delta: not idempotent")
-       (fail-if (not (< dsz ssz))
-                "FAIL pncounter delta: delta is not smaller than the state"))))
-
-;; ---------------------------------------------------------------------------
-;; G-Set and 2P-Set.  Their deltas take no state at all -- see gset-delta-add.
-
-(defn s-alice [] : GSet (gset-add (gset-add (gset-new) (quote a)) (quote b)))
-(defn s-bob   [] : GSet (gset-add (gset-new) (quote c)))
-
-(defn test-gset [] : int
-  (let [seq  (gset-count (apply-delta (apply-delta (s-bob) (gset-delta-add (quote a)))
-                                      (gset-delta-add (quote b))))
-        full (gset-count (join (s-bob) (s-alice)))
-        idem (gset-count (apply-delta
-                           (apply-delta (apply-delta (s-bob) (gset-delta-add (quote a)))
-                                        (gset-delta-add (quote b)))
-                           (gset-delta-add (quote a))))
-        has  (gset-has? (apply-delta (s-bob) (gset-delta-add (quote a))) (quote a))]
-    (+ (fail-if (not (= seq 3))     "FAIL gset delta: sequence != 3")
-       (fail-if (not (= seq full))   "FAIL gset delta: sequence != full-state join")
-       (fail-if (not (= idem full))  "FAIL gset delta: not idempotent")
-       (fail-if (not has)            "FAIL gset delta: element not present after apply"))))
-
-(defn t-alice [] : TwoPSet
-  (twopset-remove (twopset-add (twopset-add (twopset-new) (quote a)) (quote b))
-                  (quote a)))
-(defn t-bob [] : TwoPSet (twopset-add (twopset-new) (quote c)))
-
-(defn test-twopset [] : int
-  (let [seq  (apply-delta (apply-delta (apply-delta (t-bob) (twopset-delta-add (quote a)))
-                                       (twopset-delta-add (quote b)))
-                          (twopset-delta-remove (quote a)))
-        full (join (t-bob) (t-alice))
-        ;; A tombstone is permanent, so re-delivering the ADD after the remove
-        ;; must not bring the element back.
-        again (apply-delta
-                (apply-delta
-                  (apply-delta (apply-delta (t-bob) (twopset-delta-add (quote a)))
+  (import crdt/counter
+    :refer
+    [GCounter
+     gcounter-new
+     gcounter-bump
+     gcounter-value
+     gcounter-replicas
+     gcounter-delta-bump
+     PNCounter
+     pncounter-new
+     pncounter-inc
+     pncounter-dec
+     pncounter-value
+     pncounter-replicas
+     pncounter-delta-inc
+     pncounter-delta-dec])
+  (import crdt/set
+    :refer
+    [GSet
+     gset-new
+     gset-add
+     gset-has?
+     gset-count
+     gset-delta-add
+     TwoPSet
+     twopset-new
+     twopset-add
+     twopset-remove
+     twopset-has?
+     twopset-count
+     twopset-size
+     twopset-delta-add
+     twopset-delta-remove])
+  (import crdt/orset
+    :refer
+    [ORSet
+     orset-new
+     orset-add
+     orset-remove
+     orset-has?
+     orset-count
+     orset-dots
+     orset-ctx-size
+     OrsetDelta
+     orset-delta-new
+     orset-delta-add
+     orset-delta-remove
+     orset-delta-dots
+     orset-delta-retracts])
+  (import crdt/register
+    :refer
+    [LwwRegister
+     lww-new
+     lww-set
+     lww-value
+     lww-delta-set
+     MvRegister
+     mv-new
+     mv-set
+     mv-values
+     mv-delta-set])
+  (import crdt/ormap
+    :refer
+    [ORMap
+     ormap-new
+     ormap-put
+     ormap-get
+     ormap-has?
+     ormap-remove
+     ormap-count
+     OrmapDelta
+     ormap-delta-new
+     ormap-delta-put
+     ormap-delta-remove
+     ormap-delta-count
+     ormap-delta-retracts
+     ormap-apply])
+  (defn fail-if [cond : bool label : cstr] : int
+    (if cond (do (println label) 1) 0))
+  ;; Every CRDT state here holds a Map or Vec handle, so `join` and every
+  ;; mutator CONSUME their argument.  States are therefore REBUILT by a nullary
+  ;; builder per assertion rather than bound once and reused -- the same shape
+  ;; test_counter and test_converge use, and the honest one: a replica does not
+  ;; hand its state away and keep using it either.
+  ;; ---------------------------------------------------------------------------
+  ;; G-Counter.  alice bumps twice; bob has his own total.
+  (defn g-alice0 [] : GCounter (gcounter-new))
+  (defn g-alice1 [] : GCounter
+    (gcounter-bump (g-alice0) (replica (quote alice)) 3))
+  (defn g-alice2 [] : GCounter
+    (gcounter-bump (g-alice1) (replica (quote alice)) 2))
+  (defn g-bob [] : GCounter
+    (gcounter-bump (gcounter-new) (replica (quote bob)) 7))
+  ;; The delta of each bump, minted from the state that bump was applied to.
+  (defn g-d1 [] : GCounter
+    (gcounter-delta-bump (g-alice0) (replica (quote alice)) 3))
+  (defn g-d2 [] : GCounter
+    (gcounter-delta-bump (g-alice1) (replica (quote alice)) 2))
+  (defn test-gcounter [] : int
+    (let [ ;; Deltas in order, onto bob's state.
+          seq  (gcounter-value (apply-delta (apply-delta (g-bob) (g-d1)) (g-d2)))
+          ;; The full-state join.
+          full (gcounter-value (join (g-bob) (g-alice2)))
+          ;; Buffer the two deltas, then apply once.
+          buf  (gcounter-value (apply-delta (g-bob) (join (g-d1) (g-d2))))
+          ;; Re-deliver d1 after both: the counter must not move.
+          idem (gcounter-value (apply-delta (apply-delta (apply-delta (g-bob)
+                                                           (g-d1))
+                                              (g-d2))
+                                 (g-d1)))
+          dsz  (gcounter-replicas (g-d2))
+          ssz  (gcounter-replicas (join (g-bob) (g-alice2)))]
+      (+ (fail-if (not (= seq 12)) "FAIL gcounter delta: sequence != 12")
+        (fail-if (not (= seq full))
+          "FAIL gcounter delta: sequence != full-state join")
+        (fail-if (not (= buf full))
+          "FAIL gcounter delta: buffered != full-state join")
+        (fail-if (not (= idem full)) "FAIL gcounter delta: not idempotent")
+        ;; The whole point: one entry on the wire, two in the state.
+        (fail-if (not (< dsz ssz))
+          "FAIL gcounter delta: delta is not smaller than the state"))))
+  ;; ---------------------------------------------------------------------------
+  ;; PN-Counter.  An increment and a decrement travel in different halves.
+  (defn p-alice0 [] : PNCounter (pncounter-new))
+  (defn p-alice1 [] : PNCounter
+    (pncounter-inc (p-alice0) (replica (quote alice)) 5))
+  (defn p-alice2 [] : PNCounter
+    (pncounter-dec (p-alice1) (replica (quote alice)) 2))
+  (defn p-bob [] : PNCounter
+    (pncounter-inc (pncounter-new) (replica (quote bob)) 4))
+  (defn p-d1 [] : PNCounter
+    (pncounter-delta-inc (p-alice0) (replica (quote alice)) 5))
+  (defn p-d2 [] : PNCounter
+    (pncounter-delta-dec (p-alice1) (replica (quote alice)) 2))
+  (defn test-pncounter [] : int
+    (let [seq  (pncounter-value (apply-delta (apply-delta (p-bob) (p-d1))
+                                  (p-d2)))
+          full (pncounter-value (join (p-bob) (p-alice2)))
+          buf  (pncounter-value (apply-delta (p-bob) (join (p-d1) (p-d2))))
+          idem (pncounter-value (apply-delta (apply-delta (apply-delta (p-bob)
+                                                            (p-d1))
+                                               (p-d2))
+                                  (p-d2)))
+          dsz  (pncounter-replicas (p-d2))
+          ssz  (pncounter-replicas (join (p-bob) (p-alice2)))]
+      (+ (fail-if (not (= seq 7)) "FAIL pncounter delta: sequence != 7")
+        (fail-if (not (= seq full))
+          "FAIL pncounter delta: sequence != full-state join")
+        (fail-if (not (= buf full))
+          "FAIL pncounter delta: buffered != full-state join")
+        (fail-if (not (= idem full)) "FAIL pncounter delta: not idempotent")
+        (fail-if (not (< dsz ssz))
+          "FAIL pncounter delta: delta is not smaller than the state"))))
+  ;; ---------------------------------------------------------------------------
+  ;; G-Set and 2P-Set.  Their deltas take no state at all -- see gset-delta-add.
+  (defn s-alice [] : GSet (gset-add (gset-add (gset-new) (quote a)) (quote b)))
+  (defn s-bob [] : GSet (gset-add (gset-new) (quote c)))
+  (defn test-gset [] : int
+    (let [seq  (gset-count (apply-delta (apply-delta (s-bob)
+                                          (gset-delta-add (quote a)))
+                             (gset-delta-add (quote b))))
+          full (gset-count (join (s-bob) (s-alice)))
+          idem (gset-count (apply-delta (apply-delta (apply-delta (s-bob)
+                                                       (gset-delta-add (quote a)))
+                                          (gset-delta-add (quote b)))
+                             (gset-delta-add (quote a))))
+          has  (gset-has? (apply-delta (s-bob) (gset-delta-add (quote a)))
+                 (quote a))]
+      (+ (fail-if (not (= seq 3)) "FAIL gset delta: sequence != 3")
+        (fail-if (not (= seq full))
+          "FAIL gset delta: sequence != full-state join")
+        (fail-if (not (= idem full)) "FAIL gset delta: not idempotent")
+        (fail-if (not has) "FAIL gset delta: element not present after apply"))))
+  (defn t-alice [] : TwoPSet
+    (twopset-remove (twopset-add (twopset-add (twopset-new) (quote a))
+                      (quote b))
+      (quote a)))
+  (defn t-bob [] : TwoPSet (twopset-add (twopset-new) (quote c)))
+  (defn test-twopset [] : int
+    (let [seq   (apply-delta (apply-delta (apply-delta (t-bob)
+                                            (twopset-delta-add (quote a)))
                                (twopset-delta-add (quote b)))
                   (twopset-delta-remove (quote a)))
-                (twopset-delta-add (quote a)))]
-    (+ (fail-if (not (= (twopset-count seq) 2)) "FAIL twopset delta: count != 2")
-       (fail-if (not (= (twopset-count seq) (twopset-count full)))
-                "FAIL twopset delta: sequence != full-state join")
-       (fail-if (twopset-has? again (quote a))
-                "FAIL twopset delta: re-delivered add undid a tombstone")
-       (fail-if (not (= (twopset-size (twopset-delta-add (quote a))) 1))
-                "FAIL twopset delta: delta is not one element"))))
-
-;; ---------------------------------------------------------------------------
-;; OR-Set.  The type the delta formulation is for, and the one whose delta had
-;; to become a separate type -- see the file header.
-
-(defn o-a0 [] : ORSet (orset-new))
-(defn o-a1 [] : ORSet (orset-add (o-a0) (quote e0) (replica (quote alice))))
-(defn o-a2 [] : ORSet (orset-add (o-a1) (quote e1) (replica (quote alice))))
-(defn o-a3 [] : ORSet (orset-remove (o-a2) (quote e0)))
-
-(defn o-d1 [] : OrsetDelta (orset-delta-add (o-a0) (quote e0) (replica (quote alice))))
-(defn o-d2 [] : OrsetDelta (orset-delta-add (o-a1) (quote e1) (replica (quote alice))))
-(defn o-d3 [] : OrsetDelta (orset-delta-remove (o-a2) (quote e0)))
-
-;;; bob after receiving alice's first two deltas.
-(defn o-bob2 [] : ORSet (apply-delta (apply-delta (orset-new) (o-d1)) (o-d2)))
-
-(defn test-orset-equivalence [] : int
-  (let [seq  (apply-delta (o-bob2) (o-d3))
-        full (join (orset-new) (o-a3))
-        buf  (apply-delta (o-bob2) (join (join (o-d1) (o-d2)) (o-d3)))]
-    (+ (fail-if (not (= (orset-count seq) 1))
-                "FAIL orset delta: sequence count != 1")
-       (fail-if (orset-has? (apply-delta (o-bob2) (o-d3)) (quote e0))
-                "FAIL orset delta: remove did not propagate")
-       (fail-if (not (orset-has? (apply-delta (o-bob2) (o-d3)) (quote e1)))
-                "FAIL orset delta: surviving element lost")
-       (fail-if (not (= (orset-count seq) (orset-count full)))
-                "FAIL orset delta: sequence != full-state join")
-       (fail-if (not (= (orset-count buf) (orset-count full)))
-                "FAIL orset delta: buffered != full-state join"))))
-
-;;; The delta must be smaller than the state, on BOTH halves.
-(defn test-orset-size [] : int
-  (let [sdots (orset-dots (o-a2))
-        sctx  (orset-ctx-size (o-a2))
-        ddots (orset-delta-dots (o-d2))
-        drms  (orset-delta-retracts (o-d2))]
-    (+ (fail-if (not (= sdots 2)) "FAIL orset delta: state dot count != 2")
-       (fail-if (not (= sctx 1))  "FAIL orset delta: state context width != 1")
-       (fail-if (not (= ddots 1)) "FAIL orset delta: add-delta is not one dot")
-       (fail-if (not (= drms 0))  "FAIL orset delta: add-delta retracts something")
-       (fail-if (not (= (orset-delta-retracts (o-d3)) 1))
-                "FAIL orset delta: remove-delta does not retract exactly one dot"))))
-
-;;; A CONCURRENT add survives a remove delivered as a delta.
-;;;
-;;; This is the assertion the version-vector bug passed and the exact-DotSet
-;;; design has to earn: bob adds e0 himself, with a dot alice never saw, and
-;;; then receives alice's remove of HER e0.  Add-wins says bob's e0 stays.
-;;; A delta whose retraction set were a version vector would withdraw bob's
-;;; dot too and the element would vanish.
-(defn test-orset-concurrent-add-survives [] : int
-  (let [bob (orset-add (o-bob2) (quote e0) (replica (quote bob)))
-        m   (apply-delta bob (o-d3))]
-    (+ (fail-if (not (orset-has? m (quote e0)))
-                "FAIL orset delta: concurrent add eaten by a remove delta")
-       (fail-if (not (= (orset-count m) 2))
-                "FAIL orset delta: concurrent-add merge has the wrong count"))))
-
-;;; A remove delta withdraws its OWN dot and no earlier one from the same
-;;; replica.
-;;;
-;;; alice adds e0 (alice@1) then e1 (alice@2), and removes e1.  The
-;;; retraction set is exactly {alice@2}; e0's alice@1 must survive.  MEASURED:
-;;; relaxing `__rms-has?` from an exact match to "counter at or below" -- the
-;;; same over-reach that rules a version vector out as a delta's context --
-;;; fails ONLY this assertion.  Every other test in this file, including
-;;; `test-orset-concurrent-add-survives`, stays green, because their
-;;; retractions are of the LOWEST dot their replica minted and there is
-;;; nothing below to over-reach onto.  Without this case the exactness of the
-;;; retraction set is untested.
-(defn test-orset-remove-is-exact [] : int
-  (let [;; alice removes e1 (her SECOND dot), not e0.
-        d    (orset-delta-remove (o-a2) (quote e1))
-        m    (apply-delta (o-bob2) d)]
-    (+ (fail-if (not (orset-has? m (quote e0)))
-                "FAIL orset delta: remove of a later dot withdrew an earlier one")
-       (fail-if (orset-has? m (quote e1))
-                "FAIL orset delta: remove of e1 did not propagate")
-       (fail-if (not (= (orset-count m) 1))
-                "FAIL orset delta: exact-remove merge has the wrong count"))))
-
-;;; Duplicate delivery.  Re-sending the ADD after the remove must not
-;;; resurrect the element, and re-sending the REMOVE must change nothing.
-(defn test-orset-duplicates [] : int
-  (let [once  (apply-delta (o-bob2) (o-d3))
-        twice (apply-delta (apply-delta (o-bob2) (o-d3)) (o-d3))
-        readd (apply-delta (apply-delta (o-bob2) (o-d3)) (o-d1))]
-    (+ (fail-if (not (= (orset-count once) (orset-count twice)))
-                "FAIL orset delta: re-delivered remove changed the set")
-       (fail-if (orset-has? readd (quote e0))
-                "FAIL orset delta: re-delivered add resurrected a removed element"))))
-
-;; ---------------------------------------------------------------------------
-;; Registers.  Their deltas ARE their states -- see lww-delta-set -- so what
-;; is worth asserting is that the channel still picks the same winner.
-
-(defn test-lww [] : int
-  (let [a    (lww-set (lww-new (replica (quote alice))) 1 1000)
-        b    (lww-set (lww-new (replica (quote bob))) 2 2000)
-        d    (lww-delta-set (lww-new (replica (quote bob))) 2 2000)
-        seq  (lww-value (apply-delta (lww-set (lww-new (replica (quote alice))) 1 1000) d))
-        full (lww-value (join a b))]
-    (+ (fail-if (not (= seq 2))    "FAIL lww delta: later write did not win")
-       (fail-if (not (= seq full)) "FAIL lww delta: sequence != full-state join"))))
-
-(defn test-mv [] : int
-  ;; Concurrent writes: both values survive, through the delta channel as
-  ;; through a full-state merge.  That is the register doing its job, not the
-  ;; delta losing information.
-  (let [d    (mv-delta-set (mv-new (replica (quote bob))) 2 2000)
-        seq  (mv-values (apply-delta (mv-set (mv-new (replica (quote alice))) 1 1000) d))
-        full (mv-values (join (mv-set (mv-new (replica (quote alice))) 1 1000)
-                              (mv-set (mv-new (replica (quote bob))) 2 2000)))]
-    (+ (fail-if (not (= seq 2))    "FAIL mv delta: concurrent write lost")
-       (fail-if (not (= seq full)) "FAIL mv delta: sequence != full-state join"))))
-
-;; ---------------------------------------------------------------------------
-;; OR-Map.  Both jobs at once: keys survive or not by the causal rule, and
-;; shared values merge at V's OWN instance.
-
-(defn m-a0 [] : (ORMap MaxI) (:: (ormap-new) (ORMap MaxI)))
-(defn m-a1 [] : (ORMap MaxI)
-  (:: (ormap-put (m-a0) (replica (quote alice)) (quote x) (:: 1 MaxI)) (ORMap MaxI)))
-(defn m-a2 [] : (ORMap MaxI)
-  (:: (ormap-put (m-a1) (replica (quote alice)) (quote y) (:: 2 MaxI)) (ORMap MaxI)))
-(defn m-a3 [] : (ORMap MaxI)
-  (:: (ormap-remove (m-a2) (quote x)) (ORMap MaxI)))
-
-(defn m-d1 [] : (OrmapDelta MaxI)
-  (:: (ormap-delta-put (m-a0) (replica (quote alice)) (quote x) (:: 1 MaxI)) (OrmapDelta MaxI)))
-(defn m-d2 [] : (OrmapDelta MaxI)
-  (:: (ormap-delta-put (m-a1) (replica (quote alice)) (quote y) (:: 2 MaxI)) (OrmapDelta MaxI)))
-(defn m-d3 [] : (OrmapDelta MaxI)
-  (:: (ormap-delta-remove (m-a2) (quote x)) (OrmapDelta MaxI)))
-
-(defn m-bob2 [] : (ORMap MaxI)
-  (:: (apply-delta (:: (apply-delta (m-a0) (m-d1)) (ORMap MaxI)) (m-d2)) (ORMap MaxI)))
-
-(defn test-ormap [] : int
-  (let [seq  (:: (apply-delta (m-bob2) (m-d3)) (ORMap MaxI))
-        full (:: (join (m-a0) (m-a3)) (ORMap MaxI))]
-    (+ (fail-if (not (= (ormap-count seq) 1)) "FAIL ormap delta: key count != 1")
-       (fail-if (ormap-has? (:: (apply-delta (m-bob2) (m-d3)) (ORMap MaxI)) (quote x))
-                "FAIL ormap delta: remove did not propagate")
-       (fail-if (not (= (ormap-count seq) (ormap-count full)))
-                "FAIL ormap delta: sequence != full-state join")
-       (fail-if (not (= (ormap-delta-count (m-d2)) 1))
-                "FAIL ormap delta: put-delta is not one key")
-       (fail-if (not (= (ormap-delta-retracts (m-d3)) 1))
-                "FAIL ormap delta: remove-delta does not retract one dot"))))
-
-;;; Duplicate delivery on the map.
-;;;
-;;; Re-sending the PUT of a key the receiver has since removed must not bring
-;;; it back.  MEASURED: forcing `ormap-apply`'s already-seen test to false
-;;; fails only this assertion -- every other ORMap check here stays green,
-;;; because none of them re-delivers anything.  Without it the map's
-;;; idempotence under an at-least-once link is untested, which is the one
-;;; property a real link makes you need.
-(defn test-ormap-duplicates [] : int
-  (let [gone  (:: (apply-delta (m-bob2) (m-d3)) (ORMap MaxI))
-        again (:: (apply-delta (:: (apply-delta (m-bob2) (m-d3)) (ORMap MaxI)) (m-d1))
+          full  (join (t-bob) (t-alice))
+          ;; A tombstone is permanent, so re-delivering the ADD after the remove
+          ;; must not bring the element back.
+          again (apply-delta (apply-delta (apply-delta (apply-delta (t-bob)
+                                                         (twopset-delta-add (quote a)))
+                                            (twopset-delta-add (quote b)))
+                               (twopset-delta-remove (quote a)))
+                  (twopset-delta-add (quote a)))]
+      (+ (fail-if (not (= (twopset-count seq) 2))
+           "FAIL twopset delta: count != 2")
+        (fail-if (not (= (twopset-count seq) (twopset-count full)))
+          "FAIL twopset delta: sequence != full-state join")
+        (fail-if (twopset-has? again (quote a))
+          "FAIL twopset delta: re-delivered add undid a tombstone")
+        (fail-if (not (= (twopset-size (twopset-delta-add (quote a))) 1))
+          "FAIL twopset delta: delta is not one element"))))
+  ;; ---------------------------------------------------------------------------
+  ;; OR-Set.  The type the delta formulation is for, and the one whose delta had
+  ;; to become a separate type -- see the file header.
+  (defn o-a0 [] : ORSet (orset-new))
+  (defn o-a1 [] : ORSet (orset-add (o-a0) (quote e0) (replica (quote alice))))
+  (defn o-a2 [] : ORSet (orset-add (o-a1) (quote e1) (replica (quote alice))))
+  (defn o-a3 [] : ORSet (orset-remove (o-a2) (quote e0)))
+  (defn o-d1 [] : OrsetDelta
+    (orset-delta-add (o-a0) (quote e0) (replica (quote alice))))
+  (defn o-d2 [] : OrsetDelta
+    (orset-delta-add (o-a1) (quote e1) (replica (quote alice))))
+  (defn o-d3 [] : OrsetDelta (orset-delta-remove (o-a2) (quote e0)))
+  ;;; bob after receiving alice's first two deltas.
+  (defn o-bob2 [] : ORSet (apply-delta (apply-delta (orset-new) (o-d1)) (o-d2)))
+  (defn test-orset-equivalence [] : int
+    (let [seq  (apply-delta (o-bob2) (o-d3))
+          full (join (orset-new) (o-a3))
+          buf  (apply-delta (o-bob2) (join (join (o-d1) (o-d2)) (o-d3)))]
+      (+ (fail-if (not (= (orset-count seq) 1))
+           "FAIL orset delta: sequence count != 1")
+        (fail-if (orset-has? (apply-delta (o-bob2) (o-d3)) (quote e0))
+          "FAIL orset delta: remove did not propagate")
+        (fail-if (not (orset-has? (apply-delta (o-bob2) (o-d3)) (quote e1)))
+          "FAIL orset delta: surviving element lost")
+        (fail-if (not (= (orset-count seq) (orset-count full)))
+          "FAIL orset delta: sequence != full-state join")
+        (fail-if (not (= (orset-count buf) (orset-count full)))
+          "FAIL orset delta: buffered != full-state join"))))
+  ;;; The delta must be smaller than the state, on BOTH halves.
+  (defn test-orset-size [] : int
+    (let [sdots (orset-dots (o-a2))
+          sctx  (orset-ctx-size (o-a2))
+          ddots (orset-delta-dots (o-d2))
+          drms  (orset-delta-retracts (o-d2))]
+      (+ (fail-if (not (= sdots 2)) "FAIL orset delta: state dot count != 2")
+        (fail-if (not (= sctx 1)) "FAIL orset delta: state context width != 1")
+        (fail-if (not (= ddots 1)) "FAIL orset delta: add-delta is not one dot")
+        (fail-if (not (= drms 0))
+          "FAIL orset delta: add-delta retracts something")
+        (fail-if (not (= (orset-delta-retracts (o-d3)) 1))
+          "FAIL orset delta: remove-delta does not retract exactly one dot"))))
+  ;;; A CONCURRENT add survives a remove delivered as a delta.
+  ;;;
+  ;;; This is the assertion the version-vector bug passed and the exact-DotSet
+  ;;; design has to earn: bob adds e0 himself, with a dot alice never saw, and
+  ;;; then receives alice's remove of HER e0.  Add-wins says bob's e0 stays.
+  ;;; A delta whose retraction set were a version vector would withdraw bob's
+  ;;; dot too and the element would vanish.
+  (defn test-orset-concurrent-add-survives [] : int
+    (let [bob (orset-add (o-bob2) (quote e0) (replica (quote bob)))
+          m   (apply-delta bob (o-d3))]
+      (+ (fail-if (not (orset-has? m (quote e0)))
+           "FAIL orset delta: concurrent add eaten by a remove delta")
+        (fail-if (not (= (orset-count m) 2))
+          "FAIL orset delta: concurrent-add merge has the wrong count"))))
+  ;;; A remove delta withdraws its OWN dot and no earlier one from the same
+  ;;; replica.
+  ;;;
+  ;;; alice adds e0 (alice@1) then e1 (alice@2), and removes e1.  The
+  ;;; retraction set is exactly {alice@2}; e0's alice@1 must survive.  MEASURED:
+  ;;; relaxing `__rms-has?` from an exact match to "counter at or below" -- the
+  ;;; same over-reach that rules a version vector out as a delta's context --
+  ;;; fails ONLY this assertion.  Every other test in this file, including
+  ;;; `test-orset-concurrent-add-survives`, stays green, because their
+  ;;; retractions are of the LOWEST dot their replica minted and there is
+  ;;; nothing below to over-reach onto.  Without this case the exactness of the
+  ;;; retraction set is untested.
+  (defn test-orset-remove-is-exact [] : int
+    (let [ ;; alice removes e1 (her SECOND dot), not e0.
+          d (orset-delta-remove (o-a2) (quote e1))
+          m (apply-delta (o-bob2) d)]
+      (+ (fail-if (not (orset-has? m (quote e0)))
+           "FAIL orset delta: remove of a later dot withdrew an earlier one")
+        (fail-if (orset-has? m (quote e1))
+          "FAIL orset delta: remove of e1 did not propagate")
+        (fail-if (not (= (orset-count m) 1))
+          "FAIL orset delta: exact-remove merge has the wrong count"))))
+  ;;; Duplicate delivery.  Re-sending the ADD after the remove must not
+  ;;; resurrect the element, and re-sending the REMOVE must change nothing.
+  (defn test-orset-duplicates [] : int
+    (let [once  (apply-delta (o-bob2) (o-d3))
+          twice (apply-delta (apply-delta (o-bob2) (o-d3)) (o-d3))
+          readd (apply-delta (apply-delta (o-bob2) (o-d3)) (o-d1))]
+      (+ (fail-if (not (= (orset-count once) (orset-count twice)))
+           "FAIL orset delta: re-delivered remove changed the set")
+        (fail-if (orset-has? readd (quote e0))
+          "FAIL orset delta: re-delivered add resurrected a removed element"))))
+  ;; ---------------------------------------------------------------------------
+  ;; Registers.  Their deltas ARE their states -- see lww-delta-set -- so what
+  ;; is worth asserting is that the channel still picks the same winner.
+  (defn test-lww [] : int
+    (let [a    (lww-set (lww-new (replica (quote alice))) 1 1000)
+          b    (lww-set (lww-new (replica (quote bob))) 2 2000)
+          d    (lww-delta-set (lww-new (replica (quote bob))) 2 2000)
+          seq  (lww-value (apply-delta (lww-set (lww-new (replica (quote alice)))
+                                         1
+                                         1000)
+                            d))
+          full (lww-value (join a b))]
+      (+ (fail-if (not (= seq 2)) "FAIL lww delta: later write did not win")
+        (fail-if (not (= seq full))
+          "FAIL lww delta: sequence != full-state join"))))
+  (defn test-mv [] : int
+    ;; Concurrent writes: both values survive, through the delta channel as
+    ;; through a full-state merge.  That is the register doing its job, not the
+    ;; delta losing information.
+    (let [d    (mv-delta-set (mv-new (replica (quote bob))) 2 2000)
+          seq  (mv-values (apply-delta (mv-set (mv-new (replica (quote alice)))
+                                         1
+                                         1000)
+                            d))
+          full (mv-values (join (mv-set (mv-new (replica (quote alice))) 1 1000)
+                            (mv-set (mv-new (replica (quote bob))) 2 2000)))]
+      (+ (fail-if (not (= seq 2)) "FAIL mv delta: concurrent write lost")
+        (fail-if (not (= seq full))
+          "FAIL mv delta: sequence != full-state join"))))
+  ;; ---------------------------------------------------------------------------
+  ;; OR-Map.  Both jobs at once: keys survive or not by the causal rule, and
+  ;; shared values merge at V's OWN instance.
+  (defn m-a0 [] : (ORMap MaxI) (:: (ormap-new) (ORMap MaxI)))
+  (defn m-a1 [] : (ORMap MaxI)
+    (:: (ormap-put (m-a0) (replica (quote alice)) (quote x) (:: 1 MaxI))
+      (ORMap MaxI)))
+  (defn m-a2 [] : (ORMap MaxI)
+    (:: (ormap-put (m-a1) (replica (quote alice)) (quote y) (:: 2 MaxI))
+      (ORMap MaxI)))
+  (defn m-a3 [] : (ORMap MaxI)
+    (:: (ormap-remove (m-a2) (quote x)) (ORMap MaxI)))
+  (defn m-d1 [] : (OrmapDelta MaxI)
+    (:: (ormap-delta-put (m-a0) (replica (quote alice)) (quote x) (:: 1 MaxI))
+      (OrmapDelta MaxI)))
+  (defn m-d2 [] : (OrmapDelta MaxI)
+    (:: (ormap-delta-put (m-a1) (replica (quote alice)) (quote y) (:: 2 MaxI))
+      (OrmapDelta MaxI)))
+  (defn m-d3 [] : (OrmapDelta MaxI)
+    (:: (ormap-delta-remove (m-a2) (quote x)) (OrmapDelta MaxI)))
+  (defn m-bob2 [] : (ORMap MaxI)
+    (:: (apply-delta (:: (apply-delta (m-a0) (m-d1)) (ORMap MaxI)) (m-d2))
+      (ORMap MaxI)))
+  (defn test-ormap [] : int
+    (let [seq  (:: (apply-delta (m-bob2) (m-d3)) (ORMap MaxI))
+          full (:: (join (m-a0) (m-a3)) (ORMap MaxI))]
+      (+ (fail-if (not (= (ormap-count seq) 1))
+           "FAIL ormap delta: key count != 1")
+        (fail-if (ormap-has? (:: (apply-delta (m-bob2) (m-d3)) (ORMap MaxI))
+                   (quote x))
+          "FAIL ormap delta: remove did not propagate")
+        (fail-if (not (= (ormap-count seq) (ormap-count full)))
+          "FAIL ormap delta: sequence != full-state join")
+        (fail-if (not (= (ormap-delta-count (m-d2)) 1))
+          "FAIL ormap delta: put-delta is not one key")
+        (fail-if (not (= (ormap-delta-retracts (m-d3)) 1))
+          "FAIL ormap delta: remove-delta does not retract one dot"))))
+  ;;; Duplicate delivery on the map.
+  ;;;
+  ;;; Re-sending the PUT of a key the receiver has since removed must not bring
+  ;;; it back.  MEASURED: forcing `ormap-apply`'s already-seen test to false
+  ;;; fails only this assertion -- every other ORMap check here stays green,
+  ;;; because none of them re-delivers anything.  Without it the map's
+  ;;; idempotence under an at-least-once link is untested, which is the one
+  ;;; property a real link makes you need.
+  (defn test-ormap-duplicates [] : int
+    (let [gone  (:: (apply-delta (m-bob2) (m-d3)) (ORMap MaxI))
+          again (:: (apply-delta (:: (apply-delta (m-bob2) (m-d3)) (ORMap MaxI))
+                      (m-d1))
                   (ORMap MaxI))
-        twice (:: (apply-delta (:: (apply-delta (m-bob2) (m-d3)) (ORMap MaxI)) (m-d3))
+          twice (:: (apply-delta (:: (apply-delta (m-bob2) (m-d3)) (ORMap MaxI))
+                      (m-d3))
                   (ORMap MaxI))]
-    (+ (fail-if (ormap-has? again (quote x))
-                "FAIL ormap delta: re-delivered put resurrected a removed key")
-       (fail-if (not (= (ormap-count twice) (ormap-count gone)))
-                "FAIL ormap delta: re-delivered remove changed the map"))))
-
-;;; A shared key's values merge at V's instance, not by overwrite.
-;;;
-;;; The same point test_ormap_join pins for the state merge, asserted for the
-;;; delta channel: an implementation that let the incoming write win would
-;;; converge perfectly and give 3 instead of 9.
-(defn test-ormap-value-merge [] : int
-  (let [big   (:: (ormap-delta-put (m-a1) (replica (quote bob)) (quote x) (:: 9 MaxI))
+      (+ (fail-if (ormap-has? again (quote x))
+           "FAIL ormap delta: re-delivered put resurrected a removed key")
+        (fail-if (not (= (ormap-count twice) (ormap-count gone)))
+          "FAIL ormap delta: re-delivered remove changed the map"))))
+  ;;; A shared key's values merge at V's instance, not by overwrite.
+  ;;;
+  ;;; The same point test_ormap_join pins for the state merge, asserted for the
+  ;;; delta channel: an implementation that let the incoming write win would
+  ;;; converge perfectly and give 3 instead of 9.
+  (defn test-ormap-value-merge [] : int
+    (let [big   (:: (ormap-delta-put (m-a1)
+                      (replica (quote bob))
+                      (quote x)
+                      (:: 9 MaxI))
                   (OrmapDelta MaxI))
-        m     (:: (apply-delta (m-bob2) big) (ORMap MaxI))
-        v     (:: (:: (ormap-get m (quote x)) MaxI) int)
-        small (:: (ormap-delta-put (m-a1) (replica (quote bob)) (quote x) (:: 0 MaxI))
+          m     (:: (apply-delta (m-bob2) big) (ORMap MaxI))
+          v     (:: (:: (ormap-get m (quote x)) MaxI) int)
+          small (:: (ormap-delta-put (m-a1)
+                      (replica (quote bob))
+                      (quote x)
+                      (:: 0 MaxI))
                   (OrmapDelta MaxI))
-        m2    (:: (apply-delta (m-bob2) small) (ORMap MaxI))
-        v2    (:: (:: (ormap-get m2 (quote x)) MaxI) int)]
-    (+ (fail-if (not (= v 9))  "FAIL ormap delta: shared value not joined (max)")
-       (fail-if (not (= v2 1))
-                "FAIL ormap delta: incoming write overwrote a larger value"))))
-
-;; ---------------------------------------------------------------------------
-
-(defn main [] : int
-  (let [f (+ (test-gcounter)
-             (test-pncounter)
-             (test-gset)
-             (test-twopset)
-             (test-orset-equivalence)
-             (test-orset-size)
-             (test-orset-concurrent-add-survives)
-             (test-orset-remove-is-exact)
-             (test-orset-duplicates)
-             (test-lww)
-             (test-mv)
-             (test-ormap)
-             (test-ormap-duplicates)
-             (test-ormap-value-merge))]
-    (if (= f 0) (println "test_delta: ok") (println "test_delta: FAILURES"))
-    f))
-
-) ;; end defmodule
+          m2    (:: (apply-delta (m-bob2) small) (ORMap MaxI))
+          v2    (:: (:: (ormap-get m2 (quote x)) MaxI) int)]
+      (+ (fail-if (not (= v 9))
+           "FAIL ormap delta: shared value not joined (max)")
+        (fail-if (not (= v2 1))
+          "FAIL ormap delta: incoming write overwrote a larger value"))))
+  ;; ---------------------------------------------------------------------------
+  (defn main [] : int
+    (let [f (+ (test-gcounter)
+              (test-pncounter)
+              (test-gset)
+              (test-twopset)
+              (test-orset-equivalence)
+              (test-orset-size)
+              (test-orset-concurrent-add-survives)
+              (test-orset-remove-is-exact)
+              (test-orset-duplicates)
+              (test-lww)
+              (test-mv)
+              (test-ormap)
+              (test-ormap-duplicates)
+              (test-ormap-value-merge))]
+      (if (= f 0) (println "test_delta: ok") (println "test_delta: FAILURES"))
+      f))) ;; end defmodule

@@ -36,118 +36,114 @@
 ;;; Since: RE1 promotion 2026-07-26
 (defmodule ecs/sized-refined
   (export ent-at
-          sized-defworld-refined
-          sized-defcomponent-accessor-refined
-          for-each-alive)
-
-(import ecs/entity        :refer [Entity Slot Generation
-                                  entity-new entity-index
-                                  slot-new generation-new])
-(import ecs/sized-world   :refer [WorldState sized-alive? sized-despawn])
-(import ecs/sized-storage :refer [SizedDense sized-dense-get])
-(import ecs/cap           :refer [ReadCap])
-
-;;; ent-at -- the first-generation entity candidate for slot i.
-;;;
-;;; The iteration candidate `for-each-alive` guards: slot i at generation 0
-;;; (the generation a fresh world's spawns are born with; a despawn bumps
-;;; the slot's generation, which is exactly what `<World>-alive?` detects).
-;;; Exported so the macro's expansion resolves in the caller's module.
-;;;
-;;; Parameters:
-;;;   i -- slot index (the iteration counter)
-;;;
-;;; Returns:
-;;;   The Entity (slot i, generation 0).
-;;;
-;;; Example:
-;;;   (GameWorld-alive? w (ent-at 0))
-;;;
-;;; Since: RE1 promotion 2026-07-26
-(defn ent-at [i : int] : Entity
-  (entity-new (slot-new i) (generation-new 0)))
-
-;;; sized-defworld-refined -- emit the per-world refined surface anchors:
-;;; `<World>-alive?` (the `#reads` aliveness measure over the WORLD, so a
-;;; frozen borrow of `w` makes it congruent) and `<World>-despawn!` (the
-;;; `^unique ^mut` mutator the same borrow locks out, TUR-E0200).
-;;;
-;;; Parameters:
-;;;   world-name -- the monomorphic sized world type (from sized-defworld-mono)
-;;;
-;;; Example:
-;;;   (sized-defworld-refined GameWorld)
-;;;   ;; GameWorld-alive?   : ^borrow GameWorld Entity -> bool  (#reads w)
-;;;   ;; GameWorld-despawn! : ^unique ^mut GameWorld Entity -> bool
-;;;
-;;; Since: RE1 promotion 2026-07-26
-(defmacro sized-defworld-refined [world-name]
-  (let [alive (str->sym (str-append (symbol-name world-name) "-alive?"))
-        desp  (str->sym (str-append (symbol-name world-name) "-despawn!"))]
-    `(do
-       (defn ~alive [^borrow w : ~world-name e : Entity] #reads w : bool
-         (sized-alive? (.state w) e))
-       (defn ~desp [^unique ^mut w : ~world-name e : Entity] : bool
-         (sized-despawn (.state w) e)))))
-
-;;; sized-defcomponent-accessor-refined -- emit `get-<Comp>!`, the
-;;; strict-aliveness read: its entity parameter is refined on
-;;; `(<World>-alive? w x)`, so the call compiles only where aliveness is
-;;; proven (a guard inside a region that freezes `w`, or `for-each-alive`).
-;;; Cap-gated like the forgiving family (`ReadCap <Comp>`).
-;;;
-;;; Parameters:
-;;;   world-name -- the monomorphic sized world type
-;;;   comp-name  -- the component (a `(SizedDense n Comp)` field on the world)
-;;;
-;;; Example:
-;;;   (sized-defcomponent-accessor-refined GameWorld Pos)
-;;;   ;; get-Pos! : ^borrow (ReadCap Pos) ^borrow GameWorld
-;;;   ;;            #refine{ x : Entity | (GameWorld-alive? w x) } -> Pos
-;;;
-;;; Since: RE1 promotion 2026-07-26
-(defmacro sized-defcomponent-accessor-refined [world-name comp-name]
-  (let [getter (str->sym (str-append "get-" (symbol-name comp-name) "!"))
-        alive  (str->sym (str-append (symbol-name world-name) "-alive?"))
-        field  (dot-sym comp-name)]
-    `(defn ~getter [^borrow cap : (ReadCap ~comp-name)
-                    ^borrow w   : ~world-name
-                    e           : #refine{ x : Entity | (~alive w x) }]
-                  : ~comp-name
-       (let [p : ~comp-name (sized-dense-get (~field w) (entity-index e))] p))))
-
-;;; for-each-alive -- run body for each still-alive first-generation entity
-;;; in slots 0..n-1 of a refined sized world, with the aliveness PROVEN to
-;;; the refinement checker. The promotion of `ecs/refined-world`'s
-;;; `for-each-alive!` onto the real stack: one macro generates the
-;;; tail-recursive loop (named-let, TCO'd, no set!), the frozen re-borrow of
-;;; `w`, and the `<World>-alive?` guard; the user's body -- typically a
-;;; refined `get-<Comp>!` read -- is spliced under a binder for the
-;;; proven-alive entity and discharges per-entity.
-;;;
-;;; Parameters:
-;;;   world-name -- the world TYPE (names the per-world alive? measure)
-;;;   w          -- the owned `^mut` world local (borrowed per iteration)
-;;;   n          -- slot count to scan (slots 0..n-1)
-;;;   binder     -- name bound to the proven-alive Entity for the body
-;;;   body       -- forms run per alive entity (result discarded; yields 0)
-;;;
-;;; Example:
-;;;   (for-each-alive GameWorld w 3 e
-;;;     (println (:: (get-Pos! rcap w e) :int)))
-;;;
-;;; Since: RE1 promotion 2026-07-26
-(defmacro for-each-alive [world-name w n binder & body]
-  (let [alive (str->sym (str-append (symbol-name world-name) "-alive?"))]
-    `(let __fea-go [__i 0]
-       (if (< __i ~n)
-         (do
-           (let [__fea-e (ent-at __i)]
-             (let [__fea-b (& ~w)]
-               (if (~alive ~w __fea-e)
-                 (do (let [~binder __fea-e] ~@body) 0)
-                 0)))
-           (__fea-go (+ __i 1)))
-         0))))
-
-) ;; end defmodule ecs/sized-refined
+    sized-defworld-refined
+    sized-defcomponent-accessor-refined
+    for-each-alive)
+  (import ecs/entity
+    :refer
+    [Entity Slot Generation entity-new entity-index slot-new generation-new])
+  (import ecs/sized-world :refer [WorldState sized-alive? sized-despawn])
+  (import ecs/sized-storage :refer [SizedDense sized-dense-get])
+  (import ecs/cap :refer [ReadCap])
+  ;;; ent-at -- the first-generation entity candidate for slot i.
+  ;;;
+  ;;; The iteration candidate `for-each-alive` guards: slot i at generation 0
+  ;;; (the generation a fresh world's spawns are born with; a despawn bumps
+  ;;; the slot's generation, which is exactly what `<World>-alive?` detects).
+  ;;; Exported so the macro's expansion resolves in the caller's module.
+  ;;;
+  ;;; Parameters:
+  ;;;   i -- slot index (the iteration counter)
+  ;;;
+  ;;; Returns:
+  ;;;   The Entity (slot i, generation 0).
+  ;;;
+  ;;; Example:
+  ;;;   (GameWorld-alive? w (ent-at 0))
+  ;;;
+  ;;; Since: RE1 promotion 2026-07-26
+  (defn ent-at [i : int] : Entity (entity-new (slot-new i) (generation-new 0)))
+  ;;; sized-defworld-refined -- emit the per-world refined surface anchors:
+  ;;; `<World>-alive?` (the `#reads` aliveness measure over the WORLD, so a
+  ;;; frozen borrow of `w` makes it congruent) and `<World>-despawn!` (the
+  ;;; `^unique ^mut` mutator the same borrow locks out, TUR-E0200).
+  ;;;
+  ;;; Parameters:
+  ;;;   world-name -- the monomorphic sized world type (from sized-defworld-mono)
+  ;;;
+  ;;; Example:
+  ;;;   (sized-defworld-refined GameWorld)
+  ;;;   ;; GameWorld-alive?   : ^borrow GameWorld Entity -> bool  (#reads w)
+  ;;;   ;; GameWorld-despawn! : ^unique ^mut GameWorld Entity -> bool
+  ;;;
+  ;;; Since: RE1 promotion 2026-07-26
+  (defmacro sized-defworld-refined [world-name]
+    (let [alive (str->sym (str-append (symbol-name world-name) "-alive?"))
+          desp  (str->sym (str-append (symbol-name world-name) "-despawn!"))]
+      `(do
+         (defn ~alive [^borrow w : ~world-name e : Entity]
+           #reads w
+           : bool
+           (sized-alive? (.state w) e))
+         (defn ~desp [^unique ^mut w : ~world-name e : Entity] : bool
+           (sized-despawn (.state w) e)))))
+  ;;; sized-defcomponent-accessor-refined -- emit `get-<Comp>!`, the
+  ;;; strict-aliveness read: its entity parameter is refined on
+  ;;; `(<World>-alive? w x)`, so the call compiles only where aliveness is
+  ;;; proven (a guard inside a region that freezes `w`, or `for-each-alive`).
+  ;;; Cap-gated like the forgiving family (`ReadCap <Comp>`).
+  ;;;
+  ;;; Parameters:
+  ;;;   world-name -- the monomorphic sized world type
+  ;;;   comp-name  -- the component (a `(SizedDense n Comp)` field on the world)
+  ;;;
+  ;;; Example:
+  ;;;   (sized-defcomponent-accessor-refined GameWorld Pos)
+  ;;;   ;; get-Pos! : ^borrow (ReadCap Pos) ^borrow GameWorld
+  ;;;   ;;            #refine{ x : Entity | (GameWorld-alive? w x) } -> Pos
+  ;;;
+  ;;; Since: RE1 promotion 2026-07-26
+  (defmacro sized-defcomponent-accessor-refined [world-name comp-name]
+    (let [getter (str->sym (str-append "get-" (symbol-name comp-name) "!"))
+          alive  (str->sym (str-append (symbol-name world-name) "-alive?"))
+          field  (dot-sym comp-name)]
+      `(defn ~getter [^borrow cap : (ReadCap ~comp-name)
+                      ^borrow w : ~world-name
+                      e : #refine{ x : Entity | (~alive w x) }] : ~comp-name
+         (let [p                                             : ~comp-name
+               (sized-dense-get (~field w) (entity-index e))]
+           p))))
+  ;;; for-each-alive -- run body for each still-alive first-generation entity
+  ;;; in slots 0..n-1 of a refined sized world, with the aliveness PROVEN to
+  ;;; the refinement checker. The promotion of `ecs/refined-world`'s
+  ;;; `for-each-alive!` onto the real stack: one macro generates the
+  ;;; tail-recursive loop (named-let, TCO'd, no set!), the frozen re-borrow of
+  ;;; `w`, and the `<World>-alive?` guard; the user's body -- typically a
+  ;;; refined `get-<Comp>!` read -- is spliced under a binder for the
+  ;;; proven-alive entity and discharges per-entity.
+  ;;;
+  ;;; Parameters:
+  ;;;   world-name -- the world TYPE (names the per-world alive? measure)
+  ;;;   w          -- the owned `^mut` world local (borrowed per iteration)
+  ;;;   n          -- slot count to scan (slots 0..n-1)
+  ;;;   binder     -- name bound to the proven-alive Entity for the body
+  ;;;   body       -- forms run per alive entity (result discarded; yields 0)
+  ;;;
+  ;;; Example:
+  ;;;   (for-each-alive GameWorld w 3 e
+  ;;;     (println (:: (get-Pos! rcap w e) :int)))
+  ;;;
+  ;;; Since: RE1 promotion 2026-07-26
+  (defmacro for-each-alive [world-name w n binder & body]
+    (let [alive (str->sym (str-append (symbol-name world-name) "-alive?"))]
+      `(let __fea-go
+         [__i 0]
+         (if (< __i ~n)
+           (do
+             (let [__fea-e (ent-at __i)]
+               (let [__fea-b (& ~w)]
+                 (if (~alive ~w __fea-e)
+                   (do (let [~binder __fea-e] ~@body) 0)
+                   0)))
+             (__fea-go (+ __i 1)))
+           0))))) ;; end defmodule ecs/sized-refined

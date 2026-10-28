@@ -24,269 +24,389 @@
 ;; sample for sample.
 ;;
 ;; main returns the failure count for `tur test`.
-
 (defmodule signal/tests/test_filter
-  (import signal/core   :refer [constant sample])
-  (import signal/osc    :refer [sine sawtooth])
-  (import signal/noise  :refer [white])
-  (import signal/filter :refer [low-pass high-pass one-pole-lp one-pole-hp
-                                dc-block biquad biquad-lp biquad-hp biquad-bp
-                                biquad-notch biquad-allpass biquad-peak
-                                biquad-low-shelf biquad-high-shelf
-                                svf-lp svf-hp svf-bp svf-notch ladder])
-
-(defn near? [a :float b :float] :bool
-  (let [d (- a b)]
-    (if (< d 0.0) (< (- 0.0 d) 0.0001) (< d 0.0001))))
-
-(defn fail-unless [cond :bool label :cstr] :int
-  (if cond 0 (do (println label) 1)))
-
-;;; within? -- relative comparison, for squared gains of different sizes.
-(defn within? [a :float b :float rel :float] :bool
-  (let [d   (- a b)
-        ad  (if (< d 0.0) (- 0.0 d) d)
-        ab  (if (< b 0.0) (- 0.0 b) b)]
-    (<= ad (* rel ab))))
-
-;;; power -- squared amplitude of `s` at 48 kHz: 2 * mean(y^2) over `win`
-;;; samples after discarding `skip`.
-(defn power [^fat s : (fn [float] float) skip :int win :int] :float
-  (let [^mut k   0
-        ^mut acc 0.0]
-    (while (< k (+ skip win))
-      (let [y (sample s (/ (as float k) 48000.0))]
-        (if (>= k skip) (set! acc (+ acc (* y y))) (set! acc acc)))
-      (set! k (+ k 1)))
-    (/ (* 2.0 acc) (as float win))))
-
-;;; peak -- max |y| of `s` over n samples at 48 kHz.
-(defn peak [^fat s : (fn [float] float) n :int] :float
-  (let [^mut k 0
-        ^mut m 0.0]
-    (while (< k n)
-      (let [y  (sample s (/ (as float k) 48000.0))
-            ay (if (< y 0.0) (- 0.0 y) y)]
-        (if (> ay m) (set! m ay) (set! m m)))
-      (set! k (+ k 1)))
-    m))
-
-;;; maxdiff -- max |a - b| over n samples at 48 kHz, both sampled in order.
-(defn maxdiff [^fat a : (fn [float] float) ^fat b : (fn [float] float) n :int] :float
-  (let [^mut k 0
-        ^mut m 0.0]
-    (while (< k n)
-      (let [t  (/ (as float k) 48000.0)
-            d  (- (sample a t) (sample b t))
-            ad (if (< d 0.0) (- 0.0 d) d)]
-        (if (> ad m) (set! m ad) (set! m m)))
-      (set! k (+ k 1)))
-    m))
-
-;;; tone -- a unit sine at `hz`.
-(defn tone [hz :float] (sine hz 0.0))
-
-;;; one-pole-failures -- cutoff-in-Hz one-poles and the DC blocker.
-(defn one-pole-failures [] :int
-  (let [;; alpha = 1 - exp(-2*pi*1000/48000)
-        a   0.1226942309
-        lp  ((one-pole-lp 48000.0 1000.0) (constant 1.0))
-        l0  (sample lp 0.0)
-        l1  (sample lp 0.0)
-        hp  ((one-pole-hp 48000.0 1000.0) (constant 1.0))
-        h0  (sample hp 0.0)
-        ;; r = exp(-2*pi*10/48000)
-        r   0.9986918594
-        dc  ((dc-block 48000.0 10.0) (constant 1.0))
-        d0  (sample dc 0.0)
-        d1  (sample dc 0.0)
-        d2  (sample dc 0.0)]
-    (+ (fail-unless (near? l0 a) "FAIL: one-pole-lp step[0] = alpha")
-       (fail-unless (near? l1 (+ a (* (- 1.0 a) a))) "FAIL: one-pole-lp step[1]")
-       (fail-unless (near? h0 (- 1.0 a)) "FAIL: one-pole-hp step[0] = 1 - alpha")
-       (fail-unless (near? d0 1.0) "FAIL: dc-block step[0]")
-       (fail-unless (near? d1 r) "FAIL: dc-block step[1] = r")
-       (fail-unless (near? d2 (* r r)) "FAIL: dc-block step[2] = r^2")
-       (fail-unless (< (power ((dc-block 48000.0 10.0) (constant 1.0)) 96000 4800) 0.000001)
-                    "FAIL: dc-block leaves DC behind")
-       ;; At 1 kHz the 10 Hz blocker is transparent: |H|^2 = 1.0012.
-       (fail-unless (within? (power ((dc-block 48000.0 10.0) ((tone 1000.0) (constant 0.0))) 9600 4800)
-                             1.0012 0.0005)
-                    "FAIL: dc-block attenuates 1 kHz"))))
-
-;;; biquad-failures -- RBJ designs at their characteristic frequencies.
-(defn biquad-failures [] :int
-  (let [z (constant 0.0)]
-    (+ (fail-unless (within? (power ((biquad-lp 48000.0 1000.0 0.7071) ((tone 1000.0) z)) 4800 4800)
-                             0.5 0.001)
-                    "FAIL: biquad-lp is not -3 dB at the cutoff (q = 0.7071)")
-       (fail-unless (within? (power ((biquad-lp 48000.0 1000.0 2.0) ((tone 1000.0) z)) 9600 4800)
-                             4.0 0.001)
-                    "FAIL: biquad-lp gain at the cutoff is not q (q = 2)")
-       (fail-unless (within? (power ((biquad-lp 48000.0 1000.0 0.7071) ((tone 125.0) z)) 4800 4992)
-                             1.0 0.001)
-                    "FAIL: biquad-lp passband")
-       (fail-unless (< (power ((biquad-lp 48000.0 1000.0 0.7071) ((tone 12000.0) z)) 4800 4800) 0.0001)
-                    "FAIL: biquad-lp stopband (12 kHz should be below -40 dB)")
-       (fail-unless (within? (power ((biquad-hp 48000.0 1000.0 0.7071) ((tone 1000.0) z)) 4800 4800)
-                             0.5 0.001)
-                    "FAIL: biquad-hp is not -3 dB at the cutoff")
-       (fail-unless (< (power ((biquad-hp 48000.0 1000.0 0.7071) ((tone 125.0) z)) 4800 4992) 0.0003)
-                    "FAIL: biquad-hp stopband (125 Hz should be near -36 dB)")
-       (fail-unless (within? (power ((biquad-bp 48000.0 1000.0 4.0) ((tone 1000.0) z)) 9600 4800)
-                             1.0 0.001)
-                    "FAIL: biquad-bp is not unity at the center")
-       (fail-unless (< (power ((biquad-bp 48000.0 1000.0 4.0) ((tone 250.0) z)) 9600 4800) 0.01)
-                    "FAIL: biquad-bp passes 250 Hz")
-       (fail-unless (< (power ((biquad-notch 48000.0 1000.0 2.0) ((tone 1000.0) z)) 9600 4800) 0.000001)
-                    "FAIL: biquad-notch does not remove the center")
-       (fail-unless (within? (power ((biquad-notch 48000.0 1000.0 2.0) ((tone 125.0) z)) 9600 4992)
-                             1.0 0.01)
-                    "FAIL: biquad-notch attenuates far below the notch")
-       (fail-unless (within? (power ((biquad-allpass 48000.0 1000.0 0.7071) ((tone 1000.0) z)) 4800 4800)
-                             1.0 0.001)
-                    "FAIL: biquad-allpass gain at the center")
-       (fail-unless (within? (power ((biquad-allpass 48000.0 1000.0 0.7071) ((tone 3000.0) z)) 4800 4800)
-                             1.0 0.001)
-                    "FAIL: biquad-allpass gain away from the center")
-       ;; +6 dB: |H|^2 = 10^(6/10)
-       (fail-unless (within? (power ((biquad-peak 48000.0 1000.0 1.0 6.0) ((tone 1000.0) z)) 4800 4800)
-                             3.981072 0.001)
-                    "FAIL: biquad-peak gain at the center is not gain-db")
-       (fail-unless (within? (power ((biquad-peak 48000.0 1000.0 1.0 0.0) ((tone 3000.0) z)) 4800 4800)
-                             1.0 0.001)
-                    "FAIL: biquad-peak at 0 dB is not a pass-through")
-       (fail-unless (within? (power ((biquad-high-shelf 48000.0 1000.0 0.7071 6.0) ((tone 125.0) z)) 4800 4992)
-                             1.0 0.01)
-                    "FAIL: biquad-high-shelf changes the low end")
-       (fail-unless (within? (power ((biquad-high-shelf 48000.0 1000.0 0.7071 6.0) ((tone 12000.0) z)) 4800 4800)
-                             3.981072 0.02)
-                    "FAIL: biquad-high-shelf high-end gain")
-       ;; Raw coefficients: a two-tap average has a zero at Nyquist and DC gain 1.
-       (fail-unless (within? (power ((biquad 0.5 0.5 0.0 0.0 0.0) ((tone 12000.0) z)) 48 4800)
-                             0.5 0.001)
-                    "FAIL: raw biquad two-tap average at fs/4")
-       ;; A non-positive sample rate passes the input through.
-       (fail-unless (near? (sample ((biquad-lp 0.0 1000.0 0.7071) (constant 0.25)) 0.0) 0.25)
-                    "FAIL: biquad-lp with sample rate 0 is not a pass-through")
-       ;; A cutoff past Nyquist is clamped, not turned into NaN.
-       (let [y (peak ((biquad-lp 48000.0 90000.0 0.7071) ((tone 1000.0) z)) 4800)]
-         (fail-unless (and (= y y) (< y 2.0)) "FAIL: biquad-lp cutoff above Nyquist")))))
-
-;;; shelf-dc-failures -- the shelves' DC gains, from a settled step.
-(defn shelf-dc-failures [] :int
-  (+ (fail-unless (within? (power ((biquad-low-shelf 48000.0 200.0 0.7071 -6.0) (constant 1.0)) 48000 48)
-                           (* 2.0 0.251189) 0.001)
-                  "FAIL: biquad-low-shelf DC gain is not gain-db")
-     (fail-unless (within? (power ((biquad-high-shelf 48000.0 1000.0 0.7071 6.0) (constant 1.0)) 48000 48)
-                           2.0 0.001)
-                  "FAIL: biquad-high-shelf DC gain is not unity")
-     (fail-unless (within? (power ((biquad-peak 48000.0 1000.0 1.0 6.0) (constant 1.0)) 48000 48)
-                           2.0 0.001)
-                  "FAIL: biquad-peak DC gain is not unity")))
-
-;;; svf-failures -- state-variable responses, the biquad identity, modulation.
-(defn svf-failures [] :int
-  (let [z     (constant 0.0)
-        fc    (constant 1000.0)
-        saw-a ((sawtooth 220.0) z)
-        saw-b ((sawtooth 220.0) z)
-        ;; Cutoff swept 100 Hz .. 1900 Hz at 7 Hz, q = 8: the case that
-        ;; makes a direct-form biquad with per-sample coefficients misbehave.
-        sweep ((low-pass 1.0) ((sine 7.0 0.0) z))]
-    (+ (fail-unless (within? (power ((svf-lp 48000.0 fc 0.7071) ((tone 1000.0) z)) 4800 4800)
-                             0.5 0.001)
-                    "FAIL: svf-lp is not -3 dB at the cutoff")
-       (fail-unless (within? (power ((svf-lp 48000.0 fc 2.0) ((tone 1000.0) z)) 9600 4800)
-                             4.0 0.001)
-                    "FAIL: svf-lp gain at the cutoff is not q")
-       (fail-unless (within? (power ((svf-hp 48000.0 fc 0.7071) ((tone 1000.0) z)) 4800 4800)
-                             0.5 0.001)
-                    "FAIL: svf-hp is not -3 dB at the cutoff")
-       (fail-unless (within? (power ((svf-bp 48000.0 fc 4.0) ((tone 1000.0) z)) 9600 4800)
-                             1.0 0.001)
-                    "FAIL: svf-bp is not unity at the center")
-       (fail-unless (< (power ((svf-notch 48000.0 fc 2.0) ((tone 1000.0) z)) 9600 4800) 0.000001)
-                    "FAIL: svf-notch does not remove the center")
-       (fail-unless (< (maxdiff ((svf-lp 48000.0 fc 2.0) saw-a) ((biquad-lp 48000.0 1000.0 2.0) saw-b) 4800)
-                       0.000001)
-                    "FAIL: svf-lp and biquad-lp disagree")
-       (fail-unless (< (maxdiff ((svf-hp 48000.0 fc 2.0) ((sawtooth 220.0) z))
-                                ((biquad-hp 48000.0 1000.0 2.0) ((sawtooth 220.0) z)) 4800)
-                       0.000001)
-                    "FAIL: svf-hp and biquad-hp disagree")
-       (fail-unless (< (maxdiff ((svf-bp 48000.0 fc 2.0) ((sawtooth 220.0) z))
-                                ((biquad-bp 48000.0 1000.0 2.0) ((sawtooth 220.0) z)) 4800)
-                       0.000001)
-                    "FAIL: svf-bp and biquad-bp disagree")
-       (fail-unless (< (maxdiff ((svf-notch 48000.0 fc 2.0) ((sawtooth 220.0) z))
-                                ((biquad-notch 48000.0 1000.0 2.0) ((sawtooth 220.0) z)) 4800)
-                       0.000001)
-                    "FAIL: svf-notch and biquad-notch disagree")
-       (let [cut (fn [t :float] :float (+ 1000.0 (* 900.0 (sample sweep t))))
-             y   (peak ((svf-lp 48000.0 cut 8.0) ((white 3) z)) 48000)]
-         (fail-unless (and (= y y) (< y 20.0)) "FAIL: svf-lp unstable under a cutoff sweep")))))
-
-;;; ladder-failures -- 4-pole gains, resonance clamp, self-oscillation.
-(defn ladder-failures [] :int
-  (let [z  (constant 0.0)
-        fc (constant 1000.0)
-        ;; resonance 1: ring after a one-sample kick, neither dying nor growing.
-        ;; Each measurement gets its own instance: `power` restarts t at 0,
-        ;; which would kick a shared one again.
-        kick (fn [t :float] :float (if (< t 0.00001) 1.0 0.0))
-        early (power ((ladder 48000.0 fc 1.0) kick) 4800 4800)
-        late  (power ((ladder 48000.0 fc 1.0) kick) 38400 4800)
-        sat   ((sawtooth 220.0) z)]
-    (+ (fail-unless (within? (power ((ladder 48000.0 fc 0.0) ((tone 1000.0) z)) 4800 4800)
-                             0.0625 0.001)
-                    "FAIL: ladder resonance 0 is not -12 dB at the cutoff")
-       (fail-unless (within? (power ((ladder 48000.0 fc 0.5) ((tone 1000.0) z)) 9600 4800)
-                             0.25 0.001)
-                    "FAIL: ladder resonance 0.5 gain at the cutoff")
-       (fail-unless (within? (power ((ladder 48000.0 fc 0.5) (constant 1.0)) 9600 48)
-                             (/ 2.0 9.0) 0.001)
-                    "FAIL: ladder DC gain is not 1 / (1 + 4r)")
-       (fail-unless (< (maxdiff ((ladder 48000.0 fc 5.0) sat) ((ladder 48000.0 fc 1.0) ((sawtooth 220.0) z)) 4800)
-                       0.000000001)
-                    "FAIL: ladder resonance is not clamped to 1")
-       (fail-unless (within? (power ((ladder 48000.0 fc -1.0) (constant 1.0)) 9600 48) 2.0 0.001)
-                    "FAIL: ladder resonance is not clamped to 0")
-       ;; 24 dB/oct: three octaves up is about 72 dB down.
-       (fail-unless (< (power ((ladder 48000.0 fc 0.0) ((tone 8000.0) z)) 4800 4800) 0.0000001)
-                    "FAIL: ladder stopband")
-       (fail-unless (> early 0.0000000001) "FAIL: ladder resonance 1 does not ring")
-       (fail-unless (within? late early 0.01) "FAIL: ladder self-oscillation is not steady"))))
-
-(defn main [] : int
-  (let [lp ((low-pass 0.5) (constant 1.0))
-        ;; sample lp four times in order; capture the running step response.
-        l0 (sample lp 0.0)     ;; 0.5
-        l1 (sample lp 0.0)     ;; 0.75
-        l2 (sample lp 0.0)     ;; 0.875
-        l3 (sample lp 0.0)     ;; 0.9375
-        hp ((high-pass 0.5) (constant 1.0))
-        h0 (sample hp 0.0)     ;; 0.5
-        h1 (sample hp 0.0)     ;; 0.25
-        h2 (sample hp 0.0)     ;; 0.125
-        f (+ (fail-unless (near? l0 0.5)    "FAIL: low-pass step[0]")
-             (fail-unless (near? l1 0.75)   "FAIL: low-pass step[1]")
-             (fail-unless (near? l2 0.875)  "FAIL: low-pass step[2]")
-             (fail-unless (near? l3 0.9375) "FAIL: low-pass step[3]")
-             (fail-unless (near? h0 0.5)    "FAIL: high-pass step[0]")
-             (fail-unless (near? h1 0.25)   "FAIL: high-pass step[1]")
-             (fail-unless (near? h2 0.125)  "FAIL: high-pass step[2]")
-             ;; Two independent instances must not share state.
-             (fail-unless (near? (sample ((low-pass 0.5) (constant 1.0)) 0.0) 0.5)
-                          "FAIL: low-pass instances share state")
-             (one-pole-failures)
-             (biquad-failures)
-             (shelf-dc-failures)
-             (svf-failures)
-             (ladder-failures))]
-    (if (= f 0)
-      (println "PASS test_filter")
-      (println "test_filter: failures above"))
-    f))
-
-) ;; end defmodule signal/tests/test_filter
+  (import signal/core :refer [constant sample])
+  (import signal/osc :refer [sine sawtooth])
+  (import signal/noise :refer [white])
+  (import signal/filter
+    :refer
+    [low-pass
+     high-pass
+     one-pole-lp
+     one-pole-hp
+     dc-block
+     biquad
+     biquad-lp
+     biquad-hp
+     biquad-bp
+     biquad-notch
+     biquad-allpass
+     biquad-peak
+     biquad-low-shelf
+     biquad-high-shelf
+     svf-lp
+     svf-hp
+     svf-bp
+     svf-notch
+     ladder])
+  (defn near? [a :float b :float] :bool
+    (let [d (- a b)] (if (< d 0.0) (< (- 0.0 d) 0.0001) (< d 0.0001))))
+  (defn fail-unless [cond :bool label :cstr] :int
+    (if cond 0 (do (println label) 1)))
+  ;;; within? -- relative comparison, for squared gains of different sizes.
+  (defn within? [a :float b :float rel :float] :bool
+    (let [d  (- a b)
+          ad (if (< d 0.0) (- 0.0 d) d)
+          ab (if (< b 0.0) (- 0.0 b) b)]
+      (<= ad (* rel ab))))
+  ;;; power -- squared amplitude of `s` at 48 kHz: 2 * mean(y^2) over `win`
+  ;;; samples after discarding `skip`.
+  (defn power [^fat s : (fn [float] float) skip :int win :int] :float
+    (let [^mut k   0
+          ^mut acc 0.0]
+      (while (< k (+ skip win))
+        (let [y (sample s (/ (as float k) 4.8e+04))]
+          (if (>= k skip) (set! acc (+ acc (* y y))) (set! acc acc)))
+        (set! k (+ k 1)))
+      (/ (* 2.0 acc) (as float win))))
+  ;;; peak -- max |y| of `s` over n samples at 48 kHz.
+  (defn peak [^fat s : (fn [float] float) n :int] :float
+    (let [^mut k 0
+          ^mut m 0.0]
+      (while (< k n)
+        (let [y  (sample s (/ (as float k) 4.8e+04))
+              ay (if (< y 0.0) (- 0.0 y) y)]
+          (if (> ay m) (set! m ay) (set! m m)))
+        (set! k (+ k 1)))
+      m))
+  ;;; maxdiff -- max |a - b| over n samples at 48 kHz, both sampled in order.
+  (defn maxdiff [^fat a : (fn [float] float) ^fat b : (fn [float] float) n :int] :float
+    (let [^mut k 0
+          ^mut m 0.0]
+      (while (< k n)
+        (let [t  (/ (as float k) 4.8e+04)
+              d  (- (sample a t) (sample b t))
+              ad (if (< d 0.0) (- 0.0 d) d)]
+          (if (> ad m) (set! m ad) (set! m m)))
+        (set! k (+ k 1)))
+      m))
+  ;;; tone -- a unit sine at `hz`.
+  (defn tone [hz :float] (sine hz 0.0))
+  ;;; one-pole-failures -- cutoff-in-Hz one-poles and the DC blocker.
+  (defn one-pole-failures [] :int
+    (let [ ;; alpha = 1 - exp(-2*pi*1000/48000)
+          a  0.1226942309
+          lp ((one-pole-lp 4.8e+04 1e+03) (constant 1.0))
+          l0 (sample lp 0.0)
+          l1 (sample lp 0.0)
+          hp ((one-pole-hp 4.8e+04 1e+03) (constant 1.0))
+          h0 (sample hp 0.0)
+          ;; r = exp(-2*pi*10/48000)
+          r  0.9986918594
+          dc ((dc-block 4.8e+04 1e+01) (constant 1.0))
+          d0 (sample dc 0.0)
+          d1 (sample dc 0.0)
+          d2 (sample dc 0.0)]
+      (+ (fail-unless (near? l0 a) "FAIL: one-pole-lp step[0] = alpha")
+        (fail-unless (near? l1 (+ a (* (- 1.0 a) a)))
+          "FAIL: one-pole-lp step[1]")
+        (fail-unless (near? h0 (- 1.0 a))
+          "FAIL: one-pole-hp step[0] = 1 - alpha")
+        (fail-unless (near? d0 1.0) "FAIL: dc-block step[0]")
+        (fail-unless (near? d1 r) "FAIL: dc-block step[1] = r")
+        (fail-unless (near? d2 (* r r)) "FAIL: dc-block step[2] = r^2")
+        (fail-unless (< (power ((dc-block 4.8e+04 1e+01) (constant 1.0))
+                          96000
+                          4800)
+                       1e-06)
+          "FAIL: dc-block leaves DC behind")
+        ;; At 1 kHz the 10 Hz blocker is transparent: |H|^2 = 1.0012.
+        (fail-unless (within? (power ((dc-block 4.8e+04 1e+01) ((tone 1e+03) (constant 0.0)))
+                                9600
+                                4800)
+                       1.0012
+                       0.0005)
+          "FAIL: dc-block attenuates 1 kHz"))))
+  ;;; biquad-failures -- RBJ designs at their characteristic frequencies.
+  (defn biquad-failures [] :int
+    (let [z (constant 0.0)]
+      (+ (fail-unless (within? (power ((biquad-lp 4.8e+04 1e+03 0.7071) ((tone 1e+03) z))
+                                 4800
+                                 4800)
+                        0.5
+                        0.001)
+           "FAIL: biquad-lp is not -3 dB at the cutoff (q = 0.7071)")
+        (fail-unless (within? (power ((biquad-lp 4.8e+04 1e+03 2.0) ((tone 1e+03) z))
+                                9600
+                                4800)
+                       4.0
+                       0.001)
+          "FAIL: biquad-lp gain at the cutoff is not q (q = 2)")
+        (fail-unless (within? (power ((biquad-lp 4.8e+04 1e+03 0.7071) ((tone 125.0) z))
+                                4800
+                                4992)
+                       1.0
+                       0.001)
+          "FAIL: biquad-lp passband")
+        (fail-unless (< (power ((biquad-lp 4.8e+04 1e+03 0.7071) ((tone 1.2e+04) z))
+                          4800
+                          4800)
+                       0.0001)
+          "FAIL: biquad-lp stopband (12 kHz should be below -40 dB)")
+        (fail-unless (within? (power ((biquad-hp 4.8e+04 1e+03 0.7071) ((tone 1e+03) z))
+                                4800
+                                4800)
+                       0.5
+                       0.001)
+          "FAIL: biquad-hp is not -3 dB at the cutoff")
+        (fail-unless (< (power ((biquad-hp 4.8e+04 1e+03 0.7071) ((tone 125.0) z))
+                          4800
+                          4992)
+                       0.0003)
+          "FAIL: biquad-hp stopband (125 Hz should be near -36 dB)")
+        (fail-unless (within? (power ((biquad-bp 4.8e+04 1e+03 4.0) ((tone 1e+03) z))
+                                9600
+                                4800)
+                       1.0
+                       0.001)
+          "FAIL: biquad-bp is not unity at the center")
+        (fail-unless (< (power ((biquad-bp 4.8e+04 1e+03 4.0) ((tone 2.5e+02) z))
+                          9600
+                          4800)
+                       0.01)
+          "FAIL: biquad-bp passes 250 Hz")
+        (fail-unless (< (power ((biquad-notch 4.8e+04 1e+03 2.0) ((tone 1e+03) z))
+                          9600
+                          4800)
+                       1e-06)
+          "FAIL: biquad-notch does not remove the center")
+        (fail-unless (within? (power ((biquad-notch 4.8e+04 1e+03 2.0) ((tone 125.0) z))
+                                9600
+                                4992)
+                       1.0
+                       0.01)
+          "FAIL: biquad-notch attenuates far below the notch")
+        (fail-unless (within? (power ((biquad-allpass 4.8e+04 1e+03 0.7071) ((tone 1e+03) z))
+                                4800
+                                4800)
+                       1.0
+                       0.001)
+          "FAIL: biquad-allpass gain at the center")
+        (fail-unless (within? (power ((biquad-allpass 4.8e+04 1e+03 0.7071) ((tone 3e+03) z))
+                                4800
+                                4800)
+                       1.0
+                       0.001)
+          "FAIL: biquad-allpass gain away from the center")
+        ;; +6 dB: |H|^2 = 10^(6/10)
+        (fail-unless (within? (power ((biquad-peak 4.8e+04 1e+03 1.0 6.0) ((tone 1e+03) z))
+                                4800
+                                4800)
+                       3.981072
+                       0.001)
+          "FAIL: biquad-peak gain at the center is not gain-db")
+        (fail-unless (within? (power ((biquad-peak 4.8e+04 1e+03 1.0 0.0) ((tone 3e+03) z))
+                                4800
+                                4800)
+                       1.0
+                       0.001)
+          "FAIL: biquad-peak at 0 dB is not a pass-through")
+        (fail-unless (within? (power ((biquad-high-shelf 4.8e+04
+                                        1e+03
+                                        0.7071
+                                        6.0) ((tone 125.0) z))
+                                4800
+                                4992)
+                       1.0
+                       0.01)
+          "FAIL: biquad-high-shelf changes the low end")
+        (fail-unless (within? (power ((biquad-high-shelf 4.8e+04
+                                        1e+03
+                                        0.7071
+                                        6.0) ((tone 1.2e+04) z))
+                                4800
+                                4800)
+                       3.981072
+                       0.02)
+          "FAIL: biquad-high-shelf high-end gain")
+        ;; Raw coefficients: a two-tap average has a zero at Nyquist and DC gain 1.
+        (fail-unless (within? (power ((biquad 0.5 0.5 0.0 0.0 0.0) ((tone 1.2e+04) z))
+                                48
+                                4800)
+                       0.5
+                       0.001)
+          "FAIL: raw biquad two-tap average at fs/4")
+        ;; A non-positive sample rate passes the input through.
+        (fail-unless (near? (sample ((biquad-lp 0.0 1e+03 0.7071) (constant 0.25))
+                              0.0)
+                       0.25)
+          "FAIL: biquad-lp with sample rate 0 is not a pass-through")
+        ;; A cutoff past Nyquist is clamped, not turned into NaN.
+        (let [y (peak ((biquad-lp 4.8e+04 9e+04 0.7071) ((tone 1e+03) z)) 4800)]
+          (fail-unless (and (= y y) (< y 2.0))
+            "FAIL: biquad-lp cutoff above Nyquist")))))
+  ;;; shelf-dc-failures -- the shelves' DC gains, from a settled step.
+  (defn shelf-dc-failures [] :int
+    (+ (fail-unless (within? (power ((biquad-low-shelf 4.8e+04
+                                       2e+02
+                                       0.7071
+                                       -6.0) (constant 1.0))
+                               48000
+                               48)
+                      (* 2.0 0.251189)
+                      0.001)
+         "FAIL: biquad-low-shelf DC gain is not gain-db")
+      (fail-unless (within? (power ((biquad-high-shelf 4.8e+04 1e+03 0.7071 6.0) (constant 1.0))
+                              48000
+                              48)
+                     2.0
+                     0.001)
+        "FAIL: biquad-high-shelf DC gain is not unity")
+      (fail-unless (within? (power ((biquad-peak 4.8e+04 1e+03 1.0 6.0) (constant 1.0))
+                              48000
+                              48)
+                     2.0
+                     0.001)
+        "FAIL: biquad-peak DC gain is not unity")))
+  ;;; svf-failures -- state-variable responses, the biquad identity, modulation.
+  (defn svf-failures [] :int
+    (let [z     (constant 0.0)
+          fc    (constant 1e+03)
+          saw-a ((sawtooth 2.2e+02) z)
+          saw-b ((sawtooth 2.2e+02) z)
+          ;; Cutoff swept 100 Hz .. 1900 Hz at 7 Hz, q = 8: the case that
+          ;; makes a direct-form biquad with per-sample coefficients misbehave.
+          sweep ((low-pass 1.0) ((sine 7.0 0.0) z))]
+      (+ (fail-unless (within? (power ((svf-lp 4.8e+04 fc 0.7071) ((tone 1e+03) z))
+                                 4800
+                                 4800)
+                        0.5
+                        0.001)
+           "FAIL: svf-lp is not -3 dB at the cutoff")
+        (fail-unless (within? (power ((svf-lp 4.8e+04 fc 2.0) ((tone 1e+03) z))
+                                9600
+                                4800)
+                       4.0
+                       0.001)
+          "FAIL: svf-lp gain at the cutoff is not q")
+        (fail-unless (within? (power ((svf-hp 4.8e+04 fc 0.7071) ((tone 1e+03) z))
+                                4800
+                                4800)
+                       0.5
+                       0.001)
+          "FAIL: svf-hp is not -3 dB at the cutoff")
+        (fail-unless (within? (power ((svf-bp 4.8e+04 fc 4.0) ((tone 1e+03) z))
+                                9600
+                                4800)
+                       1.0
+                       0.001)
+          "FAIL: svf-bp is not unity at the center")
+        (fail-unless (< (power ((svf-notch 4.8e+04 fc 2.0) ((tone 1e+03) z))
+                          9600
+                          4800)
+                       1e-06)
+          "FAIL: svf-notch does not remove the center")
+        (fail-unless (< (maxdiff ((svf-lp 4.8e+04 fc 2.0) saw-a)
+                          ((biquad-lp 4.8e+04 1e+03 2.0) saw-b)
+                          4800)
+                       1e-06)
+          "FAIL: svf-lp and biquad-lp disagree")
+        (fail-unless (< (maxdiff ((svf-hp 4.8e+04 fc 2.0) ((sawtooth 2.2e+02) z))
+                          ((biquad-hp 4.8e+04 1e+03 2.0) ((sawtooth 2.2e+02) z))
+                          4800)
+                       1e-06)
+          "FAIL: svf-hp and biquad-hp disagree")
+        (fail-unless (< (maxdiff ((svf-bp 4.8e+04 fc 2.0) ((sawtooth 2.2e+02) z))
+                          ((biquad-bp 4.8e+04 1e+03 2.0) ((sawtooth 2.2e+02) z))
+                          4800)
+                       1e-06)
+          "FAIL: svf-bp and biquad-bp disagree")
+        (fail-unless (< (maxdiff ((svf-notch 4.8e+04 fc 2.0) ((sawtooth 2.2e+02) z))
+                          ((biquad-notch 4.8e+04 1e+03 2.0) ((sawtooth 2.2e+02) z))
+                          4800)
+                       1e-06)
+          "FAIL: svf-notch and biquad-notch disagree")
+        (let [cut (fn [t :float] :float (+ 1e+03 (* 9e+02 (sample sweep t))))
+              y   (peak ((svf-lp 4.8e+04 cut 8.0) ((white 3) z)) 48000)]
+          (fail-unless (and (= y y) (< y 2e+01))
+            "FAIL: svf-lp unstable under a cutoff sweep")))))
+  ;;; ladder-failures -- 4-pole gains, resonance clamp, self-oscillation.
+  (defn ladder-failures [] :int
+    (let [z     (constant 0.0)
+          fc    (constant 1e+03)
+          ;; resonance 1: ring after a one-sample kick, neither dying nor growing.
+          ;; Each measurement gets its own instance: `power` restarts t at 0,
+          ;; which would kick a shared one again.
+          kick  (fn [t :float] :float (if (< t 1e-05) 1.0 0.0))
+          early (power ((ladder 4.8e+04 fc 1.0) kick) 4800 4800)
+          late  (power ((ladder 4.8e+04 fc 1.0) kick) 38400 4800)
+          sat   ((sawtooth 2.2e+02) z)]
+      (+ (fail-unless (within? (power ((ladder 4.8e+04 fc 0.0) ((tone 1e+03) z))
+                                 4800
+                                 4800)
+                        0.0625
+                        0.001)
+           "FAIL: ladder resonance 0 is not -12 dB at the cutoff")
+        (fail-unless (within? (power ((ladder 4.8e+04 fc 0.5) ((tone 1e+03) z))
+                                9600
+                                4800)
+                       0.25
+                       0.001)
+          "FAIL: ladder resonance 0.5 gain at the cutoff")
+        (fail-unless (within? (power ((ladder 4.8e+04 fc 0.5) (constant 1.0))
+                                9600
+                                48)
+                       (/ 2.0 9.0)
+                       0.001)
+          "FAIL: ladder DC gain is not 1 / (1 + 4r)")
+        (fail-unless (< (maxdiff ((ladder 4.8e+04 fc 5.0) sat)
+                          ((ladder 4.8e+04 fc 1.0) ((sawtooth 2.2e+02) z))
+                          4800)
+                       1e-09)
+          "FAIL: ladder resonance is not clamped to 1")
+        (fail-unless (within? (power ((ladder 4.8e+04 fc -1.0) (constant 1.0))
+                                9600
+                                48)
+                       2.0
+                       0.001)
+          "FAIL: ladder resonance is not clamped to 0")
+        ;; 24 dB/oct: three octaves up is about 72 dB down.
+        (fail-unless (< (power ((ladder 4.8e+04 fc 0.0) ((tone 8e+03) z))
+                          4800
+                          4800)
+                       1e-07)
+          "FAIL: ladder stopband")
+        (fail-unless (> early 1e-10) "FAIL: ladder resonance 1 does not ring")
+        (fail-unless (within? late early 0.01)
+          "FAIL: ladder self-oscillation is not steady"))))
+  (defn main [] : int
+    (let [lp ((low-pass 0.5) (constant 1.0))
+          ;; sample lp four times in order; capture the running step response.
+          l0 (sample lp 0.0) ;; 0.5
+          l1 (sample lp 0.0) ;; 0.75
+          l2 (sample lp 0.0) ;; 0.875
+          l3 (sample lp 0.0) ;; 0.9375
+          hp ((high-pass 0.5) (constant 1.0))
+          h0 (sample hp 0.0) ;; 0.5
+          h1 (sample hp 0.0) ;; 0.25
+          h2 (sample hp 0.0) ;; 0.125
+          f  (+ (fail-unless (near? l0 0.5) "FAIL: low-pass step[0]")
+               (fail-unless (near? l1 0.75) "FAIL: low-pass step[1]")
+               (fail-unless (near? l2 0.875) "FAIL: low-pass step[2]")
+               (fail-unless (near? l3 0.9375) "FAIL: low-pass step[3]")
+               (fail-unless (near? h0 0.5) "FAIL: high-pass step[0]")
+               (fail-unless (near? h1 0.25) "FAIL: high-pass step[1]")
+               (fail-unless (near? h2 0.125) "FAIL: high-pass step[2]")
+               ;; Two independent instances must not share state.
+               (fail-unless (near? (sample ((low-pass 0.5) (constant 1.0)) 0.0)
+                              0.5)
+                 "FAIL: low-pass instances share state")
+               (one-pole-failures)
+               (biquad-failures)
+               (shelf-dc-failures)
+               (svf-failures)
+               (ladder-failures))]
+      (if (= f 0)
+        (println "PASS test_filter")
+        (println "test_filter: failures above"))
+      f))) ;; end defmodule signal/tests/test_filter

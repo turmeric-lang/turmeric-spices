@@ -13,331 +13,463 @@
 ;;
 ;; A binding list may be written (x coll) or [x coll]; a parameter list
 ;; (a b) or [a b].
-
 (defmodule scscm/expander
   (export expand expand-all scscm-macros-reset)
-  (import scscm/lexer :refer [cons head tail nil-value list-nil?
-                               scscm-list-rev scscm-cstr-eq? scscm-fn-head?])
-  (import scscm/parser :refer [ast-kind ast-symbol-name
-                                ast-list-len ast-list-get
-                                scscm-ast-leaf scscm-ast-list-node
-                                scscm-ast-add-child scscm-ast-value])
-
-;; ---- global macro environment (C static) ----
-;; One dispatcher owns the static, so get and set share storage.
-(defn scscm-macro-env-op [op : int val : int] #fx{Unsafe} : int
-  ```c
-  static int64_t env = 0;
+  (import scscm/lexer
+    :refer
+    [cons
+     head
+     tail
+     nil-value
+     list-nil?
+     scscm-list-rev
+     scscm-cstr-eq?
+     scscm-fn-head?])
+  (import scscm/parser
+    :refer
+    [ast-kind
+     ast-symbol-name
+     ast-list-len
+     ast-list-get
+     scscm-ast-leaf
+     scscm-ast-list-node
+     scscm-ast-add-child
+     scscm-ast-value])
+  ;; ---- global macro environment (C static) ----
+  ;; One dispatcher owns the static, so get and set share storage.
+  (defn scscm-macro-env-op [op : int val : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    static int64_t env = 0;
   if (op == 0) return env;               /* get */
   if (op == 1) { env = val; return 0; }  /* set */
   return 0;
   ```)
-
-(defn scscm-macro-get [] #fx{Unsafe} : int
-  (scscm-macro-env-op 0 0))
-
-(defn scscm-macro-set [env : int] #fx{Unsafe} : int
-  (scscm-macro-env-op 1 env))
-
-;;; scscm-macros-reset -- forget every defmacro. The table holds AST nodes,
-;;; so it must not outlive the tree they came from; compile-text resets it
-;;; around each compilation (macros are per program, as in lhc.js).
-(defn scscm-macros-reset [] #fx{Unsafe} : int
-  (scscm-macro-set (nil-value)))
-
-;; Entries are (name-node . (params . body)), newest first.
-(defn scscm-macro-define [name : int params : int body : int] #fx{Unsafe} : int
-  (scscm-macro-set (cons (cons name (cons params body)) (scscm-macro-get))))
-
-(defn scscm-macro-lookup-loop [name : cstr env : int] #fx{Unsafe} : int
-  (if (list-nil? env)
-    (nil-value)
-    (let [entry (head env)]
-      (if (scscm-cstr-eq? name (ast-symbol-name (head entry)))
-        (tail entry)
-        (scscm-macro-lookup-loop name (tail env))))))
-
-;; (params . body) for a macro name, or nil-value.
-(defn scscm-macro-lookup [name : cstr] #fx{Unsafe} : int
-  (scscm-macro-lookup-loop name (scscm-macro-get)))
-
-;; ---- AST construction ----
-
-(defn scscm-kind? [node : int kind : cstr] #fx{Unsafe} : bool
-  (scscm-cstr-eq? (ast-kind node) kind))
-
-(defn scscm-sym [name : cstr] #fx{Unsafe} : int (scscm-ast-leaf 1 name))
-(defn scscm-kw [name : cstr] #fx{Unsafe} : int (scscm-ast-leaf 2 name))
-(defn scscm-num [text : cstr] #fx{Unsafe} : int (scscm-ast-leaf 3 text))
-(defn scscm-str [text : cstr] #fx{Unsafe} : int (scscm-ast-leaf 4 text))
-(defn scscm-nil [] #fx{Unsafe} : int (scscm-ast-leaf 0 "nil"))
-
-;; Append child to node; returns node so calls chain.
-(defn scscm-add [node : int child : int] #fx{Unsafe} : int
-  (do (scscm-ast-add-child node child) node))
-
-(defn scscm-l1 [a : int] #fx{Unsafe} : int
-  (scscm-add (scscm-ast-list-node 5) a))
-(defn scscm-l2 [a : int b : int] #fx{Unsafe} : int
-  (scscm-add (scscm-l1 a) b))
-(defn scscm-l3 [a : int b : int c : int] #fx{Unsafe} : int
-  (scscm-add (scscm-l2 a b) c))
-(defn scscm-l4 [a : int b : int c : int d : int] #fx{Unsafe} : int
-  (scscm-add (scscm-l3 a b c) d))
-(defn scscm-l5 [a : int b : int c : int d : int e : int] #fx{Unsafe} : int
-  (scscm-add (scscm-l4 a b c d) e))
-
-;; Append src's children from start to dst; returns dst.
-(defn scscm-append-from [dst : int src : int start : int] #fx{Unsafe} : int
-  (if (>= start (ast-list-len src))
-    dst
-    (scscm-append-from (scscm-add dst (ast-list-get src start)) src (+ start 1))))
-
-;; (sym-name <node's children from start>)
-(defn scscm-call-from [name : cstr node : int start : int] #fx{Unsafe} : int
-  (scscm-append-from (scscm-l1 (scscm-sym name)) node start))
-
-;; (fn params <node's children from start>)
-(defn scscm-fn-from [params : int node : int start : int] #fx{Unsafe} : int
-  (scscm-append-from (scscm-l2 (scscm-sym "fn") params) node start))
-
-;; (do <node's children from start>)
-(defn scscm-do-from [node : int start : int] #fx{Unsafe} : int
-  (scscm-call-from "do" node start))
-
-;; (. recv msg)
-(defn scscm-send [recv : int msg : cstr] #fx{Unsafe} : int
-  (scscm-l3 (scscm-sym ".") recv (scscm-sym msg)))
-
-;; (.dot Cls msg)
-(defn scscm-class-send [cls : cstr msg : cstr] #fx{Unsafe} : int
-  (scscm-l3 (scscm-sym ".dot") (scscm-sym cls) (scscm-sym msg)))
-
-;; (.dot TempoClock default)
-(defn scscm-default-clock [] #fx{Unsafe} : int
-  (scscm-class-send "TempoClock" "default"))
-
-;; (dict :doneAction 2)
-(defn scscm-done-action-2 [] #fx{Unsafe} : int
-  (scscm-l3 (scscm-sym "dict") (scscm-kw ":doneAction") (scscm-num "2")))
-
-;; The i-th child, or nil when absent.
-(defn scscm-arg [node : int i : int] #fx{Unsafe} : int
-  (if (< i (ast-list-len node)) (ast-list-get node i) (scscm-nil)))
-
-;; The first and second element of a binding list (x coll) / [x coll].
-(defn scscm-bind-0 [node : int] #fx{Unsafe} : int (scscm-arg (scscm-arg node 1) 0))
-(defn scscm-bind-1 [node : int] #fx{Unsafe} : int (scscm-arg (scscm-arg node 1) 1))
-
-;; A one-parameter list (x).
-(defn scscm-params1 [p : int] #fx{Unsafe} : int
-  (scscm-add (scscm-ast-list-node 5) p))
-
-;; A symbol's text as a string node (defsynth names).
-(defn scscm-sym-string [node : int] #fx{Unsafe} : int
-  (scscm-str (ast-symbol-name node)))
-
-;; ---- built-in macros: rewrites to unexpanded forms ----
-
-;; (-> x step...): a symbol step is a message, (. acc step); a list step
-;; (f a...) becomes (f acc a...).
-(defn scscm-thread-first [node : int i : int acc : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len node))
-    acc
-    (let [step (ast-list-get node i)]
-      (scscm-thread-first node (+ i 1)
-        (if (scscm-kind? step ":list")
-          (scscm-append-from (scscm-l2 (ast-list-get step 0) acc) step 1)
-          (scscm-l3 (scscm-sym ".") acc step))))))
-
-;; (->> x step...): a symbol step is a call (step acc); a list step
-;; (f a...) becomes (f a... acc).
-(defn scscm-thread-last [node : int i : int acc : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len node))
-    acc
-    (let [step (ast-list-get node i)]
-      (scscm-thread-last node (+ i 1)
-        (if (scscm-kind? step ":list")
-          (scscm-add (scscm-append-from (scscm-ast-list-node 5) step 0) acc)
-          (scscm-l2 step acc))))))
-
-;; (when c body...) -> (if c (do body...) nil)
-(defn scscm-mac-when [node : int] #fx{Unsafe} : int
-  (scscm-l4 (scscm-sym "if") (scscm-arg node 1) (scscm-do-from node 2) (scscm-nil)))
-
-;; (unless c body...) -> (if (. c not) (do body...) nil)
-(defn scscm-mac-unless [node : int] #fx{Unsafe} : int
-  (scscm-l4 (scscm-sym "if") (scscm-send (scscm-arg node 1) "not")
-            (scscm-do-from node 2) (scscm-nil)))
-
-;; (cond (t1 e1) ... (else e)) or (cond t1 e1 ... :else e) -> nested ifs.
-(defn scscm-else-test? [t : int] #fx{Unsafe} : bool
-  (or (and (scscm-kind? t ":symbol") (scscm-cstr-eq? (ast-symbol-name t) "else"))
-      (or (and (scscm-kind? t ":keyword") (scscm-cstr-eq? (scscm-ast-value t) ":else"))
-          (and (scscm-kind? t ":atom") (scscm-cstr-eq? (scscm-ast-value t) "true")))))
-
-(defn scscm-cond-clauses? [node : int i : int] #fx{Unsafe} : bool
-  (if (>= i (ast-list-len node))
-    true
-    (let [c (ast-list-get node i)]
-      (if (and (scscm-kind? c ":list") (= (ast-list-len c) 2))
-        (scscm-cond-clauses? node (+ i 1))
-        false))))
-
-(defn scscm-cond-ifs [tests : int bodies : int] #fx{Unsafe} : int
-  (if (list-nil? tests)
-    (scscm-nil)
-    (if (scscm-else-test? (head tests))
-      (head bodies)
-      (scscm-l4 (scscm-sym "if") (head tests) (head bodies)
-                (scscm-cond-ifs (tail tests) (tail bodies))))))
-
-(defn scscm-cond-split [node : int i : int clauses : bool tests : int bodies : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len node))
-    (scscm-cond-ifs (scscm-list-rev tests (nil-value)) (scscm-list-rev bodies (nil-value)))
-    (if clauses
+  (defn scscm-macro-get [] #fx{Unsafe} : int (scscm-macro-env-op 0 0))
+  (defn scscm-macro-set [env : int]
+    #fx{Unsafe}
+    : int
+    (scscm-macro-env-op 1 env))
+  ;;; scscm-macros-reset -- forget every defmacro. The table holds AST nodes,
+  ;;; so it must not outlive the tree they came from; compile-text resets it
+  ;;; around each compilation (macros are per program, as in lhc.js).
+  (defn scscm-macros-reset [] #fx{Unsafe} : int (scscm-macro-set (nil-value)))
+  ;; Entries are (name-node . (params . body)), newest first.
+  (defn scscm-macro-define [name : int params : int body : int]
+    #fx{Unsafe}
+    : int
+    (scscm-macro-set (cons (cons name (cons params body)) (scscm-macro-get))))
+  (defn scscm-macro-lookup-loop [name : cstr env : int]
+    #fx{Unsafe}
+    : int
+    (if (list-nil? env)
+      (nil-value)
+      (let [entry (head env)]
+        (if (scscm-cstr-eq? name (ast-symbol-name (head entry)))
+          (tail entry)
+          (scscm-macro-lookup-loop name (tail env))))))
+  ;; (params . body) for a macro name, or nil-value.
+  (defn scscm-macro-lookup [name : cstr]
+    #fx{Unsafe}
+    : int
+    (scscm-macro-lookup-loop name (scscm-macro-get)))
+  ;; ---- AST construction ----
+  (defn scscm-kind? [node : int kind : cstr]
+    #fx{Unsafe}
+    : bool
+    (scscm-cstr-eq? (ast-kind node) kind))
+  (defn scscm-sym [name : cstr] #fx{Unsafe} : int (scscm-ast-leaf 1 name))
+  (defn scscm-kw [name : cstr] #fx{Unsafe} : int (scscm-ast-leaf 2 name))
+  (defn scscm-num [text : cstr] #fx{Unsafe} : int (scscm-ast-leaf 3 text))
+  (defn scscm-str [text : cstr] #fx{Unsafe} : int (scscm-ast-leaf 4 text))
+  (defn scscm-nil [] #fx{Unsafe} : int (scscm-ast-leaf 0 "nil"))
+  ;; Append child to node; returns node so calls chain.
+  (defn scscm-add [node : int child : int]
+    #fx{Unsafe}
+    : int
+    (do (scscm-ast-add-child node child) node))
+  (defn scscm-l1 [a : int]
+    #fx{Unsafe}
+    : int
+    (scscm-add (scscm-ast-list-node 5) a))
+  (defn scscm-l2 [a : int b : int] #fx{Unsafe} : int (scscm-add (scscm-l1 a) b))
+  (defn scscm-l3 [a : int b : int c : int]
+    #fx{Unsafe}
+    : int
+    (scscm-add (scscm-l2 a b) c))
+  (defn scscm-l4 [a : int b : int c : int d : int]
+    #fx{Unsafe}
+    : int
+    (scscm-add (scscm-l3 a b c) d))
+  (defn scscm-l5 [a : int b : int c : int d : int e : int]
+    #fx{Unsafe}
+    : int
+    (scscm-add (scscm-l4 a b c d) e))
+  ;; Append src's children from start to dst; returns dst.
+  (defn scscm-append-from [dst : int src : int start : int]
+    #fx{Unsafe}
+    : int
+    (if (>= start (ast-list-len src))
+      dst
+      (scscm-append-from (scscm-add dst (ast-list-get src start))
+        src
+        (+ start 1))))
+  ;; (sym-name <node's children from start>)
+  (defn scscm-call-from [name : cstr node : int start : int]
+    #fx{Unsafe}
+    : int
+    (scscm-append-from (scscm-l1 (scscm-sym name)) node start))
+  ;; (fn params <node's children from start>)
+  (defn scscm-fn-from [params : int node : int start : int]
+    #fx{Unsafe}
+    : int
+    (scscm-append-from (scscm-l2 (scscm-sym "fn") params) node start))
+  ;; (do <node's children from start>)
+  (defn scscm-do-from [node : int start : int]
+    #fx{Unsafe}
+    : int
+    (scscm-call-from "do" node start))
+  ;; (. recv msg)
+  (defn scscm-send [recv : int msg : cstr]
+    #fx{Unsafe}
+    : int
+    (scscm-l3 (scscm-sym ".") recv (scscm-sym msg)))
+  ;; (.dot Cls msg)
+  (defn scscm-class-send [cls : cstr msg : cstr]
+    #fx{Unsafe}
+    : int
+    (scscm-l3 (scscm-sym ".dot") (scscm-sym cls) (scscm-sym msg)))
+  ;; (.dot TempoClock default)
+  (defn scscm-default-clock []
+    #fx{Unsafe}
+    : int
+    (scscm-class-send "TempoClock" "default"))
+  ;; (dict :doneAction 2)
+  (defn scscm-done-action-2 []
+    #fx{Unsafe}
+    : int
+    (scscm-l3 (scscm-sym "dict") (scscm-kw ":doneAction") (scscm-num "2")))
+  ;; The i-th child, or nil when absent.
+  (defn scscm-arg [node : int i : int]
+    #fx{Unsafe}
+    : int
+    (if (< i (ast-list-len node)) (ast-list-get node i) (scscm-nil)))
+  ;; The first and second element of a binding list (x coll) / [x coll].
+  (defn scscm-bind-0 [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-arg (scscm-arg node 1) 0))
+  (defn scscm-bind-1 [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-arg (scscm-arg node 1) 1))
+  ;; A one-parameter list (x).
+  (defn scscm-params1 [p : int]
+    #fx{Unsafe}
+    : int
+    (scscm-add (scscm-ast-list-node 5) p))
+  ;; A symbol's text as a string node (defsynth names).
+  (defn scscm-sym-string [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-str (ast-symbol-name node)))
+  ;; ---- built-in macros: rewrites to unexpanded forms ----
+  ;; (-> x step...): a symbol step is a message, (. acc step); a list step
+  ;; (f a...) becomes (f acc a...).
+  (defn scscm-thread-first [node : int i : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len node))
+      acc
+      (let [step (ast-list-get node i)]
+        (scscm-thread-first node
+          (+ i 1)
+          (if (scscm-kind? step ":list")
+            (scscm-append-from (scscm-l2 (ast-list-get step 0) acc) step 1)
+            (scscm-l3 (scscm-sym ".") acc step))))))
+  ;; (->> x step...): a symbol step is a call (step acc); a list step
+  ;; (f a...) becomes (f a... acc).
+  (defn scscm-thread-last [node : int i : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len node))
+      acc
+      (let [step (ast-list-get node i)]
+        (scscm-thread-last node
+          (+ i 1)
+          (if (scscm-kind? step ":list")
+            (scscm-add (scscm-append-from (scscm-ast-list-node 5) step 0) acc)
+            (scscm-l2 step acc))))))
+  ;; (when c body...) -> (if c (do body...) nil)
+  (defn scscm-mac-when [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-l4 (scscm-sym "if")
+      (scscm-arg node 1)
+      (scscm-do-from node 2)
+      (scscm-nil)))
+  ;; (unless c body...) -> (if (. c not) (do body...) nil)
+  (defn scscm-mac-unless [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-l4 (scscm-sym "if")
+      (scscm-send (scscm-arg node 1) "not")
+      (scscm-do-from node 2)
+      (scscm-nil)))
+  ;; (cond (t1 e1) ... (else e)) or (cond t1 e1 ... :else e) -> nested ifs.
+  (defn scscm-else-test? [t : int]
+    #fx{Unsafe}
+    : bool
+    (or (and (scscm-kind? t ":symbol")
+          (scscm-cstr-eq? (ast-symbol-name t) "else"))
+      (or (and (scscm-kind? t ":keyword")
+            (scscm-cstr-eq? (scscm-ast-value t) ":else"))
+        (and (scscm-kind? t ":atom")
+          (scscm-cstr-eq? (scscm-ast-value t) "true")))))
+  (defn scscm-cond-clauses? [node : int i : int]
+    #fx{Unsafe}
+    : bool
+    (if (>= i (ast-list-len node))
+      true
       (let [c (ast-list-get node i)]
-        (scscm-cond-split node (+ i 1) clauses
-          (cons (ast-list-get c 0) tests) (cons (ast-list-get c 1) bodies)))
-      (if (>= (+ i 1) (ast-list-len node))
-        ;; A trailing lone form is the default.
-        (scscm-cond-split node (+ i 1) clauses
-          (cons (scscm-sym "else") tests) (cons (ast-list-get node i) bodies))
-        (scscm-cond-split node (+ i 2) clauses
-          (cons (ast-list-get node i) tests) (cons (ast-list-get node (+ i 1)) bodies))))))
-
-(defn scscm-mac-cond [node : int] #fx{Unsafe} : int
-  (scscm-cond-split node 1 (scscm-cond-clauses? node 1) (nil-value) (nil-value)))
-
-;; (doseq (x coll) body...) -> (. coll do (fn (x) body...))
-;; dotimes / collect / icollect have the same shape with another selector.
-(defn scscm-mac-iterate [node : int selector : cstr] #fx{Unsafe} : int
-  (scscm-l4 (scscm-sym ".") (scscm-bind-1 node) (scscm-sym selector)
-            (scscm-fn-from (scscm-params1 (scscm-bind-0 node)) node 2)))
-
-;; (accumulate (acc init x coll) body...) -> (. coll inject init (fn (acc x) body...))
-(defn scscm-mac-accumulate [node : int] #fx{Unsafe} : int
-  (let [b (scscm-arg node 1)]
-    (scscm-l5 (scscm-sym ".") (scscm-arg b 3) (scscm-sym "inject") (scscm-arg b 1)
-              (scscm-fn-from (scscm-l2 (scscm-arg b 0) (scscm-arg b 2)) node 2))))
-
-;; (comp) -> identity; (comp f) -> f; (comp f g...) -> (fn (x) (f ((comp g...) x)))
-(defn scscm-comp-from [node : int i : int] #fx{Unsafe} : int
-  (let [n (- (ast-list-len node) i)]
-    (cond
-      (<= n 0) (scscm-l3 (scscm-sym "fn") (scscm-params1 (scscm-sym "scscm_x")) (scscm-sym "scscm_x"))
-      (= n 1)  (ast-list-get node i)
-      :else    (scscm-l3 (scscm-sym "fn") (scscm-params1 (scscm-sym "scscm_x"))
-                 (scscm-l2 (ast-list-get node i)
-                   (scscm-l2 (scscm-comp-from node (+ i 1)) (scscm-sym "scscm_x")))))))
-
-;; (partial f a...) -> (fn (. extra) (. f valueArray (++ (list a...) extra)))
-(defn scscm-mac-partial [node : int] #fx{Unsafe} : int
-  (scscm-l3 (scscm-sym "fn")
-            (scscm-l2 (scscm-sym ".") (scscm-sym "scscm_extra"))
-            (scscm-l4 (scscm-sym ".") (scscm-arg node 1) (scscm-sym "valueArray")
-                      (scscm-l3 (scscm-sym "++") (scscm-call-from "list" node 2)
-                                (scscm-sym "scscm_extra")))))
-
-;; (defsynth name params body...) -> (. (SynthDef "name" (fn params body...)) add)
-;; The reference macro omits .add, which its own documentation shows.
-(defn scscm-mac-defsynth [node : int] #fx{Unsafe} : int
-  (scscm-send (scscm-l3 (scscm-sym "SynthDef") (scscm-sym-string (scscm-arg node 1))
-                        (scscm-fn-from (scscm-arg node 2) node 3))
-              "add"))
-
-;; (definst name params body...) -> a stereo SynthDef, added, and a
-;; (var name (fn (. args) (Synth "name" args))) factory.
-(defn scscm-mac-definst [node : int] #fx{Unsafe} : int
-  (let [nm  (scscm-sym-string (scscm-arg node 1))
-        out (scscm-l3 (scscm-sym "Out.ar") (scscm-num "0")
-                      (scscm-l4 (scscm-sym ".") (scscm-do-from node 3)
-                                (scscm-sym "dup") (scscm-num "2")))]
-    (scscm-l3 (scscm-sym "do")
-              (scscm-send (scscm-l3 (scscm-sym "SynthDef") nm
-                                    (scscm-l3 (scscm-sym "fn") (scscm-arg node 2) out))
-                          "add")
-              (scscm-l3 (scscm-sym "var") (scscm-arg node 1)
-                        (scscm-l3 (scscm-sym "fn")
-                                  (scscm-l2 (scscm-sym ".") (scscm-sym "scscm_args"))
-                                  (scscm-l3 (scscm-sym "Synth") (scscm-sym-string (scscm-arg node 1))
-                                            (scscm-sym "scscm_args")))))))
-
-;; (routine body...) -> (. (Routine (fn () body...)) play)
-(defn scscm-mac-routine [node : int] #fx{Unsafe} : int
-  (scscm-send (scscm-l2 (scscm-sym "Routine") (scscm-fn-from (scscm-ast-list-node 5) node 1))
-              "play"))
-
-;; (pseq items repeats) -> (.dot Pseq new items repeats), and the like.
-(defn scscm-mac-pattern [cls : cstr node : int] #fx{Unsafe} : int
-  (scscm-append-from (scscm-class-send cls "new") node 1))
-
-;; (pbind :k v ...) -> (Pbind :k v ...). The reference's Pbind.new([...])
-;; fails at runtime ("Pbind should have even number of args").
-(defn scscm-mac-pbind [node : int] #fx{Unsafe} : int
-  (scscm-call-from "Pbind" node 1))
-
-;; (ctl node :k v ...) -> (. node set :k v ...)
-(defn scscm-mac-ctl [node : int] #fx{Unsafe} : int
-  (scscm-append-from (scscm-send (scscm-arg node 1) "set") node 2))
-
-;; (at t body...) -> (. (.dot TempoClock default) schedAbs t (fn () body...))
-;; (in d body...) is the same with sched.
-(defn scscm-mac-sched [node : int selector : cstr] #fx{Unsafe} : int
-  (scscm-l5 (scscm-sym ".") (scscm-default-clock) (scscm-sym selector) (scscm-arg node 1)
-            (scscm-fn-from (scscm-ast-list-node 5) node 2)))
-
-;; (demo dur body...) -> play body for dur seconds through a line envelope.
-(defn scscm-mac-demo [node : int] #fx{Unsafe} : int
-  (let [env (scscm-l3 (scscm-sym "EnvGen.kr")
-                      (scscm-l5 (scscm-sym ".dot") (scscm-sym "Env") (scscm-sym "new")
-                                (scscm-l3 (scscm-sym "list") (scscm-num "1") (scscm-num "0"))
-                                (scscm-l2 (scscm-sym "list") (scscm-arg node 1)))
-                      (scscm-done-action-2))
-        sig (scscm-l3 (scscm-sym "var") (scscm-sym "scscm_sig") (scscm-do-from node 2))
-        evr (scscm-l3 (scscm-sym "var") (scscm-sym "scscm_env") env)
-        out (scscm-l3 (scscm-sym "Out.ar") (scscm-num "0")
-                      (scscm-l3 (scscm-sym "*")
-                                (scscm-l3 (scscm-sym "*") (scscm-sym "scscm_sig") (scscm-sym "scscm_env"))
-                                (scscm-l3 (scscm-sym "list") (scscm-num "1") (scscm-num "1"))))]
-    (scscm-send (scscm-l5 (scscm-sym "fn") (scscm-ast-list-node 5) sig evr out) "play")))
-
-;; (adsr gate a d s r) -> (EnvGen.kr (.dot Env adsr a d s r) gate (dict :doneAction 2))
-(defn scscm-mac-adsr [node : int] #fx{Unsafe} : int
-  (scscm-l4 (scscm-sym "EnvGen.kr")
-            (scscm-append-from (scscm-class-send "Env" "adsr") node 2)
-            (scscm-arg node 1)
-            (scscm-done-action-2)))
-
-;; (perc a r) -> (EnvGen.kr (.dot Env perc a r) (dict :doneAction 2))
-(defn scscm-mac-perc [node : int] #fx{Unsafe} : int
-  (scscm-l3 (scscm-sym "EnvGen.kr")
-            (scscm-append-from (scscm-class-send "Env" "perc") node 1)
-            (scscm-done-action-2)))
-
-;; (env-line a s r) -> (EnvGen.kr (.dot Env new (list 0 1 1 0) (list a s r)) (dict :doneAction 2))
-(defn scscm-mac-env-line [node : int] #fx{Unsafe} : int
-  (scscm-l3 (scscm-sym "EnvGen.kr")
-            (scscm-l5 (scscm-sym ".dot") (scscm-sym "Env") (scscm-sym "new")
-                      (scscm-l5 (scscm-sym "list") (scscm-num "0") (scscm-num "1")
-                                (scscm-num "1") (scscm-num "0"))
-                      (scscm-call-from "list" node 1))
-            (scscm-done-action-2)))
-
-;; (degrees->pitches degrees scale root) -> (+ (. (.dot Scale scale) degreeToKey degrees) root)
-(defn scscm-mac-degrees [node : int] #fx{Unsafe} : int
-  (scscm-l3 (scscm-sym "+")
-            (scscm-l4 (scscm-sym ".")
-                      (scscm-l3 (scscm-sym ".dot") (scscm-sym "Scale") (scscm-arg node 2))
-                      (scscm-sym "degreeToKey") (scscm-arg node 1))
-            (scscm-arg node 3)))
-
-;; ---- #(...) shorthand ----
-;; #(+ % 1) -> (fn (scscm_p1) (+ scscm_p1 1)); %N is the Nth argument, %& the rest.
-
-(defn scscm-pct-index [name : cstr] #fx{Unsafe} : int
-  ```c
-  const char *s = (const char*)(intptr_t)name;
+        (if (and (scscm-kind? c ":list") (= (ast-list-len c) 2))
+          (scscm-cond-clauses? node (+ i 1))
+          false))))
+  (defn scscm-cond-ifs [tests : int bodies : int]
+    #fx{Unsafe}
+    : int
+    (if (list-nil? tests)
+      (scscm-nil)
+      (if (scscm-else-test? (head tests))
+        (head bodies)
+        (scscm-l4 (scscm-sym "if")
+          (head tests)
+          (head bodies)
+          (scscm-cond-ifs (tail tests) (tail bodies))))))
+  (defn scscm-cond-split [node : int
+                          i : int
+                          clauses : bool
+                          tests : int
+                          bodies : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len node))
+      (scscm-cond-ifs (scscm-list-rev tests (nil-value))
+        (scscm-list-rev bodies (nil-value)))
+      (if clauses
+        (let [c (ast-list-get node i)]
+          (scscm-cond-split node
+            (+ i 1)
+            clauses
+            (cons (ast-list-get c 0) tests)
+            (cons (ast-list-get c 1) bodies)))
+        (if (>= (+ i 1) (ast-list-len node))
+          ;; A trailing lone form is the default.
+          (scscm-cond-split node
+            (+ i 1)
+            clauses
+            (cons (scscm-sym "else") tests)
+            (cons (ast-list-get node i) bodies))
+          (scscm-cond-split node
+            (+ i 2)
+            clauses
+            (cons (ast-list-get node i) tests)
+            (cons (ast-list-get node (+ i 1)) bodies))))))
+  (defn scscm-mac-cond [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-cond-split node
+      1
+      (scscm-cond-clauses? node 1)
+      (nil-value)
+      (nil-value)))
+  ;; (doseq (x coll) body...) -> (. coll do (fn (x) body...))
+  ;; dotimes / collect / icollect have the same shape with another selector.
+  (defn scscm-mac-iterate [node : int selector : cstr]
+    #fx{Unsafe}
+    : int
+    (scscm-l4 (scscm-sym ".")
+      (scscm-bind-1 node)
+      (scscm-sym selector)
+      (scscm-fn-from (scscm-params1 (scscm-bind-0 node)) node 2)))
+  ;; (accumulate (acc init x coll) body...) -> (. coll inject init (fn (acc x) body...))
+  (defn scscm-mac-accumulate [node : int]
+    #fx{Unsafe}
+    : int
+    (let [b (scscm-arg node 1)]
+      (scscm-l5 (scscm-sym ".")
+        (scscm-arg b 3)
+        (scscm-sym "inject")
+        (scscm-arg b 1)
+        (scscm-fn-from (scscm-l2 (scscm-arg b 0) (scscm-arg b 2)) node 2))))
+  ;; (comp) -> identity; (comp f) -> f; (comp f g...) -> (fn (x) (f ((comp g...) x)))
+  (defn scscm-comp-from [node : int i : int]
+    #fx{Unsafe}
+    : int
+    (let [n (- (ast-list-len node) i)]
+      (cond (<= n 0) (scscm-l3 (scscm-sym "fn")
+                       (scscm-params1 (scscm-sym "scscm_x"))
+                       (scscm-sym "scscm_x"))
+            (= n 1)  (ast-list-get node i)
+            :else    (scscm-l3 (scscm-sym "fn")
+                       (scscm-params1 (scscm-sym "scscm_x"))
+                       (scscm-l2 (ast-list-get node i)
+                         (scscm-l2 (scscm-comp-from node (+ i 1))
+                           (scscm-sym "scscm_x")))))))
+  ;; (partial f a...) -> (fn (. extra) (. f valueArray (++ (list a...) extra)))
+  (defn scscm-mac-partial [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-l3 (scscm-sym "fn")
+      (scscm-l2 (scscm-sym ".") (scscm-sym "scscm_extra"))
+      (scscm-l4 (scscm-sym ".")
+        (scscm-arg node 1)
+        (scscm-sym "valueArray")
+        (scscm-l3 (scscm-sym "++")
+          (scscm-call-from "list" node 2)
+          (scscm-sym "scscm_extra")))))
+  ;; (defsynth name params body...) -> (. (SynthDef "name" (fn params body...)) add)
+  ;; The reference macro omits .add, which its own documentation shows.
+  (defn scscm-mac-defsynth [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-send (scscm-l3 (scscm-sym "SynthDef")
+                  (scscm-sym-string (scscm-arg node 1))
+                  (scscm-fn-from (scscm-arg node 2) node 3))
+      "add"))
+  ;; (definst name params body...) -> a stereo SynthDef, added, and a
+  ;; (var name (fn (. args) (Synth "name" args))) factory.
+  (defn scscm-mac-definst [node : int]
+    #fx{Unsafe}
+    : int
+    (let [nm  (scscm-sym-string (scscm-arg node 1))
+          out (scscm-l3 (scscm-sym "Out.ar")
+                (scscm-num "0")
+                (scscm-l4 (scscm-sym ".")
+                  (scscm-do-from node 3)
+                  (scscm-sym "dup")
+                  (scscm-num "2")))]
+      (scscm-l3 (scscm-sym "do")
+        (scscm-send (scscm-l3 (scscm-sym "SynthDef")
+                      nm
+                      (scscm-l3 (scscm-sym "fn") (scscm-arg node 2) out))
+          "add")
+        (scscm-l3 (scscm-sym "var")
+          (scscm-arg node 1)
+          (scscm-l3 (scscm-sym "fn")
+            (scscm-l2 (scscm-sym ".") (scscm-sym "scscm_args"))
+            (scscm-l3 (scscm-sym "Synth")
+              (scscm-sym-string (scscm-arg node 1))
+              (scscm-sym "scscm_args")))))))
+  ;; (routine body...) -> (. (Routine (fn () body...)) play)
+  (defn scscm-mac-routine [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-send (scscm-l2 (scscm-sym "Routine")
+                  (scscm-fn-from (scscm-ast-list-node 5) node 1))
+      "play"))
+  ;; (pseq items repeats) -> (.dot Pseq new items repeats), and the like.
+  (defn scscm-mac-pattern [cls : cstr node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-append-from (scscm-class-send cls "new") node 1))
+  ;; (pbind :k v ...) -> (Pbind :k v ...). The reference's Pbind.new([...])
+  ;; fails at runtime ("Pbind should have even number of args").
+  (defn scscm-mac-pbind [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-call-from "Pbind" node 1))
+  ;; (ctl node :k v ...) -> (. node set :k v ...)
+  (defn scscm-mac-ctl [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-append-from (scscm-send (scscm-arg node 1) "set") node 2))
+  ;; (at t body...) -> (. (.dot TempoClock default) schedAbs t (fn () body...))
+  ;; (in d body...) is the same with sched.
+  (defn scscm-mac-sched [node : int selector : cstr]
+    #fx{Unsafe}
+    : int
+    (scscm-l5 (scscm-sym ".")
+      (scscm-default-clock)
+      (scscm-sym selector)
+      (scscm-arg node 1)
+      (scscm-fn-from (scscm-ast-list-node 5) node 2)))
+  ;; (demo dur body...) -> play body for dur seconds through a line envelope.
+  (defn scscm-mac-demo [node : int]
+    #fx{Unsafe}
+    : int
+    (let [env (scscm-l3 (scscm-sym "EnvGen.kr")
+                (scscm-l5 (scscm-sym ".dot")
+                  (scscm-sym "Env")
+                  (scscm-sym "new")
+                  (scscm-l3 (scscm-sym "list") (scscm-num "1") (scscm-num "0"))
+                  (scscm-l2 (scscm-sym "list") (scscm-arg node 1)))
+                (scscm-done-action-2))
+          sig (scscm-l3 (scscm-sym "var")
+                (scscm-sym "scscm_sig")
+                (scscm-do-from node 2))
+          evr (scscm-l3 (scscm-sym "var") (scscm-sym "scscm_env") env)
+          out (scscm-l3 (scscm-sym "Out.ar")
+                (scscm-num "0")
+                (scscm-l3 (scscm-sym "*")
+                  (scscm-l3 (scscm-sym "*")
+                    (scscm-sym "scscm_sig")
+                    (scscm-sym "scscm_env"))
+                  (scscm-l3 (scscm-sym "list") (scscm-num "1") (scscm-num "1"))))]
+      (scscm-send (scscm-l5 (scscm-sym "fn")
+                    (scscm-ast-list-node 5)
+                    sig
+                    evr
+                    out)
+        "play")))
+  ;; (adsr gate a d s r) -> (EnvGen.kr (.dot Env adsr a d s r) gate (dict :doneAction 2))
+  (defn scscm-mac-adsr [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-l4 (scscm-sym "EnvGen.kr")
+      (scscm-append-from (scscm-class-send "Env" "adsr") node 2)
+      (scscm-arg node 1)
+      (scscm-done-action-2)))
+  ;; (perc a r) -> (EnvGen.kr (.dot Env perc a r) (dict :doneAction 2))
+  (defn scscm-mac-perc [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-l3 (scscm-sym "EnvGen.kr")
+      (scscm-append-from (scscm-class-send "Env" "perc") node 1)
+      (scscm-done-action-2)))
+  ;; (env-line a s r) -> (EnvGen.kr (.dot Env new (list 0 1 1 0) (list a s r)) (dict :doneAction 2))
+  (defn scscm-mac-env-line [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-l3 (scscm-sym "EnvGen.kr")
+      (scscm-l5 (scscm-sym ".dot")
+        (scscm-sym "Env")
+        (scscm-sym "new")
+        (scscm-l5 (scscm-sym "list")
+          (scscm-num "0")
+          (scscm-num "1")
+          (scscm-num "1")
+          (scscm-num "0"))
+        (scscm-call-from "list" node 1))
+      (scscm-done-action-2)))
+  ;; (degrees->pitches degrees scale root) -> (+ (. (.dot Scale scale) degreeToKey degrees) root)
+  (defn scscm-mac-degrees [node : int]
+    #fx{Unsafe}
+    : int
+    (scscm-l3 (scscm-sym "+")
+      (scscm-l4 (scscm-sym ".")
+        (scscm-l3 (scscm-sym ".dot") (scscm-sym "Scale") (scscm-arg node 2))
+        (scscm-sym "degreeToKey")
+        (scscm-arg node 1))
+      (scscm-arg node 3)))
+  ;; ---- #(...) shorthand ----
+  ;; #(+ % 1) -> (fn (scscm_p1) (+ scscm_p1 1)); %N is the Nth argument, %& the rest.
+  (defn scscm-pct-index [name : cstr]
+    #fx{Unsafe}
+    : int
+    ```c
+    const char *s = (const char*)(intptr_t)name;
   if (!s || s[0] != '%') return 0;
   if (s[1] == '\0') return 1;
   if (s[1] == '&' && s[2] == '\0') return -1;
@@ -348,73 +480,91 @@
   }
   return n;
   ```)
-
-;; Highest %N referenced in node (or -1 bit for %&): returns max index, and
-;; records %& via a flag in the C static.
-(defn scscm-pct-op [op : int v : int] #fx{Unsafe} : int
-  ```c
-  static int64_t max = 0, rest = 0;
+  ;; Highest %N referenced in node (or -1 bit for %&): returns max index, and
+  ;; records %& via a flag in the C static.
+  (defn scscm-pct-op [op : int v : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    static int64_t max = 0, rest = 0;
   if (op == 0) { max = 0; rest = 0; return 0; }
   if (op == 1) { if (v < 0) rest = 1; else if (v > max) max = v; return 0; }
   if (op == 2) return max;
   return rest;
   ```)
-
-(defn scscm-pct-scan [node : int] #fx{Unsafe} : int
-  (if (scscm-kind? node ":symbol")
-    (scscm-pct-op 1 (scscm-pct-index (ast-symbol-name node)))
-    (scscm-pct-scan-children node 0)))
-
-(defn scscm-pct-scan-children [node : int i : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len node))
-    0
-    (do (scscm-pct-scan (ast-list-get node i))
+  (defn scscm-pct-scan [node : int]
+    #fx{Unsafe}
+    : int
+    (if (scscm-kind? node ":symbol")
+      (scscm-pct-op 1 (scscm-pct-index (ast-symbol-name node)))
+      (scscm-pct-scan-children node 0)))
+  (defn scscm-pct-scan-children [node : int i : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len node))
+      0
+      (do
+        (scscm-pct-scan (ast-list-get node i))
         (scscm-pct-scan-children node (+ i 1)))))
-
-(defn scscm-pct-name [i : int] #fx{Unsafe} : cstr
-  ```c
-  if (i < 0) return "scscm_rest";
+  (defn scscm-pct-name [i : int]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    if (i < 0) return "scscm_rest";
   char *b = malloc(24);
   snprintf(b, 24, "scscm_p%d", (int)i);
   return b;
   ```)
-
-;; Copy node with %-symbols renamed.
-(defn scscm-pct-subst [node : int] #fx{Unsafe} : int
-  (if (scscm-kind? node ":symbol")
-    (let [i (scscm-pct-index (ast-symbol-name node))]
-      (if (= i 0) node (scscm-sym (scscm-pct-name i))))
-    (if (= (ast-list-len node) 0)
-      node
-      (scscm-pct-subst-fill (scscm-ast-list-node (scscm-kind-int (ast-kind node))) node 0))))
-
-(defn scscm-pct-subst-fill [dst : int src : int i : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len src))
-    dst
-    (scscm-pct-subst-fill (scscm-add dst (scscm-pct-subst (ast-list-get src i))) src (+ i 1))))
-
-(defn scscm-pct-params [i : int n : int acc : int] #fx{Unsafe} : int
-  (if (> i n)
-    acc
-    (scscm-pct-params (+ i 1) n (scscm-add acc (scscm-sym (scscm-pct-name i))))))
-
-(defn scscm-mac-hash-fn [node : int] #fx{Unsafe} : int
-  (let [_     (scscm-pct-op 0 0)
-        _2    (scscm-pct-scan-children node 0)
-        n     (scscm-pct-op 2 0)
-        rest  (scscm-pct-op 3 0)
-        ps    (scscm-pct-params 1 n (scscm-ast-list-node 5))
-        body  (scscm-pct-subst-fill (scscm-ast-list-node 5) node 0)]
-    (if (= rest 1)
-      (do (scscm-add ps (scscm-sym "."))
+  ;; Copy node with %-symbols renamed.
+  (defn scscm-pct-subst [node : int]
+    #fx{Unsafe}
+    : int
+    (if (scscm-kind? node ":symbol")
+      (let [i (scscm-pct-index (ast-symbol-name node))]
+        (if (= i 0) node (scscm-sym (scscm-pct-name i))))
+      (if (= (ast-list-len node) 0)
+        node
+        (scscm-pct-subst-fill (scscm-ast-list-node (scscm-kind-int (ast-kind node)))
+          node
+          0))))
+  (defn scscm-pct-subst-fill [dst : int src : int i : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len src))
+      dst
+      (scscm-pct-subst-fill (scscm-add dst
+                              (scscm-pct-subst (ast-list-get src i)))
+        src
+        (+ i 1))))
+  (defn scscm-pct-params [i : int n : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (> i n)
+      acc
+      (scscm-pct-params (+ i 1)
+        n
+        (scscm-add acc (scscm-sym (scscm-pct-name i))))))
+  (defn scscm-mac-hash-fn [node : int]
+    #fx{Unsafe}
+    : int
+    (let [_    (scscm-pct-op 0 0)
+          _2   (scscm-pct-scan-children node 0)
+          n    (scscm-pct-op 2 0)
+          rest (scscm-pct-op 3 0)
+          ps   (scscm-pct-params 1 n (scscm-ast-list-node 5))
+          body (scscm-pct-subst-fill (scscm-ast-list-node 5) node 0)]
+      (if (= rest 1)
+        (do
+          (scscm-add ps (scscm-sym "."))
           (scscm-add ps (scscm-sym "scscm_rest"))
           (scscm-l3 (scscm-sym "fn") ps body))
-      (scscm-l3 (scscm-sym "fn") ps body))))
-
-;; Convert a kind string to its integer code.
-(defn scscm-kind-int [knd : cstr] #fx{Unsafe} : int
-  ```c
-  static const char *names[] = {
+        (scscm-l3 (scscm-sym "fn") ps body))))
+  ;; Convert a kind string to its integer code.
+  (defn scscm-kind-int [knd : cstr]
+    #fx{Unsafe}
+    : int
+    ```c
+    static const char *names[] = {
     ":atom",":symbol",":keyword",":number",":string",
     ":list",":vector",":quote",":quasiquote",":unquote",":unquote-splice",":hash-paren"
   };
@@ -423,259 +573,324 @@
     if (strcmp(k, names[i]) == 0) return i;
   return 5; /* default to :list */
   ```)
-
-;; ---- user macros ----
-
-;; Bind params (a b . rest) to args (a cons list): returns an env cons list
-;; of (name-cstr-node . value-node) pairs, newest first.
-(defn scscm-bind-params [params : int i : int args : int env : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len params))
-    env
-    (let [p (ast-list-get params i)]
-      (if (and (scscm-kind? p ":symbol") (scscm-cstr-eq? (ast-symbol-name p) "."))
-        (if (< (+ i 1) (ast-list-len params))
-          (cons (cons (ast-list-get params (+ i 1)) (scscm-cons-to-list args)) env)
-          env)
-        (scscm-bind-params params (+ i 1)
-          (if (list-nil? args) args (tail args))
-          (cons (cons p (if (list-nil? args) (scscm-nil) (head args))) env))))))
-
-(defn scscm-cons-to-list [args : int] #fx{Unsafe} : int
-  (scscm-cons-to-list-fill (scscm-ast-list-node 5) args))
-
-(defn scscm-cons-to-list-fill [dst : int args : int] #fx{Unsafe} : int
-  (if (list-nil? args)
-    dst
-    (scscm-cons-to-list-fill (scscm-add dst (head args)) (tail args))))
-
-(defn scscm-env-lookup [env : int name : cstr] #fx{Unsafe} : int
-  (if (list-nil? env)
-    0
-    (if (scscm-cstr-eq? (ast-symbol-name (head (head env))) name)
-      (tail (head env))
-      (scscm-env-lookup (tail env) name))))
-
-;; Replace parameter symbols in node by their argument forms.
-(defn scscm-subst [node : int env : int] #fx{Unsafe} : int
-  (if (scscm-kind? node ":symbol")
-    (let [found (scscm-env-lookup env (ast-symbol-name node))]
-      (if (= found 0) node found))
-    (if (or (scscm-kind? node ":list")
+  ;; ---- user macros ----
+  ;; Bind params (a b . rest) to args (a cons list): returns an env cons list
+  ;; of (name-cstr-node . value-node) pairs, newest first.
+  (defn scscm-bind-params [params : int i : int args : int env : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len params))
+      env
+      (let [p (ast-list-get params i)]
+        (if (and (scscm-kind? p ":symbol")
+              (scscm-cstr-eq? (ast-symbol-name p) "."))
+          (if (< (+ i 1) (ast-list-len params))
+            (cons (cons (ast-list-get params (+ i 1)) (scscm-cons-to-list args))
+              env)
+            env)
+          (scscm-bind-params params
+            (+ i 1)
+            (if (list-nil? args) args (tail args))
+            (cons (cons p (if (list-nil? args) (scscm-nil) (head args))) env))))))
+  (defn scscm-cons-to-list [args : int]
+    #fx{Unsafe}
+    : int
+    (scscm-cons-to-list-fill (scscm-ast-list-node 5) args))
+  (defn scscm-cons-to-list-fill [dst : int args : int]
+    #fx{Unsafe}
+    : int
+    (if (list-nil? args)
+      dst
+      (scscm-cons-to-list-fill (scscm-add dst (head args)) (tail args))))
+  (defn scscm-env-lookup [env : int name : cstr]
+    #fx{Unsafe}
+    : int
+    (if (list-nil? env)
+      0
+      (if (scscm-cstr-eq? (ast-symbol-name (head (head env))) name)
+        (tail (head env))
+        (scscm-env-lookup (tail env) name))))
+  ;; Replace parameter symbols in node by their argument forms.
+  (defn scscm-subst [node : int env : int]
+    #fx{Unsafe}
+    : int
+    (if (scscm-kind? node ":symbol")
+      (let [found (scscm-env-lookup env (ast-symbol-name node))]
+        (if (= found 0) node found))
+      (if (or (scscm-kind? node ":list")
             (or (scscm-kind? node ":vector")
-                (or (scscm-kind? node ":quote")
-                    (or (scscm-kind? node ":quasiquote")
-                        (or (scscm-kind? node ":hash-paren")
-                            (or (scscm-kind? node ":unquote")
-                                (scscm-kind? node ":unquote-splice")))))))
-      (scscm-subst-fill (scscm-ast-list-node (scscm-kind-int (ast-kind node))) node env 0)
-      node)))
-
-(defn scscm-subst-fill [dst : int src : int env : int i : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len src))
-    dst
-    (scscm-subst-fill (scscm-add dst (scscm-subst (ast-list-get src i) env)) src env (+ i 1))))
-
-;; Apply ` ~ ~@ to a template whose parameters are already substituted:
-;; `x -> x with ~y -> y and ~@ys spliced.
-(defn scscm-qq [node : int] #fx{Unsafe} : int
-  (cond
-    (scscm-kind? node ":unquote") (ast-list-get node 0)
-    (or (scscm-kind? node ":list") (scscm-kind? node ":vector"))
-      (scscm-qq-fill (scscm-ast-list-node (scscm-kind-int (ast-kind node))) node 0)
-    :else node))
-
-(defn scscm-qq-fill [dst : int src : int i : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len src))
-    dst
-    (let [c (ast-list-get src i)]
-      (if (scscm-kind? c ":unquote-splice")
-        (scscm-qq-fill (scscm-append-from dst (ast-list-get c 0) 0) src (+ i 1))
-        (scscm-qq-fill (scscm-add dst (scscm-qq c)) src (+ i 1))))))
-
-;; Unwrap a macro body: `template applies ` ~ ~@; a bare form is used as is.
-(defn scscm-macro-body [body : int] #fx{Unsafe} : int
-  (if (scscm-kind? body ":quasiquote")
-    (scscm-qq (ast-list-get body 0))
-    body))
-
-(defn scscm-macro-apply [entry : int node : int] #fx{Unsafe} : int
-  (let [params (head entry)
-        body   (tail entry)
-        env    (scscm-bind-params params 0 (scscm-children-cons node 1) (nil-value))]
-    (scscm-macro-body (scscm-subst body env))))
-
-(defn scscm-children-cons [src : int start : int] #fx{Unsafe} : int
-  (scscm-children-cons-loop src start (nil-value)))
-
-(defn scscm-children-cons-loop [src : int i : int acc : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len src))
-    (scscm-list-rev acc (nil-value))
-    (scscm-children-cons-loop src (+ i 1) (cons (ast-list-get src i) acc))))
-
-;; ---- expansion of core forms ----
-
-;; A copy of node with children from start expanded (earlier ones kept).
-(defn scscm-expand-from [node : int start : int] #fx{Unsafe} : int
-  (scscm-expand-fill (scscm-ast-list-node (scscm-kind-int (ast-kind node))) node 0 start))
-
-(defn scscm-expand-fill [dst : int src : int i : int start : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len src))
-    dst
-    (scscm-expand-fill
-      (scscm-add dst (if (>= i start) (expand (ast-list-get src i)) (ast-list-get src i)))
-      src (+ i 1) start)))
-
-;; (let bindings body...): expand the values, not the names.
-(defn scscm-expand-let [node : int] #fx{Unsafe} : int
-  (let [b   (scscm-arg node 1)
-        nb  (scscm-ast-list-node (scscm-kind-int (ast-kind b)))
-        out (scscm-l2 (scscm-sym "let") nb)]
-    (scscm-expand-bindings nb b 0
-      (and (> (ast-list-len b) 0)
-           (or (scscm-kind? (ast-list-get b 0) ":list")
-               (scscm-kind? (ast-list-get b 0) ":vector"))))
-    (scscm-expand-fill out node 2 2)))
-
-(defn scscm-expand-bindings [dst : int b : int i : int pairs : bool] #fx{Unsafe} : int
-  (if (>= i (ast-list-len b))
-    dst
-    (if pairs
-      (let [bp (ast-list-get b i)]
-        (scscm-add dst (scscm-l2 (scscm-arg bp 0) (expand (scscm-arg bp 1))))
-        (scscm-expand-bindings dst b (+ i 1) pairs))
-      (do
-        (scscm-add dst (ast-list-get b i))
-        (scscm-add dst (expand (scscm-arg b (+ i 1))))
-        (scscm-expand-bindings dst b (+ i 2) pairs)))))
-
-;; (defmacro name params body): record it; leave an empty form codegen drops.
-(defn scscm-handle-defmacro [node : int] #fx{Unsafe} : int
-  (do
-    (scscm-macro-define (scscm-arg node 1) (scscm-arg node 2) (scscm-arg node 3))
-    (scscm-ast-list-node 5)))
-
-;; ---- main expand dispatch ----
-
-;;; expand -- expand macros in a single AST node.
-;;;
-;;; Parameters:
-;;;   ast -- AST node handle (from parser)
-;;;
-;;; Returns:
-;;;   Expanded AST node handle, built from core forms (may be a new
-;;;   allocation; input nodes are shared, not copied).
-;;;
-;;; Example:
-;;;   (expand (parse-one-form my-tokens))
-;;;
-;;; Since: SC3
-(defn expand [ast : int] #fx{Unsafe} : int
-  (let [knd (ast-kind ast)]
-    (cond
-      (or (scscm-cstr-eq? knd ":list") (scscm-cstr-eq? knd ":vector"))
-        (if (scscm-cstr-eq? knd ":list")
-          (scscm-expand-list ast)
-          (scscm-expand-from ast 0))
-      (scscm-cstr-eq? knd ":hash-paren") (expand (scscm-mac-hash-fn ast))
-      ;; Leaves, quoted data, and stray unquotes are left alone.
-      :else ast)))
-
-;; Built-in macro rewrite for head name nm, or 0 when nm is not one.
-(defn scscm-builtin [nm : cstr node : int] #fx{Unsafe} : int
-  (cond
-    (scscm-cstr-eq? nm "->")  (scscm-thread-first node 2 (scscm-arg node 1))
-    (scscm-cstr-eq? nm "->>") (scscm-thread-last node 2 (scscm-arg node 1))
-    (scscm-cstr-eq? nm "when")   (scscm-mac-when node)
-    (scscm-cstr-eq? nm "unless") (scscm-mac-unless node)
-    (scscm-cstr-eq? nm "cond")   (scscm-mac-cond node)
-    (scscm-cstr-eq? nm "doseq")   (scscm-mac-iterate node "do")
-    (scscm-cstr-eq? nm "dotimes") (scscm-mac-iterate node "do")
-    (scscm-cstr-eq? nm "collect")  (scscm-mac-iterate node "collect")
-    (scscm-cstr-eq? nm "icollect") (scscm-mac-iterate node "collect")
-    (scscm-cstr-eq? nm "accumulate") (scscm-mac-accumulate node)
-    (scscm-cstr-eq? nm "comp")    (scscm-comp-from node 1)
-    (scscm-cstr-eq? nm "partial") (scscm-mac-partial node)
-    (scscm-cstr-eq? nm "defsynth") (scscm-mac-defsynth node)
-    (scscm-cstr-eq? nm "definst")  (scscm-mac-definst node)
-    (scscm-cstr-eq? nm "routine")  (scscm-mac-routine node)
-    (scscm-cstr-eq? nm "wait")     (scscm-send (scscm-arg node 1) "wait")
-    (scscm-cstr-eq? nm "pbind")    (scscm-mac-pbind node)
-    (scscm-cstr-eq? nm "pseq")     (scscm-mac-pattern "Pseq" node)
-    (scscm-cstr-eq? nm "prand")    (scscm-mac-pattern "Prand" node)
-    (scscm-cstr-eq? nm "pwhite")   (scscm-mac-pattern "Pwhite" node)
-    (scscm-cstr-eq? nm "pgeom")    (scscm-mac-pattern "Pgeom" node)
-    (scscm-cstr-eq? nm "ctl")      (scscm-mac-ctl node)
-    (scscm-cstr-eq? nm "kill")     (scscm-send (scscm-arg node 1) "free")
-    (scscm-cstr-eq? nm "now")      (scscm-send (scscm-default-clock) "beats")
-    (scscm-cstr-eq? nm "metronome")
-      (scscm-l4 (scscm-sym ".dot") (scscm-sym "TempoClock") (scscm-sym "new")
-                (scscm-l3 (scscm-sym "/") (scscm-arg node 1) (scscm-num "60")))
-    (scscm-cstr-eq? nm "at")       (scscm-mac-sched node "schedAbs")
-    (scscm-cstr-eq? nm "in")       (scscm-mac-sched node "sched")
-    (scscm-cstr-eq? nm "demo")     (scscm-mac-demo node)
-    (scscm-cstr-eq? nm "midi->hz") (scscm-send (scscm-arg node 1) "midicps")
-    (scscm-cstr-eq? nm "hz->midi") (scscm-send (scscm-arg node 1) "cpsmidi")
-    (scscm-cstr-eq? nm "db->amp")  (scscm-send (scscm-arg node 1) "dbamp")
-    (scscm-cstr-eq? nm "amp->db")  (scscm-send (scscm-arg node 1) "ampdb")
-    (scscm-cstr-eq? nm "adsr")     (scscm-mac-adsr node)
-    (scscm-cstr-eq? nm "perc")     (scscm-mac-perc node)
-    (scscm-cstr-eq? nm "env-line") (scscm-mac-env-line node)
-    (scscm-cstr-eq? nm "chord")    (scscm-append-from (scscm-class-send "Chord" "basicNew") node 1)
-    (scscm-cstr-eq? nm "degrees->pitches") (scscm-mac-degrees node)
-    (scscm-cstr-eq? nm "def")      (scscm-append-from (scscm-l1 (scscm-sym "var")) node 1)
-    :else 0))
-
-;; Expand a list node: built-in or user macro at the head, else a core form
-;; whose subforms are expanded.
-(defn scscm-expand-list [node : int] #fx{Unsafe} : int
-  (if (or (= (ast-list-len node) 0)
+              (or (scscm-kind? node ":quote")
+                (or (scscm-kind? node ":quasiquote")
+                  (or (scscm-kind? node ":hash-paren")
+                    (or (scscm-kind? node ":unquote")
+                      (scscm-kind? node ":unquote-splice")))))))
+        (scscm-subst-fill (scscm-ast-list-node (scscm-kind-int (ast-kind node)))
+          node
+          env
+          0)
+        node)))
+  (defn scscm-subst-fill [dst : int src : int env : int i : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len src))
+      dst
+      (scscm-subst-fill (scscm-add dst (scscm-subst (ast-list-get src i) env))
+        src
+        env
+        (+ i 1))))
+  ;; Apply ` ~ ~@ to a template whose parameters are already substituted:
+  ;; `x -> x with ~y -> y and ~@ys spliced.
+  (defn scscm-qq [node : int]
+    #fx{Unsafe}
+    : int
+    (cond (scscm-kind? node ":unquote")                                (ast-list-get node
+                                                                         0)
+          (or (scscm-kind? node ":list") (scscm-kind? node ":vector")) (scscm-qq-fill (scscm-ast-list-node (scscm-kind-int (ast-kind node)))
+                                                                         node
+                                                                         0)
+          :else                                                        node))
+  (defn scscm-qq-fill [dst : int src : int i : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len src))
+      dst
+      (let [c (ast-list-get src i)]
+        (if (scscm-kind? c ":unquote-splice")
+          (scscm-qq-fill (scscm-append-from dst (ast-list-get c 0) 0)
+            src
+            (+ i 1))
+          (scscm-qq-fill (scscm-add dst (scscm-qq c)) src (+ i 1))))))
+  ;; Unwrap a macro body: `template applies ` ~ ~@; a bare form is used as is.
+  (defn scscm-macro-body [body : int]
+    #fx{Unsafe}
+    : int
+    (if (scscm-kind? body ":quasiquote") (scscm-qq (ast-list-get body 0)) body))
+  (defn scscm-macro-apply [entry : int node : int]
+    #fx{Unsafe}
+    : int
+    (let [params (head entry)
+          body   (tail entry)
+          env    (scscm-bind-params params
+                   0
+                   (scscm-children-cons node 1)
+                   (nil-value))]
+      (scscm-macro-body (scscm-subst body env))))
+  (defn scscm-children-cons [src : int start : int]
+    #fx{Unsafe}
+    : int
+    (scscm-children-cons-loop src start (nil-value)))
+  (defn scscm-children-cons-loop [src : int i : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len src))
+      (scscm-list-rev acc (nil-value))
+      (scscm-children-cons-loop src (+ i 1) (cons (ast-list-get src i) acc))))
+  ;; ---- expansion of core forms ----
+  ;; A copy of node with children from start expanded (earlier ones kept).
+  (defn scscm-expand-from [node : int start : int]
+    #fx{Unsafe}
+    : int
+    (scscm-expand-fill (scscm-ast-list-node (scscm-kind-int (ast-kind node)))
+      node
+      0
+      start))
+  (defn scscm-expand-fill [dst : int src : int i : int start : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len src))
+      dst
+      (scscm-expand-fill (scscm-add dst
+                           (if (>= i start)
+                             (expand (ast-list-get src i))
+                             (ast-list-get src i)))
+        src
+        (+ i 1)
+        start)))
+  ;; (let bindings body...): expand the values, not the names.
+  (defn scscm-expand-let [node : int]
+    #fx{Unsafe}
+    : int
+    (let [b   (scscm-arg node 1)
+          nb  (scscm-ast-list-node (scscm-kind-int (ast-kind b)))
+          out (scscm-l2 (scscm-sym "let") nb)]
+      (scscm-expand-bindings nb
+        b
+        0
+        (and (> (ast-list-len b) 0)
+          (or (scscm-kind? (ast-list-get b 0) ":list")
+            (scscm-kind? (ast-list-get b 0) ":vector"))))
+      (scscm-expand-fill out node 2 2)))
+  (defn scscm-expand-bindings [dst : int b : int i : int pairs : bool]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len b))
+      dst
+      (if pairs
+        (let [bp (ast-list-get b i)]
+          (scscm-add dst (scscm-l2 (scscm-arg bp 0) (expand (scscm-arg bp 1))))
+          (scscm-expand-bindings dst b (+ i 1) pairs))
+        (do
+          (scscm-add dst (ast-list-get b i))
+          (scscm-add dst (expand (scscm-arg b (+ i 1))))
+          (scscm-expand-bindings dst b (+ i 2) pairs)))))
+  ;; (defmacro name params body): record it; leave an empty form codegen drops.
+  (defn scscm-handle-defmacro [node : int]
+    #fx{Unsafe}
+    : int
+    (do
+      (scscm-macro-define (scscm-arg node 1)
+        (scscm-arg node 2)
+        (scscm-arg node 3))
+      (scscm-ast-list-node 5)))
+  ;; ---- main expand dispatch ----
+  ;;; expand -- expand macros in a single AST node.
+  ;;;
+  ;;; Parameters:
+  ;;;   ast -- AST node handle (from parser)
+  ;;;
+  ;;; Returns:
+  ;;;   Expanded AST node handle, built from core forms (may be a new
+  ;;;   allocation; input nodes are shared, not copied).
+  ;;;
+  ;;; Example:
+  ;;;   (expand (parse-one-form my-tokens))
+  ;;;
+  ;;; Since: SC3
+  (defn expand [ast : int]
+    #fx{Unsafe}
+    : int
+    (let [knd (ast-kind ast)]
+      (cond (or (scscm-cstr-eq? knd ":list") (scscm-cstr-eq? knd ":vector")) (if (scscm-cstr-eq? knd
+                                                                                   ":list")
+                                                                               (scscm-expand-list ast)
+                                                                               (scscm-expand-from ast
+                                                                                 0))
+            (scscm-cstr-eq? knd ":hash-paren")                               (expand (scscm-mac-hash-fn ast))
+            ;; Leaves, quoted data, and stray unquotes are left alone.
+            :else                                                            ast)))
+  ;; Built-in macro rewrite for head name nm, or 0 when nm is not one.
+  (defn scscm-builtin [nm : cstr node : int]
+    #fx{Unsafe}
+    : int
+    (cond (scscm-cstr-eq? nm "->")               (scscm-thread-first node
+                                                   2
+                                                   (scscm-arg node 1))
+          (scscm-cstr-eq? nm "->>")              (scscm-thread-last node
+                                                   2
+                                                   (scscm-arg node 1))
+          (scscm-cstr-eq? nm "when")             (scscm-mac-when node)
+          (scscm-cstr-eq? nm "unless")           (scscm-mac-unless node)
+          (scscm-cstr-eq? nm "cond")             (scscm-mac-cond node)
+          (scscm-cstr-eq? nm "doseq")            (scscm-mac-iterate node "do")
+          (scscm-cstr-eq? nm "dotimes")          (scscm-mac-iterate node "do")
+          (scscm-cstr-eq? nm "collect")          (scscm-mac-iterate node
+                                                   "collect")
+          (scscm-cstr-eq? nm "icollect")         (scscm-mac-iterate node
+                                                   "collect")
+          (scscm-cstr-eq? nm "accumulate")       (scscm-mac-accumulate node)
+          (scscm-cstr-eq? nm "comp")             (scscm-comp-from node 1)
+          (scscm-cstr-eq? nm "partial")          (scscm-mac-partial node)
+          (scscm-cstr-eq? nm "defsynth")         (scscm-mac-defsynth node)
+          (scscm-cstr-eq? nm "definst")          (scscm-mac-definst node)
+          (scscm-cstr-eq? nm "routine")          (scscm-mac-routine node)
+          (scscm-cstr-eq? nm "wait")             (scscm-send (scscm-arg node 1)
+                                                   "wait")
+          (scscm-cstr-eq? nm "pbind")            (scscm-mac-pbind node)
+          (scscm-cstr-eq? nm "pseq")             (scscm-mac-pattern "Pseq" node)
+          (scscm-cstr-eq? nm "prand")            (scscm-mac-pattern "Prand"
+                                                   node)
+          (scscm-cstr-eq? nm "pwhite")           (scscm-mac-pattern "Pwhite"
+                                                   node)
+          (scscm-cstr-eq? nm "pgeom")            (scscm-mac-pattern "Pgeom"
+                                                   node)
+          (scscm-cstr-eq? nm "ctl")              (scscm-mac-ctl node)
+          (scscm-cstr-eq? nm "kill")             (scscm-send (scscm-arg node 1)
+                                                   "free")
+          (scscm-cstr-eq? nm "now")              (scscm-send (scscm-default-clock)
+                                                   "beats")
+          (scscm-cstr-eq? nm "metronome")        (scscm-l4 (scscm-sym ".dot")
+                                                   (scscm-sym "TempoClock")
+                                                   (scscm-sym "new")
+                                                   (scscm-l3 (scscm-sym "/")
+                                                     (scscm-arg node 1)
+                                                     (scscm-num "60")))
+          (scscm-cstr-eq? nm "at")               (scscm-mac-sched node
+                                                   "schedAbs")
+          (scscm-cstr-eq? nm "in")               (scscm-mac-sched node "sched")
+          (scscm-cstr-eq? nm "demo")             (scscm-mac-demo node)
+          (scscm-cstr-eq? nm "midi->hz")         (scscm-send (scscm-arg node 1)
+                                                   "midicps")
+          (scscm-cstr-eq? nm "hz->midi")         (scscm-send (scscm-arg node 1)
+                                                   "cpsmidi")
+          (scscm-cstr-eq? nm "db->amp")          (scscm-send (scscm-arg node 1)
+                                                   "dbamp")
+          (scscm-cstr-eq? nm "amp->db")          (scscm-send (scscm-arg node 1)
+                                                   "ampdb")
+          (scscm-cstr-eq? nm "adsr")             (scscm-mac-adsr node)
+          (scscm-cstr-eq? nm "perc")             (scscm-mac-perc node)
+          (scscm-cstr-eq? nm "env-line")         (scscm-mac-env-line node)
+          (scscm-cstr-eq? nm "chord")            (scscm-append-from (scscm-class-send "Chord"
+                                                                      "basicNew")
+                                                   node
+                                                   1)
+          (scscm-cstr-eq? nm "degrees->pitches") (scscm-mac-degrees node)
+          (scscm-cstr-eq? nm "def")              (scscm-append-from (scscm-l1 (scscm-sym "var"))
+                                                   node
+                                                   1)
+          :else                                  0))
+  ;; Expand a list node: built-in or user macro at the head, else a core form
+  ;; whose subforms are expanded.
+  (defn scscm-expand-list [node : int]
+    #fx{Unsafe}
+    : int
+    (if (or (= (ast-list-len node) 0)
           (not (scscm-kind? (ast-list-get node 0) ":symbol")))
-    (scscm-expand-from node 0)
-    (let [nm (ast-symbol-name (ast-list-get node 0))]
-      (cond
-        (scscm-cstr-eq? nm "defmacro") (scscm-handle-defmacro node)
-        (scscm-cstr-eq? nm "quote")    node
-        ;; fn / defn: parameters are not expressions.
-        (scscm-fn-head? nm)
-          (scscm-expand-from node 2)
-        (scscm-cstr-eq? nm "defn") (scscm-expand-from node 3)
-        (scscm-cstr-eq? nm "var")  (scscm-expand-from node 2)
-        (scscm-cstr-eq? nm "let")  (scscm-expand-let node)
-        (scscm-cstr-eq? nm ".")    (scscm-expand-dot node)
-        :else
-          (let [b (scscm-builtin nm node)]
-            (if (= b 0)
-              (let [mentry (scscm-macro-lookup nm)]
-                (if (list-nil? mentry)
-                  (scscm-expand-from node 1)
-                  (expand (scscm-macro-apply mentry node))))
-              (expand b)))))))
-
-;; (. recv msg args...): the selector is a name, not a call.
-(defn scscm-expand-dot [node : int] #fx{Unsafe} : int
-  (let [out (scscm-l1 (ast-list-get node 0))]
-    (if (>= (ast-list-len node) 2) (scscm-add out (expand (ast-list-get node 1))) out)
-    (if (>= (ast-list-len node) 3) (scscm-add out (ast-list-get node 2)) out)
-    (scscm-expand-fill out node 3 3)))
-
-;;; expand-all -- expand macros in a cons list of top-level AST nodes.
-;;;
-;;; Parameters:
-;;;   asts -- cons list of AST node handles
-;;;
-;;; Returns:
-;;;   Cons list of expanded AST node handles, in order. A defmacro is
-;;;   recorded and becomes an empty form, which codegen drops.
-;;;
-;;; Example:
-;;;   (expand-all top-level-nodes)
-;;;
-;;; Since: SC3
-(defn expand-all [asts : int] #fx{Unsafe} : int
-  (if (list-nil? asts)
-    (nil-value)
-    (let [expanded-head (expand (head asts))
-          expanded-tail (expand-all (tail asts))]
-      (cons expanded-head expanded-tail))))
-
-) ;; end defmodule scscm/expander
+      (scscm-expand-from node 0)
+      (let [nm (ast-symbol-name (ast-list-get node 0))]
+        (cond (scscm-cstr-eq? nm "defmacro") (scscm-handle-defmacro node)
+              (scscm-cstr-eq? nm "quote")    node
+              ;; fn / defn: parameters are not expressions.
+              (scscm-fn-head? nm)            (scscm-expand-from node 2)
+              (scscm-cstr-eq? nm "defn")     (scscm-expand-from node 3)
+              (scscm-cstr-eq? nm "var")      (scscm-expand-from node 2)
+              (scscm-cstr-eq? nm "let")      (scscm-expand-let node)
+              (scscm-cstr-eq? nm ".")        (scscm-expand-dot node)
+              :else                          (let [b (scscm-builtin nm node)]
+                                               (if (= b 0)
+                                                 (let [mentry (scscm-macro-lookup nm)]
+                                                   (if (list-nil? mentry)
+                                                     (scscm-expand-from node 1)
+                                                     (expand (scscm-macro-apply mentry
+                                                               node))))
+                                                 (expand b)))))))
+  ;; (. recv msg args...): the selector is a name, not a call.
+  (defn scscm-expand-dot [node : int]
+    #fx{Unsafe}
+    : int
+    (let [out (scscm-l1 (ast-list-get node 0))]
+      (if (>= (ast-list-len node) 2)
+        (scscm-add out (expand (ast-list-get node 1)))
+        out)
+      (if (>= (ast-list-len node) 3) (scscm-add out (ast-list-get node 2)) out)
+      (scscm-expand-fill out node 3 3)))
+  ;;; expand-all -- expand macros in a cons list of top-level AST nodes.
+  ;;;
+  ;;; Parameters:
+  ;;;   asts -- cons list of AST node handles
+  ;;;
+  ;;; Returns:
+  ;;;   Cons list of expanded AST node handles, in order. A defmacro is
+  ;;;   recorded and becomes an empty form, which codegen drops.
+  ;;;
+  ;;; Example:
+  ;;;   (expand-all top-level-nodes)
+  ;;;
+  ;;; Since: SC3
+  (defn expand-all [asts : int]
+    #fx{Unsafe}
+    : int
+    (if (list-nil? asts)
+      (nil-value)
+      (let [expanded-head (expand (head asts))
+            expanded-tail (expand-all (tail asts))]
+        (cons expanded-head expanded-tail))))) ;; end defmodule scscm/expander

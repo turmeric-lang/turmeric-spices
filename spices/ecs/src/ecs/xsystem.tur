@@ -50,460 +50,468 @@
 ;;; See `docs/upcoming/ecs-cross-world-systems-plan.md` (phase X2).
 ;;;
 ;;; Since: X2
-
 (defmodule ecs/xsystem
-  (export XSystem make-xsystem
-          xsystem-w0-reads xsystem-w0-writes
-          xsystem-w1-reads xsystem-w1-writes
-          xsystem-run-fn
-          defxsystem
-          ;; N-world (>= 3 worlds) surface (N-W-V0).
-          XSystemN make-xsystem-n
-          xsystemn-n xsystemn-reads xsystemn-writes xsystemn-run-fn
-          xsm-alloc xsm-set! xsm-get xsm-free
-          ;; helpers used by the macro expansion (and by ecs/xmirror).
-          xsystem--with-read-caps
-          xsystem--with-write-caps
-          xsystem--consume-write-caps)
-
-(import ecs/system :refer [cid-bit])
-(import ecs/xcap   :refer [XWriteCap XReadCap make-write-cap make-read-cap use-cap!])
-
-;;; xsystem--mask -- build the bit-or'd `(cid-bit <Comp>-cid)` mask for
-;;; a comp-name vector (empty -> 0). A private copy of
-;;; `defsystem--mask`; defined here rather than imported because `tur`
-;;; shares one global macro namespace, so re-`:refer`ing the same macro
-;;; from two modules linked in one program is a conflict.
-(defmacro xsystem--mask [comps]
-  (if (empty? comps)
-    0
-    (if (empty? (rest comps))
-      `(cid-bit ~(str->sym (str-append (symbol-name (first comps)) "-cid")))
-      `(bit-or
-         (cid-bit ~(str->sym (str-append (symbol-name (first comps)) "-cid")))
-         (xsystem--mask ~(rest comps))))))
-
-;;; XSystem -- a runnable two-world bundle. Each slot (w0, w1) carries
-;;; the reads/writes masks the body touches in that world; `run-fn`
-;;; points at a top-level defn with signature `[w0 : int w1 : int] :
-;;; nil`. A single-world system embeds with empty slot-1 masks.
-;;; :copy so it flows through Turmeric values cleanly, like System.
-;;; Since: X2
-(defstruct ^copy XSystem
-  [w0-reads  : int
-   w0-writes : int
-   w1-reads  : int
-   w1-writes : int
-   run-fn    : ptr<void>])
-
-;;; make-xsystem -- bundle a top-level two-world run-fn with its
-;;; per-world read/write masks.
-;;; Since: X2
-(defn make-xsystem
-  [w0-reads  : int
-   w0-writes : int
-   w1-reads  : int
-   w1-writes : int
-   run-fn    : ptr<void>]
-  : XSystem
-  (make-struct XSystem w0-reads w0-writes w1-reads w1-writes run-fn))
-
-;;; Field accessors.
-;;; Since: X2
-(defn xsystem-w0-reads  [s : XSystem] : int (.w0-reads  s))
-(defn xsystem-w0-writes [s : XSystem] : int (.w0-writes s))
-(defn xsystem-w1-reads  [s : XSystem] : int (.w1-reads  s))
-(defn xsystem-w1-writes [s : XSystem] : int (.w1-writes s))
-(defn xsystem-run-fn    [s : XSystem] : ptr<void> (.run-fn s))
-
-;;; ===========================================================================
-;;; N-W-V0 -- N-world (>= 3 worlds) support.
-;;;
-;;; The two-world surface above (XSystem / make-xsystem / the w0/w1 field
-;;; accessors and the legacy `defxsystem` 2-world expansion) is left
-;;; *unchanged* so existing fixtures keep compiling byte-for-byte. The
-;;; N-world path is additive: a system over >= 3 worlds carries its
-;;; per-world read/write masks in heap arrays rather than fixed fields,
-;;; and its run-fn takes a *pointer to an int64 handle array* (one boxed
-;;; world handle per slot) instead of two scalar handles.
-;;;
-;;; The shared int64-array helpers below back both the per-system mask
-;;; arrays (built once at `(def NAME ...)` time, so they live for the
-;;; process) and the per-binding id/handle arrays (`ecs/xstage`).
-;;; ===========================================================================
-
-;;; xsm-alloc -- allocate a zeroed int64[n] array; returns its address as
-;;; an :int carrier. Used for mask / id / handle vectors.
-;;; Since: N-W-V0
-(defn xsm-alloc [n : int] : int
-  ```c
-  #include <stdlib.h>
+  (export XSystem
+    make-xsystem
+    xsystem-w0-reads
+    xsystem-w0-writes
+    xsystem-w1-reads
+    xsystem-w1-writes
+    xsystem-run-fn
+    defxsystem
+    ;; N-world (>= 3 worlds) surface (N-W-V0).
+    XSystemN
+    make-xsystem-n
+    xsystemn-n
+    xsystemn-reads
+    xsystemn-writes
+    xsystemn-run-fn
+    xsm-alloc
+    xsm-set!
+    xsm-get
+    xsm-free
+    ;; helpers used by the macro expansion (and by ecs/xmirror).
+    xsystem--with-read-caps
+    xsystem--with-write-caps
+    xsystem--consume-write-caps)
+  (import ecs/system :refer [cid-bit])
+  (import ecs/xcap
+    :refer
+    [XWriteCap XReadCap make-write-cap make-read-cap use-cap!])
+  ;;; xsystem--mask -- build the bit-or'd `(cid-bit <Comp>-cid)` mask for
+  ;;; a comp-name vector (empty -> 0). A private copy of
+  ;;; `defsystem--mask`; defined here rather than imported because `tur`
+  ;;; shares one global macro namespace, so re-`:refer`ing the same macro
+  ;;; from two modules linked in one program is a conflict.
+  (defmacro xsystem--mask [comps]
+    (if (empty? comps)
+      0
+      (if (empty? (rest comps))
+        `(cid-bit ~(str->sym (str-append (symbol-name (first comps)) "-cid")))
+        `(bit-or (cid-bit ~(str->sym (str-append (symbol-name (first comps))
+                                       "-cid")))
+           (xsystem--mask ~(rest comps))))))
+  ;;; XSystem -- a runnable two-world bundle. Each slot (w0, w1) carries
+  ;;; the reads/writes masks the body touches in that world; `run-fn`
+  ;;; points at a top-level defn with signature `[w0 : int w1 : int] :
+  ;;; nil`. A single-world system embeds with empty slot-1 masks.
+  ;;; :copy so it flows through Turmeric values cleanly, like System.
+  ;;; Since: X2
+  (defstruct ^copy XSystem
+    [w0-reads : int
+     w0-writes : int
+     w1-reads : int
+     w1-writes : int
+     run-fn : ptr<void>])
+  ;;; make-xsystem -- bundle a top-level two-world run-fn with its
+  ;;; per-world read/write masks.
+  ;;; Since: X2
+  (defn make-xsystem [w0-reads : int
+                      w0-writes : int
+                      w1-reads : int
+                      w1-writes : int
+                      run-fn : ptr<void>] : XSystem
+    (make-struct XSystem w0-reads w0-writes w1-reads w1-writes run-fn))
+  ;;; Field accessors.
+  ;;; Since: X2
+  (defn xsystem-w0-reads [s : XSystem] : int (.w0-reads s))
+  (defn xsystem-w0-writes [s : XSystem] : int (.w0-writes s))
+  (defn xsystem-w1-reads [s : XSystem] : int (.w1-reads s))
+  (defn xsystem-w1-writes [s : XSystem] : int (.w1-writes s))
+  (defn xsystem-run-fn [s : XSystem] : ptr<void> (.run-fn s))
+  ;;; ===========================================================================
+  ;;; N-W-V0 -- N-world (>= 3 worlds) support.
+  ;;;
+  ;;; The two-world surface above (XSystem / make-xsystem / the w0/w1 field
+  ;;; accessors and the legacy `defxsystem` 2-world expansion) is left
+  ;;; *unchanged* so existing fixtures keep compiling byte-for-byte. The
+  ;;; N-world path is additive: a system over >= 3 worlds carries its
+  ;;; per-world read/write masks in heap arrays rather than fixed fields,
+  ;;; and its run-fn takes a *pointer to an int64 handle array* (one boxed
+  ;;; world handle per slot) instead of two scalar handles.
+  ;;;
+  ;;; The shared int64-array helpers below back both the per-system mask
+  ;;; arrays (built once at `(def NAME ...)` time, so they live for the
+  ;;; process) and the per-binding id/handle arrays (`ecs/xstage`).
+  ;;; ===========================================================================
+  ;;; xsm-alloc -- allocate a zeroed int64[n] array; returns its address as
+  ;;; an :int carrier. Used for mask / id / handle vectors.
+  ;;; Since: N-W-V0
+  (defn xsm-alloc [n : int] : int
+    ```c
+    #include <stdlib.h>
   return (int64_t)(intptr_t)calloc((size_t)n, sizeof(int64_t));
   ```)
-
-;;; xsm-set! -- store `v` at index `i` of the int64 array at `p`.
-;;; Since: N-W-V0
-(defn xsm-set! [p : int i : int v : int] : nil
-  ```c
-  ((int64_t *)(intptr_t)p)[i] = v;
+  ;;; xsm-set! -- store `v` at index `i` of the int64 array at `p`.
+  ;;; Since: N-W-V0
+  (defn xsm-set! [p : int i : int v : int] : nil
+    ```c
+    ((int64_t *)(intptr_t)p)[i] = v;
   ```)
-
-;;; xsm-get -- load index `i` of the int64 array at `p`.
-;;; Since: N-W-V0
-(defn xsm-get [p : int i : int] : int
-  ```c
-  return ((int64_t *)(intptr_t)p)[i];
+  ;;; xsm-get -- load index `i` of the int64 array at `p`.
+  ;;; Since: N-W-V0
+  (defn xsm-get [p : int i : int] : int
+    ```c
+    return ((int64_t *)(intptr_t)p)[i];
   ```)
-
-;;; xsm-free -- release an int64 array previously `xsm-alloc`'d.
-;;; Since: N-W-V0
-(defn xsm-free [p : int] : nil
-  ```c
-  #include <stdlib.h>
+  ;;; xsm-free -- release an int64 array previously `xsm-alloc`'d.
+  ;;; Since: N-W-V0
+  (defn xsm-free [p : int] : nil
+    ```c
+    #include <stdlib.h>
   free((void *)(intptr_t)p);
   ```)
-
-;;; XSystemN -- a runnable N-world bundle. `n` is the world count;
-;;; `reads` / `writes` are :int-carried pointers to int64[n] mask arrays
-;;; (slot i holds the read / write mask the body touches in world i);
-;;; `run-fn` points at a top-level defn with signature `[hp : int] : nil`
-;;; that reads `n` boxed world handles from the int64 array at `hp`.
-;;; :copy so it flows through Turmeric values like XSystem; the mask
-;;; arrays it points at are process-lifetime (allocated once at the
-;;; owning `(def ...)`), so copying the struct just copies the pointers.
-;;; Since: N-W-V0
-(defstruct ^copy XSystemN
-  [n      : int
-   reads  : int
-   writes : int
-   run-fn : ptr<void>])
-
-;;; make-xsystem-n -- bundle an N-world run-fn with its mask arrays.
-;;; Since: N-W-V0
-(defn make-xsystem-n
-  [n : int reads : int writes : int run-fn : ptr<void>]
-  : XSystemN
-  (make-struct XSystemN n reads writes run-fn))
-
-;;; Field accessors.
-;;; Since: N-W-V0
-(defn xsystemn-n      [s : XSystemN] : int (.n      s))
-(defn xsystemn-reads  [s : XSystemN] : int (.reads  s))
-(defn xsystemn-writes [s : XSystemN] : int (.writes s))
-(defn xsystemn-run-fn [s : XSystemN] : ptr<void> (.run-fn s))
-
-;;; xsystem--with-write-caps -- wrap `body` in a let-chain binding
-;;; `<wbind>-<Comp>-write-cap : (XWriteCap <wtype> Comp)` for each comp,
-;;; minted from `<Comp>-cid`. World-keyed analogue of
-;;; `defsystem--with-write-caps`.
-(defmacro xsystem--with-write-caps [body wbind wtype comps]
-  (if (empty? comps)
-    `~body
-    (let [comp       (first comps)
-          rest-comps (rest comps)
-          cap-name   (str->sym (str-append (symbol-name wbind) "-"
-                                           (symbol-name comp) "-write-cap"))
-          cid-name   (str->sym (str-append (symbol-name comp) "-cid"))]
-      `(let [~cap-name (:: (make-write-cap ~cid-name) (XWriteCap ~wtype ~comp))]
-         (xsystem--with-write-caps ~body ~wbind ~wtype ~rest-comps)))))
-
-;;; xsystem--with-read-caps -- wrap `body` in a let-chain binding
-;;; `<wbind>-<Comp>-read-cap : (XReadCap <wtype> Comp)` for each comp.
-;;; XReadCap is non-linear, so no auto-consume is needed.
-(defmacro xsystem--with-read-caps [body wbind wtype comps]
-  (if (empty? comps)
-    `~body
-    (let [comp       (first comps)
-          rest-comps (rest comps)
-          cap-name   (str->sym (str-append (symbol-name wbind) "-"
-                                           (symbol-name comp) "-read-cap"))
-          cid-name   (str->sym (str-append (symbol-name comp) "-cid"))]
-      `(let [~cap-name (:: (make-read-cap ~cid-name) (XReadCap ~wtype ~comp))]
-         (xsystem--with-read-caps ~body ~wbind ~wtype ~rest-comps)))))
-
-;;; xsystem--consume-write-caps -- emit `(use-cap! <wbind>-<Comp>-write-cap)`
-;;; for each comp, sequenced via nested `do`. Runs at body end so the
-;;; linear write-caps are consumed exactly once.
-(defmacro xsystem--consume-write-caps [wbind comps]
-  (if (empty? comps)
-    nil
-    (let [comp       (first comps)
-          rest-comps (rest comps)
-          cap-name   (str->sym (str-append (symbol-name wbind) "-"
-                                           (symbol-name comp) "-write-cap"))]
-      `(do
-         (use-cap! ~cap-name)
-         (xsystem--consume-write-caps ~wbind ~rest-comps)))))
-
-;;; ---------------------------------------------------------------------------
-;;; N-world `defxsystem` expansion helpers.
-;;;
-;;; Each helper walks a CT `triples` list -- one entry per declared
-;;; world, shaped `(wbind wtype reads-vec writes-vec)` -- and splices a
-;;; chunk of the N-world expansion. They are the variable-arity analogue
-;;; of the fixed two-world template; the main macro folds the cap
-;;; wrappers (which nest, rather than splice) with a CT `letrec`.
-;;; ---------------------------------------------------------------------------
-
-;;; xsystem--n-loads -- emit the `NAME-fn` let-bindings that load each
-;;; world from the handle array `hp`: `wbind : Wtype (load-Wtype (xsm-get
-;;; hp i))`, one group per world, indices counting up from `i`.
-;;; Since: N-W-V0
-(defmacro xsystem--n-loads [triples i]
-  (if (empty? triples)
-    `()
-    (let [tr     (first triples)
-          wbind  (first tr)
-          wtype  (first (rest tr))
-          loadfn (str->sym (str-append "load-" (symbol-name wtype)))]
-      `(~wbind : ~wtype (~loadfn (xsm-get hp ~i))
-        ~@(xsystem--n-loads (rest triples) (+ i 1))))))
-
-;;; xsystem--n-consumes -- emit one `(xsystem--consume-write-caps wbind
-;;; writes-vec)` per world, run at body end so every world's linear
-;;; write-caps are discharged exactly once.
-;;; Since: N-W-V0
-(defmacro xsystem--n-consumes [triples]
-  (if (empty? triples)
-    `()
-    (let [tr    (first triples)
-          wbind (first tr)
-          wv    (first (rest (rest (rest tr))))]
-      `((xsystem--consume-write-caps ~wbind ~wv)
-        ~@(xsystem--n-consumes (rest triples))))))
-
-;;; xsystem--n-mask-fills -- emit the per-world `(xsm-set! __rds i MASK)`
-;;; / `(xsm-set! __wrs i MASK)` pairs that populate the mask arrays at
-;;; `(def NAME ...)` time. `__rds` / `__wrs` are bound by the caller.
-;;; Since: N-W-V0
-(defmacro xsystem--n-mask-fills [triples i]
-  (if (empty? triples)
-    `()
-    (let [tr (first triples)
-          rv (first (rest (rest tr)))
-          wv (first (rest (rest (rest tr))))]
-      `((xsm-set! __rds ~i (xsystem--mask ~rv))
-        (xsm-set! __wrs ~i (xsystem--mask ~wv))
-        ~@(xsystem--n-mask-fills (rest triples) (+ i 1))))))
-
-;;; xsystem--n-checks -- the "every declared world appears in >= 1
-;;; clause" validation (N-W-V0.1). For each world that has *neither* a
-;;; reads nor a writes clause, emit a descriptively-named bare symbol;
-;;; with no clause referencing it the symbol is unbound, so the compiler
-;;; rejects the declaration with a message that names the dropped world.
-;;; (Turmeric has no compile-time warn channel, so this is a hard error
-;;; rather than the plan's "warn" -- it keeps unintentional drops honest
-;;; the same way, just louder.) Worlds that are used emit nothing.
-;;; Since: N-W-V0
-(defmacro xsystem--n-checks [triples]
-  (if (empty? triples)
-    `()
-    (let [tr    (first triples)
-          wbind (first tr)
-          rv    (first (rest (rest tr)))
-          wv    (first (rest (rest (rest tr))))]
-      (if (empty? rv)
-        (if (empty? wv)
-          `(~(str->sym (str-append "defxsystem--world-"
-                                   (symbol-name wbind)
-                                   "-declared-but-never-read-or-written"))
-            ~@(xsystem--n-checks (rest triples)))
-          `(~@(xsystem--n-checks (rest triples))))
-        `(~@(xsystem--n-checks (rest triples)))))))
-
-;;; defxsystem -- declare a cross-world System and its implementation.
-;;;
-;;; Syntax (any clause order; missing :reads-from / :writes-to for a
-;;; world default to []; multiple body forms are wrapped in (do ...)):
-;;;
-;;;   (defxsystem NAME
-;;;     [w0 W0Type  w1 W1Type  ...]   ;; two OR MORE world bindings
-;;;     :reads-from  w0 [..]   ;; any order; either side omittable
-;;;     :writes-to   w1 [..]
-;;;     BODY ...)
-;;;
-;;; **Two worlds (the original shape)** expand exactly as before, via a
-;;; `NAME-impl` taking both worlds `^borrow`, a `NAME-fn [wp0 wp1]`
-;;; trampoline, and `(def NAME (make-xsystem ...))`. This path is left
-;;; byte-for-byte unchanged so two-world fixtures are unaffected.
-;;;
-;;; **Three or more worlds (N-W-V0)** expand to:
-;;;
-;;;   (defn NAME-fn [hp : int] : nil          ;; hp -> int64[n] handle array
-;;;     (let [w0 : W0 (load-W0 (xsm-get hp 0))
-;;;           w1 : W1 (load-W1 (xsm-get hp 1))
-;;;           w2 : W2 (load-W2 (xsm-get hp 2))]
-;;;       ;; read-caps + write-caps bound per (world, comp); body; auto-consume
-;;;       ...))
-;;;   (def NAME
-;;;     (let [rds (xsm-alloc n) wrs (xsm-alloc n)]
-;;;       ... fill rds[i]/wrs[i] with each world's masks ...
-;;;       (make-xsystem-n n rds wrs NAME-fn)))
-;;;
-;;; The per-(world, component) lock model is identical; only the
-;;; bookkeeping arity changes. Every declared world must appear in at
-;;; least one clause (see `xsystem--n-checks`). `load-<Wtype>`
-;;; (int-carrier -> typed world) must be in scope for every world, the
-;;; same convention `sized-defsystem-scheduled` uses.
-;;;
-;;; Since: X2 (CLAUSE-V0: any clause order, empties omittable;
-;;;            N-W-V0: three-or-more worlds)
-(defmacro defxsystem [name worlds & clauses]
-  (let [impl-name (str->sym (str-append (symbol-name name) "-impl"))
-        fn-name   (str->sym (str-append (symbol-name name) "-fn"))
-        ;; `clauses` is a macro param: substitute_params replaces it with
-        ;; a literal F_LIST before CT eval runs; without `quote`, CT would
-        ;; try to call the first element as a function. The quote keeps
-        ;; the list as data for the helpers to walk.
-        cls   (quote clauses)
-        ;; CT helper: walk a clause list `cs` 3-at-a-time. When (first cs)
-        ;; matches :reads-from / :writes-to AND (second cs) matches the
-        ;; target world name, return the third (the comp vec). When the
-        ;; head is not a clause keyword the clauses have ended; return
-        ;; the empty-vec default. Recursive in CT via letrec.
-        find-clause
-        (letrec [go
-                 (fn [kw wname cs]
-                   (if (empty? cs)
-                     (vec)
-                     (let [k (first cs)]
-                       (if (= k :reads-from)
-                         (let [w    (first (rest cs))
-                               v    (first (rest (rest cs)))
-                               tail (rest (rest (rest cs)))]
-                           (if (= kw :reads-from)
-                             (if (= w wname) v (go kw wname tail))
-                             (go kw wname tail)))
-                         (if (= k :writes-to)
-                           (let [w    (first (rest cs))
-                                 v    (first (rest (rest cs)))
-                                 tail (rest (rest (rest cs)))]
-                             (if (= kw :writes-to)
-                               (if (= w wname) v (go kw wname tail))
-                               (go kw wname tail)))
-                           ;; body reached; clause not present
-                           (vec))))))]
-          go)
-        ;; CT helper: collect all forms past the trailing clauses and
-        ;; wrap them in (do ...) so multiple body forms are supported.
-        find-body
-        (letrec [go
-                 (fn [cs]
-                   (if (empty? cs)
-                     nil
-                     (let [k (first cs)]
-                       (if (= k :reads-from)
-                         (go (rest (rest (rest cs))))
-                         (if (= k :writes-to)
-                           (go (rest (rest (rest cs))))
-                           (cons (quote do) cs))))))]
-          go)
-        bdy (find-body cls)
-        ;; `more` is non-empty exactly when more than two worlds are
-        ;; declared (worlds = [b0 T0 b1 T1 ...], two tokens per world).
-        more (rest (rest (rest (rest worlds))))]
-    (if (empty? more)
-      ;; -------------------------------------------------------------
-      ;; Two-world path -- unchanged from X2 (byte-equal codegen).
-      ;; -------------------------------------------------------------
-      (let [ws1   (rest worlds)
-            ws2   (rest ws1)
-            ws3   (rest ws2)
-            w0b   (first worlds)
-            w0t   (first ws1)
-            w1b   (first ws2)
-            w1t   (first ws3)
-            load0 (str->sym (str-append "load-" (symbol-name w0t)))
-            load1 (str->sym (str-append "load-" (symbol-name w1t)))
-            r0v (find-clause :reads-from w0b cls)
-            w0v (find-clause :writes-to  w0b cls)
-            r1v (find-clause :reads-from w1b cls)
-            w1v (find-clause :writes-to  w1b cls)]
+  ;;; XSystemN -- a runnable N-world bundle. `n` is the world count;
+  ;;; `reads` / `writes` are :int-carried pointers to int64[n] mask arrays
+  ;;; (slot i holds the read / write mask the body touches in world i);
+  ;;; `run-fn` points at a top-level defn with signature `[hp : int] : nil`
+  ;;; that reads `n` boxed world handles from the int64 array at `hp`.
+  ;;; :copy so it flows through Turmeric values like XSystem; the mask
+  ;;; arrays it points at are process-lifetime (allocated once at the
+  ;;; owning `(def ...)`), so copying the struct just copies the pointers.
+  ;;; Since: N-W-V0
+  (defstruct ^copy XSystemN
+    [n : int reads : int writes : int run-fn : ptr<void>])
+  ;;; make-xsystem-n -- bundle an N-world run-fn with its mask arrays.
+  ;;; Since: N-W-V0
+  (defn make-xsystem-n [n : int reads : int writes : int run-fn : ptr<void>] : XSystemN
+    (make-struct XSystemN n reads writes run-fn))
+  ;;; Field accessors.
+  ;;; Since: N-W-V0
+  (defn xsystemn-n [s : XSystemN] : int (.n s))
+  (defn xsystemn-reads [s : XSystemN] : int (.reads s))
+  (defn xsystemn-writes [s : XSystemN] : int (.writes s))
+  (defn xsystemn-run-fn [s : XSystemN] : ptr<void> (.run-fn s))
+  ;;; xsystem--with-write-caps -- wrap `body` in a let-chain binding
+  ;;; `<wbind>-<Comp>-write-cap : (XWriteCap <wtype> Comp)` for each comp,
+  ;;; minted from `<Comp>-cid`. World-keyed analogue of
+  ;;; `defsystem--with-write-caps`.
+  (defmacro xsystem--with-write-caps [body wbind wtype comps]
+    (if (empty? comps)
+      `~body
+      (let [comp       (first comps)
+            rest-comps (rest comps)
+            cap-name   (str->sym (str-append (symbol-name wbind)
+                                   "-"
+                                   (symbol-name comp)
+                                   "-write-cap"))
+            cid-name   (str->sym (str-append (symbol-name comp) "-cid"))]
+        `(let [~cap-name (:: (make-write-cap ~cid-name)
+                           (XWriteCap ~wtype ~comp))]
+           (xsystem--with-write-caps ~body ~wbind ~wtype ~rest-comps)))))
+  ;;; xsystem--with-read-caps -- wrap `body` in a let-chain binding
+  ;;; `<wbind>-<Comp>-read-cap : (XReadCap <wtype> Comp)` for each comp.
+  ;;; XReadCap is non-linear, so no auto-consume is needed.
+  (defmacro xsystem--with-read-caps [body wbind wtype comps]
+    (if (empty? comps)
+      `~body
+      (let [comp       (first comps)
+            rest-comps (rest comps)
+            cap-name   (str->sym (str-append (symbol-name wbind)
+                                   "-"
+                                   (symbol-name comp)
+                                   "-read-cap"))
+            cid-name   (str->sym (str-append (symbol-name comp) "-cid"))]
+        `(let [~cap-name (:: (make-read-cap ~cid-name) (XReadCap ~wtype ~comp))]
+           (xsystem--with-read-caps ~body ~wbind ~wtype ~rest-comps)))))
+  ;;; xsystem--consume-write-caps -- emit `(use-cap! <wbind>-<Comp>-write-cap)`
+  ;;; for each comp, sequenced via nested `do`. Runs at body end so the
+  ;;; linear write-caps are consumed exactly once.
+  (defmacro xsystem--consume-write-caps [wbind comps]
+    (if (empty? comps)
+      nil
+      (let [comp       (first comps)
+            rest-comps (rest comps)
+            cap-name   (str->sym (str-append (symbol-name wbind)
+                                   "-"
+                                   (symbol-name comp)
+                                   "-write-cap"))]
         `(do
-           (defn ~impl-name [^borrow ~w0b : ~w0t  ^borrow ~w1b : ~w1t] : nil
-             (xsystem--with-read-caps
-               (xsystem--with-read-caps
-                 (xsystem--with-write-caps
-                   (xsystem--with-write-caps
-                     (do
-                       ~bdy
-                       (xsystem--consume-write-caps ~w0b ~w0v)
-                       (xsystem--consume-write-caps ~w1b ~w1v))
-                     ~w1b ~w1t ~w1v)
-                   ~w0b ~w0t ~w0v)
-                 ~w1b ~w1t ~r1v)
-               ~w0b ~w0t ~r0v))
-           (defn ~fn-name [wp0 : int wp1 : int] : nil
-             (let [a : ~w0t (~load0 wp0)
-                   b : ~w1t (~load1 wp1)]
-               (~impl-name a b)))
-           (def ~name (make-xsystem
-                        (xsystem--mask ~r0v)
-                        (xsystem--mask ~w0v)
-                        (xsystem--mask ~r1v)
-                        (xsystem--mask ~w1v)
-                        ~fn-name))))
-      ;; -------------------------------------------------------------
-      ;; N-world path (>= 3 worlds) -- N-W-V0.
-      ;; -------------------------------------------------------------
-      (let [;; CT: walk `worlds` two tokens at a time, resolving each
-            ;; world's reads / writes clause into a (wbind wtype rv wv)
-            ;; tuple.
-            collect
-            (letrec [go
-                     (fn [ws]
-                       (if (empty? ws)
-                         `()
-                         (let [wbind (first ws)
-                               wtype (first (rest ws))
-                               tail  (rest (rest ws))
-                               rv    (find-clause :reads-from wbind cls)
-                               wv    (find-clause :writes-to  wbind cls)]
-                           ;; Triple is a cons-LIST `(wbind wtype rv wv)`;
-                           ;; the splice helpers walk it with first/rest.
-                           ;; Both this list and the triple must terminate
-                           ;; in an empty *list* -- consing onto `(vec)`
-                           ;; yields a structure first/rest mishandle.
-                           (cons (cons wbind (cons wtype (cons rv (cons wv `()))))
-                                 (go tail)))))]
-              go)
-            ;; CT: count worlds (two tokens each).
-            countf
-            (letrec [go (fn [ws] (if (empty? ws) 0 (+ 1 (go (rest (rest ws))))))]
-              go)
-            triples (collect worlds)
-            nworlds (countf worlds)
-            ;; CT: fold the per-world cap wrappers around an inner form.
-            ;; `which` 0 -> read-caps (over each world's reads vec),
-            ;; 1 -> write-caps (over each world's writes vec). World 0 is
-            ;; outermost; nesting order is irrelevant to the lock model.
-            fold-wrap
-            (letrec [go
-                     (fn [which trs inner]
-                       (if (empty? trs)
-                         inner
-                         (let [tr    (first trs)
-                               wbind (first tr)
-                               wtype (first (rest tr))
-                               rv    (first (rest (rest tr)))
-                               wv    (first (rest (rest (rest tr))))]
-                           (if (= which 0)
-                             `(xsystem--with-read-caps
-                                ~(go which (rest trs) inner) ~wbind ~wtype ~rv)
-                             `(xsystem--with-write-caps
-                                ~(go which (rest trs) inner) ~wbind ~wtype ~wv)))))]
-              go)
-            core    `(do ~bdy ~@(xsystem--n-consumes triples))
-            wrapped (fold-wrap 0 triples (fold-wrap 1 triples core))]
-        `(do
-           (defn ~fn-name [hp : int] : nil
-             (let [~@(xsystem--n-loads triples 0)]
-               ~wrapped))
-           (def ~name
-             (let [__rds (xsm-alloc ~nworlds)
-                   __wrs (xsm-alloc ~nworlds)]
-               ~@(xsystem--n-mask-fills triples 0)
-               (make-xsystem-n ~nworlds __rds __wrs ~fn-name)))
-           ~@(xsystem--n-checks triples))))))
-
-) ;; end defmodule ecs/xsystem
+           (use-cap! ~cap-name)
+           (xsystem--consume-write-caps ~wbind ~rest-comps)))))
+  ;;; ---------------------------------------------------------------------------
+  ;;; N-world `defxsystem` expansion helpers.
+  ;;;
+  ;;; Each helper walks a CT `triples` list -- one entry per declared
+  ;;; world, shaped `(wbind wtype reads-vec writes-vec)` -- and splices a
+  ;;; chunk of the N-world expansion. They are the variable-arity analogue
+  ;;; of the fixed two-world template; the main macro folds the cap
+  ;;; wrappers (which nest, rather than splice) with a CT `letrec`.
+  ;;; ---------------------------------------------------------------------------
+  ;;; xsystem--n-loads -- emit the `NAME-fn` let-bindings that load each
+  ;;; world from the handle array `hp`: `wbind : Wtype (load-Wtype (xsm-get
+  ;;; hp i))`, one group per world, indices counting up from `i`.
+  ;;; Since: N-W-V0
+  (defmacro xsystem--n-loads [triples i]
+    (if (empty? triples)
+      `()
+      (let [tr     (first triples)
+            wbind  (first tr)
+            wtype  (first (rest tr))
+            loadfn (str->sym (str-append "load-" (symbol-name wtype)))]
+        `(~wbind : ~wtype
+           (~loadfn (xsm-get hp ~i))
+           ~@(xsystem--n-loads (rest triples) (+ i 1))))))
+  ;;; xsystem--n-consumes -- emit one `(xsystem--consume-write-caps wbind
+  ;;; writes-vec)` per world, run at body end so every world's linear
+  ;;; write-caps are discharged exactly once.
+  ;;; Since: N-W-V0
+  (defmacro xsystem--n-consumes [triples]
+    (if (empty? triples)
+      `()
+      (let [tr    (first triples)
+            wbind (first tr)
+            wv    (first (rest (rest (rest tr))))]
+        `((xsystem--consume-write-caps ~wbind ~wv) ~@(xsystem--n-consumes (rest triples))))))
+  ;;; xsystem--n-mask-fills -- emit the per-world `(xsm-set! __rds i MASK)`
+  ;;; / `(xsm-set! __wrs i MASK)` pairs that populate the mask arrays at
+  ;;; `(def NAME ...)` time. `__rds` / `__wrs` are bound by the caller.
+  ;;; Since: N-W-V0
+  (defmacro xsystem--n-mask-fills [triples i]
+    (if (empty? triples)
+      `()
+      (let [tr (first triples)
+            rv (first (rest (rest tr)))
+            wv (first (rest (rest (rest tr))))]
+        `((xsm-set! __rds ~i (xsystem--mask ~rv)) (xsm-set! __wrs
+                                                    ~i
+                                                    (xsystem--mask ~wv))
+           ~@(xsystem--n-mask-fills (rest triples) (+ i 1))))))
+  ;;; xsystem--n-checks -- the "every declared world appears in >= 1
+  ;;; clause" validation (N-W-V0.1). For each world that has *neither* a
+  ;;; reads nor a writes clause, emit a descriptively-named bare symbol;
+  ;;; with no clause referencing it the symbol is unbound, so the compiler
+  ;;; rejects the declaration with a message that names the dropped world.
+  ;;; (Turmeric has no compile-time warn channel, so this is a hard error
+  ;;; rather than the plan's "warn" -- it keeps unintentional drops honest
+  ;;; the same way, just louder.) Worlds that are used emit nothing.
+  ;;; Since: N-W-V0
+  (defmacro xsystem--n-checks [triples]
+    (if (empty? triples)
+      `()
+      (let [tr    (first triples)
+            wbind (first tr)
+            rv    (first (rest (rest tr)))
+            wv    (first (rest (rest (rest tr))))]
+        (if (empty? rv)
+          (if (empty? wv)
+            `(~(str->sym (str-append "defxsystem--world-"
+                           (symbol-name wbind)
+                           "-declared-but-never-read-or-written")) ~@(xsystem--n-checks (rest triples)))
+            `(~@(xsystem--n-checks (rest triples))))
+          `(~@(xsystem--n-checks (rest triples)))))))
+  ;;; defxsystem -- declare a cross-world System and its implementation.
+  ;;;
+  ;;; Syntax (any clause order; missing :reads-from / :writes-to for a
+  ;;; world default to []; multiple body forms are wrapped in (do ...)):
+  ;;;
+  ;;;   (defxsystem NAME
+  ;;;     [w0 W0Type  w1 W1Type  ...]   ;; two OR MORE world bindings
+  ;;;     :reads-from  w0 [..]   ;; any order; either side omittable
+  ;;;     :writes-to   w1 [..]
+  ;;;     BODY ...)
+  ;;;
+  ;;; **Two worlds (the original shape)** expand exactly as before, via a
+  ;;; `NAME-impl` taking both worlds `^borrow`, a `NAME-fn [wp0 wp1]`
+  ;;; trampoline, and `(def NAME (make-xsystem ...))`. This path is left
+  ;;; byte-for-byte unchanged so two-world fixtures are unaffected.
+  ;;;
+  ;;; **Three or more worlds (N-W-V0)** expand to:
+  ;;;
+  ;;;   (defn NAME-fn [hp : int] : nil          ;; hp -> int64[n] handle array
+  ;;;     (let [w0 : W0 (load-W0 (xsm-get hp 0))
+  ;;;           w1 : W1 (load-W1 (xsm-get hp 1))
+  ;;;           w2 : W2 (load-W2 (xsm-get hp 2))]
+  ;;;       ;; read-caps + write-caps bound per (world, comp); body; auto-consume
+  ;;;       ...))
+  ;;;   (def NAME
+  ;;;     (let [rds (xsm-alloc n) wrs (xsm-alloc n)]
+  ;;;       ... fill rds[i]/wrs[i] with each world's masks ...
+  ;;;       (make-xsystem-n n rds wrs NAME-fn)))
+  ;;;
+  ;;; The per-(world, component) lock model is identical; only the
+  ;;; bookkeeping arity changes. Every declared world must appear in at
+  ;;; least one clause (see `xsystem--n-checks`). `load-<Wtype>`
+  ;;; (int-carrier -> typed world) must be in scope for every world, the
+  ;;; same convention `sized-defsystem-scheduled` uses.
+  ;;;
+  ;;; Since: X2 (CLAUSE-V0: any clause order, empties omittable;
+  ;;;            N-W-V0: three-or-more worlds)
+  (defmacro defxsystem [name worlds & clauses]
+    (let [impl-name   (str->sym (str-append (symbol-name name) "-impl"))
+          fn-name     (str->sym (str-append (symbol-name name) "-fn"))
+          ;; `clauses` is a macro param: substitute_params replaces it with
+          ;; a literal F_LIST before CT eval runs; without `quote`, CT would
+          ;; try to call the first element as a function. The quote keeps
+          ;; the list as data for the helpers to walk.
+          cls         (quote clauses)
+          ;; CT helper: walk a clause list `cs` 3-at-a-time. When (first cs)
+          ;; matches :reads-from / :writes-to AND (second cs) matches the
+          ;; target world name, return the third (the comp vec). When the
+          ;; head is not a clause keyword the clauses have ended; return
+          ;; the empty-vec default. Recursive in CT via letrec.
+          find-clause (letrec [go
+                               (fn [kw wname cs]
+                                 (if (empty? cs)
+                                   (vec)
+                                   (let [k (first cs)]
+                                     (if (= k :reads-from)
+                                       (let [w    (first (rest cs))
+                                             v    (first (rest (rest cs)))
+                                             tail (rest (rest (rest cs)))]
+                                         (if (= kw :reads-from)
+                                           (if (= w wname) v (go kw wname tail))
+                                           (go kw wname tail)))
+                                       (if (= k :writes-to)
+                                         (let [w    (first (rest cs))
+                                               v    (first (rest (rest cs)))
+                                               tail (rest (rest (rest cs)))]
+                                           (if (= kw :writes-to)
+                                             (if (= w wname)
+                                               v
+                                               (go kw wname tail))
+                                             (go kw wname tail)))
+                                         ;; body reached; clause not present
+                                         (vec))))))]
+                        go)
+          ;; CT helper: collect all forms past the trailing clauses and
+          ;; wrap them in (do ...) so multiple body forms are supported.
+          find-body   (letrec [go
+                               (fn [cs]
+                                 (if (empty? cs)
+                                   nil
+                                   (let [k (first cs)]
+                                     (if (= k :reads-from)
+                                       (go (rest (rest (rest cs))))
+                                       (if (= k :writes-to)
+                                         (go (rest (rest (rest cs))))
+                                         (cons (quote do) cs))))))]
+                        go)
+          bdy         (find-body cls)
+          ;; `more` is non-empty exactly when more than two worlds are
+          ;; declared (worlds = [b0 T0 b1 T1 ...], two tokens per world).
+          more        (rest (rest (rest (rest worlds))))]
+      (if (empty? more)
+        ;; -------------------------------------------------------------
+        ;; Two-world path -- unchanged from X2 (byte-equal codegen).
+        ;; -------------------------------------------------------------
+        (let [ws1   (rest worlds)
+              ws2   (rest ws1)
+              ws3   (rest ws2)
+              w0b   (first worlds)
+              w0t   (first ws1)
+              w1b   (first ws2)
+              w1t   (first ws3)
+              load0 (str->sym (str-append "load-" (symbol-name w0t)))
+              load1 (str->sym (str-append "load-" (symbol-name w1t)))
+              r0v   (find-clause :reads-from w0b cls)
+              w0v   (find-clause :writes-to w0b cls)
+              r1v   (find-clause :reads-from w1b cls)
+              w1v   (find-clause :writes-to w1b cls)]
+          `(do
+             (defn ~impl-name [^borrow ~w0b : ~w0t ^borrow ~w1b : ~w1t] : nil
+               (xsystem--with-read-caps (xsystem--with-read-caps (xsystem--with-write-caps (xsystem--with-write-caps (do
+                                                                                                                       ~bdy
+                                                                                                                       (xsystem--consume-write-caps ~w0b
+                                                                                                                         ~w0v)
+                                                                                                                       (xsystem--consume-write-caps ~w1b
+                                                                                                                         ~w1v))
+                                                                                             ~w1b
+                                                                                             ~w1t
+                                                                                             ~w1v)
+                                                                   ~w0b
+                                                                   ~w0t
+                                                                   ~w0v)
+                                          ~w1b
+                                          ~w1t
+                                          ~r1v)
+                 ~w0b
+                 ~w0t
+                 ~r0v))
+             (defn ~fn-name [wp0 : int wp1 : int] : nil
+               (let [a            : ~w0t
+                     (~load0 wp0) b
+                     : ~w1t       (~load1 wp1)]
+                 (~impl-name a b)))
+             (def ~name
+               (make-xsystem (xsystem--mask ~r0v)
+                 (xsystem--mask ~w0v)
+                 (xsystem--mask ~r1v)
+                 (xsystem--mask ~w1v)
+                 ~fn-name))))
+        ;; -------------------------------------------------------------
+        ;; N-world path (>= 3 worlds) -- N-W-V0.
+        ;; -------------------------------------------------------------
+        (let [ ;; CT: walk `worlds` two tokens at a time, resolving each
+              ;; world's reads / writes clause into a (wbind wtype rv wv)
+              ;; tuple.
+              collect   (letrec [go
+                                 (fn [ws]
+                                   (if (empty? ws)
+                                     `()
+                                     (let [wbind (first ws)
+                                           wtype (first (rest ws))
+                                           tail  (rest (rest ws))
+                                           rv    (find-clause :reads-from
+                                                   wbind
+                                                   cls)
+                                           wv    (find-clause :writes-to
+                                                   wbind
+                                                   cls)]
+                                       ;; Triple is a cons-LIST `(wbind wtype rv wv)`;
+                                       ;; the splice helpers walk it with first/rest.
+                                       ;; Both this list and the triple must terminate
+                                       ;; in an empty *list* -- consing onto `(vec)`
+                                       ;; yields a structure first/rest mishandle.
+                                       (cons (cons wbind
+                                               (cons wtype
+                                                 (cons rv (cons wv `()))))
+                                         (go tail)))))]
+                          go)
+              ;; CT: count worlds (two tokens each).
+              countf    (letrec [go
+                                 (fn [ws]
+                                   (if (empty? ws)
+                                     0
+                                     (+ 1 (go (rest (rest ws))))))]
+                          go)
+              triples   (collect worlds)
+              nworlds   (countf worlds)
+              ;; CT: fold the per-world cap wrappers around an inner form.
+              ;; `which` 0 -> read-caps (over each world's reads vec),
+              ;; 1 -> write-caps (over each world's writes vec). World 0 is
+              ;; outermost; nesting order is irrelevant to the lock model.
+              fold-wrap (letrec [go
+                                 (fn [which trs inner]
+                                   (if (empty? trs)
+                                     inner
+                                     (let [tr    (first trs)
+                                           wbind (first tr)
+                                           wtype (first (rest tr))
+                                           rv    (first (rest (rest tr)))
+                                           wv    (first (rest (rest (rest tr))))]
+                                       (if (= which 0)
+                                         `(xsystem--with-read-caps ~(go which
+                                                                      (rest trs)
+                                                                      inner)
+                                            ~wbind
+                                            ~wtype
+                                            ~rv)
+                                         `(xsystem--with-write-caps ~(go which
+                                                                       (rest trs)
+                                                                       inner)
+                                            ~wbind
+                                            ~wtype
+                                            ~wv)))))]
+                          go)
+              core      `(do ~bdy ~@(xsystem--n-consumes triples))
+              wrapped   (fold-wrap 0 triples (fold-wrap 1 triples core))]
+          `(do
+             (defn ~fn-name [hp : int] : nil
+               (let [~@(xsystem--n-loads triples 0)] ~wrapped))
+             (def ~name
+               (let [__rds (xsm-alloc ~nworlds)
+                     __wrs (xsm-alloc ~nworlds)]
+                 ~@(xsystem--n-mask-fills triples 0)
+                 (make-xsystem-n ~nworlds __rds __wrs ~fn-name)))
+             ~@(xsystem--n-checks triples))))))) ;; end defmodule ecs/xsystem

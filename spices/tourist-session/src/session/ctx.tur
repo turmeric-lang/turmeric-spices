@@ -19,36 +19,43 @@
 ;;; the public ctx-attr-set! (a plain void setter).
 ;;;
 ;;; Since: v0.1.0
-
 (defmodule session/ctx
-  (import session/data   :refer [SessMap sessmap-new sessmap-get sessmap-set!
-                                 sessmap-del!])
-  (import session/id     :refer [session-id-new])
+  (import session/data
+    :refer
+    [SessMap sessmap-new sessmap-get sessmap-set! sessmap-del!])
+  (import session/id :refer [session-id-new])
   (import session/cookie :refer [cookie-unsign])
-  (import session/store  :refer [store-load])
+  (import session/store :refer [store-load])
   (import session/ownstr :refer [String to-cstr release])
-  (import session/state  :refer [session-get-store session-config-ptr
-                                 cfg-cookie-name cfg-signing-key])
-  (import tourist/param  :refer [ctx-attr-set!])
-  (import tourist/types  :refer [Ctx])
+  (import session/state
+    :refer
+    [session-get-store session-config-ptr cfg-cookie-name cfg-signing-key])
+  (import tourist/param :refer [ctx-attr-set!])
+  (import tourist/types :refer [Ctx])
   (import tourist/request :refer [req-cookie])
-  (export session-get session-set! session-del! session-destroy! session-id
-          session-rotate!
-          ;; internal surface consumed by session/mw:
-          session-existing sess-id sess-map sess-dirty? sess-destroy?
-          sess-new? sess-rotate-from sess-free)
-
-;; struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
-;;   id          -- an owned session/ownstr String handle (freed via ownstr/release)
-;;   rotate_from -- a malloc'd cstr copy of the pre-rotate id (freed via free)
-
-(def __SESS-KEY "__tursess")
-
-;; -- session-state heap struct ---------------------------------------------
-
-(defn __sess-new [id : String map : SessMap is-new : int] : int
-  ```c
-  #include <stdlib.h>
+  (export session-get
+    session-set!
+    session-del!
+    session-destroy!
+    session-id
+    session-rotate!
+    ;; internal surface consumed by session/mw:
+    session-existing
+    sess-id
+    sess-map
+    sess-dirty?
+    sess-destroy?
+    sess-new?
+    sess-rotate-from
+    sess-free)
+  ;; struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
+  ;;   id          -- an owned session/ownstr String handle (freed via ownstr/release)
+  ;;   rotate_from -- a malloc'd cstr copy of the pre-rotate id (freed via free)
+  (def __SESS-KEY "__tursess")
+  ;; -- session-state heap struct ---------------------------------------------
+  (defn __sess-new [id : String map : SessMap is-new : int] : int
+    ```c
+    #include <stdlib.h>
   struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
   struct __sess *s = malloc(sizeof(*s));
   s->id      = (int64_t)id;   /* owned ownstr String handle */
@@ -59,100 +66,89 @@
   s->rotate_from = (char *)0;
   return (int64_t)(intptr_t)s;
   ```)
-
-;;; sess-id -- session ID string held by a session-state struct (borrowed).
-;;;
-;;; Borrows the bytes of the struct's owned String id; the returned cstr is
-;;; valid until the struct is freed by sess-free.
-(defn sess-id [p : int] : cstr
-  ```c
-  extern const char *tur_string_cstr(void *);
+  ;;; sess-id -- session ID string held by a session-state struct (borrowed).
+  ;;;
+  ;;; Borrows the bytes of the struct's owned String id; the returned cstr is
+  ;;; valid until the struct is freed by sess-free.
+  (defn sess-id [p : int] : cstr
+    ```c
+    extern const char *tur_string_cstr(void *);
   struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
   return (const char *)tur_string_cstr((void *)(intptr_t)((struct __sess *)(intptr_t)p)->id);
   ```)
-
-;;; sess-map -- SessMap handle held by a session-state struct.
-(defn sess-map [p : int] : SessMap
-  ```c
-  struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
+  ;;; sess-map -- SessMap handle held by a session-state struct.
+  (defn sess-map [p : int] : SessMap
+    ```c
+    struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
   return ((struct __sess *)(intptr_t)p)->map;
   ```)
-
-;;; sess-dirty? -- 1 if the session was written since load.
-(defn sess-dirty? [p : int] : int
-  ```c
-  struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
+  ;;; sess-dirty? -- 1 if the session was written since load.
+  (defn sess-dirty? [p : int] : int
+    ```c
+    struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
   return ((struct __sess *)(intptr_t)p)->dirty;
   ```)
-
-;;; sess-destroy? -- 1 if session-destroy! was called.
-(defn sess-destroy? [p : int] : int
-  ```c
-  struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
+  ;;; sess-destroy? -- 1 if session-destroy! was called.
+  (defn sess-destroy? [p : int] : int
+    ```c
+    struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
   return ((struct __sess *)(intptr_t)p)->destroy;
   ```)
-
-;;; sess-new? -- 1 if a fresh session ID was minted (no valid cookie present).
-(defn sess-new? [p : int] : int
-  ```c
-  struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
+  ;;; sess-new? -- 1 if a fresh session ID was minted (no valid cookie present).
+  (defn sess-new? [p : int] : int
+    ```c
+    struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
   return ((struct __sess *)(intptr_t)p)->is_new;
   ```)
-
-(defn __sess-set-dirty! [p : int] : void
-  ```c
-  struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
+  (defn __sess-set-dirty! [p : int] : void
+    ```c
+    struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
   ((struct __sess *)(intptr_t)p)->dirty = 1;
   ```)
-
-(defn __sess-set-destroy! [p : int] : void
-  ```c
-  struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
+  (defn __sess-set-destroy! [p : int] : void
+    ```c
+    struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
   ((struct __sess *)(intptr_t)p)->destroy = 1;
   ```)
-
-;;; sess-rotate-from -- the original (pre-rotate) session ID, or NULL.
-;;;
-;;; Set once by the first session-rotate! of the request; read by the flush so
-;;; it can delete the stale store entry after saving under the new ID.
-(defn sess-rotate-from [p : int] : cstr
-  ```c
-  struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
+  ;;; sess-rotate-from -- the original (pre-rotate) session ID, or NULL.
+  ;;;
+  ;;; Set once by the first session-rotate! of the request; read by the flush so
+  ;;; it can delete the stale store entry after saving under the new ID.
+  (defn sess-rotate-from [p : int] : cstr
+    ```c
+    struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
   return (const char *)((struct __sess *)(intptr_t)p)->rotate_from;
   ```)
-
-;;; __sess-set-rotate-from! -- stash the original ID, once.
-;;;
-;;; Only the *first* rotate records a rotate-from id; a second rotate in the same
-;;; request keeps the original so a chain of rotates collapses to one delete of
-;;; the truly-original store entry (the intermediate IDs were never persisted).
-(defn __sess-set-rotate-from! [p : int oldid : cstr] : void
-  ```c
-  #include <stdlib.h>
+  ;;; __sess-set-rotate-from! -- stash the original ID, once.
+  ;;;
+  ;;; Only the *first* rotate records a rotate-from id; a second rotate in the same
+  ;;; request keeps the original so a chain of rotates collapses to one delete of
+  ;;; the truly-original store entry (the intermediate IDs were never persisted).
+  (defn __sess-set-rotate-from! [p : int oldid : cstr] : void
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
   struct __sess *s = (struct __sess *)(intptr_t)p;
   if (s->rotate_from == 0)
     s->rotate_from = strdup((const char *)oldid);
   ```)
-
-;;; __sess-set-id! -- replace the session ID, releasing the old owned String.
-(defn __sess-set-id! [p : int newid : String] : void
-  ```c
-  extern void tur_string_release(void *);
+  ;;; __sess-set-id! -- replace the session ID, releasing the old owned String.
+  (defn __sess-set-id! [p : int newid : String] : void
+    ```c
+    extern void tur_string_release(void *);
   struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
   struct __sess *s = (struct __sess *)(intptr_t)p;
   tur_string_release((void *)(intptr_t)s->id);
   s->id = (int64_t)newid;
   ```)
-
-;;; sess-free -- free the session-state struct, its id, and its map.
-;;;
-;;; Called by the response flush after persisting. Frees the SessMap via the
-;;; data module and the id buffer this struct owns.
-(defn sess-free [p : int] : void
-  ```c
-  #include <stdlib.h>
+  ;;; sess-free -- free the session-state struct, its id, and its map.
+  ;;;
+  ;;; Called by the response flush after persisting. Frees the SessMap via the
+  ;;; data module and the id buffer this struct owns.
+  (defn sess-free [p : int] : void
+    ```c
+    #include <stdlib.h>
   extern void session__data__sessmap_hyfree(int64_t);
   extern void tur_string_release(void *);
   struct __sess { int64_t id; int64_t map; int64_t dirty; int64_t destroy; int64_t is_new; char *rotate_from; };
@@ -163,17 +159,15 @@
   free(s->rotate_from);
   free(s);
   ```)
-
-;; -- ctx introspection (reads the documented __tourist_ctx layout) ---------
-
-;;; __ctx-attr-int -- read a per-request attr as an int (0 if absent).
-;;;
-;;; Mirrors tourist/param's ctx-attr-get but returns a bare int so it composes
-;;; without the carrier-Option ABI. The attrs cons layout is owned by
-;;; tourist/param and documented there.
-(defn __ctx-attr-int [ctx : Ctx key : cstr] : int
-  ```c
-  #include <string.h>
+  ;; -- ctx introspection (reads the documented __tourist_ctx layout) ---------
+  ;;; __ctx-attr-int -- read a per-request attr as an int (0 if absent).
+  ;;;
+  ;;; Mirrors tourist/param's ctx-attr-get but returns a bare int so it composes
+  ;;; without the carrier-Option ABI. The attrs cons layout is owned by
+  ;;; tourist/param and documented there.
+  (defn __ctx-attr-int [ctx : Ctx key : cstr] : int
+    ```c
+    #include <string.h>
   struct __tourist_attr { char *key; int64_t val; struct __tourist_attr *next; };
   struct __tourist_ctx_h {
     char  *method; char *path; char *query; char *body;
@@ -192,157 +186,130 @@
   }
   return 0;
   ```)
-
-(defn __cstr-null? [s : cstr] : bool
-  ```c
-  return ((const char *)s) == 0;
+  (defn __cstr-null? [s : cstr] : bool
+    ```c
+    return ((const char *)s) == 0;
   ```)
-
-(defn __cstr-dup [s : cstr] : cstr
-  ```c
-  #include <stdlib.h>
+  (defn __cstr-dup [s : cstr] : cstr
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   return (const char *)strdup((const char *)s);
   ```)
-
-;; -- lazy initialisation ---------------------------------------------------
-
-;;; session-existing -- the session-state struct already attached, or 0.
-;;;
-;;; Used by session/mw's flush to skip requests that never touched the session.
-;;;
-;;; Since: v0.1.0
-(defn session-existing [ctx : Ctx] : int
-  (__ctx-attr-int ctx __SESS-KEY))
-
-;;; __session-ensure -- lazily load/create the session for this request.
-;;;
-;;; Returns the session-state struct pointer, creating it on first call:
-;;;   * read the configured cookie; if it names a session the store knows,
-;;;     adopt that ID + loaded map;
-;;;   * otherwise mint a fresh 256-bit ID and an empty map.
-(defn __session-ensure [ctx : Ctx] : int
-  (let [existing (__ctx-attr-int ctx __SESS-KEY)]
-    (if (not= existing 0)
-      existing
-      (__session-init ctx))))
-
-(defn __session-init [ctx : Ctx] : int
-  (let [found (req-cookie ctx (cfg-cookie-name (session-config-ptr)))]
-    (if (some? found)
-      (__session-init-from-cookie ctx (unwrap found))
-      (__session-attach ctx (session-id-new) (sessmap-new) 1))))
-
-(defn __session-init-from-cookie [ctx : Ctx cookie-val : cstr] : int
-  ;; cookie-val is the raw (possibly signed) value, owned by the request
-  ;; (tourist's req-cookie). Verify the signature first: with a key set, a
-  ;; tampered/forged MAC fails here and is indistinguishable from an unknown
-  ;; ID (a fresh session is minted); with signing off, the value is the ID
-  ;; verbatim.
-  (let [skey (cfg-signing-key (session-config-ptr))
-        un   (cookie-unsign skey cookie-val)]
-    (if (ok? un)
-      (__session-init-with-id ctx (ok-val un))
-      (__session-attach ctx (session-id-new) (sessmap-new) 1))))
-
-;;; __session-init-with-id -- load a verified session ID from the store.
-;;;
-;;; Takes ownership of `id` (the unsigned session ID String). On a hit the id
-;;; becomes the session-state's own id; on a miss it is released and a fresh
-;;; session is minted.
-(defn __session-init-with-id [ctx : Ctx id : String] : int
-  (let [store  (session-get-store)
-        loaded (store-load store (to-cstr id))]
-    (if (not= loaded 0)
-      (__session-attach ctx id (:: loaded :SessMap) 0)
-      (let [p (__session-attach ctx (session-id-new) (sessmap-new) 1)]
-        (do (release id) p)))))
-
-(defn __session-attach [ctx : Ctx id : String map : SessMap is-new : int] : int
-  (let [p (__sess-new id map is-new)]
-    (do (ctx-attr-set! ctx __SESS-KEY p) p)))
-
-;; -- public helpers --------------------------------------------------------
-
-;;; session-get -- read a session value.
-;;;
-;;; Returns ok(value) if the key is set in this session, err("missing")
-;;; otherwise. The value is borrowed from the session map (valid until the
-;;; response flush frees it); copy it if you need it longer.
-;;;
-;;; Parameters:
-;;;   ctx -- tourist context
-;;;   key -- session key
-;;;
-;;; Returns:
-;;;   (Result cstr cstr)
-;;;
-;;; Since: v0.1.0
-(defn session-get [ctx : Ctx key : cstr] : (Result cstr cstr)
-  (sessmap-get (sess-map (__session-ensure ctx)) key))
-
-;;; session-set! -- write a session value (marks the session dirty).
-;;;
-;;; Both key and value are copied into the session map.
-;;;
-;;; Since: v0.1.0
-(defn session-set! [ctx : Ctx key : cstr val : cstr] : void
-  (let [p (__session-ensure ctx)]
-    (do
-      (sessmap-set! (sess-map p) key val)
-      (__sess-set-dirty! p))))
-
-;;; session-del! -- remove a session key (marks the session dirty).
-;;;
-;;; Since: v0.1.0
-(defn session-del! [ctx : Ctx key : cstr] : void
-  (let [p (__session-ensure ctx)]
-    (do
-      (sessmap-del! (sess-map p) key)
-      (__sess-set-dirty! p))))
-
-;;; session-destroy! -- delete the session from the store and clear its cookie.
-;;;
-;;; Marks the session for destruction; the response flush calls store-delete
-;;; and emits an expiring Set-Cookie.
-;;;
-;;; Since: v0.1.0
-(defn session-destroy! [ctx : Ctx] : void
-  (__sess-set-destroy! (__session-ensure ctx)))
-
-;;; session-id -- the current session ID (borrowed; 64-char hex).
-;;;
-;;; Since: v0.1.0
-(defn session-id [ctx : Ctx] : cstr
-  (sess-id (__session-ensure ctx)))
-
-;;; session-rotate! -- issue a fresh session ID, carrying the data forward.
-;;;
-;;; Mints a new 256-bit session ID, keeps the live session map (no data loss),
-;;; and records the original ID so the flush can save under the new ID, delete
-;;; the old store entry, and Set-Cookie the new ID. Best practice is to call
-;;; this immediately after a privilege change (e.g. successful login) to defend
-;;; against session fixation:
-;;;
-;;;   (session-set! ctx "user_id" uid)
-;;;   (session-rotate! ctx)            ;; new ID, same data
-;;;
-;;; Calling it more than once in a request is safe: only the truly-original ID
-;;; is remembered for deletion (intermediate IDs are never persisted), so a
-;;; chain of rotates collapses to one stale-entry delete. When cookie signing
-;;; (S0) is on, the cookie's MAC changes automatically because it is computed
-;;; over the new ID -- no extra work here.
-;;;
-;;; Parameters:
-;;;   ctx -- tourist context
-;;;
-;;; Since: v0.2.0
-(defn session-rotate! [ctx : Ctx] : void
-  (let [p   (__session-ensure ctx)
-        old (sess-id p)]
-    (do
-      (__sess-set-rotate-from! p old)   ;; dups `old` (once); safe before set-id!
-      (__sess-set-id! p (session-id-new))
-      (__sess-set-dirty! p))))
-
-) ;; end defmodule session/ctx
+  ;; -- lazy initialisation ---------------------------------------------------
+  ;;; session-existing -- the session-state struct already attached, or 0.
+  ;;;
+  ;;; Used by session/mw's flush to skip requests that never touched the session.
+  ;;;
+  ;;; Since: v0.1.0
+  (defn session-existing [ctx : Ctx] : int (__ctx-attr-int ctx __SESS-KEY))
+  ;;; __session-ensure -- lazily load/create the session for this request.
+  ;;;
+  ;;; Returns the session-state struct pointer, creating it on first call:
+  ;;;   * read the configured cookie; if it names a session the store knows,
+  ;;;     adopt that ID + loaded map;
+  ;;;   * otherwise mint a fresh 256-bit ID and an empty map.
+  (defn __session-ensure [ctx : Ctx] : int
+    (let [existing (__ctx-attr-int ctx __SESS-KEY)]
+      (if (not= existing 0) existing (__session-init ctx))))
+  (defn __session-init [ctx : Ctx] : int
+    (let [found (req-cookie ctx (cfg-cookie-name (session-config-ptr)))]
+      (if (some? found)
+        (__session-init-from-cookie ctx (unwrap found))
+        (__session-attach ctx (session-id-new) (sessmap-new) 1))))
+  (defn __session-init-from-cookie [ctx : Ctx cookie-val : cstr] : int
+    ;; cookie-val is the raw (possibly signed) value, owned by the request
+    ;; (tourist's req-cookie). Verify the signature first: with a key set, a
+    ;; tampered/forged MAC fails here and is indistinguishable from an unknown
+    ;; ID (a fresh session is minted); with signing off, the value is the ID
+    ;; verbatim.
+    (let [skey (cfg-signing-key (session-config-ptr))
+          un   (cookie-unsign skey cookie-val)]
+      (if (ok? un)
+        (__session-init-with-id ctx (ok-val un))
+        (__session-attach ctx (session-id-new) (sessmap-new) 1))))
+  ;;; __session-init-with-id -- load a verified session ID from the store.
+  ;;;
+  ;;; Takes ownership of `id` (the unsigned session ID String). On a hit the id
+  ;;; becomes the session-state's own id; on a miss it is released and a fresh
+  ;;; session is minted.
+  (defn __session-init-with-id [ctx : Ctx id : String] : int
+    (let [store  (session-get-store)
+          loaded (store-load store (to-cstr id))]
+      (if (not= loaded 0)
+        (__session-attach ctx id (:: loaded :SessMap) 0)
+        (let [p (__session-attach ctx (session-id-new) (sessmap-new) 1)]
+          (do (release id) p)))))
+  (defn __session-attach [ctx : Ctx id : String map : SessMap is-new : int] : int
+    (let [p (__sess-new id map is-new)] (do (ctx-attr-set! ctx __SESS-KEY p) p)))
+  ;; -- public helpers --------------------------------------------------------
+  ;;; session-get -- read a session value.
+  ;;;
+  ;;; Returns ok(value) if the key is set in this session, err("missing")
+  ;;; otherwise. The value is borrowed from the session map (valid until the
+  ;;; response flush frees it); copy it if you need it longer.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- tourist context
+  ;;;   key -- session key
+  ;;;
+  ;;; Returns:
+  ;;;   (Result cstr cstr)
+  ;;;
+  ;;; Since: v0.1.0
+  (defn session-get [ctx : Ctx key : cstr] : (Result cstr cstr)
+    (sessmap-get (sess-map (__session-ensure ctx)) key))
+  ;;; session-set! -- write a session value (marks the session dirty).
+  ;;;
+  ;;; Both key and value are copied into the session map.
+  ;;;
+  ;;; Since: v0.1.0
+  (defn session-set! [ctx : Ctx key : cstr val : cstr] : void
+    (let [p (__session-ensure ctx)]
+      (do (sessmap-set! (sess-map p) key val) (__sess-set-dirty! p))))
+  ;;; session-del! -- remove a session key (marks the session dirty).
+  ;;;
+  ;;; Since: v0.1.0
+  (defn session-del! [ctx : Ctx key : cstr] : void
+    (let [p (__session-ensure ctx)]
+      (do (sessmap-del! (sess-map p) key) (__sess-set-dirty! p))))
+  ;;; session-destroy! -- delete the session from the store and clear its cookie.
+  ;;;
+  ;;; Marks the session for destruction; the response flush calls store-delete
+  ;;; and emits an expiring Set-Cookie.
+  ;;;
+  ;;; Since: v0.1.0
+  (defn session-destroy! [ctx : Ctx] : void
+    (__sess-set-destroy! (__session-ensure ctx)))
+  ;;; session-id -- the current session ID (borrowed; 64-char hex).
+  ;;;
+  ;;; Since: v0.1.0
+  (defn session-id [ctx : Ctx] : cstr (sess-id (__session-ensure ctx)))
+  ;;; session-rotate! -- issue a fresh session ID, carrying the data forward.
+  ;;;
+  ;;; Mints a new 256-bit session ID, keeps the live session map (no data loss),
+  ;;; and records the original ID so the flush can save under the new ID, delete
+  ;;; the old store entry, and Set-Cookie the new ID. Best practice is to call
+  ;;; this immediately after a privilege change (e.g. successful login) to defend
+  ;;; against session fixation:
+  ;;;
+  ;;;   (session-set! ctx "user_id" uid)
+  ;;;   (session-rotate! ctx)            ;; new ID, same data
+  ;;;
+  ;;; Calling it more than once in a request is safe: only the truly-original ID
+  ;;; is remembered for deletion (intermediate IDs are never persisted), so a
+  ;;; chain of rotates collapses to one stale-entry delete. When cookie signing
+  ;;; (S0) is on, the cookie's MAC changes automatically because it is computed
+  ;;; over the new ID -- no extra work here.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- tourist context
+  ;;;
+  ;;; Since: v0.2.0
+  (defn session-rotate! [ctx : Ctx] : void
+    (let [p   (__session-ensure ctx)
+          old (sess-id p)]
+      (do
+        (__sess-set-rotate-from! p old) ;; dups `old` (once); safe before set-id!
+        (__sess-set-id! p (session-id-new))
+        (__sess-set-dirty! p))))) ;; end defmodule session/ctx

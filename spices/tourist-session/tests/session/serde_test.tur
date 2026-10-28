@@ -5,76 +5,71 @@
 ;; round-trips values (including escaped quotes/tabs/newlines), and the
 ;; expires_at field reflects the TTL.
 (defmodule session/tests/serde
-  (import test/suite  :refer [describe it])
+  (import test/suite :refer [describe it])
   (import test/assert :refer [assert-true])
   (import test/runner :refer [run-all-status])
-  (import session/serde :refer [sessmap-encode sessmap-decode envelope-expires-at])
-  (import session/data  :refer [SessMap sessmap-new sessmap-set! sessmap-get
-                                sessmap-count sessmap-free])
-
-(defn seq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+  (import session/serde
+    :refer
+    [sessmap-encode sessmap-decode envelope-expires-at])
+  (import session/data
+    :refer
+    [SessMap sessmap-new sessmap-set! sessmap-get sessmap-count sessmap-free])
+  (defn seq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn cfree [s : cstr] : void
-  ```c #include <stdlib.h>
+  (defn cfree [s : cstr] : void
+    ```c
+    #include <stdlib.h>
   free((void *)(intptr_t)s); ```)
-
-(defn got? [m : SessMap key : cstr want : cstr] : bool
-  (let [r (sessmap-get m key)]
-    (if (ok? r) (seq? (ok-val r) want) false)))
-
-;; encode `m` with ttl, decode it back, check key->want survives.
-(defn roundtrips? [m : SessMap key : cstr want : cstr] : bool
-  (let [json (sessmap-encode m 0)
-        back (sessmap-decode json)
-        ok   (got? back key want)]
-    (do (cfree json) (sessmap-free back) ok)))
-
-(defn main [] : int
- (do
-  (describe "session/serde"
-    (it "round-trips a simple value"
-      (let [m (sessmap-new)]
-        (sessmap-set! m "user_id" "42")
-        (let [ok (roundtrips? m "user_id" "42")]
-          (do (sessmap-free m) (assert-true ok)))))
-
-    (it "round-trips a value with quotes and tabs"
-      (let [m (sessmap-new)]
-        (sessmap-set! m "k" "a\"b\tc")
-        (let [ok (roundtrips? m "k" "a\"b\tc")]
-          (do (sessmap-free m) (assert-true ok)))))
-
-    (it "round-trips multiple keys"
-      (let [m (sessmap-new)]
-        (sessmap-set! m "a" "1")
-        (sessmap-set! m "b" "2")
-        (let [json (sessmap-encode m 0)
-              back (sessmap-decode json)
-              ok   (if (= (sessmap-count back) 2)
-                     (if (got? back "a" "1") (got? back "b" "2") false)
-                     false)]
-          (do (cfree json) (sessmap-free back) (sessmap-free m) (assert-true ok)))))
-
-    (it "decodes an empty data object to an empty map"
-      (let [back (sessmap-decode "{\"expires_at\":0,\"data\":{}}")
-            ok   (= (sessmap-count back) 0)]
-        (do (sessmap-free back) (assert-true ok))))
-
-    (it "expires_at is set when ttl > 0"
-      (let [m (sessmap-new)
-            json (sessmap-encode m 60)
-            ok   (if (> (envelope-expires-at json) 0) true false)]
-        (do (cfree json) (sessmap-free m) (assert-true ok))))
-
-    (it "expires_at is 0 when ttl <= 0"
-      (let [m (sessmap-new)
-            json (sessmap-encode m 0)
-            ok   (= (envelope-expires-at json) 0)]
-        (do (cfree json) (sessmap-free m) (assert-true ok)))))
-  (run-all-status)))
-
-) ;; end module
+  (defn got? [m : SessMap key : cstr want : cstr] : bool
+    (let [r (sessmap-get m key)] (if (ok? r) (seq? (ok-val r) want) false)))
+  ;; encode `m` with ttl, decode it back, check key->want survives.
+  (defn roundtrips? [m : SessMap key : cstr want : cstr] : bool
+    (let [json (sessmap-encode m 0)
+          back (sessmap-decode json)
+          ok   (got? back key want)]
+      (do (cfree json) (sessmap-free back) ok)))
+  (defn main [] : int
+    (do
+      (describe "session/serde"
+        (it "round-trips a simple value"
+          (let [m (sessmap-new)]
+            (sessmap-set! m "user_id" "42")
+            (let [ok (roundtrips? m "user_id" "42")]
+              (do (sessmap-free m) (assert-true ok)))))
+        (it "round-trips a value with quotes and tabs"
+          (let [m (sessmap-new)]
+            (sessmap-set! m "k" "a\"b\tc")
+            (let [ok (roundtrips? m "k" "a\"b\tc")]
+              (do (sessmap-free m) (assert-true ok)))))
+        (it "round-trips multiple keys"
+          (let [m (sessmap-new)]
+            (sessmap-set! m "a" "1")
+            (sessmap-set! m "b" "2")
+            (let [json (sessmap-encode m 0)
+                  back (sessmap-decode json)
+                  ok   (if (= (sessmap-count back) 2)
+                         (if (got? back "a" "1") (got? back "b" "2") false)
+                         false)]
+              (do
+                (cfree json)
+                (sessmap-free back)
+                (sessmap-free m)
+                (assert-true ok)))))
+        (it "decodes an empty data object to an empty map"
+          (let [back (sessmap-decode "{\"expires_at\":0,\"data\":{}}")
+                ok   (= (sessmap-count back) 0)]
+            (do (sessmap-free back) (assert-true ok))))
+        (it "expires_at is set when ttl > 0"
+          (let [m    (sessmap-new)
+                json (sessmap-encode m 60)
+                ok   (if (> (envelope-expires-at json) 0) true false)]
+            (do (cfree json) (sessmap-free m) (assert-true ok))))
+        (it "expires_at is 0 when ttl <= 0"
+          (let [m    (sessmap-new)
+                json (sessmap-encode m 0)
+                ok   (= (envelope-expires-at json) 0)]
+            (do (cfree json) (sessmap-free m) (assert-true ok)))))
+      (run-all-status)))) ;; end module

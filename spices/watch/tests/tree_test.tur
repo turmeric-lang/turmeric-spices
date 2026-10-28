@@ -27,27 +27,39 @@
 ;; With leaf.txt pre-created the snapshot diff sees the SAME name with a
 ;; DIFFERENT inode, which is unambiguously an atomic save, and both backends
 ;; report kind=rename.  See docs/watch-darwin-fresh-name-is-create.md.
-
 (defmodule watch/tests/tree
-  (import watch/event :refer [watch-kind-write watch-kind-rename
-                              watch-kind-overflow
-                              watch-event-kind watch-event-path
-                              watch-event-free])
-  (import watch/opts  :refer [watch-opts-make watch-opts-free
-                              watch-opts-set-recursive])
-  (import watch/watch :refer [watch-open-tree watch-open watch-close
-                              watch-next watch-tree-dir-count
-                              watch-tree-dir-at watch-refresh])
-
-  (defn tap-record [idx : int name : cstr ok : bool] #fx{Unsafe} : void
+  (import watch/event
+    :refer
+    [watch-kind-write
+     watch-kind-rename
+     watch-kind-overflow
+     watch-event-kind
+     watch-event-path
+     watch-event-free])
+  (import watch/opts
+    :refer
+    [watch-opts-make watch-opts-free watch-opts-set-recursive])
+  (import watch/watch
+    :refer
+    [watch-open-tree
+     watch-open
+     watch-close
+     watch-next
+     watch-tree-dir-count
+     watch-tree-dir-at
+     watch-refresh])
+  (defn tap-record [idx : int name : cstr ok : bool]
+    #fx{Unsafe}
+    : void
     ```c
     /* __tur_include__: static int g_tree_fails = 0; */
     if (!ok) g_tree_fails++;
     printf("%s %lld - %s\n", ok ? "ok" : "not ok",
            (long long)idx, (const char *)(intptr_t)name);
     ```)
-
-  (defn tap-finish [count : int] #fx{Unsafe} : int
+  (defn tap-finish [count : int]
+    #fx{Unsafe}
+    : int
     ```c
     printf("1..%lld\n", (long long)count);
     if (g_tree_fails == 0) {
@@ -58,16 +70,17 @@
             g_tree_fails, (long long)count);
     return 1;
     ```)
-
   ;; Filesystem helpers.
-
-  (defn make-dir [path : cstr] #fx{Unsafe} : int
+  (defn make-dir [path : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     /* __tur_include__: #include <sys/stat.h> */
     return mkdir((const char *)(intptr_t)path, 0755);
     ```)
-
-  (defn write-file [path : cstr content : cstr] #fx{Unsafe} : int
+  (defn write-file [path : cstr content : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     /* __tur_include__: #include <stdio.h> */
     FILE *f = fopen((const char *)(intptr_t)path, "w");
@@ -76,24 +89,28 @@
     fclose(f);
     return 0;
     ```)
-
-  (defn delete-file [path : cstr] #fx{Unsafe} : int
+  (defn delete-file [path : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     /* __tur_include__: #include <unistd.h> */
     return unlink((const char *)(intptr_t)path);
     ```)
-
-  (defn delete-dir [path : cstr] #fx{Unsafe} : int
+  (defn delete-dir [path : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     return rmdir((const char *)(intptr_t)path);
     ```)
-
-  (defn sleep-ms [ms : int] #fx{Unsafe} : void
+  (defn sleep-ms [ms : int]
+    #fx{Unsafe}
+    : void
     ```c
     if (ms > 0) usleep((useconds_t)ms * 1000u);
     ```)
-
-  (defn schedule-atomic-save [path : cstr content : cstr ms : int] #fx{Unsafe} : int
+  (defn schedule-atomic-save [path : cstr content : cstr ms : int]
+    #fx{Unsafe}
+    : int
     ```c
     /* __tur_include__: #include <pthread.h> */
     /* __tur_include__: typedef struct { char *path; char *tmp; char *content; int ms; } TurTreeAtomic; */
@@ -111,131 +128,142 @@
     pthread_detach(th);
     return 0;
     ```)
-
-  (defn tmp-root [] #fx{Unsafe} : cstr
+  (defn tmp-root []
+    #fx{Unsafe}
+    : cstr
     ```c
     /* __tur_include__: #include <unistd.h> */
     static char buf[256];
     snprintf(buf, sizeof(buf), "/tmp/tur-watch-tree-%d", (int)getpid());
     return (const char *)buf;
     ```)
-
-  (defn path-join [a : cstr b : cstr] #fx{Unsafe} : cstr
+  (defn path-join [a : cstr b : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     static char buf[1024];
     snprintf(buf, sizeof(buf), "%s/%s",
              (const char *)(intptr_t)a, (const char *)(intptr_t)b);
     return (const char *)buf;
     ```)
-
   ;; Strdup so the static path-join buffer doesn't get clobbered between uses.
-  (defn dup [s : cstr] #fx{Unsafe} : cstr
+  (defn dup [s : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c return (const char *)strdup((const char *)(intptr_t)s); ```)
-
-  (defn free-cstr [s : cstr] #fx{Unsafe} : void
+  (defn free-cstr [s : cstr]
+    #fx{Unsafe}
+    : void
     ```c free((char *)(intptr_t)s); ```)
-
-  (defn cstr-contains? [haystack : cstr needle : cstr] #fx{Unsafe} : bool
+  (defn cstr-contains? [haystack : cstr needle : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *h = (const char *)(intptr_t)haystack;
     const char *n = (const char *)(intptr_t)needle;
     return strstr(h ? h : "", n ? n : "") != NULL;
     ```)
-
-  (defn cstr-eq? [a : cstr b : cstr] #fx{Unsafe} : bool
+  (defn cstr-eq? [a : cstr b : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *sa = (const char *)(intptr_t)a;
     const char *sb = (const char *)(intptr_t)b;
     if (!sa) sa = ""; if (!sb) sb = "";
     return strcmp(sa, sb) == 0;
     ```)
-
   ;; Print the event path AND kind to stderr for debugging on failure.
   ;; The kind is the half that actually failed here once (Darwin reported
   ;; kind=create where Linux reported kind=rename), and printing only the
   ;; path meant the TAP output named the wrong suspect.
-  (defn dbg-event [ev : int kind : int] #fx{Unsafe} : void
+  (defn dbg-event [ev : int kind : int]
+    #fx{Unsafe}
+    : void
     ```c
     const char *p = (const char *)(intptr_t)
         watch_event_path(ev);
     fprintf(stderr, "# event path: [%s] kind: %lld\n", p ? p : "<null>",
             (long long)kind);
     ```)
-
-  (defn main [] #fx{Unsafe} : int
+  (defn main []
+    #fx{Unsafe}
+    : int
     (do
-      (let [root  (dup (tmp-root))
-            a     (dup (path-join root "a"))
-            b     (dup (path-join a    "b"))
-            c     (dup (path-join root "c"))
-            leaf  (dup (path-join b    "leaf.txt"))
+      (let [root (dup (tmp-root))
+            a    (dup (path-join root "a"))
+            b    (dup (path-join a "b"))
+            c    (dup (path-join root "c"))
+            leaf (dup (path-join b "leaf.txt"))
             ;; Expected relative path: "a/b/leaf.txt"
             ;; On Darwin an atomic-save via rename changes the inode of
             ;; leaf.txt, triggering a rename kind event in the snapshot diff.
             ;; On Linux inotify reports IN_MOVED_TO for the rename arrival.
             ;; Both produce kind=rename (4) or kind=write (1).
-            opts  (watch-opts-make 1 150 1 0 1)]
+            opts (watch-opts-make 1 150 1 0 1)]
         (do
           ;; Best-effort cleanup of stale state from a prior failed run.
           (delete-file leaf)
-          (delete-dir b) (delete-dir a) (delete-dir c) (delete-dir root)
-
+          (delete-dir b)
+          (delete-dir a)
+          (delete-dir c)
+          (delete-dir root)
           ;; Build the tree.
           (make-dir root)
           (make-dir a)
           (make-dir b)
           (make-dir c)
-
           ;; Seed leaf.txt so the save below is an OVERWRITE, not a create.
           ;; Different content from the save ("hello") so the size differs
           ;; too: if the inode were somehow reused, the Darwin snapshot diff
           ;; still classifies the change as a write rather than reporting
           ;; nothing.  See the header comment for why this matters.
           (write-file leaf "initial")
-
           (let [w (watch-open-tree root opts)]
             (do
-              (tap-record 1 "watch-open-tree returned non-zero"
-                          (not (= w 0)))
+              (tap-record 1 "watch-open-tree returned non-zero" (not (= w 0)))
               ;; Expect 4 registered dirs: root, a, a/b, c.
-              (tap-record 2 "tree registered 4 directories"
-                          (= (watch-tree-dir-count w) 4))
-              (tap-record 3 "first registered dir is the root"
-                          (cstr-contains? (watch-tree-dir-at w 0) "tur-watch-tree"))
-
+              (tap-record 2
+                "tree registered 4 directories"
+                (= (watch-tree-dir-count w) 4))
+              (tap-record 3
+                "first registered dir is the root"
+                (cstr-contains? (watch-tree-dir-at w 0) "tur-watch-tree"))
               ;; Schedule a write inside a/b and wait for the watcher to fire.
               (schedule-atomic-save leaf "hello" 30)
               (let [ev (watch-next w 5000)]
                 (do
-                  (tap-record 4 "watch-next returned an event"
-                              (not (= ev 0)))
-                  (tap-record 5 "event kind is write or rename (atomic-save)"
-                              (or (= (watch-event-kind ev) (watch-kind-write))
-                                  (= (watch-event-kind ev) (watch-kind-rename))))
+                  (tap-record 4 "watch-next returned an event" (not (= ev 0)))
+                  (tap-record 5
+                    "event kind is write or rename (atomic-save)"
+                    (or (= (watch-event-kind ev) (watch-kind-write))
+                      (= (watch-event-kind ev) (watch-kind-rename))))
                   ;; WTNF2/3: path must now name the file, not the directory.
                   ;; Linux delivers IN_MOVED_TO with name "leaf.txt" inside a/b.
                   ;; Darwin snapshot diff sees inode change for "leaf.txt".
                   ;; In both cases the relative path should be "a/b/leaf.txt".
                   (dbg-event ev (watch-event-kind ev))
-                  (tap-record 6 "event path is a/b/leaf.txt (per-file naming)"
-                              (cstr-eq? (watch-event-path ev) "a/b/leaf.txt"))
+                  (tap-record 6
+                    "event path is a/b/leaf.txt (per-file naming)"
+                    (cstr-eq? (watch-event-path ev) "a/b/leaf.txt"))
                   (watch-event-free ev)))
-
               (watch-close w)))
-
           ;; watch-refresh on a single-file watcher returns 0.
-          (let [w2 (watch-open root 0)]   ; default opts -> single-file
+          (let [w2 (watch-open root 0)] ; default opts -> single-file
             (do
-              (tap-record 7 "single-file watch-refresh returns 0"
-                          (= (watch-refresh w2) 0))
+              (tap-record 7
+                "single-file watch-refresh returns 0"
+                (= (watch-refresh w2) 0))
               (watch-close w2)))
-
           (watch-opts-free opts)
           (delete-file leaf)
-          (delete-dir b) (delete-dir a) (delete-dir c) (delete-dir root)
-          (free-cstr root) (free-cstr a) (free-cstr b)
-          (free-cstr c)    (free-cstr leaf)
+          (delete-dir b)
+          (delete-dir a)
+          (delete-dir c)
+          (delete-dir root)
+          (free-cstr root)
+          (free-cstr a)
+          (free-cstr b)
+          (free-cstr c)
+          (free-cstr leaf)
           (sleep-ms 100)))
-      (tap-finish 7)))
-
-) ;; end defmodule
+      (tap-finish 7)))) ;; end defmodule

@@ -4,26 +4,29 @@
 ;; and whose columns are shared with the source frame via refcount (no buffer
 ;; copies).  Freeing the new frame drops one reference; freeing the source
 ;; frame drops the other -- buffers are released when both are gone.
-
 (defmodule frame/select
   (export select-cols drop-cols rename with-col)
-
-  (import frame/schema :refer [field field-name field-type field-nullable
-                                schema schema-arity schema-field-at
-                                schema-index-of])
+  (import frame/schema
+    :refer
+    [field
+     field-name
+     field-type
+     field-nullable
+     schema
+     schema-arity
+     schema-field-at
+     schema-index-of])
   (import frame/column :refer [column-length column-retain])
-  (import frame/frame  :refer [frame frame-nrows frame-ncols frame-schema
-                                frame-column-at])
-
-;; ---------------------------------------------------------------------------
-;; Private cons helpers and small inline-C utilities.
-;; ---------------------------------------------------------------------------
-
-(defn __s-nil [] : int ```c return 0; ```)
-
-(defn __s-cons [v : int n : int] : int
-  ```c
-  #include <stdlib.h>
+  (import frame/frame
+    :refer
+    [frame frame-nrows frame-ncols frame-schema frame-column-at])
+  ;; ---------------------------------------------------------------------------
+  ;; Private cons helpers and small inline-C utilities.
+  ;; ---------------------------------------------------------------------------
+  (defn __s-nil [] : int ```c return 0; ```)
+  (defn __s-cons [v : int n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   struct __cons *c = (struct __cons *)malloc(sizeof(*c));
@@ -31,10 +34,9 @@
   c->value = v; c->next = n;
   return (int64_t)(intptr_t)c;
   ```)
-
-(defn __cstr-list-has? [xs : int needle : cstr] : bool
-  ```c
-  #include <string.h>
+  (defn __cstr-list-has? [xs : int needle : cstr] : bool
+    ```c
+    #include <string.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   const char *n = (const char *)(intptr_t)needle;
@@ -44,10 +46,9 @@
   }
   return false;
   ```)
-
-(defn __cstr-list-nth [xs : int i : int] : cstr
-  ```c
-  #include <stdint.h>
+  (defn __cstr-list-nth [xs : int i : int] : cstr
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t k = 0;
   for (struct __cons *p = (struct __cons *)(intptr_t)xs; p; p = (struct __cons *)(intptr_t)p->next, k++) {
@@ -55,10 +56,9 @@
   }
   return (const char *)(intptr_t)"";
   ```)
-
-(defn __cstr-list-nth-int [xs : int i : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __cstr-list-nth-int [xs : int i : int] : int
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t k = 0;
   for (struct __cons *p = (struct __cons *)(intptr_t)xs; p; p = (struct __cons *)(intptr_t)p->next, k++) {
@@ -66,32 +66,30 @@
   }
   return 0;
   ```)
-
-(defn __cstr-list-length [xs : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __cstr-list-length [xs : int] : int
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t n = 0;
   for (struct __cons *p = (struct __cons *)(intptr_t)xs; p; p = (struct __cons *)(intptr_t)p->next) n++;
   return n;
   ```)
-
-(defn __pair-first  [p : int] : int ```c
-  #include <stdint.h>
+  (defn __pair-first [p : int] : int
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   return ((struct __cons *)(intptr_t)p)->value;
   ```)
-
-(defn __pair-second [p : int] : int ```c
-  #include <stdint.h>
+  (defn __pair-second [p : int] : int
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   return ((struct __cons *)(intptr_t)((struct __cons *)(intptr_t)p)->next)->value;
   ```)
-
-;; Append v to the end of cons list xs (returns a new list).
-(defn __append-end [xs : int v : int] : int
-  ```c
-  #include <stdlib.h>
+  ;; Append v to the end of cons list xs (returns a new list).
+  (defn __append-end [xs : int v : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   struct __cons *head = NULL, *tail = NULL;
@@ -109,146 +107,178 @@
   tail->next = (int64_t)(intptr_t)last;
   return (int64_t)(intptr_t)head;
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Internal builders.  Defined before the public API that calls them so the
-;; type-inferred forward-call defaults match (Turmeric forward-refs assume
-;; :int args, which would break our :cstr/:bool argument types).
-;; ---------------------------------------------------------------------------
-
-(defn __clone-field-at [s : int i : int] : int
-  (let [fd (schema-field-at s i)]
-    (field (field-name fd) (field-type fd) (field-nullable fd))))
-
-(defn __build-from-indices [f : int indices : int i : int n : int
-                            fields-acc : int cols-acc : int] : int
-  ;; Build a 2-element cons (fields-list . cols-list) by walking indices in
-  ;; reverse so cons builds the result forward.
-  (if (< i 0)
-    (__s-cons fields-acc (__s-cons cols-acc (__s-nil)))
-    (let [src-i (__cstr-list-nth-int indices i)
-          fd    (__clone-field-at (frame-schema f) src-i)
-          col   (column-retain (frame-column-at f src-i))]
-      (__build-from-indices f indices (- i 1) n
-                            (__s-cons fd fields-acc)
-                            (__s-cons col cols-acc)))))
-
-(defn __indices-from-names [src-schema : int names : int i : int n : int acc : int] : int
-  ;; Walk `names` index n-1 -> 0; build a cons list of indices in forward order.
-  ;; Returns 0 (nil) if any name is missing.
-  (if (< i 0)
-    acc
-    (let [nm  (__cstr-list-nth names i)
-          ix  (schema-index-of src-schema nm)]
-      (if (< ix 0)
+  ;; ---------------------------------------------------------------------------
+  ;; Internal builders.  Defined before the public API that calls them so the
+  ;; type-inferred forward-call defaults match (Turmeric forward-refs assume
+  ;; :int args, which would break our :cstr/:bool argument types).
+  ;; ---------------------------------------------------------------------------
+  (defn __clone-field-at [s : int i : int] : int
+    (let [fd (schema-field-at s i)]
+      (field (field-name fd) (field-type fd) (field-nullable fd))))
+  (defn __build-from-indices [f : int
+                              indices : int
+                              i : int
+                              n : int
+                              fields-acc : int
+                              cols-acc : int] : int
+    ;; Build a 2-element cons (fields-list . cols-list) by walking indices in
+    ;; reverse so cons builds the result forward.
+    (if (< i 0)
+      (__s-cons fields-acc (__s-cons cols-acc (__s-nil)))
+      (let [src-i (__cstr-list-nth-int indices i)
+            fd    (__clone-field-at (frame-schema f) src-i)
+            col   (column-retain (frame-column-at f src-i))]
+        (__build-from-indices f
+          indices
+          (- i 1)
+          n
+          (__s-cons fd fields-acc)
+          (__s-cons col cols-acc)))))
+  (defn __indices-from-names [src-schema : int
+                              names : int
+                              i : int
+                              n : int
+                              acc : int] : int
+    ;; Walk `names` index n-1 -> 0; build a cons list of indices in forward order.
+    ;; Returns 0 (nil) if any name is missing.
+    (if (< i 0)
+      acc
+      (let [nm (__cstr-list-nth names i)
+            ix (schema-index-of src-schema nm)]
+        (if (< ix 0)
+          0
+          (__indices-from-names src-schema names (- i 1) n (__s-cons ix acc))))))
+  (defn __all-indices-except [src-schema : int
+                              drop-names : int
+                              i : int
+                              acc : int] : int
+    (if (< i 0)
+      acc
+      (let [fd (schema-field-at src-schema i)
+            nm (field-name fd)]
+        (if (__cstr-list-has? drop-names nm)
+          (__all-indices-except src-schema drop-names (- i 1) acc)
+          (__all-indices-except src-schema drop-names (- i 1) (__s-cons i acc))))))
+  (defn __assemble [f : int indices : int] : int
+    (let [n      (__cstr-list-length indices)
+          pair   (__build-from-indices f indices (- n 1) n (__s-nil) (__s-nil))
+          fields (__pair-first pair)
+          cols   (__pair-second pair)]
+      (frame (schema fields) cols)))
+  (defn __rename-build [f : int
+                        rename-ix : int
+                        new-name : cstr
+                        i : int
+                        fields-acc : int
+                        cols-acc : int] : int
+    (if (< i 0)
+      (frame (schema fields-acc) cols-acc)
+      (let [src-sch (frame-schema f)
+            fd-i    (schema-field-at src-sch i)
+            new-fd  (if (= i rename-ix)
+                      (field new-name (field-type fd-i) (field-nullable fd-i))
+                      (field (field-name fd-i)
+                        (field-type fd-i)
+                        (field-nullable fd-i)))
+            col     (column-retain (frame-column-at f i))]
+        (__rename-build f
+          rename-ix
+          new-name
+          (- i 1)
+          (__s-cons new-fd fields-acc)
+          (__s-cons col cols-acc)))))
+  (defn __with-col-append [f : int
+                           name : cstr
+                           type : int
+                           col : int
+                           i : int
+                           fields-acc : int
+                           cols-acc : int] : int
+    (if (< i 0)
+      (let [new-fd     (field name type 0)
+            all-fields (__append-end fields-acc new-fd)
+            all-cols   (__append-end cols-acc col)]
+        (frame (schema all-fields) all-cols))
+      (let [src-sch (frame-schema f)
+            fd-i    (schema-field-at src-sch i)
+            new-fd  (field (field-name fd-i)
+                      (field-type fd-i)
+                      (field-nullable fd-i))
+            old-col (column-retain (frame-column-at f i))]
+        (__with-col-append f
+          name
+          type
+          col
+          (- i 1)
+          (__s-cons new-fd fields-acc)
+          (__s-cons old-col cols-acc)))))
+  (defn __with-col-replace [f : int
+                            rep-ix : int
+                            name : cstr
+                            type : int
+                            col : int
+                            i : int
+                            fields-acc : int
+                            cols-acc : int] : int
+    (if (< i 0)
+      (frame (schema fields-acc) cols-acc)
+      (let [src-sch  (frame-schema f)
+            fd-i     (schema-field-at src-sch i)
+            new-fd   (if (= i rep-ix)
+                       (field name type 0)
+                       (field (field-name fd-i)
+                         (field-type fd-i)
+                         (field-nullable fd-i)))
+            this-col (if (= i rep-ix) col (column-retain (frame-column-at f i)))]
+        (__with-col-replace f
+          rep-ix
+          name
+          type
+          col
+          (- i 1)
+          (__s-cons new-fd fields-acc)
+          (__s-cons this-col cols-acc)))))
+  ;; ---------------------------------------------------------------------------
+  ;; Public API
+  ;; ---------------------------------------------------------------------------
+  ;;; select -- keep only the named columns, in the given order.
+  ;;;
+  ;;; Returns 0 if any name is missing from the source schema.  Since: FR2
+  (defn select-cols [f : int names : int] : int
+    (let [src-sch (frame-schema f)
+          n       (__cstr-list-length names)
+          indices (__indices-from-names src-sch names (- n 1) n (__s-nil))]
+      (if (and (= indices 0) (> n 0)) 0 (__assemble f indices))))
+  ;;; drop-cols -- keep every column except those named in `names`. Since: FR2
+  (defn drop-cols [f : int names : int] : int
+    (let [src-sch (frame-schema f)
+          ncols   (frame-ncols f)
+          indices (__all-indices-except src-sch names (- ncols 1) (__s-nil))]
+      (__assemble f indices)))
+  ;;; rename -- return a new frame with column `old` renamed to `new`.
+  ;;; Returns 0 if `old` is missing.  Since: FR2
+  (defn rename [f : int old : cstr new : cstr] : int
+    (let [src-sch (frame-schema f)
+          ncols   (frame-ncols f)
+          ix      (schema-index-of src-sch old)]
+      (if (< ix 0) 0 (__rename-build f ix new (- ncols 1) (__s-nil) (__s-nil)))))
+  ;;; with-col -- return a new frame with the named column added (or replaced).
+  ;;; The new column must have length = frame-nrows; otherwise returns 0.
+  ;;; Ownership of `col` is transferred to the new frame (no retain needed).
+  ;;; Since: FR2
+  (defn with-col [f : int name : cstr type : int col : int] : int
+    (let [nrows (frame-nrows f)
+          ncols (frame-ncols f)
+          ix    (schema-index-of (frame-schema f) name)]
+      (if (not= (column-length col) nrows)
         0
-        (__indices-from-names src-schema names (- i 1) n (__s-cons ix acc))))))
-
-(defn __all-indices-except [src-schema : int drop-names : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [fd (schema-field-at src-schema i)
-          nm (field-name fd)]
-      (if (__cstr-list-has? drop-names nm)
-        (__all-indices-except src-schema drop-names (- i 1) acc)
-        (__all-indices-except src-schema drop-names (- i 1) (__s-cons i acc))))))
-
-(defn __assemble [f : int indices : int] : int
-  (let [n (__cstr-list-length indices)
-        pair (__build-from-indices f indices (- n 1) n (__s-nil) (__s-nil))
-        fields (__pair-first  pair)
-        cols   (__pair-second pair)]
-    (frame (schema fields) cols)))
-
-(defn __rename-build [f : int rename-ix : int new-name : cstr
-                      i : int fields-acc : int cols-acc : int] : int
-  (if (< i 0)
-    (frame (schema fields-acc) cols-acc)
-    (let [src-sch (frame-schema f)
-          fd-i    (schema-field-at src-sch i)
-          new-fd  (if (= i rename-ix)
-                    (field new-name (field-type fd-i) (field-nullable fd-i))
-                    (field (field-name fd-i) (field-type fd-i) (field-nullable fd-i)))
-          col     (column-retain (frame-column-at f i))]
-      (__rename-build f rename-ix new-name (- i 1)
-                      (__s-cons new-fd fields-acc)
-                      (__s-cons col cols-acc)))))
-
-(defn __with-col-append [f : int name : cstr type : int col : int
-                         i : int fields-acc : int cols-acc : int] : int
-  (if (< i 0)
-    (let [new-fd     (field name type 0)
-          all-fields (__append-end fields-acc new-fd)
-          all-cols   (__append-end cols-acc col)]
-      (frame (schema all-fields) all-cols))
-    (let [src-sch (frame-schema f)
-          fd-i    (schema-field-at src-sch i)
-          new-fd  (field (field-name fd-i) (field-type fd-i) (field-nullable fd-i))
-          old-col (column-retain (frame-column-at f i))]
-      (__with-col-append f name type col (- i 1)
-                         (__s-cons new-fd fields-acc)
-                         (__s-cons old-col cols-acc)))))
-
-(defn __with-col-replace [f : int rep-ix : int name : cstr type : int col : int
-                          i : int fields-acc : int cols-acc : int] : int
-  (if (< i 0)
-    (frame (schema fields-acc) cols-acc)
-    (let [src-sch (frame-schema f)
-          fd-i    (schema-field-at src-sch i)
-          new-fd  (if (= i rep-ix)
-                    (field name type 0)
-                    (field (field-name fd-i) (field-type fd-i) (field-nullable fd-i)))
-          this-col (if (= i rep-ix)
-                     col
-                     (column-retain (frame-column-at f i)))]
-      (__with-col-replace f rep-ix name type col (- i 1)
-                          (__s-cons new-fd fields-acc)
-                          (__s-cons this-col cols-acc)))))
-
-;; ---------------------------------------------------------------------------
-;; Public API
-;; ---------------------------------------------------------------------------
-
-;;; select -- keep only the named columns, in the given order.
-;;;
-;;; Returns 0 if any name is missing from the source schema.  Since: FR2
-(defn select-cols [f : int names : int] : int
-  (let [src-sch (frame-schema f)
-        n       (__cstr-list-length names)
-        indices (__indices-from-names src-sch names (- n 1) n (__s-nil))]
-    (if (and (= indices 0) (> n 0))
-      0
-      (__assemble f indices))))
-
-;;; drop-cols -- keep every column except those named in `names`. Since: FR2
-(defn drop-cols [f : int names : int] : int
-  (let [src-sch (frame-schema f)
-        ncols   (frame-ncols f)
-        indices (__all-indices-except src-sch names (- ncols 1) (__s-nil))]
-    (__assemble f indices)))
-
-;;; rename -- return a new frame with column `old` renamed to `new`.
-;;; Returns 0 if `old` is missing.  Since: FR2
-(defn rename [f : int old : cstr new : cstr] : int
-  (let [src-sch (frame-schema f)
-        ncols   (frame-ncols f)
-        ix      (schema-index-of src-sch old)]
-    (if (< ix 0)
-      0
-      (__rename-build f ix new (- ncols 1) (__s-nil) (__s-nil)))))
-
-;;; with-col -- return a new frame with the named column added (or replaced).
-;;; The new column must have length = frame-nrows; otherwise returns 0.
-;;; Ownership of `col` is transferred to the new frame (no retain needed).
-;;; Since: FR2
-(defn with-col [f : int name : cstr type : int col : int] : int
-  (let [nrows (frame-nrows f)
-        ncols (frame-ncols f)
-        ix    (schema-index-of (frame-schema f) name)]
-    (if (not= (column-length col) nrows)
-      0
-      (if (< ix 0)
-        (__with-col-append f name type col (- ncols 1) (__s-nil) (__s-nil))
-        (__with-col-replace f ix name type col (- ncols 1) (__s-nil) (__s-nil))))))
-
-) ;; end defmodule frame/select
+        (if (< ix 0)
+          (__with-col-append f name type col (- ncols 1) (__s-nil) (__s-nil))
+          (__with-col-replace f
+            ix
+            name
+            type
+            col
+            (- ncols 1)
+            (__s-nil)
+            (__s-nil))))))) ;; end defmodule frame/select
