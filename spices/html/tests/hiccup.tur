@@ -1,0 +1,215 @@
+#use-reader-macros "../src/html/markup.tur"
+;; hiccup.tur -- `(hiccup [...])` (xml-html-followups-plan follow-up D1).
+;;
+;; The compile-error half of the gate is errors/run.sh. Here: rendering,
+;; holes through the same classes as `#html{...}`, the checking
+;; constructors, A2's escaping and URL tables applied to hiccup, and the
+;; same output from hiccup and `#html{...}` for a shared corpus.
+(defmodule html_hiccup_test
+  (export)
+  (import html/hiccup
+    :refer
+    [Html
+     HElem
+     HRawText
+     HText
+     HRaw
+     HList
+     HFragment
+     Tag
+     AttrName
+     hiccup
+     hiccup->string
+     tag
+     tag-name
+     attr-name
+     attr
+     attr-on])
+  (import html/markup :refer [html*])
+  (import dom/holes :refer [Fragment html->string raw-html trusted-url])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; renders? -- does the tree render exactly `want`?
+  (defn renders? [h : Html want : cstr] : bool (__is? (hiccup->string h) want))
+  ;;; same? -- do the hiccup tree and the #html{} literal render alike?
+  (defn same? [h : Html f : Fragment] : bool
+    (__is? (hiccup->string h) (html->string f)))
+  ;; ---- one template per context, in both notations -----------------------------
+  (defn h-child [v : cstr] : Html (hiccup [:p v]))
+  (defn f-child [v : cstr] : Fragment #html{<p>${v}</p>})
+  (defn h-attr [v : cstr] : Html (hiccup [:p #map{:title v} "x"]))
+  (defn f-attr [v : cstr] : Fragment #html{<p title=${v}>x</p>})
+  (defn h-href [v : cstr] : Html (hiccup [:a #map{:href v} "x"]))
+  (defn f-href [v : cstr] : Fragment #html{<a href=${v}>x</a>})
+  (defn h-table [v : cstr] : Html (hiccup [:table [:tbody [:tr [:td v]]]]))
+  (defn f-table [v : cstr] : Fragment
+    #html{<table><tbody><tr><td>${v}</td></tr></tbody></table>})
+  (defn h-item [name : cstr href : cstr done : bool] : Html
+    (hiccup [:li.item #map{:data-done done} [:a #map{:href href} name]]))
+  (defn f-item [name : cstr href : cstr done : bool] : Fragment
+    #html{<li class="item" data-done=${done}><a href=${href}>${name}</a></li>})
+  ;;; __corpus -- internal: hostile value i.
+  (defn __corpus [i : int] : cstr
+    ```c
+    static const char *const corpus[] = {
+    "<script>alert(1)</script>", "\"><img src=x onerror=alert(1)>", "'", "</p><p>",
+    "</td></tr></table><b>", "<!--", "-->", "&amp;", "&", "javascript:alert(1)",
+    "JavaScript:x", "java\tscript:x", " data:x", "/rel?a=1&b=2", "https://e/",
+    "\xc2\xa0nbsp", "a\tb\nc\rd", "x", NULL};
+  int64_t n = 0;
+  while (corpus[n]) n++;
+  return i < n ? corpus[i] : "";
+  ```)
+  ;;; agree-failures -- corpus values for which hiccup and #html{} differ.
+  (defn agree-failures [] : int
+    (let [^mut bad 0
+          ^mut i   0]
+      (while (< i 18)
+        (let [v (__corpus i)]
+          (if (and (same? (h-child v) (f-child v))
+                (and (same? (h-attr v) (f-attr v))
+                  (and (same? (h-href v) (f-href v))
+                    (and (same? (h-table v) (f-table v))
+                      (and (same? (h-item v v true) (f-item v v true))
+                        (same? (h-item v v false) (f-item v v false)))))))
+            nil
+            (set! bad (+ bad 1))))
+        (set! i (+ i 1)))
+      bad))
+  ;;; __some? -- internal: is the Option a Some?
+  (defn __some-tag? [o : (Option Tag)] : bool
+    (match o (Some _) true (None) false))
+  (defn __some-name? [o : (Option AttrName)] : bool
+    (match o (Some _) true (None) false))
+  ;;; built -- a tree built at run time through the checking constructors.
+  (defn built [url : cstr] : Html
+    (match (tag "a")
+      (Some t)
+      (match (attr-name "href")
+        (Some n)
+        (HElem t (tcons-of (attr n url) (tnil)) (tcons-of (HText "go") (tnil)))
+        (None)
+        (HList (tnil)))
+      (None)
+      (HList (tnil))))
+  ;;; count-elems -- elements in a tree, by `match`.
+  (defn count-elems [h : Html] : int
+    (match h
+      (HElem t as kids)
+      (+ 1 (count-list kids))
+      (HList kids)
+      (count-list kids)
+      (HText _)
+      0
+      (HRawText _ _ _)
+      1
+      (HRaw _)
+      0
+      (HFragment _)
+      0))
+  (defn count-list [xs : (Cons Html)] : int
+    (if (tnil? xs) 0 (+ (count-elems (thead xs)) (count-list (ttail xs)))))
+  (defn __all-tests [] : void
+    (describe "rendering"
+      (it "elements, text and the #id.class shorthand"
+        (renders? (hiccup [:ul#menu.nav.top [:li "a & b"] [:li 42]])
+          "<ul id=\"menu\" class=\"nav top\"><li>a &amp; b</li><li>42</li></ul>"))
+      (it "string names and attributes"
+        (renders? (hiccup ["svg"
+                           #map{"viewBox" "0 0 1 1"}
+                           ["circle" #map{:r "1"}]])
+          "<svg viewBox=\"0 0 1 1\"><circle r=\"1\"></circle></svg>"))
+      (it "void elements have no end tag"
+        (renders? (hiccup [:p "a" [:br] "b"]) "<p>a<br>b</p>"))
+      (it "a script body is written as is"
+        (renders? (hiccup [:script "if (a < b && c) {}"])
+          "<script>if (a < b && c) {}</script>"))
+      (it "a map :class joins the shorthand classes"
+        (let [c "x"]
+          (renders? (hiccup [:p.a.b #map{:class c} "t"])
+            "<p class=\"a b x\">t</p>")))
+      (it ":attrs* splices attributes built at run time"
+        (let [extra (match (attr-name "data-k")
+                      (Some n)
+                      (tcons-of (attr n "v") (tnil))
+                      (None)
+                      (tnil))]
+          (renders? (hiccup [:p #map{:id "i" :attrs* extra} "t"])
+            "<p id=\"i\" data-k=\"v\">t</p>")))
+      (it "a literal on* / style value is the author's own"
+        (renders? (hiccup [:button
+                           #map{:onclick "go()" :style "color: red"}
+                           "b"])
+          "<button onclick=\"go()\" style=\"color: red\">b</button>")))
+    (describe "holes"
+      (it "text is escaped" (renders? (h-child "<b>&") "<p>&lt;b&gt;&amp;</p>"))
+      (it "bool and Option attributes"
+        (renders? (hiccup [:input
+                           #map{:checked true
+                                :disabled false
+                                :value (:: (None) (Option cstr))}])
+          "<input checked>"))
+      (it "an href is scheme-checked"
+        (renders? (h-href "javascript:x")
+          "<a href=\"about:invalid#tur-unsafe\">x</a>"))
+      (it "trusted-url skips the check"
+        (renders? (hiccup [:a #map{:href (trusted-url "javascript:void 0")} "x"])
+          "<a href=\"javascript:void 0\">x</a>"))
+      (it "srcset candidates are checked"
+        (renders? (hiccup [:img #map{:srcset "a.png 1x, javascript:x 2x"}])
+          "<img srcset=\"a.png 1x, javascript:x 2x\">"))
+      (it "a dynamic srcset is checked"
+        (let [s "a.png 1x, javascript:x 2x"]
+          (renders? (hiccup [:img #map{:srcset s}])
+            "<img srcset=\"a.png 1x, about:invalid#tur-unsafe 2x\">")))
+      (it "an Html value, a list of them, an #html{} fragment, Option"
+        (let [kids (tcons-of (hiccup [:li "1"])
+                     (tcons-of (hiccup [:li "2"]) (tnil)))]
+          (renders? (hiccup [:div
+                             (hiccup [:b "x"])
+                             [:ul kids]
+                             #html{<i>${"f"}</i>}
+                             (Some "s")])
+            "<div><b>x</b><ul><li>1</li><li>2</li></ul><i>f</i>s</div>")))
+      (it "raw-html is parsed in its element"
+        (renders? (hiccup [:div (raw-html "<b>x</div>y")])
+          "<div><b>xy</b></div>"))
+      (it "hiccup in an #html{} literal"
+        (__is? (html->string #html{<ul>${(hiccup [:li "a"])}</ul>})
+          "<ul><li>a</li></ul>")))
+    (describe "the checking constructors"
+      (it "tag accepts names"
+        (and (__some-tag? (tag "li")) (__some-tag? (tag "svg:rect"))))
+      (it "tag refuses what is not a name"
+        (and (not (__some-tag? (tag "x onload=y")))
+          (and (not (__some-tag? (tag ""))) (not (__some-tag? (tag "1a"))))))
+      (it "tag refuses the raw-text elements"
+        (and (not (__some-tag? (tag "script")))
+          (and (not (__some-tag? (tag "STYLE")))
+            (not (__some-tag? (tag "plaintext"))))))
+      (it "attr-name refuses on*, style and srcdoc"
+        (and (not (__some-name? (attr-name "onclick")))
+          (and (not (__some-name? (attr-name "OnLoad")))
+            (and (not (__some-name? (attr-name "style")))
+              (not (__some-name? (attr-name "srcdoc")))))))
+      (it "attr-name accepts names"
+        (and (__some-name? (attr-name "data-x"))
+          (__some-name? (attr-name "xlink:href"))))
+      (it "attr checks a URL-bearing value"
+        (renders? (built "javascript:alert(1)")
+          "<a href=\"about:invalid#tur-unsafe\">go</a>"))
+      (it "a tree is data: match on it"
+        (= 4 (count-elems (hiccup [:ul [:li "a"] [:li [:b "x"]]])))))
+    (describe "hiccup and #html{} agree"
+      (it "for every corpus value in every context (18 values x 6 templates)"
+        (= 0 (agree-failures)))))
+  (defn main [] : int (__all-tests) (run-all-status))) ;; end defmodule html_hiccup_test

@@ -1,0 +1,468 @@
+;;; html/hiccupc -- the compile-time half of `hiccup`: walks a hiccup literal
+;;; and lowers it to `html/hiccup` constructor calls.
+;;;
+;;; Imported `:for-macros` by `html/hiccup`; nothing here runs in a compiled
+;;; program. `hiccup-expand` takes the literal's Syntax:
+;;;
+;;;   [name attrs? child...]   name -- a keyword (`:li.item#main` shorthand
+;;;                            for id and classes) or a string literal
+;;;                            (`"svg:rect"`); attrs -- a `#map{...}` with
+;;;                            keyword or string keys; children -- string or
+;;;                            number literals (text), nested element vectors,
+;;;                            or any other expression (a hole, through
+;;;                            `to-child`)
+;;;
+;;; and checks what the literal shows: every name is a valid XML Name; a
+;;; computed tag, children under a void element, a second id, a bare `{...}`
+;;; where the attribute map goes, a dynamic value under `on*` / `style` /
+;;; `srcdoc`, a dynamic `<script>` / `<style>` body, and nesting the HTML
+;;; parser would undo (plan D-2) are compile errors naming the problem.
+;;; Literal names compile to unchecked constructors, so a literal pays no
+;;; validation at run time.
+;;;
+;;; Since: 0.3.0
+;; tur-check: macro-time
+;; Hiccup literal lowering; macro time only.
+(defmodule html/hiccupc
+  (export hiccup-expand)
+  ;;; __lc -- internal: ASCII lower case.
+  (defn __lc [c : int] : int (if (and (>= c 65) (<= c 90)) (+ c 32) c))
+  ;;; __name-start? -- internal: may an XML Name start with byte c?
+  (defn __name-start? [c : int] : bool
+    (or (and (>= c 97) (<= c 122))
+      (or (and (>= c 65) (<= c 90)) (or (= c 95) (or (= c 58) (>= c 128))))))
+  ;;; __name-char? -- internal: may an XML Name continue with byte c?
+  (defn __name-char? [c : int] : bool
+    (or (__name-start? c) (or (and (>= c 48) (<= c 57)) (or (= c 45) (= c 46)))))
+  ;;; __valid-name? -- internal: is s an XML Name (bytes >= 0x80 allowed)?
+  (defn __valid-name? [s : cstr] : bool
+    (let [n       (cstr-len s)
+          ^mut i  1
+          ^mut ok (and (> n 0) (__name-start? (cstr-nth s 0)))]
+      (while (and ok (< i n))
+        (if (__name-char? (cstr-nth s i)) nil (set! ok false))
+        (set! i (+ i 1)))
+      ok))
+  ;;; __is? -- internal: is s the word w (ASCII case-insensitively)?
+  (defn __is? [s : cstr w : cstr] : bool
+    (let [n       (cstr-len s)
+          ^mut i  0
+          ^mut ok (= n (cstr-len w))]
+      (while (and ok (< i n))
+        (if (= (__lc (cstr-nth s i)) (cstr-nth w i)) nil (set! ok false))
+        (set! i (+ i 1)))
+      ok))
+  ;;; __in? -- internal: is s one of the space-separated words?
+  (defn __in? [s : cstr words : cstr] : bool
+    (let [wn       (cstr-len words)
+          ^mut k   0
+          ^mut hit false]
+      (while (and (not hit) (< k wn))
+        (let [^mut e k]
+          (while (and (< e wn) (not (= (cstr-nth words e) 32)))
+            (set! e (+ e 1)))
+          (if (__is? s (cstr-sub words k e)) (set! hit true) nil)
+          (set! k (+ e 1))))
+      hit))
+  ;;; __void? -- internal: an HTML void element.
+  (defn __void? [t : cstr] : bool
+    (__in? t
+      "area base basefont bgsound br col embed frame hr img input keygen link meta param source track wbr"))
+  ;;; __rawtext? -- internal: an element whose content is raw text.
+  (defn __rawtext? [t : cstr] : bool
+    (__in? t "script style xmp iframe noembed noframes plaintext"))
+  ;;; __block? -- internal: an element that closes an open <p>.
+  (defn __block? [t : cstr] : bool
+    (__in? t
+      "address article aside blockquote details dialog div dl fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header hgroup hr main menu nav ol p pre search section table ul"))
+  ;;; __interactive? -- internal: interactive content (not inside a or button).
+  (defn __interactive? [t : cstr] : bool
+    (__in? t "a button details embed iframe input label select textarea"))
+  ;;; __code-attr? -- internal: an attribute whose value is code or markup.
+  (defn __code-attr? [a : cstr] : bool
+    (or (and (>= (cstr-len a) 2) (__is? (cstr-sub a 0 2) "on"))
+      (__in? a "style srcdoc")))
+  ;;; __url-attr? -- internal: a URL-bearing attribute.
+  (defn __url-attr? [a : cstr] : bool
+    (__in? a "href src action formaction xlink:href poster cite"))
+  ;;; __fail -- internal: a compile error at stx.
+  (defn __fail [stx : Syntax msg : cstr] : Syntax
+    (syntax-error (str-concat "hiccup: " msg) stx))
+  ;;; __fail! -- internal: a compile error, in statement position.
+  (defn __fail! [stx : Syntax msg : cstr] : nil (__fail stx msg) nil)
+  ;;; __call -- internal: (f args...) as Syntax.
+  (defn __call1 [f : cstr a : Syntax] : Syntax (syntax-list (sym->syntax f) a))
+  (defn __call2 [f : cstr a : Syntax b : Syntax] : Syntax
+    (syntax-list (sym->syntax f) a b))
+  (defn __call3 [f : cstr a : Syntax b : Syntax c : Syntax] : Syntax
+    (syntax-list (sym->syntax f) a b c))
+  ;;; __list -- internal: a reversed (Cons Syntax) as a `(tcons-of ...)` list.
+  (defn __list [rev : (Cons Syntax)] : Syntax
+    (let [^mut acc (syntax-list (sym->syntax "tnil"))
+          ^mut xs  rev]
+      (while (not (tnil? xs))
+        (set! acc (syntax-list (sym->syntax "tcons-of") (thead xs) acc))
+        (set! xs (ttail xs)))
+      acc))
+  ;;; __el-vec? -- internal: is stx an element vector (headed by a keyword or
+  ;;; a string)?
+  (defn __el-vec? [stx : Syntax] : bool
+    (and (syntax-vec? stx)
+      (and (> (syntax-len stx) 0)
+        (or (syntax-keyword? (syntax-nth stx 0))
+          (syntax-str? (syntax-nth stx 0))))))
+  ;;; __curly? -- internal: does stx look like a bare `{...}` map?
+  (defn __curly? [stx : Syntax] : bool
+    (and (syntax-list? stx)
+      (and (> (syntax-len stx) 0)
+        (or (syntax-keyword? (syntax-nth stx 0))
+          (and (syntax-sym? (syntax-nth stx 0))
+            (cstr-eq? (syntax-sym-name (syntax-nth stx 0)) "$nfx$"))))))
+  ;;; __key-name -- internal: an attribute key's name, or "" when the key is
+  ;;; neither a keyword nor a string.
+  (defn __key-name [k : Syntax] : cstr
+    (cond (syntax-keyword? k) (syntax-sym-name k)
+          (syntax-str? k)     (syntax->str k)
+          :else               ""))
+  ;;; Expansion state threaded through one element: its tag, and the
+  ;;; ancestors' tags for the D-2 checks, as a space-joined string.
+  ;;; __has-ancestor? -- internal: is t among the ancestors?
+  (defn __has-ancestor? [anc : cstr t : cstr] : bool (__in? t anc))
+  ;;; __check-nesting -- internal: plan D-2, for a literal child element.
+  (defn __check-nesting [stx : Syntax parent : cstr anc : cstr child : cstr] : nil
+    (cond (and (__is? parent "p") (__block? child))                                                                      (__fail! stx
+                                                                                                                           (str-concat (str-concat "<"
+                                                                                                                                         child)
+                                                                                                                             "> inside <p> -- the HTML parser closes the <p> first; use a <div>"))
+          (and (__is? child "a") (__has-ancestor? anc "a"))                                                              (__fail! stx
+                                                                                                                           "<a> inside <a> -- the HTML parser closes the outer one")
+          (and (__is? child "form") (__has-ancestor? anc "form"))                                                        (__fail! stx
+                                                                                                                           "<form> inside <form> -- the HTML parser drops the inner one")
+          (and (__interactive? child)
+            (or (__has-ancestor? anc "a") (__has-ancestor? anc "button")))                                               (__fail! stx
+                                                                                                                           (str-concat (str-concat "interactive <"
+                                                                                                                                         child)
+                                                                                                                             "> inside <a> or <button> -- the HTML parser re-nests it"))
+          (and (__is? parent "table")
+            (not (__in? child
+                   "caption colgroup thead tbody tfoot tr script template style")))                                      (__fail! stx
+                                                                                                                           (str-concat (str-concat "<"
+                                                                                                                                         child)
+                                                                                                                             "> directly in <table> -- only caption, colgroup, thead, tbody, tfoot and tr go there"))
+          (and (__in? parent "thead tbody tfoot")
+            (not (__in? child "tr script template")))                                                                    (__fail! stx
+                                                                                                                           (str-concat (str-concat (str-concat (str-concat "<"
+                                                                                                                                                                 child)
+                                                                                                                                                     "> directly in <")
+                                                                                                                                         parent)
+                                                                                                                             "> -- only tr goes there"))
+          (and (__is? parent "tr") (not (__in? child "td th script template")))                                          (__fail! stx
+                                                                                                                           (str-concat (str-concat "<"
+                                                                                                                                         child)
+                                                                                                                             "> directly in <tr> -- only td and th go there"))
+          :else                                                                                                          nil))
+  ;;; __blank? -- internal: only whitespace?
+  (defn __blank? [s : cstr] : bool
+    (let [^mut i  0
+          ^mut ok true]
+      (while (and ok (< i (cstr-len s)))
+        (let [c (cstr-nth s i)]
+          (if (or (= c 32) (or (= c 9) (or (= c 10) (= c 13))))
+            nil
+            (set! ok false)))
+        (set! i (+ i 1)))
+      ok))
+  ;;; __raw-ok? -- internal: may a literal raw-text body stay as written?
+  (defn __raw-ok? [tag : cstr body : cstr] : bool
+    (let [n       (cstr-len body)
+          tn      (cstr-len tag)
+          ^mut i  0
+          ^mut ok true]
+      (while (and ok (< i n))
+        (if (and (= (cstr-nth body i) 60) (< (+ i 1) n))
+          (do
+            (if (and (= (cstr-nth body (+ i 1)) 47)
+                  (and (<= (+ (+ i 2) tn) n)
+                    (__is? (cstr-sub body (+ i 2) (+ (+ i 2) tn)) tag)))
+              (set! ok false)
+              nil)
+            (if (and (__is? tag "script")
+                  (and (<= (+ i 4) n)
+                    (cstr-eq? (cstr-sub body i (+ i 4)) "<!--")))
+              (set! ok false)
+              nil))
+          nil)
+        (if (= (cstr-nth body i) 13) (set! ok false) nil)
+        (set! i (+ i 1)))
+      ok))
+  ;;; __split-shorthand -- internal: a keyword name's tag, id and classes:
+  ;;; `li.a.b#x` gives the list (tag id classes) of string Syntax, with "" for
+  ;;; an absent id and the classes space-joined.
+  (defn __split-shorthand [stx : Syntax name : cstr] : Syntax
+    (let [n          (cstr-len name)
+          ^mut i     0
+          ^mut tag-e n
+          ^mut id    ""
+          ^mut cls   ""
+          ^mut nid   0]
+      ;; the tag runs to the first . or #
+      (while (< i n)
+        (let [c (cstr-nth name i)]
+          (if (and (= tag-e n) (or (= c 46) (= c 35))) (set! tag-e i) nil))
+        (set! i (+ i 1)))
+      (set! i tag-e)
+      (while (< i n)
+        (let [c      (cstr-nth name i)
+              ^mut e (+ i 1)]
+          (while (and (< e n)
+                   (not (or (= (cstr-nth name e) 46) (= (cstr-nth name e) 35))))
+            (set! e (+ e 1)))
+          (let [part (cstr-sub name (+ i 1) e)]
+            (if (= (cstr-len part) 0)
+              (__fail! stx "an empty . or # in the tag shorthand")
+              nil)
+            (if (= c 35)
+              (do
+                (set! nid (+ nid 1))
+                (if (> nid 1)
+                  (__fail! stx "a second id in the tag shorthand")
+                  nil)
+                (set! id part))
+              (set! cls
+                (if (= (cstr-len cls) 0)
+                  part
+                  (str-concat (str-concat cls " ") part)))))
+          (set! i e)))
+      (syntax-list (str->syntax (cstr-sub name 0 tag-e))
+        (str->syntax id)
+        (str->syntax cls))))
+  ;;; __attr -- internal: one attribute's constructor call.
+  (defn __attr [stx : Syntax name : cstr v : Syntax] : Syntax
+    (cond (or (syntax-str? v) (or (syntax-int? v) (syntax-float? v))) (__call2 "html/hiccup/unchecked-attr-literal"
+                                                                        (str->syntax name)
+                                                                        (if (syntax-str? v)
+                                                                          v
+                                                                          (str->syntax (syntax->string v))))
+          (__code-attr? name)                                         (__fail stx
+                                                                        (str-concat (str-concat "a dynamic value for '"
+                                                                                      name)
+                                                                          "' -- its value is JavaScript, CSS or HTML, which HTML escaping does not make safe; write a literal"))
+          (__is? name "srcset")                                       (__call2 "html/hiccup/unchecked-attr"
+                                                                        (str->syntax name)
+                                                                        (__call1 "dom/holes/srcset-check"
+                                                                          (__call1 "to-url-attr"
+                                                                            v)))
+          (__url-attr? name)                                          (__call2 "html/hiccup/unchecked-attr"
+                                                                        (str->syntax name)
+                                                                        (__call1 "to-url-attr"
+                                                                          v))
+          :else                                                       (__call2 "html/hiccup/unchecked-attr"
+                                                                        (str->syntax name)
+                                                                        (__call1 "to-attr"
+                                                                          v))))
+  ;;; __element -- internal: one element vector as an Html expression.
+  (defn __element [stx : Syntax anc : cstr] : Syntax
+    (let [head         (syntax-nth stx 0)
+          parts        (if (syntax-keyword? head)
+                         (__split-shorthand stx (syntax-sym-name head))
+                         (syntax-list head (str->syntax "") (str->syntax "")))
+          tag          (syntax->str (syntax-nth parts 0))
+          sid          (syntax->str (syntax-nth parts 1))
+          scls         (syntax->str (syntax-nth parts 2))
+          n            (syntax-len stx)
+          has-map      (and (> n 1)
+                         (cstr-eq? (syntax-tag (syntax-nth stx 1))
+                           "map-literal"))
+          first-kid    (if has-map 2 1)
+          ^mut attrs   (:: (tnil) (Cons Syntax))
+          ^mut extra   (:: (tnil) (Cons Syntax))
+          ^mut seen-id (> (cstr-len sid) 0)]
+      (if (__valid-name? tag)
+        nil
+        (__fail! stx
+          (str-concat (str-concat "'" tag) "' is not a valid element name")))
+      (if (__is? tag "plaintext")
+        (__fail! stx
+          "<plaintext> never closes; it would swallow the rest of the document")
+        nil)
+      (if (and (> n 1) (__curly? (syntax-nth stx 1)))
+        (__fail! (syntax-nth stx 1)
+          "a bare {...} is curly-infix, not a map; write the attributes as #map{...}")
+        nil)
+      ;; attributes, in order: the shorthand id and classes, then the map's
+      ;; (a map :class joins the shorthand classes, in the shorthand's place)
+      (let [m             (if has-map (syntax-nth stx 1) (syntax-list))
+            mn            (if has-map (syntax-len m) 0)
+            ^mut has-mcls false
+            ^mut mcls     (nil->syntax)
+            ^mut i        0]
+        (if (and has-map (= (- mn (* 2 (/ mn 2))) 1))
+          (__fail! m "an attribute map with an odd number of forms")
+          nil)
+        ;; find a map :class first, so it can join the shorthand ones
+        (while (< (+ i 1) mn)
+          (if (__is? (__key-name (syntax-nth m i)) "class")
+            (do (set! has-mcls true) (set! mcls (syntax-nth m (+ i 1))))
+            nil)
+          (set! i (+ i 2)))
+        (if (> (cstr-len sid) 0)
+          (set! attrs
+            (tcons-of (__call2 "html/hiccup/unchecked-attr-literal"
+                        (str->syntax "id")
+                        (str->syntax sid))
+              attrs))
+          nil)
+        (if (> (cstr-len scls) 0)
+          (set! attrs
+            (tcons-of (if (not has-mcls)
+                        (__call2 "html/hiccup/unchecked-attr-literal"
+                          (str->syntax "class")
+                          (str->syntax scls))
+                        (let [v mcls]
+                          (__call2 "html/hiccup/unchecked-attr"
+                            (str->syntax "class")
+                            (__call2 "html/hiccup/class-join"
+                              (str->syntax scls)
+                              (if (syntax-str? v)
+                                (__call1 "dom/holes/AttrTrusted" v)
+                                (__call1 "to-attr" v))))))
+              attrs))
+          nil)
+        (set! i 0)
+        (while (< (+ i 1) mn)
+          (let [k  (syntax-nth m i)
+                v  (syntax-nth m (+ i 1))
+                kn (__key-name k)]
+            (cond (= (cstr-len kn) 0)                            (__fail! k
+                                                                   "an attribute key must be a keyword or a string literal")
+                  (cstr-eq? kn "attrs*")                         (set! extra
+                                                                   (tcons-of v
+                                                                     extra))
+                  (not (__valid-name? kn))                       (__fail! k
+                                                                   (str-concat (str-concat "'"
+                                                                                 kn)
+                                                                     "' is not a valid attribute name"))
+                  (and (__is? kn "id") seen-id)                  (__fail! k
+                                                                   "a second id (the tag shorthand has one)")
+                  (and (__is? kn "class") (> (cstr-len scls) 0)) nil
+                  :else                                          (do
+                                                                   (if (__is? kn
+                                                                         "id")
+                                                                     (set! seen-id
+                                                                       true)
+                                                                     nil)
+                                                                   (set! attrs
+                                                                     (tcons-of (__attr k
+                                                                                 kn
+                                                                                 v)
+                                                                       attrs)))))
+          (set! i (+ i 2))))
+      (let [attr-list (if (tnil? extra)
+                        (__list attrs)
+                        (syntax-list (sym->syntax "html/hiccup/attrs-append")
+                          (__list attrs)
+                          (thead extra)))]
+        (cond
+              ;; raw-text elements: one string literal, checked
+              (__rawtext? tag) (do
+                                 (if (> (- n first-kid) 1)
+                                   (__fail! stx
+                                     (str-concat (str-concat "<" tag)
+                                       "> takes one string literal"))
+                                   nil)
+                                 (let [body (if (= n first-kid)
+                                              (str->syntax "")
+                                              (syntax-nth stx first-kid))]
+                                   (if (syntax-str? body)
+                                     nil
+                                     (__fail! body
+                                       (str-concat (str-concat "a dynamic <"
+                                                     tag)
+                                         "> body -- its content is raw text, which HTML escaping does not make safe")))
+                                   (if (__raw-ok? tag (syntax->str body))
+                                     nil
+                                     (__fail! body
+                                       (str-concat (str-concat "the <" tag)
+                                         "> body would end the element early (it holds its end tag, <!-- or a CR)")))
+                                   (__call3 "html/hiccup/mk-raw-text"
+                                     (__call1 "html/hiccup/unchecked-tag"
+                                       (str->syntax tag))
+                                     attr-list
+                                     (__call1 "html/hiccup/unchecked-raw-body"
+                                       body))))
+              :else            (let [^mut kids (:: (tnil) (Cons Syntax))
+                                     ^mut j    first-kid
+                                     sub-anc   (str-concat (str-concat anc " ")
+                                                 tag)]
+                                 (if (and (__void? tag) (> n first-kid))
+                                   (__fail! stx
+                                     (str-concat (str-concat "<" tag)
+                                       "> is a void element; it takes no children"))
+                                   nil)
+                                 (while (< j n)
+                                   (let [c (syntax-nth stx j)]
+                                     (cond (__el-vec? c)                          (let [ctag (if (syntax-keyword? (syntax-nth c
+                                                                                                                    0))
+                                                                                               (syntax->str (syntax-nth (__split-shorthand c
+                                                                                                                          (syntax-sym-name (syntax-nth c
+                                                                                                                                             0)))
+                                                                                                              0))
+                                                                                               (syntax->str (syntax-nth c
+                                                                                                              0)))]
+                                                                                    (__check-nesting c
+                                                                                      tag
+                                                                                      sub-anc
+                                                                                      ctag)
+                                                                                    (set! kids
+                                                                                      (tcons-of (__element c
+                                                                                                  sub-anc)
+                                                                                        kids)))
+                                           (syntax-str? c)                        (do
+                                                                                    (if (and (__in? tag
+                                                                                               "table thead tbody tfoot tr")
+                                                                                          (not (__blank? (syntax->str c))))
+                                                                                      (__fail! c
+                                                                                        (str-concat (str-concat "text directly in <"
+                                                                                                      tag)
+                                                                                          "> -- the HTML parser moves it out of the table"))
+                                                                                      nil)
+                                                                                    (set! kids
+                                                                                      (tcons-of (__call1 "html/hiccup/mk-text"
+                                                                                                  c)
+                                                                                        kids)))
+                                           (or (syntax-int? c)
+                                             (syntax-float? c))                   (set! kids
+                                                                                    (tcons-of (__call1 "html/hiccup/mk-text"
+                                                                                                (str->syntax (syntax->string c)))
+                                                                                      kids))
+                                           (syntax-vec? c)                        (__fail! c
+                                                                                    "an element's name must be a keyword or a string literal (a computed tag is not allowed; build one with `tag` and the constructors)")
+                                           :else                                  (set! kids
+                                                                                    (tcons-of (__call1 "html/hiccup/child->html"
+                                                                                                (__call1 "to-child"
+                                                                                                  c))
+                                                                                      kids))))
+                                   (set! j (+ j 1)))
+                                 (__call3 "html/hiccup/mk-elem"
+                                   (__call1 "html/hiccup/unchecked-tag"
+                                     (str->syntax tag))
+                                   attr-list
+                                   (__list kids)))))))
+  ;;; hiccup-expand -- lower a hiccup literal to an Html expression.
+  ;;;
+  ;;; Parameters:
+  ;;;   form -- the literal: an element vector
+  ;;;
+  ;;; Returns:
+  ;;;   Syntax -- constructor calls building the Html value
+  ;;;
+  ;;; Example:
+  ;;;   (defmacro* hiccup [form] (hiccup-expand form))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn hiccup-expand [form : Syntax] : Syntax
+    (cond (__el-vec? form)   (__element form "")
+          (syntax-vec? form) (__fail form
+                               "an element's name must be a keyword or a string literal (a computed tag is not allowed; build one with `tag` and the constructors)")
+          :else              (__fail form
+                               "expected an element vector, [:tag attrs? child...]")))) ;; end defmodule html/hiccupc

@@ -1,0 +1,500 @@
+;;; html/hiccup -- markup as a typed Turmeric value (`Html`), written
+;;; `(hiccup [:li.item #map{:href u} name])`.
+;;;
+;;; Follow-up D of xml-html-followups-plan. A hiccup literal lowers, at
+;;; compile time, to constructor calls building an `Html` tree -- a value
+;;; ordinary functions build, map, filter and `match` on before it is
+;;; rendered (tur-html's `hiccup->string`). Every field that could carry
+;;; unsafe bytes is an opaque type with a checking constructor, so any `Html`
+;;; value is safe to render, whoever built it:
+;;;
+;;;   - `tag` and `attr-name` take a cstr and return an Option: both follow
+;;;     the XML Name production; `tag` refuses the raw-text elements
+;;;     (`script`, `style`, `xmp`, `iframe`, `noembed`, `noframes`,
+;;;     `plaintext`) and `attr-name` the code-bearing names (`on*`, `style`,
+;;;     `srcdoc`), which only a literal the macro checked can write.
+;;;   - `attr` builds an `Attr` from an AttrName and a value, scheme-checking
+;;;     it when the name is URL-bearing, as a literal's hole is.
+;;;
+;;; The literal itself (`hiccup`) checks what it shows: names, a computed
+;;; tag, children under a void element, a second id, a bare `{...}` where
+;;; `#map{...}` belongs, a dynamic value under `on*` / `style` / `srcdoc`, a
+;;; dynamic `<script>` / `<style>` body, and nesting the HTML parser would
+;;; undo (`[:p [:div]]`, `[:a [:a]]`, text in a `<table>`) -- all compile
+;;; errors. Holes take the same classes as `#html{...}`'s (`dom/holes`), plus
+;;; `Html` itself. A literal pays no validation at run time: its names were
+;;; checked at expansion and compile to unchecked constructors.
+;;;
+;;; `Html` is `^heap`: every constructor call allocates a node nothing frees.
+;;; A page per request belongs in a `with-region` bracket.
+;;;
+;;; Since: 0.3.0
+;; Hiccup trees over dom/holes.
+(defmodule html/hiccup
+  (export Html
+    HElem
+    HRawText
+    HText
+    HRaw
+    HList
+    HFragment
+    Tag
+    AttrName
+    Attr
+    RawBody
+    hiccup
+    tag
+    tag-name
+    attr-name
+    attr
+    attr-on
+    unchecked-tag
+    unchecked-attr
+    unchecked-attr-literal
+    unchecked-raw-body
+    attrs-append
+    class-join
+    child->html
+    mk-elem
+    mk-raw-text
+    mk-text
+    hiccup->string)
+  (import dom/holes
+    :refer
+    [Fragment
+     RawHtml
+     Child
+     ChildText
+     ChildHtml
+     ChildXml
+     ChildRaw
+     ChildList
+     ChildEmpty
+     AttrVal
+     AttrText
+     AttrTrusted
+     AttrOn
+     AttrOff
+     url-safe
+     html->string
+     raw-html-markup])
+  (import html/hiccupc :for-macros)
+  (import html/markup :refer [html-raw-fix])
+  ;;; Tag -- a validated element name.
+  (defopaque Tag :ptr<void>)
+  ;;; AttrName -- a validated attribute name.
+  (defopaque AttrName :ptr<void>)
+  ;;; Attr -- an attribute: a name and a value (or boolean presence).
+  (defopaque Attr :ptr<void>)
+  ;;; RawBody -- the text of a raw-text element, checked not to end it early.
+  (defopaque RawBody :ptr<void>)
+  ;;; Html -- markup as a tree.
+  ;;;
+  ;;;   HElem     -- an element: tag, attributes, children
+  ;;;   HRawText  -- script, style and the other raw-text elements
+  ;;;   HText     -- text, escaped when rendered
+  ;;;   HRaw      -- raw-html's opt-out: parsed in its element when rendered
+  ;;;   HList     -- siblings with no wrapper
+  ;;;   HFragment -- an `#html{...}` value spliced in
+  (defdata ^heap ^copy Html
+    (HElem Tag (Cons Attr) (Cons Html))
+    (HRawText Tag (Cons Attr) RawBody)
+    (HText cstr)
+    (HRaw RawHtml)
+    (HList (Cons Html))
+    (HFragment Fragment))
+  ;; ---------------------------------------------------------------------------
+  ;; Names
+  ;; ---------------------------------------------------------------------------
+  ;;; __name-ok -- internal: 0 for a valid name, else why not (C).
+  (defn __name-check [s : cstr kind : int] : bool
+    ```c
+    /* kind 0: element (no raw-text tags); 1: attribute (no code-bearing names) */
+  const unsigned char *p = (const unsigned char *)s;
+  size_t n = strlen((const char *)s);
+  if (n == 0) return false;
+  #define NS(c) (((c) >= 'a' && (c) <= 'z') || ((c) >= 'A' && (c) <= 'Z') || (c) == '_' || (c) == ':' || (c) >= 0x80)
+  #define NC(c) (NS(c) || ((c) >= '0' && (c) <= '9') || (c) == '-' || (c) == '.')
+  if (!NS(p[0])) return false;
+  for (size_t i = 1; i < n; i++) if (!NC(p[i])) return false;
+  char low[32];
+  size_t k = n < sizeof low - 1 ? n : sizeof low - 1;
+  for (size_t i = 0; i < k; i++) low[i] = (char)((p[i] >= 'A' && p[i] <= 'Z') ? p[i] + 32 : p[i]);
+  low[k] = '\0';
+  if (kind == 0) {
+    static const char *const raw[] = {"script", "style", "xmp", "iframe", "noembed",
+                                      "noframes", "plaintext", NULL};
+    if (n < sizeof low - 1)
+      for (int i = 0; raw[i]; i++) if (strcmp(low, raw[i]) == 0) return false;
+  } else {
+    if (n >= 2 && low[0] == 'o' && low[1] == 'n') return false;
+    if (n < sizeof low - 1 && (strcmp(low, "style") == 0 || strcmp(low, "srcdoc") == 0)) return false;
+  }
+  return true;
+  #undef NS
+  #undef NC
+  ```)
+  ;;; __dup-ptr -- internal: a malloc'd copy, as a pointer.
+  (defn __dup-ptr [s : cstr] : ptr<void>
+    ```c
+    size_t n = strlen((const char *)s);
+  char *d = (char *)malloc(n + 1);
+  if (!d) abort();
+  memcpy(d, s, n + 1);
+  return d;
+  ```)
+  ;;; __as-cstr -- internal.
+  (defn __as-cstr [p : ptr<void>] : cstr
+    ```c
+    return (const char *)p;
+  ```)
+  ;;; tag -- a checked element name.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the name
+  ;;;
+  ;;; Returns:
+  ;;;   (Option Tag) -- None for a name that is not an XML Name, and for the
+  ;;;   raw-text elements (script, style, xmp, iframe, noembed, noframes,
+  ;;;   plaintext), which only a checked literal can write.
+  ;;;
+  ;;; Example:
+  ;;;   (match (tag "li") (Some t) (HElem t (tnil) (tnil)) (None) (HList (tnil)))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn tag [s : cstr] : (Option Tag)
+    (if (__name-check s 0) (Some (:: (__dup-ptr s) Tag)) (None)))
+  ;;; tag-name -- an element name's text.
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the tag
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- borrowed
+  ;;;
+  ;;; Example:
+  ;;;   (tag-name (unchecked-tag "li"))   ; => "li"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn tag-name [t : Tag] : cstr (__as-cstr (:: t ptr<void>)))
+  ;;; attr-name -- a checked attribute name.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the name
+  ;;;
+  ;;; Returns:
+  ;;;   (Option AttrName) -- None for a name that is not an XML Name, and for
+  ;;;   `on*`, `style` and `srcdoc`, whose values are code or markup.
+  ;;;
+  ;;; Example:
+  ;;;   (attr-name "data-id")   ; => (Some ...)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn attr-name [s : cstr] : (Option AttrName)
+    (if (__name-check s 1) (Some (:: (__dup-ptr s) AttrName)) (None)))
+  ;;; unchecked-tag -- internal: a tag the macro already checked.
+  (defn unchecked-tag [s : cstr] : Tag (:: (__as-ptr s) Tag))
+  ;;; __as-ptr -- internal.
+  (defn __as-ptr [s : cstr] : ptr<void>
+    ```c
+    return (void *)s;
+  ```)
+  ;; ---------------------------------------------------------------------------
+  ;; Attributes: a malloc'd {name, state, value}; state 0 absent, 1 present
+  ;; (boolean), 2 a value.
+  ;; ---------------------------------------------------------------------------
+  ;;; __attr-new -- internal.
+  (defn __attr-new [name : cstr state : int value : cstr] : ptr<void>
+    ```c
+    struct tur_hattr { const char *name; int64_t state; const char *value; };
+  struct tur_hattr *a = (struct tur_hattr *)malloc(sizeof *a);
+  if (!a) abort();
+  a->name = (const char *)name;
+  a->state = state;
+  a->value = (const char *)value;
+  return a;
+  ```)
+  ;;; __attr-name -- internal.
+  (defn __attr-name-of [a : Attr] : cstr
+    ```c
+    return ((const char **)(intptr_t)a)[0];
+  ```)
+  ;;; __attr-state -- internal.
+  (defn __attr-state [a : Attr] : int
+    ```c
+    return ((const int64_t *)(intptr_t)a)[1];
+  ```)
+  ;;; __attr-value -- internal.
+  (defn __attr-value [a : Attr] : cstr
+    ```c
+    return ((const char **)(intptr_t)a)[2];
+  ```)
+  ;;; unchecked-attr -- internal: an attribute from a literal's hole (the
+  ;;; macro checked the name and chose the class).
+  (defn unchecked-attr [name : cstr v : AttrVal] : Attr
+    (:: (match v
+          (AttrText s)
+          (__attr-new name 2 s)
+          (AttrTrusted s)
+          (__attr-new name 2 s)
+          (AttrOn)
+          (__attr-new name 1 "")
+          (AttrOff)
+          (__attr-new name 0 ""))
+      Attr))
+  ;;; unchecked-attr-literal -- internal: a literal attribute value.
+  (defn unchecked-attr-literal [name : cstr v : cstr] : Attr
+    (:: (__attr-new name 2 v) Attr))
+  ;;; __url-name? -- internal: is this a URL-bearing attribute?
+  (defn __url-name? [n : cstr] : bool
+    ```c
+    static const char *const urls[] = {"href", "src", "action", "formaction", "xlink:href",
+                                       "poster", "cite", NULL};
+  for (int i = 0; urls[i]; i++)
+    if (strcasecmp((const char *)n, urls[i]) == 0) return true;
+  return false;
+  ```)
+  ;;; attr -- an attribute with a value, checked like a literal's hole.
+  ;;;
+  ;;; Parameters:
+  ;;;   n -- the name (from `attr-name`)
+  ;;;   v -- the value; escaped when rendered, and scheme-checked first when
+  ;;;        `n` is URL-bearing (`href`, `src`, ...)
+  ;;;
+  ;;; Returns:
+  ;;;   Attr
+  ;;;
+  ;;; Example:
+  ;;;   (match (attr-name "href") (Some n) (attr n url) (None) ...)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn attr [n : AttrName v : cstr] : Attr
+    (let [name (__as-cstr (:: n ptr<void>))]
+      (:: (__attr-new name 2 (if (__url-name? name) (url-safe v) v)) Attr)))
+  ;;; attr-on -- a boolean attribute, present.
+  ;;;
+  ;;; Parameters:
+  ;;;   n -- the name
+  ;;;
+  ;;; Returns:
+  ;;;   Attr
+  ;;;
+  ;;; Example:
+  ;;;   (match (attr-name "hidden") (Some n) (attr-on n) (None) ...)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn attr-on [n : AttrName] : Attr
+    (:: (__attr-new (__as-cstr (:: n ptr<void>)) 1 "") Attr))
+  ;;; attrs-append -- internal: a literal's attributes, then `:attrs*`'s.
+  (defn attrs-append [xs : (Cons Attr) ys : (Cons Attr)] : (Cons Attr)
+    (if (tnil? xs) ys (tcons-of (thead xs) (attrs-append (ttail xs) ys))))
+  ;;; class-join -- internal: the shorthand classes, then the map's `:class`.
+  (defn class-join [pre : cstr v : AttrVal] : AttrVal
+    (match v
+      (AttrText s)
+      (AttrText (__cat3 pre " " s))
+      (AttrTrusted s)
+      (AttrTrusted (__cat3 pre " " s))
+      (AttrOn)
+      (AttrTrusted pre)
+      (AttrOff)
+      (AttrTrusted pre)))
+  ;;; __cat3 -- internal: a malloc'd a + b + c.
+  (defn __cat3 [a : cstr b : cstr c : cstr] : cstr
+    ```c
+    size_t la = strlen((const char *)a), lb = strlen((const char *)b), lc = strlen((const char *)c);
+  char *o = (char *)malloc(la + lb + lc + 1);
+  if (!o) abort();
+  memcpy(o, a, la); memcpy(o + la, b, lb); memcpy(o + la + lb, c, lc + 1);
+  return o;
+  ```)
+  ;;; unchecked-raw-body -- internal: a raw-text body the macro checked.
+  (defn unchecked-raw-body [s : cstr] : RawBody (:: (__as-ptr s) RawBody))
+  ;;; mk-elem -- internal: HElem, as the macro calls it.
+  ;;;
+  ;;; The expansion names everything module-qualified, so it works in a file
+  ;;; that imported only `hiccup`; a qualified constructor
+  ;;; (`html/hiccup/HElem`) mistypes as an argument today, so the macro calls
+  ;;; these instead.
+  (defn mk-elem [t : Tag as : (Cons Attr) kids : (Cons Html)] : Html
+    (HElem t as kids))
+  ;;; mk-raw-text -- internal: HRawText, as the macro calls it.
+  (defn mk-raw-text [t : Tag as : (Cons Attr) body : RawBody] : Html
+    (HRawText t as body))
+  ;;; mk-text -- internal: HText, as the macro calls it.
+  (defn mk-text [s : cstr] : Html (HText s))
+  ;;; child->html -- internal: a content hole's value as Html.
+  (defn child->html [c : Child] : Html
+    (match c
+      (ChildText s)
+      (HText s)
+      (ChildHtml s)
+      (HFragment (:: (__as-ptr s) Fragment))
+      (ChildXml s)
+      (panic "an #xml{} fragment (or XML node) cannot go in hiccup")
+      (ChildRaw s)
+      (HRaw (:: (__as-ptr s) RawHtml))
+      (ChildList xs)
+      (HList (__child-list xs))
+      (ChildEmpty)
+      (HList (tnil))))
+  ;;; __child-list -- internal.
+  (defn __child-list [xs : (Cons Child)] : (Cons Html)
+    (if (tnil? xs)
+      (tnil)
+      (tcons-of (child->html (thead xs)) (__child-list (ttail xs)))))
+  ;;; hiccup -- markup as an `Html` value, from a hiccup literal.
+  ;;;
+  ;;; Parameters:
+  ;;;   form -- `[name attrs? child...]`: name a keyword (`:li.item#main`)
+  ;;;           or a string; attrs a `#map{...}`; children text, nested
+  ;;;           vectors or any expression with a `to-child` instance
+  ;;;
+  ;;; Returns:
+  ;;;   Html
+  ;;;
+  ;;; Example:
+  ;;;   (hiccup [:li.item #map{:data-done done} [:a #map{:href url} name]])
+  ;;;
+  ;;; Since: 0.3.0
+  (defmacro* hiccup [form] (hiccup-expand form))
+  ;; ---------------------------------------------------------------------------
+  ;; Rendering
+  ;; ---------------------------------------------------------------------------
+  ;;; __mb-new -- internal.
+  (defn __mb-new [] : ptr<void>
+    ```c
+    extern void *turdom_mbuf_new(void);
+  return turdom_mbuf_new();
+  ```)
+  ;;; __mb-put -- internal.
+  (defn __mb-put [b : ptr<void> s : cstr] : nil
+    ```c
+    extern void turdom_mbuf_put(void *, const char *);
+  turdom_mbuf_put(b, (const char *)s);
+  ```)
+  ;;; __mb-esc -- internal.
+  (defn __mb-esc [b : ptr<void> s : cstr attr : bool html : bool] : nil
+    ```c
+    extern void turdom_mbuf_put_escaped(void *, const char *, int, int);
+  turdom_mbuf_put_escaped(b, (const char *)s, attr ? 1 : 0, html ? 1 : 0);
+  ```)
+  ;;; __mb-finish -- internal.
+  (defn __mb-finish [b : ptr<void>] : cstr
+    ```c
+    extern char *turdom_mbuf_finish(void *);
+  return turdom_mbuf_finish(b);
+  ```)
+  ;;; __void-tag? -- internal.
+  (defn __void-tag? [t : cstr] : bool
+    ```c
+    static const char *const v[] = {"area", "base", "basefont", "bgsound", "br", "col", "embed",
+                                    "frame", "hr", "img", "input", "keygen", "link", "meta",
+                                    "param", "source", "track", "wbr", NULL};
+  for (int i = 0; v[i]; i++)
+    if (strcasecmp((const char *)t, v[i]) == 0) return true;
+  return false;
+  ```)
+  ;;; __render-attrs -- internal.
+  (defn __render-attrs [b : ptr<void> xs : (Cons Attr) html : bool] : nil
+    (if (tnil? xs)
+      nil
+      (let [a (thead xs)
+            s (__attr-state a)]
+        (cond (= s 1) (do
+                        (__mb-put b " ")
+                        (__mb-put b (__attr-name-of a))
+                        (if html
+                          nil
+                          (do
+                            (__mb-put b "=\"")
+                            (__mb-put b (__attr-name-of a))
+                            (__mb-put b "\""))))
+              (= s 2) (do
+                        (__mb-put b " ")
+                        (__mb-put b (__attr-name-of a))
+                        (__mb-put b "=\"")
+                        (__mb-esc b (__attr-value a) true html)
+                        (__mb-put b "\""))
+              :else   nil)
+        (__render-attrs b (ttail xs) html))))
+  ;;; __render-list -- internal.
+  (defn __render-list [b : ptr<void>
+                       xs : (Cons Html)
+                       parent : cstr
+                       html : bool
+                       raw-fix : (fn [cstr cstr] cstr)] : nil
+    (if (tnil? xs)
+      nil
+      (do
+        (__render b (thead xs) parent html raw-fix)
+        (__render-list b (ttail xs) parent html raw-fix))))
+  ;;; __render -- internal.
+  (defn __render [b : ptr<void>
+                  h : Html
+                  parent : cstr
+                  html : bool
+                  raw-fix : (fn [cstr cstr] cstr)] : nil
+    (match h
+      (HElem t as kids)
+      (let [name (tag-name t)]
+        (__mb-put b "<")
+        (__mb-put b name)
+        (__render-attrs b as html)
+        (if (and (not html) (tnil? kids))
+          (__mb-put b "/>")
+          (do
+            (__mb-put b ">")
+            (if (and html (__void-tag? name))
+              nil
+              (do
+                (__render-list b kids name html raw-fix)
+                (__mb-put b "</")
+                (__mb-put b name)
+                (__mb-put b ">"))))))
+      (HRawText t as body)
+      (let [name (tag-name t)]
+        (__mb-put b "<")
+        (__mb-put b name)
+        (__render-attrs b as html)
+        (__mb-put b ">")
+        (if html
+          (__mb-put b (__as-cstr (:: body ptr<void>)))
+          (__mb-esc b (__as-cstr (:: body ptr<void>)) false false))
+        (__mb-put b "</")
+        (__mb-put b name)
+        (__mb-put b ">"))
+      (HText s)
+      (__mb-esc b s false html)
+      (HRaw r)
+      (__mb-put b (raw-fix (raw-html-markup r) parent))
+      (HList xs)
+      (__render-list b xs parent html raw-fix)
+      (HFragment f)
+      (__mb-put b (html->string f))))
+  ;;; __render-tree -- internal: a tree's markup, malloc'd. `html` picks the
+  ;;; serialization rules; HTML is all D1 writes (D2 adds the XML flavour).
+  (defn __render-tree [h : Html html : bool raw-fix : (fn [cstr cstr] cstr)] : cstr
+    (let [b (__mb-new)] (__render b h "template" html raw-fix) (__mb-finish b)))
+  ;;; hiccup->string -- an Html tree as HTML markup.
+  ;;;
+  ;;; The HTML serialization rules: void elements have no end tag, a boolean
+  ;;; attribute is its bare name, raw-text bodies are written as they are.
+  ;;; Text and attribute values are escaped as `#html{...}` escapes them, so
+  ;;; the two give byte-identical output for the same markup. A `raw-html`
+  ;;; child is parsed in its parent element first, so it cannot unbalance
+  ;;; the tree.
+  ;;;
+  ;;; Parameters:
+  ;;;   h -- the tree
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- malloc'd markup
+  ;;;
+  ;;; Example:
+  ;;;   (hiccup->string (hiccup [:p.note "a < b"]))   ; => "<p class=\"note\">a &lt; b</p>"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn hiccup->string [h : Html] : cstr (__render-tree h true html-raw-fix))
+  ;;; ToChild [Html] -- a tree in an #html{} literal or another tree's hole.
+  (definstance ToChild [Html] (to-child [x] (ChildHtml (hiccup->string x))))) ;; end defmodule html/hiccup

@@ -12,7 +12,20 @@
   renders, and URL attributes are scheme-checked. Each literal is parsed
   once with lexbor, in `template` context, on its first render to check
   the holes landed where the macro said. `html*` is the macro behind it.
-- `errors/run.sh`: the compile-error table for `#html{...}` holes.
+- `html/hiccup` (xml-html-followups-plan follow-up D1): markup as a typed
+  value. `(hiccup [:li.item #map{:href u} name])` lowers at compile time to
+  constructor calls building an `Html` tree (`HElem`, `HRawText`, `HText`,
+  `HRaw`, `HList`, `HFragment`); `hiccup->string` renders it, byte for byte
+  as `#html{...}` renders the same markup. Holes go through the same
+  classes, plus `ToChild Html`. The literal checks names, void elements, a
+  second id, bare `{...}` attribute maps, dynamic `on*`/`style`/`srcdoc`
+  values and `<script>`/`<style>` bodies, and nesting the HTML parser would
+  undo (plan D-2). The checking constructors `tag`, `attr-name`, `attr`,
+  `attr-on` keep a hand-built tree safe to render. The macro-time half is
+  `html/hiccupc`.
+- `html-raw-fix` (html/markup): the raw-html fixer both renderers use.
+- `errors/run.sh`: the compile-error tables for `#html{...}` holes and
+  `hiccup` literals.
 
 ## 0.2.0
 

@@ -13,7 +13,7 @@
   picks the class each hole goes through. `dom/holes` has the classes --
   `ToChild`, `ToAttr`, `ToUrlAttr`, with instances for `cstr`, `String`,
   `int`, `bool`, `Fragment`, `XmlFragment`, `Node`, `RawHtml`,
-  `TrustedUrl`, lists and `Option` -- the `raw-html` and `trusted-url`
+  `TrustedUrl`, `Option` and `(Cons T)` of any of them -- the `raw-html` and `trusted-url`
   opt-outs, the URL scheme allowlist (`url-safe`, `srcset-check`),
   `html->string` / `xml->string` / `fragment-free`, and the renderer and the
   per-literal parser check both literals share.

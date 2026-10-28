@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# errors/run.sh -- `#html{...}` holes in forbidden places are compile errors
-# (xml-html-followups-plan follow-up A1).
+# errors/run.sh -- `#html{...}` holes in forbidden places, and `hiccup`
+# literals the plan rules out, are compile errors (xml-html-followups-plan
+# follow-ups A1 and D1).
 #
 # Each case is one literal, compiled through `html*` (the macro behind
 # `#html{...}`) with `tur check`; it must be REJECTED with a message naming
@@ -92,6 +93,74 @@ echo "# types: the position picks the class"
 expect_reject '<p title=${(html* \"<b>x</b>\")}>x</p>' "ToAttr"
 expect_reject '<a href=${b}>x</a>' "ToUrlAttr"
 expect_reject '<p>${b}</p>' "ToChild"
+
+# ---- hiccup (follow-up D1) ------------------------------------------------------
+#
+# expect_hiccup_reject <form> <witness>: `(hiccup <form>)` must not compile.
+# The form is Turmeric source; it may use `x` (a cstr) and `n` (an int).
+expect_hiccup_reject() {
+  local form="$1" witness="$2" f out
+  n=$((n + 1))
+  f="$TMP/hiccup$n.tur"
+  cat > "$f" <<EOF
+(defmodule hcase$n
+  (import html/hiccup :refer [hiccup hiccup->string])
+  (defn main [] : int
+    (let [x "v" k 3]
+      (println (hiccup->string (hiccup $form))))
+    0))
+EOF
+  out="$("$TUR" check "$f" 2>&1)"
+  if printf '%s' "$out" | grep -qF -- "$witness"; then
+    echo "ok $n - hiccup $form"
+  else
+    echo "not ok $n - hiccup $form"
+    echo "    expected a diagnostic containing: $witness"
+    printf '%s\n' "$out" | grep -m3 'error' | sed 's/^/      /'
+    fail=1
+  fi
+}
+
+echo "# hiccup: names and shapes"
+expect_hiccup_reject '[:p+q "x"]' "is not a valid element name"
+expect_hiccup_reject '["1p" "x"]' "is not a valid element name"
+expect_hiccup_reject '[:p #map{"a b" "1"} "x"]' "is not a valid attribute name"
+expect_hiccup_reject '[x "y"]' "a computed tag is not allowed"
+expect_hiccup_reject '[:div [x "y"]]' "a computed tag is not allowed"
+expect_hiccup_reject '"text"' "expected an element vector"
+expect_hiccup_reject '[:br "x"]' "is a void element"
+expect_hiccup_reject '[:img [:b]]' "is a void element"
+expect_hiccup_reject '[:p#a#b "x"]' "a second id in the tag shorthand"
+expect_hiccup_reject '[:p#a #map{:id "b"} "x"]' "a second id"
+expect_hiccup_reject '[:p {:class "a"} "x"]' "write the attributes as #map{...}"
+expect_hiccup_reject '[:p {:class "a" :id "b"} "x"]' "write the attributes as #map{...}"
+expect_hiccup_reject '[:p #map{1 "a"} "x"]' "an attribute key must be a keyword or a string"
+expect_hiccup_reject '[:plaintext "x"]' "<plaintext> never closes"
+echo "# hiccup: code-bearing attributes and raw text (plan A-4)"
+expect_hiccup_reject '[:a #map{:onclick x} "y"]' "a dynamic value for 'onclick'"
+expect_hiccup_reject '[:p #map{:style x} "y"]' "a dynamic value for 'style'"
+expect_hiccup_reject '[:iframe #map{:srcdoc x}]' "a dynamic value for 'srcdoc'"
+expect_hiccup_reject '[:script x]' "a dynamic <script> body"
+expect_hiccup_reject '[:style x]' "a dynamic <style> body"
+expect_hiccup_reject '[:script "a" "b"]' "takes one string literal"
+expect_hiccup_reject '[:script "x</script><b>"]' "would end the element early"
+expect_hiccup_reject '[:script "<!-- x"]' "would end the element early"
+expect_hiccup_reject '[:style "a</STYLE>"]' "would end the element early"
+echo "# hiccup: nesting the HTML parser would undo (plan D-2)"
+expect_hiccup_reject '[:p [:div "x"]]' "<div> inside <p>"
+expect_hiccup_reject '[:p [:ul [:li "x"]]]' "<ul> inside <p>"
+expect_hiccup_reject '[:a [:span [:a "x"]]]' "<a> inside <a>"
+expect_hiccup_reject '[:form [:div [:form]]]' "<form> inside <form>"
+expect_hiccup_reject '[:a [:button "x"]]' "interactive <button> inside <a> or <button>"
+expect_hiccup_reject '[:button [:input]]' "interactive <input> inside <a> or <button>"
+expect_hiccup_reject '[:table [:td "x"]]' "<td> directly in <table>"
+expect_hiccup_reject '[:table "x"]' "text directly in <table>"
+expect_hiccup_reject '[:tbody [:td "x"]]' "<td> directly in <tbody>"
+expect_hiccup_reject '[:tr [:div "x"]]' "<div> directly in <tr>"
+echo "# hiccup: types, through the same classes as #html{}"
+expect_hiccup_reject '[:p #map{:title (hiccup [:b])} "x"]' "ToAttr"
+expect_hiccup_reject '[:a #map{:href true} "x"]' "ToUrlAttr"
+expect_hiccup_reject '[:p true]' "ToChild"
 
 # A raw-html value that cannot be written back panics at render time.
 n=$((n + 1))

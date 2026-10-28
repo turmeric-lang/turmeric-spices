@@ -24,6 +24,7 @@ what is particular to HTML.
 7. [Options, files and encodings](#7-options-files-and-encodings)
 8. [Editing and token-level transforms](#8-editing-and-token-level-transforms)
 10. [Markup literals](#10-markup-literals)
+11. [Hiccup: markup as a value](#11-hiccup-markup-as-a-value)
 
 ---
 
@@ -331,3 +332,76 @@ Two things about the syntax:
 
 A `Fragment` owns its markup; `fragment-free` releases one, which a server
 rendering a page per request will want.
+
+---
+
+## 11. Hiccup: markup as a value
+
+`html/hiccup` builds markup as a Turmeric value, Clojure-hiccup style:
+`(hiccup [...])` lowers a literal to constructor calls building an `Html`
+tree, which ordinary functions build, map, filter and `match` on before
+`hiccup->string` renders it.
+
+```turmeric
+(import html/hiccup :refer [Html hiccup hiccup->string])
+
+(defn item [name : cstr href : cstr done : bool] : Html
+  (hiccup [:li.item #map{:data-done done}
+            [:a #map{:href href} name]]))
+
+(defn page [items : (Cons Html)] : cstr
+  (hiccup->string (hiccup [:ul#menu items])))
+```
+
+```sweet-exp
+#lang sweet-exp
+import html/hiccup :refer [Html hiccup hiccup->string]
+
+defn item [name : cstr href : cstr done : bool] : Html
+  hiccup [:li.item #map{:data-done done} [:a #map{:href href} name]]
+
+defn page [items : (Cons Html)] : cstr
+  hiccup->string $ hiccup [:ul#menu items]
+```
+
+An element is `[name attrs? child...]`:
+
+- **name** -- a keyword, with CSS-style shorthand for the id and classes
+  (`:li.item#main`), or a string literal for a name with a colon
+  (`["svg:rect" ...]`; a keyword splits at the colon). A computed name is a
+  compile error: build that element with `tag` and the constructors.
+- **attrs** -- a `#map{...}` with keyword or string keys. A bare `{...}` is
+  curly-infix, not a map, and is a compile error pointing here. A literal
+  value is written as given; any other value is a hole through `to-attr`
+  (or `to-url-attr` for `href`, `src` and the other URL attributes), exactly
+  as in `#html{...}`: a `bool` is a boolean attribute, `None` drops the
+  attribute, a URL is scheme-checked. A map `:class` joins the shorthand
+  classes. `:attrs*` splices a `(Cons Attr)` built at run time.
+- **children** -- string and number literals are text; nested vectors are
+  elements; anything else is a hole through `to-child`, which takes what
+  `#html{...}`'s content holes take plus `Html` and lists of `Html`.
+
+What the literal shows is checked at compile time: every name is a valid
+name; a void element (`br`, `img`, ...) takes no children; a second id; a
+dynamic value under `on*`, `style` or `srcdoc`; a `<script>` or `<style>`
+body that is not one string literal, or that would end the element early;
+and nesting the HTML parser would undo -- block content in a `<p>`, `<a>`
+in `<a>`, `<form>` in `<form>`, interactive content in `<a>` or `<button>`,
+anything but the table-structure elements (or text) directly in a
+`<table>`, `<tbody>` or `<tr>`. A tree assembled at run time is not
+checked for nesting.
+
+`Html`'s constructors are public, so a tree can be built and taken apart by
+hand; every field that could carry unsafe bytes is an opaque type with a
+checking constructor, so any `Html` value renders safely: `tag` and
+`attr-name` return `None` for a name that is not a name, `tag` refuses the
+raw-text elements, `attr-name` refuses `on*`, `style` and `srcdoc`, and
+`attr` scheme-checks a URL-bearing attribute's value.
+
+`hiccup->string` writes what `#html{...}` would for the same markup -- the
+test suite checks the two give byte-identical output across a hostile
+corpus -- and either can hold the other: an `Html` value goes in an
+`#html{...}` hole, a `Fragment` in a hiccup child.
+
+`Html` nodes are heap-allocated and never freed; rendering a tree per
+request belongs in a `with-region` bracket.

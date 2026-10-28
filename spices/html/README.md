@@ -24,6 +24,10 @@ back as the tree a browser builds, and `html-parse` never fails.
   scheme-checked and holes in unsafe places (`<script>`, `on*`, names)
   rejected at compile time. See the
   [guide](../../docs/guides/html-guide.md#10-markup-literals).
+- **Hiccup** (`html/hiccup`) -- `(hiccup [:li.item #map{:href u} name])`:
+  markup as a typed `Html` value to build, map and `match` on, rendered
+  with `hiccup->string`. See the
+  [guide](../../docs/guides/html-guide.md#11-hiccup-markup-as-a-value).
 - **innerHTML** (`html/edit`) -- `set-inner-html!` parses markup in an
   element's own context and puts it in place of the element's children,
   through dom-core's validated `dom/edit`; `node-inner-html` and
@@ -93,7 +97,8 @@ defn main [] : int
 | `html/edit` | `set-inner-html!`, `node-inner-html`, `node-outer-html` |
 | `html/sax` | `HtmlSaxParser`, `html-sax-parse-string`, `html-sax-parse-string-opts`, `html-sax-parser-new`, `html-sax-parser-new-opts`, `html-sax-feed!`, `html-sax-finish!`, `html-sax-parser-free` |
 | `html/transform` | `html-sax-transform`, `html-sax-transform-opts` |
-| `html/markup` | `html*` (the macro behind `#html{...}`), `html-render`; the literal's types and opt-outs are dom-core's `dom/holes` |
+| `html/hiccup` | `Html` (`HElem` `HRawText` `HText` `HRaw` `HList` `HFragment`), `Tag`, `AttrName`, `Attr`, `RawBody`, `hiccup`, `hiccup->string`, `tag`, `tag-name`, `attr-name`, `attr`, `attr-on` (and the internals the macro expands to) |
+| `html/markup` | `html*` (the macro behind `#html{...}`), `html-render`, `html-raw-fix`; the literal's types and opt-outs are dom-core's `dom/holes` |
 
 The [HTML guide](../../docs/guides/html-guide.md) covers both, the tree's
 shape (namespaces, templates, the depth cap), how the tokenizer stream

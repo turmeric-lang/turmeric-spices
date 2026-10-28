@@ -7,9 +7,9 @@
 ;;; `cite`, `srcset`) `ToUrlAttr` -- and the value's TYPE picks the instance:
 ;;;
 ;;;   ToChild    cstr, String, int -- text, escaped; Fragment / XmlFragment --
-;;;              a nested literal, spliced as markup; (Cons Fragment); Node --
-;;;              serialized in; RawHtml -- unescaped, see `raw-html`;
-;;;              (Option T) -- None renders nothing
+;;;              a nested literal, spliced as markup; Node -- serialized in;
+;;;              RawHtml -- unescaped, see `raw-html`; (Option T) -- None
+;;;              renders nothing; (Cons T) -- each element in order
 ;;;   ToAttr     cstr, String, int -- escaped; bool -- present or absent (an
 ;;;              HTML boolean attribute); (Option T) -- None drops the attribute
 ;;;   ToUrlAttr  cstr, String -- scheme-checked, then escaped; TrustedUrl --
@@ -35,6 +35,7 @@
     ChildHtml
     ChildXml
     ChildRaw
+    ChildList
     ChildEmpty
     AttrVal
     AttrText
@@ -73,12 +74,14 @@
   ;;; TrustedUrl -- a URL a caller vouches for; see `trusted-url`.
   (defopaque TrustedUrl :ptr<void>)
   ;;; Child -- what a content hole renders: text to escape, markup of either
-  ;;; flavour, raw markup to parse in the hole's context, or nothing.
+  ;;; flavour, raw markup to parse in the hole's context, several of those in
+  ;;; order, or nothing.
   (defdata ^copy Child
     (ChildText cstr)
     (ChildHtml cstr)
     (ChildXml cstr)
     (ChildRaw cstr)
+    (ChildList (Cons Child))
     (ChildEmpty))
   ;;; AttrVal -- what an attribute hole renders: a value to escape (checked or
   ;;; trusted), or a boolean attribute present (`AttrOn`) or absent
@@ -374,24 +377,15 @@
   (definstance ToChild [(Option A)]
     [(ToChild A)]
     (to-child [x] (match x (Some v) (to-child v) (None) (ChildEmpty))))
-  ;;; __cat-html -- internal: the markup of a list of fragments.
-  (defn __cat-html [b : ptr<void> xs : (Cons Fragment)] : nil
+  ;;; __children -- internal: each element of a list as a Child.
+  (defn __children [^ToChild A] [xs : (Cons A)] : (Cons Child)
     (if (tnil? xs)
-      nil
-      (do (__mb-put b (html->string (thead xs))) (__cat-html b (ttail xs)))))
-  ;;; __cat-xml -- internal: the markup of a list of XML fragments.
-  (defn __cat-xml [b : ptr<void> xs : (Cons XmlFragment)] : nil
-    (if (tnil? xs)
-      nil
-      (do (__mb-put b (xml->string (thead xs))) (__cat-xml b (ttail xs)))))
-  ;;; ToChild [(Cons Fragment)] -- the fragments in order.
-  (definstance ToChild [(Cons Fragment)]
-    (to-child [x]
-      (let [b (__mb-new)] (__cat-html b x) (ChildHtml (__mb-finish b)))))
-  ;;; ToChild [(Cons XmlFragment)] -- the fragments in order.
-  (definstance ToChild [(Cons XmlFragment)]
-    (to-child [x]
-      (let [b (__mb-new)] (__cat-xml b x) (ChildXml (__mb-finish b)))))
+      (tnil)
+      (tcons-of (to-child (thead xs)) (__children (ttail xs)))))
+  ;;; ToChild [(Cons A)] -- the elements in order.
+  (definstance ToChild [(Cons A)]
+    [(ToChild A)]
+    (to-child [x] (ChildList (__children x))))
   ;;; ToChild [Node] -- a node of a parsed or built tree, serialized in.
   (definstance ToChild [Node]
     (to-child [x]
@@ -498,8 +492,22 @@
         (__mb-put b s))
       (ChildRaw s)
       (__mb-put b (raw-fix s (template-parent tpl i)))
+      (ChildList xs)
+      (__render-children b tpl i xs html raw-fix)
       (ChildEmpty)
       nil))
+  ;;; __render-children -- internal: a ChildList, in order.
+  (defn __render-children [b : ptr<void>
+                           tpl : cstr
+                           i : int
+                           xs : (Cons Child)
+                           html : bool
+                           raw-fix : (fn [cstr cstr] cstr)] : nil
+    (if (tnil? xs)
+      nil
+      (do
+        (__render-child b tpl i (thead xs) html raw-fix)
+        (__render-children b tpl i (ttail xs) html raw-fix))))
   ;;; __render-attr -- internal.
   (defn __render-attr [b : ptr<void>
                        tpl : cstr
