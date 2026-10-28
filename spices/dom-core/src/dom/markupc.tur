@@ -1,0 +1,606 @@
+;;; dom/markupc -- the compile-time half of markup literals: a context
+;;; tokenizer that finds the `${...}` holes in an `#html{...}` / `#xml{...}`
+;;; body and decides, from where each one sits, what it may hold.
+;;;
+;;; Imported `:for-macros` by tur-html's `html/markup` and tur-xml's
+;;; `xml/markup`; nothing here runs in a compiled program. `markup-expand`
+;;; walks the body as the HTML (or XML) tokenizer would -- data, tag name,
+;;; attribute name, attribute value (quoted or not), comment, doctype,
+;;; processing instruction, raw text (`script`, `style`, `textarea`,
+;;; `title`, ...), CDATA -- and at each hole:
+;;;
+;;;   - in content: a content hole, filled through `to-child`;
+;;;   - in an attribute value: filled through `to-attr`, or `to-url-attr`
+;;;     for a URL-bearing attribute, plus `srcset-check` for `srcset`;
+;;;   - anywhere else -- a tag or attribute name, a comment, raw text, a
+;;;     doctype, an unquoted value it shares with other text -- a compile
+;;;     error naming the place, because a value there could change the
+;;;     document's structure and no escaping makes that safe;
+;;;   - in the value of an attribute that holds code or markup (`on*`,
+;;;     `style`, `srcdoc`): a compile error too (plan A-4), since HTML
+;;;     escaping protects only the attribute layer.
+;;;
+;;; It emits one template string (see c/dom/turmarkup.c for the encoding) and
+;;; the hole expressions, each wrapped for its context. A literal whose first
+;;; tag is `<!doctype` or `<html>` is a whole document; otherwise a
+;;; top-level `<head>` or `<body>` is a compile error, since a fragment parse
+;;; drops it.
+;;;
+;;; Since: 0.3.0
+;; tur-check: macro-time
+;; Context tokenizer for markup literals; macro time only.
+(defmodule dom/markupc
+  (export markup-expand)
+  ;;; __b -- internal: the byte at i, or -1 past the end.
+  (defn __b [s : cstr i : int n : int] : int (if (< i n) (cstr-nth s i) -1))
+  ;;; __ws? -- internal: HTML whitespace.
+  (defn __ws? [c : int] : bool
+    (or (= c 32) (or (= c 9) (or (= c 10) (or (= c 13) (= c 12))))))
+  ;;; __lc -- internal: ASCII lower case.
+  (defn __lc [c : int] : int (if (and (>= c 65) (<= c 90)) (+ c 32) c))
+  ;;; __letter? -- internal: may a tag name start with c?
+  (defn __letter? [c : int html : bool] : bool
+    (or (and (>= c 97) (<= c 122))
+      (or (and (>= c 65) (<= c 90))
+        (or (and (not html) (or (= c 95) (= c 58))) (and (not html) (>= c 128))))))
+  ;;; __span-is? -- internal: is s[a, b) the word w (ASCII case-insensitively
+  ;;; when fold)?
+  (defn __span-is? [s : cstr a : int b : int w : cstr fold : bool] : bool
+    (let [wn      (cstr-len w)
+          ^mut k  0
+          ^mut ok (= (- b a) wn)]
+      (while (and ok (< k wn))
+        (let [x (cstr-nth s (+ a k))
+              y (cstr-nth w k)]
+          (if (= (if fold (__lc x) x) y) nil (set! ok false)))
+        (set! k (+ k 1)))
+      ok))
+  ;;; __span-in? -- internal: is s[a, b) one of the space-separated words?
+  (defn __span-in? [s : cstr a : int b : int words : cstr fold : bool] : bool
+    (let [wn       (cstr-len words)
+          ^mut k   0
+          ^mut hit false]
+      (while (and (not hit) (< k wn))
+        (let [^mut e k]
+          (while (and (< e wn) (not (= (cstr-nth words e) 32)))
+            (set! e (+ e 1)))
+          (if (__span-is? s a b (cstr-sub words k e) fold) (set! hit true) nil)
+          (set! k (+ e 1))))
+      hit))
+  ;;; __starts-ci? -- internal: does s continue at i with w (case-insensitive)?
+  (defn __starts-ci? [s : cstr i : int n : int w : cstr] : bool
+    (let [wn (cstr-len w)]
+      (if (> (+ i wn) n) false (__span-is? s i (+ i wn) w true))))
+  ;;; __starts? -- internal: does s continue at i with w exactly?
+  (defn __starts? [s : cstr i : int n : int w : cstr] : bool
+    (let [wn (cstr-len w)]
+      (if (> (+ i wn) n) false (__span-is? s i (+ i wn) w false))))
+  ;;; __hole-at? -- internal: does a `${` start at i?
+  (defn __hole-at? [s : cstr i : int n : int] : bool
+    (and (= (__b s i n) 36) (= (__b s (+ i 1) n) 123)))
+  ;;; __hole-end -- internal: the index of the `}` closing the hole at i, or
+  ;;; -1. Braces nest; braces inside a string literal do not count.
+  (defn __hole-end [s : cstr i : int n : int] : int
+    (let [^mut j     (+ i 2)
+          ^mut depth 1
+          ^mut res   -1]
+      (while (and (< j n) (< res 0))
+        (let [c (cstr-nth s j)]
+          (cond (= c 34)  (do
+                            (set! j (+ j 1))
+                            (while (and (< j n) (not (= (cstr-nth s j) 34)))
+                              (set! j
+                                (if (= (cstr-nth s j) 92) (+ j 2) (+ j 1)))))
+                (= c 123) (set! depth (+ depth 1))
+                (= c 125) (do
+                            (set! depth (- depth 1))
+                            (if (= depth 0) (set! res j) nil))
+                :else     nil))
+        (set! j (+ j 1)))
+      res))
+  ;;; __ws-before -- internal: where the whitespace run ending before i starts.
+  (defn __ws-before [s : cstr i : int] : int
+    (let [^mut k i]
+      (while (and (> k 0) (__ws? (cstr-nth s (- k 1)))) (set! k (- k 1)))
+      k))
+  ;;; __fail -- internal: a compile error at the literal.
+  (defn __fail [body : Syntax html : bool msg : cstr] : Syntax
+    (syntax-error (str-concat (if html "#html{...}: " "#xml{...}: ") msg) body))
+  ;;; __fail! -- internal: a compile error, in statement position.
+  (defn __fail! [body : Syntax html : bool msg : cstr] : nil
+    (__fail body html msg)
+    nil)
+  ;;; __hole-form -- internal: the hole's expression, read from its text.
+  (defn __hole-form [body : Syntax html : bool s : cstr i : int j : int] : Syntax
+    (let [text       (cstr-sub s (+ i 2) j)
+          ^mut k     0
+          ^mut blank true]
+      (while (< k (cstr-len text))
+        (if (__ws? (cstr-nth text k)) nil (set! blank false))
+        (set! k (+ k 1)))
+      (if blank (__fail body html "an empty hole ${}") (read-string text))))
+  ;;; __call1 -- internal: (f x) as Syntax.
+  (defn __call1 [f : cstr x : Syntax] : Syntax (syntax-list (sym->syntax f) x))
+  ;;; __attr-hole -- internal: an attribute hole's wrapped expression, or a
+  ;;; compile error for an attribute that holds code or markup.
+  (defn __attr-hole [body : Syntax
+                     html : bool
+                     s : cstr
+                     a : int
+                     b : int
+                     e : Syntax] : Syntax
+    (cond (and (>= (- b a) 2) (__span-is? s a (+ a 2) "on" true))                     (__fail body
+                                                                                        html
+                                                                                        (str-concat (str-concat "a hole in the event-handler attribute '"
+                                                                                                      (cstr-sub s
+                                                                                                        a
+                                                                                                        b))
+                                                                                          "' -- its value is JavaScript, which HTML escaping does not make safe"))
+          (__span-in? s a b "style srcdoc" true)                                      (__fail body
+                                                                                        html
+                                                                                        (str-concat (str-concat "a hole in the '"
+                                                                                                      (cstr-sub s
+                                                                                                        a
+                                                                                                        b))
+                                                                                          "' attribute -- its value is CSS or HTML, which HTML escaping does not make safe"))
+          (__span-is? s a b "srcset" true)                                            (__call1 "dom/holes/hole-attr"
+                                                                                        (__call1 "dom/holes/srcset-check"
+                                                                                          (__call1 "to-url-attr"
+                                                                                            e)))
+          (__span-in? s
+            a
+            b
+            "href src action formaction xlink:href poster cite"
+            true)                                                                     (__call1 "dom/holes/hole-attr"
+                                                                                        (__call1 "to-url-attr"
+                                                                                          e))
+          :else                                                                       (__call1 "dom/holes/hole-attr"
+                                                                                        (__call1 "to-attr"
+                                                                                          e))))
+  ;;; __void? -- internal: an HTML void element (no end tag, no content).
+  (defn __void? [s : cstr a : int b : int] : bool
+    (__span-in? s
+      a
+      b
+      "area base basefont bgsound br col embed frame hr img input keygen link meta param source track wbr"
+      true))
+  ;;; __rawtext? -- internal: an HTML element whose content is raw text.
+  (defn __rawtext? [s : cstr a : int b : int] : bool
+    (__span-in? s
+      a
+      b
+      "script style textarea title xmp iframe noembed noframes noscript plaintext"
+      true))
+  ;;; markup-expand -- expand a markup literal body into a render call.
+  ;;;
+  ;;; Parameters:
+  ;;;   body   -- the literal's body (a string literal Syntax)
+  ;;;   html   -- HTML (true) or XML rules
+  ;;;   render -- the name of the function to call with the template and holes
+  ;;;
+  ;;; Returns:
+  ;;;   Syntax -- `(render "template" (tcons-of hole ... (tnil)))`
+  ;;;
+  ;;; Example:
+  ;;;   (defmacro* html* [body] (markup-expand body true "html/markup/html-render"))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn markup-expand [body : Syntax html : bool render : cstr] : Syntax
+    (let [s           (syntax->str body)
+          n           (cstr-len s)
+          ^mut i      0
+          ^mut st     0
+          ^mut out    ""
+          ^mut seg    0
+          ^mut holes  (:: (tnil) (Cons Syntax))
+          ^mut tag-a  0
+          ^mut tag-b  0
+          ^mut raw-a  0
+          ^mut raw-b  0
+          ^mut attr-a 0
+          ^mut attr-b 0
+          ^mut val-a  0
+          ^mut q      0
+          ^mut depth  0
+          ^mut seen   false
+          ^mut doc    false
+          ^mut close  false]
+      (let [^mut k 0]
+        (while (< k n)
+          (let [c (cstr-nth s k)]
+            (if (or (= c 1) (= c 2))
+              (__fail! body
+                html
+                "control characters U+0001 and U+0002 are reserved")
+              nil))
+          (set! k (+ k 1))))
+      (match (cstr-index-of s "__tur_hole_")
+        (Some _)
+        (__fail! body html "'__tur_hole_' is reserved for hole markers")
+        (None)
+        nil)
+      (while (< i n)
+        (let [c (cstr-nth s i)]
+          (cond
+                ;; ---- data
+                (= st 0)  (cond (__hole-at? s i n) (let [j (__hole-end s i n)]
+                                                     (if (< j 0)
+                                                       (__fail! body
+                                                         html
+                                                         "unterminated ${")
+                                                       nil)
+                                                     ;; `<${x}`: the tokenizer saw a `<` that does not open a tag,
+                                                     ;; but the static `<` and the value would print one.
+                                                     (if (and (> i 0)
+                                                           (= (cstr-nth s
+                                                                (- i 1))
+                                                             60))
+                                                       (__fail! body
+                                                         html
+                                                         "a hole cannot be a tag name")
+                                                       nil)
+                                                     (set! out
+                                                       (str-concat (str-concat out
+                                                                     (cstr-sub s
+                                                                       seg
+                                                                       i))
+                                                         "\x01c\x02"))
+                                                     (set! holes
+                                                       (tcons-of (__call1 "dom/holes/hole-child"
+                                                                   (__call1 "to-child"
+                                                                     (__hole-form body
+                                                                       html
+                                                                       s
+                                                                       i
+                                                                       j)))
+                                                         holes))
+                                                     (set! i (+ j 1))
+                                                     (set! seg i))
+                                (= c 60)           (cond (__starts? s
+                                                           i
+                                                           n
+                                                           "<!--")                                      (do
+                                                                                                          (set! st
+                                                                                                            8)
+                                                                                                          (set! i
+                                                                                                            (+ i
+                                                                                                              4)))
+                                                         (and (not html)
+                                                           (__starts? s
+                                                             i
+                                                             n
+                                                             "<![CDATA["))                              (do
+                                                                                                          (set! st
+                                                                                                            13)
+                                                                                                          (set! i
+                                                                                                            (+ i
+                                                                                                              9)))
+                                                         (= (__b s (+ i 1) n)
+                                                           33)                                          (do
+                                                                                                          (if (and html
+                                                                                                                (and (not seen)
+                                                                                                                  (__starts-ci? s
+                                                                                                                    i
+                                                                                                                    n
+                                                                                                                    "<!doctype")))
+                                                                                                            (set! doc
+                                                                                                              true)
+                                                                                                            nil)
+                                                                                                          (set! seen
+                                                                                                            true)
+                                                                                                          (set! st
+                                                                                                            9)
+                                                                                                          (set! i
+                                                                                                            (+ i
+                                                                                                              2)))
+                                                         (= (__b s (+ i 1) n)
+                                                           63)                                          (do
+                                                                                                          (set! st
+                                                                                                            (if html
+                                                                                                              9
+                                                                                                              10))
+                                                                                                          (set! i
+                                                                                                            (+ i
+                                                                                                              2)))
+                                                         (= (__b s (+ i 1) n)
+                                                           47)                                          (do
+                                                                                                          (set! st
+                                                                                                            11)
+                                                                                                          (set! i
+                                                                                                            (+ i
+                                                                                                              2)))
+                                                         (__letter? (__b s
+                                                                      (+ i 1)
+                                                                      n)
+                                                           html)                                        (do
+                                                                                                          (set! st
+                                                                                                            1)
+                                                                                                          (set! close
+                                                                                                            false)
+                                                                                                          (set! tag-a
+                                                                                                            (+ i
+                                                                                                              1))
+                                                                                                          (set! i
+                                                                                                            (+ i
+                                                                                                              1)))
+                                                         :else                                          (set! i
+                                                                                                          (+ i
+                                                                                                            1)))
+                                :else              (set! i (+ i 1)))
+                ;; ---- tag name
+                (= st 1)  (cond (__hole-at? s i n)                    (__fail! body
+                                                                        html
+                                                                        "a hole cannot be part of a tag name")
+                                (or (__ws? c) (or (= c 47) (= c 62))) (do
+                                                                        (set! tag-b
+                                                                          i)
+                                                                        (if (and html
+                                                                              (and (not seen)
+                                                                                (__span-is? s
+                                                                                  tag-a
+                                                                                  tag-b
+                                                                                  "html"
+                                                                                  true)))
+                                                                          (set! doc
+                                                                            true)
+                                                                          nil)
+                                                                        (set! seen
+                                                                          true)
+                                                                        (if (and html
+                                                                              (and (not doc)
+                                                                                (and (= depth
+                                                                                       0)
+                                                                                  (__span-in? s
+                                                                                    tag-a
+                                                                                    tag-b
+                                                                                    "head body"
+                                                                                    true))))
+                                                                          (__fail! body
+                                                                            html
+                                                                            "a top-level <head> or <body> is dropped by a fragment parse; start the literal with <!doctype html> or <html> for a whole document")
+                                                                          nil)
+                                                                        (set! st
+                                                                          2))
+                                :else                                 (set! i
+                                                                        (+ i 1)))
+                ;; ---- between attributes
+                (= st 2)  (cond (__ws? c)          (set! i (+ i 1))
+                                (= c 62)           (do
+                                                     (if (and html
+                                                           (__rawtext? s
+                                                             tag-a
+                                                             tag-b))
+                                                       (do
+                                                         (set! st 12)
+                                                         (set! raw-a tag-a)
+                                                         (set! raw-b tag-b))
+                                                       (set! st 0))
+                                                     (if (or close
+                                                           (and html
+                                                             (__void? s
+                                                               tag-a
+                                                               tag-b)))
+                                                       nil
+                                                       (set! depth (+ depth 1)))
+                                                     (set! i (+ i 1)))
+                                (= c 47)           (do
+                                                     (if (= (__b s (+ i 1) n)
+                                                           62)
+                                                       (set! close true)
+                                                       nil)
+                                                     (set! i (+ i 1)))
+                                (__hole-at? s i n) (__fail! body
+                                                     html
+                                                     "a hole cannot be an attribute name; write name=${...} (a boolean attribute takes a bool)")
+                                :else              (do
+                                                     (set! attr-a i)
+                                                     (set! st 3)))
+                ;; ---- attribute name
+                (= st 3)  (cond (__hole-at? s i n)                                  (__fail! body
+                                                                                      html
+                                                                                      "a hole cannot be part of an attribute name")
+                                (or (__ws? c)
+                                  (or (= c 61) (or (= c 62) (= c 47))))             (do
+                                                                                      (set! attr-b
+                                                                                        i)
+                                                                                      (set! st
+                                                                                        4))
+                                :else                                               (set! i
+                                                                                      (+ i
+                                                                                        1)))
+                ;; ---- after an attribute name
+                (= st 4)  (cond (__ws? c) (set! i (+ i 1))
+                                (= c 61)  (do (set! st 5) (set! i (+ i 1)))
+                                :else     (set! st 2))
+                ;; ---- before an attribute value
+                (= st 5)  (cond (__ws? c)              (set! i (+ i 1))
+                                (or (= c 34) (= c 39)) (do
+                                                         (set! q c)
+                                                         (set! val-a (+ i 1))
+                                                         (set! st 6)
+                                                         (set! i (+ i 1)))
+                                (__hole-at? s i n)     (let [j     (__hole-end s
+                                                                     i
+                                                                     n)
+                                                             after (+ j 1)
+                                                             nc    (__b s
+                                                                     after
+                                                                     n)]
+                                                         (if (< j 0)
+                                                           (__fail! body
+                                                             html
+                                                             "unterminated ${")
+                                                           nil)
+                                                         (if (or (< nc 0)
+                                                               (or (__ws? nc)
+                                                                 (or (= nc 62)
+                                                                   (= nc 47))))
+                                                           nil
+                                                           (__fail! body
+                                                             html
+                                                             "a hole shares an unquoted attribute value with other text; quote the value"))
+                                                         (set! holes
+                                                           (tcons-of (__attr-hole body
+                                                                       html
+                                                                       s
+                                                                       attr-a
+                                                                       attr-b
+                                                                       (__hole-form body
+                                                                         html
+                                                                         s
+                                                                         i
+                                                                         j))
+                                                             holes))
+                                                         (set! out
+                                                           (str-concat (str-concat (str-concat (str-concat out
+                                                                                                 (cstr-sub s
+                                                                                                   seg
+                                                                                                   (__ws-before s
+                                                                                                     attr-a)))
+                                                                                     "\x01w")
+                                                                         (cstr-sub s
+                                                                           attr-a
+                                                                           attr-b))
+                                                             "\x02"))
+                                                         (set! i after)
+                                                         (set! seg after)
+                                                         (set! st 2))
+                                (= c 62)               (set! st 2)
+                                :else                  (set! st 7))
+                ;; ---- quoted attribute value
+                (= st 6)  (cond (= c q)            (do
+                                                     (set! st 2)
+                                                     (set! i (+ i 1)))
+                                (__hole-at? s i n) (let [j (__hole-end s i n)]
+                                                     (if (< j 0)
+                                                       (__fail! body
+                                                         html
+                                                         "unterminated ${")
+                                                       nil)
+                                                     (set! holes
+                                                       (tcons-of (__attr-hole body
+                                                                   html
+                                                                   s
+                                                                   attr-a
+                                                                   attr-b
+                                                                   (__hole-form body
+                                                                     html
+                                                                     s
+                                                                     i
+                                                                     j))
+                                                         holes))
+                                                     (if (and (= i val-a)
+                                                           (= (__b s (+ j 1) n)
+                                                             q))
+                                                       (do
+                                                         (set! out
+                                                           (str-concat (str-concat (str-concat (str-concat out
+                                                                                                 (cstr-sub s
+                                                                                                   seg
+                                                                                                   (__ws-before s
+                                                                                                     attr-a)))
+                                                                                     "\x01w")
+                                                                         (cstr-sub s
+                                                                           attr-a
+                                                                           attr-b))
+                                                             "\x02"))
+                                                         (set! i (+ j 2))
+                                                         (set! seg i)
+                                                         (set! st 2))
+                                                       (do
+                                                         (set! out
+                                                           (str-concat (str-concat out
+                                                                         (cstr-sub s
+                                                                           seg
+                                                                           i))
+                                                             "\x01a\x02"))
+                                                         (set! i (+ j 1))
+                                                         (set! seg i))))
+                                :else              (set! i (+ i 1)))
+                ;; ---- unquoted attribute value
+                (= st 7)  (cond (__hole-at? s i n) (__fail! body
+                                                     html
+                                                     "a hole shares an unquoted attribute value with other text; quote the value")
+                                (__ws? c)          (set! st 2)
+                                (= c 62)           (set! st 2)
+                                :else              (set! i (+ i 1)))
+                ;; ---- comment
+                (= st 8)  (cond (__hole-at? s i n)      (__fail! body
+                                                          html
+                                                          "a hole inside a comment")
+                                (__starts? s i n "-->") (do
+                                                          (set! st 0)
+                                                          (set! i (+ i 3)))
+                                :else                   (set! i (+ i 1)))
+                ;; ---- doctype, markup declaration, HTML bogus comment
+                (= st 9)  (cond (__hole-at? s i n) (__fail! body
+                                                     html
+                                                     "a hole inside a doctype or markup declaration")
+                                (= c 62)           (do
+                                                     (set! st 0)
+                                                     (set! i (+ i 1)))
+                                :else              (set! i (+ i 1)))
+                ;; ---- XML processing instruction
+                (= st 10) (cond (__hole-at? s i n)     (__fail! body
+                                                         html
+                                                         "a hole inside a processing instruction")
+                                (__starts? s i n "?>") (do
+                                                         (set! st 0)
+                                                         (set! i (+ i 2)))
+                                :else                  (set! i (+ i 1)))
+                ;; ---- end tag
+                (= st 11) (cond (__hole-at? s i n) (__fail! body
+                                                     html
+                                                     "a hole cannot be part of an end tag")
+                                (= c 62)           (do
+                                                     (set! depth
+                                                       (if (> depth 0)
+                                                         (- depth 1)
+                                                         0))
+                                                     (set! st 0)
+                                                     (set! i (+ i 1)))
+                                :else              (set! i (+ i 1)))
+                ;; ---- raw text (script, style, ...)
+                (= st 12) (cond (__hole-at? s i n)                                                                                                                                                                                                             (__fail! body
+                                                                                                                                                                                                                                                                 html
+                                                                                                                                                                                                                                                                 (str-concat (str-concat "a hole inside <"
+                                                                                                                                                                                                                                                                               (cstr-sub s
+                                                                                                                                                                                                                                                                                 raw-a
+                                                                                                                                                                                                                                                                                 raw-b))
+                                                                                                                                                                                                                                                                   "> -- its content is raw text, which HTML escaping does not make safe"))
+                                (and (= c 60)
+                                  (and (= (__b s (+ i 1) n) 47)
+                                    (and (__starts-ci? s
+                                           (+ i 2)
+                                           n
+                                           (cstr-sub s raw-a raw-b))
+                                      (let [after (__b s
+                                                    (+ (+ i 2) (- raw-b raw-a))
+                                                    n)]
+                                        (or (< after 0)
+                                          (or (__ws? after)
+                                            (or (= after 47) (= after 62))))))))                                                                                                                                                                               (do
+                                                                                                                                                                                                                                                                 (set! st
+                                                                                                                                                                                                                                                                   11)
+                                                                                                                                                                                                                                                                 (set! i
+                                                                                                                                                                                                                                                                   (+ i
+                                                                                                                                                                                                                                                                     2)))
+                                :else                                                                                                                                                                                                                          (set! i
+                                                                                                                                                                                                                                                                 (+ i
+                                                                                                                                                                                                                                                                   1)))
+                ;; ---- CDATA section (XML)
+                :else     (cond (__hole-at? s i n)      (__fail! body
+                                                          html
+                                                          "a hole inside a CDATA section")
+                                (__starts? s i n "]]>") (do
+                                                          (set! st 0)
+                                                          (set! i (+ i 3)))
+                                :else                   (set! i (+ i 1))))))
+      (let [tpl      (str-concat (str-concat (if html (if doc "D" "F") "X") out)
+                       (cstr-sub s seg n))
+            ^mut acc (syntax-list (sym->syntax "tnil"))
+            ^mut hs  holes]
+        (while (not (tnil? hs))
+          (set! acc (syntax-list (sym->syntax "tcons-of") (thead hs) acc))
+          (set! hs (ttail hs)))
+        (syntax-list (sym->syntax render) (str->syntax tpl) acc))))) ;; end defmodule dom/markupc

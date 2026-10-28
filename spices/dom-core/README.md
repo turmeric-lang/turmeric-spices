@@ -18,6 +18,11 @@ its modules are what you import to read what they produce:
   across documents, and `dom-new` to build one from nothing. Every edit is
   validated, so a serialized tree cannot carry structure the edits did not
   make.
+- `dom/holes` -- what the `${...}` holes of tur-html's `#html{...}` and
+  tur-xml's `#xml{...}` markup literals accept and how they render: the
+  `ToChild` / `ToAttr` / `ToUrlAttr` classes, `Fragment`, the `raw-html`
+  and `trusted-url` opt-outs and the URL scheme check (`url-safe`).
+  `dom/markupc` is the literals' compile-time context tokenizer.
 - `dom/event` -- `SaxEvent`, `SaxControl` and `Attr`: the event stream both
   SAX front doors deliver.
 - `dom/ownstr` -- `String`, the owned string type events and `node-text` hand
@@ -169,6 +174,8 @@ released. `sax-keep` is the identity.
 | `dom/core` | `Document`, `Node`, `NodeKind` (`DocumentNode` `ElementNode` `TextNode` `CommentNode` `CdataNode` `PiNode` `DoctypeNode`), `SourcePos`, `ParseError`, `ParseErrorKind` (`Syntax` `Limit` `Refused` `Io`), `syntax-kind`, `limit-kind`, `refused-kind`, `io-kind`, `dom-root`, `dom-node`, `dom-free`, `dom-serialize`, `dom-equal?`, `dom-node-count`, `dom-live-bytes`, `node-kind`, `node-element?`, `node-name`, `node-local-name`, `node-ns-uri`, `node-value`, `node-text`, `node-attr`, `node-attr-count`, `node-attr-name-at`, `node-attr-value-at`, `node-children`, `node-child-count`, `node-first-child`, `node-last-child`, `node-next-sibling`, `node-prev-sibling`, `node-parent`, `node-document`, `node-pos`, `node-depth`, `node-matches?`, `find-all`, `find-first`, `parse-error-message`, `parse-error-release`, `parse-error-pos` |
 | `dom/edit` | `DomFlavor` (`XmlFlavor` `HtmlFlavor`), `EditError` (`WrongDocument` `WouldCycle` `NotAContainer` `BadPlacement` `Detached` `WrongKind` `BadName` `BadContent` `OutOfMemory`), `edit-error-message`, `dom-new`, `dom-flavor`, `create-element`, `create-element-ns`, `create-text`, `create-comment`, `create-cdata`, `create-pi`, `node-import`, `node-clone`, `node-append!`, `node-prepend!`, `node-insert-before!`, `node-insert-after!`, `node-replace!`, `node-remove!`, `node-unwrap!`, `set-attr!`, `set-attr-ns!`, `remove-attr!`, `set-text!`, `set-value!`, `rename!`, `rename-ns!`, `node-normalize!`, `dom-garbage-bytes`, `dom-compact`, `node-attached?` |
 | `dom/event` | `SaxEvent` (`StartElement` `EndElement` `Chars` `Comment` `Pi` `StartCdata` `EndCdata` `Doctype`), `SaxControl` (`Continue` `Stop`), `Attr`, `attrs-get`, `sax-event-release`, `sax-event-retain`, `sax-dispatch` |
+| `dom/holes` | `Fragment`, `XmlFragment`, `RawHtml`, `TrustedUrl`, `Child` (`ChildText` `ChildHtml` `ChildXml` `ChildRaw` `ChildEmpty`), `AttrVal` (`AttrText` `AttrTrusted` `AttrOn` `AttrOff`), `Hole` (`HoleChild` `HoleAttr`), `raw-html`, `raw-html-markup`, `trusted-url`, `url-safe`, `srcset-check`, `html->string`, `xml->string`, `fragment-free`, `xml-fragment-free`, `hole-child`, `hole-attr`, `render-template`, `template-checked?`, `template-check-markup`, `template-verify`, `template-parent`; the class methods `to-child`, `to-attr`, `to-url-attr` are ambient |
+| `dom/markupc` | `markup-expand` (macro time only; import it `:for-macros`) |
 | `dom/writer` | `SaxWriter`, `WriteError` (`Rejected` `IoFailed`), `write-error-message`, `TransformError` (`InputError` `OutputError`), `transform-error-message`, `transform-error-release`, `sax-writer-new`, `sax-writer-to-file`, `sax-write!`, `sax-write-all!`, `sax-writer-finish!`, `sax-writer-free`, `sax-transform-handler`, `sax-keep` |
 | `dom/ownstr` | `String`, `from-cstr`, `adopt-cstr`, `to-cstr`, `retain`, `release`, `str-len`, `string=?` |
 

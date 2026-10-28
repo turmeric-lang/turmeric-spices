@@ -1,0 +1,152 @@
+;;; xml/markup -- XML markup literals: `#xml{...}` with `${...}` holes,
+;;; escaped by construction.
+;;;
+;;; ```turmeric
+;;; (defn entry [title : cstr href : cstr] : XmlFragment
+;;;   #xml{<entry><title>${title}</title><link href=${href}/></entry>})
+;;; ```
+;;;
+;;; The XML counterpart of tur-html's `#html{...}`, over the same holes
+;;; (`dom/holes`) and the same context tokenizer (`dom/markupc`) with XML's
+;;; rules: names are case-sensitive, there is no raw text, CDATA sections
+;;; and processing instructions take no holes, and holes in `on*`, `style`
+;;; and `srcdoc` values are compile errors here too, because browsers run
+;;; them in SVG and XHTML served as XML. A boolean `true` renders as
+;;; `name="name"`.
+;;;
+;;; The first time a literal renders it is parsed once with expat, wrapped in
+;;; a root element, and every hole is checked to land where the macro said; a
+;;; literal that is not well-formed panics then with expat's message. So
+;;; namespace prefixes must be declared inside the literal. A `raw-html`
+;;; value must be well-formed XML content on its own (its prefixes declared
+;;; in it), and is parsed and re-serialized before it is written.
+;;;
+;;; Using the literal syntax: as for `#html{...}`, import `xml/markup` from a
+;;; module read before the one that uses `#xml{...}`, or call
+;;; `(xml* "<a>${x}</a>")` directly.
+;;;
+;;; Since: 0.3.0
+;; XML literals over dom/holes and expat.
+(defmodule xml/markup
+  (export xml* xml-render)
+  (import dom/ownstr :refer [String to-cstr release])
+  (import dom/core
+    :refer
+    [Document
+     ParseError
+     dom-node
+     dom-root
+     dom-free
+     dom-serialize
+     parse-error-message])
+  (import dom/holes
+    :refer
+    [XmlFragment
+     Hole
+     render-template
+     template-checked?
+     template-check-markup
+     template-verify])
+  (import dom/markupc :for-macros)
+  (import xml/dom :refer [dom-parse-string])
+  ;;; xml* -- the macro behind `#xml{...}`: a markup literal as an XmlFragment.
+  ;;;
+  ;;; Parameters:
+  ;;;   body -- the literal's markup, a string literal, with `${expr}` holes
+  ;;;
+  ;;; Returns:
+  ;;;   XmlFragment
+  ;;;
+  ;;; Example:
+  ;;;   (xml->string (xml* "<t>${title}</t>"))   ; => "<t>Q&amp;A</t>"
+  ;;;
+  ;;; Since: 0.3.0
+  (defmacro* xml* [body] (markup-expand body false "xml/markup/xml-render"))
+  ;;; __free-cstr -- internal.
+  (defn __free-cstr [s : cstr] : nil
+    ```c
+    free((void *)s);
+  ```)
+  ;;; __cat3 -- internal: a malloc'd a + b + c.
+  (defn __cat3 [a : cstr b : cstr c : cstr] : cstr
+    ```c
+    size_t la = strlen((const char *)a), lb = strlen((const char *)b), lc = strlen((const char *)c);
+  char *o = (char *)malloc(la + lb + lc + 1);
+  if (!o) abort();
+  memcpy(o, a, la); memcpy(o + la, b, lb); memcpy(o + la + lb, c, lc + 1);
+  return o;
+  ```)
+  ;;; __check -- internal: parse the literal once and check its holes.
+  (defn __check [tpl : cstr] : nil
+    (let [m (template-check-markup tpl)]
+      (match (dom-parse-string m)
+        (Ok d)
+        (do (template-verify tpl (dom-node d)) (dom-free d))
+        (Err e)
+        (panic (__cat3 "#xml{...} literal is not well-formed XML: "
+                 (parse-error-message e)
+                 (__cat3 "\n  the literal, with its holes marked: " m ""))))
+      (__free-cstr m)))
+  ;;; __unwrap -- internal: the content of a serialized wrapper element,
+  ;;; malloc'd.
+  (defn __unwrap [s : cstr] : cstr
+    ```c
+    const char *open = "<__tur_root__>", *close = "</__tur_root__>";
+  const char *p = (const char *)s;
+  size_t n = strlen(p), lo = strlen(open), lc = strlen(close);
+  char *o;
+  if (n >= lo + lc && strncmp(p, open, lo) == 0 && strcmp(p + n - lc, close) == 0) {
+    o = (char *)malloc(n - lo - lc + 1);
+    if (!o) abort();
+    memcpy(o, p + lo, n - lo - lc);
+    o[n - lo - lc] = '\0';
+  } else {
+    o = (char *)malloc(1);  /* <__tur_root__/>: no content */
+    if (!o) abort();
+    o[0] = '\0';
+  }
+  return o;
+  ```)
+  ;;; __raw-fix -- internal: raw XML content, checked and re-serialized.
+  (defn __raw-fix [raw : cstr ctx : cstr] : cstr
+    (let [w (__cat3 "<__tur_root__>" raw "</__tur_root__>")
+          r (match (dom-parse-string w)
+              (Ok d)
+              (let [out (match (dom-root d)
+                          (Some root)
+                          (let [s (dom-serialize root)
+                                u (__unwrap (to-cstr s))]
+                            (release s)
+                            u)
+                          (None)
+                          (__unwrap ""))]
+                (dom-free d)
+                out)
+              (Err e)
+              (panic (__cat3 "raw-html value in an #xml{...} literal is not well-formed XML content: "
+                       (parse-error-message e)
+                       "")))]
+      (__free-cstr w)
+      r))
+  ;;; __as-fragment -- internal: malloc'd markup as an XmlFragment.
+  (defn __as-fragment [s : cstr] : ptr<void>
+    ```c
+    return (void *)s;
+  ```)
+  ;;; xml-render -- render a checked literal (what `xml*` expands to).
+  ;;;
+  ;;; Parameters:
+  ;;;   tpl   -- the template the macro produced
+  ;;;   holes -- the hole values, in order
+  ;;;
+  ;;; Returns:
+  ;;;   XmlFragment
+  ;;;
+  ;;; Example:
+  ;;;   (xml-render tpl holes)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn xml-render [tpl : cstr holes : (Cons Hole)] : XmlFragment
+    (if (template-checked? tpl) nil (__check tpl))
+    (:: (__as-fragment (render-template tpl holes false __raw-fix)) XmlFragment))) ;; end defmodule xml/markup
+(reader-macros/define 'xml :raw-brace '(xml* $body))

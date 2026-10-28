@@ -23,6 +23,7 @@ what is particular to HTML.
 6. [Tokenizer events](#6-tokenizer-events)
 7. [Options, files and encodings](#7-options-files-and-encodings)
 8. [Editing and token-level transforms](#8-editing-and-token-level-transforms)
+10. [Markup literals](#10-markup-literals)
 
 ---
 
@@ -235,3 +236,98 @@ things to know:
 For input too large to hold, plug `dom/writer`'s `sax-transform-handler` into
 `html-sax-parser-new`, with a writer from `sax-writer-to-file`, and feed the
 input in chunks.
+
+---
+
+## 10. Markup literals
+
+`html/markup` adds `#html{...}`: markup written as markup, with `${...}`
+holes for values, escaped by construction. The result is a `Fragment`
+(`dom/holes`), and `html->string` gives its markup.
+
+```turmeric no-check
+(import html/markup :refer [html*])
+(import dom/holes   :refer [Fragment html->string])
+
+(defn item [name : cstr href : cstr done : bool] : Fragment
+  #html{<li class="item" data-done=${done}>
+          <a href=${href}>${name}</a>
+        </li>})
+
+(defn page [items : (Cons Fragment)] : Fragment
+  #html{<ul>${items}</ul>})
+```
+
+```sweet-exp
+#lang sweet-exp
+import html/markup :refer [html*]
+import dom/holes   :refer [Fragment html->string]
+
+defn item [name : cstr href : cstr done : bool] : Fragment
+  #html{<li class="item" data-done=${done}>
+          <a href=${href}>${name}</a>
+        </li>}
+
+defn page [items : (Cons Fragment)] : Fragment
+  #html{<ul>${items}</ul>}
+```
+
+`(item "Q&A" "javascript:alert(1)" true)` renders the literal as written,
+line breaks included, with the holes filled: `data-done` present (a
+boolean attribute), `href="about:invalid#tur-unsafe"` (the scheme check) and
+`Q&amp;A` (escaped text).
+
+**Where a hole sits decides what it may hold; the value's type decides how
+it renders.** The macro reads the literal the way the HTML tokenizer does:
+
+| Hole | Accepts (through) | Renders |
+|---|---|---|
+| content | `cstr`, `String`, `int` (`to-child`) | escaped text |
+| | `Fragment`, `(Cons Fragment)`, `Node` | spliced markup |
+| | `RawHtml` (`raw-html`) | unescaped, parsed in the hole's element |
+| | `(Option T)` | nothing for `None` |
+| attribute value | `cstr`, `String`, `int` (`to-attr`) | escaped value |
+| | `bool` | present or absent (an HTML boolean attribute) |
+| | `(Option T)` | `None` drops the whole attribute |
+| `href` `src` `action` `formaction` `xlink:href` `poster` `cite` `srcset` | `cstr`, `String` (`to-url-attr`) | scheme-checked, then escaped |
+| | `TrustedUrl` (`trusted-url`) | escaped, not checked |
+
+A value of the wrong kind for its place -- a `Fragment` in an attribute, a
+`bool` in content -- has no instance, so it is a type error at the hole.
+
+A hole anywhere a value could change the document's structure is a
+**compile error naming the place**: in a tag or attribute name, right after
+a `<`, in a comment or doctype, inside `<script>`, `<style>`, `<textarea>`,
+`<title>` and the other raw-text elements, sharing an unquoted attribute
+value with other text, and in the value of an `on*`, `style` or `srcdoc`
+attribute -- the browser hands those values to a JavaScript, CSS or HTML
+parser, which HTML escaping does not protect.
+
+URLs are checked with an allowlist: a relative URL or one with scheme
+`http`, `https`, `mailto` or `tel` passes, anything else (`javascript:`,
+`data:`, ...) becomes `about:invalid#tur-unsafe`. `trusted-url` and
+`raw-html` are the two opt-outs, both greppable; `raw-html` markup is still
+parsed in the hole's own element, so it cannot close anything outside it,
+but it is **not sanitized** -- never give it markup an untrusted party wrote.
+
+A literal is parsed as the content of a `<template>`, so one that starts
+with `<tr>`, `<td>`, `<option>` or `<col>` keeps that structure. A literal
+that starts with `<!doctype html>` or `<html>` is a whole document; a
+fragment with a top-level `<head>` or `<body>` is a compile error, because
+a fragment parse drops them. The first time a literal renders it is parsed
+once with lexbor and every hole is checked to land where the macro said
+(a disagreement panics with the literal); rendering itself is string
+concatenation, with no tree built.
+
+Two things about the syntax:
+
+- `#html{...}` exists in a file read *after* `html/markup` is loaded. Import
+  it from the entry module, before the modules that use the literal; or put
+  `#use-reader-macros "<path to html/markup.tur>"` at the top of the file; or
+  call the macro directly, `(html* "<p>${name}</p>")`.
+- The body is read raw up to the matching `}`, counting braces but not
+  quotes: a `}` that closes nothing is written `\}` (also inside a string in
+  a hole), a backslash `\\`. `${` always opens a hole.
+
+A `Fragment` owns its markup; `fragment-free` releases one, which a server
+rendering a page per request will want.

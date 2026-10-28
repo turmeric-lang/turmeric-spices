@@ -1,0 +1,141 @@
+;;; html/markup -- HTML markup literals: `#html{...}` with `${...}` holes,
+;;; escaped by construction.
+;;;
+;;; ```turmeric
+;;; (defn item [name : cstr href : cstr done : bool] : Fragment
+;;;   #html{<li class="item" data-done=${done}>
+;;;           <a href=${href}>${name}</a>
+;;;         </li>})
+;;; ```
+;;;
+;;; A literal is checked when it compiles: `dom/markupc`'s context tokenizer
+;;; reads it the way the HTML tokenizer would and decides, from where each
+;;; hole sits, what it may hold (see `dom/holes`). A hole in a tag or
+;;; attribute name, a comment, `<script>` / `<style>` text, a doctype, or the
+;;; value of an `on*`, `style` or `srcdoc` attribute is a compile error. The
+;;; value's type then picks how it renders, through `to-child`, `to-attr` or
+;;; `to-url-attr`: text is escaped, a URL's scheme is checked, a bool is a
+;;; boolean attribute, a nested literal is spliced in.
+;;;
+;;; The first time a literal renders, its markup is parsed once with the real
+;;; HTML parser (fragment context `template`, or as a whole document when it
+;;; starts with `<!doctype` or `<html>`) and every hole is checked to land
+;;; where the macro said; a disagreement panics with the literal. Rendering
+;;; itself is string concatenation -- no tree is built.
+;;;
+;;; Using the literal syntax: `#html{...}` exists in a file read AFTER this
+;;; module has been loaded -- so import `html/markup` from the entry module
+;;; (before the modules that use the literal), or name it in the spice's
+;;; `:reader-macros`. A file can always call the macro directly:
+;;; `(html* "<p>${name}</p>")`. Inside the braces, a `}` that does not close
+;;; a `{` is written `\}` and a backslash `\\`; `${` always opens a hole
+;;; (`&#36;{` is a literal one).
+;;;
+;;; Since: 0.3.0
+;; HTML literals over dom/holes and lexbor.
+(defmodule html/markup
+  (export html* html-render)
+  (import dom/ownstr :refer [String to-cstr release])
+  (import dom/core :refer [Document dom-node dom-free dom-serialize])
+  (import dom/holes
+    :refer
+    [Fragment
+     Hole
+     render-template
+     template-checked?
+     template-check-markup
+     template-verify])
+  (import dom/markupc :for-macros)
+  (import html/dom :refer [html-parse html-parse-fragment])
+  ;;; html* -- the macro behind `#html{...}`: a markup literal as a Fragment.
+  ;;;
+  ;;; Parameters:
+  ;;;   body -- the literal's markup, a string literal, with `${expr}` holes
+  ;;;
+  ;;; Returns:
+  ;;;   Fragment
+  ;;;
+  ;;; Example:
+  ;;;   (html->string (html* "<b>${name}</b>"))   ; => "<b>Ada &amp; co</b>"
+  ;;;
+  ;;; Since: 0.3.0
+  (defmacro* html* [body] (markup-expand body true "html/markup/html-render"))
+  ;;; __free-cstr -- internal.
+  (defn __free-cstr [s : cstr] : nil
+    ```c
+    free((void *)s);
+  ```)
+  ;;; __mode -- internal: the template's mode byte.
+  (defn __mode [tpl : cstr] : int
+    ```c
+    return (unsigned char)((const char *)tpl)[0];
+  ```)
+  ;;; __check -- internal: parse the literal once and check its holes.
+  (defn __check [tpl : cstr] : nil
+    (let [m (template-check-markup tpl)
+          d (if (= (__mode tpl) 68)
+              (html-parse m)
+              (html-parse-fragment "template" m))]
+      (template-verify tpl (dom-node d))
+      (dom-free d)
+      (__free-cstr m)))
+  ;;; __dup -- internal: a malloc'd copy.
+  (defn __dup [s : cstr] : cstr
+    ```c
+    size_t n = strlen((const char *)s);
+  char *d = (char *)malloc(n + 1);
+  if (!d) abort();
+  memcpy(d, s, n + 1);
+  return d;
+  ```)
+  ;;; __raw-writable? -- internal: can every node of a parsed raw value be
+  ;;; written back and parse the same way? dom/edit's checks: no
+  ;;; `<plaintext>` (its end tag is never recognized, so it would swallow the
+  ;;; rest of the literal), no comment or raw text that would end early.
+  (defn __raw-writable? [d : Document] : bool
+    ```c
+    extern void *turdom_doc_node(void *);
+  extern void *turdom_first_child(const void *);
+  extern void *turdom_next_sibling(const void *);
+  extern int turdom_check_subtree(const void *, const void *);
+  void *doc = (void *)(intptr_t)d;
+  for (void *c = turdom_first_child(turdom_doc_node(doc)); c; c = turdom_next_sibling(c))
+    if (turdom_check_subtree(doc, c) != 0) return false;
+  return true;
+  ```)
+  ;;; __raw-fix -- internal: raw markup as balanced markup for its context.
+  ;;;
+  ;;; Panics on markup that cannot be written back faithfully (see
+  ;;; `__raw-writable?`) rather than let it unbalance the literal.
+  (defn __raw-fix [raw : cstr ctx : cstr] : cstr
+    (let [d (html-parse-fragment ctx raw)]
+      (if (__raw-writable? d)
+        nil
+        (panic "raw-html value holds markup that cannot be written back as parsed (a <plaintext> element, or a comment or raw text that would end early); it would unbalance the #html{} literal"))
+      (let [s (dom-serialize (dom-node d))
+            m (__dup (to-cstr s))]
+        (release s)
+        (dom-free d)
+        m)))
+  ;;; __as-fragment -- internal: malloc'd markup as a Fragment.
+  (defn __as-fragment [s : cstr] : ptr<void>
+    ```c
+    return (void *)s;
+  ```)
+  ;;; html-render -- render a checked literal (what `html*` expands to).
+  ;;;
+  ;;; Parameters:
+  ;;;   tpl   -- the template the macro produced
+  ;;;   holes -- the hole values, in order
+  ;;;
+  ;;; Returns:
+  ;;;   Fragment
+  ;;;
+  ;;; Example:
+  ;;;   (html-render tpl holes)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn html-render [tpl : cstr holes : (Cons Hole)] : Fragment
+    (if (template-checked? tpl) nil (__check tpl))
+    (:: (__as-fragment (render-template tpl holes true __raw-fix)) Fragment))) ;; end defmodule html/markup
+(reader-macros/define 'html :raw-brace '(html* $body))

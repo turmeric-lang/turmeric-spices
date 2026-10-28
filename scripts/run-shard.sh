@@ -96,6 +96,16 @@ stage_check() {
   fi
   [ -d src ] || { echo "no src/ directory; skipping check"; return 0; }
   while IFS= read -r -d '' f; do
+    # A module imported only `:for-macros` (a macro's compile-time helper)
+    # calls the macro-time natives -- syntax-*, read-string -- and the
+    # preloaded string helpers, none of which exist in an ordinary compile,
+    # so `tur check` of it on its own cannot succeed.  It is compiled, in the
+    # macro environment, every time a module importing it is checked.  Such a
+    # file says so with a `;; tur-check: macro-time` line in its header.
+    if head -n 40 "$f" | grep -q '^;; tur-check: macro-time'; then
+      echo "  skip $f (macro-time module; checked through its importers)"
+      continue
+    fi
     n_files=$((n_files + 1))
     if "$TUR_BIN" check "$f"; then
       echo "  ok   $f"

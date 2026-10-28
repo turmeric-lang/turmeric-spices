@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `html/markup` (xml-html-followups-plan follow-up A1-A2): `#html{...}`
+  markup literals with `${...}` holes, escaped by construction, rendering
+  to a `Fragment` with no tree built. A hole's position picks what it may
+  hold (a hole in a name, comment, `<script>`/`<style>` text or an
+  `on*`/`style`/`srcdoc` value is a compile error), its type picks how it
+  renders, and URL attributes are scheme-checked. Each literal is parsed
+  once with lexbor, in `template` context, on its first render to check
+  the holes landed where the macro said. `html*` is the macro behind it.
+- `errors/run.sh`: the compile-error table for `#html{...}` holes.
+
 ## 0.2.0
 
 ### Added

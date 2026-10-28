@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `xml/markup` (xml-html-followups-plan follow-up A1-A2): `#xml{...}`
+  markup literals, the XML counterpart of tur-html's `#html{...}`, checked
+  once with expat on first render. `xml*` is the macro behind it.
+- `errors/run.sh`: the compile-error table for `#xml{...}` holes.
+
 ## 0.2.0
 
 ### Added

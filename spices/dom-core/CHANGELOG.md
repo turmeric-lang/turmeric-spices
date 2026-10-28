@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Added
+
+- `dom/holes` and `dom/markupc` (xml-html-followups-plan follow-up A1-A2):
+  the shared halves of tur-html's `#html{...}` and tur-xml's `#xml{...}`
+  markup literals. `dom/markupc` is the compile-time context tokenizer the
+  literal macros import `:for-macros`: it finds the `${...}` holes, makes a
+  hole in a tag or attribute name, a comment, raw text, a doctype, or an
+  `on*` / `style` / `srcdoc` value a compile error naming the place, and
+  picks the class each hole goes through. `dom/holes` has the classes --
+  `ToChild`, `ToAttr`, `ToUrlAttr`, with instances for `cstr`, `String`,
+  `int`, `bool`, `Fragment`, `XmlFragment`, `Node`, `RawHtml`,
+  `TrustedUrl`, lists and `Option` -- the `raw-html` and `trusted-url`
+  opt-outs, the URL scheme allowlist (`url-safe`, `srcset-check`),
+  `html->string` / `xml->string` / `fragment-free`, and the renderer and the
+  per-literal parser check both literals share.
+- `c/dom/turmarkup.c`, a third `:c-source`: escaping, the URL check, the
+  template walk and the per-literal check cache.
+
 ### Changed
 
 - `sax-event-retain` returns the event it retained, so a handler can write

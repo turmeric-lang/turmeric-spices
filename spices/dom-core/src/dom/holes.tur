@@ -1,0 +1,642 @@
+;;; dom/holes -- what a markup literal's holes accept, and how they render.
+;;;
+;;; The shared half of tur-html's `#html{...}` and tur-xml's `#xml{...}`
+;;; (xml-html-followups-plan follow-up A). A hole's POSITION picks a class --
+;;; content takes `ToChild`, an attribute value `ToAttr`, a URL-bearing
+;;; attribute (`href`, `src`, `action`, `formaction`, `xlink:href`, `poster`,
+;;; `cite`, `srcset`) `ToUrlAttr` -- and the value's TYPE picks the instance:
+;;;
+;;;   ToChild    cstr, String, int -- text, escaped; Fragment / XmlFragment --
+;;;              a nested literal, spliced as markup; (Cons Fragment); Node --
+;;;              serialized in; RawHtml -- unescaped, see `raw-html`;
+;;;              (Option T) -- None renders nothing
+;;;   ToAttr     cstr, String, int -- escaped; bool -- present or absent (an
+;;;              HTML boolean attribute); (Option T) -- None drops the attribute
+;;;   ToUrlAttr  cstr, String -- scheme-checked, then escaped; TrustedUrl --
+;;;              escaped, not checked, see `trusted-url`; (Option T)
+;;;
+;;; A Node or a Fragment in attribute position has no instance, so it is a
+;;; type error at the hole. Escaping is by construction: the only ways to put
+;;; unescaped markup in are `raw-html` and nested literals, and the only way
+;;; around the URL check is `trusted-url` -- both greppable.
+;;;
+;;; Memory: a Fragment owns its markup (malloc'd). Splicing it into another
+;;; literal copies it; `fragment-free` releases one that is done with.
+;;;
+;;; Since: 0.3.0
+;; Runtime support for markup literals over c/dom/turmarkup.c.
+(defmodule dom/holes
+  (export Fragment
+    XmlFragment
+    RawHtml
+    TrustedUrl
+    Child
+    ChildText
+    ChildHtml
+    ChildXml
+    ChildRaw
+    ChildEmpty
+    AttrVal
+    AttrText
+    AttrTrusted
+    AttrOn
+    AttrOff
+    Hole
+    HoleChild
+    HoleAttr
+    raw-html
+    raw-html-markup
+    trusted-url
+    url-safe
+    srcset-check
+    html->string
+    xml->string
+    fragment-free
+    xml-fragment-free
+    hole-child
+    hole-attr
+    render-template
+    template-checked?
+    template-check-markup
+    template-verify
+    template-parent)
+  (import dom/ownstr :refer [String to-cstr adopt-cstr release])
+  (import dom/core :refer [Node dom-serialize node-document])
+  (import dom/edit :refer [DomFlavor XmlFlavor HtmlFlavor dom-flavor])
+  ;;; Fragment -- the rendered markup of an `#html{...}` literal: safe to put
+  ;;; anywhere HTML content goes, by construction.
+  (defopaque Fragment :ptr<void>)
+  ;;; XmlFragment -- the rendered markup of an `#xml{...}` literal.
+  (defopaque XmlFragment :ptr<void>)
+  ;;; RawHtml -- markup a caller vouches for; see `raw-html`.
+  (defopaque RawHtml :ptr<void>)
+  ;;; TrustedUrl -- a URL a caller vouches for; see `trusted-url`.
+  (defopaque TrustedUrl :ptr<void>)
+  ;;; Child -- what a content hole renders: text to escape, markup of either
+  ;;; flavour, raw markup to parse in the hole's context, or nothing.
+  (defdata ^copy Child
+    (ChildText cstr)
+    (ChildHtml cstr)
+    (ChildXml cstr)
+    (ChildRaw cstr)
+    (ChildEmpty))
+  ;;; AttrVal -- what an attribute hole renders: a value to escape (checked or
+  ;;; trusted), or a boolean attribute present (`AttrOn`) or absent
+  ;;; (`AttrOff`). Absent drops the whole attribute when the hole is its whole
+  ;;; value; inside a larger value, on renders `true` and off nothing.
+  (defdata ^copy AttrVal (AttrText cstr) (AttrTrusted cstr) (AttrOn) (AttrOff))
+  ;;; Hole -- one hole's value, as the renderer receives it.
+  (defdata ^copy Hole (HoleChild Child) (HoleAttr AttrVal))
+  ;;; hole-child -- internal: a content hole (what the macro emits).
+  (defn hole-child [c : Child] : Hole (HoleChild c))
+  ;;; hole-attr -- internal: an attribute hole (what the macro emits).
+  (defn hole-attr [a : AttrVal] : Hole (HoleAttr a))
+  ;; ---------------------------------------------------------------------------
+  ;; Raw helpers
+  ;; ---------------------------------------------------------------------------
+  ;;; __as-cstr -- internal: an opaque's pointer as a cstr.
+  (defn __as-cstr [p : ptr<void>] : cstr
+    ```c
+    return (const char *)p;
+  ```)
+  ;;; __as-ptr -- internal: a cstr as a pointer.
+  (defn __as-ptr [s : cstr] : ptr<void>
+    ```c
+    return (void *)s;
+  ```)
+  ;;; __dup -- internal: a malloc'd copy.
+  (defn __dup [s : cstr] : cstr
+    ```c
+    size_t n = strlen((const char *)s);
+  char *d = (char *)malloc(n + 1);
+  if (!d) abort();
+  memcpy(d, s, n + 1);
+  return d;
+  ```)
+  ;;; __itoa -- internal: decimal text, malloc'd.
+  (defn __itoa [v : int] : cstr
+    ```c
+    char *b = (char *)malloc(24);
+  if (!b) abort();
+  snprintf(b, 24, "%lld", (long long)v);
+  return b;
+  ```)
+  ;;; __mb-new -- internal: a markup buffer.
+  (defn __mb-new [] : ptr<void>
+    ```c
+    extern void *turdom_mbuf_new(void);
+  return turdom_mbuf_new();
+  ```)
+  ;;; __mb-put -- internal: append verbatim.
+  (defn __mb-put [b : ptr<void> s : cstr] : nil
+    ```c
+    extern void turdom_mbuf_put(void *, const char *);
+  turdom_mbuf_put(b, (const char *)s);
+  ```)
+  ;;; __mb-put-esc -- internal: append escaped text or attribute value.
+  (defn __mb-put-esc [b : ptr<void> s : cstr attr : bool html : bool] : nil
+    ```c
+    extern void turdom_mbuf_put_escaped(void *, const char *, int, int);
+  turdom_mbuf_put_escaped(b, (const char *)s, attr ? 1 : 0, html ? 1 : 0);
+  ```)
+  ;;; __mb-finish -- internal: the buffer's text, malloc'd.
+  (defn __mb-finish [b : ptr<void>] : cstr
+    ```c
+    extern char *turdom_mbuf_finish(void *);
+  return turdom_mbuf_finish(b);
+  ```)
+  ;; ---------------------------------------------------------------------------
+  ;; The opt-outs and the URL check
+  ;; ---------------------------------------------------------------------------
+  ;;; raw-html -- mark markup as trusted, for a content hole. UNSAFE.
+  ;;;
+  ;;; In a content hole the markup is PARSED in the hole's own context
+  ;;; (its parent element) and the parsed nodes are written back, so it can
+  ;;; never unbalance the surrounding literal -- an extra `</div>` cannot close
+  ;;; anything outside it. It is NOT sanitized: a `<script>`, an `onerror`
+  ;;; handler or a `javascript:` URL in it survives and runs. Never pass it
+  ;;; markup an untrusted party wrote. In an `#xml{...}` literal the markup
+  ;;; must be well-formed XML content.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the markup; copied
+  ;;;
+  ;;; Returns:
+  ;;;   RawHtml
+  ;;;
+  ;;; Example:
+  ;;;   #html{<div class="post">${(raw-html rendered-markdown)}</div>}
+  ;;;
+  ;;; Since: 0.3.0
+  (defn raw-html [s : cstr] : RawHtml (:: (__as-ptr (__dup s)) RawHtml))
+  ;;; raw-html-markup -- the markup a RawHtml holds.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- the value
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- borrowed from r
+  ;;;
+  ;;; Example:
+  ;;;   (raw-html-markup (raw-html "<b>x</b>"))   ; => "<b>x</b>"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn raw-html-markup [r : RawHtml] : cstr (__as-cstr (:: r ptr<void>)))
+  ;;; trusted-url -- mark a URL as trusted, skipping the scheme check. UNSAFE.
+  ;;;
+  ;;; The value is still escaped for its attribute; only the scheme allowlist
+  ;;; (`url-safe`) is skipped, so a `javascript:` URL passes. For URLs the
+  ;;; program made itself.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the URL; copied
+  ;;;
+  ;;; Returns:
+  ;;;   TrustedUrl
+  ;;;
+  ;;; Example:
+  ;;;   #html{<a href=${(trusted-url "javascript:history.back()")}>back</a>}
+  ;;;
+  ;;; Since: 0.3.0
+  (defn trusted-url [s : cstr] : TrustedUrl
+    (:: (__as-ptr (__dup s)) TrustedUrl))
+  ;;; __url-safe-raw -- internal.
+  (defn __url-safe-raw [s : cstr] : cstr
+    ```c
+    extern const char *turdom_url_safe(const char *);
+  return turdom_url_safe((const char *)s);
+  ```)
+  ;;; url-safe -- a URL, or `about:invalid#tur-unsafe` when its scheme is not
+  ;;; allowed.
+  ;;;
+  ;;; Leading spaces and C0 controls are stripped and ASCII tab, LF and CR
+  ;;; dropped anywhere, as a browser's URL parser does; then a relative URL
+  ;;; (no scheme) or one with scheme `http`, `https`, `mailto` or `tel` (any
+  ;;; case) passes. Everything else -- `javascript:`, `data:`, `vbscript:`,
+  ;;; the next one -- becomes the dead URL. A scheme check is not
+  ;;; sanitization: an `https:` URL to a hostile site passes, as it should.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the URL
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- `s` itself or the dead URL (both borrowed)
+  ;;;
+  ;;; Example:
+  ;;;   (url-safe "JavaScript:alert(1)")   ; => "about:invalid#tur-unsafe"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn url-safe [s : cstr] : cstr (__url-safe-raw s))
+  ;;; __srcset-raw -- internal: a malloc'd checked srcset.
+  (defn __srcset-raw [s : cstr] : cstr
+    ```c
+    extern char *turdom_srcset_safe(const char *);
+  return turdom_srcset_safe((const char *)s);
+  ```)
+  ;;; srcset-check -- check every candidate URL of a `srcset` value.
+  ;;;
+  ;;; What the macro wraps around a `srcset` hole: an unchecked value has
+  ;;; each comma-separated candidate's URL passed through `url-safe`.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the hole's value
+  ;;;
+  ;;; Returns:
+  ;;;   AttrVal -- trusted values and booleans unchanged.
+  ;;;
+  ;;; Example:
+  ;;;   (srcset-check (AttrText "a.png 1x, javascript:x 2x"))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn srcset-check [a : AttrVal] : AttrVal
+    (match a
+      (AttrText s)
+      (AttrText (__srcset-raw s))
+      (AttrTrusted s)
+      (AttrTrusted s)
+      (AttrOn)
+      (AttrOn)
+      (AttrOff)
+      (AttrOff)))
+  ;; ---------------------------------------------------------------------------
+  ;; Fragments
+  ;; ---------------------------------------------------------------------------
+  ;;; html->string -- the markup of an `#html{...}` literal.
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- the fragment
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- borrowed from f (valid until `fragment-free`)
+  ;;;
+  ;;; Example:
+  ;;;   (println (html->string #html{<p>${name}</p>}))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn html->string [f : Fragment] : cstr (__as-cstr (:: f ptr<void>)))
+  ;;; xml->string -- the markup of an `#xml{...}` literal.
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- the fragment
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- borrowed from f (valid until `xml-fragment-free`)
+  ;;;
+  ;;; Example:
+  ;;;   (println (xml->string #xml{<item>${name}</item>}))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn xml->string [f : XmlFragment] : cstr (__as-cstr (:: f ptr<void>)))
+  ;;; __free -- internal.
+  (defn __free [p : ptr<void>] : nil
+    ```c
+    free(p);
+  ```)
+  ;;; fragment-free -- release a Fragment's markup.
+  ;;;
+  ;;; Optional: a Fragment that lives as long as the program need not be
+  ;;; freed. A long-running server freeing each page's Fragment once it is
+  ;;; written keeps its memory flat.
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- the fragment, not used afterwards
+  ;;;
+  ;;; Example:
+  ;;;   (fragment-free page)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn fragment-free [f : Fragment] : nil (__free (:: f ptr<void>)))
+  ;;; xml-fragment-free -- release an XmlFragment's markup.
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- the fragment, not used afterwards
+  ;;;
+  ;;; Example:
+  ;;;   (xml-fragment-free feed)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn xml-fragment-free [f : XmlFragment] : nil (__free (:: f ptr<void>)))
+  ;; ---------------------------------------------------------------------------
+  ;; The classes
+  ;; ---------------------------------------------------------------------------
+  ;;; ToChild -- a value that can fill a content hole.
+  ;;;
+  ;;; Parameters:
+  ;;;   T -- the value's type
+  ;;;
+  ;;; Methods:
+  ;;;   to-child -- the value as a Child
+  ;;;
+  ;;; Example:
+  ;;;   (to-child "a < b")   ; => (ChildText "a < b"), escaped when rendered
+  ;;;
+  ;;; Since: 0.3.0
+  (defclass ToChild [T] (to-child [x : T] : Child))
+  ;;; ToAttr -- a value that can fill an attribute-value hole.
+  ;;;
+  ;;; Parameters:
+  ;;;   T -- the value's type
+  ;;;
+  ;;; Methods:
+  ;;;   to-attr -- the value as an AttrVal
+  ;;;
+  ;;; Example:
+  ;;;   (to-attr true)   ; => (AttrOn)
+  ;;;
+  ;;; Since: 0.3.0
+  (defclass ToAttr [T] (to-attr [x : T] : AttrVal))
+  ;;; ToUrlAttr -- a value that can fill a URL-bearing attribute's hole.
+  ;;;
+  ;;; Parameters:
+  ;;;   T -- the value's type
+  ;;;
+  ;;; Methods:
+  ;;;   to-url-attr -- the value as an AttrVal, scheme-checked unless trusted
+  ;;;
+  ;;; Example:
+  ;;;   (to-url-attr "javascript:x")   ; => (AttrText "about:invalid#tur-unsafe")
+  ;;;
+  ;;; Since: 0.3.0
+  (defclass ToUrlAttr [T] (to-url-attr [x : T] : AttrVal))
+  ;;; ToChild [cstr] -- text, escaped.
+  (definstance ToChild [cstr] (to-child [x] (ChildText x)))
+  ;;; ToChild [String] -- text, escaped.
+  (definstance ToChild [String] (to-child [x] (ChildText (to-cstr x))))
+  ;;; ToChild [int] -- decimal text.
+  (definstance ToChild [int] (to-child [x] (ChildText (__itoa x))))
+  ;;; ToChild [Fragment] -- a nested #html{} literal, spliced in.
+  (definstance ToChild [Fragment] (to-child [x] (ChildHtml (html->string x))))
+  ;;; ToChild [XmlFragment] -- a nested #xml{} literal, spliced in.
+  (definstance ToChild [XmlFragment] (to-child [x] (ChildXml (xml->string x))))
+  ;;; ToChild [RawHtml] -- raw markup, parsed in the hole's context.
+  (definstance ToChild [RawHtml] (to-child [x] (ChildRaw (raw-html-markup x))))
+  ;;; ToChild [(Option A)] -- None renders nothing.
+  (definstance ToChild [(Option A)]
+    [(ToChild A)]
+    (to-child [x] (match x (Some v) (to-child v) (None) (ChildEmpty))))
+  ;;; __cat-html -- internal: the markup of a list of fragments.
+  (defn __cat-html [b : ptr<void> xs : (Cons Fragment)] : nil
+    (if (tnil? xs)
+      nil
+      (do (__mb-put b (html->string (thead xs))) (__cat-html b (ttail xs)))))
+  ;;; __cat-xml -- internal: the markup of a list of XML fragments.
+  (defn __cat-xml [b : ptr<void> xs : (Cons XmlFragment)] : nil
+    (if (tnil? xs)
+      nil
+      (do (__mb-put b (xml->string (thead xs))) (__cat-xml b (ttail xs)))))
+  ;;; ToChild [(Cons Fragment)] -- the fragments in order.
+  (definstance ToChild [(Cons Fragment)]
+    (to-child [x]
+      (let [b (__mb-new)] (__cat-html b x) (ChildHtml (__mb-finish b)))))
+  ;;; ToChild [(Cons XmlFragment)] -- the fragments in order.
+  (definstance ToChild [(Cons XmlFragment)]
+    (to-child [x]
+      (let [b (__mb-new)] (__cat-xml b x) (ChildXml (__mb-finish b)))))
+  ;;; ToChild [Node] -- a node of a parsed or built tree, serialized in.
+  (definstance ToChild [Node]
+    (to-child [x]
+      (let [s (dom-serialize x)
+            m (__dup (to-cstr s))]
+        (release s)
+        (match (dom-flavor (node-document x))
+          (HtmlFlavor)
+          (ChildHtml m)
+          (XmlFlavor)
+          (ChildXml m)))))
+  ;;; ToAttr [cstr] -- escaped.
+  (definstance ToAttr [cstr] (to-attr [x] (AttrText x)))
+  ;;; ToAttr [String] -- escaped.
+  (definstance ToAttr [String] (to-attr [x] (AttrText (to-cstr x))))
+  ;;; ToAttr [int] -- decimal.
+  (definstance ToAttr [int] (to-attr [x] (AttrText (__itoa x))))
+  ;;; ToAttr [bool] -- an HTML boolean attribute: present or absent.
+  (definstance ToAttr [bool] (to-attr [x] (if x (AttrOn) (AttrOff))))
+  ;;; ToAttr [(Option A)] -- None drops the attribute.
+  (definstance ToAttr [(Option A)]
+    [(ToAttr A)]
+    (to-attr [x] (match x (Some v) (to-attr v) (None) (AttrOff))))
+  ;;; ToUrlAttr [cstr] -- scheme-checked, then escaped.
+  (definstance ToUrlAttr [cstr] (to-url-attr [x] (AttrText (url-safe x))))
+  ;;; ToUrlAttr [String] -- scheme-checked, then escaped.
+  (definstance ToUrlAttr [String]
+    (to-url-attr [x] (AttrText (url-safe (to-cstr x)))))
+  ;;; ToUrlAttr [TrustedUrl] -- escaped, not checked.
+  (definstance ToUrlAttr [TrustedUrl]
+    (to-url-attr [x] (AttrTrusted (__as-cstr (:: x ptr<void>)))))
+  ;;; ToUrlAttr [(Option A)] -- None drops the attribute.
+  (definstance ToUrlAttr [(Option A)]
+    [(ToUrlAttr A)]
+    (to-url-attr [x] (match x (Some v) (to-url-attr v) (None) (AttrOff))))
+  ;; ---------------------------------------------------------------------------
+  ;; Rendering a template (what tur-html's and tur-xml's literals call)
+  ;; ---------------------------------------------------------------------------
+  ;;; __tpl-static -- internal: append static text; the next marker or -1.
+  (defn __tpl-static [b : ptr<void> tpl : cstr pos : int] : int
+    ```c
+    extern int64_t turdom_tpl_static(void *, const char *, int64_t);
+  return turdom_tpl_static(b, (const char *)tpl, pos);
+  ```)
+  ;;; __tpl-kind -- internal: the marker's kind byte.
+  (defn __tpl-kind [tpl : cstr pos : int] : int
+    ```c
+    extern int turdom_tpl_kind(const char *, int64_t);
+  return turdom_tpl_kind((const char *)tpl, pos);
+  ```)
+  ;;; __tpl-after -- internal: the offset just past a marker.
+  (defn __tpl-after [tpl : cstr pos : int] : int
+    ```c
+    extern int64_t turdom_tpl_after(const char *, int64_t);
+  return turdom_tpl_after((const char *)tpl, pos);
+  ```)
+  ;;; __tpl-whole -- internal: write a whole-value attribute hole.
+  (defn __tpl-whole [b : ptr<void>
+                     tpl : cstr
+                     pos : int
+                     state : int
+                     v : cstr
+                     html : bool] : nil
+    ```c
+    extern void turdom_tpl_whole_attr(void *, const char *, int64_t, int, const char *, int);
+  turdom_tpl_whole_attr(b, (const char *)tpl, pos, (int)state, (const char *)v, html ? 1 : 0);
+  ```)
+  ;;; template-parent -- the element child hole i of a checked literal sits in
+  ;;; ("template" at the top level).
+  ;;;
+  ;;; Parameters:
+  ;;;   tpl -- the template
+  ;;;   i   -- the hole's index
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- borrowed
+  ;;;
+  ;;; Example:
+  ;;;   (template-parent tpl 0)   ; => "li"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn template-parent [tpl : cstr i : int] : cstr
+    ```c
+    extern const char *turdom_tpl_parent(const char *, int64_t);
+  return turdom_tpl_parent((const char *)tpl, i);
+  ```)
+  ;;; __render-child -- internal.
+  (defn __render-child [b : ptr<void>
+                        tpl : cstr
+                        i : int
+                        c : Child
+                        html : bool
+                        raw-fix : (fn [cstr cstr] cstr)] : nil
+    (match c
+      (ChildText s)
+      (__mb-put-esc b s false html)
+      (ChildHtml s)
+      (if html
+        (__mb-put b s)
+        (panic "an #html{} fragment (or HTML node) cannot go in an #xml{} literal"))
+      (ChildXml s)
+      (if html
+        (panic "an #xml{} fragment (or XML node) cannot go in an #html{} literal")
+        (__mb-put b s))
+      (ChildRaw s)
+      (__mb-put b (raw-fix s (template-parent tpl i)))
+      (ChildEmpty)
+      nil))
+  ;;; __render-attr -- internal.
+  (defn __render-attr [b : ptr<void>
+                       tpl : cstr
+                       pos : int
+                       a : AttrVal
+                       html : bool] : nil
+    (if (= (__tpl-kind tpl pos) 119)
+      (match a
+        (AttrText s)
+        (__tpl-whole b tpl pos 2 s html)
+        (AttrTrusted s)
+        (__tpl-whole b tpl pos 2 s html)
+        (AttrOn)
+        (__tpl-whole b tpl pos 1 "" html)
+        (AttrOff)
+        (__tpl-whole b tpl pos 0 "" html))
+      (match a
+        (AttrText s)
+        (__mb-put-esc b s true html)
+        (AttrTrusted s)
+        (__mb-put-esc b s true html)
+        (AttrOn)
+        (__mb-put b "true")
+        (AttrOff)
+        nil)))
+  ;;; __render-loop -- internal: static text and holes, in order.
+  (defn __render-loop [b : ptr<void>
+                       tpl : cstr
+                       pos : int
+                       i : int
+                       holes : (Cons Hole)
+                       html : bool
+                       raw-fix : (fn [cstr cstr] cstr)] : nil
+    (let [m (__tpl-static b tpl pos)]
+      (if (< m 0)
+        nil
+        (if (tnil? holes)
+          (panic "markup literal: fewer hole values than holes")
+          (do
+            (match (thead holes)
+              (HoleChild c)
+              (__render-child b tpl i c html raw-fix)
+              (HoleAttr a)
+              (__render-attr b tpl m a html))
+            (__render-loop b
+              tpl
+              (__tpl-after tpl m)
+              (+ i 1)
+              (ttail holes)
+              html
+              raw-fix))))))
+  ;;; render-template -- render a literal's template with its hole values.
+  ;;;
+  ;;; Internal to the markup literals: tur-html's and tur-xml's renderers call
+  ;;; it after checking the literal. `raw-fix` turns a RawHtml value into
+  ;;; balanced markup for the hole's parent element.
+  ;;;
+  ;;; Parameters:
+  ;;;   tpl     -- the template the macro produced
+  ;;;   holes   -- the hole values, in order
+  ;;;   html    -- HTML (true) or XML escaping and boolean attributes
+  ;;;   raw-fix -- (raw markup, context element) -> markup
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- the markup, malloc'd
+  ;;;
+  ;;; Example:
+  ;;;   (render-template tpl holes true fix)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn render-template [tpl : cstr
+                         holes : (Cons Hole)
+                         html : bool
+                         raw-fix : (fn [cstr cstr] cstr)] : cstr
+    (let [b (__mb-new)]
+      (__render-loop b tpl 0 0 holes html raw-fix)
+      (__mb-finish b)))
+  ;;; template-checked? -- has this literal been checked against the parser?
+  ;;;
+  ;;; Parameters:
+  ;;;   tpl -- the template
+  ;;;
+  ;;; Returns:
+  ;;;   bool
+  ;;;
+  ;;; Example:
+  ;;;   (template-checked? tpl)   ; => true after its first render
+  ;;;
+  ;;; Since: 0.3.0
+  (defn template-checked? [tpl : cstr] : bool
+    ```c
+    extern int turdom_tpl_checked(const char *);
+  return turdom_tpl_checked((const char *)tpl) != 0;
+  ```)
+  ;;; template-check-markup -- the template as parseable markup, its holes
+  ;;; marked (malloc'd).
+  ;;;
+  ;;; Parameters:
+  ;;;   tpl -- the template
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- markup with `__tur_hole_N__` markers
+  ;;;
+  ;;; Example:
+  ;;;   (template-check-markup tpl)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn template-check-markup [tpl : cstr] : cstr
+    ```c
+    extern char *turdom_tpl_check_markup(const char *);
+  return turdom_tpl_check_markup((const char *)tpl);
+  ```)
+  ;;; __verify-raw -- internal: NULL, or the malloc'd failure message.
+  (defn __verify-raw [tpl : cstr top : Node] : cstr
+    ```c
+    extern char *turdom_tpl_verify(const char *, const void *);
+  return turdom_tpl_verify((const char *)tpl, (const void *)(intptr_t)top);
+  ```)
+  ;;; __null-cstr? -- internal.
+  (defn __null-cstr? [s : cstr] : bool
+    ```c
+    return s == NULL;
+  ```)
+  ;;; template-verify -- check the parsed check-markup against the template.
+  ;;;
+  ;;; Every hole marker must turn up exactly once, in the kind of slot the
+  ;;; macro predicted. A disagreement means the macro's context tokenizer and
+  ;;; the real parser read the literal differently, so it panics with the
+  ;;; literal. On success the literal is recorded as checked.
+  ;;;
+  ;;; Parameters:
+  ;;;   tpl -- the template
+  ;;;   top -- the parsed `template-check-markup` (its document node)
+  ;;;
+  ;;; Example:
+  ;;;   (template-verify tpl (dom-node d))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn template-verify [tpl : cstr top : Node] : nil
+    (let [err (__verify-raw tpl top)] (if (__null-cstr? err) nil (panic err))))) ;; end defmodule dom/holes
