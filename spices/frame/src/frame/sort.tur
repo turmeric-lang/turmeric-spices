@@ -5,26 +5,29 @@
 ;; v0 deviates from the plan's `(arrange f keys)` signature where
 ;; keys is a cons list of (name . direction) pairs: we instead take two
 ;; parallel lists -- (arrange f names dirs) -- so we don't need a pair type.
-
 (defmodule frame/sort
   (export arrange arrange-indices reorder __so-take)
-
-  (import frame/schema :refer [field field-name field-type field-nullable
-                                schema schema-arity schema-field-at
-                                schema-index-of])
+  (import frame/schema
+    :refer
+    [field
+     field-name
+     field-type
+     field-nullable
+     schema
+     schema-arity
+     schema-field-at
+     schema-index-of])
   (import frame/column :refer [column-length column-type column-retain])
-  (import frame/frame  :refer [frame frame-nrows frame-ncols frame-schema
-                                frame-column-at])
-
-;; ---------------------------------------------------------------------------
-;; Private cons helpers (namespaced).
-;; ---------------------------------------------------------------------------
-
-(defn __so-nil [] : int ```c return 0; ```)
-
-(defn __so-cons [v : int n : int] : int
-  ```c
-  #include <stdlib.h>
+  (import frame/frame
+    :refer
+    [frame frame-nrows frame-ncols frame-schema frame-column-at])
+  ;; ---------------------------------------------------------------------------
+  ;; Private cons helpers (namespaced).
+  ;; ---------------------------------------------------------------------------
+  (defn __so-nil [] : int ```c return 0; ```)
+  (defn __so-cons [v : int n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   struct __cons *c = (struct __cons *)malloc(sizeof(*c));
@@ -32,18 +35,19 @@
   c->value = v; c->next = n;
   return (int64_t)(intptr_t)c;
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Inline-C core: compute permutation, then take by indices.
-;; ---------------------------------------------------------------------------
-
-;;; __so-compute-perm -- given a frame and parallel arrays of (col_ix, dir),
-;;; allocate and fill a permutation int64_t[n_rows] using qsort with stability
-;;; tiebreaker.  Returns the array as :int (intptr_t), 0 on OOM.  Since: FR4
-(defn __so-compute-perm [f : int n-rows : int n-keys : int
-                         col-ixs : int dirs : int] : int
-  ```c
-  #include <stdlib.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Inline-C core: compute permutation, then take by indices.
+  ;; ---------------------------------------------------------------------------
+  ;;; __so-compute-perm -- given a frame and parallel arrays of (col_ix, dir),
+  ;;; allocate and fill a permutation int64_t[n_rows] using qsort with stability
+  ;;; tiebreaker.  Returns the array as :int (intptr_t), 0 on OOM.  Since: FR4
+  (defn __so-compute-perm [f : int
+                           n-rows : int
+                           n-keys : int
+                           col-ixs : int
+                           dirs : int] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
@@ -184,31 +188,28 @@
   free(s_dirs); free(s_tags); free(s_values); free(s_offsets); free(s_validity);
   return (int64_t)(intptr_t)perm;
   ```)
-
-;;; __so-perm-len -- length of a perm array (we already passed n-rows but
-;;; expose this so callers can sanity-check).  Just returns whatever len you
-;;; pass in -- placeholder so the API has a fetch.  Since: FR4
-(defn __so-perm-free [perm : int] : void
-  ```c
-  #include <stdlib.h>
+  ;;; __so-perm-len -- length of a perm array (we already passed n-rows but
+  ;;; expose this so callers can sanity-check).  Just returns whatever len you
+  ;;; pass in -- placeholder so the API has a fetch.  Since: FR4
+  (defn __so-perm-free [perm : int] : void
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   void *p = (void *)(intptr_t)perm;
   if (p) free(p);
   ```)
-
-;;; __so-perm-nth -- read perm[i] (used by arrange-indices to build the
-;;; user-visible cons list). Since: FR4
-(defn __so-perm-nth [perm : int i : int] : int
-  ```c
-  #include <stdint.h>
+  ;;; __so-perm-nth -- read perm[i] (used by arrange-indices to build the
+  ;;; user-visible cons list). Since: FR4
+  (defn __so-perm-nth [perm : int i : int] : int
+    ```c
+    #include <stdint.h>
   return ((int64_t *)(intptr_t)perm)[i];
   ```)
-
-;;; __so-take -- build a new column by applying `perm` (int64_t[n]) to `col`.
-;;; Handles every type that the sort comparator handles.  Since: FR4
-(defn __so-take [col : int perm : int n : int] : int
-  ```c
-  #include <stdlib.h>
+  ;;; __so-take -- build a new column by applying `perm` (int64_t[n]) to `col`.
+  ;;; Handles every type that the sort comparator handles.  Since: FR4
+  (defn __so-take [col : int perm : int n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
   struct __frame_col {
@@ -355,14 +356,12 @@
   out->offsets    = doffsets;
   return (int64_t)(intptr_t)out;
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Turmeric driver code.
-;; ---------------------------------------------------------------------------
-
-(defn __so-name-at [xs : int i : int] : cstr
-  ```c
-  #include <stdint.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Turmeric driver code.
+  ;; ---------------------------------------------------------------------------
+  (defn __so-name-at [xs : int i : int] : cstr
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t k = 0;
   for (struct __cons *p = (struct __cons *)(intptr_t)xs; p; p = (struct __cons *)(intptr_t)p->next, k++) {
@@ -370,85 +369,80 @@
   }
   return (const char *)(intptr_t)"";
   ```)
-
-(defn __so-names-to-ixs [s : int names : int i : int n : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [nm (__so-name-at names i)
-          ix (schema-index-of s nm)]
-      (if (< ix 0)
-        -1
-        (__so-names-to-ixs s names (- i 1) n (__so-cons ix acc))))))
-
-(defn __so-list-length [xs : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __so-names-to-ixs [s : int names : int i : int n : int acc : int] : int
+    (if (< i 0)
+      acc
+      (let [nm (__so-name-at names i)
+            ix (schema-index-of s nm)]
+        (if (< ix 0)
+          -1
+          (__so-names-to-ixs s names (- i 1) n (__so-cons ix acc))))))
+  (defn __so-list-length [xs : int] : int
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t n = 0;
   for (struct __cons *p = (struct __cons *)(intptr_t)xs; p; p = (struct __cons *)(intptr_t)p->next) n++;
   return n;
   ```)
-
-(defn __so-clone-field-at [s : int i : int] : int
-  (let [fd (schema-field-at s i)]
-    (field (field-name fd) (field-type fd) (field-nullable fd))))
-
-(defn __so-build-fields [s : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (__so-build-fields s (- i 1) (__so-cons (__so-clone-field-at s i) acc))))
-
-(defn __so-build-cols [f : int perm : int n : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [col (__so-take (frame-column-at f i) perm n)]
-      (__so-build-cols f perm n (- i 1) (__so-cons col acc)))))
-
-(defn __so-perm-to-list [perm : int n : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (__so-perm-to-list perm n (- i 1) (__so-cons (__so-perm-nth perm i) acc))))
-
-;;; arrange-indices -- compute the permutation that would sort the frame.
-;;;
-;;; Parameters:
-;;;   f     -- :int frame
-;;;   names -- cons list of :cstr column names
-;;;   dirs  -- parallel cons list of :int directions (0 = asc, 1 = desc)
-;;;
-;;; Returns:
-;;;   :int  cons list of row indices in sorted order; 0 if any name is missing.
-;;;
-;;; Since: FR4
-(defn arrange-indices [f : int names : int dirs : int] : int
-  (let [src-sch (frame-schema f)
-        n-keys  (__so-list-length names)
-        ixs     (__so-names-to-ixs src-sch names (- n-keys 1) n-keys (__so-nil))]
-    (if (= ixs -1)
-      0
-      (let [nrows (frame-nrows f)
-            perm  (__so-compute-perm f nrows n-keys ixs dirs)
-            lst   (__so-perm-to-list perm nrows (- nrows 1) (__so-nil))]
-        (do (__so-perm-free perm) lst)))))
-
-;;; reorder -- apply a permutation cons list to f (returns a new frame).
-;;; Length of `indices` must equal frame-nrows; otherwise returns 0.
-;;; Since: FR4
-(defn reorder [f : int indices : int] : int
-  (let [nrows (frame-nrows f)
-        ncols (frame-ncols f)
-        n-ix  (__so-list-length indices)]
-    (if (not= n-ix nrows)
-      0
-      (let [perm   (__so-list-to-perm indices nrows)
-            cols   (__so-build-cols f perm nrows (- ncols 1) (__so-nil))
-            fields (__so-build-fields (frame-schema f) (- ncols 1) (__so-nil))
-            g      (frame (schema fields) cols)]
-        (do (__so-perm-free perm) g)))))
-
-(defn __so-list-to-perm [xs : int n : int] : int
-  ```c
-  #include <stdlib.h>
+  (defn __so-clone-field-at [s : int i : int] : int
+    (let [fd (schema-field-at s i)]
+      (field (field-name fd) (field-type fd) (field-nullable fd))))
+  (defn __so-build-fields [s : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (__so-build-fields s (- i 1) (__so-cons (__so-clone-field-at s i) acc))))
+  (defn __so-build-cols [f : int perm : int n : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (let [col (__so-take (frame-column-at f i) perm n)]
+        (__so-build-cols f perm n (- i 1) (__so-cons col acc)))))
+  (defn __so-perm-to-list [perm : int n : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (__so-perm-to-list perm n (- i 1) (__so-cons (__so-perm-nth perm i) acc))))
+  ;;; arrange-indices -- compute the permutation that would sort the frame.
+  ;;;
+  ;;; Parameters:
+  ;;;   f     -- :int frame
+  ;;;   names -- cons list of :cstr column names
+  ;;;   dirs  -- parallel cons list of :int directions (0 = asc, 1 = desc)
+  ;;;
+  ;;; Returns:
+  ;;;   :int  cons list of row indices in sorted order; 0 if any name is missing.
+  ;;;
+  ;;; Since: FR4
+  (defn arrange-indices [f : int names : int dirs : int] : int
+    (let [src-sch (frame-schema f)
+          n-keys  (__so-list-length names)
+          ixs     (__so-names-to-ixs src-sch
+                    names
+                    (- n-keys 1)
+                    n-keys
+                    (__so-nil))]
+      (if (= ixs -1)
+        0
+        (let [nrows (frame-nrows f)
+              perm  (__so-compute-perm f nrows n-keys ixs dirs)
+              lst   (__so-perm-to-list perm nrows (- nrows 1) (__so-nil))]
+          (do (__so-perm-free perm) lst)))))
+  ;;; reorder -- apply a permutation cons list to f (returns a new frame).
+  ;;; Length of `indices` must equal frame-nrows; otherwise returns 0.
+  ;;; Since: FR4
+  (defn reorder [f : int indices : int] : int
+    (let [nrows (frame-nrows f)
+          ncols (frame-ncols f)
+          n-ix  (__so-list-length indices)]
+      (if (not= n-ix nrows)
+        0
+        (let [perm   (__so-list-to-perm indices nrows)
+              cols   (__so-build-cols f perm nrows (- ncols 1) (__so-nil))
+              fields (__so-build-fields (frame-schema f) (- ncols 1) (__so-nil))
+              g      (frame (schema fields) cols)]
+          (do (__so-perm-free perm) g)))))
+  (defn __so-list-to-perm [xs : int n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t *p = (int64_t *)malloc((size_t)n * sizeof(int64_t));
@@ -459,22 +453,23 @@
   }
   return (int64_t)(intptr_t)p;
   ```)
-
-;;; arrange -- return a new frame sorted by the given keys.
-;;; Equivalent to (reorder f (arrange-indices f names dirs)) but skips the
-;;; intermediate cons list.  Since: FR4
-(defn arrange [f : int names : int dirs : int] : int
-  (let [src-sch (frame-schema f)
-        n-keys  (__so-list-length names)
-        ixs     (__so-names-to-ixs src-sch names (- n-keys 1) n-keys (__so-nil))]
-    (if (= ixs -1)
-      0
-      (let [nrows  (frame-nrows f)
-            ncols  (frame-ncols f)
-            perm   (__so-compute-perm f nrows n-keys ixs dirs)
-            cols   (__so-build-cols f perm nrows (- ncols 1) (__so-nil))
-            fields (__so-build-fields src-sch (- ncols 1) (__so-nil))
-            g      (frame (schema fields) cols)]
-        (do (__so-perm-free perm) g)))))
-
-) ;; end defmodule frame/sort
+  ;;; arrange -- return a new frame sorted by the given keys.
+  ;;; Equivalent to (reorder f (arrange-indices f names dirs)) but skips the
+  ;;; intermediate cons list.  Since: FR4
+  (defn arrange [f : int names : int dirs : int] : int
+    (let [src-sch (frame-schema f)
+          n-keys  (__so-list-length names)
+          ixs     (__so-names-to-ixs src-sch
+                    names
+                    (- n-keys 1)
+                    n-keys
+                    (__so-nil))]
+      (if (= ixs -1)
+        0
+        (let [nrows  (frame-nrows f)
+              ncols  (frame-ncols f)
+              perm   (__so-compute-perm f nrows n-keys ixs dirs)
+              cols   (__so-build-cols f perm nrows (- ncols 1) (__so-nil))
+              fields (__so-build-fields src-sch (- ncols 1) (__so-nil))
+              g      (frame (schema fields) cols)]
+          (do (__so-perm-free perm) g)))))) ;; end defmodule frame/sort

@@ -48,28 +48,39 @@
 ;;     httpd-set-bind-addr! (or sets TUR_HTTPD_BIND_ANY=1).
 ;;   * Request heads must arrive within the read timeout (5 s; 408 past it),
 ;;     bodies are capped (8 MiB; 413 past it) -- see ServerOpts.
-
 (load "stdlib/httpd.tur")
 
 (defmodule httpd/server
-  (import httpd/request  :refer [request-view-new request-view-free])
+  (import httpd/request :refer [request-view-new request-view-free])
   (import httpd/response :refer [free-response])
-  (import httpd/conn     :refer [conn-of-httpd conn-upgraded? conn-free])
-  (import httpd/types    :refer [Request Response Conn])
-  (export ServerOpts default-server-opts
-          server-start server-start-pool server-start-spawn server-start-opts
-          server-start-conn server-start-pool-conn server-start-conn-opts
-          ServerWrap server-wrap server-start-wrapped server-start-conn-wrapped
-          take-conn-response
-          server-port server-stop
-          serve-httpd-request serve-httpd-request-conn
-          server-launch server-tls-ctx server-set-tls-ctx!)
-
-;; file-scope-c-block: system headers like <pthread.h> contain static inline
-;; function definitions that are not legal inside a function body on macOS
-;; 14+ / Xcode 15+.  Hoist the headers and the shared struct layouts here.
-```c
-#include <stdlib.h>
+  (import httpd/conn :refer [conn-of-httpd conn-upgraded? conn-free])
+  (import httpd/types :refer [Request Response Conn])
+  (export ServerOpts
+    default-server-opts
+    server-start
+    server-start-pool
+    server-start-spawn
+    server-start-opts
+    server-start-conn
+    server-start-pool-conn
+    server-start-conn-opts
+    ServerWrap
+    server-wrap
+    server-start-wrapped
+    server-start-conn-wrapped
+    take-conn-response
+    server-port
+    server-stop
+    serve-httpd-request
+    serve-httpd-request-conn
+    server-launch
+    server-tls-ctx
+    server-set-tls-ctx!)
+  ;; file-scope-c-block: system headers like <pthread.h> contain static inline
+  ;; function definitions that are not legal inside a function body on macOS
+  ;; 14+ / Xcode 15+.  Hoist the headers and the shared struct layouts here.
+  ```c
+  #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <pthread.h>
@@ -81,65 +92,57 @@ struct __httpd_resp {
   char **hdr_keys; char **hdr_vals; int hdr_count; int hdr_cap;
 };
 ```
-
-;;; ServerOpts -- configuration for server-start-opts / server-start-conn-opts.
-;;;
-;;; Fields:
-;;;   pool-size       -- worker threads (>= 1; server-start uses 8).  A
-;;;                      WebSocket session holds its worker while it runs.
-;;;   max-body        -- request body cap in bytes; a larger Content-Length
-;;;                      is answered 413 before any of the body is read.
-;;;                      -1 keeps stdlib httpd's (8 MiB, httpd-set-max-body!).
-;;;   read-timeout-ms -- how long a request head may take to arrive (408
-;;;                      after it), and each body read may wait.  0 keeps
-;;;                      stdlib httpd's (5 s, httpd-set-read-timeout!).
-;;;
-;;; Since: tourist-on-stdlib-httpd H2
-(defstruct ServerOpts
-  [pool-size : int
-   max-body : int
-   read-timeout-ms : int])
-
-;;; default-server-opts -- the settings server-start uses.
-;;;
-;;; 8 workers, stdlib httpd's body cap and read timeout.
-;;;
-;;; Returns:
-;;;   ServerOpts
-;;;
-;;; Example:
-;;;   (server-start-opts 8080 my-handler
-;;;     (make-struct ServerOpts 16 1048576 2000))
-;;;
-;;; Since: tourist-on-stdlib-httpd H2
-(defn default-server-opts [] : ServerOpts
-  (make-struct ServerOpts 8 -1 0))
-
-;; =============================================================================
-;; Request dispatch: the stdlib handler body
-;; =============================================================================
-
-;; Invoke a handler function pointer: handler(req) -> resp.
-(defn srv-call-handler [handler : (c-fn [int] int) req : int] : int
-  ```c
-  typedef int64_t (*handler_fn)(int64_t);
+  ;;; ServerOpts -- configuration for server-start-opts / server-start-conn-opts.
+  ;;;
+  ;;; Fields:
+  ;;;   pool-size       -- worker threads (>= 1; server-start uses 8).  A
+  ;;;                      WebSocket session holds its worker while it runs.
+  ;;;   max-body        -- request body cap in bytes; a larger Content-Length
+  ;;;                      is answered 413 before any of the body is read.
+  ;;;                      -1 keeps stdlib httpd's (8 MiB, httpd-set-max-body!).
+  ;;;   read-timeout-ms -- how long a request head may take to arrive (408
+  ;;;                      after it), and each body read may wait.  0 keeps
+  ;;;                      stdlib httpd's (5 s, httpd-set-read-timeout!).
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H2
+  (defstruct ServerOpts [pool-size : int max-body : int read-timeout-ms : int])
+  ;;; default-server-opts -- the settings server-start uses.
+  ;;;
+  ;;; 8 workers, stdlib httpd's body cap and read timeout.
+  ;;;
+  ;;; Returns:
+  ;;;   ServerOpts
+  ;;;
+  ;;; Example:
+  ;;;   (server-start-opts 8080 my-handler
+  ;;;     (make-struct ServerOpts 16 1048576 2000))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H2
+  (defn default-server-opts [] : ServerOpts (make-struct ServerOpts 8 -1 0))
+  ;; =============================================================================
+  ;; Request dispatch: the stdlib handler body
+  ;; =============================================================================
+  ;; Invoke a handler function pointer: handler(req) -> resp.
+  (defn srv-call-handler [handler : (c-fn [int] int) req : int] : int
+    ```c
+    typedef int64_t (*handler_fn)(int64_t);
   return ((handler_fn)(intptr_t)handler)((int64_t)req);
   ```)
-
-;; Invoke a two-arg handler function pointer: handler(conn, req) -> resp.
-(defn srv-call-handler-conn [handler : (c-fn [int int] int) conn : int req : int] : int
-  ```c
-  typedef int64_t (*handler_fn)(int64_t, int64_t);
+  ;; Invoke a two-arg handler function pointer: handler(conn, req) -> resp.
+  (defn srv-call-handler-conn [handler : (c-fn [int int] int)
+                               conn : int
+                               req : int] : int
+    ```c
+    typedef int64_t (*handler_fn)(int64_t, int64_t);
   return ((handler_fn)(intptr_t)handler)((int64_t)conn, (int64_t)req);
   ```)
-
-;; Write a Response value onto the stdlib conn: status, every header in order
-;; (stdlib owns Content-Length and Connection; a `Connection: close` header is
-;; honoured by closing after this response), and the body, binary-safe.  A
-;; null Response is a handler bug and is answered 500.
-(defn srv-send-response [hc : ptr<void> resp : Response] : void
-  ```c
-  struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
+  ;; Write a Response value onto the stdlib conn: status, every header in order
+  ;; (stdlib owns Content-Length and Connection; a `Connection: close` header is
+  ;; honoured by closing after this response), and the body, binary-safe.  A
+  ;; null Response is a handler bug and is answered 500.
+  (defn srv-send-response [hc : ptr<void> resp : Response] : void
+    ```c
+    struct __httpd_resp *r = (struct __httpd_resp *)(intptr_t)resp;
   if (!r) {
     __TUR_CNAME_httpd-resp-status!__(hc, 500);
     __TUR_CNAME_httpd-resp-body!__(hc, "handler returned no response");
@@ -157,34 +160,31 @@ struct __httpd_resp {
   }
   __TUR_CNAME_httpd-resp-body-bytes!__(hc, r->body, (int64_t)r->body_len);
   ```)
-
-(defn srv-null? [p : ptr<void>] : bool
-  ```c return p == NULL; ```)
-
-;;; take-conn-response -- move what a stdlib helper wrote on the conn into a
-;;; Response.
-;;;
-;;; For a typed handler that lets a stdlib function answer -- stdlib's
-;;; httpd-static-serve!, say -- and must hand the server a Response: the
-;;; conn's status (200 when unset), headers and body (binary-safe) move into a
-;;; new Response, and the conn's pending response is cleared, so the server
-;;; writes them once, from the Response.
-;;;
-;;; Parameters:
-;;;   hc -- the stdlib httpd conn of the current request (request-conn)
-;;;
-;;; Returns:
-;;;   Response -- owned by the caller, like any handler's Response.
-;;;
-;;; Example:
-;;;   (if (httpd-static-serve! hc "./public" path)
-;;;     (take-conn-response hc)
-;;;     (not-found))
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn take-conn-response [hc : ptr<void>] : Response
-  ```c
-  HttpdConn *c = (HttpdConn *)hc;
+  (defn srv-null? [p : ptr<void>] : bool ```c return p == NULL; ```)
+  ;;; take-conn-response -- move what a stdlib helper wrote on the conn into a
+  ;;; Response.
+  ;;;
+  ;;; For a typed handler that lets a stdlib function answer -- stdlib's
+  ;;; httpd-static-serve!, say -- and must hand the server a Response: the
+  ;;; conn's status (200 when unset), headers and body (binary-safe) move into a
+  ;;; new Response, and the conn's pending response is cleared, so the server
+  ;;; writes them once, from the Response.
+  ;;;
+  ;;; Parameters:
+  ;;;   hc -- the stdlib httpd conn of the current request (request-conn)
+  ;;;
+  ;;; Returns:
+  ;;;   Response -- owned by the caller, like any handler's Response.
+  ;;;
+  ;;; Example:
+  ;;;   (if (httpd-static-serve! hc "./public" path)
+  ;;;     (take-conn-response hc)
+  ;;;     (not-found))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn take-conn-response [hc : ptr<void>] : Response
+    ```c
+    HttpdConn *c = (HttpdConn *)hc;
   struct __httpd_resp *r = (struct __httpd_resp *)calloc(1, sizeof *r);
   if (!r) return 0;
   int n = 0;
@@ -220,99 +220,83 @@ struct __httpd_resp {
   }
   return (int64_t)(intptr_t)r;
   ```)
-
-;;; serve-httpd-request -- internal: serve one stdlib httpd request with a
-;;; one-arg (Request -> Response) handler.  The body of the stdlib handler
-;;; closure every server-start* builds.
-;;;
-;;; Since: tourist-on-stdlib-httpd H2
-(defn serve-httpd-request [hc : ptr<void> handler : (c-fn [int] int)] : nil
-  (let [req (request-view-new hc)]
-    (if (= (:: req :int) 0)
-      (httpd-resp-status! hc 500)
-      (srv-serve-view hc req handler))))
-
-;; The view is released by a defer, so a handler that panics (under a
-;; server-start-wrapped mw-recover) does not leak it.
-(defn srv-serve-view [hc : ptr<void> req : Request handler : (c-fn [int] int)] : nil
-  (defer (request-view-free req))
-  (let [resp (:: (srv-call-handler handler (:: req :int)) :Response)]
-    (srv-send-response hc resp)
-    (free-response resp)))
-
-;;; serve-httpd-request-conn -- internal: serve one stdlib httpd request with a
-;;; two-arg (Conn, Request -> Response) handler.  When the handler took the
-;;; connection (conn-mark-upgraded!) its Response is discarded unsent.
-;;;
-;;; Since: tourist-on-stdlib-httpd H2
-(defn serve-httpd-request-conn [hc : ptr<void> handler : (c-fn [int int] int)] : nil
-  (let [req  (request-view-new hc)
-        conn (conn-of-httpd hc)]
-    (if (or (= (:: req :int) 0) (= (:: conn :int) 0))
-      (do
-        (request-view-free req)
-        (conn-free conn)
-        (httpd-resp-status! hc 500))
-      (srv-serve-view-conn hc conn req handler))))
-
-;; As srv-serve-view, for the two-arg handler.
-(defn srv-serve-view-conn [hc : ptr<void> conn : Conn req : Request
-                           handler : (c-fn [int int] int)] : nil
-  (defer (do (conn-free conn) (request-view-free req)))
-  (let [resp (:: (srv-call-handler-conn handler (:: conn :int) (:: req :int)) :Response)]
-    (when (not (conn-upgraded? conn))
-      (srv-send-response hc resp))
-    (free-response resp)))
-
-;; =============================================================================
-;; Server state + the thread that runs httpd-run
-;; =============================================================================
-
-(defn srv-null-ptr [] : ptr<void>
-  ```c return NULL; ```)
-
-;; Thread entry: run the stdlib server until httpd-stop.
-(defn srv-run-loop [h : ptr<void>] : ptr<void>
-  (httpd-run h)
-  (srv-null-ptr))
-
-(defn srv-state-h [s : ptr<void>] : ptr<void>
-  ```c return ((struct __httpd_server *)s)->h; ```)
-
-(defn srv-state-join [s : ptr<void>] : void
-  ```c
-  struct __httpd_server *sv = (struct __httpd_server *)s;
+  ;;; serve-httpd-request -- internal: serve one stdlib httpd request with a
+  ;;; one-arg (Request -> Response) handler.  The body of the stdlib handler
+  ;;; closure every server-start* builds.
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H2
+  (defn serve-httpd-request [hc : ptr<void> handler : (c-fn [int] int)] : nil
+    (let [req (request-view-new hc)]
+      (if (= (:: req :int) 0)
+        (httpd-resp-status! hc 500)
+        (srv-serve-view hc req handler))))
+  ;; The view is released by a defer, so a handler that panics (under a
+  ;; server-start-wrapped mw-recover) does not leak it.
+  (defn srv-serve-view [hc : ptr<void> req : Request handler : (c-fn [int] int)] : nil
+    (defer (request-view-free req))
+    (let [resp (:: (srv-call-handler handler (:: req :int)) :Response)]
+      (srv-send-response hc resp)
+      (free-response resp)))
+  ;;; serve-httpd-request-conn -- internal: serve one stdlib httpd request with a
+  ;;; two-arg (Conn, Request -> Response) handler.  When the handler took the
+  ;;; connection (conn-mark-upgraded!) its Response is discarded unsent.
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H2
+  (defn serve-httpd-request-conn [hc : ptr<void> handler : (c-fn [int int] int)] : nil
+    (let [req  (request-view-new hc)
+          conn (conn-of-httpd hc)]
+      (if (or (= (:: req :int) 0) (= (:: conn :int) 0))
+        (do
+          (request-view-free req)
+          (conn-free conn)
+          (httpd-resp-status! hc 500))
+        (srv-serve-view-conn hc conn req handler))))
+  ;; As srv-serve-view, for the two-arg handler.
+  (defn srv-serve-view-conn [hc : ptr<void>
+                             conn : Conn
+                             req : Request
+                             handler : (c-fn [int int] int)] : nil
+    (defer (do (conn-free conn) (request-view-free req)))
+    (let [resp (:: (srv-call-handler-conn handler (:: conn :int) (:: req :int))
+                 :Response)]
+      (when (not (conn-upgraded? conn)) (srv-send-response hc resp))
+      (free-response resp)))
+  ;; =============================================================================
+  ;; Server state + the thread that runs httpd-run
+  ;; =============================================================================
+  (defn srv-null-ptr [] : ptr<void> ```c return NULL; ```)
+  ;; Thread entry: run the stdlib server until httpd-stop.
+  (defn srv-run-loop [h : ptr<void>] : ptr<void> (httpd-run h) (srv-null-ptr))
+  (defn srv-state-h [s : ptr<void>] : ptr<void>
+    ```c return ((struct __httpd_server *)s)->h; ```)
+  (defn srv-state-join [s : ptr<void>] : void
+    ```c
+    struct __httpd_server *sv = (struct __httpd_server *)s;
   if (!sv->thread) return;
   pthread_join(*(pthread_t *)sv->thread, NULL);
   free(sv->thread);
   sv->thread = NULL;
   ```)
-
-(defn srv-state-free [s : ptr<void>] : void
-  ```c free(s); ```)
-
-;;; server-launch -- internal: run a stdlib httpd server on a background
-;;; thread and wrap it in this spice's server handle.
-;;;
-;;; Takes ownership of `h` (frees it if the thread cannot be started).
-;;;
-;;; Parameters:
-;;;   h -- a stdlib httpd pool server handle, or NULL
-;;;
-;;; Returns:
-;;;   :ptr<void> -- the server handle for server-stop, or NULL.
-;;;
-;;; Since: tourist-on-stdlib-httpd H2
-(defn server-launch [h : ptr<void>] : ptr<void>
-  (if (srv-null? h)
-    (srv-null-ptr)
-    (let [s (srv-spawn h)]
-      (when (srv-null? s) (httpd-free h))
-      s)))
-
-(defn srv-spawn [h : ptr<void>] : ptr<void>
-  ```c
-  extern void *httpd__server__srv_hyrun_hyloop(void *);
+  (defn srv-state-free [s : ptr<void>] : void ```c free(s); ```)
+  ;;; server-launch -- internal: run a stdlib httpd server on a background
+  ;;; thread and wrap it in this spice's server handle.
+  ;;;
+  ;;; Takes ownership of `h` (frees it if the thread cannot be started).
+  ;;;
+  ;;; Parameters:
+  ;;;   h -- a stdlib httpd pool server handle, or NULL
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- the server handle for server-stop, or NULL.
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H2
+  (defn server-launch [h : ptr<void>] : ptr<void>
+    (if (srv-null? h)
+      (srv-null-ptr)
+      (let [s (srv-spawn h)] (when (srv-null? s) (httpd-free h)) s)))
+  (defn srv-spawn [h : ptr<void>] : ptr<void>
+    ```c
+    extern void *httpd__server__srv_hyrun_hyloop(void *);
   struct __httpd_server *s = (struct __httpd_server *)calloc(1, sizeof *s);
   if (!s) return NULL;
   pthread_t *tid = (pthread_t *)malloc(sizeof *tid);
@@ -324,330 +308,320 @@ struct __httpd_resp {
   s->thread = (void *)tid;
   return (void *)s;
   ```)
-
-;;; server-tls-ctx -- internal: the TLS context recorded on a server handle.
-(defn server-tls-ctx [s : ptr<void>] : int
-  ```c return s ? ((struct __httpd_server *)s)->tls_ctx : 0; ```)
-
-;;; server-set-tls-ctx! -- internal: record the TLS context httpd/tls frees.
-(defn server-set-tls-ctx! [s : ptr<void> ctx : int] : void
-  ```c if (s) ((struct __httpd_server *)s)->tls_ctx = (int64_t)ctx; ```)
-
-(defn srv-clamp-pool [size : int] : int
-  (if (< size 1) 1 size))
-
-;; Apply ServerOpts' per-server limits to a stdlib handle (NULL-safe).
-(defn srv-apply-opts [h : ptr<void> opts : ServerOpts] : ptr<void>
-  (httpd-server-set-max-body! h (.max-body opts))
-  (httpd-server-set-read-timeout! h (.read-timeout-ms opts))
-  h)
-
-;; =============================================================================
-;; Public API
-;; =============================================================================
-
-;; Default pool size used by `server-start`: the spice server's historical 8
-;; (stdlib httpd-new uses 4).
-(defn srv-default-pool-size [] : int 8)
-
-;;; server-start -- bind a TCP listener on `port` and dispatch requests to
-;;; `handler` on a pool of 8 worker threads.
-;;;
-;;; This is the recommended entry point.  Use server-start-pool to choose the
-;;; pool size, or server-start-opts for the body cap and read timeout too.
-;;;
-;;; Parameters:
-;;;   port    -- TCP port to bind on (0 = kernel-assigned; see server-port).
-;;;              127.0.0.1 unless the program called httpd-set-bind-any! or
-;;;              httpd-set-bind-addr!.
-;;;   handler -- captureless `(c-fn [int] int)` request handler.  Define
-;;;              it as a top-level defn of type `[req : int] : int`
-;;;              returning a Response handle, and pass the defn name.
-;;;              The handler is invoked from a worker thread; it must be
-;;;              Send-safe.  The server takes ownership of the Response
-;;;              it returns (it is freed after the response is written).
-;;;
-;;; Returns:
-;;;   :ptr<void> -- opaque server handle.  Pass to server-stop to shut down,
-;;;                 or NULL if the listening socket could not be created.
-;;;
-;;; Example:
-;;;   (defn my-handler [req :int] :int
-;;;     (resp-ok "text/plain" "Hello"))
-;;;
-;;;   (let [srv (server-start 8080 my-handler)]
-;;;     ;; ... handle SIGINT, etc. ...
-;;;     (server-stop srv))
-;;;
-;;; Since: H6 (pool default added in H7)
-(defn server-start [port : int handler : (c-fn [int] int)] : ptr<void>
-  (server-start-pool port handler (srv-default-pool-size)))
-
-;;; server-start-pool -- like server-start but with an explicit pool size.
-;;;
-;;; Parameters:
-;;;   port    -- TCP port to bind on
-;;;   handler -- (c-fn [int] int) request handler (see server-start)
-;;;   size    -- number of worker threads in the pool (clamped to >= 1)
-;;;
-;;; Returns:
-;;;   :ptr<void> -- opaque server handle, or NULL on failure.
-;;;
-;;; Example:
-;;;   (def srv (server-start-pool 8080 my-handler 32))
-;;;
-;;; Since: H7
-(defn server-start-pool [port : int handler : (c-fn [int] int) size : int] : ptr<void>
-  (server-launch
-    (httpd-new-pool port (srv-clamp-pool size)
-      (fn [c : ptr<void>] : nil (serve-httpd-request c handler)))))
-
-;;; server-start-opts -- like server-start, configured by a ServerOpts.
-;;;
-;;; Parameters:
-;;;   port    -- TCP port to bind on
-;;;   handler -- (c-fn [int] int) request handler (see server-start)
-;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
-;;;
-;;; Returns:
-;;;   :ptr<void> -- opaque server handle, or NULL on failure.
-;;;
-;;; Example:
-;;;   (server-start-opts 8080 my-handler (make-struct ServerOpts 8 65536 1000))
-;;;
-;;; Since: tourist-on-stdlib-httpd H2
-(defn server-start-opts [port : int handler : (c-fn [int] int) opts : ServerOpts] : ptr<void>
-  (server-launch
-    (srv-apply-opts
-      (httpd-new-pool port (srv-clamp-pool (.pool-size opts))
-        (fn [c : ptr<void>] : nil (serve-httpd-request c handler)))
-      opts)))
-
-;;; server-start-conn -- like server-start, but the handler receives a Conn
-;;; alongside the Request: `(c-fn [int int] int)` = (Conn, Request) ->
-;;; Response. This is the entry point upgrade-aware handlers (e.g. ws-server's
-;;; `ws-upgrade`) require: the handler can read the raw fd via `conn-fd`, write
-;;; its own switch-protocols response, and call `conn-mark-upgraded!` to take
-;;; ownership of the socket. When a handler does not upgrade, its Response is
-;;; written exactly as in the single-arg path.
-;;;
-;;; Parameters:
-;;;   port    -- TCP port to bind on
-;;;   handler -- captureless `(c-fn [int int] int)`. Define it as a top-level
-;;;              `(defn h [conn : Conn req : Request] : Response ...)` and pass
-;;;              the name.
-;;;
-;;; Returns:
-;;;   :ptr<void> -- opaque server handle, or NULL on failure.
-;;;
-;;; Since: WS0
-(defn server-start-conn [port : int handler : (c-fn [int int] int)] : ptr<void>
-  (server-start-pool-conn port handler (srv-default-pool-size)))
-
-;;; server-start-pool-conn -- like server-start-conn but with an explicit pool
-;;; size (the two-arg-handler counterpart of server-start-pool).
-;;;
-;;; Parameters:
-;;;   port    -- TCP port to bind on
-;;;   handler -- (c-fn [int int] int) (Conn, Request) -> Response handler
-;;;   size    -- number of worker threads (clamped to >= 1)
-;;;
-;;; Returns:
-;;;   :ptr<void> -- opaque server handle, or NULL on failure.
-;;;
-;;; Since: WS0
-(defn server-start-pool-conn [port : int handler : (c-fn [int int] int) size : int] : ptr<void>
-  (server-launch
-    (httpd-new-pool port (srv-clamp-pool size)
-      (fn [c : ptr<void>] : nil (serve-httpd-request-conn c handler)))))
-
-;;; server-start-conn-opts -- like server-start-conn, configured by a ServerOpts.
-;;;
-;;; Parameters:
-;;;   port    -- TCP port to bind on
-;;;   handler -- (c-fn [int int] int) (Conn, Request) -> Response handler
-;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
-;;;
-;;; Returns:
-;;;   :ptr<void> -- opaque server handle, or NULL on failure.
-;;;
-;;; Since: tourist-on-stdlib-httpd H2
-(defn server-start-conn-opts [port : int handler : (c-fn [int int] int) opts : ServerOpts] : ptr<void>
-  (server-launch
-    (srv-apply-opts
-      (httpd-new-pool port (srv-clamp-pool (.pool-size opts))
-        (fn [c : ptr<void>] : nil (serve-httpd-request-conn c handler)))
-      opts)))
-
-;; =============================================================================
-;; Stdlib middleware around the handler (tourist-on-stdlib-httpd H4)
-;; =============================================================================
-
-;;; ServerWrap -- a function that puts stdlib middleware around a server's
-;;; handler.
-;;;
-;;; Built by server-wrap; consumed by server-start-wrapped /
-;;; server-start-conn-wrapped, which call it once and release it.
-;;;
-;;; Since: tourist-on-stdlib-httpd H4
-(defopaque ServerWrap :int)
-
-;;; server-wrap -- package a wrap function for server-start-wrapped.
-;;;
-;;; `f` receives the stdlib httpd handler this spice builds (it makes the
-;;; Request view, calls the typed handler, and writes the Response onto the
-;;; conn) and returns the handler the server runs -- typically that one with
-;;; a stack of stdlib middleware around it, so mw-recover, mw-cors-opts,
-;;; mw-log, mw-rate-limit, mw-secure-headers, ... apply to every request.
-;;; Both handlers are stdlib httpd's own representation, the `ptr<void>`
-;;; every stdlib mw-* takes and returns.
-;;;
-;;; Middleware that answers by itself (a CORS preflight, a 429) never reaches
-;;; the typed handler; middleware that runs after `next` sees the Response
-;;; already written onto the conn and may adjust it.
-;;;
-;;; Parameters:
-;;;   f -- (fn [ptr<void>] ptr<void>), called once when the server starts
-;;;
-;;; Returns:
-;;;   ServerWrap -- pass to exactly one server-start-wrapped call
-;;;
-;;; Example:
-;;;   (server-wrap (fn [inner : ptr<void>] : ptr<void>
-;;;                  (compose-middleware inner mw-recover mw-log)))
-;;;
-;;; Since: tourist-on-stdlib-httpd H4
-(defn server-wrap [^fat f : (fn [ptr<void>] ptr<void>)] : ServerWrap
-  (:: (:: f :int) :ServerWrap))
-
-;; Call a ServerWrap on the base handler and release it.  The wrap arrived
-;; through a ^fat parameter: a { thunk, env } closure whose slot 0 takes
-;; (env, arg).
-(defn srv-wrap-apply [wrap : ServerWrap base : ptr<void>] : ptr<void>
-  ```c
-  if (!wrap) return base;
+  ;;; server-tls-ctx -- internal: the TLS context recorded on a server handle.
+  (defn server-tls-ctx [s : ptr<void>] : int
+    ```c return s ? ((struct __httpd_server *)s)->tls_ctx : 0; ```)
+  ;;; server-set-tls-ctx! -- internal: record the TLS context httpd/tls frees.
+  (defn server-set-tls-ctx! [s : ptr<void> ctx : int] : void
+    ```c if (s) ((struct __httpd_server *)s)->tls_ctx = (int64_t)ctx; ```)
+  (defn srv-clamp-pool [size : int] : int (if (< size 1) 1 size))
+  ;; Apply ServerOpts' per-server limits to a stdlib handle (NULL-safe).
+  (defn srv-apply-opts [h : ptr<void> opts : ServerOpts] : ptr<void>
+    (httpd-server-set-max-body! h (.max-body opts))
+    (httpd-server-set-read-timeout! h (.read-timeout-ms opts))
+    h)
+  ;; =============================================================================
+  ;; Public API
+  ;; =============================================================================
+  ;; Default pool size used by `server-start`: the spice server's historical 8
+  ;; (stdlib httpd-new uses 4).
+  (defn srv-default-pool-size [] : int 8)
+  ;;; server-start -- bind a TCP listener on `port` and dispatch requests to
+  ;;; `handler` on a pool of 8 worker threads.
+  ;;;
+  ;;; This is the recommended entry point.  Use server-start-pool to choose the
+  ;;; pool size, or server-start-opts for the body cap and read timeout too.
+  ;;;
+  ;;; Parameters:
+  ;;;   port    -- TCP port to bind on (0 = kernel-assigned; see server-port).
+  ;;;              127.0.0.1 unless the program called httpd-set-bind-any! or
+  ;;;              httpd-set-bind-addr!.
+  ;;;   handler -- captureless `(c-fn [int] int)` request handler.  Define
+  ;;;              it as a top-level defn of type `[req : int] : int`
+  ;;;              returning a Response handle, and pass the defn name.
+  ;;;              The handler is invoked from a worker thread; it must be
+  ;;;              Send-safe.  The server takes ownership of the Response
+  ;;;              it returns (it is freed after the response is written).
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- opaque server handle.  Pass to server-stop to shut down,
+  ;;;                 or NULL if the listening socket could not be created.
+  ;;;
+  ;;; Example:
+  ;;;   (defn my-handler [req :int] :int
+  ;;;     (resp-ok "text/plain" "Hello"))
+  ;;;
+  ;;;   (let [srv (server-start 8080 my-handler)]
+  ;;;     ;; ... handle SIGINT, etc. ...
+  ;;;     (server-stop srv))
+  ;;;
+  ;;; Since: H6 (pool default added in H7)
+  (defn server-start [port : int handler : (c-fn [int] int)] : ptr<void>
+    (server-start-pool port handler (srv-default-pool-size)))
+  ;;; server-start-pool -- like server-start but with an explicit pool size.
+  ;;;
+  ;;; Parameters:
+  ;;;   port    -- TCP port to bind on
+  ;;;   handler -- (c-fn [int] int) request handler (see server-start)
+  ;;;   size    -- number of worker threads in the pool (clamped to >= 1)
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+  ;;;
+  ;;; Example:
+  ;;;   (def srv (server-start-pool 8080 my-handler 32))
+  ;;;
+  ;;; Since: H7
+  (defn server-start-pool [port : int handler : (c-fn [int] int) size : int] : ptr<void>
+    (server-launch (httpd-new-pool port
+                     (srv-clamp-pool size)
+                     (fn [c : ptr<void>] : nil (serve-httpd-request c handler)))))
+  ;;; server-start-opts -- like server-start, configured by a ServerOpts.
+  ;;;
+  ;;; Parameters:
+  ;;;   port    -- TCP port to bind on
+  ;;;   handler -- (c-fn [int] int) request handler (see server-start)
+  ;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+  ;;;
+  ;;; Example:
+  ;;;   (server-start-opts 8080 my-handler (make-struct ServerOpts 8 65536 1000))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H2
+  (defn server-start-opts [port : int
+                           handler : (c-fn [int] int)
+                           opts : ServerOpts] : ptr<void>
+    (server-launch (srv-apply-opts (httpd-new-pool port
+                                     (srv-clamp-pool (.pool-size opts))
+                                     (fn [c : ptr<void>] : nil
+                                       (serve-httpd-request c handler)))
+                     opts)))
+  ;;; server-start-conn -- like server-start, but the handler receives a Conn
+  ;;; alongside the Request: `(c-fn [int int] int)` = (Conn, Request) ->
+  ;;; Response. This is the entry point upgrade-aware handlers (e.g. ws-server's
+  ;;; `ws-upgrade`) require: the handler can read the raw fd via `conn-fd`, write
+  ;;; its own switch-protocols response, and call `conn-mark-upgraded!` to take
+  ;;; ownership of the socket. When a handler does not upgrade, its Response is
+  ;;; written exactly as in the single-arg path.
+  ;;;
+  ;;; Parameters:
+  ;;;   port    -- TCP port to bind on
+  ;;;   handler -- captureless `(c-fn [int int] int)`. Define it as a top-level
+  ;;;              `(defn h [conn : Conn req : Request] : Response ...)` and pass
+  ;;;              the name.
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+  ;;;
+  ;;; Since: WS0
+  (defn server-start-conn [port : int handler : (c-fn [int int] int)] : ptr<void>
+    (server-start-pool-conn port handler (srv-default-pool-size)))
+  ;;; server-start-pool-conn -- like server-start-conn but with an explicit pool
+  ;;; size (the two-arg-handler counterpart of server-start-pool).
+  ;;;
+  ;;; Parameters:
+  ;;;   port    -- TCP port to bind on
+  ;;;   handler -- (c-fn [int int] int) (Conn, Request) -> Response handler
+  ;;;   size    -- number of worker threads (clamped to >= 1)
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+  ;;;
+  ;;; Since: WS0
+  (defn server-start-pool-conn [port : int
+                                handler : (c-fn [int int] int)
+                                size : int] : ptr<void>
+    (server-launch (httpd-new-pool port
+                     (srv-clamp-pool size)
+                     (fn [c : ptr<void>] : nil
+                       (serve-httpd-request-conn c handler)))))
+  ;;; server-start-conn-opts -- like server-start-conn, configured by a ServerOpts.
+  ;;;
+  ;;; Parameters:
+  ;;;   port    -- TCP port to bind on
+  ;;;   handler -- (c-fn [int int] int) (Conn, Request) -> Response handler
+  ;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H2
+  (defn server-start-conn-opts [port : int
+                                handler : (c-fn [int int] int)
+                                opts : ServerOpts] : ptr<void>
+    (server-launch (srv-apply-opts (httpd-new-pool port
+                                     (srv-clamp-pool (.pool-size opts))
+                                     (fn [c : ptr<void>] : nil
+                                       (serve-httpd-request-conn c handler)))
+                     opts)))
+  ;; =============================================================================
+  ;; Stdlib middleware around the handler (tourist-on-stdlib-httpd H4)
+  ;; =============================================================================
+  ;;; ServerWrap -- a function that puts stdlib middleware around a server's
+  ;;; handler.
+  ;;;
+  ;;; Built by server-wrap; consumed by server-start-wrapped /
+  ;;; server-start-conn-wrapped, which call it once and release it.
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H4
+  (defopaque ServerWrap :int)
+  ;;; server-wrap -- package a wrap function for server-start-wrapped.
+  ;;;
+  ;;; `f` receives the stdlib httpd handler this spice builds (it makes the
+  ;;; Request view, calls the typed handler, and writes the Response onto the
+  ;;; conn) and returns the handler the server runs -- typically that one with
+  ;;; a stack of stdlib middleware around it, so mw-recover, mw-cors-opts,
+  ;;; mw-log, mw-rate-limit, mw-secure-headers, ... apply to every request.
+  ;;; Both handlers are stdlib httpd's own representation, the `ptr<void>`
+  ;;; every stdlib mw-* takes and returns.
+  ;;;
+  ;;; Middleware that answers by itself (a CORS preflight, a 429) never reaches
+  ;;; the typed handler; middleware that runs after `next` sees the Response
+  ;;; already written onto the conn and may adjust it.
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- (fn [ptr<void>] ptr<void>), called once when the server starts
+  ;;;
+  ;;; Returns:
+  ;;;   ServerWrap -- pass to exactly one server-start-wrapped call
+  ;;;
+  ;;; Example:
+  ;;;   (server-wrap (fn [inner : ptr<void>] : ptr<void>
+  ;;;                  (compose-middleware inner mw-recover mw-log)))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H4
+  (defn server-wrap [^fat f : (fn [ptr<void>] ptr<void>)] : ServerWrap
+    (:: (:: f :int) :ServerWrap))
+  ;; Call a ServerWrap on the base handler and release it.  The wrap arrived
+  ;; through a ^fat parameter: a { thunk, env } closure whose slot 0 takes
+  ;; (env, arg).
+  (defn srv-wrap-apply [wrap : ServerWrap base : ptr<void>] : ptr<void>
+    ```c
+    if (!wrap) return base;
   typedef void *(*fn1_t)(void *, int64_t);
   void *h = ((fn1_t)(intptr_t)((int64_t *)(intptr_t)wrap)[0])((void *)(intptr_t)wrap,
                                                             (int64_t)(intptr_t)base);
   TUR_CLOSURE_DROP(wrap);
   return h;
   ```)
-
-;;; server-start-wrapped -- server-start-opts with stdlib middleware around
-;;; the handler.
-;;;
-;;; Parameters:
-;;;   port    -- TCP port to bind on
-;;;   handler -- (c-fn [int] int) request handler (see server-start)
-;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
-;;;   wrap    -- ServerWrap from server-wrap; called once and released, so
-;;;              build one per server
-;;;
-;;; Returns:
-;;;   :ptr<void> -- opaque server handle, or NULL on failure.
-;;;
-;;; Example:
-;;;   (server-start-wrapped 8080 my-handler (default-server-opts)
-;;;     (server-wrap (fn [inner : ptr<void>] : ptr<void>
-;;;                    (compose-middleware inner mw-recover mw-log))))
-;;;
-;;; Since: tourist-on-stdlib-httpd H4
-(defn server-start-wrapped [port : int handler : (c-fn [int] int) opts : ServerOpts
-                            wrap : ServerWrap] : ptr<void>
-  (server-launch
-    (srv-apply-opts
-      (httpd-new-pool port (srv-clamp-pool (.pool-size opts))
-        (srv-wrap-apply wrap
-          (:: (fn [c : ptr<void>] : nil (serve-httpd-request c handler)) :ptr<void>)))
-      opts)))
-
-;;; server-start-conn-wrapped -- server-start-conn-opts with stdlib middleware
-;;; around the handler (see server-start-wrapped).
-;;;
-;;; A handler that upgrades the connection leaves the middleware nothing to
-;;; write: post-processing that sets headers on an upgraded request is
-;;; ignored.
-;;;
-;;; Parameters:
-;;;   port    -- TCP port to bind on
-;;;   handler -- (c-fn [int int] int) (Conn, Request) -> Response handler
-;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
-;;;   wrap    -- ServerWrap from server-wrap; called once and released
-;;;
-;;; Returns:
-;;;   :ptr<void> -- opaque server handle, or NULL on failure.
-;;;
-;;; Since: tourist-on-stdlib-httpd H4
-(defn server-start-conn-wrapped [port : int handler : (c-fn [int int] int) opts : ServerOpts
-                                 wrap : ServerWrap] : ptr<void>
-  (server-launch
-    (srv-apply-opts
-      (httpd-new-pool port (srv-clamp-pool (.pool-size opts))
-        (srv-wrap-apply wrap
-          (:: (fn [c : ptr<void>] : nil (serve-httpd-request-conn c handler)) :ptr<void>)))
-      opts)))
-
-;;; server-start-spawn -- compatibility entry point: a pool of 64 workers.
-;;;
-;;; This used to spawn a detached thread per connection.  stdlib httpd has a
-;;; bounded pool only, so it now runs one with 64 workers (and stdlib's cap
-;;; of 512 queued connections); prefer server-start-pool.
-;;;
-;;; Parameters:
-;;;   port    -- TCP port to bind on
-;;;   handler -- (c-fn [int] int) request handler (see server-start)
-;;;
-;;; Returns:
-;;;   :ptr<void> -- opaque server handle, or NULL on failure.
-;;;
-;;; Example:
-;;;   (def srv (server-start-spawn 8080 my-handler))
-;;;
-;;; Since: H7
-(defn server-start-spawn [port : int handler : (c-fn [int] int)] : ptr<void>
-  (server-start-pool port handler 64))
-
-;;; server-port -- the TCP port a server is listening on.
-;;;
-;;; Useful after starting on port 0 (kernel-assigned).
-;;;
-;;; Parameters:
-;;;   s -- server handle from a server-start* function
-;;;
-;;; Returns:
-;;;   :int -- the port, or -1 for a NULL handle.
-;;;
-;;; Example:
-;;;   (let [srv (server-start 0 my-handler)]
-;;;     (println (server-port srv)))
-;;;
-;;; Since: tourist-on-stdlib-httpd H2
-(defn server-port [s : ptr<void>] : int
-  (if (srv-null? s) -1 (httpd-port (srv-state-h s))))
-
-;;; server-stop -- stop the server and release it.
-;;;
-;;; Stops accepting, lets the workers finish the connections already queued,
-;;; joins every thread, and frees the server.  Once it returns no httpd-owned
-;;; thread is running.  A connection a handler upgraded belongs to that
-;;; handler and is not closed here.
-;;;
-;;; Parameters:
-;;;   s -- :ptr<void> server handle returned by server-start (or NULL: no-op).
-;;;
-;;; Returns:
-;;;   :void
-;;;
-;;; Example:
-;;;   (server-stop srv)
-;;;
-;;; Since: H6 (pool join added in H7)
-(defn server-stop [s : ptr<void>] : void
-  (when (not (srv-null? s))
-    (let [h (srv-state-h s)]
-      (httpd-stop h)
-      (srv-state-join s)
-      (httpd-free h)
-      (srv-state-free s))))
-
-) ;; end defmodule httpd/server
+  ;;; server-start-wrapped -- server-start-opts with stdlib middleware around
+  ;;; the handler.
+  ;;;
+  ;;; Parameters:
+  ;;;   port    -- TCP port to bind on
+  ;;;   handler -- (c-fn [int] int) request handler (see server-start)
+  ;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
+  ;;;   wrap    -- ServerWrap from server-wrap; called once and released, so
+  ;;;              build one per server
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+  ;;;
+  ;;; Example:
+  ;;;   (server-start-wrapped 8080 my-handler (default-server-opts)
+  ;;;     (server-wrap (fn [inner : ptr<void>] : ptr<void>
+  ;;;                    (compose-middleware inner mw-recover mw-log))))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H4
+  (defn server-start-wrapped [port : int
+                              handler : (c-fn [int] int)
+                              opts : ServerOpts
+                              wrap : ServerWrap] : ptr<void>
+    (server-launch (srv-apply-opts (httpd-new-pool port
+                                     (srv-clamp-pool (.pool-size opts))
+                                     (srv-wrap-apply wrap
+                                       (:: (fn [c : ptr<void>] : nil
+                                             (serve-httpd-request c handler))
+                                         :ptr<void>)))
+                     opts)))
+  ;;; server-start-conn-wrapped -- server-start-conn-opts with stdlib middleware
+  ;;; around the handler (see server-start-wrapped).
+  ;;;
+  ;;; A handler that upgrades the connection leaves the middleware nothing to
+  ;;; write: post-processing that sets headers on an upgraded request is
+  ;;; ignored.
+  ;;;
+  ;;; Parameters:
+  ;;;   port    -- TCP port to bind on
+  ;;;   handler -- (c-fn [int int] int) (Conn, Request) -> Response handler
+  ;;;   opts    -- ServerOpts (pool size, body cap, read timeout)
+  ;;;   wrap    -- ServerWrap from server-wrap; called once and released
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H4
+  (defn server-start-conn-wrapped [port : int
+                                   handler : (c-fn [int int] int)
+                                   opts : ServerOpts
+                                   wrap : ServerWrap] : ptr<void>
+    (server-launch (srv-apply-opts (httpd-new-pool port
+                                     (srv-clamp-pool (.pool-size opts))
+                                     (srv-wrap-apply wrap
+                                       (:: (fn [c : ptr<void>] : nil
+                                             (serve-httpd-request-conn c
+                                               handler))
+                                         :ptr<void>)))
+                     opts)))
+  ;;; server-start-spawn -- compatibility entry point: a pool of 64 workers.
+  ;;;
+  ;;; This used to spawn a detached thread per connection.  stdlib httpd has a
+  ;;; bounded pool only, so it now runs one with 64 workers (and stdlib's cap
+  ;;; of 512 queued connections); prefer server-start-pool.
+  ;;;
+  ;;; Parameters:
+  ;;;   port    -- TCP port to bind on
+  ;;;   handler -- (c-fn [int] int) request handler (see server-start)
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- opaque server handle, or NULL on failure.
+  ;;;
+  ;;; Example:
+  ;;;   (def srv (server-start-spawn 8080 my-handler))
+  ;;;
+  ;;; Since: H7
+  (defn server-start-spawn [port : int handler : (c-fn [int] int)] : ptr<void>
+    (server-start-pool port handler 64))
+  ;;; server-port -- the TCP port a server is listening on.
+  ;;;
+  ;;; Useful after starting on port 0 (kernel-assigned).
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- server handle from a server-start* function
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- the port, or -1 for a NULL handle.
+  ;;;
+  ;;; Example:
+  ;;;   (let [srv (server-start 0 my-handler)]
+  ;;;     (println (server-port srv)))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H2
+  (defn server-port [s : ptr<void>] : int
+    (if (srv-null? s) -1 (httpd-port (srv-state-h s))))
+  ;;; server-stop -- stop the server and release it.
+  ;;;
+  ;;; Stops accepting, lets the workers finish the connections already queued,
+  ;;; joins every thread, and frees the server.  Once it returns no httpd-owned
+  ;;; thread is running.  A connection a handler upgraded belongs to that
+  ;;; handler and is not closed here.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- :ptr<void> server handle returned by server-start (or NULL: no-op).
+  ;;;
+  ;;; Returns:
+  ;;;   :void
+  ;;;
+  ;;; Example:
+  ;;;   (server-stop srv)
+  ;;;
+  ;;; Since: H6 (pool join added in H7)
+  (defn server-stop [s : ptr<void>] : void
+    (when (not (srv-null? s))
+      (let [h (srv-state-h s)]
+        (httpd-stop h)
+        (srv-state-join s)
+        (httpd-free h)
+        (srv-state-free s))))) ;; end defmodule httpd/server

@@ -42,61 +42,72 @@
 ;; printed form is canonical; round-tripping a canonical template is exact.
 ;;
 ;; Since: U5
-
 (defmodule template/tree
-  (export TplF Tpl
-          tpl-end tpl-lit tpl-emit tpl-if tpl-for tpl-let
-          tpl-cata tpl-size tpl-directives tpl-depth tpl->str)
-
+  (export TplF
+    Tpl
+    tpl-end
+    tpl-lit
+    tpl-emit
+    tpl-if
+    tpl-for
+    tpl-let
+    tpl-cata
+    tpl-size
+    tpl-directives
+    tpl-depth
+    tpl->str)
   ;; --- one layer of a template AST ----------------------------------------
   ;; `:copy` so an immutable AST value can be folded more than once (the nodes
   ;; are heap pointers into an immutable tree; copying the handle is sound),
   ;; matching regex/tree's `ReF` and scscm/tree's `SxF`.
-  (defdata ^copy TplF [a]
-    (EndF)                 ;; end of a node sequence (nil)
-    (LitF :cstr a)         ;; literal text, then the rest of the sequence
-    (EmitF :cstr a)        ;; <%= name %>, then rest
-    (IfF :cstr a a a)      ;; <% if name %> then-body <% else %> else-body, then rest
+  (defdata ^copy TplF
+    [a]
+    (EndF) ;; end of a node sequence (nil)
+    (LitF :cstr a) ;; literal text, then the rest of the sequence
+    (EmitF :cstr a) ;; <%= name %>, then rest
+    (IfF :cstr a a a) ;; <% if name %> then-body <% else %> else-body, then rest
     (ForF :cstr :cstr a a) ;; <% for [var coll] %> body <% end %>, then rest
-    (LetF :cstr :cstr a a))  ;; <% let [var value] %> body <% end %>, then rest
-
+    (LetF :cstr :cstr a a)) ;; <% let [var value] %> body <% end %>, then rest
   ;; --- by-value fixed point:  Tpl ~= TplF Tpl -----------------------------
   ;; The monomorphic inlining of `Fix TplF`. Needs #483 to carry the applied
   ;; `(TplF Tpl)` field by value.
   (defdata ^copy Tpl (Roll (TplF Tpl)))
-
   ;; --- Functor: map over every recursive (body / tail) position -----------
   (definstance Functor [TplF]
     (fmap [c g]
       (match c
-        (EndF)              (EndF)
-        (LitF t rest)       (LitF t (g rest))
-        (EmitF nm rest)     (EmitF nm (g rest))
-        (IfF nm th el rest) (IfF nm (g th) (g el) (g rest))
-        (ForF v coll b rest)  (ForF v coll (g b) (g rest))
-        (LetF v val b rest)   (LetF v val (g b) (g rest)))))
-
+        (EndF)
+        (EndF)
+        (LitF t rest)
+        (LitF t (g rest))
+        (EmitF nm rest)
+        (EmitF nm (g rest))
+        (IfF nm th el rest)
+        (IfF nm (g th) (g el) (g rest))
+        (ForF v coll b rest)
+        (ForF v coll (g b) (g rest))
+        (LetF v val b rest)
+        (LetF v val (g b) (g rest)))))
   ;; unwrap one layer, recovering the recursive element type. As in regex/tree
   ;; and scscm/tree, matching `(Roll l)` refines `l`'s recursion slot directly
   ;; post #489..#497 (no `(:: l (TplF Tpl))` ascription needed).
-  (defn unroll-tpl [e : Tpl] : (TplF Tpl)
-    (match e (Roll l) l))
-
+  (defn unroll-tpl [e : Tpl] : (TplF Tpl) (match e (Roll l) l))
   ;; --- the generic catamorphism (the U5 ideal) ----------------------------
   ;; cata alg = alg . fmap (cata alg) . unroll
   ;; Polymorphic in the carrier B, so a fold is *just* an F-algebra
   ;; `(TplF B) -> B` handed to this single driver -- no per-node scaffolding.
   (defn tpl-cata [B] [alg : (fn [(TplF B)] B) e : Tpl] : B
     (alg (:: (fmap (unroll-tpl e) (fn [c : Tpl] : B (tpl-cata alg c))) (TplF B))))
-
   ;; --- smart constructors -------------------------------------------------
-  (defn tpl-end  []                              : Tpl (Roll (EndF)))
-  (defn tpl-lit  [t : cstr rest : Tpl]           : Tpl (Roll (LitF t rest)))
-  (defn tpl-emit [nm : cstr rest : Tpl]          : Tpl (Roll (EmitF nm rest)))
-  (defn tpl-if   [nm : cstr th : Tpl el : Tpl rest : Tpl] : Tpl (Roll (IfF nm th el rest)))
-  (defn tpl-for  [v : cstr coll : cstr b : Tpl rest : Tpl] : Tpl (Roll (ForF v coll b rest)))
-  (defn tpl-let  [v : cstr val : cstr b : Tpl rest : Tpl] : Tpl (Roll (LetF v val b rest)))
-
+  (defn tpl-end [] : Tpl (Roll (EndF)))
+  (defn tpl-lit [t : cstr rest : Tpl] : Tpl (Roll (LitF t rest)))
+  (defn tpl-emit [nm : cstr rest : Tpl] : Tpl (Roll (EmitF nm rest)))
+  (defn tpl-if [nm : cstr th : Tpl el : Tpl rest : Tpl] : Tpl
+    (Roll (IfF nm th el rest)))
+  (defn tpl-for [v : cstr coll : cstr b : Tpl rest : Tpl] : Tpl
+    (Roll (ForF v coll b rest)))
+  (defn tpl-let [v : cstr val : cstr b : Tpl rest : Tpl] : Tpl
+    (Roll (LetF v val b rest)))
   ;; --- C helpers for the cstr fold ----------------------------------------
   (defn cat2 [a : cstr b : cstr] : cstr
     ```c
@@ -113,46 +124,59 @@
   (defn cat5 [a : cstr b : cstr c : cstr d : cstr e : cstr] : cstr
     (cat2 (cat2 (cat2 (cat2 a b) c) d) e))
   (defn imax [a : int b : int] : int (if (> a b) a b))
-
   ;; --- value folds, each an F-algebra over the single tpl-cata ------------
-
   ;; total content-node count (End terminators are not counted)
   (defn size-alg [l : (TplF int)] : int
     (match l
-      (EndF)              0
-      (LitF t rest)       (+ 1 rest)
-      (EmitF nm rest)     (+ 1 rest)
-      (IfF nm th el rest) (+ 1 (+ th (+ el rest)))
-      (ForF v coll b rest)  (+ 1 (+ b rest))
-      (LetF v val b rest)   (+ 1 (+ b rest))))
+      (EndF)
+      0
+      (LitF t rest)
+      (+ 1 rest)
+      (EmitF nm rest)
+      (+ 1 rest)
+      (IfF nm th el rest)
+      (+ 1 (+ th (+ el rest)))
+      (ForF v coll b rest)
+      (+ 1 (+ b rest))
+      (LetF v val b rest)
+      (+ 1 (+ b rest))))
   (defn tpl-size [e : Tpl] : int (tpl-cata size-alg e))
-
   ;; count just the dynamic directives (Emit / If / For / Let); literals and
   ;; End contribute nothing -- a quick "how templated is this?" metric.
   (defn dir-alg [l : (TplF int)] : int
     (match l
-      (EndF)              0
-      (LitF t rest)       rest
-      (EmitF nm rest)     (+ 1 rest)
-      (IfF nm th el rest) (+ 1 (+ th (+ el rest)))
-      (ForF v coll b rest)  (+ 1 (+ b rest))
-      (LetF v val b rest)   (+ 1 (+ b rest))))
+      (EndF)
+      0
+      (LitF t rest)
+      rest
+      (EmitF nm rest)
+      (+ 1 rest)
+      (IfF nm th el rest)
+      (+ 1 (+ th (+ el rest)))
+      (ForF v coll b rest)
+      (+ 1 (+ b rest))
+      (LetF v val b rest)
+      (+ 1 (+ b rest))))
   (defn tpl-directives [e : Tpl] : int (tpl-cata dir-alg e))
-
   ;; block-nesting depth. The functor keeps body slots distinct from the
   ;; sibling-tail slot, so the algebra adds +1 only on the body axis: a block
   ;; is `1 + deepest body`, taken against whatever the rest of the sequence
   ;; reaches. Literals/emits pass the tail depth through.
   (defn depth-alg [l : (TplF int)] : int
     (match l
-      (EndF)              0
-      (LitF t rest)       rest
-      (EmitF nm rest)     rest
-      (IfF nm th el rest) (imax (+ 1 (imax th el)) rest)
-      (ForF v coll b rest)  (imax (+ 1 b) rest)
-      (LetF v val b rest)   (imax (+ 1 b) rest)))
+      (EndF)
+      0
+      (LitF t rest)
+      rest
+      (EmitF nm rest)
+      rest
+      (IfF nm th el rest)
+      (imax (+ 1 (imax th el)) rest)
+      (ForF v coll b rest)
+      (imax (+ 1 b) rest)
+      (LetF v val b rest)
+      (imax (+ 1 b) rest)))
   (defn tpl-depth [e : Tpl] : int (tpl-cata depth-alg e))
-
   ;; round-trip back to template source via the generic cata. Because body and
   ;; tail slots are distinct fields, the algebra reconstructs the source
   ;; directly -- no erased structure to recover. An `IfF` always prints its
@@ -160,12 +184,16 @@
   ;; which prints as nothing between `<% else %>` and `<% end %>`).
   (defn str-alg [l : (TplF cstr)] : cstr
     (match l
-      (EndF)              ""
-      (LitF t rest)       (cat2 t rest)
-      (EmitF nm rest)     (cat3 (cat3 "<%= " nm " %>") rest "")
-      (IfF nm th el rest) (cat2 (cat5 (cat3 "<% if " nm " %>") th "<% else %>" el "<% end %>") rest)
-      (ForF v coll b rest)  (cat2 (cat5 "<% for [" (cat3 v " " coll) "] %>" b "<% end %>") rest)
-      (LetF v val b rest)   (cat2 (cat5 "<% let [" (cat3 v " " val) "] %>" b "<% end %>") rest)))
-  (defn tpl->str [e : Tpl] : cstr (tpl-cata str-alg e))
-
-) ;; end defmodule template/tree
+      (EndF)
+      ""
+      (LitF t rest)
+      (cat2 t rest)
+      (EmitF nm rest)
+      (cat3 (cat3 "<%= " nm " %>") rest "")
+      (IfF nm th el rest)
+      (cat2 (cat5 (cat3 "<% if " nm " %>") th "<% else %>" el "<% end %>") rest)
+      (ForF v coll b rest)
+      (cat2 (cat5 "<% for [" (cat3 v " " coll) "] %>" b "<% end %>") rest)
+      (LetF v val b rest)
+      (cat2 (cat5 "<% let [" (cat3 v " " val) "] %>" b "<% end %>") rest)))
+  (defn tpl->str [e : Tpl] : cstr (tpl-cata str-alg e))) ;; end defmodule template/tree

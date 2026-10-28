@@ -32,45 +32,55 @@
 ;; stays direct structural recursion. Full analysis + minimal repro:
 ;; docs/u5-regex-matcher-cata-blocker-2026-06-22.md (feasibility history in
 ;; docs/u5-hkt-ast-feasibility-2026-06-21.md).
-
 (defmodule regex/tree
-  (export ReF Re
-          r-empty r-lit r-alt r-cat r-star r-plus r-opt
-          re-cata re-size re-nullable? re->str re-matches?)
-
+  (export ReF
+    Re
+    r-empty
+    r-lit
+    r-alt
+    r-cat
+    r-star
+    r-plus
+    r-opt
+    re-cata
+    re-size
+    re-nullable?
+    re->str
+    re-matches?)
   ;; --- one layer of a regex AST -------------------------------------------
   ;; `:copy` so an immutable AST value can be folded more than once (the
   ;; nodes are heap pointers into an immutable tree; copying the handle is
   ;; sound).
-  (defdata ^copy ReF [a]
-    (EmptyF)        ;; matches the empty string
-    (LitF :cstr)    ;; a literal token (a single character, as a 1-char cstr)
-    (AltF a a)      ;; alternation:    r | s
-    (CatF a a)      ;; concatenation:  r s
-    (StarF a))      ;; Kleene star:    r*
-
+  (defdata ^copy ReF
+    [a]
+    (EmptyF) ;; matches the empty string
+    (LitF :cstr) ;; a literal token (a single character, as a 1-char cstr)
+    (AltF a a) ;; alternation:    r | s
+    (CatF a a) ;; concatenation:  r s
+    (StarF a)) ;; Kleene star:    r*
   ;; --- by-value fixed point:  Re ~= ReF Re --------------------------------
   ;; The monomorphic inlining of `Fix ReF`. Needs #483 to carry the applied
   ;; `(ReF Re)` field by value.
   (defdata ^copy Re (Roll (ReF Re)))
-
   ;; --- Functor: map over the recursive positions --------------------------
   (definstance Functor [ReF]
     (fmap [c g]
       (match c
-        (EmptyF)    (EmptyF)
-        (LitF s)    (LitF s)
-        (AltF x y)  (AltF (g x) (g y))
-        (CatF x y)  (CatF (g x) (g y))
-        (StarF x)   (StarF (g x)))))
-
+        (EmptyF)
+        (EmptyF)
+        (LitF s)
+        (LitF s)
+        (AltF x y)
+        (AltF (g x) (g y))
+        (CatF x y)
+        (CatF (g x) (g y))
+        (StarF x)
+        (StarF (g x)))))
   ;; unwrap one layer, recovering the recursive element type. Matching
   ;; `(Roll l)` now refines `l`'s recursion slot directly -- the `(:: l (ReF
   ;; Re))` ascription this used to need was retired once turmeric main learned
   ;; to refine the layer's recursive type var (verified post #489..#497).
-  (defn unroll-re [e : Re] : (ReF Re)
-    (match e (Roll l) l))
-
+  (defn unroll-re [e : Re] : (ReF Re) (match e (Roll l) l))
   ;; --- the generic catamorphism (the U5 ideal) ----------------------------
   ;; cata alg = alg . fmap (cata alg) . unroll
   ;; Polymorphic in the carrier B, so a fold is *just* an F-algebra
@@ -79,39 +89,44 @@
   ;; every value carrier (int/bool/cstr) since #487 (gap G6).
   (defn re-cata [B] [alg : (fn [(ReF B)] B) e : Re] : B
     (alg (:: (fmap (unroll-re e) (fn [c : Re] : B (re-cata alg c))) (ReF B))))
-
   ;; --- smart constructors -------------------------------------------------
-  (defn r-empty []                       : Re (Roll (EmptyF)))
-  (defn r-lit   [s : cstr]               : Re (Roll (LitF s)))
-  (defn r-alt   [x : Re y : Re]          : Re (Roll (AltF x y)))
-  (defn r-cat   [x : Re y : Re]          : Re (Roll (CatF x y)))
-  (defn r-star  [x : Re]                 : Re (Roll (StarF x)))
+  (defn r-empty [] : Re (Roll (EmptyF)))
+  (defn r-lit [s : cstr] : Re (Roll (LitF s)))
+  (defn r-alt [x : Re y : Re] : Re (Roll (AltF x y)))
+  (defn r-cat [x : Re y : Re] : Re (Roll (CatF x y)))
+  (defn r-star [x : Re] : Re (Roll (StarF x)))
   ;; derived: r+ = rr*  ;  r? = r|ε
-  (defn r-plus  [x : Re]                 : Re (Roll (CatF x (Roll (StarF x)))))
-  (defn r-opt   [x : Re]                 : Re (Roll (AltF x (Roll (EmptyF)))))
-
+  (defn r-plus [x : Re] : Re (Roll (CatF x (Roll (StarF x)))))
+  (defn r-opt [x : Re] : Re (Roll (AltF x (Roll (EmptyF)))))
   ;; --- value folds, each an F-algebra over the single re-cata -------------
-
   ;; node count
   (defn size-alg [l : (ReF int)] : int
     (match l
-      (EmptyF)   1
-      (LitF s)   1
-      (AltF x y) (+ 1 (+ x y))
-      (CatF x y) (+ 1 (+ x y))
-      (StarF x)  (+ 1 x)))
+      (EmptyF)
+      1
+      (LitF s)
+      1
+      (AltF x y)
+      (+ 1 (+ x y))
+      (CatF x y)
+      (+ 1 (+ x y))
+      (StarF x)
+      (+ 1 x)))
   (defn re-size [e : Re] : int (re-cata size-alg e))
-
   ;; does the regex match the empty string?
   (defn null-alg [l : (ReF bool)] : bool
     (match l
-      (EmptyF)   true
-      (LitF s)   false
-      (AltF x y) (or x y)
-      (CatF x y) (and x y)
-      (StarF x)  true))
+      (EmptyF)
+      true
+      (LitF s)
+      false
+      (AltF x y)
+      (or x y)
+      (CatF x y)
+      (and x y)
+      (StarF x)
+      true))
   (defn re-nullable? [e : Re] : bool (re-cata null-alg e))
-
   ;; pretty-print back to regex syntax
   (defn cat2 [a : cstr b : cstr] : cstr
     ```c
@@ -124,13 +139,17 @@
     ```)
   (defn str-alg [l : (ReF cstr)] : cstr
     (match l
-      (EmptyF)   ""
-      (LitF s)   s
-      (AltF x y) (cat2 (cat2 (cat2 (cat2 "(" x) "|") y) ")")
-      (CatF x y) (cat2 x y)
-      (StarF x)  (cat2 (cat2 "(" x) ")*")))
+      (EmptyF)
+      ""
+      (LitF s)
+      s
+      (AltF x y)
+      (cat2 (cat2 (cat2 (cat2 "(" x) "|") y) ")")
+      (CatF x y)
+      (cat2 x y)
+      (StarF x)
+      (cat2 (cat2 "(" x) ")*")))
   (defn re->str [e : Re] : cstr (re-cata str-alg e))
-
   ;; --- a backtracking matcher ---------------------------------------------
   ;; CPS: `m e k s` asks "does `e` match a prefix of `s` such that `k` accepts
   ;; the leftover suffix?". The elegant form is a cata whose carrier is a
@@ -154,7 +173,6 @@
   ;; The matcher below stays direct structural recursion over the same tree --
   ;; still a fold, just not routed through `re-cata`. That is now a code-shape
   ;; choice, not a compiler constraint.
-
   ;; consume one literal char off the front of `s`; return s+1, or null on miss
   (defn lit-step [lit : cstr s : cstr] : cstr
     ```c
@@ -167,23 +185,24 @@
     ```c return ((const char *)s) != 0 && ((const char *)s)[0] == '\0'; ```)
   (defn cstr-same? [a : cstr b : cstr] : bool
     ```c return (const char *)a == (const char *)b; ```)
-
   (defn m [e : Re k : (fn [cstr] bool) s : cstr] : bool
     (match e
       (Roll layer)
-        (let [l layer]
-          (match l
-            (EmptyF)   (k s)
-            (LitF c)   (let [s2 (lit-step c s)]
-                         (if (cstr-null? s2) false (k s2)))
-            (AltF x y) (or (m x k s) (m y k s))
-            (CatF x y) (m x (fn [s2 : cstr] : bool (m y k s2)) s)
-            (StarF x)  (or (k s)
-                           (m x (fn [s2 : cstr] : bool
-                                  (if (cstr-same? s2 s) false (m e k s2))) s))))))
-
+      (let [l layer]
+        (match l
+          (EmptyF)
+          (k s)
+          (LitF c)
+          (let [s2 (lit-step c s)] (if (cstr-null? s2) false (k s2)))
+          (AltF x y)
+          (or (m x k s) (m y k s))
+          (CatF x y)
+          (m x (fn [s2 : cstr] : bool (m y k s2)) s)
+          (StarF x)
+          (or (k s)
+            (m x
+              (fn [s2 : cstr] : bool (if (cstr-same? s2 s) false (m e k s2)))
+              s))))))
   ;; does `e` match the whole string `s`?
   (defn re-matches? [e : Re s : cstr] : bool
-    (m e (fn [rest : cstr] : bool (cstr-empty? rest)) s))
-
-) ;; end defmodule regex/tree
+    (m e (fn [rest : cstr] : bool (cstr-empty? rest)) s))) ;; end defmodule regex/tree

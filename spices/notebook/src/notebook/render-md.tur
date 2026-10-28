@@ -1,113 +1,143 @@
 ;;; notebook/render-md -- render notebook documents to markdown with output blocks.
 ;; notebook/render-md -- evaluate .tur.md files and emit markdown output.
-
 (defmodule notebook/render-md
   (import notebook/cmark :refer [md-emit])
-  (import notebook/format :refer [parse-file node-tag node-prose node-cell nodes-free])
-  (import notebook/cell :refer [attr-get-bool cell-id cell-lang cell-source cell-attrs cells-assign-ids])
-  (import notebook/session :refer [session-open-for session-close
-                                   output-status-ok output-status-error output-status-skipped
-                                   cell-output-cell-id cell-output-status cell-output-stdout
-                                   cell-output-value-repr cell-output-error-msg
-                                   cell-output-elapsed-ms])
+  (import notebook/format
+    :refer
+    [parse-file node-tag node-prose node-cell nodes-free])
+  (import notebook/cell
+    :refer
+    [attr-get-bool cell-id cell-lang cell-source cell-attrs cells-assign-ids])
+  (import notebook/session
+    :refer
+    [session-open-for
+     session-close
+     output-status-ok
+     output-status-error
+     output-status-skipped
+     cell-output-cell-id
+     cell-output-status
+     cell-output-stdout
+     cell-output-value-repr
+     cell-output-error-msg
+     cell-output-elapsed-ms])
   (import notebook/eval :refer [eval-all outputs-free])
   (import notebook/cache :refer [cache-open cache-close])
   (export render-opts-make
-          render-opts-output-dir render-opts-use-cache
-          render-opts-include-source render-opts-include-output
-          render-opts-fail-fast render-opts-set-math-mode render-opts-set-assets-mode
-          default-render-opts
-          render-md-string render-md
-          render-opts-free)
-
+    render-opts-output-dir
+    render-opts-use-cache
+    render-opts-include-source
+    render-opts-include-output
+    render-opts-fail-fast
+    render-opts-set-math-mode
+    render-opts-set-assets-mode
+    default-render-opts
+    render-md-string
+    render-md
+    render-opts-free)
   (defn __rmd-build-hint [] : int
     ```c
     /* __tur_include__: #include <sys/stat.h> */
     return 0;
     ```)
-
-  (defn __rmd-nil-value [] #fx{Unsafe} : int
+  (defn __rmd-nil-value []
+    #fx{Unsafe}
+    : int
     ```c
     return 0;
     ```)
-
-  (defn __rmd-list-nil? [lst : int] #fx{Unsafe} : bool
+  (defn __rmd-list-nil? [lst : int]
+    #fx{Unsafe}
+    : bool
     ```c
     return lst == 0;
     ```)
-
-  (defn __rmd-cons [value : int next : int] #fx{Unsafe} : int
+  (defn __rmd-cons [value : int next : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t head; int64_t tail; } *cell = malloc(sizeof(*cell));
     cell->head = value;
     cell->tail = next;
     return (int64_t)(intptr_t)cell;
     ```)
-
-  (defn __rmd-head [lst : int] #fx{Unsafe} : int
+  (defn __rmd-head [lst : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t head; int64_t tail; } *cell = (void*)(intptr_t)lst;
     if (!cell) { fprintf(stderr, "head: empty list\n"); exit(1); }
     return cell->head;
     ```)
-
-  (defn __rmd-tail [lst : int] #fx{Unsafe} : int
+  (defn __rmd-tail [lst : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t head; int64_t tail; } *cell = (void*)(intptr_t)lst;
     if (!cell) { fprintf(stderr, "tail: empty list\n"); exit(1); }
     return cell->tail;
     ```)
-
-  (defn __rmd-ok [value : int] #fx{Unsafe} : int
+  (defn __rmd-ok [value : int]
+    #fx{Unsafe}
+    : int
     ```c
     return tur_box_ok(value);
     ```)
-
-  (defn __rmd-err [value : cstr] #fx{Unsafe} : int
+  (defn __rmd-err [value : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     return tur_err_ptr(value ? strdup((const char *)(intptr_t)value) : strdup(""));
     ```)
-
-  (defn __rmd-result-ok? [result : int] #fx{Unsafe} : bool
+  (defn __rmd-result-ok? [result : int]
+    #fx{Unsafe}
+    : bool
     ```c
     return tur_is_ok(result);
     ```)
-
-  (defn __rmd-result-ok-val [result : int] #fx{Unsafe} : int
+  (defn __rmd-result-ok-val [result : int]
+    #fx{Unsafe}
+    : int
     ```c
     return result ? tur_ok_value(result) : 0;
     ```)
-
-  (defn __rmd-cstr-eq? [a : cstr b : cstr] #fx{Unsafe} : bool
+  (defn __rmd-cstr-eq? [a : cstr b : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *sa = a ? (const char *)(intptr_t)a : "";
     const char *sb = b ? (const char *)(intptr_t)b : "";
     return strcmp(sa, sb) == 0;
     ```)
-
-  (defn __rmd-cstr-empty? [s : cstr] #fx{Unsafe} : bool
+  (defn __rmd-cstr-empty? [s : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *src = s ? (const char *)(intptr_t)s : "";
     return src[0] == '\0';
     ```)
-
-  (defn __rmd-cstr-as-int [s : cstr] #fx{Unsafe} : int
+  (defn __rmd-cstr-as-int [s : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     return (int64_t)(intptr_t)s;
     ```)
-
-  (defn __rmd-int-as-cstr [value : int] #fx{Unsafe} : cstr
+  (defn __rmd-int-as-cstr [value : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     return (const char *)(intptr_t)value;
     ```)
-
-  (defn __rmd-cstr-free [s : cstr] #fx{Unsafe} : void
+  (defn __rmd-cstr-free [s : cstr]
+    #fx{Unsafe}
+    : void
     ```c
     void *p = (void *)(intptr_t)s;
     if (p) free(p);
     ```)
-
-  (defn __rmd-str-concat [a : cstr b : cstr] #fx{Unsafe} : cstr
+  (defn __rmd-str-concat [a : cstr b : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *sa = a ? (const char *)(intptr_t)a : "";
     const char *sb = b ? (const char *)(intptr_t)b : "";
@@ -118,28 +148,29 @@
     out[la + lb] = '\0';
     return out;
     ```)
-
-;; ---------------------------------------------------------------------
-;; String ownership
-;;
-;; This module used to mix borrowed literals and malloc'd strings in the same
-;; return type -- __rmd-render-attrs returned either "" or a fresh string,
-;; __rmd-join-blocks sometimes returned one of its arguments and sometimes a
-;; new string -- so no call site could know whether to free what it got, and
-;; none did.  Every helper below returns a string the CALLER OWNS; the
-;; literals are strdup'd to keep that uniform.
-;; ---------------------------------------------------------------------
-
-;;; __rmd-strdup -- an owned copy of a borrowed string.
-  (defn __rmd-strdup [s : cstr] #fx{Unsafe} : cstr
+  ;; ---------------------------------------------------------------------
+  ;; String ownership
+  ;;
+  ;; This module used to mix borrowed literals and malloc'd strings in the same
+  ;; return type -- __rmd-render-attrs returned either "" or a fresh string,
+  ;; __rmd-join-blocks sometimes returned one of its arguments and sometimes a
+  ;; new string -- so no call site could know whether to free what it got, and
+  ;; none did.  Every helper below returns a string the CALLER OWNS; the
+  ;; literals are strdup'd to keep that uniform.
+  ;; ---------------------------------------------------------------------
+  ;;; __rmd-strdup -- an owned copy of a borrowed string.
+  (defn __rmd-strdup [s : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *p = s ? (const char *)(intptr_t)s : "";
     return strdup(p);
     ```)
-
-;;; __rmd-join-owned -- join two OWNED blocks with a blank line, releasing
-;;; both.  Returns a new owned string.
-  (defn __rmd-join-owned [a : cstr b : cstr] #fx{Unsafe} : cstr
+  ;;; __rmd-join-owned -- join two OWNED blocks with a blank line, releasing
+  ;;; both.  Returns a new owned string.
+  (defn __rmd-join-owned [a : cstr b : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *sa = a ? (const char *)(intptr_t)a : "";
     const char *sb = b ? (const char *)(intptr_t)b : "";
@@ -158,23 +189,29 @@
     if (b) free((void *)(intptr_t)b);
     return out;
     ```)
-
-  (defn __rmd-join-blocks [a : cstr b : cstr] #fx{Unsafe} : cstr
+  (defn __rmd-join-blocks [a : cstr b : cstr]
+    #fx{Unsafe}
+    : cstr
     (if (__rmd-cstr-empty? a)
       b
       (if (__rmd-cstr-empty? b)
         a
         (__rmd-str-concat a (__rmd-str-concat "\n\n" b)))))
-
-  (defn __rmd-int->cstr [value : int] #fx{Unsafe} : cstr
+  (defn __rmd-int->cstr [value : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long)value);
     return strdup(buf);
     ```)
-
-  (defn render-opts-make [output_dir : cstr use_cache : int include_source : int
-                          include_output : int fail_fast : int] #fx{Unsafe} : int
+  (defn render-opts-make [output_dir : cstr
+                          use_cache : int
+                          include_source : int
+                          include_output : int
+                          fail_fast : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -195,8 +232,9 @@
     opts->assets_mode = 0;
     return (int64_t)(intptr_t)opts;
     ```)
-
-  (defn render-opts-output-dir [opts : int] #fx{Unsafe} : cstr
+  (defn render-opts-output-dir [opts : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct {
       char *output_dir;
@@ -208,8 +246,9 @@
     RenderOpts *o = (RenderOpts *)(intptr_t)opts;
     return o && o->output_dir ? o->output_dir : "";
     ```)
-
-  (defn render-opts-use-cache [opts : int] #fx{Unsafe} : int
+  (defn render-opts-use-cache [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -221,8 +260,9 @@
     RenderOpts *o = (RenderOpts *)(intptr_t)opts;
     return o ? o->use_cache : 0;
     ```)
-
-  (defn render-opts-include-source [opts : int] #fx{Unsafe} : int
+  (defn render-opts-include-source [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -234,8 +274,9 @@
     RenderOpts *o = (RenderOpts *)(intptr_t)opts;
     return o ? o->include_source : 1;
     ```)
-
-  (defn render-opts-include-output [opts : int] #fx{Unsafe} : int
+  (defn render-opts-include-output [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -247,8 +288,9 @@
     RenderOpts *o = (RenderOpts *)(intptr_t)opts;
     return o ? o->include_output : 1;
     ```)
-
-  (defn render-opts-fail-fast [opts : int] #fx{Unsafe} : int
+  (defn render-opts-fail-fast [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -260,9 +302,10 @@
     RenderOpts *o = (RenderOpts *)(intptr_t)opts;
     return o ? o->fail_fast : 1;
     ```)
-
   ;;; render-opts-set-math-mode -- set math rendering mode on an opts value.
-  (defn render-opts-set-math-mode [opts : int mode : int] #fx{Unsafe} : int
+  (defn render-opts-set-math-mode [opts : int mode : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -277,9 +320,10 @@
     if (o) o->math_mode = mode;
     return opts;
     ```)
-
   ;;; render-opts-set-assets-mode -- set asset embedding mode (0=inline 1=sibling).
-  (defn render-opts-set-assets-mode [opts : int mode : int] #fx{Unsafe} : int
+  (defn render-opts-set-assets-mode [opts : int mode : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *output_dir;
@@ -294,11 +338,10 @@
     if (o) o->assets_mode = mode;
     return opts;
     ```)
-
-  (defn default-render-opts [] #fx{Unsafe} : int
-    (render-opts-make "" 0 1 1 1))
-
-  (defn __rmd-output-path [src_path : cstr output_dir : cstr] #fx{Unsafe} : cstr
+  (defn default-render-opts [] #fx{Unsafe} : int (render-opts-make "" 0 1 1 1))
+  (defn __rmd-output-path [src_path : cstr output_dir : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *src = src_path ? (const char *)(intptr_t)src_path : "";
     const char *out_dir = output_dir ? (const char *)(intptr_t)output_dir : "";
@@ -342,8 +385,9 @@
     free(dir);
     return out;
     ```)
-
-  (defn __rmd-ensure-parent-dir [path : cstr] #fx{Unsafe} : int
+  (defn __rmd-ensure-parent-dir [path : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     #include <sys/stat.h>
     const char *src = path ? (const char *)(intptr_t)path : "";
@@ -380,8 +424,9 @@
     free(dir);
     return ret;
     ```)
-
-  (defn __rmd-write-file [path : cstr s : cstr] #fx{Unsafe} : int
+  (defn __rmd-write-file [path : cstr s : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     const char *p = path ? (const char *)(intptr_t)path : "";
     const char *text = s ? (const char *)(intptr_t)s : "";
@@ -392,18 +437,17 @@
     fclose(fp);
     return wrote == len ? 1 : 0;
     ```)
-
-  (defn __rmd-close-cache [cache : int] #fx{Unsafe} : int
-    (if (not (= cache 0))
-      (do
-        (cache-close cache)
-        0)
-      0))
-
-  (defn __rmd-lang-label [lang : int] #fx{Unsafe} : cstr
+  (defn __rmd-close-cache [cache : int]
+    #fx{Unsafe}
+    : int
+    (if (not (= cache 0)) (do (cache-close cache) 0) 0))
+  (defn __rmd-lang-label [lang : int]
+    #fx{Unsafe}
+    : cstr
     (__rmd-strdup (if (= lang 0) "turmeric" "sweet-exp")))
-
-  (defn __rmd-render-attr-list [attrs : int] #fx{Unsafe} : cstr
+  (defn __rmd-render-attr-list [attrs : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     typedef struct { char *name; char *value; } Attr;
@@ -432,19 +476,19 @@
     }
     return out;
     ```)
-
-  (defn __rmd-render-attrs [attrs : int] #fx{Unsafe} : cstr
+  (defn __rmd-render-attrs [attrs : int]
+    #fx{Unsafe}
+    : cstr
     (if (__rmd-list-nil? attrs)
       (__rmd-strdup "")
       (let [inner (__rmd-render-attr-list attrs)
             out   (__rmd-attrs-wrap inner)]
-        (do
-          (__rmd-cstr-free inner)
-          out))))
-
-;;; __rmd-attrs-wrap -- " {" + inner + "}" in one allocation.
-;;; The nested __rmd-str-concat chain this replaces dropped its intermediates.
-  (defn __rmd-attrs-wrap [inner : cstr] #fx{Unsafe} : cstr
+        (do (__rmd-cstr-free inner) out))))
+  ;;; __rmd-attrs-wrap -- " {" + inner + "}" in one allocation.
+  ;;; The nested __rmd-str-concat chain this replaces dropped its intermediates.
+  (defn __rmd-attrs-wrap [inner : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *p = inner ? (const char *)(intptr_t)inner : "";
     size_t n = strlen(p);
@@ -455,21 +499,20 @@
     out[n + 3] = '\0';
     return out;
     ```)
-
   ;;; __rmd-render-source-block -- the ```lang {attrs}\n<source>\n``` fence.
   ;;;
   ;;; Built in one allocation.  The five nested __rmd-str-concat calls this
   ;;; replaces dropped four intermediate strings per cell.
-  (defn __rmd-render-source-block [cell : int] #fx{Unsafe} : cstr
+  (defn __rmd-render-source-block [cell : int]
+    #fx{Unsafe}
+    : cstr
     (let [label (__rmd-lang-label (cell-lang cell))
           attrs (__rmd-render-attrs (cell-attrs cell))
           out   (__rmd-source-fence label attrs (cell-source cell))]
-      (do
-        (__rmd-cstr-free label)
-        (__rmd-cstr-free attrs)
-        out)))
-
-  (defn __rmd-source-fence [label : cstr attrs : cstr source : cstr] #fx{Unsafe} : cstr
+      (do (__rmd-cstr-free label) (__rmd-cstr-free attrs) out)))
+  (defn __rmd-source-fence [label : cstr attrs : cstr source : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *l = label  ? (const char *)(intptr_t)label  : "";
     const char *a = attrs  ? (const char *)(intptr_t)attrs  : "";
@@ -481,8 +524,9 @@
     snprintf(out, n, "\x60\x60\x60%s%s\n%s\n\x60\x60\x60", l, a, b);
     return out;
     ```)
-
-  (defn __rmd-output-fence [output : int] #fx{Unsafe} : cstr
+  (defn __rmd-output-fence [output : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct {
       char *cell_id;
@@ -530,22 +574,24 @@
     buf[len] = '\0';
     return buf;
     ```)
-
   ;;; __rmd-render-cell-block -- source fence and/or output fence for one cell.
   ;;; Both halves are owned strings; __rmd-join-owned consumes them.
-  (defn __rmd-render-cell-block [cell : int output : int opts : int] #fx{Unsafe} : cstr
+  (defn __rmd-render-cell-block [cell : int output : int opts : int]
+    #fx{Unsafe}
+    : cstr
     (let [source-part (if (and (= (render-opts-include-source opts) 1)
-                               (= (attr-get-bool (cell-attrs cell) "echo" 1) 1))
+                            (= (attr-get-bool (cell-attrs cell) "echo" 1) 1))
                         (__rmd-render-source-block cell)
                         (__rmd-strdup ""))
           output-part (if (and (not (= output 0))
-                               (= (render-opts-include-output opts) 1)
-                               (= (attr-get-bool (cell-attrs cell) "output" 1) 1))
+                            (= (render-opts-include-output opts) 1)
+                            (= (attr-get-bool (cell-attrs cell) "output" 1) 1))
                         (__rmd-output-fence output)
                         (__rmd-strdup ""))]
       (__rmd-join-owned source-part output-part)))
-
-  (defn __rmd-render-state-make [text : cstr outputs : int] #fx{Unsafe} : int
+  (defn __rmd-render-state-make [text : cstr outputs : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { char *text; int64_t outputs; } RenderState;
     RenderState *state = malloc(sizeof(*state));
@@ -553,25 +599,28 @@
     state->outputs = outputs;
     return (int64_t)(intptr_t)state;
     ```)
-
-  (defn __rmd-render-state-text [state : int] #fx{Unsafe} : cstr
+  (defn __rmd-render-state-text [state : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct { char *text; int64_t outputs; } RenderState;
     RenderState *s = (RenderState *)(intptr_t)state;
     return s && s->text ? s->text : "";
     ```)
-
-  (defn __rmd-render-state-outputs [state : int] #fx{Unsafe} : int
+  (defn __rmd-render-state-outputs [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { char *text; int64_t outputs; } RenderState;
     RenderState *s = (RenderState *)(intptr_t)state;
     return s ? s->outputs : 0;
     ```)
-
-;;; __rmd-render-state-adopt -- build a state that TAKES OWNERSHIP of `text`.
-;;; (__rmd-render-state-make strdups instead, which is right for a literal
-;;; and wrong for a string the caller just built.)
-  (defn __rmd-render-state-adopt [text : cstr outputs : int] #fx{Unsafe} : int
+  ;;; __rmd-render-state-adopt -- build a state that TAKES OWNERSHIP of `text`.
+  ;;; (__rmd-render-state-make strdups instead, which is right for a literal
+  ;;; and wrong for a string the caller just built.)
+  (defn __rmd-render-state-adopt [text : cstr outputs : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { char *text; int64_t outputs; } RenderState;
     RenderState *state = malloc(sizeof(*state));
@@ -579,10 +628,11 @@
     state->outputs = outputs;
     return (int64_t)(intptr_t)state;
     ```)
-
-;;; __rmd-state-take-text -- hand the text out and clear the field, so the
-;;; state can be freed without taking the string with it.
-  (defn __rmd-state-take-text [state : int] #fx{Unsafe} : cstr
+  ;;; __rmd-state-take-text -- hand the text out and clear the field, so the
+  ;;; state can be freed without taking the string with it.
+  (defn __rmd-state-take-text [state : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct { char *text; int64_t outputs; } RenderState;
     RenderState *s = (RenderState *)(intptr_t)state;
@@ -591,9 +641,10 @@
     s->text = NULL;
     return t;
     ```)
-
-;;; __rmd-render-state-free -- release a state and its text.  Safe on 0.
-  (defn __rmd-render-state-free [state : int] #fx{Unsafe} : void
+  ;;; __rmd-render-state-free -- release a state and its text.  Safe on 0.
+  (defn __rmd-render-state-free [state : int]
+    #fx{Unsafe}
+    : void
     ```c
     typedef struct { char *text; int64_t outputs; } RenderState;
     RenderState *s = (RenderState *)(intptr_t)state;
@@ -601,9 +652,10 @@
     free(s->text);
     free(s);
     ```)
-
-;;; render-opts-free -- release a RenderOpts.  Safe on 0.
-  (defn render-opts-free [opts : int] #fx{Unsafe} : void
+  ;;; render-opts-free -- release a RenderOpts.  Safe on 0.
+  (defn render-opts-free [opts : int]
+    #fx{Unsafe}
+    : void
     ```c
     typedef struct {
       char *output_dir;
@@ -619,7 +671,6 @@
     free(o->output_dir);
     free(o);
     ```)
-
   ;;; __rmd-render-nodes -- fold the node list into one rendered block.
   ;;;
   ;;; Each level used to build a state from the text of the level below it
@@ -627,7 +678,9 @@
   ;;; and md-emit's freshly allocated block went the same way.  Now the text
   ;;; is TAKEN from the inner state (which is then freed) and joined with an
   ;;; owned block, so exactly one string survives each level.
-  (defn __rmd-render-nodes [nodes : int outputs : int opts : int] #fx{Unsafe} : int
+  (defn __rmd-render-nodes [nodes : int outputs : int opts : int]
+    #fx{Unsafe}
+    : int
     (if (__rmd-list-nil? nodes)
       (__rmd-render-state-make "" outputs)
       (let [node (__rmd-head nodes)]
@@ -635,51 +688,58 @@
           (let [rest      (__rmd-render-nodes (__rmd-tail nodes) outputs opts)
                 rest-outs (__rmd-render-state-outputs rest)
                 joined    (__rmd-join-owned (md-emit (node-prose node))
-                                            (__rmd-state-take-text rest))]
+                            (__rmd-state-take-text rest))]
             (do
               (__rmd-render-state-free rest)
               (__rmd-render-state-adopt joined rest-outs)))
-          (let [cell (node-cell node)
-                cur-output (if (__rmd-list-nil? outputs) 0 (__rmd-head outputs))
-                rest-outputs (if (__rmd-list-nil? outputs) (__rmd-nil-value) (__rmd-tail outputs))
-                rest      (__rmd-render-nodes (__rmd-tail nodes) rest-outputs opts)
-                rest-outs (__rmd-render-state-outputs rest)
-                joined    (__rmd-join-owned (__rmd-render-cell-block cell cur-output opts)
-                                            (__rmd-state-take-text rest))]
+          (let [cell         (node-cell node)
+                cur-output   (if (__rmd-list-nil? outputs)
+                               0
+                               (__rmd-head outputs))
+                rest-outputs (if (__rmd-list-nil? outputs)
+                               (__rmd-nil-value)
+                               (__rmd-tail outputs))
+                rest         (__rmd-render-nodes (__rmd-tail nodes)
+                               rest-outputs
+                               opts)
+                rest-outs    (__rmd-render-state-outputs rest)
+                joined       (__rmd-join-owned (__rmd-render-cell-block cell
+                                                 cur-output
+                                                 opts)
+                               (__rmd-state-take-text rest))]
             (do
               (__rmd-render-state-free rest)
               (__rmd-render-state-adopt joined rest-outs)))))))
-
-  (defn __rmd-cells-from-nodes-rev [nodes : int acc : int] #fx{Unsafe} : int
+  (defn __rmd-cells-from-nodes-rev [nodes : int acc : int]
+    #fx{Unsafe}
+    : int
     (if (__rmd-list-nil? nodes)
       acc
       (let [node (__rmd-head nodes)]
-        (__rmd-cells-from-nodes-rev
-          (__rmd-tail nodes)
-          (if (= (node-tag node) 1)
-            (__rmd-cons (node-cell node) acc)
-            acc)))))
-
+        (__rmd-cells-from-nodes-rev (__rmd-tail nodes)
+          (if (= (node-tag node) 1) (__rmd-cons (node-cell node) acc) acc)))))
   ;;; __rmd-reverse -- reverse a list, consuming its cons cells.
-  (defn __rmd-reverse [lst : int acc : int] #fx{Unsafe} : int
+  (defn __rmd-reverse [lst : int acc : int]
+    #fx{Unsafe}
+    : int
     (if (__rmd-list-nil? lst)
       acc
       (let [next (__rmd-tail lst)
             out  (__rmd-cons (__rmd-head lst) acc)]
-        (do
-          (__rmd-cons-free lst)
-          (__rmd-reverse next out)))))
-
-;;; __rmd-cons-free -- free one cons cell, leaving its head alone.
-  (defn __rmd-cons-free [node : int] #fx{Unsafe} : void
+        (do (__rmd-cons-free lst) (__rmd-reverse next out)))))
+  ;;; __rmd-cons-free -- free one cons cell, leaving its head alone.
+  (defn __rmd-cons-free [node : int]
+    #fx{Unsafe}
+    : void
     ```c
     free((void *)(intptr_t)node);
     ```)
-
-;;; __rmd-spine-free -- free a cons spine, leaving the heads alone.  Used for
-;;; the cell list __rmd-cells-from-nodes builds: those Cells belong to the
-;;; nodes, only the spine is ours.
-  (defn __rmd-spine-free [lst : int] #fx{Unsafe} : void
+  ;;; __rmd-spine-free -- free a cons spine, leaving the heads alone.  Used for
+  ;;; the cell list __rmd-cells-from-nodes builds: those Cells belong to the
+  ;;; nodes, only the spine is ours.
+  (defn __rmd-spine-free [lst : int]
+    #fx{Unsafe}
+    : void
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     Cons *node = (Cons *)(intptr_t)lst;
@@ -689,29 +749,27 @@
       node = next;
     }
     ```)
-
-  (defn __rmd-cells-from-nodes [nodes : int] #fx{Unsafe} : int
+  (defn __rmd-cells-from-nodes [nodes : int]
+    #fx{Unsafe}
+    : int
     (__rmd-reverse (__rmd-cells-from-nodes-rev nodes (__rmd-nil-value))
-                   (__rmd-nil-value)))
-
-  (defn __rmd-list-length [lst : int] #fx{Unsafe} : int
-    (if (__rmd-list-nil? lst)
-      0
-      (+ 1 (__rmd-list-length (__rmd-tail lst)))))
-
+      (__rmd-nil-value)))
+  (defn __rmd-list-length [lst : int]
+    #fx{Unsafe}
+    : int
+    (if (__rmd-list-nil? lst) 0 (+ 1 (__rmd-list-length (__rmd-tail lst)))))
   ;;; render-md-string -- render a parsed notebook and its outputs to markdown.
   ;;;
   ;;; Returns a string the caller owns.  It used to return the interior text
   ;;; pointer of a RenderState it immediately dropped -- so the result was a
   ;;; live pointer into leaked memory, which happened to work only because
   ;;; nothing freed the state.
-  (defn render-md-string [nodes : int outputs : int opts : int] #fx{Unsafe} : cstr
+  (defn render-md-string [nodes : int outputs : int opts : int]
+    #fx{Unsafe}
+    : cstr
     (let [st   (__rmd-render-nodes nodes outputs opts)
           text (__rmd-state-take-text st)]
-      (do
-        (__rmd-render-state-free st)
-        text)))
-
+      (do (__rmd-render-state-free st) text)))
   ;;; render-md -- evaluate a notebook file and write rendered markdown beside it.
   ;;; render-md -- evaluate a notebook file and write rendered markdown beside it.
   ;;;
@@ -720,21 +778,22 @@
   ;;; spine is ours), the outputs, and the rendered text.  On success the
   ;;; output path is handed to the caller inside the ok result; on failure it
   ;;; is released here.  None of this used to be freed.
-  (defn render-md [path : cstr opts : int] #fx{Unsafe} : int
+  (defn render-md [path : cstr opts : int]
+    #fx{Unsafe}
+    : int
     (let [parsed (parse-file path)]
       (if (not (__rmd-result-ok? parsed))
         (__rmd-err "failed to parse notebook file")
-        (let [nodes (__rmd-result-ok-val parsed)
+        (let [nodes   (__rmd-result-ok-val parsed)
               ;; the Result box itself is ours once the nodes are out of it
-              _box (__rmd-result-box-free parsed)
-              cells (cells-assign-ids (__rmd-cells-from-nodes nodes))
+              _box    (__rmd-result-box-free parsed)
+              cells   (cells-assign-ids (__rmd-cells-from-nodes nodes))
               session (session-open-for path)
-              cache (if (= (render-opts-use-cache opts) 1)
-                      (cache-open "")
-                      0)
+              cache   (if (= (render-opts-use-cache opts) 1) (cache-open "") 0)
               outputs (eval-all session cells cache 0)
               halted? (and (= (render-opts-fail-fast opts) 1)
-                           (< (__rmd-list-length outputs) (__rmd-list-length cells)))]
+                        (< (__rmd-list-length outputs)
+                          (__rmd-list-length cells)))]
           (if halted?
             (do
               (session-close session)
@@ -744,7 +803,8 @@
               (nodes-free nodes)
               (__rmd-err "render halted after a cell error"))
             (let [rendered (render-md-string nodes outputs opts)
-                  out-path (__rmd-output-path path (render-opts-output-dir opts))]
+                  out-path (__rmd-output-path path
+                             (render-opts-output-dir opts))]
               (do
                 (session-close session)
                 (__rmd-close-cache cache)
@@ -764,19 +824,19 @@
                       (__rmd-noop)
                       (__rmd-cstr-free out-path))
                     result)))))))))
-
-;;; __rmd-result-box-free -- release a Result box after taking its payload.
-;;; Returns 0 so it can sit in a `let` binding.
-  (defn __rmd-result-box-free [r : int] #fx{Unsafe} : int
+  ;;; __rmd-result-box-free -- release a Result box after taking its payload.
+  ;;; Returns 0 so it can sit in a `let` binding.
+  (defn __rmd-result-box-free [r : int]
+    #fx{Unsafe}
+    : int
     ```c
     if (r) free((void *)(intptr_t)r);
     return 0;
     ```)
-
-;;; __rmd-noop -- void no-op, so a cleanup-only `if` has void on both arms.
-  (defn __rmd-noop [] #fx{Unsafe} : void
+  ;;; __rmd-noop -- void no-op, so a cleanup-only `if` has void on both arms.
+  (defn __rmd-noop []
+    #fx{Unsafe}
+    : void
     ```c
     return;
-    ```)
-
-) ;; end defmodule notebook/render-md
+    ```)) ;; end defmodule notebook/render-md

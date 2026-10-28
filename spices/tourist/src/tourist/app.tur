@@ -16,99 +16,112 @@
 ;; Stored as a static local inside tourist-state-ptr so it persists across
 ;; calls. Set once by tourist before server-start; read concurrently by
 ;; worker threads (set-once = no race on aligned int64_t reads on POSIX).
-
 (defmodule tourist/app
-  (import tourist/dsl       :refer [route-method route-pattern route-call-handler])
-  (import tourist/middleware :refer [mw-item? mw-chain-run
-                                      mwaround-item? mwaround-call
-                                      mwafter-item? mwafter-chain-run])
-  (import tourist/param     :refer [tourist-ctx-new tourist-ctx-free
-                                     tourist-ctx-resp-headers
-                                     tourist-ctx-clear-resp-headers
-                                     tourist-ctx-around-rest
-                                     tourist-ctx-set-around-rest!])
-  (import tourist/router    :refer [router-match captures-free])
-  (import httpd/response    :refer [not-found with-header])
-  (import tourist/static    :refer [static-item? static-route-fs-root static-serve-ctx])
-  (import tourist/routing   :refer [subapp-item? subapp-call])
-  (import httpd/server      :refer [server-start server-start-conn
-                                     ServerOpts default-server-opts server-start-opts
-                                     server-start-conn-opts
-                                     ServerWrap server-wrap
-                                     server-start-wrapped server-start-conn-wrapped])
-  (import httpd/request     :refer [req-method req-path])
-  (import httpd/types       :refer [Request Response Conn])
-  (import tourist/types     :refer [Ctx Captures Item ItemList Pattern])
-  (export tourist tourist-conn tourist-request-conn
-          TouristOpts default-tourist-opts tourist-opts tourist-with tourist-conn-with)
-
-;; -- Cons list helpers ------------------------------------------------------
-
-;;; __tourist-cons -- allocate a cons cell carrying an Item head.
-(defn __tourist-cons [h : Item t : ItemList] : ItemList
-  ```c
-  #include <stdlib.h>
+  (import tourist/dsl :refer [route-method route-pattern route-call-handler])
+  (import tourist/middleware
+    :refer
+    [mw-item?
+     mw-chain-run
+     mwaround-item?
+     mwaround-call
+     mwafter-item?
+     mwafter-chain-run])
+  (import tourist/param
+    :refer
+    [tourist-ctx-new
+     tourist-ctx-free
+     tourist-ctx-resp-headers
+     tourist-ctx-clear-resp-headers
+     tourist-ctx-around-rest
+     tourist-ctx-set-around-rest!])
+  (import tourist/router :refer [router-match captures-free])
+  (import httpd/response :refer [not-found with-header])
+  (import tourist/static
+    :refer
+    [static-item? static-route-fs-root static-serve-ctx])
+  (import tourist/routing :refer [subapp-item? subapp-call])
+  (import httpd/server
+    :refer
+    [server-start
+     server-start-conn
+     ServerOpts
+     default-server-opts
+     server-start-opts
+     server-start-conn-opts
+     ServerWrap
+     server-wrap
+     server-start-wrapped
+     server-start-conn-wrapped])
+  (import httpd/request :refer [req-method req-path])
+  (import httpd/types :refer [Request Response Conn])
+  (import tourist/types :refer [Ctx Captures Item ItemList Pattern])
+  (export tourist
+    tourist-conn
+    tourist-request-conn
+    TouristOpts
+    default-tourist-opts
+    tourist-opts
+    tourist-with
+    tourist-conn-with)
+  ;; -- Cons list helpers ------------------------------------------------------
+  ;;; __tourist-cons -- allocate a cons cell carrying an Item head.
+  (defn __tourist-cons [h : Item t : ItemList] : ItemList
+    ```c
+    #include <stdlib.h>
   typedef struct { int64_t head; int64_t tail; } __tur_cons;
   __tur_cons *c = malloc(sizeof(*c));
   c->head = h;
   c->tail = t;
   return (int64_t)(intptr_t)c;
   ```)
-
-;;; __tourist-cons-head -- head Item of a cons cell.
-(defn __tourist-cons-head [lst : ItemList] : Item
-  ```c
-  typedef struct { int64_t head; int64_t tail; } __tur_cons;
+  ;;; __tourist-cons-head -- head Item of a cons cell.
+  (defn __tourist-cons-head [lst : ItemList] : Item
+    ```c
+    typedef struct { int64_t head; int64_t tail; } __tur_cons;
   return ((__tur_cons *)(intptr_t)lst)->head;
   ```)
-
-;;; __tourist-cons-tail -- tail ItemList of a cons cell.
-(defn __tourist-cons-tail [lst : ItemList] : ItemList
-  ```c
-  typedef struct { int64_t head; int64_t tail; } __tur_cons;
+  ;;; __tourist-cons-tail -- tail ItemList of a cons cell.
+  (defn __tourist-cons-tail [lst : ItemList] : ItemList
+    ```c
+    typedef struct { int64_t head; int64_t tail; } __tur_cons;
   return ((__tur_cons *)(intptr_t)lst)->tail;
   ```)
-
-;;; __tourist-list-rev -- reverse an ItemList using an accumulator,
-;;; consuming it: each input cell is freed once its head has moved over.
-;;; Every caller hands it a list the collect step built for this purpose.
-(defn __tourist-list-rev [lst : ItemList acc : ItemList] : ItemList
-  (if (= (:: lst :int) 0)
-    acc
-    (let [head (__tourist-cons-head lst)
-          tail (__tourist-cons-tail lst)]
-      (__tourist-cell-free lst)
-      (:: (__tourist-list-rev tail (__tourist-cons head acc)) :ItemList))))
-
-;;; __tourist-cell-free -- free one cons cell (not its head).
-(defn __tourist-cell-free [cell : ItemList] : void
-  ```c
-  #include <stdlib.h>
+  ;;; __tourist-list-rev -- reverse an ItemList using an accumulator,
+  ;;; consuming it: each input cell is freed once its head has moved over.
+  ;;; Every caller hands it a list the collect step built for this purpose.
+  (defn __tourist-list-rev [lst : ItemList acc : ItemList] : ItemList
+    (if (= (:: lst :int) 0)
+      acc
+      (let [head (__tourist-cons-head lst)
+            tail (__tourist-cons-tail lst)]
+        (__tourist-cell-free lst)
+        (:: (__tourist-list-rev tail (__tourist-cons head acc)) :ItemList))))
+  ;;; __tourist-cell-free -- free one cons cell (not its head).
+  (defn __tourist-cell-free [cell : ItemList] : void
+    ```c
+    #include <stdlib.h>
   free((void *)(intptr_t)cell);
   ```)
-
-;;; __tourist-spine-free -- free the cells of a list, leaving the heads.
-;;;
-;;; tourist / tourist-conn own their `& items` rest list; once the items are
-;;; partitioned into the dispatch lists the spine is dead.
-(defn __tourist-spine-free [lst : ItemList] : void
-  ```c
-  #include <stdlib.h>
+  ;;; __tourist-spine-free -- free the cells of a list, leaving the heads.
+  ;;;
+  ;;; tourist / tourist-conn own their `& items` rest list; once the items are
+  ;;; partitioned into the dispatch lists the spine is dead.
+  (defn __tourist-spine-free [lst : ItemList] : void
+    ```c
+    #include <stdlib.h>
   typedef struct { int64_t head; int64_t tail; } __tur_cons;
   __tur_cons *c = (__tur_cons *)(intptr_t)lst;
   while (c) { __tur_cons *nx = (__tur_cons *)(intptr_t)c->tail; free(c); c = nx; }
   ```)
-
-;; -- Global dispatch state (singleton) -------------------------------------
-
-;;; tourist-state-ptr -- return a pointer to the persistent dispatch state.
-;;;
-;;; Stores mws, after_mws, routes and arounds as a static local; lives for
-;;; the process lifetime. Other functions in this module reference it via
-;;; its mangled C name.
-(defn tourist-state-ptr [] : int
-  ```c
-  typedef struct {
+  ;; -- Global dispatch state (singleton) -------------------------------------
+  ;;; tourist-state-ptr -- return a pointer to the persistent dispatch state.
+  ;;;
+  ;;; Stores mws, after_mws, routes and arounds as a static local; lives for
+  ;;; the process lifetime. Other functions in this module reference it via
+  ;;; its mangled C name.
+  (defn tourist-state-ptr [] : int
+    ```c
+    typedef struct {
     int64_t mws;
     int64_t after_mws;
     int64_t routes;
@@ -117,12 +130,13 @@
   static __tourist_app_state s = { 0, 0, 0, 0 };
   return (int64_t)(intptr_t)&s;
   ```)
-
-;;; __tourist-state-set -- write mws, after_mws, and routes into dispatch state.
-(defn __tourist-state-set [mws : ItemList after-mws : ItemList routes : ItemList
-                           arounds : ItemList] : void
-  ```c
-  extern int64_t tourist__app__tourist_hystate_hyptr(void);
+  ;;; __tourist-state-set -- write mws, after_mws, and routes into dispatch state.
+  (defn __tourist-state-set [mws : ItemList
+                             after-mws : ItemList
+                             routes : ItemList
+                             arounds : ItemList] : void
+    ```c
+    extern int64_t tourist__app__tourist_hystate_hyptr(void);
   typedef struct {
     int64_t mws;
     int64_t after_mws;
@@ -136,118 +150,108 @@
   s->routes    = routes;
   s->arounds   = arounds;
   ```)
-
-;;; __tourist-state-arounds -- read the use-around! list (declaration order).
-(defn __tourist-state-arounds [] : ItemList
-  ```c
-  extern int64_t tourist__app__tourist_hystate_hyptr(void);
+  ;;; __tourist-state-arounds -- read the use-around! list (declaration order).
+  (defn __tourist-state-arounds [] : ItemList
+    ```c
+    extern int64_t tourist__app__tourist_hystate_hyptr(void);
   typedef struct {
     int64_t mws; int64_t after_mws; int64_t routes; int64_t arounds;
   } __tourist_app_state;
   return ((__tourist_app_state *)
     (intptr_t)tourist__app__tourist_hystate_hyptr())->arounds;
   ```)
-
-;;; __tourist-state-mws -- read the mws cons list from the dispatch state.
-(defn __tourist-state-mws [] : ItemList
-  ```c
-  extern int64_t tourist__app__tourist_hystate_hyptr(void);
+  ;;; __tourist-state-mws -- read the mws cons list from the dispatch state.
+  (defn __tourist-state-mws [] : ItemList
+    ```c
+    extern int64_t tourist__app__tourist_hystate_hyptr(void);
   typedef struct {
     int64_t mws; int64_t after_mws; int64_t routes; int64_t arounds;
   } __tourist_app_state;
   return ((__tourist_app_state *)
     (intptr_t)tourist__app__tourist_hystate_hyptr())->mws;
   ```)
-
-;;; __tourist-state-after-mws -- read the after-mws cons list (reverse decl order).
-(defn __tourist-state-after-mws [] : ItemList
-  ```c
-  extern int64_t tourist__app__tourist_hystate_hyptr(void);
+  ;;; __tourist-state-after-mws -- read the after-mws cons list (reverse decl order).
+  (defn __tourist-state-after-mws [] : ItemList
+    ```c
+    extern int64_t tourist__app__tourist_hystate_hyptr(void);
   typedef struct {
     int64_t mws; int64_t after_mws; int64_t routes; int64_t arounds;
   } __tourist_app_state;
   return ((__tourist_app_state *)
     (intptr_t)tourist__app__tourist_hystate_hyptr())->after_mws;
   ```)
-
-;;; __tourist-state-routes -- read the routes cons list from the dispatch state.
-(defn __tourist-state-routes [] : ItemList
-  ```c
-  extern int64_t tourist__app__tourist_hystate_hyptr(void);
+  ;;; __tourist-state-routes -- read the routes cons list from the dispatch state.
+  (defn __tourist-state-routes [] : ItemList
+    ```c
+    extern int64_t tourist__app__tourist_hystate_hyptr(void);
   typedef struct {
     int64_t mws; int64_t after_mws; int64_t routes; int64_t arounds;
   } __tourist_app_state;
   return ((__tourist_app_state *)
     (intptr_t)tourist__app__tourist_hystate_hyptr())->routes;
   ```)
-
-;; -- Item partition --------------------------------------------------------
-
-;;; __tourist-collect-mws -- accumulate pre-middleware handles from items (reversed).
-;;;
-;;; Caller reverses with __tourist-list-rev to restore declaration order.
-(defn __tourist-collect-mws [items : ItemList acc : ItemList] : ItemList
-  (if (= (:: items :int) 0)
-    acc
-    (let [item (__tourist-cons-head items)
-          rest (__tourist-cons-tail items)]
-      (:: (if (mw-item? item)
-            (__tourist-collect-mws rest (__tourist-cons item acc))
-            (__tourist-collect-mws rest acc))
+  ;; -- Item partition --------------------------------------------------------
+  ;;; __tourist-collect-mws -- accumulate pre-middleware handles from items (reversed).
+  ;;;
+  ;;; Caller reverses with __tourist-list-rev to restore declaration order.
+  (defn __tourist-collect-mws [items : ItemList acc : ItemList] : ItemList
+    (if (= (:: items :int) 0)
+      acc
+      (let [item (__tourist-cons-head items)
+            rest (__tourist-cons-tail items)]
+        (:: (if (mw-item? item)
+              (__tourist-collect-mws rest (__tourist-cons item acc))
+              (__tourist-collect-mws rest acc))
           :ItemList))))
-
-;;; __tourist-collect-after-mws -- accumulate after-middleware handles (reversed).
-;;;
-;;; The collection accumulator naturally reverses input order; the caller
-;;; does NOT re-reverse this list because we want execution in reverse
-;;; declaration order, which matches the head-first traversal of the
-;;; collected (reversed) list.
-(defn __tourist-collect-after-mws [items : ItemList acc : ItemList] : ItemList
-  (if (= (:: items :int) 0)
-    acc
-    (let [item (__tourist-cons-head items)
-          rest (__tourist-cons-tail items)]
-      (:: (if (mwafter-item? item)
-            (__tourist-collect-after-mws rest (__tourist-cons item acc))
-            (__tourist-collect-after-mws rest acc))
+  ;;; __tourist-collect-after-mws -- accumulate after-middleware handles (reversed).
+  ;;;
+  ;;; The collection accumulator naturally reverses input order; the caller
+  ;;; does NOT re-reverse this list because we want execution in reverse
+  ;;; declaration order, which matches the head-first traversal of the
+  ;;; collected (reversed) list.
+  (defn __tourist-collect-after-mws [items : ItemList acc : ItemList] : ItemList
+    (if (= (:: items :int) 0)
+      acc
+      (let [item (__tourist-cons-head items)
+            rest (__tourist-cons-tail items)]
+        (:: (if (mwafter-item? item)
+              (__tourist-collect-after-mws rest (__tourist-cons item acc))
+              (__tourist-collect-after-mws rest acc))
           :ItemList))))
-
-;;; __tourist-collect-arounds -- accumulate use-around! handles (reversed).
-;;;
-;;; Caller reverses to declaration order: the head is the outermost.
-(defn __tourist-collect-arounds [items : ItemList acc : ItemList] : ItemList
-  (if (= (:: items :int) 0)
-    acc
-    (let [item (__tourist-cons-head items)
-          rest (__tourist-cons-tail items)]
-      (:: (if (mwaround-item? item)
-            (__tourist-collect-arounds rest (__tourist-cons item acc))
-            (__tourist-collect-arounds rest acc))
+  ;;; __tourist-collect-arounds -- accumulate use-around! handles (reversed).
+  ;;;
+  ;;; Caller reverses to declaration order: the head is the outermost.
+  (defn __tourist-collect-arounds [items : ItemList acc : ItemList] : ItemList
+    (if (= (:: items :int) 0)
+      acc
+      (let [item (__tourist-cons-head items)
+            rest (__tourist-cons-tail items)]
+        (:: (if (mwaround-item? item)
+              (__tourist-collect-arounds rest (__tourist-cons item acc))
+              (__tourist-collect-arounds rest acc))
           :ItemList))))
-
-;;; __tourist-collect-routes -- accumulate route handles from items (reversed).
-;;;
-;;; Skips every middleware item (pre, around, after) so the routes list
-;;; contains only Routes, sub-apps, and static-route items.
-(defn __tourist-collect-routes [items : ItemList acc : ItemList] : ItemList
-  (if (= (:: items :int) 0)
-    acc
-    (let [item (__tourist-cons-head items)
-          rest (__tourist-cons-tail items)]
-      (:: (if (or (mw-item? item) (or (mwafter-item? item) (mwaround-item? item)))
-            (__tourist-collect-routes rest acc)
-            (__tourist-collect-routes rest (__tourist-cons item acc)))
+  ;;; __tourist-collect-routes -- accumulate route handles from items (reversed).
+  ;;;
+  ;;; Skips every middleware item (pre, around, after) so the routes list
+  ;;; contains only Routes, sub-apps, and static-route items.
+  (defn __tourist-collect-routes [items : ItemList acc : ItemList] : ItemList
+    (if (= (:: items :int) 0)
+      acc
+      (let [item (__tourist-cons-head items)
+            rest (__tourist-cons-tail items)]
+        (:: (if (or (mw-item? item)
+                  (or (mwafter-item? item) (mwaround-item? item)))
+              (__tourist-collect-routes rest acc)
+              (__tourist-collect-routes rest (__tourist-cons item acc)))
           :ItemList))))
-
-;; -- Dispatch internals ----------------------------------------------------
-
-;;; __tourist-caps-wildcard -- extract the "*" wildcard value from captures.
-;;;
-;;; Returns the char* of the wildcard capture value as int64_t (0 = not found).
-;;; Caller must read the value before calling captures-free.
-(defn __tourist-caps-wildcard [caps : Captures] : int
-  ```c
-  struct __tourist_caps { char **keys; char **vals; int count; int cap; };
+  ;; -- Dispatch internals ----------------------------------------------------
+  ;;; __tourist-caps-wildcard -- extract the "*" wildcard value from captures.
+  ;;;
+  ;;; Returns the char* of the wildcard capture value as int64_t (0 = not found).
+  ;;; Caller must read the value before calling captures-free.
+  (defn __tourist-caps-wildcard [caps : Captures] : int
+    ```c
+    struct __tourist_caps { char **keys; char **vals; int count; int cap; };
   if (caps == 0) return 0;
   struct __tourist_caps *c = (struct __tourist_caps *)(intptr_t)caps;
   for (int i = 0; i < c->count; i++) {
@@ -256,77 +260,81 @@
   }
   return 0;
   ```)
-
-;;; __tourist-method-match? -- true if rmethod matches the request method.
-;;;
-;;; An empty rmethod string matches any HTTP method (used by any!).
-(defn __tourist-method-match? [rmethod : cstr qmethod : cstr] : bool
-  ```c
-  #include <string.h>
+  ;;; __tourist-method-match? -- true if rmethod matches the request method.
+  ;;;
+  ;;; An empty rmethod string matches any HTTP method (used by any!).
+  (defn __tourist-method-match? [rmethod : cstr qmethod : cstr] : bool
+    ```c
+    #include <string.h>
   return ((const char *)rmethod)[0] == '\0'
       || strcmp((const char *)rmethod, (const char *)qmethod) == 0;
   ```)
-
-;;; __tourist-route-dispatch -- find the first matching route and dispatch.
-;;;
-;;; Walks the route cons list in order. The ctx is built once at request
-;;; entry (in __tourist-handler) and reused across middleware + every route
-;;; attempt; route-specific captures are swapped into the ctx via
-;;; tourist/routing's caps slot just before the handler runs and restored
-;;; afterwards. Static routes (serve-static!) are detected via static-item?
-;;; and handled by static-serve; a 0 return means "no match" -- fall
-;;; through to the next item. Returns a 404 Not Found response if no route
-;;; matches.
-(defn __tourist-route-dispatch [routes : ItemList ctx : Ctx] : int
-  (if (= (:: routes :int) 0)
-    (:: (not-found "404 Not Found") :int)
-    (let [route (__tourist-cons-head routes)
-          path  (req-path (:: ctx :Request))
-          rqm   (req-method (:: ctx :Request))]
-      (if (subapp-item? route)
-        ;; Sub-app (url-map!/cascade!): delegate on the shared ctx. A return
-        ;; of 0 means "no inner route matched" -- fall through to the next
-        ;; item, exactly like a static-route miss.
-        (let [resp (subapp-call (:: route :int) ctx)]
-          (if (not= resp 0)
-            resp
-            (__tourist-route-dispatch (__tourist-cons-tail routes) ctx)))
-      (if (static-item? route)
-        ;; Static file route: GET only; fall through on any miss.
-        (if (__tourist-method-match? "GET" rqm)
-          (let [caps (router-match (:: (route-pattern (:: route :int)) :Pattern) path)]
-            (if (not= (:: caps :int) 0)
-              (let [rel  (__tourist-caps-wildcard caps)
-                    resp (if (not= rel 0)
-                           (static-serve-ctx ctx (static-route-fs-root (:: route :int)) rel)
-                           0)]
-                (captures-free caps)
-                (if (not= resp 0)
-                  resp
-                  (__tourist-route-dispatch (__tourist-cons-tail routes) ctx)))
+  ;;; __tourist-route-dispatch -- find the first matching route and dispatch.
+  ;;;
+  ;;; Walks the route cons list in order. The ctx is built once at request
+  ;;; entry (in __tourist-handler) and reused across middleware + every route
+  ;;; attempt; route-specific captures are swapped into the ctx via
+  ;;; tourist/routing's caps slot just before the handler runs and restored
+  ;;; afterwards. Static routes (serve-static!) are detected via static-item?
+  ;;; and handled by static-serve; a 0 return means "no match" -- fall
+  ;;; through to the next item. Returns a 404 Not Found response if no route
+  ;;; matches.
+  (defn __tourist-route-dispatch [routes : ItemList ctx : Ctx] : int
+    (if (= (:: routes :int) 0)
+      (:: (not-found "404 Not Found") :int)
+      (let [route (__tourist-cons-head routes)
+            path  (req-path (:: ctx :Request))
+            rqm   (req-method (:: ctx :Request))]
+        (if (subapp-item? route)
+          ;; Sub-app (url-map!/cascade!): delegate on the shared ctx. A return
+          ;; of 0 means "no inner route matched" -- fall through to the next
+          ;; item, exactly like a static-route miss.
+          (let [resp (subapp-call (:: route :int) ctx)]
+            (if (not= resp 0)
+              resp
               (__tourist-route-dispatch (__tourist-cons-tail routes) ctx)))
-          (__tourist-route-dispatch (__tourist-cons-tail routes) ctx))
-        ;; Regular route: method match, swap caps into ctx, call handler.
-        (let [method (route-method (:: route :int))]
-          (if (__tourist-method-match? method rqm)
-            (let [caps (router-match (:: (route-pattern (:: route :int)) :Pattern) path)]
-              (if (not= (:: caps :int) 0)
-                (let [prev (__tourist-ctx-swap-caps ctx caps)
-                      resp (route-call-handler (:: route :int) ctx)]
-                  (__tourist-ctx-swap-caps ctx prev)
-                  (captures-free caps)
-                  resp)
-                (__tourist-route-dispatch (__tourist-cons-tail routes) ctx)))
-            (__tourist-route-dispatch (__tourist-cons-tail routes) ctx))))))))
-
-;;; __tourist-ctx-swap-caps -- replace ctx->caps; return previous handle.
-;;;
-;;; Mirrors routing.tur's __ctx-set-caps but kept private to app.tur to
-;;; avoid leaking a routing-internal helper into the app/middleware import
-;;; graph.
-(defn __tourist-ctx-swap-caps [ctx : Ctx caps : Captures] : Captures
-  ```c
-  struct __tourist_ctx {
+          (if (static-item? route)
+            ;; Static file route: GET only; fall through on any miss.
+            (if (__tourist-method-match? "GET" rqm)
+              (let [caps (router-match (:: (route-pattern (:: route :int))
+                                         :Pattern)
+                           path)]
+                (if (not= (:: caps :int) 0)
+                  (let [rel  (__tourist-caps-wildcard caps)
+                        resp (if (not= rel 0)
+                               (static-serve-ctx ctx
+                                 (static-route-fs-root (:: route :int))
+                                 rel)
+                               0)]
+                    (captures-free caps)
+                    (if (not= resp 0)
+                      resp
+                      (__tourist-route-dispatch (__tourist-cons-tail routes)
+                        ctx)))
+                  (__tourist-route-dispatch (__tourist-cons-tail routes) ctx)))
+              (__tourist-route-dispatch (__tourist-cons-tail routes) ctx))
+            ;; Regular route: method match, swap caps into ctx, call handler.
+            (let [method (route-method (:: route :int))]
+              (if (__tourist-method-match? method rqm)
+                (let [caps (router-match (:: (route-pattern (:: route :int))
+                                           :Pattern)
+                             path)]
+                  (if (not= (:: caps :int) 0)
+                    (let [prev (__tourist-ctx-swap-caps ctx caps)
+                          resp (route-call-handler (:: route :int) ctx)]
+                      (__tourist-ctx-swap-caps ctx prev)
+                      (captures-free caps)
+                      resp)
+                    (__tourist-route-dispatch (__tourist-cons-tail routes) ctx)))
+                (__tourist-route-dispatch (__tourist-cons-tail routes) ctx))))))))
+  ;;; __tourist-ctx-swap-caps -- replace ctx->caps; return previous handle.
+  ;;;
+  ;;; Mirrors routing.tur's __ctx-set-caps but kept private to app.tur to
+  ;;; avoid leaking a routing-internal helper into the app/middleware import
+  ;;; graph.
+  (defn __tourist-ctx-swap-caps [ctx : Ctx caps : Captures] : Captures
+    ```c
+    struct __tourist_ctx {
     char  *method; char *path; char *query; char *body;
     char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
     int64_t caps;
@@ -338,80 +346,75 @@
   c->caps = (int64_t)caps;
   return prev;
   ```)
-
-;;; __hdr-name / __hdr-value / __hdr-next -- resp-headers cons cell accessors.
-;;;
-;;; The underlying layout is `{char *name; char *value; struct *next;}`; see
-;;; tourist/param's ctx-add-header!. These accessors let __apply-resp-headers
-;;; walk the list in Turmeric instead of from inline-C, which keeps the
-;;; with-header call (which the framework wants to type-check) on the
-;;; Turmeric side.
-(defn __hdr-name [cell : int] : cstr
-  ```c
-  struct __tourist_hdr { char *name; char *value; struct __tourist_hdr *next; };
+  ;;; __hdr-name / __hdr-value / __hdr-next -- resp-headers cons cell accessors.
+  ;;;
+  ;;; The underlying layout is `{char *name; char *value; struct *next;}`; see
+  ;;; tourist/param's ctx-add-header!. These accessors let __apply-resp-headers
+  ;;; walk the list in Turmeric instead of from inline-C, which keeps the
+  ;;; with-header call (which the framework wants to type-check) on the
+  ;;; Turmeric side.
+  (defn __hdr-name [cell : int] : cstr
+    ```c
+    struct __tourist_hdr { char *name; char *value; struct __tourist_hdr *next; };
   return (const char *)((struct __tourist_hdr *)(intptr_t)cell)->name;
   ```)
-
-(defn __hdr-value [cell : int] : cstr
-  ```c
-  struct __tourist_hdr { char *name; char *value; struct __tourist_hdr *next; };
+  (defn __hdr-value [cell : int] : cstr
+    ```c
+    struct __tourist_hdr { char *name; char *value; struct __tourist_hdr *next; };
   return (const char *)((struct __tourist_hdr *)(intptr_t)cell)->value;
   ```)
-
-(defn __hdr-next [cell : int] : int
-  ```c
-  struct __tourist_hdr { char *name; char *value; struct __tourist_hdr *next; };
+  (defn __hdr-next [cell : int] : int
+    ```c
+    struct __tourist_hdr { char *name; char *value; struct __tourist_hdr *next; };
   return (int64_t)(intptr_t)((struct __tourist_hdr *)(intptr_t)cell)->next;
   ```)
-
-;;; __apply-resp-headers -- walk ctx->resp_headers and append each to resp.
-;;;
-;;; Returns the final response handle. The cons list is consumed
-;;; afterwards by tourist-ctx-clear-resp-headers in __tourist-handler so the
-;;; same buffers aren't applied twice in the (currently unreachable) case
-;;; that a ctx is reused.
-(defn __apply-resp-headers [hdrs : int resp : int] : int
-  (if (= hdrs 0)
-    resp
-    (__apply-resp-headers
-      (__hdr-next hdrs)
-      (:: (with-header (:: resp :Response)
-                       (__hdr-name hdrs) (__hdr-value hdrs))
+  ;;; __apply-resp-headers -- walk ctx->resp_headers and append each to resp.
+  ;;;
+  ;;; Returns the final response handle. The cons list is consumed
+  ;;; afterwards by tourist-ctx-clear-resp-headers in __tourist-handler so the
+  ;;; same buffers aren't applied twice in the (currently unreachable) case
+  ;;; that a ctx is reused.
+  (defn __apply-resp-headers [hdrs : int resp : int] : int
+    (if (= hdrs 0)
+      resp
+      (__apply-resp-headers (__hdr-next hdrs)
+        (:: (with-header (:: resp :Response)
+              (__hdr-name hdrs)
+              (__hdr-value hdrs))
           :int))))
-
-;;; __tourist-handler -- top-level request handler passed to server-start.
-;;;
-;;; Builds the per-request ctx once with empty captures, then runs the
-;;; use-around! items outside-in around the core (the use! chain and, if no
-;;; use! short-circuited, the route table), then the use-after! chain, then
-;;; applies any headers queued via ctx-add-header! -- on every response,
-;;; a short-circuit included. The ctx is freed last, taking
-;;; ownership of any captures left in the caps slot (route dispatch always
-;;; swaps the original 0-caps value back into place via
-;;; __tourist-ctx-swap-caps) and freeing the attrs / resp_headers lists.
-;;; A route that panics -- answered 500 by an mw-recover in tourist-with's
-;;; wrap -- leaks nothing either: __tourist-run-guarded frees the ctx (the
-;;; captures it was dispatched with are still in its caps slot then).
-(defn __tourist-handler [req : int] : int
-  (let [ctx       (tourist-ctx-new req 0)
-        raw       (__tourist-run-guarded ctx)
-        decorated (mwafter-chain-run (__tourist-state-after-mws) ctx raw)
-        resp      (__apply-resp-headers (tourist-ctx-resp-headers ctx) decorated)]
-    (tourist-ctx-free ctx)
-    resp))
-
-;;; __tourist-run-guarded -- __tourist-run, freeing the ctx when the request
-;;; panicked.
-;;;
-;;; A panic returns through every caller at once, so __tourist-handler never
-;;; reaches its own free.  Not a `defer`: __tourist-handler is CPS-converted,
-;;; and a defer there does not run on the panic path (see turmeric
-;;; docs/reported/defer-skipped-on-panic-in-cps-function.md).  The panic flag
-;;; is lowered while the ctx is freed, since tourist-ctx-free is Turmeric code
-;;; that would otherwise return at its first call.
-(defn __tourist-run-guarded [ctx : Ctx] : int
-  ```c
-  int64_t r = (int64_t)tourist__app___un_untourist_hyrun(ctx);
+  ;;; __tourist-handler -- top-level request handler passed to server-start.
+  ;;;
+  ;;; Builds the per-request ctx once with empty captures, then runs the
+  ;;; use-around! items outside-in around the core (the use! chain and, if no
+  ;;; use! short-circuited, the route table), then the use-after! chain, then
+  ;;; applies any headers queued via ctx-add-header! -- on every response,
+  ;;; a short-circuit included. The ctx is freed last, taking
+  ;;; ownership of any captures left in the caps slot (route dispatch always
+  ;;; swaps the original 0-caps value back into place via
+  ;;; __tourist-ctx-swap-caps) and freeing the attrs / resp_headers lists.
+  ;;; A route that panics -- answered 500 by an mw-recover in tourist-with's
+  ;;; wrap -- leaks nothing either: __tourist-run-guarded frees the ctx (the
+  ;;; captures it was dispatched with are still in its caps slot then).
+  (defn __tourist-handler [req : int] : int
+    (let [ctx       (tourist-ctx-new req 0)
+          raw       (__tourist-run-guarded ctx)
+          decorated (mwafter-chain-run (__tourist-state-after-mws) ctx raw)
+          resp      (__apply-resp-headers (tourist-ctx-resp-headers ctx)
+                      decorated)]
+      (tourist-ctx-free ctx)
+      resp))
+  ;;; __tourist-run-guarded -- __tourist-run, freeing the ctx when the request
+  ;;; panicked.
+  ;;;
+  ;;; A panic returns through every caller at once, so __tourist-handler never
+  ;;; reaches its own free.  Not a `defer`: __tourist-handler is CPS-converted,
+  ;;; and a defer there does not run on the panic path (see turmeric
+  ;;; docs/reported/defer-skipped-on-panic-in-cps-function.md).  The panic flag
+  ;;; is lowered while the ctx is freed, since tourist-ctx-free is Turmeric code
+  ;;; that would otherwise return at its first call.
+  (defn __tourist-run-guarded [ctx : Ctx] : int
+    ```c
+    int64_t r = (int64_t)tourist__app___un_untourist_hyrun(ctx);
   if (tur_panicking) {
       int p = tur_panicking;
       tur_panicking = 0;
@@ -421,284 +424,272 @@
   }
   return r;
   ```)
-
-;;; __tourist-run -- run the request through every use-around! (outermost
-;;; first) and the core inside them.
-(defn __tourist-run [ctx : Ctx] : Response
-  (do
-    (tourist-ctx-set-around-rest! ctx (__tourist-state-arounds))
-    (__tourist-around-next ctx)))
-
-;;; __tourist-core -- the inside of every use-around!: the use! chain, then
-;;; (unless a use! short-circuited) the route table.
-(defn __tourist-core [ctx : Ctx] : Response
-  (let [opt (mw-chain-run (__tourist-state-mws) ctx)]
-    (if (some? opt)
-      (unwrap opt)
-      (:: (__tourist-route-dispatch (__tourist-state-routes) ctx) :Response))))
-
-;;; __tourist-around-next -- the `next` every use-around! receives.
-;;;
-;;; The ctx records which around items are still to run (around_rest).  Run
-;;; the first of them with this same function as its `next`, restoring the
-;;; position afterwards so a `next` called twice runs the inside twice; with
-;;; none left, run the core.  A top-level fn, so handing it out allocates
-;;; nothing per request.
-(defn __tourist-around-next [ctx : Ctx] : Response
-  (let [rest (tourist-ctx-around-rest ctx)]
-    (if (= (:: rest :int) 0)
-      (__tourist-core ctx)
-      (do
-        (tourist-ctx-set-around-rest! ctx (__tourist-cons-tail rest))
-        (let [resp (mwaround-call (__tourist-cons-head rest) ctx __tourist-around-next)]
-          (tourist-ctx-set-around-rest! ctx rest)
-          resp)))))
-
-;;; __tourist-handler-ptr -- return __tourist-handler as a typed (c-fn [int] int).
-;;;
-;;; server-start expects the handler as a bare C-ABI function pointer.
-(defn __tourist-handler-ptr [] : (c-fn [int] int)
-  ```c
-  extern int64_t tourist__app___un_untourist_hyhandler(int64_t);
+  ;;; __tourist-run -- run the request through every use-around! (outermost
+  ;;; first) and the core inside them.
+  (defn __tourist-run [ctx : Ctx] : Response
+    (do
+      (tourist-ctx-set-around-rest! ctx (__tourist-state-arounds))
+      (__tourist-around-next ctx)))
+  ;;; __tourist-core -- the inside of every use-around!: the use! chain, then
+  ;;; (unless a use! short-circuited) the route table.
+  (defn __tourist-core [ctx : Ctx] : Response
+    (let [opt (mw-chain-run (__tourist-state-mws) ctx)]
+      (if (some? opt)
+        (unwrap opt)
+        (:: (__tourist-route-dispatch (__tourist-state-routes) ctx) :Response))))
+  ;;; __tourist-around-next -- the `next` every use-around! receives.
+  ;;;
+  ;;; The ctx records which around items are still to run (around_rest).  Run
+  ;;; the first of them with this same function as its `next`, restoring the
+  ;;; position afterwards so a `next` called twice runs the inside twice; with
+  ;;; none left, run the core.  A top-level fn, so handing it out allocates
+  ;;; nothing per request.
+  (defn __tourist-around-next [ctx : Ctx] : Response
+    (let [rest (tourist-ctx-around-rest ctx)]
+      (if (= (:: rest :int) 0)
+        (__tourist-core ctx)
+        (do
+          (tourist-ctx-set-around-rest! ctx (__tourist-cons-tail rest))
+          (let [resp (mwaround-call (__tourist-cons-head rest)
+                       ctx
+                       __tourist-around-next)]
+            (tourist-ctx-set-around-rest! ctx rest)
+            resp)))))
+  ;;; __tourist-handler-ptr -- return __tourist-handler as a typed (c-fn [int] int).
+  ;;;
+  ;;; server-start expects the handler as a bare C-ABI function pointer.
+  (defn __tourist-handler-ptr [] : (c-fn [int] int)
+    ```c
+    extern int64_t tourist__app___un_untourist_hyhandler(int64_t);
   return tourist__app___un_untourist_hyhandler;
   ```)
-
-;; -- Public API ------------------------------------------------------------
-
-;;; tourist -- start an HTTP server on port with the given routes and middleware.
-;;;
-;;; Accepts a variadic mix of items from get!, post!, put!, delete!, any!,
-;;; serve-static!, and use!. Middleware (use!) items run in declaration order
-;;; before any route handler. Routes are matched in declaration order; the
-;;; first match wins. The dispatch state is written once before the server
-;;; starts and is safe to read from concurrent worker threads.
-;;;
-;;; Starts a bounded thread-pool server (default pool size 8) and returns the
-;;; server handle. The caller is responsible for blocking until shutdown and
-;;; calling server-stop to join all threads.
-;;;
-;;; Parameters:
-;;;   port  -- TCP port to bind on (IPv4, INADDR_ANY)
-;;;   items -- mix of Route and Middleware handles from the DSL constructors
-;;;
-;;; Returns:
-;;;   :ptr<void> -- server handle; pass to server-stop when done,
-;;;                 or NULL on bind/pool failure
-;;;
-;;; Example:
-;;;   (import httpd/server :refer [server-stop])
-;;;   (let [srv (tourist 3000
-;;;               (use! logger)
-;;;               (get! "/hello/:name"
-;;;                 (fn [req]
-;;;                   (text (ok-val (capture req "name"))))))]
-;;;     (server-stop srv))
-;;;
-;;; Since: v0.1.0
-(defn tourist [port : int & items : int] : ptr<void>
-  (do
-    (__tourist-install (:: items :ItemList))
-    (server-start port (__tourist-handler-ptr))))
-
-;;; __tourist-install -- sort the items into the dispatch state and free the
-;;; variadic list's spine (the items themselves now belong to the state).
-(defn __tourist-install [items-l : ItemList] : void
-  (let [empty     (:: 0 :ItemList)
-        mws       (__tourist-list-rev (__tourist-collect-mws       items-l empty) empty)
-        ;; After-mws are intentionally NOT reversed: head-first walk
-        ;; matches the reverse-declaration-order semantics use-after!
-        ;; documents.
-        after-mws (__tourist-collect-after-mws items-l empty)
-        routes    (__tourist-list-rev (__tourist-collect-routes    items-l empty) empty)
-        arounds   (__tourist-list-rev (__tourist-collect-arounds   items-l empty) empty)]
-    (__tourist-state-set mws after-mws routes arounds)
-    (__tourist-spine-free items-l)))
-
-;; -- Conn-aware entry point (TOUR-V0) --------------------------------------
-;;
-;; tourist's default `tourist` runs on httpd's single-arg `server-start`, whose
-;; handler only sees a Request -- there is no Conn to hand to a WebSocket
-;; upgrade. `tourist-conn` is an additive variant that runs on the two-arg
-;; `server-start-conn`: it stashes the per-request Conn in a thread-local slot
-;; (one worker thread owns a request end to end) and then runs the exact same
-;; middleware + dispatch pipeline. A route handler -- e.g. tourist-ws's
-;; ws-route! -- recovers the Conn with `tourist-request-conn` and calls
-;; ws-upgrade. The "hijack" itself needs no special tourist signal: ws-upgrade
-;; marks the Conn upgraded, so httpd's worker skips its serialize/write/close
-;; and does not double-close the socket the WebSocket handler now owns.
-;;
-;; This is deliberately additive -- the existing `tourist` / `server-start`
-;; path is untouched -- so it does not disturb non-WebSocket apps.
-
-;;; __tourist-conn-cell -- thread-local current-request Conn slot.
-;;;
-;;; mode 0 reads the slot; mode != 0 writes `v` first. The slot is `__thread`
-;;; so each httpd worker thread keeps its own current Conn for the request it
-;;; is serving.
-(defn __tourist-conn-cell [mode : int v : int] : int
-  ```c
-  static __thread int64_t cur = 0;
+  ;; -- Public API ------------------------------------------------------------
+  ;;; tourist -- start an HTTP server on port with the given routes and middleware.
+  ;;;
+  ;;; Accepts a variadic mix of items from get!, post!, put!, delete!, any!,
+  ;;; serve-static!, and use!. Middleware (use!) items run in declaration order
+  ;;; before any route handler. Routes are matched in declaration order; the
+  ;;; first match wins. The dispatch state is written once before the server
+  ;;; starts and is safe to read from concurrent worker threads.
+  ;;;
+  ;;; Starts a bounded thread-pool server (default pool size 8) and returns the
+  ;;; server handle. The caller is responsible for blocking until shutdown and
+  ;;; calling server-stop to join all threads.
+  ;;;
+  ;;; Parameters:
+  ;;;   port  -- TCP port to bind on (IPv4, INADDR_ANY)
+  ;;;   items -- mix of Route and Middleware handles from the DSL constructors
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- server handle; pass to server-stop when done,
+  ;;;                 or NULL on bind/pool failure
+  ;;;
+  ;;; Example:
+  ;;;   (import httpd/server :refer [server-stop])
+  ;;;   (let [srv (tourist 3000
+  ;;;               (use! logger)
+  ;;;               (get! "/hello/:name"
+  ;;;                 (fn [req]
+  ;;;                   (text (ok-val (capture req "name"))))))]
+  ;;;     (server-stop srv))
+  ;;;
+  ;;; Since: v0.1.0
+  (defn tourist [port : int & items : int] : ptr<void>
+    (do
+      (__tourist-install (:: items :ItemList))
+      (server-start port (__tourist-handler-ptr))))
+  ;;; __tourist-install -- sort the items into the dispatch state and free the
+  ;;; variadic list's spine (the items themselves now belong to the state).
+  (defn __tourist-install [items-l : ItemList] : void
+    (let [empty     (:: 0 :ItemList)
+          mws       (__tourist-list-rev (__tourist-collect-mws items-l empty)
+                      empty)
+          ;; After-mws are intentionally NOT reversed: head-first walk
+          ;; matches the reverse-declaration-order semantics use-after!
+          ;; documents.
+          after-mws (__tourist-collect-after-mws items-l empty)
+          routes    (__tourist-list-rev (__tourist-collect-routes items-l empty)
+                      empty)
+          arounds   (__tourist-list-rev (__tourist-collect-arounds items-l
+                                          empty)
+                      empty)]
+      (__tourist-state-set mws after-mws routes arounds)
+      (__tourist-spine-free items-l)))
+  ;; -- Conn-aware entry point (TOUR-V0) --------------------------------------
+  ;;
+  ;; tourist's default `tourist` runs on httpd's single-arg `server-start`, whose
+  ;; handler only sees a Request -- there is no Conn to hand to a WebSocket
+  ;; upgrade. `tourist-conn` is an additive variant that runs on the two-arg
+  ;; `server-start-conn`: it stashes the per-request Conn in a thread-local slot
+  ;; (one worker thread owns a request end to end) and then runs the exact same
+  ;; middleware + dispatch pipeline. A route handler -- e.g. tourist-ws's
+  ;; ws-route! -- recovers the Conn with `tourist-request-conn` and calls
+  ;; ws-upgrade. The "hijack" itself needs no special tourist signal: ws-upgrade
+  ;; marks the Conn upgraded, so httpd's worker skips its serialize/write/close
+  ;; and does not double-close the socket the WebSocket handler now owns.
+  ;;
+  ;; This is deliberately additive -- the existing `tourist` / `server-start`
+  ;; path is untouched -- so it does not disturb non-WebSocket apps.
+  ;;; __tourist-conn-cell -- thread-local current-request Conn slot.
+  ;;;
+  ;;; mode 0 reads the slot; mode != 0 writes `v` first. The slot is `__thread`
+  ;;; so each httpd worker thread keeps its own current Conn for the request it
+  ;;; is serving.
+  (defn __tourist-conn-cell [mode : int v : int] : int
+    ```c
+    static __thread int64_t cur = 0;
   if (mode != 0) cur = (int64_t)v;
   return cur;
   ```)
-
-;;; tourist-request-conn -- the httpd Conn for the in-flight request.
-;;;
-;;; Valid only inside a handler dispatched by `tourist-conn`; returns 0 under
-;;; the plain `tourist` entry point (no Conn is available there). WebSocket
-;;; route handlers pass this to ws-upgrade.
-;;;
-;;; Since: TOUR-V0
-(defn tourist-request-conn [] : Conn
-  (:: (__tourist-conn-cell 0 0) :Conn))
-
-;;; __tourist-handler-conn -- two-arg handler: record the Conn, then dispatch.
-(defn __tourist-handler-conn [conn : int req : int] : int
-  (do
-    (__tourist-conn-cell 1 conn)
-    (__tourist-handler req)))
-
-;;; __tourist-handler-conn-ptr -- __tourist-handler-conn as a (c-fn [int int] int).
-(defn __tourist-handler-conn-ptr [] : (c-fn [int int] int)
-  ```c
-  extern int64_t tourist__app___un_untourist_hyhandler_hyconn(int64_t, int64_t);
+  ;;; tourist-request-conn -- the httpd Conn for the in-flight request.
+  ;;;
+  ;;; Valid only inside a handler dispatched by `tourist-conn`; returns 0 under
+  ;;; the plain `tourist` entry point (no Conn is available there). WebSocket
+  ;;; route handlers pass this to ws-upgrade.
+  ;;;
+  ;;; Since: TOUR-V0
+  (defn tourist-request-conn [] : Conn (:: (__tourist-conn-cell 0 0) :Conn))
+  ;;; __tourist-handler-conn -- two-arg handler: record the Conn, then dispatch.
+  (defn __tourist-handler-conn [conn : int req : int] : int
+    (do (__tourist-conn-cell 1 conn) (__tourist-handler req)))
+  ;;; __tourist-handler-conn-ptr -- __tourist-handler-conn as a (c-fn [int int] int).
+  (defn __tourist-handler-conn-ptr [] : (c-fn [int int] int)
+    ```c
+    extern int64_t tourist__app___un_untourist_hyhandler_hyconn(int64_t, int64_t);
   return tourist__app___un_untourist_hyhandler_hyconn;
   ```)
-
-;;; tourist-conn -- like `tourist`, but on httpd's Conn-aware listener.
-;;;
-;;; Use this instead of `tourist` when any route needs the underlying
-;;; connection -- in particular tourist-ws's ws-route!. Routes and middleware
-;;; are collected and dispatched exactly as for `tourist`; the only difference
-;;; is that the per-request Conn is available via tourist-request-conn.
-;;;
-;;; Parameters:
-;;;   port  -- TCP port to bind on.
-;;;   items -- mix of Route and Middleware handles from the DSL constructors
-;;;            (including ws-route! from tourist-ws).
-;;;
-;;; Returns:
-;;;   :ptr<void> -- server handle; pass to server-stop when done, or NULL on
-;;;                 bind/pool failure.
-;;;
-;;; Since: TOUR-V0
-(defn tourist-conn [port : int & items : int] : ptr<void>
-  (do
-    (__tourist-install (:: items :ItemList))
-    (server-start-conn port (__tourist-handler-conn-ptr))))
-
-;; -- Options: server settings and a stdlib middleware stack (H4) -----------
-;;
-;; Express apps get most of their cross-cutting behaviour from connect
-;; middleware (`app.use(cors())`).  tourist's equivalent is stdlib httpd's
-;; middleware set, applied around tourist's whole dispatch through the `wrap`
-;; field: it runs before tourist builds the Ctx, so it sees every request,
-;; including the ones no route matches and the ones it answers itself (a
-;; CORS preflight, a 429), and after tourist's response is written, so it can
-;; decorate or replace it.  See the README's Middleware section for the
-;; Express package -> stdlib name table.
-
-;;; TouristOpts -- how tourist-with runs the server.
-;;;
-;;; Fields:
-;;;   server -- httpd's ServerOpts: worker count, body cap, read timeout
-;;;   wrap   -- (Option ServerWrap): a stdlib middleware stack around the
-;;;             app (see tourist-opts), or none
-;;;
-;;; A TouristOpts with a wrap starts one server: the wrap is called once and
-;;; released then, so build a fresh TouristOpts for each server.
-;;;
-;;; Since: tourist-on-stdlib-httpd H4
-(defstruct TouristOpts
-  [server : ServerOpts
-   wrap   : (Option ServerWrap)])
-
-;;; default-tourist-opts -- `tourist`'s own settings: 8 workers, stdlib's
-;;; body cap and read timeout, and no middleware stack.
-;;;
-;;; Returns:
-;;;   TouristOpts
-;;;
-;;; Example:
-;;;   (tourist-with 8080 (default-tourist-opts) (get! "/" home))
-;;;
-;;; Since: tourist-on-stdlib-httpd H4
-(defn default-tourist-opts [] : TouristOpts
-  (make-struct TouristOpts (default-server-opts) (none)))
-
-;;; tourist-opts -- the default settings with a stdlib middleware stack.
-;;;
-;;; `wrap` receives tourist's dispatch as a stdlib httpd handler -- the
-;;; `ptr<void>` every stdlib mw-* takes and returns -- and returns the
-;;; handler to serve, usually it inside compose-middleware (whose leftmost
-;;; layer is outermost).
-;;;
-;;; Parameters:
-;;;   wrap -- (fn [ptr<void>] ptr<void>), called once when the server starts
-;;;
-;;; Returns:
-;;;   TouristOpts
-;;;
-;;; Example:
-;;;   (tourist-with 8080
-;;;     (tourist-opts (fn [inner : ptr<void>] : ptr<void>
-;;;                     (compose-middleware inner mw-log mw-recover
-;;;                                         (mw-cors-opts cors))))
-;;;     (get! "/" home))
-;;;
-;;; Since: tourist-on-stdlib-httpd H4
-(defn tourist-opts [^fat wrap : (fn [ptr<void>] ptr<void>)] : TouristOpts
-  (make-struct TouristOpts (default-server-opts) (some (server-wrap wrap))))
-
-;;; tourist-with -- like `tourist`, configured by a TouristOpts.
-;;;
-;;; The routes and use! / use-around! / use-after! items behave exactly as
-;;; under `tourist`; the opts add the server settings and the stdlib
-;;; middleware stack around all of it (see TouristOpts).
-;;;
-;;; Parameters:
-;;;   port  -- TCP port to bind on (0 = kernel-assigned; see server-port)
-;;;   opts  -- TouristOpts
-;;;   items -- mix of Route and Middleware handles from the DSL constructors
-;;;
-;;; Returns:
-;;;   :ptr<void> -- server handle for server-stop, or NULL on failure
-;;;
-;;; Example:
-;;;   (let [srv (tourist-with 8080
-;;;               (tourist-opts (fn [inner : ptr<void>] : ptr<void>
-;;;                               (compose-middleware inner mw-log mw-recover)))
-;;;               (get! "/" (fn [_] (text "hi"))))]
-;;;     (server-stop srv))
-;;;
-;;; Since: tourist-on-stdlib-httpd H4
-(defn tourist-with [port : int opts : TouristOpts & items : int] : ptr<void>
-  (let [wrap (.wrap opts)]
-    (__tourist-install (:: items :ItemList))
-    (if (some? wrap)
-      (server-start-wrapped port (__tourist-handler-ptr) (.server opts) (unwrap wrap))
-      (server-start-opts port (__tourist-handler-ptr) (.server opts)))))
-
-;;; tourist-conn-with -- like `tourist-conn`, configured by a TouristOpts.
-;;;
-;;; For apps with WebSocket routes (tourist-ws) that also want the stdlib
-;;; middleware stack.  An upgraded request leaves the middleware nothing to
-;;; decorate.
-;;;
-;;; Parameters:
-;;;   port  -- TCP port to bind on
-;;;   opts  -- TouristOpts
-;;;   items -- mix of Route and Middleware handles (including ws-route!)
-;;;
-;;; Returns:
-;;;   :ptr<void> -- server handle for server-stop, or NULL on failure
-;;;
-;;; Since: tourist-on-stdlib-httpd H4
-(defn tourist-conn-with [port : int opts : TouristOpts & items : int] : ptr<void>
-  (let [wrap (.wrap opts)]
-    (__tourist-install (:: items :ItemList))
-    (if (some? wrap)
-      (server-start-conn-wrapped port (__tourist-handler-conn-ptr) (.server opts) (unwrap wrap))
-      (server-start-conn-opts port (__tourist-handler-conn-ptr) (.server opts)))))
-
-) ;; end defmodule tourist/app
+  ;;; tourist-conn -- like `tourist`, but on httpd's Conn-aware listener.
+  ;;;
+  ;;; Use this instead of `tourist` when any route needs the underlying
+  ;;; connection -- in particular tourist-ws's ws-route!. Routes and middleware
+  ;;; are collected and dispatched exactly as for `tourist`; the only difference
+  ;;; is that the per-request Conn is available via tourist-request-conn.
+  ;;;
+  ;;; Parameters:
+  ;;;   port  -- TCP port to bind on.
+  ;;;   items -- mix of Route and Middleware handles from the DSL constructors
+  ;;;            (including ws-route! from tourist-ws).
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- server handle; pass to server-stop when done, or NULL on
+  ;;;                 bind/pool failure.
+  ;;;
+  ;;; Since: TOUR-V0
+  (defn tourist-conn [port : int & items : int] : ptr<void>
+    (do
+      (__tourist-install (:: items :ItemList))
+      (server-start-conn port (__tourist-handler-conn-ptr))))
+  ;; -- Options: server settings and a stdlib middleware stack (H4) -----------
+  ;;
+  ;; Express apps get most of their cross-cutting behaviour from connect
+  ;; middleware (`app.use(cors())`).  tourist's equivalent is stdlib httpd's
+  ;; middleware set, applied around tourist's whole dispatch through the `wrap`
+  ;; field: it runs before tourist builds the Ctx, so it sees every request,
+  ;; including the ones no route matches and the ones it answers itself (a
+  ;; CORS preflight, a 429), and after tourist's response is written, so it can
+  ;; decorate or replace it.  See the README's Middleware section for the
+  ;; Express package -> stdlib name table.
+  ;;; TouristOpts -- how tourist-with runs the server.
+  ;;;
+  ;;; Fields:
+  ;;;   server -- httpd's ServerOpts: worker count, body cap, read timeout
+  ;;;   wrap   -- (Option ServerWrap): a stdlib middleware stack around the
+  ;;;             app (see tourist-opts), or none
+  ;;;
+  ;;; A TouristOpts with a wrap starts one server: the wrap is called once and
+  ;;; released then, so build a fresh TouristOpts for each server.
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H4
+  (defstruct TouristOpts [server : ServerOpts wrap : (Option ServerWrap)])
+  ;;; default-tourist-opts -- `tourist`'s own settings: 8 workers, stdlib's
+  ;;; body cap and read timeout, and no middleware stack.
+  ;;;
+  ;;; Returns:
+  ;;;   TouristOpts
+  ;;;
+  ;;; Example:
+  ;;;   (tourist-with 8080 (default-tourist-opts) (get! "/" home))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H4
+  (defn default-tourist-opts [] : TouristOpts
+    (make-struct TouristOpts (default-server-opts) (none)))
+  ;;; tourist-opts -- the default settings with a stdlib middleware stack.
+  ;;;
+  ;;; `wrap` receives tourist's dispatch as a stdlib httpd handler -- the
+  ;;; `ptr<void>` every stdlib mw-* takes and returns -- and returns the
+  ;;; handler to serve, usually it inside compose-middleware (whose leftmost
+  ;;; layer is outermost).
+  ;;;
+  ;;; Parameters:
+  ;;;   wrap -- (fn [ptr<void>] ptr<void>), called once when the server starts
+  ;;;
+  ;;; Returns:
+  ;;;   TouristOpts
+  ;;;
+  ;;; Example:
+  ;;;   (tourist-with 8080
+  ;;;     (tourist-opts (fn [inner : ptr<void>] : ptr<void>
+  ;;;                     (compose-middleware inner mw-log mw-recover
+  ;;;                                         (mw-cors-opts cors))))
+  ;;;     (get! "/" home))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H4
+  (defn tourist-opts [^fat wrap : (fn [ptr<void>] ptr<void>)] : TouristOpts
+    (make-struct TouristOpts (default-server-opts) (some (server-wrap wrap))))
+  ;;; tourist-with -- like `tourist`, configured by a TouristOpts.
+  ;;;
+  ;;; The routes and use! / use-around! / use-after! items behave exactly as
+  ;;; under `tourist`; the opts add the server settings and the stdlib
+  ;;; middleware stack around all of it (see TouristOpts).
+  ;;;
+  ;;; Parameters:
+  ;;;   port  -- TCP port to bind on (0 = kernel-assigned; see server-port)
+  ;;;   opts  -- TouristOpts
+  ;;;   items -- mix of Route and Middleware handles from the DSL constructors
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- server handle for server-stop, or NULL on failure
+  ;;;
+  ;;; Example:
+  ;;;   (let [srv (tourist-with 8080
+  ;;;               (tourist-opts (fn [inner : ptr<void>] : ptr<void>
+  ;;;                               (compose-middleware inner mw-log mw-recover)))
+  ;;;               (get! "/" (fn [_] (text "hi"))))]
+  ;;;     (server-stop srv))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H4
+  (defn tourist-with [port : int opts : TouristOpts & items : int] : ptr<void>
+    (let [wrap (.wrap opts)]
+      (__tourist-install (:: items :ItemList))
+      (if (some? wrap)
+        (server-start-wrapped port
+          (__tourist-handler-ptr)
+          (.server opts)
+          (unwrap wrap))
+        (server-start-opts port (__tourist-handler-ptr) (.server opts)))))
+  ;;; tourist-conn-with -- like `tourist-conn`, configured by a TouristOpts.
+  ;;;
+  ;;; For apps with WebSocket routes (tourist-ws) that also want the stdlib
+  ;;; middleware stack.  An upgraded request leaves the middleware nothing to
+  ;;; decorate.
+  ;;;
+  ;;; Parameters:
+  ;;;   port  -- TCP port to bind on
+  ;;;   opts  -- TouristOpts
+  ;;;   items -- mix of Route and Middleware handles (including ws-route!)
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- server handle for server-stop, or NULL on failure
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H4
+  (defn tourist-conn-with [port : int opts : TouristOpts & items : int] : ptr<void>
+    (let [wrap (.wrap opts)]
+      (__tourist-install (:: items :ItemList))
+      (if (some? wrap)
+        (server-start-conn-wrapped port
+          (__tourist-handler-conn-ptr)
+          (.server opts)
+          (unwrap wrap))
+        (server-start-conn-opts port
+          (__tourist-handler-conn-ptr)
+          (.server opts)))))) ;; end defmodule tourist/app

@@ -19,302 +19,283 @@
   ;; also what brings the ambient DeltaCRDT methods into scope (C4).
   (import crdt/lattice :refer [map-merge-with])
   (import crdt/replica :refer [ReplicaId replica-sym])
-  (export GCounter gcounter-new gcounter-bump gcounter-value gcounter-replicas
-          gcounter-delta-bump
-          PNCounter pncounter-new pncounter-inc pncounter-dec pncounter-value
-          pncounter-replicas pncounter-delta-inc pncounter-delta-dec)
-
-;;; GCounter -- grow-only counter: per-replica totals.
-;;;
-;;; Since: crdt-spice-plan C1
-(defstruct GCounter [entries : int])
-
-;;; gcounter-new -- an empty G-Counter.
-;;;
-;;; Returns:
-;;;   A G-Counter with no replica entries; its value is 0.
-;;;
-;;; Example:
-;;;   (gcounter-new)
-;;;
-;;; Since: crdt-spice-plan C1
-(defn gcounter-new [] : GCounter
-  (GCounter (:: (map-new) int)))
-
-;;; gcounter-bump -- add to one replica's own total.
-;;;
-;;; Parameters:
-;;;   c -- the counter
-;;;   r -- the replica doing the increment
-;;;   n -- how much to add (non-negative; a G-Counter never decreases)
-;;;
-;;; Returns:
-;;;   A new G-Counter; the old one remains valid.
-;;;
-;;; Example:
-;;;   (gcounter-bump (gcounter-new) (replica (quote alice)) 3)
-;;;
-;;; Since: crdt-spice-plan C1
-;;
-;; Only the replica ITSELF may bump its slot.  That is what makes the pointwise
-;; max a correct merge: no two replicas ever write the same slot, so a
-;; disagreement about a slot is always "one of us has seen fewer updates", never
-;; a conflict.
-(defn gcounter-bump [c : GCounter r : ReplicaId n : int] : GCounter
-  (let [m   (:: (.entries c) (Map Sym int))
-        cur (if (map-has? m (replica-sym r)) (map-get m (replica-sym r)) 0)]
-    (GCounter (:: (map-assoc m (replica-sym r) (+ cur n)) int))))
-
-;;; gcounter-value -- the counter's reading.
-;;;
-;;; Parameters:
-;;;   c -- the counter
-;;;
-;;; Returns:
-;;;   The sum of every replica's total.
-;;;
-;;; Example:
-;;;   (gcounter-value c)   ; => 8
-;;;
-;;; Since: crdt-spice-plan C1
-;;
-;; NOT part of the lattice: join is how two states combine, and this is how one
-;; state is read.  Keeping them separate is why the join can stay idempotent.
-(defn gcounter-value [^borrow c : GCounter] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: (.entries c) (Map Sym int))))
-        s  (__sum-loop it 0)]
-    (hamt/iter-destroy! it)
-    s))
-
-;;; __sum-loop -- internal: sum the remaining iterator values into acc.
-(defn __sum-loop [it : ptr<void> acc : int] : int
-  (if (hamt/iter-advance! it)
-    (__sum-loop it (+ acc (:: (hamt/iter-cur-val it) int)))
-    acc))
-
-;;; gcounter-replicas -- how many replicas this counter has entries for.
-;;;
-;;; Parameters:
-;;;   c -- the counter
-;;;
-;;; Returns:
-;;;   The number of entries -- the counter's SIZE, as distinct from its value.
-;;;
-;;; Example:
-;;;   (gcounter-replicas c)   ; => 3
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; The reading a delta test needs: `gcounter-value` cannot tell a one-entry
-;; delta from a three-entry state that happens to sum the same, and "the delta
-;; is smaller than the state" is the entire claim C4 makes.
-(defn gcounter-replicas [^borrow c : GCounter] : int
-  (map-count (:: (.entries c) (Map Sym int))))
-
-;;; __imax -- internal: the larger of two ints.
-(defn __imax [x : int y : int] : int (if (< x y) y x))
-
-;;; JoinSemilattice [GCounter] -- pointwise maximum.
-(definstance JoinSemilattice [GCounter]
-  (join [x y]
-    (GCounter (map-merge-with (.entries x) (.entries y) __imax))))
-
-;;; BoundedJoin [GCounter] -- the empty counter is the least element.
-(definstance BoundedJoin [GCounter]
-  (bottom [] (gcounter-new)))
-
-;;; Eq [GCounter] -- equal readings and equal entry counts.
-;;
-;; Structural on the observable state.  A law suite wired to pointer identity
-;; would pass on everything, which is the trap the lattice plan's section 5
-;; names.
-(definstance Eq [GCounter]
-  (eq? [^borrow x ^borrow y]
-    (and (= (gcounter-value x) (gcounter-value y))
-         (= (map-count (:: (.entries x) (Map Sym int)))
-            (map-count (:: (.entries y) (Map Sym int)))))))
-
-;;; gcounter-delta-bump -- the DELTA of adding to one replica's own total.
-;;;
-;;; Parameters:
-;;;   c -- the counter, read for this replica's current total
-;;;   r -- the replica doing the increment
-;;;   n -- how much to add (non-negative)
-;;;
-;;; Returns:
-;;;   A one-entry G-Counter holding r's NEW total -- not the increment.
-;;;
-;;; Example:
-;;;   (gcounter-delta-bump c (replica (quote alice)) 3)
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; The new TOTAL, not the increment, because the join is pointwise max: a
-;; delta carrying `+3` would be wrong under duplicate delivery, and the whole
-;; reason a CRDT can tolerate an at-least-once link is that re-delivering a
-;; state changes nothing.  Carrying the total keeps `apply-delta` idempotent,
-;; which is what `delta-bump` buys over an increment message.
-;;
-;; `c` is read but not consumed, so a replica bumps its own state and mints the
-;; delta from the same value:
-;;
-;;   (let [d (gcounter-delta-bump c r 3)
-;;         c2 (gcounter-bump c r 3)] ...)
-;;
-;; and `(join c2 d)` equals `c2` -- the delta is below the state it came from.
-(defn gcounter-delta-bump [^borrow c : GCounter r : ReplicaId n : int] : GCounter
-  (let [m   (:: (.entries c) (Map Sym int))
-        cur (if (map-has? m (replica-sym r)) (map-get m (replica-sym r)) 0)]
-    (GCounter (:: (map-assoc (:: (map-new) (Map Sym int)) (replica-sym r) (+ cur n)) int))))
-
-;;; DeltaCRDT [GCounter] -- the delta is another G-Counter.
-;;
-;; `Delta = GCounter` is not a shortcut: the delta-state theorem says a delta
-;; is an element of the state lattice, and `delta-join` must be closed over
-;; deltas, so nothing smaller than "a G-Counter with fewer entries" is a delta
-;; at all.  What makes it cheap is that `gcounter-delta-bump` mints ONE entry
-;; where the state has one per replica.
-(definstance DeltaCRDT [GCounter]
-  (type Delta = GCounter)
-  (delta-bottom [x] (gcounter-new))
-  (delta-join   [x d e] (join d e))
-  (apply-delta  [x d] (join x d)))
-
-;;; PNCounter -- a counter that can decrease: increments and decrements apart.
-;;;
-;;; Since: crdt-spice-plan C1
-(defstruct PNCounter [pos : GCounter neg : GCounter])
-
-;;; pncounter-new -- an empty PN-Counter.
-;;;
-;;; Returns:
-;;;   A PN-Counter whose value is 0.
-;;;
-;;; Example:
-;;;   (pncounter-new)
-;;;
-;;; Since: crdt-spice-plan C1
-(defn pncounter-new [] : PNCounter
-  (PNCounter (gcounter-new) (gcounter-new)))
-
-;;; pncounter-inc -- increment on one replica.
-;;;
-;;; Parameters:
-;;;   c -- the counter
-;;;   r -- the replica
-;;;   n -- amount (non-negative)
-;;;
-;;; Returns:
-;;;   A new PN-Counter.
-;;;
-;;; Example:
-;;;   (pncounter-inc (pncounter-new) (replica (quote alice)) 5)
-;;;
-;;; Since: crdt-spice-plan C1
-(defn pncounter-inc [c : PNCounter r : ReplicaId n : int] : PNCounter
-  (PNCounter (gcounter-bump (.pos c) r n) (.neg c)))
-
-;;; pncounter-dec -- decrement on one replica.
-;;;
-;;; Parameters:
-;;;   c -- the counter
-;;;   r -- the replica
-;;;   n -- amount (non-negative; it is ADDED to the decrement half)
-;;;
-;;; Returns:
-;;;   A new PN-Counter.
-;;;
-;;; Example:
-;;;   (pncounter-dec (pncounter-new) (replica (quote bob)) 2)
-;;;
-;;; Since: crdt-spice-plan C1
-(defn pncounter-dec [c : PNCounter r : ReplicaId n : int] : PNCounter
-  (PNCounter (.pos c) (gcounter-bump (.neg c) r n)))
-
-;;; pncounter-value -- the counter's reading.
-;;;
-;;; Parameters:
-;;;   c -- the counter
-;;;
-;;; Returns:
-;;;   increments minus decrements.
-;;;
-;;; Example:
-;;;   (pncounter-value c)   ; => 3
-;;;
-;;; Since: crdt-spice-plan C1
-(defn pncounter-value [^borrow c : PNCounter] : int
-  (- (gcounter-value (.pos c)) (gcounter-value (.neg c))))
-
-;;; JoinSemilattice [PNCounter] -- join each half.
-(definstance JoinSemilattice [PNCounter]
-  (join [x y]
-    (PNCounter (join (.pos x) (.pos y)) (join (.neg x) (.neg y)))))
-
-;;; BoundedJoin [PNCounter] -- both halves empty.
-(definstance BoundedJoin [PNCounter]
-  (bottom [] (pncounter-new)))
-
-;;; Eq [PNCounter] -- equal on both halves.
-(definstance Eq [PNCounter]
-  (eq? [^borrow x ^borrow y]
-    (and (eq? (.pos x) (.pos y)) (eq? (.neg x) (.neg y)))))
-
-;;; pncounter-replicas -- how many entries both halves hold together.
-;;;
-;;; Parameters:
-;;;   c -- the counter
-;;;
-;;; Returns:
-;;;   The size of the state, for comparison against a delta's.
-;;;
-;;; Example:
-;;;   (pncounter-replicas c)   ; => 4
-;;;
-;;; Since: crdt-spice-plan C4
-(defn pncounter-replicas [^borrow c : PNCounter] : int
-  (+ (gcounter-replicas (.pos c)) (gcounter-replicas (.neg c))))
-
-;;; pncounter-delta-inc -- the DELTA of an increment on one replica.
-;;;
-;;; Parameters:
-;;;   c -- the counter
-;;;   r -- the replica
-;;;   n -- amount (non-negative)
-;;;
-;;; Returns:
-;;;   A PN-Counter whose increment half holds one entry and whose decrement
-;;;   half is empty.
-;;;
-;;; Example:
-;;;   (pncounter-delta-inc c (replica (quote alice)) 5)
-;;;
-;;; Since: crdt-spice-plan C4
-(defn pncounter-delta-inc [^borrow c : PNCounter r : ReplicaId n : int] : PNCounter
-  (PNCounter (gcounter-delta-bump (.pos c) r n) (gcounter-new)))
-
-;;; pncounter-delta-dec -- the DELTA of a decrement on one replica.
-;;;
-;;; Parameters:
-;;;   c -- the counter
-;;;   r -- the replica
-;;;   n -- amount (non-negative; it lands in the decrement half)
-;;;
-;;; Returns:
-;;;   A PN-Counter whose decrement half holds one entry.
-;;;
-;;; Example:
-;;;   (pncounter-delta-dec c (replica (quote bob)) 2)
-;;;
-;;; Since: crdt-spice-plan C4
-(defn pncounter-delta-dec [^borrow c : PNCounter r : ReplicaId n : int] : PNCounter
-  (PNCounter (gcounter-new) (gcounter-delta-bump (.neg c) r n)))
-
-;;; DeltaCRDT [PNCounter] -- the delta is another PN-Counter, one half empty.
-(definstance DeltaCRDT [PNCounter]
-  (type Delta = PNCounter)
-  (delta-bottom [x] (pncounter-new))
-  (delta-join   [x d e] (join d e))
-  (apply-delta  [x d] (join x d)))
-
-) ;; end defmodule crdt/counter
+  (export GCounter
+    gcounter-new
+    gcounter-bump
+    gcounter-value
+    gcounter-replicas
+    gcounter-delta-bump
+    PNCounter
+    pncounter-new
+    pncounter-inc
+    pncounter-dec
+    pncounter-value
+    pncounter-replicas
+    pncounter-delta-inc
+    pncounter-delta-dec)
+  ;;; GCounter -- grow-only counter: per-replica totals.
+  ;;;
+  ;;; Since: crdt-spice-plan C1
+  (defstruct GCounter [entries : int])
+  ;;; gcounter-new -- an empty G-Counter.
+  ;;;
+  ;;; Returns:
+  ;;;   A G-Counter with no replica entries; its value is 0.
+  ;;;
+  ;;; Example:
+  ;;;   (gcounter-new)
+  ;;;
+  ;;; Since: crdt-spice-plan C1
+  (defn gcounter-new [] : GCounter (GCounter (:: (map-new) int)))
+  ;;; gcounter-bump -- add to one replica's own total.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the counter
+  ;;;   r -- the replica doing the increment
+  ;;;   n -- how much to add (non-negative; a G-Counter never decreases)
+  ;;;
+  ;;; Returns:
+  ;;;   A new G-Counter; the old one remains valid.
+  ;;;
+  ;;; Example:
+  ;;;   (gcounter-bump (gcounter-new) (replica (quote alice)) 3)
+  ;;;
+  ;;; Since: crdt-spice-plan C1
+  ;;
+  ;; Only the replica ITSELF may bump its slot.  That is what makes the pointwise
+  ;; max a correct merge: no two replicas ever write the same slot, so a
+  ;; disagreement about a slot is always "one of us has seen fewer updates", never
+  ;; a conflict.
+  (defn gcounter-bump [c : GCounter r : ReplicaId n : int] : GCounter
+    (let [m   (:: (.entries c) (Map Sym int))
+          cur (if (map-has? m (replica-sym r)) (map-get m (replica-sym r)) 0)]
+      (GCounter (:: (map-assoc m (replica-sym r) (+ cur n)) int))))
+  ;;; gcounter-value -- the counter's reading.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the counter
+  ;;;
+  ;;; Returns:
+  ;;;   The sum of every replica's total.
+  ;;;
+  ;;; Example:
+  ;;;   (gcounter-value c)   ; => 8
+  ;;;
+  ;;; Since: crdt-spice-plan C1
+  ;;
+  ;; NOT part of the lattice: join is how two states combine, and this is how one
+  ;; state is read.  Keeping them separate is why the join can stay idempotent.
+  (defn gcounter-value [^borrow c : GCounter] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: (.entries c) (Map Sym int))))
+          s  (__sum-loop it 0)]
+      (hamt/iter-destroy! it)
+      s))
+  ;;; __sum-loop -- internal: sum the remaining iterator values into acc.
+  (defn __sum-loop [it : ptr<void> acc : int] : int
+    (if (hamt/iter-advance! it)
+      (__sum-loop it (+ acc (:: (hamt/iter-cur-val it) int)))
+      acc))
+  ;;; gcounter-replicas -- how many replicas this counter has entries for.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the counter
+  ;;;
+  ;;; Returns:
+  ;;;   The number of entries -- the counter's SIZE, as distinct from its value.
+  ;;;
+  ;;; Example:
+  ;;;   (gcounter-replicas c)   ; => 3
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; The reading a delta test needs: `gcounter-value` cannot tell a one-entry
+  ;; delta from a three-entry state that happens to sum the same, and "the delta
+  ;; is smaller than the state" is the entire claim C4 makes.
+  (defn gcounter-replicas [^borrow c : GCounter] : int
+    (map-count (:: (.entries c) (Map Sym int))))
+  ;;; __imax -- internal: the larger of two ints.
+  (defn __imax [x : int y : int] : int (if (< x y) y x))
+  ;;; JoinSemilattice [GCounter] -- pointwise maximum.
+  (definstance JoinSemilattice [GCounter]
+    (join [x y] (GCounter (map-merge-with (.entries x) (.entries y) __imax))))
+  ;;; BoundedJoin [GCounter] -- the empty counter is the least element.
+  (definstance BoundedJoin [GCounter] (bottom [] (gcounter-new)))
+  ;;; Eq [GCounter] -- equal readings and equal entry counts.
+  ;;
+  ;; Structural on the observable state.  A law suite wired to pointer identity
+  ;; would pass on everything, which is the trap the lattice plan's section 5
+  ;; names.
+  (definstance Eq [GCounter]
+    (eq? [^borrow x ^borrow y]
+      (and (= (gcounter-value x) (gcounter-value y))
+        (= (map-count (:: (.entries x) (Map Sym int)))
+          (map-count (:: (.entries y) (Map Sym int)))))))
+  ;;; gcounter-delta-bump -- the DELTA of adding to one replica's own total.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the counter, read for this replica's current total
+  ;;;   r -- the replica doing the increment
+  ;;;   n -- how much to add (non-negative)
+  ;;;
+  ;;; Returns:
+  ;;;   A one-entry G-Counter holding r's NEW total -- not the increment.
+  ;;;
+  ;;; Example:
+  ;;;   (gcounter-delta-bump c (replica (quote alice)) 3)
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; The new TOTAL, not the increment, because the join is pointwise max: a
+  ;; delta carrying `+3` would be wrong under duplicate delivery, and the whole
+  ;; reason a CRDT can tolerate an at-least-once link is that re-delivering a
+  ;; state changes nothing.  Carrying the total keeps `apply-delta` idempotent,
+  ;; which is what `delta-bump` buys over an increment message.
+  ;;
+  ;; `c` is read but not consumed, so a replica bumps its own state and mints the
+  ;; delta from the same value:
+  ;;
+  ;;   (let [d (gcounter-delta-bump c r 3)
+  ;;         c2 (gcounter-bump c r 3)] ...)
+  ;;
+  ;; and `(join c2 d)` equals `c2` -- the delta is below the state it came from.
+  (defn gcounter-delta-bump [^borrow c : GCounter r : ReplicaId n : int] : GCounter
+    (let [m   (:: (.entries c) (Map Sym int))
+          cur (if (map-has? m (replica-sym r)) (map-get m (replica-sym r)) 0)]
+      (GCounter (:: (map-assoc (:: (map-new) (Map Sym int))
+                      (replica-sym r)
+                      (+ cur n))
+                  int))))
+  ;;; DeltaCRDT [GCounter] -- the delta is another G-Counter.
+  ;;
+  ;; `Delta = GCounter` is not a shortcut: the delta-state theorem says a delta
+  ;; is an element of the state lattice, and `delta-join` must be closed over
+  ;; deltas, so nothing smaller than "a G-Counter with fewer entries" is a delta
+  ;; at all.  What makes it cheap is that `gcounter-delta-bump` mints ONE entry
+  ;; where the state has one per replica.
+  (definstance DeltaCRDT [GCounter]
+    (type Delta = GCounter)
+    (delta-bottom [x] (gcounter-new))
+    (delta-join [x d e] (join d e))
+    (apply-delta [x d] (join x d)))
+  ;;; PNCounter -- a counter that can decrease: increments and decrements apart.
+  ;;;
+  ;;; Since: crdt-spice-plan C1
+  (defstruct PNCounter [pos : GCounter neg : GCounter])
+  ;;; pncounter-new -- an empty PN-Counter.
+  ;;;
+  ;;; Returns:
+  ;;;   A PN-Counter whose value is 0.
+  ;;;
+  ;;; Example:
+  ;;;   (pncounter-new)
+  ;;;
+  ;;; Since: crdt-spice-plan C1
+  (defn pncounter-new [] : PNCounter (PNCounter (gcounter-new) (gcounter-new)))
+  ;;; pncounter-inc -- increment on one replica.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the counter
+  ;;;   r -- the replica
+  ;;;   n -- amount (non-negative)
+  ;;;
+  ;;; Returns:
+  ;;;   A new PN-Counter.
+  ;;;
+  ;;; Example:
+  ;;;   (pncounter-inc (pncounter-new) (replica (quote alice)) 5)
+  ;;;
+  ;;; Since: crdt-spice-plan C1
+  (defn pncounter-inc [c : PNCounter r : ReplicaId n : int] : PNCounter
+    (PNCounter (gcounter-bump (.pos c) r n) (.neg c)))
+  ;;; pncounter-dec -- decrement on one replica.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the counter
+  ;;;   r -- the replica
+  ;;;   n -- amount (non-negative; it is ADDED to the decrement half)
+  ;;;
+  ;;; Returns:
+  ;;;   A new PN-Counter.
+  ;;;
+  ;;; Example:
+  ;;;   (pncounter-dec (pncounter-new) (replica (quote bob)) 2)
+  ;;;
+  ;;; Since: crdt-spice-plan C1
+  (defn pncounter-dec [c : PNCounter r : ReplicaId n : int] : PNCounter
+    (PNCounter (.pos c) (gcounter-bump (.neg c) r n)))
+  ;;; pncounter-value -- the counter's reading.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the counter
+  ;;;
+  ;;; Returns:
+  ;;;   increments minus decrements.
+  ;;;
+  ;;; Example:
+  ;;;   (pncounter-value c)   ; => 3
+  ;;;
+  ;;; Since: crdt-spice-plan C1
+  (defn pncounter-value [^borrow c : PNCounter] : int
+    (- (gcounter-value (.pos c)) (gcounter-value (.neg c))))
+  ;;; JoinSemilattice [PNCounter] -- join each half.
+  (definstance JoinSemilattice [PNCounter]
+    (join [x y] (PNCounter (join (.pos x) (.pos y)) (join (.neg x) (.neg y)))))
+  ;;; BoundedJoin [PNCounter] -- both halves empty.
+  (definstance BoundedJoin [PNCounter] (bottom [] (pncounter-new)))
+  ;;; Eq [PNCounter] -- equal on both halves.
+  (definstance Eq [PNCounter]
+    (eq? [^borrow x ^borrow y]
+      (and (eq? (.pos x) (.pos y)) (eq? (.neg x) (.neg y)))))
+  ;;; pncounter-replicas -- how many entries both halves hold together.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the counter
+  ;;;
+  ;;; Returns:
+  ;;;   The size of the state, for comparison against a delta's.
+  ;;;
+  ;;; Example:
+  ;;;   (pncounter-replicas c)   ; => 4
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  (defn pncounter-replicas [^borrow c : PNCounter] : int
+    (+ (gcounter-replicas (.pos c)) (gcounter-replicas (.neg c))))
+  ;;; pncounter-delta-inc -- the DELTA of an increment on one replica.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the counter
+  ;;;   r -- the replica
+  ;;;   n -- amount (non-negative)
+  ;;;
+  ;;; Returns:
+  ;;;   A PN-Counter whose increment half holds one entry and whose decrement
+  ;;;   half is empty.
+  ;;;
+  ;;; Example:
+  ;;;   (pncounter-delta-inc c (replica (quote alice)) 5)
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  (defn pncounter-delta-inc [^borrow c : PNCounter r : ReplicaId n : int] : PNCounter
+    (PNCounter (gcounter-delta-bump (.pos c) r n) (gcounter-new)))
+  ;;; pncounter-delta-dec -- the DELTA of a decrement on one replica.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the counter
+  ;;;   r -- the replica
+  ;;;   n -- amount (non-negative; it lands in the decrement half)
+  ;;;
+  ;;; Returns:
+  ;;;   A PN-Counter whose decrement half holds one entry.
+  ;;;
+  ;;; Example:
+  ;;;   (pncounter-delta-dec c (replica (quote bob)) 2)
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  (defn pncounter-delta-dec [^borrow c : PNCounter r : ReplicaId n : int] : PNCounter
+    (PNCounter (gcounter-new) (gcounter-delta-bump (.neg c) r n)))
+  ;;; DeltaCRDT [PNCounter] -- the delta is another PN-Counter, one half empty.
+  (definstance DeltaCRDT [PNCounter]
+    (type Delta = PNCounter)
+    (delta-bottom [x] (pncounter-new))
+    (delta-join [x d e] (join d e))
+    (apply-delta [x d] (join x d)))) ;; end defmodule crdt/counter

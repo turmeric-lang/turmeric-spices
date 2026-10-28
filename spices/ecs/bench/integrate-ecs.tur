@@ -16,94 +16,88 @@
 ;; is consumed (printed) so the integration loop cannot be optimised away,
 ;; and is compared against the C baseline's to confirm both programs did
 ;; the same arithmetic.
-
 (defmodule integrate_ecs_bench
   (export)
-
-(import ecs/entity  :refer [Slot slot-new entity-index])
-(import ecs/storage :refer [dense-new dense-set! dense-get])
-(import ecs/world   :refer [defcomponent defworld world-alloc-entity!])
-(import ecs/query   :refer [for-each2])
-
-(defstruct Pos [x : float y : float])
-(defstruct Vel [x : float y : float])
-
-(defcomponent Pos)
-(defcomponent Vel)
-
-(defworld GameWorld [Pos Vel])
-
-(def N      100000)
-(def FRAMES 100)
-(def DT     0.25)
-
-;; Local int->float so the benchmark stays self-contained (stdlib/math is
-;; not auto-loaded, and pulling it in would put stdlib code in the timed
-;; program's translation unit).
-(defn i->f [i : int] : float
-  ```c
-  return (double)i;
+  (import ecs/entity :refer [Slot slot-new entity-index])
+  (import ecs/storage :refer [dense-new dense-set! dense-get])
+  (import ecs/world :refer [defcomponent defworld world-alloc-entity!])
+  (import ecs/query :refer [for-each2])
+  (defstruct Pos [x : float y : float])
+  (defstruct Vel [x : float y : float])
+  (defcomponent Pos)
+  (defcomponent Vel)
+  (defworld GameWorld [Pos Vel])
+  (def N 100000)
+  (def FRAMES 100)
+  (def DT 0.25)
+  ;; Local int->float so the benchmark stays self-contained (stdlib/math is
+  ;; not auto-loaded, and pulling it in would put stdlib code in the timed
+  ;; program's translation unit).
+  (defn i->f [i : int] : float
+    ```c
+    return (double)i;
   ```)
-
-;; Checksum scaled to an integer so every variant and the C baseline can
-;; be compared for EXACT equality -- `println` on a float prints
-;; ~6 significant digits (1.87748e+09), which would hide a real
-;; divergence between the ECS path and the hand-rolled one.
-(defn checksum [sum : float] : int
-  ```c
-  return (int64_t)(sum * 100.0);
+  ;; Checksum scaled to an integer so every variant and the C baseline can
+  ;; be compared for EXACT equality -- `println` on a float prints
+  ;; ~6 significant digits (1.87748e+09), which would hide a real
+  ;; divergence between the ECS path and the hand-rolled one.
+  (defn checksum [sum : float] : int
+    ```c
+    return (int64_t)(sum * 100.0);
   ```)
-
-(defn now-us [] : int
-  ```c
-  #include <time.h>
+  (defn now-us [] : int
+    ```c
+    #include <time.h>
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
   ```)
-
-(defn main [] : int
-  (let [w (make-struct GameWorld
-                       (vec-new)
-                       (:: (dense-new) (Storage Pos))
-                       (:: (dense-new) (Storage Vel)))]
-    (do
-      ;; Spawn N entities. Entity i starts at Pos (i/8, i/4) with a
-      ;; fractional velocity so every frame moves a non-integral amount.
-      (let [^mut i 0]
-        (while (< i N)
-          (let [e (world-alloc-entity! (.gens w))
-                f (i->f i)]
-            (dense-set! (.Pos w) (entity-index e)
-                        (make-struct Pos (/ f 8.0) (/ f 4.0)))
-            (dense-set! (.Vel w) (entity-index e)
-                        (make-struct Vel 1.5 -0.5)))
-          (set! i (+ i 1))))
-
-      ;; Timed region: FRAMES passes of Pos += Vel * DT over the query.
-      (let [t0 (now-us)]
-        (do
-          (let [^mut frame 0]
-            (while (< frame FRAMES)
+  (defn main [] : int
+    (let [w (make-struct GameWorld
+              (vec-new)
+              (:: (dense-new) (Storage Pos))
+              (:: (dense-new) (Storage Vel)))]
+      (do
+        ;; Spawn N entities. Entity i starts at Pos (i/8, i/4) with a
+        ;; fractional velocity so every frame moves a non-integral amount.
+        (let [^mut i 0]
+          (while (< i N)
+            (let [e (world-alloc-entity! (.gens w))
+                  f (i->f i)]
+              (dense-set! (.Pos w)
+                (entity-index e)
+                (make-struct Pos (/ f 8.0) (/ f 4.0)))
+              (dense-set! (.Vel w) (entity-index e) (make-struct Vel 1.5 -0.5)))
+            (set! i (+ i 1))))
+        ;; Timed region: FRAMES passes of Pos += Vel * DT over the query.
+        (let [t0 (now-us)]
+          (do
+            (let [^mut frame 0]
+              (while (< frame FRAMES)
+                (do
+                  (for-each2 w
+                    Pos
+                    Vel
+                    e
+                    p
+                    v
+                    (dense-set! (.Pos w)
+                      e
+                      (make-struct Pos
+                        (+ (.x p) (* (.x v) DT))
+                        (+ (.y p) (* (.y v) DT)))))
+                  (set! frame (+ frame 1)))))
+            (let [t1       (now-us)
+                  ;; Checksum: sum of every entity's Pos.x + Pos.y. Printed,
+                  ;; so the loop above is load-bearing and cannot be elided.
+                  ^mut sum 0.0
+                  ^mut j   0]
               (do
-                (for-each2 w Pos Vel e p v
-                  (dense-set! (.Pos w) e
-                              (make-struct Pos
-                                           (+ (.x p) (* (.x v) DT))
-                                           (+ (.y p) (* (.y v) DT)))))
-                (set! frame (+ frame 1)))))
-          (let [t1      (now-us)
-                ;; Checksum: sum of every entity's Pos.x + Pos.y. Printed,
-                ;; so the loop above is load-bearing and cannot be elided.
-                ^mut sum 0.0
-                ^mut j   0]
-            (do
-              (while (< j N)
-                (let [p : Pos (dense-get (.Pos w) (slot-new j))]
-                  (set! sum (+ sum (+ (.x p) (.y p)))))
-                (set! j (+ j 1)))
-              (println (- t1 t0))
-              (println (checksum sum))
-              0)))))))
-
-) ;; end defmodule integrate_ecs_bench
+                (while (< j N)
+                  (let [p                                 : Pos
+                        (dense-get (.Pos w) (slot-new j))]
+                    (set! sum (+ sum (+ (.x p) (.y p)))))
+                  (set! j (+ j 1)))
+                (println (- t1 t0))
+                (println (checksum sum))
+                0)))))))) ;; end defmodule integrate_ecs_bench

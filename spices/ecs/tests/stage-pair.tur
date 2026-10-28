@@ -12,98 +12,85 @@
 ;;   2000               -- parallel total
 ;;   conflict-check-ok
 ;;   ok
-
 (defmodule stage_pair_test
   (export)
-
-(import ecs/system :refer [System make-system system-conflicts? cid-bit defsystem])
-(import ecs/cap    :refer [WriteCap ReadCap make-write-cap make-read-cap use-cap!])
-(import ecs/stage  :refer [stage-run-seq stage-run-pair-parallel])
-
-;; Component IDs follow the I3 `<Comp>-cid` titlecase convention so
-;; defsystem can derive them from the comp-name vectors.  (E2/E1 tests
-;; used lowercase pos-cid; migrated as part of the I3 surface flip.)
-(defstruct Pos [x : int])
-(defstruct Vel [x : int])
-(defstruct Hp  [x : int])
-
-(def Pos-cid 0)
-(def Vel-cid 1)
-(def Hp-cid  2)
-
-;; Heap-allocated accumulator + mutex-protected helpers. Each system
-;; body bumps the same int64_t through accum-add! so the final value
-;; reflects both runs regardless of which thread saw which increments.
-(defn make-accum [] : ptr<void>
-  ```c
-  #include <stdlib.h>
+  (import ecs/system
+    :refer
+    [System make-system system-conflicts? cid-bit defsystem])
+  (import ecs/cap
+    :refer
+    [WriteCap ReadCap make-write-cap make-read-cap use-cap!])
+  (import ecs/stage :refer [stage-run-seq stage-run-pair-parallel])
+  ;; Component IDs follow the I3 `<Comp>-cid` titlecase convention so
+  ;; defsystem can derive them from the comp-name vectors.  (E2/E1 tests
+  ;; used lowercase pos-cid; migrated as part of the I3 surface flip.)
+  (defstruct Pos [x : int])
+  (defstruct Vel [x : int])
+  (defstruct Hp [x : int])
+  (def Pos-cid 0)
+  (def Vel-cid 1)
+  (def Hp-cid 2)
+  ;; Heap-allocated accumulator + mutex-protected helpers. Each system
+  ;; body bumps the same int64_t through accum-add! so the final value
+  ;; reflects both runs regardless of which thread saw which increments.
+  (defn make-accum [] : ptr<void>
+    ```c
+    #include <stdlib.h>
   int64_t *p = (int64_t *)calloc(1, sizeof(int64_t));
   return p;
   ```)
-
-(defn accum-read [p : ptr<void>] : int
-  ```c
-  return *(int64_t *)p;
+  (defn accum-read [p : ptr<void>] : int
+    ```c
+    return *(int64_t *)p;
   ```)
-
-(defn accum-add! [p : ptr<void> delta : int] : nil
-  ```c
-  #include <pthread.h>
+  (defn accum-add! [p : ptr<void> delta : int] : nil
+    ```c
+    #include <pthread.h>
   static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
   pthread_mutex_lock(&mu);
   *(int64_t *)p += delta;
   pthread_mutex_unlock(&mu);
   ```)
-
-(defn accum-reset! [p : ptr<void>] : nil
-  ```c
-  #include <pthread.h>
+  (defn accum-reset! [p : ptr<void>] : nil
+    ```c
+    #include <pthread.h>
   static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
   pthread_mutex_lock(&mu);
   *(int64_t *)p = 0;
   pthread_mutex_unlock(&mu);
   ```)
-
-;; Two systems via the defsystem macro. Each expansion emits both
-;; <name>-impl (the body) and <name> (the System struct holding the
-;; fn-ptr and masks). Masks are disjoint so the parallel scheduler
-;; can run them concurrently.
-(defsystem physics
-  [Pos]                           ;; reads
-  [Pos]                           ;; writes
-  (let [^mut i 0]
-    (while (< i 500)
-      (accum-add! (:: w :ptr<void>) 1)
-      (set! i (+ i 1)))))
-
-(defsystem render
-  [Hp]                            ;; reads
-  [Hp]                            ;; writes
-  (let [^mut i 0]
-    (while (< i 1500)
-      (accum-add! (:: w :ptr<void>) 1)
-      (set! i (+ i 1)))))
-
-(defn main [] : int
-  (let [accum (make-accum)
-        world (:: accum :int)]
-    ;; Sequential run.
-    (accum-reset! accum)
-    (stage-run-seq physics render world)
-    (let [seq-total (accum-read accum)]
-      (println seq-total)                       ;; expect 2000
-      ;; Reset, then parallel run -- non-conflicting masks.
+  ;; Two systems via the defsystem macro. Each expansion emits both
+  ;; <name>-impl (the body) and <name> (the System struct holding the
+  ;; fn-ptr and masks). Masks are disjoint so the parallel scheduler
+  ;; can run them concurrently.
+  (defsystem physics
+    [Pos] ;; reads
+    [Pos] ;; writes
+    (let [^mut i 0]
+      (while (< i 500) (accum-add! (:: w :ptr<void>) 1) (set! i (+ i 1)))))
+  (defsystem render
+    [Hp] ;; reads
+    [Hp] ;; writes
+    (let [^mut i 0]
+      (while (< i 1500) (accum-add! (:: w :ptr<void>) 1) (set! i (+ i 1)))))
+  (defn main [] : int
+    (let [accum (make-accum)
+          world (:: accum :int)]
+      ;; Sequential run.
       (accum-reset! accum)
-      (stage-run-pair-parallel physics render world)
-      (let [par-total (accum-read accum)]
-        (println par-total)                     ;; expect 2000
-        (if (system-conflicts? physics render)
-          (println "conflict-check-broken")
-          (println "conflict-check-ok"))
-        (if (and (= seq-total 2000)
-                 (and (= par-total 2000)
-                      (not (system-conflicts? physics render))))
-          (do (println "ok") 0)
-          (do (println "FAIL") 1))))))
-
-) ;; end defmodule stage_pair_test
+      (stage-run-seq physics render world)
+      (let [seq-total (accum-read accum)]
+        (println seq-total) ;; expect 2000
+        ;; Reset, then parallel run -- non-conflicting masks.
+        (accum-reset! accum)
+        (stage-run-pair-parallel physics render world)
+        (let [par-total (accum-read accum)]
+          (println par-total) ;; expect 2000
+          (if (system-conflicts? physics render)
+            (println "conflict-check-broken")
+            (println "conflict-check-ok"))
+          (if (and (= seq-total 2000)
+                (and (= par-total 2000)
+                  (not (system-conflicts? physics render))))
+            (do (println "ok") 0)
+            (do (println "FAIL") 1))))))) ;; end defmodule stage_pair_test

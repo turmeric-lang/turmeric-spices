@@ -27,107 +27,128 @@
 ;;; mirroring `ecs/world`'s E2d-P5b `defworld` collapse.
 ;;;
 ;;; Since: E2c slice 3 -- see docs/upcoming/ecs-sized-world-plan.md.
-
 (defmodule ecs/sized-world
-  (export sized-defworld sized-defworld-mono
-          sized-defworld-copy-into sized-defworld-world-resize
-          sized-defcomponent-accessors sized-defcomponent-accessors-mono
-          sized-defsystem sized-defsystem-scheduled
-          sized-state-new sized-state-free sized-state-copy-into
-          sized-live sized-cap
-          WorldFull WorldState
-          sized-spawn! sized-spawn sized-despawn
-          sized-alive? sized-slot-generation)
-
-(import ecs/sized-storage :refer [SizedDense sized-dense-new
-                                   sized-dense-get sized-dense-set!
-                                   sized-dense-has?])
-(import ecs/cap           :refer [WriteCap ReadCap
-                                   make-write-cap make-read-cap use-cap!])
-(import ecs/system        :refer [make-system defsystem--mask
-                                   defsystem--with-read-caps
-                                   defsystem--with-write-caps
-                                   defsystem--consume-write-caps])
-(import ecs/entity        :refer [Entity Slot Generation
-                                   entity-new entity-index entity-generation
-                                   slot->int generation->int
-                                   slot-new generation-new])
-
-;;; WorldState -- opaque handle to a sized world's malloc'd control block
-;;; (the `__ecs_state` struct: next / live / cap counters, free-list, and
-;;; per-slot generation array). Rides the int64 carrier like every other
-;;; handle here, but is a distinct newtype so the state cell can no longer
-;;; be confused with a slot index, an entity, or any other int on the
-;;; sized-world surface. The `__sized-state-*-raw` inline-C helpers stay
-;;; `:int` internally (they cast the carrier to `__ecs_state *`); the
-;;; typed wrappers below unwrap `WorldState` to the raw carrier with
-;;; `worldstate->int` at the boundary.
-;;;
-;;; Since: RE0
-(defopaque WorldState :int)
-
-;;; worldstate->int -- recover the raw carrier behind a `WorldState`, for
-;;; handing to the `__sized-state-*-raw` inline-C helpers.
-;;; Since: RE0
-(defn worldstate->int [s : WorldState] : int
-  (:: s :int))
-
-;; Slice 4 shipped the panicking `sized-spawn!`; slice 12 adds the
-;; design plan's fallible `sized-spawn : ... -> (Result int WorldFull)`
-;; (Q3). The fallible variant was previously deferred behind the M3
-;; struct-carrier path, but Track A's audit refresh (parallel-tracks.md
-;; "Not a blocker") establishes that a spice surface returning
-;; `(Result T E)` over primitive (int-carried) payloads -- which both
-;; the ok-arm `int` entity and the `WorldFull` marker are -- monomorphizes
-;; by-value and is not M3-gated. Callers pick the panicking or the
-;; result-returning variant per call site.
-
-;; ===== Slice 4 / 4b / 4c -- spawn / despawn over a state cell =====
-;;
-;; The world struct holds a `state : int` field carrying a malloc'd
-;; control block:
-;;
-;;   typedef struct {
-;;     int64_t next;          // high-water mark of fresh slot ids handed out
-;;     int64_t live;          // current live entity count
-;;     int64_t cap;           // runtime image of the type-level `n`
-;;     int64_t *fl_data;      // free-list buffer (slots ready for reuse)
-;;     int64_t  fl_len;       // count of slots currently on the free-list
-;;     int64_t  fl_cap;       // capacity of fl_data
-;;     int64_t *gens;         // generation counter per slot (size = cap)
-;;   } __ecs_state;
-;;
-;; Slice 4b added free-list-based slot reuse: `sized-despawn` takes the
-;; slot id and pushes it onto the free-list; `sized-spawn!` pops from
-;; the free-list before reaching for a fresh slot. `next` is the
-;; monotonic high-water mark of fresh ids -- once `next == cap` all
-;; further spawns must come through the free-list, so a world that
-;; recycles slots can run indefinitely within its capacity. The
-;; free-list grows on push and is freed alongside the state cell;
-;; total memory stays O(cap).
-;;
-;; Slice 4c lifts the world's surface from bare slot ints to the
-;; packed generational `Entity` handle that `ecs/entity` already
-;; defines: `sized-spawn!` returns `(entity-new slot gen)`,
-;; `sized-despawn` takes the `Entity`, and `sized-alive?` answers
-;; the use-after-despawn question. The generation counter for each
-;; slot is bumped on despawn, so a stale handle that names the
-;; original (idx, gen) no longer matches `gens[idx]` once the slot
-;; is recycled -- the application-surface safety net the unsized
-;; `ecs/world` has provided since E0, now uniform across both
-;; worlds. The `gens` array is cap-sized at construction (one
-;; `calloc(cap, sizeof(int64_t))`) and freed alongside the state
-;; cell; memory stays O(cap).
-;;
-;; Slice 12 lifts the fallible-spawn type story to a real
-;; `sized-spawn : ... -> (Result int WorldFull)` (see `sized-spawn`
-;; below). The panicking `sized-spawn!` is retained for benchmark /
-;; demo paths where the ergonomic hit of unwrapping a Result is not
-;; wanted (sized-world plan Q3 ships both variants).
-
-(defn __sized-state-new-raw [k : int] #fx{Unsafe} : int
-  ```c
-  #include <stdlib.h>
+  (export sized-defworld
+    sized-defworld-mono
+    sized-defworld-copy-into
+    sized-defworld-world-resize
+    sized-defcomponent-accessors
+    sized-defcomponent-accessors-mono
+    sized-defsystem
+    sized-defsystem-scheduled
+    sized-state-new
+    sized-state-free
+    sized-state-copy-into
+    sized-live
+    sized-cap
+    WorldFull
+    WorldState
+    sized-spawn!
+    sized-spawn
+    sized-despawn
+    sized-alive?
+    sized-slot-generation)
+  (import ecs/sized-storage
+    :refer
+    [SizedDense
+     sized-dense-new
+     sized-dense-get
+     sized-dense-set!
+     sized-dense-has?])
+  (import ecs/cap
+    :refer
+    [WriteCap ReadCap make-write-cap make-read-cap use-cap!])
+  (import ecs/system
+    :refer
+    [make-system
+     defsystem--mask
+     defsystem--with-read-caps
+     defsystem--with-write-caps
+     defsystem--consume-write-caps])
+  (import ecs/entity
+    :refer
+    [Entity
+     Slot
+     Generation
+     entity-new
+     entity-index
+     entity-generation
+     slot->int
+     generation->int
+     slot-new
+     generation-new])
+  ;;; WorldState -- opaque handle to a sized world's malloc'd control block
+  ;;; (the `__ecs_state` struct: next / live / cap counters, free-list, and
+  ;;; per-slot generation array). Rides the int64 carrier like every other
+  ;;; handle here, but is a distinct newtype so the state cell can no longer
+  ;;; be confused with a slot index, an entity, or any other int on the
+  ;;; sized-world surface. The `__sized-state-*-raw` inline-C helpers stay
+  ;;; `:int` internally (they cast the carrier to `__ecs_state *`); the
+  ;;; typed wrappers below unwrap `WorldState` to the raw carrier with
+  ;;; `worldstate->int` at the boundary.
+  ;;;
+  ;;; Since: RE0
+  (defopaque WorldState :int)
+  ;;; worldstate->int -- recover the raw carrier behind a `WorldState`, for
+  ;;; handing to the `__sized-state-*-raw` inline-C helpers.
+  ;;; Since: RE0
+  (defn worldstate->int [s : WorldState] : int (:: s :int))
+  ;; Slice 4 shipped the panicking `sized-spawn!`; slice 12 adds the
+  ;; design plan's fallible `sized-spawn : ... -> (Result int WorldFull)`
+  ;; (Q3). The fallible variant was previously deferred behind the M3
+  ;; struct-carrier path, but Track A's audit refresh (parallel-tracks.md
+  ;; "Not a blocker") establishes that a spice surface returning
+  ;; `(Result T E)` over primitive (int-carried) payloads -- which both
+  ;; the ok-arm `int` entity and the `WorldFull` marker are -- monomorphizes
+  ;; by-value and is not M3-gated. Callers pick the panicking or the
+  ;; result-returning variant per call site.
+  ;; ===== Slice 4 / 4b / 4c -- spawn / despawn over a state cell =====
+  ;;
+  ;; The world struct holds a `state : int` field carrying a malloc'd
+  ;; control block:
+  ;;
+  ;;   typedef struct {
+  ;;     int64_t next;          // high-water mark of fresh slot ids handed out
+  ;;     int64_t live;          // current live entity count
+  ;;     int64_t cap;           // runtime image of the type-level `n`
+  ;;     int64_t *fl_data;      // free-list buffer (slots ready for reuse)
+  ;;     int64_t  fl_len;       // count of slots currently on the free-list
+  ;;     int64_t  fl_cap;       // capacity of fl_data
+  ;;     int64_t *gens;         // generation counter per slot (size = cap)
+  ;;   } __ecs_state;
+  ;;
+  ;; Slice 4b added free-list-based slot reuse: `sized-despawn` takes the
+  ;; slot id and pushes it onto the free-list; `sized-spawn!` pops from
+  ;; the free-list before reaching for a fresh slot. `next` is the
+  ;; monotonic high-water mark of fresh ids -- once `next == cap` all
+  ;; further spawns must come through the free-list, so a world that
+  ;; recycles slots can run indefinitely within its capacity. The
+  ;; free-list grows on push and is freed alongside the state cell;
+  ;; total memory stays O(cap).
+  ;;
+  ;; Slice 4c lifts the world's surface from bare slot ints to the
+  ;; packed generational `Entity` handle that `ecs/entity` already
+  ;; defines: `sized-spawn!` returns `(entity-new slot gen)`,
+  ;; `sized-despawn` takes the `Entity`, and `sized-alive?` answers
+  ;; the use-after-despawn question. The generation counter for each
+  ;; slot is bumped on despawn, so a stale handle that names the
+  ;; original (idx, gen) no longer matches `gens[idx]` once the slot
+  ;; is recycled -- the application-surface safety net the unsized
+  ;; `ecs/world` has provided since E0, now uniform across both
+  ;; worlds. The `gens` array is cap-sized at construction (one
+  ;; `calloc(cap, sizeof(int64_t))`) and freed alongside the state
+  ;; cell; memory stays O(cap).
+  ;;
+  ;; Slice 12 lifts the fallible-spawn type story to a real
+  ;; `sized-spawn : ... -> (Result int WorldFull)` (see `sized-spawn`
+  ;; below). The panicking `sized-spawn!` is retained for benchmark /
+  ;; demo paths where the ergonomic hit of unwrapping a Result is not
+  ;; wanted (sized-world plan Q3 ships both variants).
+  (defn __sized-state-new-raw [k : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    #include <stdlib.h>
   typedef struct {
     int64_t next; int64_t live; int64_t cap;
     int64_t *fl_data; int64_t fl_len; int64_t fl_cap;
@@ -143,10 +164,11 @@
   s->gens    = (k > 0) ? (int64_t *)calloc((size_t)k, sizeof(int64_t)) : NULL;
   return (int64_t)(intptr_t)s;
   ```)
-
-(defn __sized-state-free-raw [s : int] #fx{Unsafe} : nil
-  ```c
-  #include <stdlib.h>
+  (defn __sized-state-free-raw [s : int]
+    #fx{Unsafe}
+    : nil
+    ```c
+    #include <stdlib.h>
   typedef struct {
     int64_t next; int64_t live; int64_t cap;
     int64_t *fl_data; int64_t fl_len; int64_t fl_cap;
@@ -159,16 +181,17 @@
     free(st);
   }
   ```)
-
-;; Try to allocate the next slot: returns the slot index on success,
-;; or -1 if the world is full. Pops from the free-list when one is
-;; available; otherwise advances the `next` high-water mark. The
-;; per-slot generation is held in `gens[slot]` and is read off here
-;; (not modified) so the spawn site can pack (slot, gen) into the
-;; returned Entity.
-(defn __sized-state-try-spawn-raw [s : int] #fx{Unsafe} : int
-  ```c
-  typedef struct {
+  ;; Try to allocate the next slot: returns the slot index on success,
+  ;; or -1 if the world is full. Pops from the free-list when one is
+  ;; available; otherwise advances the `next` high-water mark. The
+  ;; per-slot generation is held in `gens[slot]` and is read off here
+  ;; (not modified) so the spawn site can pack (slot, gen) into the
+  ;; returned Entity.
+  (defn __sized-state-try-spawn-raw [s : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    typedef struct {
     int64_t next; int64_t live; int64_t cap;
     int64_t *fl_data; int64_t fl_len; int64_t fl_cap;
     int64_t *gens;
@@ -185,17 +208,18 @@
   st->live = st->live + 1;
   return slot;
   ```)
-
-;;; Copy the gens / next / live counters from `src` into `dst` and
-;;; clear `dst`'s free-list. Used by the per-world `copy-into-<W>`
-;;; emission (slice 11) to preserve generational Entity handles
-;;; across a slot-by-slot world resize. The caller has already
-;;; checked `dst->cap >= src->cap`; on mismatch this raw helper
-;;; truncates silently -- the Turmeric wrapper `sized-state-copy-into`
-;;; below does the cap check first.
-(defn __sized-state-copy-into-raw [src : int dst : int] #fx{Unsafe} : nil
-  ```c
-  #include <stdlib.h>
+  ;;; Copy the gens / next / live counters from `src` into `dst` and
+  ;;; clear `dst`'s free-list. Used by the per-world `copy-into-<W>`
+  ;;; emission (slice 11) to preserve generational Entity handles
+  ;;; across a slot-by-slot world resize. The caller has already
+  ;;; checked `dst->cap >= src->cap`; on mismatch this raw helper
+  ;;; truncates silently -- the Turmeric wrapper `sized-state-copy-into`
+  ;;; below does the cap check first.
+  (defn __sized-state-copy-into-raw [src : int dst : int]
+    #fx{Unsafe}
+    : nil
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   typedef struct {
     int64_t next; int64_t live; int64_t cap;
@@ -216,235 +240,233 @@
      consistent with the copied gens. Future despawns repopulate. */
   d->fl_len = 0;
   ```)
-
-;;; sized-gen-of -- read the current generation counter for `slot` out of
-;;; the state cell, or -1 when `slot` is outside `[0, cap)` (or the world
-;;; is zero-capacity). The Turmeric-VISIBLE replacement for the retired
-;;; `__sized-state-gen-of-raw`: every load is a typed-pointer read the
-;;; compiler's footprint walk can attribute to `s`, so the `#reads s`
-;;; frame is VERIFIED rather than trusted (R4 of the turmeric repo's
-;;; trusted-refinement-claims-plan; check with `tur --dump-read-frames`).
-;;;
-;;; Layout note: the `__ecs_state` control block is seven 8-byte fields
-;;; -- next(0) live(1) cap(2) fl_data(3) fl_len(4) fl_cap(5) gens(6) --
-;;; so slot k of the block is `array-get-unchecked` index k, and the
-;;; gens ARRAY is one more load through the pointer at index 6. The
-;;; pointer expressions are deliberately inline rather than let-bound:
-;;; the footprint walk's root chase follows loads, casts, and field
-;;; hops, but not local aliases.
-;;;
-;;; Since: sized-world visible reads (R4)
-(defn sized-gen-of [s : WorldState slot : int] #reads s : int
-  (if (< slot 0)
-    -1
-    (if (>= slot (unsafe (array-get-unchecked (:: (:: s :int) :ptr<void>) 2)))
+  ;;; sized-gen-of -- read the current generation counter for `slot` out of
+  ;;; the state cell, or -1 when `slot` is outside `[0, cap)` (or the world
+  ;;; is zero-capacity). The Turmeric-VISIBLE replacement for the retired
+  ;;; `__sized-state-gen-of-raw`: every load is a typed-pointer read the
+  ;;; compiler's footprint walk can attribute to `s`, so the `#reads s`
+  ;;; frame is VERIFIED rather than trusted (R4 of the turmeric repo's
+  ;;; trusted-refinement-claims-plan; check with `tur --dump-read-frames`).
+  ;;;
+  ;;; Layout note: the `__ecs_state` control block is seven 8-byte fields
+  ;;; -- next(0) live(1) cap(2) fl_data(3) fl_len(4) fl_cap(5) gens(6) --
+  ;;; so slot k of the block is `array-get-unchecked` index k, and the
+  ;;; gens ARRAY is one more load through the pointer at index 6. The
+  ;;; pointer expressions are deliberately inline rather than let-bound:
+  ;;; the footprint walk's root chase follows loads, casts, and field
+  ;;; hops, but not local aliases.
+  ;;;
+  ;;; Since: sized-world visible reads (R4)
+  (defn sized-gen-of [s : WorldState slot : int]
+    #reads s
+    : int
+    (if (< slot 0)
       -1
-      (if (= (unsafe (array-get-unchecked (:: (:: s :int) :ptr<void>) 6)) 0)
+      (if (>= slot (unsafe (array-get-unchecked (:: (:: s :int) :ptr<void>) 2)))
         -1
-        (unsafe (array-get-unchecked
-                  (:: (array-get-unchecked (:: (:: s :int) :ptr<void>) 6)
-                      :ptr<void>)
-                  slot))))))
-
-;;; sized-state-new -- allocate a state cell with capacity k.
-;;; Used internally by the constructor that sized-defworld emits;
-;;; exposed for callers that want to construct a world by hand.
-(defn sized-state-new [k : int] : WorldState
-  (:: (unsafe (__sized-state-new-raw k)) :WorldState))
-
-;;; sized-state-free -- release a state cell.
-(defn sized-state-free [s : WorldState] : nil
-  (unsafe (__sized-state-free-raw (worldstate->int s))))
-
-;;; sized-live -- read the world's current live count from the
-;;; state cell (callers pass `(.state w)`).
-(defn sized-live [s : WorldState] #reads s : int
-  (unsafe (array-get-unchecked (:: (:: s :int) :ptr<void>) 1)))
-
-;;; sized-cap -- read the world's static capacity from the state cell.
-;;; This is the runtime image of the world's type-level `n`.
-(defn sized-cap [s : WorldState] #reads s : int
-  (unsafe (array-get-unchecked (:: (:: s :int) :ptr<void>) 2)))
-
-(defn __sized-state-copy-abort-raw [] #fx{Unsafe} : nil
-  ```c
-  fprintf(stderr, "sized-state-copy-into: dst cap smaller than src cap\n");
+        (if (= (unsafe (array-get-unchecked (:: (:: s :int) :ptr<void>) 6)) 0)
+          -1
+          (unsafe (array-get-unchecked (:: (array-get-unchecked (:: (:: s :int)
+                                                                  :ptr<void>)
+                                             6)
+                                         :ptr<void>)
+                    slot))))))
+  ;;; sized-state-new -- allocate a state cell with capacity k.
+  ;;; Used internally by the constructor that sized-defworld emits;
+  ;;; exposed for callers that want to construct a world by hand.
+  (defn sized-state-new [k : int] : WorldState
+    (:: (unsafe (__sized-state-new-raw k)) :WorldState))
+  ;;; sized-state-free -- release a state cell.
+  (defn sized-state-free [s : WorldState] : nil
+    (unsafe (__sized-state-free-raw (worldstate->int s))))
+  ;;; sized-live -- read the world's current live count from the
+  ;;; state cell (callers pass `(.state w)`).
+  (defn sized-live [s : WorldState]
+    #reads s
+    : int
+    (unsafe (array-get-unchecked (:: (:: s :int) :ptr<void>) 1)))
+  ;;; sized-cap -- read the world's static capacity from the state cell.
+  ;;; This is the runtime image of the world's type-level `n`.
+  (defn sized-cap [s : WorldState]
+    #reads s
+    : int
+    (unsafe (array-get-unchecked (:: (:: s :int) :ptr<void>) 2)))
+  (defn __sized-state-copy-abort-raw []
+    #fx{Unsafe}
+    : nil
+    ```c
+    fprintf(stderr, "sized-state-copy-into: dst cap smaller than src cap\n");
   abort();
   ```)
-
-;;; sized-state-copy-into -- copy `src`'s generation array + counters
-;;; into `dst`. Required for slot-preserving world resizes so an
-;;; Entity packed against `src` keeps matching `dst.gens[idx]` after
-;;; the copy. Aborts if `dst.cap < src.cap` -- shrinking is not safe
-;;; (the truncated slots' gens would silently disappear and any live
-;;; Entity referencing them would suddenly mismatch).
-;;;
-;;; Free-list is reset to empty in `dst` (its previous contents
-;;; referenced the pre-copy gens that are now overwritten).
-;;;
-;;; Since: E2c slice 11
-(defn sized-state-copy-into [src : WorldState dst : WorldState] : nil
-  (let [srci    (worldstate->int src)
-        dsti    (worldstate->int dst)
-        src-cap (sized-cap src)
-        dst-cap (sized-cap dst)]
-    (if (< dst-cap src-cap)
-      (unsafe (__sized-state-copy-abort-raw))
-      (unsafe (__sized-state-copy-into-raw srci dsti)))))
-
-;;; sized-spawn! -- allocate a fresh `Entity` and return its packed
-;;; (idx, gen) handle. Aborts if the world is at capacity; callers
-;;; that need a graceful failure path should guard with
-;;; `(< (sized-live s) (sized-cap s))` first.
-;;;
-;;; Slice 4c: the return is `Entity` (packed idx + gen via
-;;; `entity-new`) rather than the bare slot int slice 4 / 4b
-;;; returned. For a fresh world every slot starts at generation 0,
-;;; so `(entity-index (sized-spawn! s))` continues to walk 0, 1,
-;;; 2, ... over the first cap spawns -- the slice-4 / 4b output
-;;; shape is preserved up to a `(entity-index ...)` unpack. The
-;;; generation only diverges from zero once a slot is despawned
-;;; and reused.
-;;;
-;;; Since: E2c slice 4 (panicking spawn over bare slot int);
-;;; slice 4c (Entity-returning)
-(defn sized-spawn! [s : WorldState] : Entity
-  (let [si   (worldstate->int s)
-        slot (unsafe (__sized-state-try-spawn-raw si))]
-    (if (< slot 0)
-      (:: (unsafe (__sized-spawn-bang-abort-raw)) :Entity)
-      (entity-new (slot-new slot)
-                  (generation-new (sized-gen-of s slot))))))
-
-;;; sized-slot-generation -- read the current generation counter
-;;; for `slot` out of the state cell. Exposed for tests and for
-;;; callers building hand-rolled aliveness checks on top of the
-;;; packed Entity.
-;;;
-;;; Returns `Generation` -1 if `slot` is outside `[0, cap)`.
-;;;
-;;; Since: E2c slice 4c
-;;; RE0: takes a `Slot`, returns a `Generation`.
-(defn sized-slot-generation [s : WorldState slot : Slot] #reads s : Generation
-  (generation-new (sized-gen-of s (slot->int slot))))
-
-;;; sized-alive? -- is the Entity handle `e` still valid against
-;;; the world's state cell?
-;;;
-;;; An entity stays alive as long as its packed (idx, gen) matches
-;;; `gens[idx]`. `sized-despawn` bumps `gens[idx]`, so any handle
-;;; that named the slot before the despawn fails this check even
-;;; after `sized-spawn!` reuses the slot at a new generation. This
-;;; is the application-surface use-after-despawn guard that
-;;; `ecs/world` has provided for unsized worlds since E0, now
-;;; uniform across both worlds.
-;;;
-;;; Since: E2c slice 4c
-(defn sized-alive? [s : WorldState e : Entity] #reads s : bool
-  (let [idx (entity-index e)
-        gen (entity-generation e)
-        cur (sized-gen-of s (slot->int idx))]
-    (if (< cur 0)
-      false
-      (= (generation->int gen) cur))))
-
-(defn __sized-spawn-bang-abort-raw [] #fx{Unsafe} : int
-  ```c
-  fprintf(stderr, "sized-spawn!: world full\n");
+  ;;; sized-state-copy-into -- copy `src`'s generation array + counters
+  ;;; into `dst`. Required for slot-preserving world resizes so an
+  ;;; Entity packed against `src` keeps matching `dst.gens[idx]` after
+  ;;; the copy. Aborts if `dst.cap < src.cap` -- shrinking is not safe
+  ;;; (the truncated slots' gens would silently disappear and any live
+  ;;; Entity referencing them would suddenly mismatch).
+  ;;;
+  ;;; Free-list is reset to empty in `dst` (its previous contents
+  ;;; referenced the pre-copy gens that are now overwritten).
+  ;;;
+  ;;; Since: E2c slice 11
+  (defn sized-state-copy-into [src : WorldState dst : WorldState] : nil
+    (let [srci    (worldstate->int src)
+          dsti    (worldstate->int dst)
+          src-cap (sized-cap src)
+          dst-cap (sized-cap dst)]
+      (if (< dst-cap src-cap)
+        (unsafe (__sized-state-copy-abort-raw))
+        (unsafe (__sized-state-copy-into-raw srci dsti)))))
+  ;;; sized-spawn! -- allocate a fresh `Entity` and return its packed
+  ;;; (idx, gen) handle. Aborts if the world is at capacity; callers
+  ;;; that need a graceful failure path should guard with
+  ;;; `(< (sized-live s) (sized-cap s))` first.
+  ;;;
+  ;;; Slice 4c: the return is `Entity` (packed idx + gen via
+  ;;; `entity-new`) rather than the bare slot int slice 4 / 4b
+  ;;; returned. For a fresh world every slot starts at generation 0,
+  ;;; so `(entity-index (sized-spawn! s))` continues to walk 0, 1,
+  ;;; 2, ... over the first cap spawns -- the slice-4 / 4b output
+  ;;; shape is preserved up to a `(entity-index ...)` unpack. The
+  ;;; generation only diverges from zero once a slot is despawned
+  ;;; and reused.
+  ;;;
+  ;;; Since: E2c slice 4 (panicking spawn over bare slot int);
+  ;;; slice 4c (Entity-returning)
+  (defn sized-spawn! [s : WorldState] : Entity
+    (let [si   (worldstate->int s)
+          slot (unsafe (__sized-state-try-spawn-raw si))]
+      (if (< slot 0)
+        (:: (unsafe (__sized-spawn-bang-abort-raw)) :Entity)
+        (entity-new (slot-new slot) (generation-new (sized-gen-of s slot))))))
+  ;;; sized-slot-generation -- read the current generation counter
+  ;;; for `slot` out of the state cell. Exposed for tests and for
+  ;;; callers building hand-rolled aliveness checks on top of the
+  ;;; packed Entity.
+  ;;;
+  ;;; Returns `Generation` -1 if `slot` is outside `[0, cap)`.
+  ;;;
+  ;;; Since: E2c slice 4c
+  ;;; RE0: takes a `Slot`, returns a `Generation`.
+  (defn sized-slot-generation [s : WorldState slot : Slot]
+    #reads s
+    : Generation
+    (generation-new (sized-gen-of s (slot->int slot))))
+  ;;; sized-alive? -- is the Entity handle `e` still valid against
+  ;;; the world's state cell?
+  ;;;
+  ;;; An entity stays alive as long as its packed (idx, gen) matches
+  ;;; `gens[idx]`. `sized-despawn` bumps `gens[idx]`, so any handle
+  ;;; that named the slot before the despawn fails this check even
+  ;;; after `sized-spawn!` reuses the slot at a new generation. This
+  ;;; is the application-surface use-after-despawn guard that
+  ;;; `ecs/world` has provided for unsized worlds since E0, now
+  ;;; uniform across both worlds.
+  ;;;
+  ;;; Since: E2c slice 4c
+  (defn sized-alive? [s : WorldState e : Entity]
+    #reads s
+    : bool
+    (let [idx (entity-index e)
+          gen (entity-generation e)
+          cur (sized-gen-of s (slot->int idx))]
+      (if (< cur 0) false (= (generation->int gen) cur))))
+  (defn __sized-spawn-bang-abort-raw []
+    #fx{Unsafe}
+    : int
+    ```c
+    fprintf(stderr, "sized-spawn!: world full\n");
   abort();
   return 0;  /* unreachable */
   ```)
-
-;;; WorldFull -- the err-arm marker for `sized-spawn`. A payload-less
-;;; nominal type (defopaque over `:int`, so it rides the int64 carrier
-;;; like every other handle in this module). It exists so the spawn
-;;; failure mode is a *typed* error rather than an `:int` status code or
-;;; a bare `(none)`, matching turmeric's "no `:int` status codes" rule
-;;; and the stdlib `(Result A B)` idiom.
-;;;
-;;; Since: E2c slice 12
-(defopaque WorldFull :int)
-
-;; ok / err arm helpers for `sized-spawn`. Extracted into their own
-;; one-line `defn`s on purpose: the carrier-ABI `ok`/`err` constructors
-;; return the int64 carrier, and the carrier->Result-struct bridge fires
-;; at a *direct* tail-return position but NOT when an `(ok ...)` / `(err
-;; ...)` call sits in an `if` branch (the branch result is materialized
-;; into a struct temp before the function return, so the bridge is
-;; skipped and codegen rejects the int64->struct assignment). Routing
-;; each arm through a helper whose body is a bare `(ok ...)` / `(err ...)`
-;; tail makes the bridge fire inside the helper; `sized-spawn`'s `if`
-;; then dispatches between two struct-returning calls, which assigns
-;; cleanly. (Same class of carrier-bridge tail-position limitation Track
-;; A tracks; the helper split is the spice-side idiom until the
-;; if-branched form bridges directly.)
-(defn __sized-spawn-ok  [e : Entity] : (Result Entity WorldFull) (ok e))
-(defn __sized-spawn-err []           : (Result Entity WorldFull)
-  (err (:: 0 :WorldFull)))
-
-;;; sized-spawn -- fallible counterpart of `sized-spawn!`. Allocates a
-;;; fresh slot and returns its packed (idx, gen) entity wrapped in
-;;; `(ok ...)`; on capacity exhaustion returns `(err world-full)` rather
-;;; than aborting.
-;;;
-;;; The slot-allocation path is identical to `sized-spawn!` -- both call
-;;; `__sized-state-try-spawn-raw`, which pops a reused slot off the
-;;; free-list when one is available and otherwise advances the `next`
-;;; high-water mark, returning -1 only when both the free-list is empty
-;;; and `next == cap`. So a world that despawns to make room succeeds on
-;;; the next `sized-spawn` exactly as `sized-spawn!` would, and the
-;;; returned entity is generation-correct (the slot's `gens[slot]` is
-;;; read at spawn and packed into the handle, slice 4c).
-;;;
-;;; Use `sized-spawn` when capacity exhaustion is a recoverable
-;;; application condition; use `sized-spawn!` on benchmark / demo paths
-;;; where the world is sized to never fill and the Result unwrap is pure
-;;; overhead (sized-world plan Q3 ships both).
-;;;
-;;; The ok arm carries the entity as `int` (the same packed handle
-;;; `sized-spawn!` returns), so `(entity-index (ok-val r))` recovers the
-;;; slot id; the err arm carries a `WorldFull` marker.
-;;;
-;;; Since: E2c slice 12
-(defn sized-spawn [s : WorldState] : (Result Entity WorldFull)
-  (let [si   (worldstate->int s)
-        slot (unsafe (__sized-state-try-spawn-raw si))]
-    (if (< slot 0)
-      (__sized-spawn-err)
-      (__sized-spawn-ok (entity-new (slot-new slot)
-                                    (generation-new (sized-gen-of s slot)))))))
-
-;;; sized-despawn -- free the slot named by Entity `e` for reuse,
-;;; bump that slot's generation counter, and decrement `live`.
-;;;
-;;; Pushes the slot onto the world's free-list so the next
-;;; `sized-spawn!` hands it back at the new generation; the `next`
-;;; high-water mark only advances when the free-list is empty, so a
-;;; world that recycles slots can run indefinitely within its
-;;; capacity. The generation bump is what makes the stale handle
-;;; that named the original (idx, gen) fail `sized-alive?` after
-;;; the slot is reused.
-;;;
-;;; Returns false (and is a no-op) when the Entity does not name a
-;;; despawnable slot:
-;;;   - the slot index is outside `[0, next)` (never handed out);
-;;;   - the Entity's generation does not match the slot's current
-;;;     generation (already-despawned or never-allocated handle);
-;;;   - `live` is already zero.
-;;; The generation check covers double-despawn safely: the second
-;;; call sees the bumped gen, mismatches, and no-ops without
-;;; corrupting the free-list with a duplicate slot.
-;;;
-;;; Since: E2c slice 4 (signature-only); slice 4b (free-list reuse);
-;;; slice 4c (Entity-typed; bumps generation; double-despawn-safe)
-(defn sized-despawn [s : WorldState e : Entity] : bool
-  (unsafe (__sized-despawn-raw (worldstate->int s)
-                               (slot->int (entity-index e))
-                               (generation->int (entity-generation e)))))
-
-(defn __sized-despawn-raw [s : int slot : int gen : int] #fx{Unsafe} : bool
-  ```c
-  #include <stdlib.h>
+  ;;; WorldFull -- the err-arm marker for `sized-spawn`. A payload-less
+  ;;; nominal type (defopaque over `:int`, so it rides the int64 carrier
+  ;;; like every other handle in this module). It exists so the spawn
+  ;;; failure mode is a *typed* error rather than an `:int` status code or
+  ;;; a bare `(none)`, matching turmeric's "no `:int` status codes" rule
+  ;;; and the stdlib `(Result A B)` idiom.
+  ;;;
+  ;;; Since: E2c slice 12
+  (defopaque WorldFull :int)
+  ;; ok / err arm helpers for `sized-spawn`. Extracted into their own
+  ;; one-line `defn`s on purpose: the carrier-ABI `ok`/`err` constructors
+  ;; return the int64 carrier, and the carrier->Result-struct bridge fires
+  ;; at a *direct* tail-return position but NOT when an `(ok ...)` / `(err
+  ;; ...)` call sits in an `if` branch (the branch result is materialized
+  ;; into a struct temp before the function return, so the bridge is
+  ;; skipped and codegen rejects the int64->struct assignment). Routing
+  ;; each arm through a helper whose body is a bare `(ok ...)` / `(err ...)`
+  ;; tail makes the bridge fire inside the helper; `sized-spawn`'s `if`
+  ;; then dispatches between two struct-returning calls, which assigns
+  ;; cleanly. (Same class of carrier-bridge tail-position limitation Track
+  ;; A tracks; the helper split is the spice-side idiom until the
+  ;; if-branched form bridges directly.)
+  (defn __sized-spawn-ok [e : Entity] : (Result Entity WorldFull) (ok e))
+  (defn __sized-spawn-err [] : (Result Entity WorldFull)
+    (err (:: 0 :WorldFull)))
+  ;;; sized-spawn -- fallible counterpart of `sized-spawn!`. Allocates a
+  ;;; fresh slot and returns its packed (idx, gen) entity wrapped in
+  ;;; `(ok ...)`; on capacity exhaustion returns `(err world-full)` rather
+  ;;; than aborting.
+  ;;;
+  ;;; The slot-allocation path is identical to `sized-spawn!` -- both call
+  ;;; `__sized-state-try-spawn-raw`, which pops a reused slot off the
+  ;;; free-list when one is available and otherwise advances the `next`
+  ;;; high-water mark, returning -1 only when both the free-list is empty
+  ;;; and `next == cap`. So a world that despawns to make room succeeds on
+  ;;; the next `sized-spawn` exactly as `sized-spawn!` would, and the
+  ;;; returned entity is generation-correct (the slot's `gens[slot]` is
+  ;;; read at spawn and packed into the handle, slice 4c).
+  ;;;
+  ;;; Use `sized-spawn` when capacity exhaustion is a recoverable
+  ;;; application condition; use `sized-spawn!` on benchmark / demo paths
+  ;;; where the world is sized to never fill and the Result unwrap is pure
+  ;;; overhead (sized-world plan Q3 ships both).
+  ;;;
+  ;;; The ok arm carries the entity as `int` (the same packed handle
+  ;;; `sized-spawn!` returns), so `(entity-index (ok-val r))` recovers the
+  ;;; slot id; the err arm carries a `WorldFull` marker.
+  ;;;
+  ;;; Since: E2c slice 12
+  (defn sized-spawn [s : WorldState] : (Result Entity WorldFull)
+    (let [si   (worldstate->int s)
+          slot (unsafe (__sized-state-try-spawn-raw si))]
+      (if (< slot 0)
+        (__sized-spawn-err)
+        (__sized-spawn-ok (entity-new (slot-new slot)
+                            (generation-new (sized-gen-of s slot)))))))
+  ;;; sized-despawn -- free the slot named by Entity `e` for reuse,
+  ;;; bump that slot's generation counter, and decrement `live`.
+  ;;;
+  ;;; Pushes the slot onto the world's free-list so the next
+  ;;; `sized-spawn!` hands it back at the new generation; the `next`
+  ;;; high-water mark only advances when the free-list is empty, so a
+  ;;; world that recycles slots can run indefinitely within its
+  ;;; capacity. The generation bump is what makes the stale handle
+  ;;; that named the original (idx, gen) fail `sized-alive?` after
+  ;;; the slot is reused.
+  ;;;
+  ;;; Returns false (and is a no-op) when the Entity does not name a
+  ;;; despawnable slot:
+  ;;;   - the slot index is outside `[0, next)` (never handed out);
+  ;;;   - the Entity's generation does not match the slot's current
+  ;;;     generation (already-despawned or never-allocated handle);
+  ;;;   - `live` is already zero.
+  ;;; The generation check covers double-despawn safely: the second
+  ;;; call sees the bumped gen, mismatches, and no-ops without
+  ;;; corrupting the free-list with a duplicate slot.
+  ;;;
+  ;;; Since: E2c slice 4 (signature-only); slice 4b (free-list reuse);
+  ;;; slice 4c (Entity-typed; bumps generation; double-despawn-safe)
+  (defn sized-despawn [s : WorldState e : Entity] : bool
+    (unsafe (__sized-despawn-raw (worldstate->int s)
+              (slot->int (entity-index e))
+              (generation->int (entity-generation e)))))
+  (defn __sized-despawn-raw [s : int slot : int gen : int]
+    #fx{Unsafe}
+    : bool
+    ```c
+    #include <stdlib.h>
   typedef struct {
     int64_t next; int64_t live; int64_t cap;
     int64_t *fl_data; int64_t fl_len; int64_t fl_cap;
@@ -466,561 +488,538 @@
   st->live = st->live - 1;
   return true;
   ```)
-
-;;; sized-world-fields -- expand a component vector into the flat
-;;; `(Comp (SizedDense n Comp))` old-style field groups a parameterised
-;;; `defstruct` body wants.
-;;;
-;;; Recurses over `comps`, emitting one `(name (SizedDense n name))` group
-;;; per component and splicing the tail in via `~@`. A parameterised
-;;; `defstruct ~name [n] ...` keeps old-style `(field type)` groups (the
-;;; new-style `[field : type]` vector is not accepted alongside a type-param
-;;; vector), so this helper produces groups rather than `name : type`
-;;; triples -- the only shape difference from `ecs/world`'s `world-fields`.
-;;;
-;;; Since: E2c slice 3b (cascade collapse)
-(defmacro sized-world-fields [comps]
-  (if (empty? comps)
-    `()
-    `((~(first comps) (SizedDense n ~(first comps)))
-      ~@(sized-world-fields (rest comps)))))
-
-;;; sized-ctor-args -- expand a component vector into the per-component
-;;; `(:: (sized-dense-new k) (SizedDense n Comp))` arguments the generated
-;;; constructor splices into its `make-struct` call, one storage handle per
-;;; component (the trailing `(sized-state-new k)` is appended by the caller).
-;;;
-;;; Since: E2c slice 3b (cascade collapse)
-(defmacro sized-ctor-args [comps]
-  (if (empty? comps)
-    `()
-    `((:: (sized-dense-new k) (SizedDense n ~(first comps)))
-      ~@(sized-ctor-args (rest comps)))))
-
-;;; sized-mono-world-fields -- like `sized-world-fields` but emits
-;;; new-style `[field : type]` field triples with the capacity index
-;;; fixed at a caller-supplied `cap-expr` (typically `(Static k)`).
-;;;
-;;; The polymorphic `sized-world-fields` emits old-style `(field type)`
-;;; groups because a parameterised `defstruct ~name [n] ...` requires
-;;; them. The monomorphic body has no type-param vector so it can use
-;;; (and must use, for the inline `(SizedDense (Static k) Comp)` slot
-;;; to parse) the new-style `[name : type ...]` field surface.
-;;;
-;;; Since: E2c slice 10
-(defmacro sized-mono-world-fields [cap-expr comps]
-  (if (empty? comps)
-    `()
-    `(~(first comps) : (SizedDense ~cap-expr ~(first comps))
-      ~@(sized-mono-world-fields ~cap-expr ~(rest comps)))))
-
-;;; sized-mono-ctor-args -- the monomorphic counterpart of
-;;; `sized-ctor-args`. Emits the per-component `(:: (sized-dense-new
-;;; k) (SizedDense cap-expr Comp))` constructor arguments with the
-;;; capacity index fixed at `cap-expr`.
-;;;
-;;; Since: E2c slice 10
-(defmacro sized-mono-ctor-args [cap-expr comps]
-  (if (empty? comps)
-    `()
-    `((:: (sized-dense-new k) (SizedDense ~cap-expr ~(first comps)))
-      ~@(sized-mono-ctor-args ~cap-expr ~(rest comps)))))
-
-;;; sized-defworld-mono -- declare a bounded-capacity world type with
-;;; the capacity baked in at the declaration. Monomorphic counterpart
-;;; of `sized-defworld`, satisfying the sized-world plan's
-;;; "ergonomic-default for application code with a fixed budget"
-;;; surface point.
-;;;
-;;; Syntax:
-;;;   (sized-defworld-mono GameWorld (Static 64) [Pos Vel])
-;;;
-;;; Lowers to a non-parameterised `defstruct` whose fields are
-;;; `(SizedDense (Static 64) Comp)`, plus a `make-GameWorld`
-;;; constructor that takes the runtime `k` slot count -- which the
-;;; caller is expected to match against the declared `cap-expr`:
-;;;
-;;;   (defstruct GameWorld
-;;;     [Pos   : (SizedDense (Static 64) Pos)
-;;;      Vel   : (SizedDense (Static 64) Vel)
-;;;      state : int])
-;;;   (defn make-GameWorld [k : int] : GameWorld ...)
-;;;
-;;; The polymorphic `sized-defworld` previously documented the
-;;; monomorphic form as "trivially expressed via `(deftype GW64
-;;; (GameWorld (Static 64)))`" -- which works, but loses the
-;;; ergonomic `(make-GameWorld 64)` call and forces every accessor /
-;;; defsystem invocation to re-ascribe the type. This macro is the
-;;; first-class form so application code reads `GameWorld` everywhere
-;;; without the alias-vs-original split.
-;;;
-;;; The cap-expr ↔ k matching is a runtime convention, not a static
-;;; constraint: a caller that writes `(sized-defworld-mono W (Static
-;;; 64) [Pos])` and then constructs via `(make-W 32)` gets a
-;;; world whose runtime storage is 32 slots wide even though the
-;;; type-level cap is `(Static 64)`. The accessors' runtime bounds
-;;; checks (sized-world plan Q4) catch the resulting OOB at the
-;;; access site; no static check today.
-;;;
-;;; Since: E2c slice 10
-(defmacro sized-defworld-mono [name cap-expr comps]
-  (let [ctor-name (str->sym (str-append "make-" (symbol-name name)))]
-    `(do
-       (defstruct ~name
-         [~@(sized-mono-world-fields ~cap-expr ~comps)
-          state : WorldState])
-       (defn ~ctor-name [k : int] : ~name
-         (make-struct ~name
-                      ~@(sized-mono-ctor-args ~cap-expr ~comps)
-                      (sized-state-new k))))))
-
-;;; sized-defcomponent-accessors-mono -- emit cap-gated
-;;; `get-<Comp>` / `set-<Comp>!` / `has-<Comp>?` for one (mono sized
-;;; world, component) pair, matching the surface of
-;;; `sized-defcomponent-accessors` but against a *non-parameterised*
-;;; world type (the shape `sized-defworld-mono` emits).
-;;;
-;;; The polymorphic variant emits `[n]` as a type-param vector and
-;;; types `w` as `(~world-name n)`. The monomorphic world has no `n`
-;;; -- the capacity is baked into the storage field types -- so the
-;;; accessor's signature is `[w : ~world-name]` with no type-param
-;;; vector, otherwise identical (same cap surface, same backend
-;;; calls). Splitting into a separate macro is the lightest landing:
-;;; trying to overload on world shape would require the macro to
-;;; inspect the world-name's binding at macro-expand time, which the
-;;; current macro system does not support.
-;;;
-;;; Since: E2c slice 10
-(defmacro sized-defcomponent-accessors-mono [world-name comp-name]
-  (let [getter (str->sym (str-append "get-"  (symbol-name comp-name)))
-        setter (str->sym (str-append "set-"  (symbol-name comp-name) "!"))
-        haser  (str->sym (str-append "has-"  (symbol-name comp-name) "?"))
-        field  (dot-sym comp-name)]
-    `(do
-       (defn ~getter [^borrow cap : (ReadCap  ~comp-name)
-                      ^borrow w   : ~world-name
-                      e           : Slot]
-                    : ~comp-name
-         (let [p : ~comp-name (sized-dense-get (~field w) e)] p))
-       (defn ~setter [^borrow cap : (WriteCap ~comp-name)
-                      ^borrow w   : ~world-name
-                      e           : Slot
-                      v           : ~comp-name]
-                    : nil
-         (sized-dense-set! (~field w) e v))
-       (defn ~haser [^borrow w : ~world-name e : Slot] : bool
-         (sized-dense-has? (~field w) e)))))
-
-;;; sized-defworld -- declare a bounded-capacity world type `(Name n)`.
-;;;
-;;; E2c slice 3b: the former slice-3 per-arity cascade (unrolled 1..4, with
-;;; arity capped at four components) is collapsed into one variadic body that
-;;; computes its field list with `sized-world-fields` and its constructor
-;;; args with `sized-ctor-args`, splicing both at macro-expansion time. Arity
-;;; is no longer capped -- a sized world may carry any number of components
-;;; (see `tests/sized-world-wide.tur`, a five-component world). The collapse
-;;; mirrors `ecs/world`'s E2d-P5b `defworld` collapse and depends on the same
-;;; two turmeric fixes that landed 2026-06-17: `~@`-splice into a literal and
-;;; a nested user-macro call from inside a splice expression.
-;;;
-;;; Since: E2c slice 3 (1..4 components); slice 3b (variadic, uncapped arity)
-(defmacro sized-defworld [name comps]
-  (let [ctor-name (str->sym (str-append "make-" (symbol-name name)))]
-    `(do
-       (defstruct ~name [n] ~@(sized-world-fields comps) (state WorldState))
-       (defn ~ctor-name [n] [k : int] : (~name n)
-         (make-struct ~name
-                      ~@(sized-ctor-args comps)
-                      (sized-state-new k))))))
-
-;;; sized-copy-component-body -- recursive helper for
-;;; sized-defworld-copy-into. Expands to a chain of per-component
-;;; copy steps inside the iteration body: for each component,
-;;;
-;;;   (when (sized-dense-has? (.~Comp src) i)
-;;;     (sized-dense-set! (.~Comp dst) i
-;;;                       (sized-dense-get (.~Comp src) i)))
-;;;
-;;; The trailing component's expansion is the final form of the body
-;;; (no `do`-tail needed because each step is in a top-level position
-;;; in the body sequence).
-;;;
-;;; Since: E2c slice 11
-(defmacro sized-copy-component-body [src dst i comps]
-  (if (empty? comps)
-    `nil
-    (let [__c (first comps)
-          __field (dot-sym __c)]
+  ;;; sized-world-fields -- expand a component vector into the flat
+  ;;; `(Comp (SizedDense n Comp))` old-style field groups a parameterised
+  ;;; `defstruct` body wants.
+  ;;;
+  ;;; Recurses over `comps`, emitting one `(name (SizedDense n name))` group
+  ;;; per component and splicing the tail in via `~@`. A parameterised
+  ;;; `defstruct ~name [n] ...` keeps old-style `(field type)` groups (the
+  ;;; new-style `[field : type]` vector is not accepted alongside a type-param
+  ;;; vector), so this helper produces groups rather than `name : type`
+  ;;; triples -- the only shape difference from `ecs/world`'s `world-fields`.
+  ;;;
+  ;;; Since: E2c slice 3b (cascade collapse)
+  (defmacro sized-world-fields [comps]
+    (if (empty? comps)
+      `()
+      `((~(first comps) (SizedDense n ~(first comps))) ~@(sized-world-fields (rest comps)))))
+  ;;; sized-ctor-args -- expand a component vector into the per-component
+  ;;; `(:: (sized-dense-new k) (SizedDense n Comp))` arguments the generated
+  ;;; constructor splices into its `make-struct` call, one storage handle per
+  ;;; component (the trailing `(sized-state-new k)` is appended by the caller).
+  ;;;
+  ;;; Since: E2c slice 3b (cascade collapse)
+  (defmacro sized-ctor-args [comps]
+    (if (empty? comps)
+      `()
+      `((:: (sized-dense-new k) (SizedDense n ~(first comps))) ~@(sized-ctor-args (rest comps)))))
+  ;;; sized-mono-world-fields -- like `sized-world-fields` but emits
+  ;;; new-style `[field : type]` field triples with the capacity index
+  ;;; fixed at a caller-supplied `cap-expr` (typically `(Static k)`).
+  ;;;
+  ;;; The polymorphic `sized-world-fields` emits old-style `(field type)`
+  ;;; groups because a parameterised `defstruct ~name [n] ...` requires
+  ;;; them. The monomorphic body has no type-param vector so it can use
+  ;;; (and must use, for the inline `(SizedDense (Static k) Comp)` slot
+  ;;; to parse) the new-style `[name : type ...]` field surface.
+  ;;;
+  ;;; Since: E2c slice 10
+  (defmacro sized-mono-world-fields [cap-expr comps]
+    (if (empty? comps)
+      `()
+      `(~(first comps) : (SizedDense ~cap-expr ~(first comps))
+         ~@(sized-mono-world-fields ~cap-expr ~(rest comps)))))
+  ;;; sized-mono-ctor-args -- the monomorphic counterpart of
+  ;;; `sized-ctor-args`. Emits the per-component `(:: (sized-dense-new
+  ;;; k) (SizedDense cap-expr Comp))` constructor arguments with the
+  ;;; capacity index fixed at `cap-expr`.
+  ;;;
+  ;;; Since: E2c slice 10
+  (defmacro sized-mono-ctor-args [cap-expr comps]
+    (if (empty? comps)
+      `()
+      `((:: (sized-dense-new k) (SizedDense ~cap-expr ~(first comps))) ~@(sized-mono-ctor-args ~cap-expr
+                                                                           ~(rest comps)))))
+  ;;; sized-defworld-mono -- declare a bounded-capacity world type with
+  ;;; the capacity baked in at the declaration. Monomorphic counterpart
+  ;;; of `sized-defworld`, satisfying the sized-world plan's
+  ;;; "ergonomic-default for application code with a fixed budget"
+  ;;; surface point.
+  ;;;
+  ;;; Syntax:
+  ;;;   (sized-defworld-mono GameWorld (Static 64) [Pos Vel])
+  ;;;
+  ;;; Lowers to a non-parameterised `defstruct` whose fields are
+  ;;; `(SizedDense (Static 64) Comp)`, plus a `make-GameWorld`
+  ;;; constructor that takes the runtime `k` slot count -- which the
+  ;;; caller is expected to match against the declared `cap-expr`:
+  ;;;
+  ;;;   (defstruct GameWorld
+  ;;;     [Pos   : (SizedDense (Static 64) Pos)
+  ;;;      Vel   : (SizedDense (Static 64) Vel)
+  ;;;      state : int])
+  ;;;   (defn make-GameWorld [k : int] : GameWorld ...)
+  ;;;
+  ;;; The polymorphic `sized-defworld` previously documented the
+  ;;; monomorphic form as "trivially expressed via `(deftype GW64
+  ;;; (GameWorld (Static 64)))`" -- which works, but loses the
+  ;;; ergonomic `(make-GameWorld 64)` call and forces every accessor /
+  ;;; defsystem invocation to re-ascribe the type. This macro is the
+  ;;; first-class form so application code reads `GameWorld` everywhere
+  ;;; without the alias-vs-original split.
+  ;;;
+  ;;; The cap-expr ↔ k matching is a runtime convention, not a static
+  ;;; constraint: a caller that writes `(sized-defworld-mono W (Static
+  ;;; 64) [Pos])` and then constructs via `(make-W 32)` gets a
+  ;;; world whose runtime storage is 32 slots wide even though the
+  ;;; type-level cap is `(Static 64)`. The accessors' runtime bounds
+  ;;; checks (sized-world plan Q4) catch the resulting OOB at the
+  ;;; access site; no static check today.
+  ;;;
+  ;;; Since: E2c slice 10
+  (defmacro sized-defworld-mono [name cap-expr comps]
+    (let [ctor-name (str->sym (str-append "make-" (symbol-name name)))]
       `(do
-         (when (sized-dense-has? (~__field ~src) ~i)
-           (sized-dense-set! (~__field ~dst) ~i
-                             (sized-dense-get (~__field ~src) ~i)))
-         (sized-copy-component-body ~src ~dst ~i ~(rest comps))))))
-
-;;; sized-defworld-copy-into -- emit a per-world slot-preserving copy
-;;; function `copy-into-<Name>`.
-;;;
-;;; Syntax:
-;;;   (sized-defworld GameWorld [Pos Vel])
-;;;   (sized-defworld-copy-into GameWorld [Pos Vel])
-;;;
-;;; The component vector must match `sized-defworld`'s -- we can't
-;;; recover it from the world type alone (the storage handles are
-;;; defopaque ints at the C ABI), so the caller spells it out a
-;;; second time. The lowering is polymorphic in both src and dst
-;;; capacity:
-;;;
-;;;   (defn copy-into-GameWorld [n n'] [src : (GameWorld n)
-;;;                                     dst : (GameWorld n')] : nil
-;;;     ;; per-slot, per-component, has?-guarded copy
-;;;     ...
-;;;     (sized-state-copy-into (.state src) (.state dst)))
-;;;
-;;; Cross-parameter unification: `(GameWorld n)` and `(GameWorld n')`
-;;; carry independent caps -- the SZ8 unifier does NOT collapse them,
-;;; which is exactly what we want for a resize (the whole point is
-;;; that `n` and `n'` can differ). The state-copy aborts at runtime
-;;; if `dst.cap < src.cap`; the slot-by-slot dense copy is bounded
-;;; by `src`'s cap and writes into `dst`'s same-indexed slots, so
-;;; growing copies (n' > n) work directly and shrinking is rejected
-;;; by the state-copy guard before any partial copy is observable.
-;;;
-;;; Entity-handle preservation: generations are carried in the state
-;;; cell (slice 4c), and `sized-state-copy-into` copies the full
-;;; gens array, so an `Entity` packed against `src` continues to
-;;; satisfy `(sized-alive? dst e)` after the copy. The dst's
-;;; free-list is reset to empty (its pre-copy contents referenced
-;;; gens that have just been overwritten); future despawns repopulate
-;;; it consistently with the new generation state.
-;;;
-;;; Since: E2c slice 11
-(defmacro sized-defworld-copy-into [name comps]
-  (let [fn-name (str->sym (str-append "copy-into-" (symbol-name name)))]
-    `(defn ~fn-name [n n']
-                    [^borrow src : (~name n) ^borrow dst : (~name n')] : nil
-       (let [^mut i 0
-             src-cap (sized-cap (.state src))]
-         (do
-           (while (< i src-cap)
-             (do
-               (let [__sl (slot-new i)]
-                 (sized-copy-component-body src dst __sl ~comps))
-               (set! i (+ i 1))))
-           (sized-state-copy-into (.state src) (.state dst)))))))
-
-;;; sized-defworld-world-resize -- emit a per-world `world-resize-<Name>`
-;;; that grows a sized world to a fresh runtime capacity and hands the
-;;; result back inside the size-hiding existential
-;;; `(exists [n'] (<Name> n'))`.
-;;;
-;;; Syntax:
-;;;   (sized-defworld GameWorld [Pos Vel])
-;;;   (sized-defworld-copy-into GameWorld [Pos Vel])
-;;;   (sized-defworld-world-resize GameWorld)
-;;;
-;;; Unlike `sized-defworld-copy-into`, this macro does not need the
-;;; component vector: the per-component copy is delegated to the
-;;; already-emitted `copy-into-<Name>`, so the only names it weaves are
-;;; the world's constructor (`make-<Name>`) and copy function. The
-;;; component list therefore lives in exactly one place (the
-;;; `sized-defworld-copy-into` call). Emitting `world-resize-<Name>`
-;;; requires both `make-<Name>` (from `sized-defworld`) and
-;;; `copy-into-<Name>` (from `sized-defworld-copy-into`) to be in scope.
-;;;
-;;; The lowering:
-;;;
-;;;   (defn world-resize-GameWorld [n]
-;;;                                [^borrow src : (GameWorld n) k : int]
-;;;                                : (exists [n'] (GameWorld n'))
-;;;     (let [dst : (GameWorld (Static 0)) (make-GameWorld k)]
-;;;       (copy-into-GameWorld src dst)
-;;;       (pack dst (exists [n'] (GameWorld n')))))
-;;;
-;;; This is the thin client layer the sized-world plan calls out:
-;;; `copy-into-<Name>` does the slot-preserving, generation-threading
-;;; copy (so an `Entity` packed against `src` stays `sized-alive?` in
-;;; the resized world), and the `pack` lifts the fresh destination into
-;;; the existential so callers recover an abstract `n'` via `open` (or
-;;; the stdlib `open-sized`) and run `sized-for-each` / the cap-gated
-;;; accessors against it. The emitted `(pack v (exists [n'] (W n')))`
-;;; is exactly what `stdlib/sized-handle-existential.tur`'s `pack-sized`
-;;; macro expands to; the native form is used directly so the spice
-;;; carries no `load`-time dependency on that stdlib module.
-;;;
-;;; New capacity is a runtime argument (`k`), which is *why* the result
-;;; is existential: the destination cap is not known statically, so it
-;;; is sealed behind a fresh `n'` rather than surfaced as a concrete
-;;; `(<Name> (Static k))`. The phantom cap on the destination is
-;;; written as `(Static 0)` purely to give `make-<Name>` a ground type
-;;; to monomorphise against (the constructor only codegens at a ground
-;;; capacity); it is forgotten the instant the value is packed, and it
-;;; never reaches runtime -- every storage and the state cell are sized
-;;; from the runtime `k`, and `sized-dense-cap` / `sized-cap` read that
-;;; runtime width, so `sized-for-each`'s loop bound and the accessors'
-;;; bounds checks all see `k`, not `0`.
-;;;
-;;; Growing is the supported direction (`k >= src` capacity): the
-;;; underlying `sized-state-copy-into` aborts before any partial state
-;;; is observable if `k` is smaller than the source capacity, matching
-;;; `copy-into-<Name>`'s shrink-rejection guarantee.
-;;;
-;;; Since: E2c slice 11 follow-up (world-resize existential wrapper);
-;;; unblocked by turmeric's existential pack/open heap-boxing fix for
-;;; multi-field struct payloads.
-(defmacro sized-defworld-world-resize [name]
-  (let [fn-name   (str->sym (str-append "world-resize-" (symbol-name name)))
-        ctor-name (str->sym (str-append "make-"         (symbol-name name)))
-        copy-name (str->sym (str-append "copy-into-"    (symbol-name name)))]
-    `(defn ~fn-name [n] [^borrow src : (~name n) k : int]
-                        : (exists [n'] (~name n'))
-       (let [dst : (~name (Static 0)) (~ctor-name k)]
-         (do
-           (~copy-name src dst)
-           (pack dst (exists [n'] (~name n'))))))))
-
-;;; sized-defcomponent-accessors -- emit cap-gated
-;;; `get-<Comp>` / `set-<Comp>!` / `has-<Comp>?` accessors for one
-;;; (sized world, component) pair. The sized counterpart of
-;;; `ecs/world`'s `defcomponent-accessors`.
-;;;
-;;; Each accessor's world parameter is `^borrow w : (~world-name n)`,
-;;; so the type-level `n` is polymorphic at the accessor's signature
-;;; and unified by the call site against whichever concrete
-;;; `(GameWorld (Static k))` value is passed. The element type
-;;; threads through `(SizedDense n ~comp-name)`, so a hand-written
-;;; `(set-Pos! cap w 0 (:: 42 :Pos))` against a `w : (GameWorld
-;;; (Static 64))` resolves both `n` and the element type without an
-;;; explicit witness.
-;;;
-;;; Cap surface matches the unsized accessors exactly:
-;;;
-;;;   - `get-<Comp>`: `^borrow cap : (ReadCap Comp)` -- non-consuming
-;;;     so a body that reads many slots per iteration does not need
-;;;     to re-mint.
-;;;   - `set-<Comp>!`: `^borrow cap : (WriteCap Comp)` -- same
-;;;     borrow-not-consume rationale as I4. The linear cap is auto-
-;;;     consumed once by `defsystem`'s body-end wrapper (unchanged
-;;;     from the unsized path; sized `defsystem` is a follow-up
-;;;     slice).
-;;;   - `has-<Comp>?`: no cap (presence is observable without
-;;;     declaring a read effect; matches the unsized surface).
-;;;
-;;; The bounds-check story per the sized-world plan Q4: the
-;;; underlying `sized-dense-get` / `sized-dense-set!` keep their
-;;; runtime checks against `cap`. The static-index path
-;;; (`(Fin n)` accessors) is refinement-types-gated and out of
-;;; scope here.
-;;;
-;;; Required imports at the call site:
-;;;   (import ecs/cap :refer [WriteCap ReadCap])
-;;;
-;;; Since: E2c slice 7
-(defmacro sized-defcomponent-accessors [world-name comp-name]
-  (let [getter (str->sym (str-append "get-"  (symbol-name comp-name)))
-        setter (str->sym (str-append "set-"  (symbol-name comp-name) "!"))
-        haser  (str->sym (str-append "has-"  (symbol-name comp-name) "?"))
-        field  (dot-sym comp-name)]
-    `(do
-       (defn ~getter [n]
-                     [^borrow cap : (ReadCap  ~comp-name)
-                      ^borrow w   : (~world-name n)
-                      e           : Slot]
-                    : ~comp-name
-         (let [p : ~comp-name (sized-dense-get (~field w) e)] p))
-       (defn ~setter [n]
-                     [^borrow cap : (WriteCap ~comp-name)
-                      ^borrow w   : (~world-name n)
-                      e           : Slot
-                      v           : ~comp-name]
-                    : nil
-         (sized-dense-set! (~field w) e v))
-       (defn ~haser [n]
-                    [^borrow w : (~world-name n) e : Slot] : bool
-         (sized-dense-has? (~field w) e)))))
-
-;;; sized-defsystem -- declare a typed sized-world system body with
-;;; `:reads` / `:writes` caps bound in scope.
-;;;
-;;; Syntax:
-;;;   (sized-defsystem name WorldName [reads-comp ...] [writes-comp ...] body)
-;;;
-;;; `WorldName` is the unparameterized world type (e.g. `GameWorld`,
-;;; not `(GameWorld (Static 64))`). The macro emits one polymorphic
-;;; `defn`:
-;;;
-;;;   (defn name [n] [^borrow w : (WorldName n)] : nil
-;;;     (defsystem--with-read-caps
-;;;       (defsystem--with-write-caps
-;;;         (do body (defsystem--consume-write-caps writes))
-;;;         writes)
-;;;       reads))
-;;;
-;;; ...so a single `name` defn elaborates against every concrete
-;;; `(WorldName (Static k))` capacity without duplication, mirroring
-;;; `sized-defcomponent-accessors`'s `n`-polymorphic shape.
-;;;
-;;; The cap-binding lowering reuses the unsized `ecs/system` helpers
-;;; (`defsystem--with-read-caps`, `defsystem--with-write-caps`,
-;;; `defsystem--consume-write-caps`), so the binding rules and
-;;; auto-consume semantics are identical to `defsystem`: read caps
-;;; are non-linear and bound as `<Comp>-read-cap`; write caps are
-;;; linear, bound as `<Comp>-write-cap`, and auto-consumed once at
-;;; body end. A `<Comp>-cid` binding must be in scope at the macro
-;;; call site for each declared comp.
-;;;
-;;; **No `System` value is emitted by this macro.** The `ecs/system`
-;;; scheduler's `System` value packs `(reads-mask, writes-mask, run-fn
-;;; : ptr<void>)` whose run-fn signature is `[w : int] : nil` -- the
-;;; world is type-erased through a void* cast. A `(WorldName n)` is a
-;;; multi-int64 struct, not an int handle, so it cannot ride the
-;;; scheduler's one-word carrier by value.
-;;;
-;;; The "by heap pointer" workaround (sized-scheduler report,
-;;; direction 1 -- docs/reported/sized-scheduler-system-stage-world-
-;;; carrier.md) is fully expressible at the spice layer today:
-;;; heap-box the sized world, pass its pointer reinterpreted as `:int`
-;;; through the existing carrier, and have each system's run-fn load
-;;; the world struct back from the pointer to drive the cap-gated
-;;; accessors. `tests/sized-stage.tur` ships the end-to-end recipe
-;;; (sized world declared via `sized-defworld-mono`, per-world
-;;; `box-<W>` / `load-<W>` / `free-<W>-box` inline-C helpers,
-;;; `make-system` packed `[wp : int]` run-fns, wave-scheduled via
-;;; `stage-run!`). Direction 2 (cross-world / heterogeneous scheduling
-;;; -- one stage running systems over differently-typed worlds) shipped
-;;; as `ecs/hstage`: `bind-system` lifts a scheduled `System` into a
-;;; `WorldSystem` keyed on a `(world-id, world)` pair, and `HStage`
-;;; dispatches each system against its own boxed world with a
-;;; (World, Component) conflict key, so systems over distinct worlds
-;;; never falsely serialise. It rides the typeclass-bounded-wrapper
-;;; monomorphisation that closed gap-H upstream (turmeric #447/#448).
-;;; `tests/hstage-cross-world.tur` is the end-to-end regression.
-;;;
-;;; Callers that just want the typed cap-bound body without the
-;;; scheduler wiring still invoke the macro-emitted impl directly:
-;;;
-;;;   (sized-defsystem physics GameWorld [Pos Vel] [Pos]
-;;;     (set-Pos! Pos-write-cap w 0 (:: 1 :Pos)))
-;;;   (physics game-world)
-;;;
-;;; This still buys the load-bearing static guarantee: a body that
-;;; writes a component it did not declare has no `<Comp>-write-cap`
-;;; in scope, so the call fails to elaborate. The Stage-parallel
-;;; story is purely an integration follow-up; the cap-gating is
-;;; complete.
-;;;
-;;; Required imports at the call site:
-;;;   (import ecs/cap :refer [WriteCap ReadCap make-write-cap make-read-cap use-cap!])
-;;;
-;;; Since: E2c slice 8
-(defmacro sized-defsystem [name world-name reads-vec writes-vec body]
-  `(defn ~name [n] [^borrow w : (~world-name n)] : nil
-     (defsystem--with-read-caps
-       (defsystem--with-write-caps
-         (do
-           ~body
-           (defsystem--consume-write-caps ~writes-vec))
-         ~writes-vec)
-       ~reads-vec)))
-
-;;; sized-defsystem-scheduled -- declare a monomorphic sized-world
-;;; system that ships as a `System` value runnable on the parallel
-;;; `Stage` scheduler. The "by heap pointer" landing for the report's
-;;; direction-1 follow-up
-;;; (`docs/archive/sized-scheduler-system-stage-world-carrier.md`).
-;;;
-;;; Syntax:
-;;;   (sized-defsystem-scheduled name WorldName [reads-comp ...] [writes-comp ...] body)
-;;;
-;;; `WorldName` is the *monomorphic* world type (the shape emitted by
-;;; `sized-defworld-mono`). The polymorphic `(WorldName n)` shape is
-;;; deliberately not supported here -- the `System` carrier passes the
-;;; world as a `ptr<void>` reinterpreted as `:int`, so the world's C
-;;; representation must be a single concrete struct type the wrapper
-;;; can cast back to.
-;;;
-;;; Pre-condition: a `load-<WorldName>` function with signature
-;;; `[wp : int] : <WorldName>` must be in scope at the macro call
-;;; site. The matching `box-<WorldName>` (allocate + copy world onto
-;;; the heap) and `free-<WorldName>-box` (release the boxed world)
-;;; are needed by the *caller* of `stage-add!`/`stage-run!` but are
-;;; not consulted by this macro's expansion. They stay user-written
-;;; -- macros cannot splice identifiers into inline-C text and the
-;;; heap-box / load / free triple is three short inline-C blocks
-;;; referencing the C struct name verbatim (see
-;;; `tests/sized-stage.tur` for the canonical recipe and
-;;; `docs/archive/history/macro-cannot-emit-inline-c-block.md` for
-;;; the underlying limitation).
-;;;
-;;; Expands to three top-level forms:
-;;;
-;;;   (defn name-impl [^borrow w : WorldName] : nil
-;;;     ;; cap-binding lets per :reads / :writes, body, auto-consume
-;;;     ;; -- same lowering as `sized-defsystem`'s emitted impl but
-;;;     ;; monomorphic in the world type.
-;;;     ...)
-;;;
-;;;   (defn name-fn [wp : int] : nil
-;;;     ;; int-carrier wrapper -- load the boxed world, dispatch to
-;;;     ;; the typed impl.
-;;;     (let [w : WorldName (load-WorldName wp)]
-;;;       (name-impl w)))
-;;;
-;;;   (def name (make-system READS-MASK WRITES-MASK name-fn))
-;;;
-;;; Cap-binding rules and auto-consume semantics match `sized-defsystem`
-;;; and `defsystem` exactly: read caps are non-linear and bound as
-;;; `<Comp>-read-cap`; write caps are linear, bound as `<Comp>-write-cap`,
-;;; and auto-consumed once at body end. A `<Comp>-cid` binding must be
-;;; in scope at the macro call site for each declared comp.
-;;;
-;;; A body that writes a component not declared in `:writes` fails to
-;;; elaborate with `unbound symbol '<Comp>-write-cap'` -- the same
-;;; compile-time guarantee the unsized `defsystem` and the typed
-;;; `sized-defsystem` give. The int-carrier wrapper does not weaken
-;;; this: the cap-binding lets sit *inside* the typed impl, above the
-;;; wrapper's `(name-impl w)` call.
-;;;
-;;; The world struct is loaded by-value into the impl. Its fields are
-;;; int64 handles into shared heap storage, so mutations applied
-;;; through cap-gated `set-<Comp>!` flow through to every other loaded
-;;; copy of the same boxed world. Callers re-load the boxed world
-;;; after `stage-run!` to observe the writes (see
-;;; `tests/sized-stage.tur` for the round-trip).
-;;;
-;;; Required imports at the call site:
-;;;   (import ecs/cap    :refer [WriteCap ReadCap make-write-cap make-read-cap use-cap!])
-;;;   (import ecs/system :refer [System make-system cid-bit])
-;;;   (import ecs/stage  :refer [Stage stage-new stage-add! stage-n-waves stage-run! stage-free!])
-;;;
-;;; Example:
-;;;   (sized-defworld-mono GameWorld (Static 8) [Pos Hp])
-;;;   (sized-defcomponent-accessors-mono GameWorld Pos)
-;;;   ;; box-GameWorld / load-GameWorld / free-GameWorld-box defined here ...
-;;;   (def Pos-cid 0)
-;;;   (sized-defsystem-scheduled physics GameWorld [Pos] [Pos]
-;;;     (set-Pos! Pos-write-cap w 0 (:: 42 :Pos)))
-;;;   ;; ... stage-add! stage physics ...
-;;;
-;;; Since: E2c sized-scheduler wiring (direction 1)
-(defmacro sized-defsystem-scheduled [name world-name reads-vec writes-vec body]
-  (let [impl-name (str->sym (str-append (symbol-name name) "-impl"))
-        fn-name   (str->sym (str-append (symbol-name name) "-fn"))
-        load-name (str->sym (str-append "load-" (symbol-name world-name)))]
-    `(do
-       (defn ~impl-name [^borrow w : ~world-name] : nil
-         (defsystem--with-read-caps
-           (defsystem--with-write-caps
-             (do
-               ~body
-               (defsystem--consume-write-caps ~writes-vec))
-             ~writes-vec)
-           ~reads-vec))
-       (defn ~fn-name [wp : int] : nil
-         (let [w : ~world-name (~load-name wp)]
-           (~impl-name w)))
-       (def ~name (make-system
-                    (defsystem--mask ~reads-vec)
-                    (defsystem--mask ~writes-vec)
-                    ~fn-name)))))
-
-) ;; end defmodule ecs/sized-world
+         (defstruct ~name
+           [~@(sized-mono-world-fields ~cap-expr ~comps) state : WorldState])
+         (defn ~ctor-name [k : int] : ~name
+           (make-struct ~name
+             ~@(sized-mono-ctor-args ~cap-expr ~comps)
+             (sized-state-new k))))))
+  ;;; sized-defcomponent-accessors-mono -- emit cap-gated
+  ;;; `get-<Comp>` / `set-<Comp>!` / `has-<Comp>?` for one (mono sized
+  ;;; world, component) pair, matching the surface of
+  ;;; `sized-defcomponent-accessors` but against a *non-parameterised*
+  ;;; world type (the shape `sized-defworld-mono` emits).
+  ;;;
+  ;;; The polymorphic variant emits `[n]` as a type-param vector and
+  ;;; types `w` as `(~world-name n)`. The monomorphic world has no `n`
+  ;;; -- the capacity is baked into the storage field types -- so the
+  ;;; accessor's signature is `[w : ~world-name]` with no type-param
+  ;;; vector, otherwise identical (same cap surface, same backend
+  ;;; calls). Splitting into a separate macro is the lightest landing:
+  ;;; trying to overload on world shape would require the macro to
+  ;;; inspect the world-name's binding at macro-expand time, which the
+  ;;; current macro system does not support.
+  ;;;
+  ;;; Since: E2c slice 10
+  (defmacro sized-defcomponent-accessors-mono [world-name comp-name]
+    (let [getter (str->sym (str-append "get-" (symbol-name comp-name)))
+          setter (str->sym (str-append "set-" (symbol-name comp-name) "!"))
+          haser  (str->sym (str-append "has-" (symbol-name comp-name) "?"))
+          field  (dot-sym comp-name)]
+      `(do
+         (defn ~getter [^borrow cap : (ReadCap ~comp-name)
+                        ^borrow w : ~world-name
+                        e : Slot] : ~comp-name
+           (let [p                              : ~comp-name
+                 (sized-dense-get (~field w) e)]
+             p))
+         (defn ~setter [^borrow cap : (WriteCap ~comp-name)
+                        ^borrow w : ~world-name
+                        e : Slot
+                        v : ~comp-name] : nil
+           (sized-dense-set! (~field w) e v))
+         (defn ~haser [^borrow w : ~world-name e : Slot] : bool
+           (sized-dense-has? (~field w) e)))))
+  ;;; sized-defworld -- declare a bounded-capacity world type `(Name n)`.
+  ;;;
+  ;;; E2c slice 3b: the former slice-3 per-arity cascade (unrolled 1..4, with
+  ;;; arity capped at four components) is collapsed into one variadic body that
+  ;;; computes its field list with `sized-world-fields` and its constructor
+  ;;; args with `sized-ctor-args`, splicing both at macro-expansion time. Arity
+  ;;; is no longer capped -- a sized world may carry any number of components
+  ;;; (see `tests/sized-world-wide.tur`, a five-component world). The collapse
+  ;;; mirrors `ecs/world`'s E2d-P5b `defworld` collapse and depends on the same
+  ;;; two turmeric fixes that landed 2026-06-17: `~@`-splice into a literal and
+  ;;; a nested user-macro call from inside a splice expression.
+  ;;;
+  ;;; Since: E2c slice 3 (1..4 components); slice 3b (variadic, uncapped arity)
+  (defmacro sized-defworld [name comps]
+    (let [ctor-name (str->sym (str-append "make-" (symbol-name name)))]
+      `(do
+         (defstruct ~name [n] ~@(sized-world-fields comps) (state WorldState))
+         (defn ~ctor-name [n] [k : int] : (~name n)
+           (make-struct ~name ~@(sized-ctor-args comps) (sized-state-new k))))))
+  ;;; sized-copy-component-body -- recursive helper for
+  ;;; sized-defworld-copy-into. Expands to a chain of per-component
+  ;;; copy steps inside the iteration body: for each component,
+  ;;;
+  ;;;   (when (sized-dense-has? (.~Comp src) i)
+  ;;;     (sized-dense-set! (.~Comp dst) i
+  ;;;                       (sized-dense-get (.~Comp src) i)))
+  ;;;
+  ;;; The trailing component's expansion is the final form of the body
+  ;;; (no `do`-tail needed because each step is in a top-level position
+  ;;; in the body sequence).
+  ;;;
+  ;;; Since: E2c slice 11
+  (defmacro sized-copy-component-body [src dst i comps]
+    (if (empty? comps)
+      `nil
+      (let [__c     (first comps)
+            __field (dot-sym __c)]
+        `(do
+           (when (sized-dense-has? (~__field ~src) ~i)
+             (sized-dense-set! (~__field ~dst)
+               ~i
+               (sized-dense-get (~__field ~src) ~i)))
+           (sized-copy-component-body ~src ~dst ~i ~(rest comps))))))
+  ;;; sized-defworld-copy-into -- emit a per-world slot-preserving copy
+  ;;; function `copy-into-<Name>`.
+  ;;;
+  ;;; Syntax:
+  ;;;   (sized-defworld GameWorld [Pos Vel])
+  ;;;   (sized-defworld-copy-into GameWorld [Pos Vel])
+  ;;;
+  ;;; The component vector must match `sized-defworld`'s -- we can't
+  ;;; recover it from the world type alone (the storage handles are
+  ;;; defopaque ints at the C ABI), so the caller spells it out a
+  ;;; second time. The lowering is polymorphic in both src and dst
+  ;;; capacity:
+  ;;;
+  ;;;   (defn copy-into-GameWorld [n n'] [src : (GameWorld n)
+  ;;;                                     dst : (GameWorld n')] : nil
+  ;;;     ;; per-slot, per-component, has?-guarded copy
+  ;;;     ...
+  ;;;     (sized-state-copy-into (.state src) (.state dst)))
+  ;;;
+  ;;; Cross-parameter unification: `(GameWorld n)` and `(GameWorld n')`
+  ;;; carry independent caps -- the SZ8 unifier does NOT collapse them,
+  ;;; which is exactly what we want for a resize (the whole point is
+  ;;; that `n` and `n'` can differ). The state-copy aborts at runtime
+  ;;; if `dst.cap < src.cap`; the slot-by-slot dense copy is bounded
+  ;;; by `src`'s cap and writes into `dst`'s same-indexed slots, so
+  ;;; growing copies (n' > n) work directly and shrinking is rejected
+  ;;; by the state-copy guard before any partial copy is observable.
+  ;;;
+  ;;; Entity-handle preservation: generations are carried in the state
+  ;;; cell (slice 4c), and `sized-state-copy-into` copies the full
+  ;;; gens array, so an `Entity` packed against `src` continues to
+  ;;; satisfy `(sized-alive? dst e)` after the copy. The dst's
+  ;;; free-list is reset to empty (its pre-copy contents referenced
+  ;;; gens that have just been overwritten); future despawns repopulate
+  ;;; it consistently with the new generation state.
+  ;;;
+  ;;; Since: E2c slice 11
+  (defmacro sized-defworld-copy-into [name comps]
+    (let [fn-name (str->sym (str-append "copy-into-" (symbol-name name)))]
+      `(defn ~fn-name [n n'] [^borrow src : (~name n) ^borrow dst : (~name n')] : nil
+         (let [^mut i  0
+               src-cap (sized-cap (.state src))]
+           (do
+             (while (< i src-cap)
+               (do
+                 (let [__sl (slot-new i)]
+                   (sized-copy-component-body src dst __sl ~comps))
+                 (set! i (+ i 1))))
+             (sized-state-copy-into (.state src) (.state dst)))))))
+  ;;; sized-defworld-world-resize -- emit a per-world `world-resize-<Name>`
+  ;;; that grows a sized world to a fresh runtime capacity and hands the
+  ;;; result back inside the size-hiding existential
+  ;;; `(exists [n'] (<Name> n'))`.
+  ;;;
+  ;;; Syntax:
+  ;;;   (sized-defworld GameWorld [Pos Vel])
+  ;;;   (sized-defworld-copy-into GameWorld [Pos Vel])
+  ;;;   (sized-defworld-world-resize GameWorld)
+  ;;;
+  ;;; Unlike `sized-defworld-copy-into`, this macro does not need the
+  ;;; component vector: the per-component copy is delegated to the
+  ;;; already-emitted `copy-into-<Name>`, so the only names it weaves are
+  ;;; the world's constructor (`make-<Name>`) and copy function. The
+  ;;; component list therefore lives in exactly one place (the
+  ;;; `sized-defworld-copy-into` call). Emitting `world-resize-<Name>`
+  ;;; requires both `make-<Name>` (from `sized-defworld`) and
+  ;;; `copy-into-<Name>` (from `sized-defworld-copy-into`) to be in scope.
+  ;;;
+  ;;; The lowering:
+  ;;;
+  ;;;   (defn world-resize-GameWorld [n]
+  ;;;                                [^borrow src : (GameWorld n) k : int]
+  ;;;                                : (exists [n'] (GameWorld n'))
+  ;;;     (let [dst : (GameWorld (Static 0)) (make-GameWorld k)]
+  ;;;       (copy-into-GameWorld src dst)
+  ;;;       (pack dst (exists [n'] (GameWorld n')))))
+  ;;;
+  ;;; This is the thin client layer the sized-world plan calls out:
+  ;;; `copy-into-<Name>` does the slot-preserving, generation-threading
+  ;;; copy (so an `Entity` packed against `src` stays `sized-alive?` in
+  ;;; the resized world), and the `pack` lifts the fresh destination into
+  ;;; the existential so callers recover an abstract `n'` via `open` (or
+  ;;; the stdlib `open-sized`) and run `sized-for-each` / the cap-gated
+  ;;; accessors against it. The emitted `(pack v (exists [n'] (W n')))`
+  ;;; is exactly what `stdlib/sized-handle-existential.tur`'s `pack-sized`
+  ;;; macro expands to; the native form is used directly so the spice
+  ;;; carries no `load`-time dependency on that stdlib module.
+  ;;;
+  ;;; New capacity is a runtime argument (`k`), which is *why* the result
+  ;;; is existential: the destination cap is not known statically, so it
+  ;;; is sealed behind a fresh `n'` rather than surfaced as a concrete
+  ;;; `(<Name> (Static k))`. The phantom cap on the destination is
+  ;;; written as `(Static 0)` purely to give `make-<Name>` a ground type
+  ;;; to monomorphise against (the constructor only codegens at a ground
+  ;;; capacity); it is forgotten the instant the value is packed, and it
+  ;;; never reaches runtime -- every storage and the state cell are sized
+  ;;; from the runtime `k`, and `sized-dense-cap` / `sized-cap` read that
+  ;;; runtime width, so `sized-for-each`'s loop bound and the accessors'
+  ;;; bounds checks all see `k`, not `0`.
+  ;;;
+  ;;; Growing is the supported direction (`k >= src` capacity): the
+  ;;; underlying `sized-state-copy-into` aborts before any partial state
+  ;;; is observable if `k` is smaller than the source capacity, matching
+  ;;; `copy-into-<Name>`'s shrink-rejection guarantee.
+  ;;;
+  ;;; Since: E2c slice 11 follow-up (world-resize existential wrapper);
+  ;;; unblocked by turmeric's existential pack/open heap-boxing fix for
+  ;;; multi-field struct payloads.
+  (defmacro sized-defworld-world-resize [name]
+    (let [fn-name   (str->sym (str-append "world-resize-" (symbol-name name)))
+          ctor-name (str->sym (str-append "make-" (symbol-name name)))
+          copy-name (str->sym (str-append "copy-into-" (symbol-name name)))]
+      `(defn ~fn-name [n] [^borrow src : (~name n) k : int] : (exists [n']
+                                                                (~name n'))
+         (let [dst            : (~name (Static 0))
+               (~ctor-name k)]
+           (do (~copy-name src dst) (pack dst (exists [n'] (~name n'))))))))
+  ;;; sized-defcomponent-accessors -- emit cap-gated
+  ;;; `get-<Comp>` / `set-<Comp>!` / `has-<Comp>?` accessors for one
+  ;;; (sized world, component) pair. The sized counterpart of
+  ;;; `ecs/world`'s `defcomponent-accessors`.
+  ;;;
+  ;;; Each accessor's world parameter is `^borrow w : (~world-name n)`,
+  ;;; so the type-level `n` is polymorphic at the accessor's signature
+  ;;; and unified by the call site against whichever concrete
+  ;;; `(GameWorld (Static k))` value is passed. The element type
+  ;;; threads through `(SizedDense n ~comp-name)`, so a hand-written
+  ;;; `(set-Pos! cap w 0 (:: 42 :Pos))` against a `w : (GameWorld
+  ;;; (Static 64))` resolves both `n` and the element type without an
+  ;;; explicit witness.
+  ;;;
+  ;;; Cap surface matches the unsized accessors exactly:
+  ;;;
+  ;;;   - `get-<Comp>`: `^borrow cap : (ReadCap Comp)` -- non-consuming
+  ;;;     so a body that reads many slots per iteration does not need
+  ;;;     to re-mint.
+  ;;;   - `set-<Comp>!`: `^borrow cap : (WriteCap Comp)` -- same
+  ;;;     borrow-not-consume rationale as I4. The linear cap is auto-
+  ;;;     consumed once by `defsystem`'s body-end wrapper (unchanged
+  ;;;     from the unsized path; sized `defsystem` is a follow-up
+  ;;;     slice).
+  ;;;   - `has-<Comp>?`: no cap (presence is observable without
+  ;;;     declaring a read effect; matches the unsized surface).
+  ;;;
+  ;;; The bounds-check story per the sized-world plan Q4: the
+  ;;; underlying `sized-dense-get` / `sized-dense-set!` keep their
+  ;;; runtime checks against `cap`. The static-index path
+  ;;; (`(Fin n)` accessors) is refinement-types-gated and out of
+  ;;; scope here.
+  ;;;
+  ;;; Required imports at the call site:
+  ;;;   (import ecs/cap :refer [WriteCap ReadCap])
+  ;;;
+  ;;; Since: E2c slice 7
+  (defmacro sized-defcomponent-accessors [world-name comp-name]
+    (let [getter (str->sym (str-append "get-" (symbol-name comp-name)))
+          setter (str->sym (str-append "set-" (symbol-name comp-name) "!"))
+          haser  (str->sym (str-append "has-" (symbol-name comp-name) "?"))
+          field  (dot-sym comp-name)]
+      `(do
+         (defn ~getter [n] [^borrow cap : (ReadCap ~comp-name)
+                            ^borrow w : (~world-name n)
+                            e : Slot] : ~comp-name
+           (let [p                              : ~comp-name
+                 (sized-dense-get (~field w) e)]
+             p))
+         (defn ~setter [n] [^borrow cap : (WriteCap ~comp-name)
+                            ^borrow w : (~world-name n)
+                            e : Slot
+                            v : ~comp-name] : nil
+           (sized-dense-set! (~field w) e v))
+         (defn ~haser [n] [^borrow w : (~world-name n) e : Slot] : bool
+           (sized-dense-has? (~field w) e)))))
+  ;;; sized-defsystem -- declare a typed sized-world system body with
+  ;;; `:reads` / `:writes` caps bound in scope.
+  ;;;
+  ;;; Syntax:
+  ;;;   (sized-defsystem name WorldName [reads-comp ...] [writes-comp ...] body)
+  ;;;
+  ;;; `WorldName` is the unparameterized world type (e.g. `GameWorld`,
+  ;;; not `(GameWorld (Static 64))`). The macro emits one polymorphic
+  ;;; `defn`:
+  ;;;
+  ;;;   (defn name [n] [^borrow w : (WorldName n)] : nil
+  ;;;     (defsystem--with-read-caps
+  ;;;       (defsystem--with-write-caps
+  ;;;         (do body (defsystem--consume-write-caps writes))
+  ;;;         writes)
+  ;;;       reads))
+  ;;;
+  ;;; ...so a single `name` defn elaborates against every concrete
+  ;;; `(WorldName (Static k))` capacity without duplication, mirroring
+  ;;; `sized-defcomponent-accessors`'s `n`-polymorphic shape.
+  ;;;
+  ;;; The cap-binding lowering reuses the unsized `ecs/system` helpers
+  ;;; (`defsystem--with-read-caps`, `defsystem--with-write-caps`,
+  ;;; `defsystem--consume-write-caps`), so the binding rules and
+  ;;; auto-consume semantics are identical to `defsystem`: read caps
+  ;;; are non-linear and bound as `<Comp>-read-cap`; write caps are
+  ;;; linear, bound as `<Comp>-write-cap`, and auto-consumed once at
+  ;;; body end. A `<Comp>-cid` binding must be in scope at the macro
+  ;;; call site for each declared comp.
+  ;;;
+  ;;; **No `System` value is emitted by this macro.** The `ecs/system`
+  ;;; scheduler's `System` value packs `(reads-mask, writes-mask, run-fn
+  ;;; : ptr<void>)` whose run-fn signature is `[w : int] : nil` -- the
+  ;;; world is type-erased through a void* cast. A `(WorldName n)` is a
+  ;;; multi-int64 struct, not an int handle, so it cannot ride the
+  ;;; scheduler's one-word carrier by value.
+  ;;;
+  ;;; The "by heap pointer" workaround (sized-scheduler report,
+  ;;; direction 1 -- docs/reported/sized-scheduler-system-stage-world-
+  ;;; carrier.md) is fully expressible at the spice layer today:
+  ;;; heap-box the sized world, pass its pointer reinterpreted as `:int`
+  ;;; through the existing carrier, and have each system's run-fn load
+  ;;; the world struct back from the pointer to drive the cap-gated
+  ;;; accessors. `tests/sized-stage.tur` ships the end-to-end recipe
+  ;;; (sized world declared via `sized-defworld-mono`, per-world
+  ;;; `box-<W>` / `load-<W>` / `free-<W>-box` inline-C helpers,
+  ;;; `make-system` packed `[wp : int]` run-fns, wave-scheduled via
+  ;;; `stage-run!`). Direction 2 (cross-world / heterogeneous scheduling
+  ;;; -- one stage running systems over differently-typed worlds) shipped
+  ;;; as `ecs/hstage`: `bind-system` lifts a scheduled `System` into a
+  ;;; `WorldSystem` keyed on a `(world-id, world)` pair, and `HStage`
+  ;;; dispatches each system against its own boxed world with a
+  ;;; (World, Component) conflict key, so systems over distinct worlds
+  ;;; never falsely serialise. It rides the typeclass-bounded-wrapper
+  ;;; monomorphisation that closed gap-H upstream (turmeric #447/#448).
+  ;;; `tests/hstage-cross-world.tur` is the end-to-end regression.
+  ;;;
+  ;;; Callers that just want the typed cap-bound body without the
+  ;;; scheduler wiring still invoke the macro-emitted impl directly:
+  ;;;
+  ;;;   (sized-defsystem physics GameWorld [Pos Vel] [Pos]
+  ;;;     (set-Pos! Pos-write-cap w 0 (:: 1 :Pos)))
+  ;;;   (physics game-world)
+  ;;;
+  ;;; This still buys the load-bearing static guarantee: a body that
+  ;;; writes a component it did not declare has no `<Comp>-write-cap`
+  ;;; in scope, so the call fails to elaborate. The Stage-parallel
+  ;;; story is purely an integration follow-up; the cap-gating is
+  ;;; complete.
+  ;;;
+  ;;; Required imports at the call site:
+  ;;;   (import ecs/cap :refer [WriteCap ReadCap make-write-cap make-read-cap use-cap!])
+  ;;;
+  ;;; Since: E2c slice 8
+  (defmacro sized-defsystem [name world-name reads-vec writes-vec body]
+    `(defn ~name [n] [^borrow w : (~world-name n)] : nil
+       (defsystem--with-read-caps (defsystem--with-write-caps (do
+                                                                ~body
+                                                                (defsystem--consume-write-caps ~writes-vec))
+                                    ~writes-vec)
+         ~reads-vec)))
+  ;;; sized-defsystem-scheduled -- declare a monomorphic sized-world
+  ;;; system that ships as a `System` value runnable on the parallel
+  ;;; `Stage` scheduler. The "by heap pointer" landing for the report's
+  ;;; direction-1 follow-up
+  ;;; (`docs/archive/sized-scheduler-system-stage-world-carrier.md`).
+  ;;;
+  ;;; Syntax:
+  ;;;   (sized-defsystem-scheduled name WorldName [reads-comp ...] [writes-comp ...] body)
+  ;;;
+  ;;; `WorldName` is the *monomorphic* world type (the shape emitted by
+  ;;; `sized-defworld-mono`). The polymorphic `(WorldName n)` shape is
+  ;;; deliberately not supported here -- the `System` carrier passes the
+  ;;; world as a `ptr<void>` reinterpreted as `:int`, so the world's C
+  ;;; representation must be a single concrete struct type the wrapper
+  ;;; can cast back to.
+  ;;;
+  ;;; Pre-condition: a `load-<WorldName>` function with signature
+  ;;; `[wp : int] : <WorldName>` must be in scope at the macro call
+  ;;; site. The matching `box-<WorldName>` (allocate + copy world onto
+  ;;; the heap) and `free-<WorldName>-box` (release the boxed world)
+  ;;; are needed by the *caller* of `stage-add!`/`stage-run!` but are
+  ;;; not consulted by this macro's expansion. They stay user-written
+  ;;; -- macros cannot splice identifiers into inline-C text and the
+  ;;; heap-box / load / free triple is three short inline-C blocks
+  ;;; referencing the C struct name verbatim (see
+  ;;; `tests/sized-stage.tur` for the canonical recipe and
+  ;;; `docs/archive/history/macro-cannot-emit-inline-c-block.md` for
+  ;;; the underlying limitation).
+  ;;;
+  ;;; Expands to three top-level forms:
+  ;;;
+  ;;;   (defn name-impl [^borrow w : WorldName] : nil
+  ;;;     ;; cap-binding lets per :reads / :writes, body, auto-consume
+  ;;;     ;; -- same lowering as `sized-defsystem`'s emitted impl but
+  ;;;     ;; monomorphic in the world type.
+  ;;;     ...)
+  ;;;
+  ;;;   (defn name-fn [wp : int] : nil
+  ;;;     ;; int-carrier wrapper -- load the boxed world, dispatch to
+  ;;;     ;; the typed impl.
+  ;;;     (let [w : WorldName (load-WorldName wp)]
+  ;;;       (name-impl w)))
+  ;;;
+  ;;;   (def name (make-system READS-MASK WRITES-MASK name-fn))
+  ;;;
+  ;;; Cap-binding rules and auto-consume semantics match `sized-defsystem`
+  ;;; and `defsystem` exactly: read caps are non-linear and bound as
+  ;;; `<Comp>-read-cap`; write caps are linear, bound as `<Comp>-write-cap`,
+  ;;; and auto-consumed once at body end. A `<Comp>-cid` binding must be
+  ;;; in scope at the macro call site for each declared comp.
+  ;;;
+  ;;; A body that writes a component not declared in `:writes` fails to
+  ;;; elaborate with `unbound symbol '<Comp>-write-cap'` -- the same
+  ;;; compile-time guarantee the unsized `defsystem` and the typed
+  ;;; `sized-defsystem` give. The int-carrier wrapper does not weaken
+  ;;; this: the cap-binding lets sit *inside* the typed impl, above the
+  ;;; wrapper's `(name-impl w)` call.
+  ;;;
+  ;;; The world struct is loaded by-value into the impl. Its fields are
+  ;;; int64 handles into shared heap storage, so mutations applied
+  ;;; through cap-gated `set-<Comp>!` flow through to every other loaded
+  ;;; copy of the same boxed world. Callers re-load the boxed world
+  ;;; after `stage-run!` to observe the writes (see
+  ;;; `tests/sized-stage.tur` for the round-trip).
+  ;;;
+  ;;; Required imports at the call site:
+  ;;;   (import ecs/cap    :refer [WriteCap ReadCap make-write-cap make-read-cap use-cap!])
+  ;;;   (import ecs/system :refer [System make-system cid-bit])
+  ;;;   (import ecs/stage  :refer [Stage stage-new stage-add! stage-n-waves stage-run! stage-free!])
+  ;;;
+  ;;; Example:
+  ;;;   (sized-defworld-mono GameWorld (Static 8) [Pos Hp])
+  ;;;   (sized-defcomponent-accessors-mono GameWorld Pos)
+  ;;;   ;; box-GameWorld / load-GameWorld / free-GameWorld-box defined here ...
+  ;;;   (def Pos-cid 0)
+  ;;;   (sized-defsystem-scheduled physics GameWorld [Pos] [Pos]
+  ;;;     (set-Pos! Pos-write-cap w 0 (:: 42 :Pos)))
+  ;;;   ;; ... stage-add! stage physics ...
+  ;;;
+  ;;; Since: E2c sized-scheduler wiring (direction 1)
+  (defmacro sized-defsystem-scheduled [name
+                                       world-name
+                                       reads-vec
+                                       writes-vec
+                                       body]
+    (let [impl-name (str->sym (str-append (symbol-name name) "-impl"))
+          fn-name   (str->sym (str-append (symbol-name name) "-fn"))
+          load-name (str->sym (str-append "load-" (symbol-name world-name)))]
+      `(do
+         (defn ~impl-name [^borrow w : ~world-name] : nil
+           (defsystem--with-read-caps (defsystem--with-write-caps (do
+                                                                    ~body
+                                                                    (defsystem--consume-write-caps ~writes-vec))
+                                        ~writes-vec)
+             ~reads-vec))
+         (defn ~fn-name [wp : int] : nil
+           (let [w               : ~world-name
+                 (~load-name wp)]
+             (~impl-name w)))
+         (def ~name
+           (make-system (defsystem--mask ~reads-vec)
+             (defsystem--mask ~writes-vec)
+             ~fn-name)))))) ;; end defmodule ecs/sized-world

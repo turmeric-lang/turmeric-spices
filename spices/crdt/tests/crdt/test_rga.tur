@@ -24,232 +24,244 @@
 ;; Characters are int codes; the tests compare codes rather than rendering.
 ;;
 ;; main returns the failure count so `tur test` reports a non-zero exit.
-
 (defmodule crdt/tests/test_rga
   (import crdt/replica :refer [ReplicaId replica replica-sym])
-  (import crdt/rga :refer [Rga rga-new rga-len rga-size rga-clock rga-get
-                           rga-alive? rga-insert rga-append rga-delete
-                           rga-delta-insert rga-delta-delete])
+  (import crdt/rga
+    :refer
+    [Rga
+     rga-new
+     rga-len
+     rga-size
+     rga-clock
+     rga-get
+     rga-alive?
+     rga-insert
+     rga-append
+     rga-delete
+     rga-delta-insert
+     rga-delta-delete])
   (import crdt/lattice :refer [join-all])
-
-(defn fail-if [cond : bool label : cstr] : int
-  (if cond (do (println label) 1) 0))
-
-;; An Rga holds a Vec handle, so it is affine: `join` and every mutator
-;; CONSUME it.  States are rebuilt by a nullary builder per assertion, the
-;; same way test_counter and test_converge do it.
-
-;;; __codes-match? -- internal: does the document read as this code sequence?
-(defn __codes-match? [^borrow s : Rga v : (Vec int) i : int] : bool
-  (if (>= i (vec-len v))
-    (= (rga-len s) (vec-len v))
-    (if (= (rga-get s i) (vec-get v i))
-      (__codes-match? s v (+ i 1))
-      false)))
-
-;; ---------------------------------------------------------------------------
-;; 1. A local document.
-
-;; "HELLO" = 72 69 76 76 79, typed left to right by alice.
-(defn hello [] : Rga
-  (rga-append (rga-append (rga-append (rga-append
-    (rga-append (rga-new) (replica (quote alice)) 72)
-    (replica (quote alice)) 69) (replica (quote alice)) 76) (replica (quote alice)) 76) (replica (quote alice)) 79))
-
-(defn test-local [] : int
-  (let [s  (hello)
-        ok (__codes-match? s (vec-of 72 69 76 76 79) 0)]
-    (+ (fail-if (not ok) "FAIL rga: HELLO did not read back in order")
-       (fail-if (not (= (rga-clock (hello)) 5))
-                "FAIL rga: clock did not advance once per insert"))))
-
-;;; An insert in the MIDDLE, which is where an append-only test would stop.
-(defn test-insert-middle [] : int
-  (let [s  (rga-insert (hello) (replica (quote alice)) 1 88)   ;; H X E L L O
-        ok (__codes-match? s (vec-of 72 88 69 76 76 79) 0)]
-    (fail-if (not ok) "FAIL rga: middle insert landed in the wrong place")))
-
-;; ---------------------------------------------------------------------------
-;; 2. Concurrent inserts at the same position.
-;;
-;; bob and carol both insert at index 0 of the same "HELLO", neither having
-;; seen the other.  Both carry counter 6, so the replica NAME breaks the tie
-;; -- and it must break it the same way on both replicas or they diverge.
-;; carol > bob, so carol's character comes first, in either merge order.
-
-(defn c-bob   [] : Rga (rga-insert (hello) (replica (quote bob))   0 88))   ;; X
-(defn c-carol [] : Rga (rga-insert (hello) (replica (quote carol)) 0 89))   ;; Y
-
-(defn test-concurrent-same-spot [] : int
-  (let [m1 (join (c-bob) (c-carol))
-        m2 (join (c-carol) (c-bob))
-        e  (vec-of 89 88 72 69 76 76 79)]
-    (+ (fail-if (not (__codes-match? m1 e 0))
-                "FAIL rga: concurrent same-spot insert wrong (bob first)")
-       (fail-if (not (__codes-match? m2 e 0))
-                "FAIL rga: concurrent same-spot insert wrong (carol first)")
-       (fail-if (not (= (rga-len (join (c-bob) (c-carol))) 7))
-                "FAIL rga: a concurrent insert was lost"))))
-
-;; ---------------------------------------------------------------------------
-;; 3. Concurrent RUNS do not interleave.  The scenario this file exists for.
-;;
-;; alice types "abc" at the head; bob types "xyz" at the head; neither has
-;; seen the other.  The merge must read "abcxyz" or "xyzabc" -- one run then
-;; the other.  "axbycz" converges just as well and is what a sequence CRDT
-;; that orders by timestamp alone produces, because alice's 'b' and bob's 'y'
-;; carry the same counter and sort next to each other.
-;;
-;; RGA avoids it because 'b' is a CHILD of 'a' and 'y' a child of 'x': the
-;; integration scan walks past a higher-id sibling's whole subtree, so a run
-;; stays contiguous.  That is exactly what invariant (1) in crdt/rga's header
-;; buys, and this assertion is what would notice if it stopped holding.
-
-(defn run-alice [] : Rga
-  (rga-insert (rga-insert (rga-insert (rga-new) (replica (quote alice)) 0 97)
-                          (replica (quote alice)) 1 98) (replica (quote alice)) 2 99))   ;; a b c
-(defn run-bob [] : Rga
-  (rga-insert (rga-insert (rga-insert (rga-new) (replica (quote bob)) 0 120)
-                          (replica (quote bob)) 1 121) (replica (quote bob)) 2 122))     ;; x y z
-
-(defn test-no-interleave [] : int
-  (let [m1 (join (run-alice) (run-bob))
-        m2 (join (run-bob) (run-alice))
-        e  (vec-of 120 121 122 97 98 99)]   ;; bob > alice, so "xyzabc"
-    (+ (fail-if (not (__codes-match? m1 e 0))
-                "FAIL rga: concurrent runs interleaved (alice first)")
-       (fail-if (not (__codes-match? m2 e 0))
-                "FAIL rga: concurrent runs interleaved (bob first)"))))
-
-;; ---------------------------------------------------------------------------
-;; 4. An insert whose ORIGIN has been deleted.
-;;
-;; alice has "HELLO" and deletes the 'E'.  carol, who has not seen the delete,
-;; inserts 'X' right after the 'E'.  The merged document must read "H X L L O"
-;; -- carol's character keeps its place even though the element it was
-;; anchored to is gone.  This is the whole reason a tombstone stays in the
-;; array instead of being removed: it is still somebody's origin.
-
-(defn del-e   [] : Rga (rga-delete (hello) 1))                     ;; H _ L L O
-(defn ins-after-e [] : Rga (rga-insert (hello) (replica (quote carol)) 2 88)) ;; H E X L L O
-
-(defn test-insert-after-tombstone [] : int
-  (let [m  (join (del-e) (ins-after-e))
-        ok (__codes-match? m (vec-of 72 88 76 76 79) 0)]
-    (+ (fail-if (not ok) "FAIL rga: insert after a deleted origin lost its place")
-       (fail-if (not (= (rga-size (join (del-e) (ins-after-e))) 6))
-                "FAIL rga: tombstone was dropped from the array")
-       (fail-if (not (= (rga-len (join (del-e) (ins-after-e))) 5))
-                "FAIL rga: visible length wrong after a concurrent delete"))))
-
-;;; A plain delete: visible length falls, physical size does not.
-(defn test-delete [] : int
-  (+ (fail-if (not (= (rga-len (del-e)) 4))  "FAIL rga: delete did not hide the element")
-     (fail-if (not (= (rga-size (del-e)) 5)) "FAIL rga: delete removed the tombstone")
-     (fail-if (not (__codes-match? (del-e) (vec-of 72 76 76 79) 0))
-              "FAIL rga: document wrong after delete")
-     ;; Out of range is a no-op, not a crash or a silent shift.
-     (fail-if (not (= (rga-len (rga-delete (hello) 99)) 5))
-              "FAIL rga: out-of-range delete changed the document")
-     (fail-if (rga-alive? (hello) 5) "FAIL rga: rga-alive? past the end")))
-
-;; ---------------------------------------------------------------------------
-;; 5. A CAUSAL chain across replicas.
-;;
-;; bob receives alice's "HELLO", appends '!', and alice merges it back.  bob's
-;; node names alice's 'O' as its origin and carries a counter above hers, so
-;; the '!' can only land at the end.  A per-replica counter -- which is what
-;; crdt/causal's DotContext would have given -- would have minted bob@1 here,
-;; BELOW its own origin's alice@5, and the integration scan would have placed
-;; it wrongly.  That is the reason crdt/rga keeps a Lamport clock instead.
-
-(defn bob-appends [] : Rga (rga-append (hello) (replica (quote bob)) 33))
-
-(defn test-causal-chain [] : int
-  (let [m  (join (hello) (bob-appends))
-        ok (__codes-match? m (vec-of 72 69 76 76 79 33) 0)]
-    (+ (fail-if (not ok) "FAIL rga: causal append did not stay at the end")
-       (fail-if (not (> (rga-clock (bob-appends)) 5))
-                "FAIL rga: clock did not exceed the origin it named"))))
-
-;;; After a merge the clock covers BOTH sides.
-;;;
-;;; crdt/rga's invariant (1) -- a node's id exceeds its origin's -- only holds
-;;; if merging raises this replica's clock to cover what it just absorbed.
-;;; Drop the `max` in `rga-merge` and the next local insert can mint a
-;;; counter below the origin it names, and the integration scan then places
-;;; nodes inside a subtree they do not belong to.
-;;;
-;;; MEASURED, and the reason this is a white-box assertion rather than a
-;;; document comparison: removing that `max` leaves EVERY other test in this
-;;; file green, the convergence fuzzer green, and the documents identical.
-;;; The damage is to the tree the ids encode, and two replicas corrupt it
-;;; identically, so they still agree -- the same shape as crdt-spice-plan
-;;; C2's finding that a convergence check cannot see a merge that converges
-;;; on the wrong answer.  Stating the invariant directly is what catches it.
-(defn test-clock-monotone [] : int
-  ;; `b` first, so a merge that simply kept the left clock would report 3.
-  (let [m (join (run-bob) (hello))
-        c (rga-clock m)
-        after (rga-clock (rga-append (join (run-bob) (hello)) (replica (quote carol)) 33))]
-    (+ (fail-if (not (>= c 5))
-                "FAIL rga: merge did not raise the clock to cover the other side")
-       (fail-if (not (> after 5))
-                "FAIL rga: a post-merge insert minted a counter below an existing node"))))
-
-;; ---------------------------------------------------------------------------
-;; 6. The laws, on a state that actually has structure.
-
-(defn test-laws [] : int
-  (let [once  (join (c-bob) (c-carol))
-        twice (join (join (c-bob) (c-carol)) (c-carol))
-        l3    (join (join (c-bob) (c-carol)) (run-bob))
-        r3    (join (c-bob) (join (c-carol) (run-bob)))]
-    (+ (fail-if (not (eq? once twice))     "FAIL rga: join is not idempotent")
-       (fail-if (not (eq? l3 r3))          "FAIL rga: join is not associative")
-       (fail-if (not (eq? (join-all (vec-of (c-bob) (c-carol)))
-                          (join (c-carol) (c-bob))))
-                "FAIL rga: join-all disagrees with a direct join")
-       (fail-if (not (= (rga-len (join-all (:: (vec-of) (Vec Rga)))) 0))
-                "FAIL rga: join-all of empty is not bottom"))))
-
-;; ---------------------------------------------------------------------------
-;; Deltas (C4's channel, on C5's type).
-
-(defn test-delta [] : int
-  (let [di   (rga-delta-insert (hello) (replica (quote bob)) 0 88)
-        dd   (rga-delta-delete (hello) 1)
-        seq  (apply-delta (apply-delta (hello) (rga-delta-insert (hello) (replica (quote bob)) 0 88))
-                          (rga-delta-delete (hello) 1))
-        full (join (rga-delete (rga-insert (hello) (replica (quote bob)) 0 88) 2) (hello))
-        idem (apply-delta (apply-delta (hello)
-                                       (rga-delta-insert (hello) (replica (quote bob)) 0 88))
-                          (rga-delta-insert (hello) (replica (quote bob)) 0 88))]
-    (+ ;; One node on the wire against five in the document.
-       (fail-if (not (= (rga-size di) 1))
-                "FAIL rga delta: insert delta is not one node")
-       (fail-if (not (= (rga-size dd) 1))
-                "FAIL rga delta: delete delta is not one node")
-       (fail-if (not (__codes-match? seq (vec-of 88 72 76 76 79) 0))
-                "FAIL rga delta: delta sequence gave the wrong document")
-       (fail-if (not (eq? seq full))
-                "FAIL rga delta: delta sequence != full-state join")
-       ;; Re-delivering the insert must not duplicate the character.
-       (fail-if (not (= (rga-len idem) 6))
-                "FAIL rga delta: re-delivered insert duplicated a node"))))
-
-(defn main [] : int
-  (let [f (+ (test-local)
-             (test-insert-middle)
-             (test-concurrent-same-spot)
-             (test-no-interleave)
-             (test-insert-after-tombstone)
-             (test-delete)
-             (test-causal-chain)
-             (test-clock-monotone)
-             (test-laws)
-             (test-delta))]
-    (if (= f 0) (println "test_rga: ok") (println "test_rga: FAILURES"))
-    f))
-
-) ;; end defmodule
+  (defn fail-if [cond : bool label : cstr] : int
+    (if cond (do (println label) 1) 0))
+  ;; An Rga holds a Vec handle, so it is affine: `join` and every mutator
+  ;; CONSUME it.  States are rebuilt by a nullary builder per assertion, the
+  ;; same way test_counter and test_converge do it.
+  ;;; __codes-match? -- internal: does the document read as this code sequence?
+  (defn __codes-match? [^borrow s : Rga v : (Vec int) i : int] : bool
+    (if (>= i (vec-len v))
+      (= (rga-len s) (vec-len v))
+      (if (= (rga-get s i) (vec-get v i)) (__codes-match? s v (+ i 1)) false)))
+  ;; ---------------------------------------------------------------------------
+  ;; 1. A local document.
+  ;; "HELLO" = 72 69 76 76 79, typed left to right by alice.
+  (defn hello [] : Rga
+    (rga-append (rga-append (rga-append (rga-append (rga-append (rga-new)
+                                                      (replica (quote alice))
+                                                      72)
+                                          (replica (quote alice))
+                                          69)
+                              (replica (quote alice))
+                              76)
+                  (replica (quote alice))
+                  76)
+      (replica (quote alice))
+      79))
+  (defn test-local [] : int
+    (let [s  (hello)
+          ok (__codes-match? s (vec-of 72 69 76 76 79) 0)]
+      (+ (fail-if (not ok) "FAIL rga: HELLO did not read back in order")
+        (fail-if (not (= (rga-clock (hello)) 5))
+          "FAIL rga: clock did not advance once per insert"))))
+  ;;; An insert in the MIDDLE, which is where an append-only test would stop.
+  (defn test-insert-middle [] : int
+    (let [s  (rga-insert (hello) (replica (quote alice)) 1 88) ;; H X E L L O
+          ok (__codes-match? s (vec-of 72 88 69 76 76 79) 0)]
+      (fail-if (not ok) "FAIL rga: middle insert landed in the wrong place")))
+  ;; ---------------------------------------------------------------------------
+  ;; 2. Concurrent inserts at the same position.
+  ;;
+  ;; bob and carol both insert at index 0 of the same "HELLO", neither having
+  ;; seen the other.  Both carry counter 6, so the replica NAME breaks the tie
+  ;; -- and it must break it the same way on both replicas or they diverge.
+  ;; carol > bob, so carol's character comes first, in either merge order.
+  (defn c-bob [] : Rga (rga-insert (hello) (replica (quote bob)) 0 88)) ;; X
+  (defn c-carol [] : Rga (rga-insert (hello) (replica (quote carol)) 0 89)) ;; Y
+  (defn test-concurrent-same-spot [] : int
+    (let [m1 (join (c-bob) (c-carol))
+          m2 (join (c-carol) (c-bob))
+          e  (vec-of 89 88 72 69 76 76 79)]
+      (+ (fail-if (not (__codes-match? m1 e 0))
+           "FAIL rga: concurrent same-spot insert wrong (bob first)")
+        (fail-if (not (__codes-match? m2 e 0))
+          "FAIL rga: concurrent same-spot insert wrong (carol first)")
+        (fail-if (not (= (rga-len (join (c-bob) (c-carol))) 7))
+          "FAIL rga: a concurrent insert was lost"))))
+  ;; ---------------------------------------------------------------------------
+  ;; 3. Concurrent RUNS do not interleave.  The scenario this file exists for.
+  ;;
+  ;; alice types "abc" at the head; bob types "xyz" at the head; neither has
+  ;; seen the other.  The merge must read "abcxyz" or "xyzabc" -- one run then
+  ;; the other.  "axbycz" converges just as well and is what a sequence CRDT
+  ;; that orders by timestamp alone produces, because alice's 'b' and bob's 'y'
+  ;; carry the same counter and sort next to each other.
+  ;;
+  ;; RGA avoids it because 'b' is a CHILD of 'a' and 'y' a child of 'x': the
+  ;; integration scan walks past a higher-id sibling's whole subtree, so a run
+  ;; stays contiguous.  That is exactly what invariant (1) in crdt/rga's header
+  ;; buys, and this assertion is what would notice if it stopped holding.
+  (defn run-alice [] : Rga
+    (rga-insert (rga-insert (rga-insert (rga-new) (replica (quote alice)) 0 97)
+                  (replica (quote alice))
+                  1
+                  98)
+      (replica (quote alice))
+      2
+      99)) ;; a b c
+  (defn run-bob [] : Rga
+    (rga-insert (rga-insert (rga-insert (rga-new) (replica (quote bob)) 0 120)
+                  (replica (quote bob))
+                  1
+                  121)
+      (replica (quote bob))
+      2
+      122)) ;; x y z
+  (defn test-no-interleave [] : int
+    (let [m1 (join (run-alice) (run-bob))
+          m2 (join (run-bob) (run-alice))
+          e  (vec-of 120 121 122 97 98 99)] ;; bob > alice, so "xyzabc"
+      (+ (fail-if (not (__codes-match? m1 e 0))
+           "FAIL rga: concurrent runs interleaved (alice first)")
+        (fail-if (not (__codes-match? m2 e 0))
+          "FAIL rga: concurrent runs interleaved (bob first)"))))
+  ;; ---------------------------------------------------------------------------
+  ;; 4. An insert whose ORIGIN has been deleted.
+  ;;
+  ;; alice has "HELLO" and deletes the 'E'.  carol, who has not seen the delete,
+  ;; inserts 'X' right after the 'E'.  The merged document must read "H X L L O"
+  ;; -- carol's character keeps its place even though the element it was
+  ;; anchored to is gone.  This is the whole reason a tombstone stays in the
+  ;; array instead of being removed: it is still somebody's origin.
+  (defn del-e [] : Rga (rga-delete (hello) 1)) ;; H _ L L O
+  (defn ins-after-e [] : Rga (rga-insert (hello) (replica (quote carol)) 2 88)) ;; H E X L L O
+  (defn test-insert-after-tombstone [] : int
+    (let [m  (join (del-e) (ins-after-e))
+          ok (__codes-match? m (vec-of 72 88 76 76 79) 0)]
+      (+ (fail-if (not ok)
+           "FAIL rga: insert after a deleted origin lost its place")
+        (fail-if (not (= (rga-size (join (del-e) (ins-after-e))) 6))
+          "FAIL rga: tombstone was dropped from the array")
+        (fail-if (not (= (rga-len (join (del-e) (ins-after-e))) 5))
+          "FAIL rga: visible length wrong after a concurrent delete"))))
+  ;;; A plain delete: visible length falls, physical size does not.
+  (defn test-delete [] : int
+    (+ (fail-if (not (= (rga-len (del-e)) 4))
+         "FAIL rga: delete did not hide the element")
+      (fail-if (not (= (rga-size (del-e)) 5))
+        "FAIL rga: delete removed the tombstone")
+      (fail-if (not (__codes-match? (del-e) (vec-of 72 76 76 79) 0))
+        "FAIL rga: document wrong after delete")
+      ;; Out of range is a no-op, not a crash or a silent shift.
+      (fail-if (not (= (rga-len (rga-delete (hello) 99)) 5))
+        "FAIL rga: out-of-range delete changed the document")
+      (fail-if (rga-alive? (hello) 5) "FAIL rga: rga-alive? past the end")))
+  ;; ---------------------------------------------------------------------------
+  ;; 5. A CAUSAL chain across replicas.
+  ;;
+  ;; bob receives alice's "HELLO", appends '!', and alice merges it back.  bob's
+  ;; node names alice's 'O' as its origin and carries a counter above hers, so
+  ;; the '!' can only land at the end.  A per-replica counter -- which is what
+  ;; crdt/causal's DotContext would have given -- would have minted bob@1 here,
+  ;; BELOW its own origin's alice@5, and the integration scan would have placed
+  ;; it wrongly.  That is the reason crdt/rga keeps a Lamport clock instead.
+  (defn bob-appends [] : Rga (rga-append (hello) (replica (quote bob)) 33))
+  (defn test-causal-chain [] : int
+    (let [m  (join (hello) (bob-appends))
+          ok (__codes-match? m (vec-of 72 69 76 76 79 33) 0)]
+      (+ (fail-if (not ok) "FAIL rga: causal append did not stay at the end")
+        (fail-if (not (> (rga-clock (bob-appends)) 5))
+          "FAIL rga: clock did not exceed the origin it named"))))
+  ;;; After a merge the clock covers BOTH sides.
+  ;;;
+  ;;; crdt/rga's invariant (1) -- a node's id exceeds its origin's -- only holds
+  ;;; if merging raises this replica's clock to cover what it just absorbed.
+  ;;; Drop the `max` in `rga-merge` and the next local insert can mint a
+  ;;; counter below the origin it names, and the integration scan then places
+  ;;; nodes inside a subtree they do not belong to.
+  ;;;
+  ;;; MEASURED, and the reason this is a white-box assertion rather than a
+  ;;; document comparison: removing that `max` leaves EVERY other test in this
+  ;;; file green, the convergence fuzzer green, and the documents identical.
+  ;;; The damage is to the tree the ids encode, and two replicas corrupt it
+  ;;; identically, so they still agree -- the same shape as crdt-spice-plan
+  ;;; C2's finding that a convergence check cannot see a merge that converges
+  ;;; on the wrong answer.  Stating the invariant directly is what catches it.
+  (defn test-clock-monotone [] : int
+    ;; `b` first, so a merge that simply kept the left clock would report 3.
+    (let [m     (join (run-bob) (hello))
+          c     (rga-clock m)
+          after (rga-clock (rga-append (join (run-bob) (hello))
+                             (replica (quote carol))
+                             33))]
+      (+ (fail-if (not (>= c 5))
+           "FAIL rga: merge did not raise the clock to cover the other side")
+        (fail-if (not (> after 5))
+          "FAIL rga: a post-merge insert minted a counter below an existing node"))))
+  ;; ---------------------------------------------------------------------------
+  ;; 6. The laws, on a state that actually has structure.
+  (defn test-laws [] : int
+    (let [once  (join (c-bob) (c-carol))
+          twice (join (join (c-bob) (c-carol)) (c-carol))
+          l3    (join (join (c-bob) (c-carol)) (run-bob))
+          r3    (join (c-bob) (join (c-carol) (run-bob)))]
+      (+ (fail-if (not (eq? once twice)) "FAIL rga: join is not idempotent")
+        (fail-if (not (eq? l3 r3)) "FAIL rga: join is not associative")
+        (fail-if (not (eq? (join-all (vec-of (c-bob) (c-carol)))
+                        (join (c-carol) (c-bob))))
+          "FAIL rga: join-all disagrees with a direct join")
+        (fail-if (not (= (rga-len (join-all (:: (vec-of) (Vec Rga)))) 0))
+          "FAIL rga: join-all of empty is not bottom"))))
+  ;; ---------------------------------------------------------------------------
+  ;; Deltas (C4's channel, on C5's type).
+  (defn test-delta [] : int
+    (let [di   (rga-delta-insert (hello) (replica (quote bob)) 0 88)
+          dd   (rga-delta-delete (hello) 1)
+          seq  (apply-delta (apply-delta (hello)
+                              (rga-delta-insert (hello)
+                                (replica (quote bob))
+                                0
+                                88))
+                 (rga-delta-delete (hello) 1))
+          full (join (rga-delete (rga-insert (hello) (replica (quote bob)) 0 88)
+                       2)
+                 (hello))
+          idem (apply-delta (apply-delta (hello)
+                              (rga-delta-insert (hello)
+                                (replica (quote bob))
+                                0
+                                88))
+                 (rga-delta-insert (hello) (replica (quote bob)) 0 88))]
+      (+ ;; One node on the wire against five in the document.
+        (fail-if (not (= (rga-size di) 1))
+          "FAIL rga delta: insert delta is not one node")
+        (fail-if (not (= (rga-size dd) 1))
+          "FAIL rga delta: delete delta is not one node")
+        (fail-if (not (__codes-match? seq (vec-of 88 72 76 76 79) 0))
+          "FAIL rga delta: delta sequence gave the wrong document")
+        (fail-if (not (eq? seq full))
+          "FAIL rga delta: delta sequence != full-state join")
+        ;; Re-delivering the insert must not duplicate the character.
+        (fail-if (not (= (rga-len idem) 6))
+          "FAIL rga delta: re-delivered insert duplicated a node"))))
+  (defn main [] : int
+    (let [f (+ (test-local)
+              (test-insert-middle)
+              (test-concurrent-same-spot)
+              (test-no-interleave)
+              (test-insert-after-tombstone)
+              (test-delete)
+              (test-causal-chain)
+              (test-clock-monotone)
+              (test-laws)
+              (test-delta))]
+      (if (= f 0) (println "test_rga: ok") (println "test_rga: FAILURES"))
+      f))) ;; end defmodule

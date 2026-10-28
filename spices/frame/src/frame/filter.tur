@@ -3,23 +3,27 @@
 ;; FR2 ships filter-mask (the workhorse).  Predicate-driven filter, drop-nulls,
 ;; and sample land in FR2.5 / FR7 once Turmeric higher-order function-pointer
 ;; passing into inline-C is established for kernels of this shape.
-
 (defmodule frame/filter
   (export filter-mask distinct sample)
-
-  (import frame/schema :refer [field field-name field-type field-nullable
-                                schema schema-arity schema-field-at])
+  (import frame/schema
+    :refer
+    [field
+     field-name
+     field-type
+     field-nullable
+     schema
+     schema-arity
+     schema-field-at])
   (import frame/column :refer [column-length column-type])
-  (import frame/frame  :refer [frame frame-nrows frame-ncols frame-schema
-                                frame-column-at])
-  (import frame/sort   :refer [arrange-indices reorder __so-take])
-  (import frame/group  :refer [__group-by-cons grouped-count grouped-free])
-
-(defn __f-nil [] : int ```c return 0; ```)
-
-(defn __f-cons [v : int n : int] : int
-  ```c
-  #include <stdlib.h>
+  (import frame/frame
+    :refer
+    [frame frame-nrows frame-ncols frame-schema frame-column-at])
+  (import frame/sort :refer [arrange-indices reorder __so-take])
+  (import frame/group :refer [__group-by-cons grouped-count grouped-free])
+  (defn __f-nil [] : int ```c return 0; ```)
+  (defn __f-cons [v : int n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   struct __cons *c = (struct __cons *)malloc(sizeof(*c));
@@ -27,18 +31,16 @@
   c->value = v; c->next = n;
   return (int64_t)(intptr_t)c;
   ```)
-
-(defn __filter-clone-field-at [s : int i : int] : int
-  (let [fd (schema-field-at s i)]
-    (field (field-name fd) (field-type fd) (field-nullable fd))))
-
-;;; __column-take-mask -- build a new column containing rows of `col` whose
-;;; corresponding bit in `mask` (a packed bool column's values buffer) is 1.
-;;; `n_rows` is the length of the source column / mask.  Returns 0 on OOM or
-;;; unsupported type.  Since: FR2 (internal helper)
-(defn __column-take-mask [col : int mask : int n-rows : int n-kept : int] : int
-  ```c
-  #include <stdlib.h>
+  (defn __filter-clone-field-at [s : int i : int] : int
+    (let [fd (schema-field-at s i)]
+      (field (field-name fd) (field-type fd) (field-nullable fd))))
+  ;;; __column-take-mask -- build a new column containing rows of `col` whose
+  ;;; corresponding bit in `mask` (a packed bool column's values buffer) is 1.
+  ;;; `n_rows` is the length of the source column / mask.  Returns 0 on OOM or
+  ;;; unsupported type.  Since: FR2 (internal helper)
+  (defn __column-take-mask [col : int mask : int n-rows : int n-kept : int] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
   struct __frame_col {
@@ -210,11 +212,10 @@
   out->offsets    = doffsets;
   return (int64_t)(intptr_t)out;
   ```)
-
-;;; __count-set-bits -- count 1-bits in the first n bits of mask. Since: FR2
-(defn __count-set-bits [mask : int n : int] : int
-  ```c
-  #include <stdint.h>
+  ;;; __count-set-bits -- count 1-bits in the first n bits of mask. Since: FR2
+  (defn __count-set-bits [mask : int n : int] : int
+    ```c
+    #include <stdint.h>
   struct __frame_col {
     int64_t type_tag; int64_t length; int64_t null_count; int64_t refcount;
     void *validity; void *values; void *offsets;
@@ -227,54 +228,53 @@
   }
   return k;
   ```)
-
-(defn __take-cols [f : int mask : int n-rows : int n-kept : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [src-col (frame-column-at f i)
-          new-col (__column-take-mask src-col mask n-rows n-kept)]
-      (__take-cols f mask n-rows n-kept (- i 1) (__f-cons new-col acc)))))
-
-(defn __clone-fields [src-sch : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (__clone-fields src-sch (- i 1)
-                    (__f-cons (__filter-clone-field-at src-sch i) acc))))
-
-;;; filter-mask -- return a new frame containing rows where mask = 1.
-;;;
-;;; `mask` must be a bool column of length frame-nrows(f).  Returns 0 if
-;;; lengths do not match.  Since: FR2
-(defn filter-mask [f : int mask : int] : int
-  (let [nrows (frame-nrows f)
-        ncols (frame-ncols f)]
-    (if (or (not= (column-length mask) nrows)
-            (not= (column-type mask) 5))    ;; 5 = type-bool
-      0
-      (let [n-kept   (__count-set-bits mask nrows)
-            new-cols (__take-cols f mask nrows n-kept (- ncols 1) (__f-nil))
-            new-flds (__clone-fields (frame-schema f) (- ncols 1) (__f-nil))]
-        (frame (schema new-flds) new-cols)))))
-
-;; ---------------------------------------------------------------------------
-;; FR7: distinct and sample.
-;; ---------------------------------------------------------------------------
-
-;;; __filter-take -- build a new frame from f by selecting rows in `indices`
-;;; (cons list of int).  Length of indices can be < frame-nrows(f), unlike
-;;; reorder which requires equality.  Internally bridges to frame/sort's
-;;; __so-take helper.
-(defn __filter-take [f : int indices : int n : int] : int
-  (let [perm (__list-to-int-array indices n)
-        ncols (frame-ncols f)
-        cols  (__take-all-cols f perm n (- ncols 1) (__f-nil))
-        flds  (__clone-fields (frame-schema f) (- ncols 1) (__f-nil))
-        g     (frame (schema flds) cols)]
-    (do (__free-int-array perm) g)))
-
-(defn __list-to-int-array [xs : int n : int] : int
-  ```c
-  #include <stdlib.h>
+  (defn __take-cols [f : int
+                     mask : int
+                     n-rows : int
+                     n-kept : int
+                     i : int
+                     acc : int] : int
+    (if (< i 0)
+      acc
+      (let [src-col (frame-column-at f i)
+            new-col (__column-take-mask src-col mask n-rows n-kept)]
+        (__take-cols f mask n-rows n-kept (- i 1) (__f-cons new-col acc)))))
+  (defn __clone-fields [src-sch : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (__clone-fields src-sch
+        (- i 1)
+        (__f-cons (__filter-clone-field-at src-sch i) acc))))
+  ;;; filter-mask -- return a new frame containing rows where mask = 1.
+  ;;;
+  ;;; `mask` must be a bool column of length frame-nrows(f).  Returns 0 if
+  ;;; lengths do not match.  Since: FR2
+  (defn filter-mask [f : int mask : int] : int
+    (let [nrows (frame-nrows f)
+          ncols (frame-ncols f)]
+      (if (or (not= (column-length mask) nrows) (not= (column-type mask) 5)) ;; 5 = type-bool
+        0
+        (let [n-kept   (__count-set-bits mask nrows)
+              new-cols (__take-cols f mask nrows n-kept (- ncols 1) (__f-nil))
+              new-flds (__clone-fields (frame-schema f) (- ncols 1) (__f-nil))]
+          (frame (schema new-flds) new-cols)))))
+  ;; ---------------------------------------------------------------------------
+  ;; FR7: distinct and sample.
+  ;; ---------------------------------------------------------------------------
+  ;;; __filter-take -- build a new frame from f by selecting rows in `indices`
+  ;;; (cons list of int).  Length of indices can be < frame-nrows(f), unlike
+  ;;; reorder which requires equality.  Internally bridges to frame/sort's
+  ;;; __so-take helper.
+  (defn __filter-take [f : int indices : int n : int] : int
+    (let [perm  (__list-to-int-array indices n)
+          ncols (frame-ncols f)
+          cols  (__take-all-cols f perm n (- ncols 1) (__f-nil))
+          flds  (__clone-fields (frame-schema f) (- ncols 1) (__f-nil))
+          g     (frame (schema flds) cols)]
+      (do (__free-int-array perm) g)))
+  (defn __list-to-int-array [xs : int n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t *a = (int64_t *)malloc((size_t)n * sizeof(int64_t));
@@ -283,33 +283,31 @@
   for (int64_t i = 0; i < n && p; i++, p = (struct __cons *)(intptr_t)p->next) a[i] = p->value;
   return (int64_t)(intptr_t)a;
   ```)
-
-(defn __free-int-array [p : int] : void
-  ```c
-  #include <stdlib.h>
+  (defn __free-int-array [p : int] : void
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   if (p) free((void *)(intptr_t)p);
   ```)
-
-(defn __take-all-cols [f : int perm : int n : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [c (__so-take (frame-column-at f i) perm n)]
-      (__take-all-cols f perm n (- i 1) (__f-cons c acc)))))
-
-;;; __distinct-first-of-group -- given a frame, key-name list, and the
-;;; (already-computed) group-by handle, build a cons list of row indices that
-;;; are the first occurrence (in sorted order) of each unique key tuple.
-(defn __distinct-first-rows [g : int n-groups : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (__distinct-first-rows g n-groups (- i 1)
-                           (__f-cons (__g-first-row g i) acc))))
-
-;;; __g-first-row -- accessor for grouped-frame's perm[group_starts[gi]].
-(defn __g-first-row [g : int gi : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __take-all-cols [f : int perm : int n : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (let [c (__so-take (frame-column-at f i) perm n)]
+        (__take-all-cols f perm n (- i 1) (__f-cons c acc)))))
+  ;;; __distinct-first-of-group -- given a frame, key-name list, and the
+  ;;; (already-computed) group-by handle, build a cons list of row indices that
+  ;;; are the first occurrence (in sorted order) of each unique key tuple.
+  (defn __distinct-first-rows [g : int n-groups : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (__distinct-first-rows g
+        n-groups
+        (- i 1)
+        (__f-cons (__g-first-row g i) acc))))
+  ;;; __g-first-row -- accessor for grouped-frame's perm[group_starts[gi]].
+  (defn __g-first-row [g : int gi : int] : int
+    ```c
+    #include <stdint.h>
   struct __grouped {
     int64_t frame; int64_t n_keys; int64_t *key_ixs;
     int64_t n_rows; int64_t *perm;
@@ -318,47 +316,48 @@
   struct __grouped *gp = (struct __grouped *)(intptr_t)g;
   return gp->perm[gp->group_starts[gi]];
   ```)
-
-;;; distinct -- return a new frame with duplicate rows removed.
-;;;
-;;; Parameters:
-;;;   f     -- :int frame
-;;;   names -- cons list of :cstr column names that define the key.  If 0
-;;;            (nil), all columns are used.
-;;;
-;;; Returns:
-;;;   :int  new frame containing one row per unique key tuple, in the order
-;;;   the first occurrence appeared after sorting by the key columns.
-;;;
-;;; Since: FR7
-(defn distinct [f : int names : int] : int
-  (let [effective (if (= names 0) (__all-column-names (frame-schema f) (- (frame-ncols f) 1) (__f-nil)) names)
-        g         (__group-by-cons f effective)]
-    (if (= g 0)
-      0
-      (let [n-grp (grouped-count g)
-            ixs   (__distinct-first-rows g n-grp (- n-grp 1) (__f-nil))
-            r     (__filter-take f ixs n-grp)]
-        (do (grouped-free g) r)))))
-
-(defn __cstr-as-int [s : cstr] : int
-  ```c
-  #include <stdint.h>
+  ;;; distinct -- return a new frame with duplicate rows removed.
+  ;;;
+  ;;; Parameters:
+  ;;;   f     -- :int frame
+  ;;;   names -- cons list of :cstr column names that define the key.  If 0
+  ;;;            (nil), all columns are used.
+  ;;;
+  ;;; Returns:
+  ;;;   :int  new frame containing one row per unique key tuple, in the order
+  ;;;   the first occurrence appeared after sorting by the key columns.
+  ;;;
+  ;;; Since: FR7
+  (defn distinct [f : int names : int] : int
+    (let [effective (if (= names 0)
+                      (__all-column-names (frame-schema f)
+                        (- (frame-ncols f) 1)
+                        (__f-nil))
+                      names)
+          g         (__group-by-cons f effective)]
+      (if (= g 0)
+        0
+        (let [n-grp (grouped-count g)
+              ixs   (__distinct-first-rows g n-grp (- n-grp 1) (__f-nil))
+              r     (__filter-take f ixs n-grp)]
+          (do (grouped-free g) r)))))
+  (defn __cstr-as-int [s : cstr] : int
+    ```c
+    #include <stdint.h>
   return (int64_t)(intptr_t)s;
   ```)
-
-(defn __all-column-names [s : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (__all-column-names s (- i 1)
-                        (__f-cons (__cstr-as-int (field-name (schema-field-at s i))) acc))))
-
-;;; __sample-indices -- produce an int64_t* of `n` distinct random indices in
-;;; [0, n_rows) using a 64-bit splitmix-style PRNG seeded by `seed` (use 0 for
-;;; time-based seed).  Returns a cons list of those indices.  Since: FR7
-(defn __sample-indices [n-rows : int n : int seed : int] : int
-  ```c
-  #include <stdlib.h>
+  (defn __all-column-names [s : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (__all-column-names s
+        (- i 1)
+        (__f-cons (__cstr-as-int (field-name (schema-field-at s i))) acc))))
+  ;;; __sample-indices -- produce an int64_t* of `n` distinct random indices in
+  ;;; [0, n_rows) using a 64-bit splitmix-style PRNG seeded by `seed` (use 0 for
+  ;;; time-based seed).  Returns a cons list of those indices.  Since: FR7
+  (defn __sample-indices [n-rows : int n : int seed : int] : int
+    ```c
+    #include <stdlib.h>
   #include <time.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
@@ -396,17 +395,14 @@
   free(arr);
   return head;
   ```)
-
-;;; sample -- return a new frame with `n` rows chosen uniformly at random
-;;; without replacement.  seed = 0 uses a time-based seed (nondeterministic).
-;;; If n >= frame-nrows(f), returns a permutation of the whole frame.
-;;; Since: FR7
-(defn sample [f : int n : int seed : int] : int
-  (let [nrows (frame-nrows f)
-        n-eff (if (> n nrows) nrows n)]
-    (if (or (<= nrows 0) (<= n-eff 0))
-      0
-      (let [ixs (__sample-indices nrows n-eff seed)]
-        (__filter-take f ixs n-eff)))))
-
-) ;; end defmodule frame/filter
+  ;;; sample -- return a new frame with `n` rows chosen uniformly at random
+  ;;; without replacement.  seed = 0 uses a time-based seed (nondeterministic).
+  ;;; If n >= frame-nrows(f), returns a permutation of the whole frame.
+  ;;; Since: FR7
+  (defn sample [f : int n : int seed : int] : int
+    (let [nrows (frame-nrows f)
+          n-eff (if (> n nrows) nrows n)]
+      (if (or (<= nrows 0) (<= n-eff 0))
+        0
+        (let [ixs (__sample-indices nrows n-eff seed)]
+          (__filter-take f ixs n-eff)))))) ;; end defmodule frame/filter

@@ -12,57 +12,57 @@
 ;;   1
 ;;   200
 ;;   ok
-
 (defmodule xstage_wide_wave_test
   (export)
-
-(import ecs/system  :refer [cid-bit])
-(import ecs/xsystem :refer [XSystem make-xsystem])
-(import ecs/xstage  :refer [BoundXSystem make-bound-xsystem
-                            XStage xstage-new xstage-add!
-                            xstage-n-waves xstage-run! xstage-free!])
-
-(def Pos-cid 0)
-
-;; Process-lifetime counter, accessed via a single defn so the static
-;; storage location is shared across init / bump / get. Each Turmeric
-;; defn emits its own C function, and `static` inside a function is
-;; per-function -- so we route every op through `counter-op` (the
-;; static `atomic_int c` then resides in that one function).
-;;   op 0 -> reset; op 1 -> bump; op 2 -> read.
-(defn counter-op [op : int] : int
-  ```c
-  #include <stdatomic.h>
+  (import ecs/system :refer [cid-bit])
+  (import ecs/xsystem :refer [XSystem make-xsystem])
+  (import ecs/xstage
+    :refer
+    [BoundXSystem
+     make-bound-xsystem
+     XStage
+     xstage-new
+     xstage-add!
+     xstage-n-waves
+     xstage-run!
+     xstage-free!])
+  (def Pos-cid 0)
+  ;; Process-lifetime counter, accessed via a single defn so the static
+  ;; storage location is shared across init / bump / get. Each Turmeric
+  ;; defn emits its own C function, and `static` inside a function is
+  ;; per-function -- so we route every op through `counter-op` (the
+  ;; static `atomic_int c` then resides in that one function).
+  ;;   op 0 -> reset; op 1 -> bump; op 2 -> read.
+  (defn counter-op [op : int] : int
+    ```c
+    #include <stdatomic.h>
   static atomic_int c;
   if (op == 0) { atomic_store(&c, 0); return 0; }
   if (op == 1) { atomic_fetch_add(&c, 1); return 0; }
   return (int64_t)atomic_load(&c);
   ```)
-
-;; The wave's run-fn. Top-level so its address is a stable C symbol.
-(defn bump-system [w0 : int w1 : int] : nil
-  (counter-op 1)
-  nil)
-
-(defn main [] : int
-  (counter-op 0)
-  (let [s (xstage-new)
-        ;; reads=Pos, writes=0; world-id 0; slot 1 unused (id -1).
-        bx (make-bound-xsystem
-             0 (cid-bit Pos-cid) 0 0
-             (- 0 1) 0 0 0
-             bump-system)
-        ^mut i 0]
-    (while (< i 200)
-      (xstage-add! s bx)
-      (set! i (+ i 1)))
-    (xstage-run! s)
-    (let [n  (xstage-n-waves s)
-          c  (counter-op 2)
-          ok (and (= n 1) (= c 200))]
-      (println n)
-      (println c)
-      (xstage-free! s)
-      (if ok (do (println "ok") 0) (do (println "FAIL") 1)))))
-
-) ;; end defmodule xstage_wide_wave_test
+  ;; The wave's run-fn. Top-level so its address is a stable C symbol.
+  (defn bump-system [w0 : int w1 : int] : nil (counter-op 1) nil)
+  (defn main [] : int
+    (counter-op 0)
+    (let [s      (xstage-new)
+          ;; reads=Pos, writes=0; world-id 0; slot 1 unused (id -1).
+          bx     (make-bound-xsystem 0
+                   (cid-bit Pos-cid)
+                   0
+                   0
+                   (- 0 1)
+                   0
+                   0
+                   0
+                   bump-system)
+          ^mut i 0]
+      (while (< i 200) (xstage-add! s bx) (set! i (+ i 1)))
+      (xstage-run! s)
+      (let [n  (xstage-n-waves s)
+            c  (counter-op 2)
+            ok (and (= n 1) (= c 200))]
+        (println n)
+        (println c)
+        (xstage-free! s)
+        (if ok (do (println "ok") 0) (do (println "FAIL") 1)))))) ;; end defmodule xstage_wide_wave_test

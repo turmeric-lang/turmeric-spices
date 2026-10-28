@@ -13,135 +13,169 @@
 ;;     under #fx{IO}, checked at compile time by the effect-row pass.
 ;;
 ;; main returns the failure count for `tur test`.
-
 (defmodule signal/tests/test_noise
-  (import signal/core  :refer [constant sample])
-  (import signal/noise :refer [rng white-from pink-from brown-from blue-from
-                               violet-from white pink brown blue violet])
-
-(defn near? [a :float b :float] :bool
-  (let [d (- a b)]
-    (if (< d 0.0) (< (- 0.0 d) 0.0001) (< d 0.0001))))
-
-(defn fail-unless [cond :bool label :cstr] :int
-  (if cond 0 (do (println label) 1)))
-
-(defn abs-f [x :float] :float (if (< x 0.0) (- 0.0 x) x))
-
-;; Sample k of s is taken at t = k, in order. Each helper consumes a FRESH
-;; instance (same seed, so the same stream).
-
-(defn sum-sq [^fat s : (fn [float] float) k :int n :int acc :float] :float
-  (if (>= k n) acc
-    (let [y (sample s (as float k))] (sum-sq s (+ k 1) n (+ acc (* y y))))))
-
-(defn sum-diff-sq [^fat s : (fn [float] float) k :int n :int prev :float acc :float] :float
-  (if (>= k n) acc
-    (let [y (sample s (as float k)) d (- y prev)]
-      (sum-diff-sq s (+ k 1) n y (+ acc (* d d))))))
-
-(defn sum-all [^fat s : (fn [float] float) k :int n :int acc :float] :float
-  (if (>= k n) acc
-    (sum-all s (+ k 1) n (+ acc (sample s (as float k))))))
-
-(defn max-abs [^fat s : (fn [float] float) k :int n :int m :float] :float
-  (if (>= k n) m
-    (let [a (abs-f (sample s (as float k)))]
-      (max-abs s (+ k 1) n (if (> a m) a m)))))
-
-;; True when the first `n` samples of a and b are identical.
-(defn same-stream? [^fat a : (fn [float] float) ^fat b : (fn [float] float) k :int n :int] :bool
-  (if (>= k n) true
-    (if (near? (sample a (as float k)) (sample b (as float k)))
-      (same-stream? a b (+ k 1) n)
-      false)))
-
-(defn tilt [^fat s : (fn [float] float) ^fat s2 : (fn [float] float) n :int] :float
-  (/ (sum-diff-sq s 0 n 0.0 0.0) (sum-sq s2 0 n 0.0)))
-
-(defn src-const [] : float 0.25)
-(defn src-big [] : float 5.0)
-(defn src-nan [] : float (/ 0.0 (as float 0)))
-
-;; Compile-time purity checks. A seeded color has no visible effect; an impure
-;; source is allowed only where IO is declared.
-(defn pure-seeded [] #fx{} : float
-  (sample ((pink 1) (constant 0.0)) 0.0))
-(defn noisy-src [] #fx{IO} : float 0.5)
-(defn impure-injected [] #fx{IO} : float
-  (sample ((white-from noisy-src) (constant 0.0)) 0.0))
-
-(defn main [] : int
-  (let [n 40000
-        z (constant 0.0)
-        ;; determinism
-        det (same-stream? ((white 5) z) ((white 5) z) 0 64)
-        diff-seed (not (same-stream? ((white 5) z) ((white 6) z) 0 64))
-        ;; white statistics
-        wmean (/ (sum-all ((white 11) z) 0 n 0.0) (as float n))
-        wpow  (/ (sum-sq ((white 11) z) 0 n 0.0) (as float n))
-        ;; ranges
-        mw (max-abs ((white 3) z) 0 n 0.0)
-        mp (max-abs ((pink 3) z) 0 n 0.0)
-        mb (max-abs ((brown 3) z) 0 n 0.0)
-        mu (max-abs ((blue 3) z) 0 n 0.0)
-        mv (max-abs ((violet 3) z) 0 n 0.0)
-        ;; tilt
-        tb (tilt ((brown 3) z) ((brown 3) z) n)
-        tp (tilt ((pink 3) z) ((pink 3) z) n)
-        tw (tilt ((white 3) z) ((white 3) z) n)
-        tu (tilt ((blue 3) z) ((blue 3) z) n)
-        tv (tilt ((violet 3) z) ((violet 3) z) n)
-        ;; injected forms
-        inj-white  (same-stream? ((white-from (rng 9)) z) ((white 9) z) 0 64)
-        inj-pink   (same-stream? ((pink-from (rng 9)) z) ((pink 9) z) 0 64)
-        inj-brown  (same-stream? ((brown-from (rng 9)) z) ((brown 9) z) 0 64)
-        inj-blue   (same-stream? ((blue-from (rng 9)) z) ((blue 9) z) 0 64)
-        inj-violet (same-stream? ((violet-from (rng 9)) z) ((violet 9) z) 0 64)
-        cw ((white-from src-const) z)
-        cw0 (sample cw 0.0) cw1 (sample cw 1.0)
-        cv ((violet-from src-const) z)
-        cv0 (sample cv 0.0) cv1 (sample cv 1.0)
-        cb ((brown-from src-const) z)
-        cb0 (sample cb 0.0)
-        big (sample ((white-from src-big) z) 0.0)
-        nan (sample ((white-from src-nan) z) 0.0)
-        f (+ (fail-unless det "FAIL: same seed must give the same stream")
-             (fail-unless diff-seed "FAIL: different seeds must give different streams")
-             (fail-unless (< (abs-f wmean) 0.02) "FAIL: white mean is not ~0")
-             (fail-unless (and (> wpow 0.31) (< wpow 0.355)) "FAIL: white power is not ~1/3")
-             (fail-unless (< mw 1.0) "FAIL: white must stay in [-1, 1)")
-             (fail-unless (<= mp 1.0) "FAIL: pink out of range")
-             (fail-unless (<= mb 1.0) "FAIL: brown out of range")
-             (fail-unless (<= mu 1.0) "FAIL: blue out of range")
-             (fail-unless (<= mv 1.0) "FAIL: violet out of range")
-             (fail-unless (and (> mp 0.1) (> mb 0.1) (> mu 0.1) (> mv 0.1))
-                          "FAIL: a colored noise is suspiciously silent")
-             (fail-unless (< tb 0.1) "FAIL: brown tilt (should be << white)")
-             (fail-unless (and (> tp 0.2) (< tp 0.6)) "FAIL: pink tilt")
-             (fail-unless (and (> tw 1.9) (< tw 2.1)) "FAIL: white tilt (should be ~2)")
-             (fail-unless (and (> tu tw) (< tu tv)) "FAIL: blue tilt must sit between white and violet")
-             (fail-unless (and (< tb tp) (< tp tw)) "FAIL: tilt order brown < pink < white")
-             (fail-unless (> tv 2.7) "FAIL: violet tilt")
-             (fail-unless inj-white  "FAIL: white-from (rng s) != white s")
-             (fail-unless inj-pink   "FAIL: pink-from (rng s) != pink s")
-             (fail-unless inj-brown  "FAIL: brown-from (rng s) != brown s")
-             (fail-unless inj-blue   "FAIL: blue-from (rng s) != blue s")
-             (fail-unless inj-violet "FAIL: violet-from (rng s) != violet s")
-             (fail-unless (and (near? cw0 0.25) (near? cw1 0.25))
-                          "FAIL: white-from must pass the source through")
-             ;; violet = 0.5 * first difference: 0.5*(0.25-0), then 0.
-             (fail-unless (and (near? cv0 0.125) (near? cv1 0.0))
-                          "FAIL: violet-from first difference")
-             ;; brown first step: ((0 + 0.02*0.25)/1.02) * 3.5
-             (fail-unless (near? cb0 0.017157) "FAIL: brown-from leaky integrator")
-             (fail-unless (near? big 1.0) "FAIL: an out-of-range source must be clamped")
-             (fail-unless (near? nan 0.0) "FAIL: a NaN source must map to 0")
-             (fail-unless (< (abs-f (pure-seeded)) 1.0) "FAIL: pure-seeded")
-             (fail-unless (near? (impure-injected) 0.5) "FAIL: impure-injected"))]
-    (if (= f 0)
-      (println "PASS test_noise")
-      (println "test_noise: failures above"))
-    f))
-
-) ;; end defmodule signal/tests/test_noise
+  (import signal/core :refer [constant sample])
+  (import signal/noise
+    :refer
+    [rng
+     white-from
+     pink-from
+     brown-from
+     blue-from
+     violet-from
+     white
+     pink
+     brown
+     blue
+     violet])
+  (defn near? [a :float b :float] :bool
+    (let [d (- a b)] (if (< d 0.0) (< (- 0.0 d) 0.0001) (< d 0.0001))))
+  (defn fail-unless [cond :bool label :cstr] :int
+    (if cond 0 (do (println label) 1)))
+  (defn abs-f [x :float] :float (if (< x 0.0) (- 0.0 x) x))
+  ;; Sample k of s is taken at t = k, in order. Each helper consumes a FRESH
+  ;; instance (same seed, so the same stream).
+  (defn sum-sq [^fat s : (fn [float] float) k :int n :int acc :float] :float
+    (if (>= k n)
+      acc
+      (let [y (sample s (as float k))] (sum-sq s (+ k 1) n (+ acc (* y y))))))
+  (defn sum-diff-sq [^fat s : (fn [float] float)
+                     k :int
+                     n :int
+                     prev :float
+                     acc :float] :float
+    (if (>= k n)
+      acc
+      (let [y (sample s (as float k))
+            d (- y prev)]
+        (sum-diff-sq s (+ k 1) n y (+ acc (* d d))))))
+  (defn sum-all [^fat s : (fn [float] float) k :int n :int acc :float] :float
+    (if (>= k n) acc (sum-all s (+ k 1) n (+ acc (sample s (as float k))))))
+  (defn max-abs [^fat s : (fn [float] float) k :int n :int m :float] :float
+    (if (>= k n)
+      m
+      (let [a (abs-f (sample s (as float k)))]
+        (max-abs s (+ k 1) n (if (> a m) a m)))))
+  ;; True when the first `n` samples of a and b are identical.
+  (defn same-stream? [^fat a : (fn [float] float)
+                      ^fat b : (fn [float] float)
+                      k :int
+                      n :int] :bool
+    (if (>= k n)
+      true
+      (if (near? (sample a (as float k)) (sample b (as float k)))
+        (same-stream? a b (+ k 1) n)
+        false)))
+  (defn tilt [^fat s : (fn [float] float) ^fat s2 : (fn [float] float) n :int] :float
+    (/ (sum-diff-sq s 0 n 0.0 0.0) (sum-sq s2 0 n 0.0)))
+  (defn src-const [] : float 0.25)
+  (defn src-big [] : float 5.0)
+  (defn src-nan [] : float (/ 0.0 (as float 0)))
+  ;; Compile-time purity checks. A seeded color has no visible effect; an impure
+  ;; source is allowed only where IO is declared.
+  (defn pure-seeded [] #fx{} : float (sample ((pink 1) (constant 0.0)) 0.0))
+  (defn noisy-src [] #fx{IO} : float 0.5)
+  (defn impure-injected []
+    #fx{IO}
+    : float
+    (sample ((white-from noisy-src) (constant 0.0)) 0.0))
+  (defn main [] : int
+    (let [n          40000
+          z          (constant 0.0)
+          ;; determinism
+          det        (same-stream? ((white 5) z) ((white 5) z) 0 64)
+          diff-seed  (not (same-stream? ((white 5) z) ((white 6) z) 0 64))
+          ;; white statistics
+          wmean      (/ (sum-all ((white 11) z) 0 n 0.0) (as float n))
+          wpow       (/ (sum-sq ((white 11) z) 0 n 0.0) (as float n))
+          ;; ranges
+          mw         (max-abs ((white 3) z) 0 n 0.0)
+          mp         (max-abs ((pink 3) z) 0 n 0.0)
+          mb         (max-abs ((brown 3) z) 0 n 0.0)
+          mu         (max-abs ((blue 3) z) 0 n 0.0)
+          mv         (max-abs ((violet 3) z) 0 n 0.0)
+          ;; tilt
+          tb         (tilt ((brown 3) z) ((brown 3) z) n)
+          tp         (tilt ((pink 3) z) ((pink 3) z) n)
+          tw         (tilt ((white 3) z) ((white 3) z) n)
+          tu         (tilt ((blue 3) z) ((blue 3) z) n)
+          tv         (tilt ((violet 3) z) ((violet 3) z) n)
+          ;; injected forms
+          inj-white  (same-stream? ((white-from (rng 9)) z) ((white 9) z) 0 64)
+          inj-pink   (same-stream? ((pink-from (rng 9)) z) ((pink 9) z) 0 64)
+          inj-brown  (same-stream? ((brown-from (rng 9)) z) ((brown 9) z) 0 64)
+          inj-blue   (same-stream? ((blue-from (rng 9)) z) ((blue 9) z) 0 64)
+          inj-violet (same-stream? ((violet-from (rng 9)) z)
+                       ((violet 9) z)
+                       0
+                       64)
+          cw         ((white-from src-const) z)
+          cw0        (sample cw 0.0)
+          cw1        (sample cw 1.0)
+          cv         ((violet-from src-const) z)
+          cv0        (sample cv 0.0)
+          cv1        (sample cv 1.0)
+          cb         ((brown-from src-const) z)
+          cb0        (sample cb 0.0)
+          big        (sample ((white-from src-big) z) 0.0)
+          nan        (sample ((white-from src-nan) z) 0.0)
+          f          (+ (fail-unless det
+                          "FAIL: same seed must give the same stream")
+                       (fail-unless diff-seed
+                         "FAIL: different seeds must give different streams")
+                       (fail-unless (< (abs-f wmean) 0.02)
+                         "FAIL: white mean is not ~0")
+                       (fail-unless (and (> wpow 0.31) (< wpow 0.355))
+                         "FAIL: white power is not ~1/3")
+                       (fail-unless (< mw 1.0)
+                         "FAIL: white must stay in [-1, 1)")
+                       (fail-unless (<= mp 1.0) "FAIL: pink out of range")
+                       (fail-unless (<= mb 1.0) "FAIL: brown out of range")
+                       (fail-unless (<= mu 1.0) "FAIL: blue out of range")
+                       (fail-unless (<= mv 1.0) "FAIL: violet out of range")
+                       (fail-unless (and (> mp 0.1)
+                                      (> mb 0.1)
+                                      (> mu 0.1)
+                                      (> mv 0.1))
+                         "FAIL: a colored noise is suspiciously silent")
+                       (fail-unless (< tb 0.1)
+                         "FAIL: brown tilt (should be << white)")
+                       (fail-unless (and (> tp 0.2) (< tp 0.6))
+                         "FAIL: pink tilt")
+                       (fail-unless (and (> tw 1.9) (< tw 2.1))
+                         "FAIL: white tilt (should be ~2)")
+                       (fail-unless (and (> tu tw) (< tu tv))
+                         "FAIL: blue tilt must sit between white and violet")
+                       (fail-unless (and (< tb tp) (< tp tw))
+                         "FAIL: tilt order brown < pink < white")
+                       (fail-unless (> tv 2.7) "FAIL: violet tilt")
+                       (fail-unless inj-white
+                         "FAIL: white-from (rng s) != white s")
+                       (fail-unless inj-pink
+                         "FAIL: pink-from (rng s) != pink s")
+                       (fail-unless inj-brown
+                         "FAIL: brown-from (rng s) != brown s")
+                       (fail-unless inj-blue
+                         "FAIL: blue-from (rng s) != blue s")
+                       (fail-unless inj-violet
+                         "FAIL: violet-from (rng s) != violet s")
+                       (fail-unless (and (near? cw0 0.25) (near? cw1 0.25))
+                         "FAIL: white-from must pass the source through")
+                       ;; violet = 0.5 * first difference: 0.5*(0.25-0), then 0.
+                       (fail-unless (and (near? cv0 0.125) (near? cv1 0.0))
+                         "FAIL: violet-from first difference")
+                       ;; brown first step: ((0 + 0.02*0.25)/1.02) * 3.5
+                       (fail-unless (near? cb0 0.017157)
+                         "FAIL: brown-from leaky integrator")
+                       (fail-unless (near? big 1.0)
+                         "FAIL: an out-of-range source must be clamped")
+                       (fail-unless (near? nan 0.0)
+                         "FAIL: a NaN source must map to 0")
+                       (fail-unless (< (abs-f (pure-seeded)) 1.0)
+                         "FAIL: pure-seeded")
+                       (fail-unless (near? (impure-injected) 0.5)
+                         "FAIL: impure-injected"))]
+      (if (= f 0)
+        (println "PASS test_noise")
+        (println "test_noise: failures above"))
+      f))) ;; end defmodule signal/tests/test_noise

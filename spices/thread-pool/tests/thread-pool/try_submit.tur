@@ -9,88 +9,92 @@
 ;;                                 returns (err (PoolFull cap cap)).
 ;;
 ;; main returns the failed-assertion count.
-
 (defmodule thread-pool/tests/try_submit
   (import thread-pool/pool
-    :refer [Pool pool-new pool-submit pool-try-submit
-            pool-pending pool-workers pool-queue-cap
-            FullError PoolFull Unit TheUnit])
-
-;; A gate the worker callback blocks on, so we can park the worker and let the
-;; ring fill deterministically.  gate-wait blocks until gate-open is called.
-```c
-#include <pthread.h>
+    :refer
+    [Pool
+     pool-new
+     pool-submit
+     pool-try-submit
+     pool-pending
+     pool-workers
+     pool-queue-cap
+     FullError
+     PoolFull
+     Unit
+     TheUnit])
+  ;; A gate the worker callback blocks on, so we can park the worker and let the
+  ;; ring fill deterministically.  gate-wait blocks until gate-open is called.
+  ```c
+  #include <pthread.h>
 static pthread_mutex_t gate_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  gate_cv = PTHREAD_COND_INITIALIZER;
 static int             gate_open_flag = 0;
 ```
-(defn gate-reset [] : void
-  ```c
-  pthread_mutex_lock(&gate_mu); gate_open_flag = 0; pthread_mutex_unlock(&gate_mu);
+  (defn gate-reset [] : void
+    ```c
+    pthread_mutex_lock(&gate_mu); gate_open_flag = 0; pthread_mutex_unlock(&gate_mu);
   ```)
-(defn gate-wait [] : void
-  ```c
-  pthread_mutex_lock(&gate_mu);
+  (defn gate-wait [] : void
+    ```c
+    pthread_mutex_lock(&gate_mu);
   while (!gate_open_flag) pthread_cond_wait(&gate_cv, &gate_mu);
   pthread_mutex_unlock(&gate_mu);
   ```)
-(defn gate-open [] : void
-  ```c
-  pthread_mutex_lock(&gate_mu); gate_open_flag = 1;
+  (defn gate-open [] : void
+    ```c
+    pthread_mutex_lock(&gate_mu); gate_open_flag = 1;
   pthread_cond_broadcast(&gate_cv); pthread_mutex_unlock(&gate_mu);
   ```)
-
-;; spin-until-empty -- busy-wait until the worker has dequeued the parked item
-;; (pending == 0), so the ring starts the fill loop empty.
-(defn spin-until-empty [^borrow p : (Pool int)] : void
-  (when (> (pool-pending p) 0) (spin-until-empty p)))
-
-(defn fail-if [cond : bool label : cstr] : int
-  (if cond (do (println label) 1) 0))
-
-;; fill-count -- try-submit in a loop until the first FullError; return how many
-;; items were accepted before it, and assert the FullError reports pending=cap.
-;; `acc` accumulates accepted count; `errs` accumulates assertion failures.
-(defn fill-loop [^borrow p : (Pool int) cap : int acc : int] : int
-  (let [r (pool-try-submit p 1)]
-    (if (ok? r)
-      (fill-loop p cap (+ acc 1))
-      (match (err-val r)
-        (PoolFull pending fcap)
-        (+ (fail-if (not= acc cap)      "FAIL: accepted != cap before full")
-           (+ (fail-if (not= pending cap) "FAIL: PoolFull pending != cap")
-              (fail-if (not= fcap cap)    "FAIL: PoolFull cap != queue cap")))))))
-
-(defn main [] : int
-  (let [;; 1. Introspection on a fresh pool (no items, workers idle).
-        f1 (let [p (pool-new 4 (fn [x : int] : void nil))]
-             (let [w  (pool-workers p)
-                   qc (pool-queue-cap p)]
-               (do (pool-stop p)
-                   (+ (fail-if (not= w 4)   "FAIL: pool-workers != 4")
-                      (fail-if (not= qc 64) "FAIL: pool-queue-cap != 64")))))
-        ;; size 20 => cap max(80,64) = 80.
-        f2 (let [p (pool-new 20 (fn [x : int] : void nil))]
-             (let [qc (pool-queue-cap p)]
-               (do (pool-stop p)
-                   (fail-if (not= qc 80) "FAIL: pool-queue-cap != 80 for size 20"))))
-        ;; 3. Backpressure: park the one worker, fill the ring, expect FullError.
-        f3 (do
-             (gate-reset)
-             (let [p (pool-new 1 (fn [x : int] : void (gate-wait)))]
-               (let [cap (pool-queue-cap p)]
+  ;; spin-until-empty -- busy-wait until the worker has dequeued the parked item
+  ;; (pending == 0), so the ring starts the fill loop empty.
+  (defn spin-until-empty [^borrow p : (Pool int)] : void
+    (when (> (pool-pending p) 0) (spin-until-empty p)))
+  (defn fail-if [cond : bool label : cstr] : int
+    (if cond (do (println label) 1) 0))
+  ;; fill-count -- try-submit in a loop until the first FullError; return how many
+  ;; items were accepted before it, and assert the FullError reports pending=cap.
+  ;; `acc` accumulates accepted count; `errs` accumulates assertion failures.
+  (defn fill-loop [^borrow p : (Pool int) cap : int acc : int] : int
+    (let [r (pool-try-submit p 1)]
+      (if (ok? r)
+        (fill-loop p cap (+ acc 1))
+        (match (err-val r)
+          (PoolFull pending fcap)
+          (+ (fail-if (not= acc cap) "FAIL: accepted != cap before full")
+            (+ (fail-if (not= pending cap) "FAIL: PoolFull pending != cap")
+              (fail-if (not= fcap cap) "FAIL: PoolFull cap != queue cap")))))))
+  (defn main [] : int
+    (let [ ;; 1. Introspection on a fresh pool (no items, workers idle).
+          f1 (let [p (pool-new 4 (fn [x : int] : void nil))]
+               (let [w  (pool-workers p)
+                     qc (pool-queue-cap p)]
                  (do
-                   (pool-submit p 1)        ;; worker dequeues this and parks
-                   (spin-until-empty p)     ;; ring now empty, worker parked
-                   (let [errs (fill-loop p cap 0)]
-                     (do
-                       (gate-open)          ;; release the worker
-                       (pool-stop p)        ;; drain + join
-                       errs))))))
-        f (+ f1 (+ f2 f3))]
-    (if (= f 0)
-      (println "PASS try_submit")
-      (println "try_submit: failures above"))
-    f))
-
-) ;; end defmodule thread-pool/tests/try_submit
+                   (pool-stop p)
+                   (+ (fail-if (not= w 4) "FAIL: pool-workers != 4")
+                     (fail-if (not= qc 64) "FAIL: pool-queue-cap != 64")))))
+          ;; size 20 => cap max(80,64) = 80.
+          f2 (let [p (pool-new 20 (fn [x : int] : void nil))]
+               (let [qc (pool-queue-cap p)]
+                 (do
+                   (pool-stop p)
+                   (fail-if (not= qc 80)
+                     "FAIL: pool-queue-cap != 80 for size 20"))))
+          ;; 3. Backpressure: park the one worker, fill the ring, expect FullError.
+          f3 (do
+               (gate-reset)
+               (let [p (pool-new 1 (fn [x : int] : void (gate-wait)))]
+                 (let [cap (pool-queue-cap p)]
+                   (do
+                     (pool-submit p 1) ;; worker dequeues this and parks
+                     (spin-until-empty p) ;; ring now empty, worker parked
+                     (let [errs (fill-loop p cap 0)]
+                       (do
+                         (gate-open) ;; release the worker
+                         (pool-stop p) ;; drain + join
+                         errs))))))
+          f  (+ f1 (+ f2 f3))]
+      (if (= f 0)
+        (println "PASS try_submit")
+        (println "try_submit: failures above"))
+      f))) ;; end defmodule thread-pool/tests/try_submit

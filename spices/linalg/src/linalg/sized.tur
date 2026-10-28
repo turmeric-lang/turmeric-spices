@@ -33,41 +33,59 @@
 ;;;
 ;;; `stdlib/sized.tur` (the `Size` / `Static` type) must be loaded for the
 ;;; `(LaVecN (Static k))` annotations callers write; this module loads it.
-
 (load "stdlib/sized.tur")
 
 (defmodule linalg/sized
   (export LaVecN
-          lavecn-zeros lavecn-free lavecn-len lavecn-get lavecn-set!
-          lavecn-add lavecn-sub lavecn-scale lavecn-dot lavecn-norm
-          LaMatN
-          lamat-zeros lamat-free lamat-rows lamat-cols lamat-get lamat-set!
-          lamat-add lamat-sub lamat-scale lamat-mul lamat-transpose)
-
+    lavecn-zeros
+    lavecn-free
+    lavecn-len
+    lavecn-get
+    lavecn-set!
+    lavecn-add
+    lavecn-sub
+    lavecn-scale
+    lavecn-dot
+    lavecn-norm
+    LaMatN
+    lamat-zeros
+    lamat-free
+    lamat-rows
+    lamat-cols
+    lamat-get
+    lamat-set!
+    lamat-add
+    lamat-sub
+    lamat-scale
+    lamat-mul
+    lamat-transpose)
   ;; (LaVecN n) -- phantom-indexed handle to a flat float64 buffer.
   (defopaque LaVecN [n] :int)
-
   ;; ===== raw int-carried implementation (private) =====
-
-  (defn __lavecn-new-zeroed-raw [k : int] #fx{Unsafe} : int
+  (defn __lavecn-new-zeroed-raw [k : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t len; double *data; } *b = malloc(sizeof(*b));
     b->len  = k;
     b->data = k > 0 ? (double *)calloc((size_t)k, sizeof(double)) : NULL;
     return (int64_t)(intptr_t)b;
     ```)
-
-  (defn __lavecn-free-raw [b : int] #fx{Unsafe} : nil
+  (defn __lavecn-free-raw [b : int]
+    #fx{Unsafe}
+    : nil
     ```c
     struct { int64_t len; double *data; } *v = (void *)(intptr_t)b;
     if (v->data) free(v->data);
     free(v);
     ```)
-
-  (defn __lavecn-len-raw [b : int] #fx{Unsafe} : int
+  (defn __lavecn-len-raw [b : int]
+    #fx{Unsafe}
+    : int
     ```c struct { int64_t len; double *data; } *v = (void *)(intptr_t)b; return (int)v->len; ```)
-
-  (defn __lavecn-get-raw [b : int i : int] #fx{Unsafe} : float
+  (defn __lavecn-get-raw [b : int i : int]
+    #fx{Unsafe}
+    : float
     ```c
     struct { int64_t len; double *data; } *v = (void *)(intptr_t)b;
     if (i < 0 || i >= v->len) {
@@ -77,8 +95,9 @@
     }
     return v->data[i];
     ```)
-
-  (defn __lavecn-set-raw [b : int i : int x : float] #fx{Unsafe} : nil
+  (defn __lavecn-set-raw [b : int i : int x : float]
+    #fx{Unsafe}
+    : nil
     ```c
     struct { int64_t len; double *data; } *v = (void *)(intptr_t)b;
     if (i < 0 || i >= v->len) {
@@ -88,8 +107,9 @@
     }
     v->data[i] = x;
     ```)
-
-  (defn __lavecn-dot-raw [a : int b : int] #fx{Unsafe} : float
+  (defn __lavecn-dot-raw [a : int b : int]
+    #fx{Unsafe}
+    : float
     ```c
     struct { int64_t len; double *data; } *x = (void *)(intptr_t)a;
     struct { int64_t len; double *data; } *y = (void *)(intptr_t)b;
@@ -97,9 +117,10 @@
     for (int64_t i = 0; i < x->len; i++) s += x->data[i] * y->data[i];
     return s;
     ```)
-
   ;; element-wise a (op) b into a fresh buffer; sign = +1 add, -1 sub.
-  (defn __lavecn-zip-raw [a : int b : int sign : float] #fx{Unsafe} : int
+  (defn __lavecn-zip-raw [a : int b : int sign : float]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t len; double *data; } *x = (void *)(intptr_t)a;
     struct { int64_t len; double *data; } *y = (void *)(intptr_t)b;
@@ -109,8 +130,9 @@
     for (int64_t i = 0; i < x->len; i++) o->data[i] = x->data[i] + sign * y->data[i];
     return (int64_t)(intptr_t)o;
     ```)
-
-  (defn __lavecn-scale-raw [b : int s : float] #fx{Unsafe} : int
+  (defn __lavecn-scale-raw [b : int s : float]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t len; double *data; } *x = (void *)(intptr_t)b;
     struct { int64_t len; double *data; } *o = malloc(sizeof(*o));
@@ -119,8 +141,9 @@
     for (int64_t i = 0; i < x->len; i++) o->data[i] = x->data[i] * s;
     return (int64_t)(intptr_t)o;
     ```)
-
-  (defn __lavecn-norm-raw [b : int] #fx{Unsafe} : float
+  (defn __lavecn-norm-raw [b : int]
+    #fx{Unsafe}
+    : float
     ```c
     #include <math.h>
     struct { int64_t len; double *data; } *x = (void *)(intptr_t)b;
@@ -128,62 +151,49 @@
     for (int64_t i = 0; i < x->len; i++) s += x->data[i] * x->data[i];
     return sqrt(s);
     ```)
-
   ;; ===== public phantom-typed surface =====
-
   ;;; lavecn-zeros -- a fresh length-k vector of zeros. The static length is
   ;;; pinned by the caller's annotation, e.g.
   ;;;   (defn mk3 [] : (LaVecN (Static 3)) (lavecn-zeros 3))
   (defn lavecn-zeros [n] [k : int] : (LaVecN n)
     (:: (unsafe (__lavecn-new-zeroed-raw k)) :LaVecN))
-
   ;;; lavecn-free -- free a vector and its backing buffer.
   (defn lavecn-free [n] [v : (LaVecN n)] : nil
     (unsafe (__lavecn-free-raw (:: v :int))))
-
   ;;; lavecn-len -- runtime element count (equals the static `n`).
   (defn lavecn-len [n] [v : (LaVecN n)] : int
     (unsafe (__lavecn-len-raw (:: v :int))))
-
   ;;; lavecn-get -- bounds-checked element read at index i.
   (defn lavecn-get [n] [v : (LaVecN n) i : int] : float
     (unsafe (__lavecn-get-raw (:: v :int) i)))
-
   ;;; lavecn-set! -- bounds-checked element write at index i.
   (defn lavecn-set! [n] [v : (LaVecN n) i : int x : float] : nil
     (unsafe (__lavecn-set-raw (:: v :int) i x)))
-
   ;;; lavecn-dot -- dot product. Both operands share `n`, so a length mismatch
   ;;; is a compile-time TUR-E0260.
   (defn lavecn-dot [n] [a : (LaVecN n) b : (LaVecN n)] : float
     (unsafe (__lavecn-dot-raw (:: a :int) (:: b :int))))
-
   ;;; lavecn-add -- element-wise sum (shared `n`); returns a fresh vector.
   (defn lavecn-add [n] [a : (LaVecN n) b : (LaVecN n)] : (LaVecN n)
     (:: (unsafe (__lavecn-zip-raw (:: a :int) (:: b :int) 1.0)) :LaVecN))
-
   ;;; lavecn-sub -- element-wise difference (shared `n`); returns a fresh vector.
   (defn lavecn-sub [n] [a : (LaVecN n) b : (LaVecN n)] : (LaVecN n)
     (:: (unsafe (__lavecn-zip-raw (:: a :int) (:: b :int) -1.0)) :LaVecN))
-
   ;;; lavecn-scale -- multiply every element by s; returns a fresh vector.
   (defn lavecn-scale [n] [v : (LaVecN n) s : float] : (LaVecN n)
     (:: (unsafe (__lavecn-scale-raw (:: v :int) s)) :LaVecN))
-
   ;;; lavecn-norm -- Euclidean (L2) norm.
   (defn lavecn-norm [n] [v : (LaVecN n)] : float
     (unsafe (__lavecn-norm-raw (:: v :int))))
-
   ;; =========================================================================
   ;; Sized matrices -- (LaMatN m n), row-major m x n.
   ;; =========================================================================
-
   ;; (LaMatN m n) -- phantom-indexed handle to a row-major float64 matrix.
   (defopaque LaMatN [m n] :int)
-
   ;; ===== raw int-carried implementation (private) =====
-
-  (defn __lamat-new-zeroed-raw [r : int c : int] #fx{Unsafe} : int
+  (defn __lamat-new-zeroed-raw [r : int c : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t rows; int64_t cols; double *data; } *b = malloc(sizeof(*b));
     int64_t nelem = r * c;
@@ -191,21 +201,25 @@
     b->data = nelem > 0 ? (double *)calloc((size_t)nelem, sizeof(double)) : NULL;
     return (int64_t)(intptr_t)b;
     ```)
-
-  (defn __lamat-free-raw [b : int] #fx{Unsafe} : nil
+  (defn __lamat-free-raw [b : int]
+    #fx{Unsafe}
+    : nil
     ```c
     struct { int64_t rows; int64_t cols; double *data; } *m = (void *)(intptr_t)b;
     if (m->data) free(m->data);
     free(m);
     ```)
-
-  (defn __lamat-rows-raw [b : int] #fx{Unsafe} : int
+  (defn __lamat-rows-raw [b : int]
+    #fx{Unsafe}
+    : int
     ```c struct { int64_t rows; int64_t cols; double *data; } *m = (void *)(intptr_t)b; return (int)m->rows; ```)
-
-  (defn __lamat-cols-raw [b : int] #fx{Unsafe} : int
+  (defn __lamat-cols-raw [b : int]
+    #fx{Unsafe}
+    : int
     ```c struct { int64_t rows; int64_t cols; double *data; } *m = (void *)(intptr_t)b; return (int)m->cols; ```)
-
-  (defn __lamat-get-raw [b : int i : int j : int] #fx{Unsafe} : float
+  (defn __lamat-get-raw [b : int i : int j : int]
+    #fx{Unsafe}
+    : float
     ```c
     struct { int64_t rows; int64_t cols; double *data; } *m = (void *)(intptr_t)b;
     if (i < 0 || i >= m->rows || j < 0 || j >= m->cols) {
@@ -215,8 +229,9 @@
     }
     return m->data[i * m->cols + j];
     ```)
-
-  (defn __lamat-set-raw [b : int i : int j : int x : float] #fx{Unsafe} : nil
+  (defn __lamat-set-raw [b : int i : int j : int x : float]
+    #fx{Unsafe}
+    : nil
     ```c
     struct { int64_t rows; int64_t cols; double *data; } *m = (void *)(intptr_t)b;
     if (i < 0 || i >= m->rows || j < 0 || j >= m->cols) {
@@ -226,11 +241,12 @@
     }
     m->data[i * m->cols + j] = x;
     ```)
-
   ;; element-wise a (op) b into a fresh matrix; sign = +1 add, -1 sub.
   ;; Runtime shape guard (belt-and-suspenders until the static two-index check
   ;; lands; with it, the shapes are already proven equal here).
-  (defn __lamat-zip-raw [a : int b : int sign : float] #fx{Unsafe} : int
+  (defn __lamat-zip-raw [a : int b : int sign : float]
+    #fx{Unsafe}
+    : int
     ```c
     struct M { int64_t rows; int64_t cols; double *data; };
     struct M *x = (void *)(intptr_t)a;
@@ -248,8 +264,9 @@
     for (int64_t i = 0; i < nelem; i++) o->data[i] = x->data[i] + sign * y->data[i];
     return (int64_t)(intptr_t)o;
     ```)
-
-  (defn __lamat-scale-raw [b : int s : float] #fx{Unsafe} : int
+  (defn __lamat-scale-raw [b : int s : float]
+    #fx{Unsafe}
+    : int
     ```c
     struct M { int64_t rows; int64_t cols; double *data; };
     struct M *x = (void *)(intptr_t)b;
@@ -260,9 +277,10 @@
     for (int64_t i = 0; i < nelem; i++) o->data[i] = x->data[i] * s;
     return (int64_t)(intptr_t)o;
     ```)
-
   ;; (m x k) * (k x n) -> (m x n). Runtime guard on the shared inner dimension.
-  (defn __lamat-mul-raw [a : int b : int] #fx{Unsafe} : int
+  (defn __lamat-mul-raw [a : int b : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct M { int64_t rows; int64_t cols; double *data; };
     struct M *x = (void *)(intptr_t)a;
@@ -285,9 +303,10 @@
       }
     return (int64_t)(intptr_t)o;
     ```)
-
   ;; (m x n) -> (n x m).
-  (defn __lamat-transpose-raw [b : int] #fx{Unsafe} : int
+  (defn __lamat-transpose-raw [b : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct M { int64_t rows; int64_t cols; double *data; };
     struct M *x = (void *)(intptr_t)b;
@@ -300,48 +319,37 @@
         o->data[j * o->cols + i] = x->data[i * x->cols + j];
     return (int64_t)(intptr_t)o;
     ```)
-
   ;; ===== public phantom-typed surface =====
-
   ;;; lamat-zeros -- a fresh r x c matrix of zeros; the static shape is pinned
   ;;; by the caller's annotation, e.g.
   ;;;   (defn id [] : (LaMatN (Static 2) (Static 2)) ...)
   (defn lamat-zeros [m n] [r : int c : int] : (LaMatN m n)
     (:: (unsafe (__lamat-new-zeroed-raw r c)) :LaMatN))
-
   ;;; lamat-free -- free a matrix and its backing buffer.
   (defn lamat-free [m n] [a : (LaMatN m n)] : nil
     (unsafe (__lamat-free-raw (:: a :int))))
-
   ;;; lamat-rows / lamat-cols -- runtime shape (equal to the static m / n).
   (defn lamat-rows [m n] [a : (LaMatN m n)] : int
     (unsafe (__lamat-rows-raw (:: a :int))))
   (defn lamat-cols [m n] [a : (LaMatN m n)] : int
     (unsafe (__lamat-cols-raw (:: a :int))))
-
   ;;; lamat-get / lamat-set! -- bounds-checked element access at (i, j).
   (defn lamat-get [m n] [a : (LaMatN m n) i : int j : int] : float
     (unsafe (__lamat-get-raw (:: a :int) i j)))
   (defn lamat-set! [m n] [a : (LaMatN m n) i : int j : int x : float] : nil
     (unsafe (__lamat-set-raw (:: a :int) i j x)))
-
   ;;; lamat-add / lamat-sub -- element-wise; both operands share shape (m, n).
   (defn lamat-add [m n] [a : (LaMatN m n) b : (LaMatN m n)] : (LaMatN m n)
     (:: (unsafe (__lamat-zip-raw (:: a :int) (:: b :int) 1.0)) :LaMatN))
   (defn lamat-sub [m n] [a : (LaMatN m n) b : (LaMatN m n)] : (LaMatN m n)
     (:: (unsafe (__lamat-zip-raw (:: a :int) (:: b :int) -1.0)) :LaMatN))
-
   ;;; lamat-scale -- multiply every element by s.
   (defn lamat-scale [m n] [a : (LaMatN m n) s : float] : (LaMatN m n)
     (:: (unsafe (__lamat-scale-raw (:: a :int) s)) :LaMatN))
-
   ;;; lamat-mul -- matrix product: (m x k) * (k x n) -> (m x n). The inner
   ;;; dimension k is the shared size variable.
   (defn lamat-mul [m k n] [a : (LaMatN m k) b : (LaMatN k n)] : (LaMatN m n)
     (:: (unsafe (__lamat-mul-raw (:: a :int) (:: b :int))) :LaMatN))
-
   ;;; lamat-transpose -- (m x n) -> (n x m).
   (defn lamat-transpose [m n] [a : (LaMatN m n)] : (LaMatN n m)
-    (:: (unsafe (__lamat-transpose-raw (:: a :int))) :LaMatN))
-
-) ;; end defmodule linalg/sized
+    (:: (unsafe (__lamat-transpose-raw (:: a :int))) :LaMatN))) ;; end defmodule linalg/sized

@@ -14,158 +14,136 @@
 ;; (The types are named differently on purpose: an opaque resolves globally, so
 ;; if this spice had called its carrier `Buf` -- as its plan originally did --
 ;; this program could not be compiled at all.)
-
-(defmodule nng/tests/msgpack (export)
-
-(import nng/socket     :refer [Socket push-open pull-open dial listen close
-                               set-recv-timeout-ms])
-(import nng/msg        :refer [send-payload recv-payload])
-(import nng/payload    :refer [Payload payload-free payload-len])
-(import msgpack/buf    :refer [Buf buf-free buf-len])
-(import msgpack/decode :refer [MpTree mp-parse mp-tree-root mp-tree-free])
-(import msgpack/encode :refer [derive-msgpack])
-(import test/suite     :refer [describe it])
-(import test/assert    :refer [assert-true])
-(import test/runner    :refer [run-all-status])
-
-(def recv-timeout-ms 2000)
-
-(defn cstr-eq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+(defmodule nng/tests/msgpack
+  (export)
+  (import nng/socket
+    :refer
+    [Socket push-open pull-open dial listen close set-recv-timeout-ms])
+  (import nng/msg :refer [send-payload recv-payload])
+  (import nng/payload :refer [Payload payload-free payload-len])
+  (import msgpack/buf :refer [Buf buf-free buf-len])
+  (import msgpack/decode :refer [MpTree mp-parse mp-tree-root mp-tree-free])
+  (import msgpack/encode :refer [derive-msgpack])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true])
+  (import test/runner :refer [run-all-status])
+  (def recv-timeout-ms 2000)
+  (defn cstr-eq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Crossing the buffer boundary
-;;
-;; Each direction is a copy into a fresh block the receiving side owns. The raw
-;; producers declare `ptr<void>` and the wrapper does the `(:: p T)`, for the
-;; reason both spices' own buffer modules spell out: the C type an opaque
-;; lowers to is not stable across compiler versions, and `return (void *)p;`
-;; from an int64-typed function is a hard error on AppleClang.
-;; ---------------------------------------------------------------------------
-
-;;; __mp->nng-raw -- internal: copy a msgpack Buf's bytes into a fresh block.
-(defn __mp->nng-raw [p : ptr<void>] : ptr<void>
-  ```c
-  extern void *turnng_payload_of_bytes(const void *, int64_t);
+  ;; ---------------------------------------------------------------------------
+  ;; Crossing the buffer boundary
+  ;;
+  ;; Each direction is a copy into a fresh block the receiving side owns. The raw
+  ;; producers declare `ptr<void>` and the wrapper does the `(:: p T)`, for the
+  ;; reason both spices' own buffer modules spell out: the C type an opaque
+  ;; lowers to is not stable across compiler versions, and `return (void *)p;`
+  ;; from an int64-typed function is a hard error on AppleClang.
+  ;; ---------------------------------------------------------------------------
+  ;;; __mp->nng-raw -- internal: copy a msgpack Buf's bytes into a fresh block.
+  (defn __mp->nng-raw [p : ptr<void>] : ptr<void>
+    ```c
+    extern void *turnng_payload_of_bytes(const void *, int64_t);
   /* Both spices lay a buffer out as { int64_t len; uint8_t data[] }. */
   const int64_t *b = (const int64_t *)p;
   if (b == NULL) return turnng_payload_of_bytes("", 0);
   return turnng_payload_of_bytes((const void *)(b + 1), b[0]);
   ```)
-
-;;; mp->nng -- an nng Payload holding the msgpack encoder's bytes.
-;;; Returns a FRESH owned Payload (release with payload-free); the caller still
-;;; owns the Buf it passed in.
-(defn mp->nng [b : Buf] : Payload
-  (:: (__mp->nng-raw (:: b :ptr<void>)) Payload))
-
-;;; __nng->mp-raw -- internal: the other direction, as a bare pointer.
-(defn __nng->mp-raw [p : Payload] : ptr<void>
-  ```c
-  extern void *turnng_payload_of_bytes(const void *, int64_t);
+  ;;; mp->nng -- an nng Payload holding the msgpack encoder's bytes.
+  ;;; Returns a FRESH owned Payload (release with payload-free); the caller still
+  ;;; owns the Buf it passed in.
+  (defn mp->nng [b : Buf] : Payload
+    (:: (__mp->nng-raw (:: b :ptr<void>)) Payload))
+  ;;; __nng->mp-raw -- internal: the other direction, as a bare pointer.
+  (defn __nng->mp-raw [p : Payload] : ptr<void>
+    ```c
+    extern void *turnng_payload_of_bytes(const void *, int64_t);
   extern int64_t turnng_payload_len(const void *);
   extern void   *turnng_payload_data(void *);
   void *src = turnng_payload_data((void *)(intptr_t)p);
   return turnng_payload_of_bytes(src ? src : "",
                                  turnng_payload_len((const void *)(intptr_t)p));
   ```)
-
-;;; nng->mp -- a msgpack Buf holding a received payload's bytes.
-;;; Returns a FRESH owned Buf; the caller still owns the Payload.
-(defn nng->mp [p : Payload] : Buf
-  (:: (__nng->mp-raw p) Buf))
-
-;; ---------------------------------------------------------------------------
-;; The job
-;; ---------------------------------------------------------------------------
-
-(defstruct Job [id : int  kind : cstr  urgent : bool])
-
-(derive-msgpack Job (id int) (kind cstr) (urgent bool))
-
-;;; push-job! -- encode a Job and push it. Releases both buffers it makes.
-(defn push-job! [^borrow s : Socket j : Job] : bool
-  (let [encoded (encode-mp j)
-        wire    (mp->nng encoded)
-        sent    (send-payload s wire)]
-    (payload-free wire)
-    (buf-free encoded)
-    (ok? sent)))
-
-;;; job-is? -- decode a received Payload as a Job and check every field.
-;;;
-;;; Takes the RESULT rather than the Payload so a timed-out receive is a false
-;;; assertion and not an `ok-val` on an err carrier: a flaky run should fail
-;;; this suite, not crash it. Releases everything it allocates, including the
-;;; msgpack Buf it copies into -- `mp-parse` borrows that buffer, it does not
-;;; adopt it.
-(defn job-is? [wire : (Result Payload int) id : int kind : cstr urgent : bool] : bool
-  (if (err? wire)
-    false
-    (let [mp     (nng->mp (ok-val wire))
-          parsed (mp-parse mp)]
-      (if (err? parsed)
-        (do (buf-free mp) false)
-        (let [t   (ok-val parsed)
-              dec (:: (decode-mp t (mp-tree-root t)) (Result Job cstr))]
-          (if (err? dec)
-            (do (mp-tree-free t) (buf-free mp) false)
-            (let [job (ok-val dec)
-                  r   (and (= id (.id job))
-                           (and (cstr-eq? kind (.kind job))
-                                (= urgent (.urgent job))))]
-              (mp-tree-free t)
-              (buf-free mp)
-              r)))))))
-
-;;; wire-len -- the received payload's byte count, or -1 if nothing arrived.
-(defn wire-len [wire : (Result Payload int)] : int
-  (if (ok? wire) (payload-len (ok-val wire)) -1))
-
-;;; release -- free a received Payload if one arrived.
-(defn release [wire : (Result Payload int)] : nil
-  (when (ok? wire) (payload-free (ok-val wire))))
-
-(defn __all-tests [] : void
-  (describe "nng + msgpack -- a typed job queue over inproc"
-
-    (it "round-trips a derived struct across a pipeline socket"
-      (let [push (ok-val (push-open))
-            pull (ok-val (pull-open))
-            _    (listen push "inproc://ng4-jobs")
-            _    (dial pull "inproc://ng4-jobs")
-            _    (set-recv-timeout-ms pull recv-timeout-ms)
-            sent (push-job! push (make-struct Job 42 "reindex" true))
-            wire (recv-payload pull)
-            r    (assert-true (and sent (job-is? wire 42 "reindex" true)))]
-        (release wire)
-        (close pull)
-        (close push)
-        r))
-
-    (it "puts exactly the encoder's bytes on the wire, no more and no fewer"
-      ;; Against the encoder's own length rather than a literal: the assertion
-      ;; is that nothing is added, dropped, or re-framed in transit, and a
-      ;; msgpack encoding change should not have to touch this file.
-      (let [push  (ok-val (push-open))
-            pull  (ok-val (pull-open))
-            _     (listen push "inproc://ng4-jobs-size")
-            _     (dial pull "inproc://ng4-jobs-size")
-            _     (set-recv-timeout-ms pull recv-timeout-ms)
-            _     (push-job! push (make-struct Job 7 "vacuum" false))
-            local (encode-mp (make-struct Job 7 "vacuum" false))
-            wire  (recv-payload pull)
-            r     (assert-true (= (buf-len local) (wire-len wire)))]
-        (release wire)
-        (buf-free local)
-        (close pull)
-        (close push)
-        r))))
-
-(defn main [] : int
-  (__all-tests)
-  (run-all-status))
-)
+  ;;; nng->mp -- a msgpack Buf holding a received payload's bytes.
+  ;;; Returns a FRESH owned Buf; the caller still owns the Payload.
+  (defn nng->mp [p : Payload] : Buf (:: (__nng->mp-raw p) Buf))
+  ;; ---------------------------------------------------------------------------
+  ;; The job
+  ;; ---------------------------------------------------------------------------
+  (defstruct Job [id : int kind : cstr urgent : bool])
+  (derive-msgpack Job (id int) (kind cstr) (urgent bool))
+  ;;; push-job! -- encode a Job and push it. Releases both buffers it makes.
+  (defn push-job! [^borrow s : Socket j : Job] : bool
+    (let [encoded (encode-mp j)
+          wire    (mp->nng encoded)
+          sent    (send-payload s wire)]
+      (payload-free wire)
+      (buf-free encoded)
+      (ok? sent)))
+  ;;; job-is? -- decode a received Payload as a Job and check every field.
+  ;;;
+  ;;; Takes the RESULT rather than the Payload so a timed-out receive is a false
+  ;;; assertion and not an `ok-val` on an err carrier: a flaky run should fail
+  ;;; this suite, not crash it. Releases everything it allocates, including the
+  ;;; msgpack Buf it copies into -- `mp-parse` borrows that buffer, it does not
+  ;;; adopt it.
+  (defn job-is? [wire : (Result Payload int) id : int kind : cstr urgent : bool] : bool
+    (if (err? wire)
+      false
+      (let [mp     (nng->mp (ok-val wire))
+            parsed (mp-parse mp)]
+        (if (err? parsed)
+          (do (buf-free mp) false)
+          (let [t   (ok-val parsed)
+                dec (:: (decode-mp t (mp-tree-root t)) (Result Job cstr))]
+            (if (err? dec)
+              (do (mp-tree-free t) (buf-free mp) false)
+              (let [job (ok-val dec)
+                    r   (and (= id (.id job))
+                          (and (cstr-eq? kind (.kind job))
+                            (= urgent (.urgent job))))]
+                (mp-tree-free t)
+                (buf-free mp)
+                r)))))))
+  ;;; wire-len -- the received payload's byte count, or -1 if nothing arrived.
+  (defn wire-len [wire : (Result Payload int)] : int
+    (if (ok? wire) (payload-len (ok-val wire)) -1))
+  ;;; release -- free a received Payload if one arrived.
+  (defn release [wire : (Result Payload int)] : nil
+    (when (ok? wire) (payload-free (ok-val wire))))
+  (defn __all-tests [] : void
+    (describe "nng + msgpack -- a typed job queue over inproc"
+      (it "round-trips a derived struct across a pipeline socket"
+        (let [push (ok-val (push-open))
+              pull (ok-val (pull-open))
+              _    (listen push "inproc://ng4-jobs")
+              _    (dial pull "inproc://ng4-jobs")
+              _    (set-recv-timeout-ms pull recv-timeout-ms)
+              sent (push-job! push (make-struct Job 42 "reindex" true))
+              wire (recv-payload pull)
+              r    (assert-true (and sent (job-is? wire 42 "reindex" true)))]
+          (release wire)
+          (close pull)
+          (close push)
+          r))
+      (it "puts exactly the encoder's bytes on the wire, no more and no fewer"
+        ;; Against the encoder's own length rather than a literal: the assertion
+        ;; is that nothing is added, dropped, or re-framed in transit, and a
+        ;; msgpack encoding change should not have to touch this file.
+        (let [push  (ok-val (push-open))
+              pull  (ok-val (pull-open))
+              _     (listen push "inproc://ng4-jobs-size")
+              _     (dial pull "inproc://ng4-jobs-size")
+              _     (set-recv-timeout-ms pull recv-timeout-ms)
+              _     (push-job! push (make-struct Job 7 "vacuum" false))
+              local (encode-mp (make-struct Job 7 "vacuum" false))
+              wire  (recv-payload pull)
+              r     (assert-true (= (buf-len local) (wire-len wire)))]
+          (release wire)
+          (buf-free local)
+          (close pull)
+          (close push)
+          r))))
+  (defn main [] : int (__all-tests) (run-all-status)))

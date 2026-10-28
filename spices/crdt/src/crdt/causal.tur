@@ -17,415 +17,394 @@
 (defmodule crdt/causal
   (import crdt/lattice :refer [map-merge-with])
   (import crdt/replica :refer [ReplicaId replica replica-sym])
-  (export Dot mk-dot dot-replica dot-counter
-          DotContext dotctx-new dotctx-witness dotctx-seen? dotctx-next
-          dotctx-count dotctx-witness-set
-          DotSet dotset-new dotset-add dotset-has? dotset-count dotset-union)
-
-;;; Dot -- one replica's n-th event.
-;;;
-;;; Since: crdt-spice-plan C2
-;;
-;; NOTE the constructor is `mk-dot`, not `dot`: stdlib/macros.tur (which IS
-;; auto-loaded) already defines a `dot` macro for method-call sugar, and macro
-;; expansion precedes everything, so a function of that name is unreachable.
-;; Same collision shape that retired the max/min macros in
-;; lattice-vocabulary-plan L1 -- worth checking a name against macros.tur before
-;; exporting it.
-(defstruct Dot [replica : ReplicaId counter : int])
-
-;;; mk-dot -- mint a dot.
-;;;
-;;; Parameters:
-;;;   r -- the replica
-;;;   n -- its counter value for this event
-;;;
-;;; Returns:
-;;;   The Dot (r, n).
-;;;
-;;; Example:
-;;;   (mk-dot (replica (quote alice)) 3)
-;;;
-;;; Since: crdt-spice-plan C2
-(defn mk-dot [r : ReplicaId n : int] : Dot (Dot r n))
-
-;;; dot-replica -- the replica that minted this dot.
-;;;
-;;; Parameters:
-;;;   d -- the dot
-;;;
-;;; Returns:
-;;;   Its replica.
-;;;
-;;; Example:
-;;;   (replica-sym (dot-replica (mk-dot (replica (quote alice)) 3)))   ; => alice
-;;;
-;;; Since: crdt-spice-plan C2
-(defn dot-replica [^borrow d : Dot] : ReplicaId (.replica d))
-
-;;; dot-counter -- the counter value of this dot.
-;;;
-;;; Parameters:
-;;;   d -- the dot
-;;;
-;;; Returns:
-;;;   Its counter.
-;;;
-;;; Example:
-;;;   (dot-counter (mk-dot (replica (quote alice)) 3))   ; => 3
-;;;
-;;; Since: crdt-spice-plan C2
-(defn dot-counter [^borrow d : Dot] : int (.counter d))
-
-;;; DotContext -- the causal history a replica has observed.
-;;;
-;;; Since: crdt-spice-plan C2
-(defstruct ^heap DotContext [seen : int])
-
-;;; dotctx-new -- an empty causal history.
-;;;
-;;; Returns:
-;;;   A DotContext that has observed nothing.
-;;;
-;;; Example:
-;;;   (dotctx-new)
-;;;
-;;; Since: crdt-spice-plan C2
-(defn dotctx-new [] : DotContext
-  (DotContext (:: (map-new) int)))
-
-;;; dotctx-witness -- record that a dot has been observed.
-;;;
-;;; Parameters:
-;;;   c -- the context
-;;;   d -- the dot
-;;;
-;;; Returns:
-;;;   A new DotContext including d.
-;;;
-;;; Example:
-;;;   (dotctx-witness (dotctx-new) (mk-dot (replica (quote alice)) 1))
-;;;
-;;; Since: crdt-spice-plan C2
-;;
-;; Keeps the HIGHEST counter per replica, so witnessing an older dot is a
-;; no-op.  That is what makes the context a join-semilattice rather than a
-;; growing log.
-(defn dotctx-witness [c : DotContext ^borrow d : Dot] : DotContext
-  (let [m   (:: (.seen c) (Map Sym int))
-        r   (replica-sym (.replica d))
-        n   (.counter d)
-        cur (if (map-has? m r) (map-get m r) 0)]
-    (DotContext (:: (map-assoc m r (if (< cur n) n cur)) int))))
-
-;;; dotctx-seen? -- has this dot been observed?
-;;;
-;;; Parameters:
-;;;   c -- the context
-;;;   d -- the dot
-;;;
-;;; Returns:
-;;;   true when the context's counter for d's replica is at least d's.
-;;;
-;;; Example:
-;;;   (dotctx-seen? ctx (mk-dot (replica (quote alice)) 1))
-;;;
-;;; Since: crdt-spice-plan C2
-(defn dotctx-seen? [^borrow c : DotContext ^borrow d : Dot] : bool
-  (let [m (:: (.seen c) (Map Sym int))
-        r (replica-sym (.replica d))]
-    (if (map-has? m r) (>= (map-get m r) (.counter d)) false)))
-
-;;; dotctx-next -- the next dot this replica may mint.
-;;;
-;;; Parameters:
-;;;   c -- the context
-;;;   r -- the replica
-;;;
-;;; Returns:
-;;;   The dot one past the highest this context has for r.
-;;;
-;;; Example:
-;;;   (dotctx-next ctx (replica (quote alice)))
-;;;
-;;; Since: crdt-spice-plan C2
-(defn dotctx-next [^borrow c : DotContext r : ReplicaId] : Dot
-  (let [m (:: (.seen c) (Map Sym int))
-        k (replica-sym r)]
-    (Dot r (+ 1 (if (map-has? m k) (map-get m k) 0)))))
-
-;;; dotctx-count -- how many replicas this context has heard from.
-;;;
-;;; Parameters:
-;;;   c -- the context
-;;;
-;;; Returns:
-;;;   The number of distinct replicas in the version vector.
-;;;
-;;; Example:
-;;;   (dotctx-count ctx)   ; => 2
-;;;
-;;; Since: crdt-spice-plan C2
-(defn dotctx-count [^borrow c : DotContext] : int
-  (map-count (:: (.seen c) (Map Sym int))))
-
-;;; DotSet -- an EXACT set of dots.
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; A DotContext is a COMPACTED history: `alice -> 3` means alice's dots 1, 2
-;; and 3, and the compaction is what makes a state's context one int per
-;; replica instead of one per event.  A DotSet is the uncompacted thing --
-;; `{alice@3}` means that dot and no other.
-;;
-;; The distinction is invisible for a state, where the history really is
-;; downward-closed, and load-bearing for a DELTA, where it is not.  A delta
-;; asserting "I retract alice@3" must not also be read as "I have seen
-;; alice@1", because the merge's add-wins test would then drop whatever
-;; element alice@1 added.  That is a silent wrong answer -- elements vanish,
-;; nothing errors -- and it is why the causal types' deltas carry a DotSet
-;; rather than a DotContext.  See crdt/lattice's DeltaCRDT note.
-;;
-;; Representation: replica -> (counter -> 1), a HAMT of HAMTs, the same
-;; two-level shape crdt/orset uses for its dot store.  There is no compaction
-;; and there is meant to be none.
-(defstruct ^heap DotSet [dots : int])
-
-;;; dotset-new -- an empty dot set.
-;;;
-;;; Returns:
-;;;   A DotSet holding no dots.
-;;;
-;;; Example:
-;;;   (dotset-new)
-;;;
-;;; Since: crdt-spice-plan C4
-(defn dotset-new [] : DotSet
-  (DotSet (:: (map-new) int)))
-
-;;; __inner-dots -- internal: one replica's counter set, or a fresh empty one.
-;;
-;; A helper rather than an inline `if` so BOTH arms are forced to the `:int`
-;; handle by the declared return type -- the same shape crdt/orset's
-;; `__inner-of` documents.
-(defn __inner-dots [m : int r : Sym] : int
-  (if (map-has? (:: m (Map Sym int)) r)
-    (:: (map-get (:: m (Map Sym int)) r) int)
-    (:: (map-new) int)))
-
-;;; dotset-add -- add one dot.
-;;;
-;;; Parameters:
-;;;   s -- the set
-;;;   d -- the dot
-;;;
-;;; Returns:
-;;;   A new DotSet containing d.
-;;;
-;;; Example:
-;;;   (dotset-add (dotset-new) (mk-dot (replica (quote alice)) 3))
-;;;
-;;; Since: crdt-spice-plan C4
-(defn dotset-add [s : DotSet ^borrow d : Dot] : DotSet
-  (let [m   (.dots s)
-        r   (replica-sym (.replica d))
-        inn (:: (map-assoc (:: (__inner-dots m r) (Map int int)) (.counter d) 1) int)]
-    (DotSet (:: (map-assoc (:: m (Map Sym int)) r inn) int))))
-
-;;; dotset-has? -- is this exact dot in the set?
-;;;
-;;; Parameters:
-;;;   s -- the set
-;;;   d -- the dot
-;;;
-;;; Returns:
-;;;   true only for the dot itself -- never for an earlier one, which is the
-;;;   whole difference from dotctx-seen?.
-;;;
-;;; Example:
-;;;   (dotset-has? s (mk-dot (replica (quote alice)) 3))
-;;;
-;;; Since: crdt-spice-plan C4
-(defn dotset-has? [^borrow s : DotSet ^borrow d : Dot] : bool
-  (let [m (.dots s)
-        r (replica-sym (.replica d))]
+  (export Dot
+    mk-dot
+    dot-replica
+    dot-counter
+    DotContext
+    dotctx-new
+    dotctx-witness
+    dotctx-seen?
+    dotctx-next
+    dotctx-count
+    dotctx-witness-set
+    DotSet
+    dotset-new
+    dotset-add
+    dotset-has?
+    dotset-count
+    dotset-union)
+  ;;; Dot -- one replica's n-th event.
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  ;;
+  ;; NOTE the constructor is `mk-dot`, not `dot`: stdlib/macros.tur (which IS
+  ;; auto-loaded) already defines a `dot` macro for method-call sugar, and macro
+  ;; expansion precedes everything, so a function of that name is unreachable.
+  ;; Same collision shape that retired the max/min macros in
+  ;; lattice-vocabulary-plan L1 -- worth checking a name against macros.tur before
+  ;; exporting it.
+  (defstruct Dot [replica : ReplicaId counter : int])
+  ;;; mk-dot -- mint a dot.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- the replica
+  ;;;   n -- its counter value for this event
+  ;;;
+  ;;; Returns:
+  ;;;   The Dot (r, n).
+  ;;;
+  ;;; Example:
+  ;;;   (mk-dot (replica (quote alice)) 3)
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn mk-dot [r : ReplicaId n : int] : Dot (Dot r n))
+  ;;; dot-replica -- the replica that minted this dot.
+  ;;;
+  ;;; Parameters:
+  ;;;   d -- the dot
+  ;;;
+  ;;; Returns:
+  ;;;   Its replica.
+  ;;;
+  ;;; Example:
+  ;;;   (replica-sym (dot-replica (mk-dot (replica (quote alice)) 3)))   ; => alice
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn dot-replica [^borrow d : Dot] : ReplicaId (.replica d))
+  ;;; dot-counter -- the counter value of this dot.
+  ;;;
+  ;;; Parameters:
+  ;;;   d -- the dot
+  ;;;
+  ;;; Returns:
+  ;;;   Its counter.
+  ;;;
+  ;;; Example:
+  ;;;   (dot-counter (mk-dot (replica (quote alice)) 3))   ; => 3
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn dot-counter [^borrow d : Dot] : int (.counter d))
+  ;;; DotContext -- the causal history a replica has observed.
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defstruct ^heap DotContext [seen : int])
+  ;;; dotctx-new -- an empty causal history.
+  ;;;
+  ;;; Returns:
+  ;;;   A DotContext that has observed nothing.
+  ;;;
+  ;;; Example:
+  ;;;   (dotctx-new)
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn dotctx-new [] : DotContext (DotContext (:: (map-new) int)))
+  ;;; dotctx-witness -- record that a dot has been observed.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the context
+  ;;;   d -- the dot
+  ;;;
+  ;;; Returns:
+  ;;;   A new DotContext including d.
+  ;;;
+  ;;; Example:
+  ;;;   (dotctx-witness (dotctx-new) (mk-dot (replica (quote alice)) 1))
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  ;;
+  ;; Keeps the HIGHEST counter per replica, so witnessing an older dot is a
+  ;; no-op.  That is what makes the context a join-semilattice rather than a
+  ;; growing log.
+  (defn dotctx-witness [c : DotContext ^borrow d : Dot] : DotContext
+    (let [m   (:: (.seen c) (Map Sym int))
+          r   (replica-sym (.replica d))
+          n   (.counter d)
+          cur (if (map-has? m r) (map-get m r) 0)]
+      (DotContext (:: (map-assoc m r (if (< cur n) n cur)) int))))
+  ;;; dotctx-seen? -- has this dot been observed?
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the context
+  ;;;   d -- the dot
+  ;;;
+  ;;; Returns:
+  ;;;   true when the context's counter for d's replica is at least d's.
+  ;;;
+  ;;; Example:
+  ;;;   (dotctx-seen? ctx (mk-dot (replica (quote alice)) 1))
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn dotctx-seen? [^borrow c : DotContext ^borrow d : Dot] : bool
+    (let [m (:: (.seen c) (Map Sym int))
+          r (replica-sym (.replica d))]
+      (if (map-has? m r) (>= (map-get m r) (.counter d)) false)))
+  ;;; dotctx-next -- the next dot this replica may mint.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the context
+  ;;;   r -- the replica
+  ;;;
+  ;;; Returns:
+  ;;;   The dot one past the highest this context has for r.
+  ;;;
+  ;;; Example:
+  ;;;   (dotctx-next ctx (replica (quote alice)))
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn dotctx-next [^borrow c : DotContext r : ReplicaId] : Dot
+    (let [m (:: (.seen c) (Map Sym int))
+          k (replica-sym r)]
+      (Dot r (+ 1 (if (map-has? m k) (map-get m k) 0)))))
+  ;;; dotctx-count -- how many replicas this context has heard from.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the context
+  ;;;
+  ;;; Returns:
+  ;;;   The number of distinct replicas in the version vector.
+  ;;;
+  ;;; Example:
+  ;;;   (dotctx-count ctx)   ; => 2
+  ;;;
+  ;;; Since: crdt-spice-plan C2
+  (defn dotctx-count [^borrow c : DotContext] : int
+    (map-count (:: (.seen c) (Map Sym int))))
+  ;;; DotSet -- an EXACT set of dots.
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; A DotContext is a COMPACTED history: `alice -> 3` means alice's dots 1, 2
+  ;; and 3, and the compaction is what makes a state's context one int per
+  ;; replica instead of one per event.  A DotSet is the uncompacted thing --
+  ;; `{alice@3}` means that dot and no other.
+  ;;
+  ;; The distinction is invisible for a state, where the history really is
+  ;; downward-closed, and load-bearing for a DELTA, where it is not.  A delta
+  ;; asserting "I retract alice@3" must not also be read as "I have seen
+  ;; alice@1", because the merge's add-wins test would then drop whatever
+  ;; element alice@1 added.  That is a silent wrong answer -- elements vanish,
+  ;; nothing errors -- and it is why the causal types' deltas carry a DotSet
+  ;; rather than a DotContext.  See crdt/lattice's DeltaCRDT note.
+  ;;
+  ;; Representation: replica -> (counter -> 1), a HAMT of HAMTs, the same
+  ;; two-level shape crdt/orset uses for its dot store.  There is no compaction
+  ;; and there is meant to be none.
+  (defstruct ^heap DotSet [dots : int])
+  ;;; dotset-new -- an empty dot set.
+  ;;;
+  ;;; Returns:
+  ;;;   A DotSet holding no dots.
+  ;;;
+  ;;; Example:
+  ;;;   (dotset-new)
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  (defn dotset-new [] : DotSet (DotSet (:: (map-new) int)))
+  ;;; __inner-dots -- internal: one replica's counter set, or a fresh empty one.
+  ;;
+  ;; A helper rather than an inline `if` so BOTH arms are forced to the `:int`
+  ;; handle by the declared return type -- the same shape crdt/orset's
+  ;; `__inner-of` documents.
+  (defn __inner-dots [m : int r : Sym] : int
     (if (map-has? (:: m (Map Sym int)) r)
-      (map-has? (:: (:: (map-get (:: m (Map Sym int)) r) int) (Map int int))
-                (.counter d))
-      false)))
-
-;;; dotset-count -- how many dots the set holds.
-;;;
-;;; Parameters:
-;;;   s -- the set
-;;;
-;;; Returns:
-;;;   The total over every replica.
-;;;
-;;; Example:
-;;;   (dotset-count s)   ; => 2
-;;;
-;;; Since: crdt-spice-plan C4
-(defn dotset-count [^borrow s : DotSet] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: (.dots s) (Map Sym int))))
-        r  (__dotset-count-loop it 0)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __dotset-count-loop -- internal.
-(defn __dotset-count-loop [it : ptr<void> acc : int] : int
-  (if (hamt/iter-advance! it)
-    (__dotset-count-loop
-      it (+ acc (map-count (:: (:: (hamt/iter-cur-val it) int) (Map int int)))))
-    acc))
-
-;;; dotset-union -- every dot from both sets.
-;;;
-;;; Parameters:
-;;;   a -- first set
-;;;   b -- second set
-;;;
-;;; Returns:
-;;;   Their union.
-;;;
-;;; Example:
-;;;   (dotset-union x y)
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; Union with no compaction: two deltas buffered before a send must assert
-;; exactly the dots they each asserted and not the gaps between them.
-(defn dotset-union [a : DotSet b : DotSet] : DotSet
-  (let [it (hamt/iter-alloc (map-hamt (:: (.dots b) (Map Sym int))))
-        r  (__dotset-union-loop (.dots a) it)]
-    (hamt/iter-destroy! it)
-    (DotSet r)))
-
-;;; __dotset-union-loop -- internal: fold b's replicas into acc.
-(defn __dotset-union-loop [acc : int it : ptr<void>] : int
-  (if (hamt/iter-advance! it)
-    (let [r    (:: (hamt/iter-cur-key it) Sym)
-          bset (:: (hamt/iter-cur-val it) int)
-          merged (__counters-union (__inner-dots acc r) bset)]
-      (__dotset-union-loop (:: (map-assoc (:: acc (Map Sym int)) r merged) int) it))
-    acc))
-
-;;; __counters-union -- internal: union two counter sets.
-(defn __counters-union [a : int b : int] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: b (Map int int))))
-        r  (__counters-union-loop a it)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __counters-union-loop -- internal.
-(defn __counters-union-loop [acc : int it : ptr<void>] : int
-  (if (hamt/iter-advance! it)
-    (__counters-union-loop
-      (:: (map-assoc (:: acc (Map int int)) (:: (hamt/iter-cur-key it) int) 1) int)
-      it)
-    acc))
-
-;;; JoinSemilattice [DotSet] -- union.
-(definstance JoinSemilattice [DotSet]
-  (join [x y] (dotset-union x y)))
-
-;;; BoundedJoin [DotSet] -- the empty set is the least element.
-(definstance BoundedJoin [DotSet]
-  (bottom [] (dotset-new)))
-
-;;; Eq [DotSet] -- same number of dots.
-;;
-;; Size-only, like Eq [GSet] and for the same reason, and recorded rather than
-;; papered over: two dot sets of equal size over different dots compare equal.
-(definstance Eq [DotSet]
-  (eq? [^borrow x ^borrow y] (= (dotset-count x) (dotset-count y))))
-
-;;; dotctx-witness-set -- record every dot of a DotSet as observed.
-;;;
-;;; Parameters:
-;;;   c -- the context
-;;;   s -- the exact dots to witness
-;;;
-;;; Returns:
-;;;   A DotContext that has observed all of them.
-;;;
-;;; Example:
-;;;   (dotctx-witness-set ctx (dotset-add (dotset-new) (mk-dot (replica (quote alice)) 3)))
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; This is the lossy step, and it is deliberate: the context COMPACTS, so
-;; witnessing alice@3 marks alice@1 and alice@2 seen too.  Under causal
-;; delivery that is exact -- alice's dots arrive without gaps, so the earlier
-;; ones really have been seen by the time this runs.  Out of causal order it
-;; over-approximates, and a later-arriving alice@1 add would be read as
-;; already-removed and dropped.  That is the assumption C6's sync layer owes
-;; this module; it is the same one crdt/causal's header already records for
-;; the version vector itself.
-(defn dotctx-witness-set [c : DotContext ^borrow s : DotSet] : DotContext
-  (let [it (hamt/iter-alloc (map-hamt (:: (.dots s) (Map Sym int))))
-        r  (__witness-reps-loop c it)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __witness-reps-loop -- internal: witness each replica's counters.
-(defn __witness-reps-loop [acc : DotContext it : ptr<void>] : DotContext
-  (if (hamt/iter-advance! it)
-    (let [r (:: (hamt/iter-cur-key it) Sym)
-          n (__max-counter (:: (hamt/iter-cur-val it) int))
-          w (dotctx-witness acc (Dot (replica r) n))]
-      (__witness-reps-loop w it))
-    acc))
-
-;;; __max-counter -- internal: the highest counter in a counter set.
-;;
-;; Only the maximum is witnessed: the context is downward-closed, so
-;; witnessing the highest dot of a replica subsumes every lower one in the
-;; same set.  Folding them one at a time would give the same answer and do
-;; more work.
-(defn __max-counter [m : int] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: m (Map int int))))
-        r  (__max-counter-loop it 0)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __max-counter-loop -- internal.
-(defn __max-counter-loop [it : ptr<void> acc : int] : int
-  (if (hamt/iter-advance! it)
-    (__max-counter-loop it (__imax__cx acc (:: (hamt/iter-cur-key it) int)))
-    acc))
-
-;;; __imax__cx -- internal: the larger of two ints.
-(defn __imax__cx [x : int y : int] : int (if (< x y) y x))
-
-;;; JoinSemilattice [DotContext] -- pointwise maximum of the version vectors.
-;;
-;; The same join a G-Counter uses, and for the same reason: each replica owns
-;; its own slot, so a disagreement is always "one of us has seen less".
-(definstance JoinSemilattice [DotContext]
-  (join [x y] (DotContext (map-merge-with (.seen x) (.seen y) __imax__cx))))
-
-;;; BoundedJoin [DotContext] -- the empty history is the least element.
-(definstance BoundedJoin [DotContext]
-  (bottom [] (dotctx-new)))
-
-;;; Eq [DotContext] -- same replicas, same counters.
-(definstance Eq [DotContext]
-  (eq? [^borrow x ^borrow y]
-    (and (= (dotctx-count x) (dotctx-count y))
-         (= (__dotctx-sum x) (__dotctx-sum y)))))
-
-;;; __dotctx-sum -- internal: sum of the counters, a cheap content digest.
-(defn __dotctx-sum [^borrow c : DotContext] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: (.seen c) (Map Sym int))))
-        s  (__sum-loop__cx it 0)]
-    (hamt/iter-destroy! it)
-    s))
-
-;;; __sum-loop__cx -- internal.
-(defn __sum-loop__cx [it : ptr<void> acc : int] : int
-  (if (hamt/iter-advance! it)
-    (__sum-loop__cx it (+ acc (:: (hamt/iter-cur-val it) int)))
-    acc))
-
-) ;; end defmodule crdt/causal
+      (:: (map-get (:: m (Map Sym int)) r) int)
+      (:: (map-new) int)))
+  ;;; dotset-add -- add one dot.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the set
+  ;;;   d -- the dot
+  ;;;
+  ;;; Returns:
+  ;;;   A new DotSet containing d.
+  ;;;
+  ;;; Example:
+  ;;;   (dotset-add (dotset-new) (mk-dot (replica (quote alice)) 3))
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  (defn dotset-add [s : DotSet ^borrow d : Dot] : DotSet
+    (let [m   (.dots s)
+          r   (replica-sym (.replica d))
+          inn (:: (map-assoc (:: (__inner-dots m r) (Map int int))
+                    (.counter d)
+                    1)
+                int)]
+      (DotSet (:: (map-assoc (:: m (Map Sym int)) r inn) int))))
+  ;;; dotset-has? -- is this exact dot in the set?
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the set
+  ;;;   d -- the dot
+  ;;;
+  ;;; Returns:
+  ;;;   true only for the dot itself -- never for an earlier one, which is the
+  ;;;   whole difference from dotctx-seen?.
+  ;;;
+  ;;; Example:
+  ;;;   (dotset-has? s (mk-dot (replica (quote alice)) 3))
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  (defn dotset-has? [^borrow s : DotSet ^borrow d : Dot] : bool
+    (let [m (.dots s)
+          r (replica-sym (.replica d))]
+      (if (map-has? (:: m (Map Sym int)) r)
+        (map-has? (:: (:: (map-get (:: m (Map Sym int)) r) int) (Map int int))
+          (.counter d))
+        false)))
+  ;;; dotset-count -- how many dots the set holds.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the set
+  ;;;
+  ;;; Returns:
+  ;;;   The total over every replica.
+  ;;;
+  ;;; Example:
+  ;;;   (dotset-count s)   ; => 2
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  (defn dotset-count [^borrow s : DotSet] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: (.dots s) (Map Sym int))))
+          r  (__dotset-count-loop it 0)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __dotset-count-loop -- internal.
+  (defn __dotset-count-loop [it : ptr<void> acc : int] : int
+    (if (hamt/iter-advance! it)
+      (__dotset-count-loop it
+        (+ acc (map-count (:: (:: (hamt/iter-cur-val it) int) (Map int int)))))
+      acc))
+  ;;; dotset-union -- every dot from both sets.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- first set
+  ;;;   b -- second set
+  ;;;
+  ;;; Returns:
+  ;;;   Their union.
+  ;;;
+  ;;; Example:
+  ;;;   (dotset-union x y)
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; Union with no compaction: two deltas buffered before a send must assert
+  ;; exactly the dots they each asserted and not the gaps between them.
+  (defn dotset-union [a : DotSet b : DotSet] : DotSet
+    (let [it (hamt/iter-alloc (map-hamt (:: (.dots b) (Map Sym int))))
+          r  (__dotset-union-loop (.dots a) it)]
+      (hamt/iter-destroy! it)
+      (DotSet r)))
+  ;;; __dotset-union-loop -- internal: fold b's replicas into acc.
+  (defn __dotset-union-loop [acc : int it : ptr<void>] : int
+    (if (hamt/iter-advance! it)
+      (let [r      (:: (hamt/iter-cur-key it) Sym)
+            bset   (:: (hamt/iter-cur-val it) int)
+            merged (__counters-union (__inner-dots acc r) bset)]
+        (__dotset-union-loop (:: (map-assoc (:: acc (Map Sym int)) r merged)
+                               int)
+          it))
+      acc))
+  ;;; __counters-union -- internal: union two counter sets.
+  (defn __counters-union [a : int b : int] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: b (Map int int))))
+          r  (__counters-union-loop a it)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __counters-union-loop -- internal.
+  (defn __counters-union-loop [acc : int it : ptr<void>] : int
+    (if (hamt/iter-advance! it)
+      (__counters-union-loop (:: (map-assoc (:: acc (Map int int))
+                                   (:: (hamt/iter-cur-key it) int)
+                                   1)
+                               int)
+        it)
+      acc))
+  ;;; JoinSemilattice [DotSet] -- union.
+  (definstance JoinSemilattice [DotSet] (join [x y] (dotset-union x y)))
+  ;;; BoundedJoin [DotSet] -- the empty set is the least element.
+  (definstance BoundedJoin [DotSet] (bottom [] (dotset-new)))
+  ;;; Eq [DotSet] -- same number of dots.
+  ;;
+  ;; Size-only, like Eq [GSet] and for the same reason, and recorded rather than
+  ;; papered over: two dot sets of equal size over different dots compare equal.
+  (definstance Eq [DotSet]
+    (eq? [^borrow x ^borrow y] (= (dotset-count x) (dotset-count y))))
+  ;;; dotctx-witness-set -- record every dot of a DotSet as observed.
+  ;;;
+  ;;; Parameters:
+  ;;;   c -- the context
+  ;;;   s -- the exact dots to witness
+  ;;;
+  ;;; Returns:
+  ;;;   A DotContext that has observed all of them.
+  ;;;
+  ;;; Example:
+  ;;;   (dotctx-witness-set ctx (dotset-add (dotset-new) (mk-dot (replica (quote alice)) 3)))
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; This is the lossy step, and it is deliberate: the context COMPACTS, so
+  ;; witnessing alice@3 marks alice@1 and alice@2 seen too.  Under causal
+  ;; delivery that is exact -- alice's dots arrive without gaps, so the earlier
+  ;; ones really have been seen by the time this runs.  Out of causal order it
+  ;; over-approximates, and a later-arriving alice@1 add would be read as
+  ;; already-removed and dropped.  That is the assumption C6's sync layer owes
+  ;; this module; it is the same one crdt/causal's header already records for
+  ;; the version vector itself.
+  (defn dotctx-witness-set [c : DotContext ^borrow s : DotSet] : DotContext
+    (let [it (hamt/iter-alloc (map-hamt (:: (.dots s) (Map Sym int))))
+          r  (__witness-reps-loop c it)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __witness-reps-loop -- internal: witness each replica's counters.
+  (defn __witness-reps-loop [acc : DotContext it : ptr<void>] : DotContext
+    (if (hamt/iter-advance! it)
+      (let [r (:: (hamt/iter-cur-key it) Sym)
+            n (__max-counter (:: (hamt/iter-cur-val it) int))
+            w (dotctx-witness acc (Dot (replica r) n))]
+        (__witness-reps-loop w it))
+      acc))
+  ;;; __max-counter -- internal: the highest counter in a counter set.
+  ;;
+  ;; Only the maximum is witnessed: the context is downward-closed, so
+  ;; witnessing the highest dot of a replica subsumes every lower one in the
+  ;; same set.  Folding them one at a time would give the same answer and do
+  ;; more work.
+  (defn __max-counter [m : int] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: m (Map int int))))
+          r  (__max-counter-loop it 0)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __max-counter-loop -- internal.
+  (defn __max-counter-loop [it : ptr<void> acc : int] : int
+    (if (hamt/iter-advance! it)
+      (__max-counter-loop it (__imax__cx acc (:: (hamt/iter-cur-key it) int)))
+      acc))
+  ;;; __imax__cx -- internal: the larger of two ints.
+  (defn __imax__cx [x : int y : int] : int (if (< x y) y x))
+  ;;; JoinSemilattice [DotContext] -- pointwise maximum of the version vectors.
+  ;;
+  ;; The same join a G-Counter uses, and for the same reason: each replica owns
+  ;; its own slot, so a disagreement is always "one of us has seen less".
+  (definstance JoinSemilattice [DotContext]
+    (join [x y] (DotContext (map-merge-with (.seen x) (.seen y) __imax__cx))))
+  ;;; BoundedJoin [DotContext] -- the empty history is the least element.
+  (definstance BoundedJoin [DotContext] (bottom [] (dotctx-new)))
+  ;;; Eq [DotContext] -- same replicas, same counters.
+  (definstance Eq [DotContext]
+    (eq? [^borrow x ^borrow y]
+      (and (= (dotctx-count x) (dotctx-count y))
+        (= (__dotctx-sum x) (__dotctx-sum y)))))
+  ;;; __dotctx-sum -- internal: sum of the counters, a cheap content digest.
+  (defn __dotctx-sum [^borrow c : DotContext] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: (.seen c) (Map Sym int))))
+          s  (__sum-loop__cx it 0)]
+      (hamt/iter-destroy! it)
+      s))
+  ;;; __sum-loop__cx -- internal.
+  (defn __sum-loop__cx [it : ptr<void> acc : int] : int
+    (if (hamt/iter-advance! it)
+      (__sum-loop__cx it (+ acc (:: (hamt/iter-cur-val it) int)))
+      acc))) ;; end defmodule crdt/causal

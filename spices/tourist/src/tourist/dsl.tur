@@ -17,21 +17,25 @@
 ;;     int64_t  pattern;  /* compiled __tourist_pattern handle           */
 ;;     int64_t  handler;  /* fat-closure box ptr; dispatch via TUR_APPLY1 */
 ;;   };
-
 (defmodule tourist/dsl
   (import tourist/router :refer [router-compile pattern-free])
-  (import tourist/types  :refer [Ctx Pattern])
-  (import httpd/types    :refer [Response])
-  (export get! post! put! delete! any!
-          route-new
-          route-method route-pattern route-handler route-call-handler
-          route-free)
-
-;; -- Internal: allocate a Route struct from already-compiled pieces --------
-
-(defn __route-alloc [method : cstr pat : int handler : int] : int
-  ```c
-  #include <stdlib.h>
+  (import tourist/types :refer [Ctx Pattern])
+  (import httpd/types :refer [Response])
+  (export get!
+    post!
+    put!
+    delete!
+    any!
+    route-new
+    route-method
+    route-pattern
+    route-handler
+    route-call-handler
+    route-free)
+  ;; -- Internal: allocate a Route struct from already-compiled pieces --------
+  (defn __route-alloc [method : cstr pat : int handler : int] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   struct __tourist_route { char *method; int64_t pattern; int64_t handler; };
   struct __tourist_route *r = malloc(sizeof(*r));
@@ -43,241 +47,228 @@
   r->handler = (int64_t)handler;
   return (int64_t)(intptr_t)r;
   ```)
-
-;; -- Internal: free the struct only (pattern already freed separately) -----
-
-(defn __route-free-struct [r : int] : void
-  ```c
-  #include <stdlib.h>
+  ;; -- Internal: free the struct only (pattern already freed separately) -----
+  (defn __route-free-struct [r : int] : void
+    ```c
+    #include <stdlib.h>
   struct __tourist_route { char *method; int64_t pattern; int64_t handler; };
   if (r == 0) return;
   struct __tourist_route *rt = (struct __tourist_route *)(intptr_t)r;
   free(rt->method);
   free(rt);
   ```)
-
-;; -- Public route constructor (accepts an already-compiled pattern handle) -
-
-;;; route-new -- construct a Route from a compiled pattern handle.
-;;;
-;;; Used internally by get!/post!/etc. and by tourist/static for
-;;; serve-static!. Takes an already-compiled pattern from router-compile
-;;; so the caller controls pattern lifetime.
-;;;
-;;; Parameters:
-;;;   method  -- HTTP method string: "GET", "POST", "PUT", "DELETE", or ""
-;;;              for any-method matching
-;;;   pat     -- the route struct's generic payload slot as a raw :int: a
-;;;              compiled Pattern bridged via (:: p :int) for real routes, 0
-;;;              for middleware, or a sub-app handle for url-map!/cascade!
-;;;              items (see tourist/routing). Kept :int precisely because the
-;;;              slot is polymorphic across item kinds.
-;;;   handler -- Turmeric function value (fn [req :int] :int)
-;;;
-;;; Returns:
-;;;   :int -- Route handle; free with route-free (which also frees pat)
-;;;
-;;; Example:
-;;;   (route-new "GET" (router-compile "/hello") my-handler)
-;;;
-;;; Since: v0.1.0
-(defn route-new [method : cstr pat : int handler : int] : int
-  (__route-alloc method pat handler))
-
-;; -- Accessors -------------------------------------------------------------
-
-;;; route-method -- HTTP method string of a Route ("" means any).
-;;;
-;;; Parameters:
-;;;   r -- :int Route handle
-;;;
-;;; Returns:
-;;;   :cstr -- e.g. "GET", "POST", or "" for any
-;;;
-;;; Since: v0.1.0
-(defn route-method [r : int] : cstr
-  ```c
-  struct __tourist_route { char *method; int64_t pattern; int64_t handler; };
+  ;; -- Public route constructor (accepts an already-compiled pattern handle) -
+  ;;; route-new -- construct a Route from a compiled pattern handle.
+  ;;;
+  ;;; Used internally by get!/post!/etc. and by tourist/static for
+  ;;; serve-static!. Takes an already-compiled pattern from router-compile
+  ;;; so the caller controls pattern lifetime.
+  ;;;
+  ;;; Parameters:
+  ;;;   method  -- HTTP method string: "GET", "POST", "PUT", "DELETE", or ""
+  ;;;              for any-method matching
+  ;;;   pat     -- the route struct's generic payload slot as a raw :int: a
+  ;;;              compiled Pattern bridged via (:: p :int) for real routes, 0
+  ;;;              for middleware, or a sub-app handle for url-map!/cascade!
+  ;;;              items (see tourist/routing). Kept :int precisely because the
+  ;;;              slot is polymorphic across item kinds.
+  ;;;   handler -- Turmeric function value (fn [req :int] :int)
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- Route handle; free with route-free (which also frees pat)
+  ;;;
+  ;;; Example:
+  ;;;   (route-new "GET" (router-compile "/hello") my-handler)
+  ;;;
+  ;;; Since: v0.1.0
+  (defn route-new [method : cstr pat : int handler : int] : int
+    (__route-alloc method pat handler))
+  ;; -- Accessors -------------------------------------------------------------
+  ;;; route-method -- HTTP method string of a Route ("" means any).
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- :int Route handle
+  ;;;
+  ;;; Returns:
+  ;;;   :cstr -- e.g. "GET", "POST", or "" for any
+  ;;;
+  ;;; Since: v0.1.0
+  (defn route-method [r : int] : cstr
+    ```c
+    struct __tourist_route { char *method; int64_t pattern; int64_t handler; };
   return ((struct __tourist_route *)(intptr_t)r)->method;
   ```)
-
-;;; route-pattern -- generic payload slot of a Route.
-;;;
-;;; For real routes this is a compiled pattern; bridge it back to a Pattern
-;;; with (:: (route-pattern r) :Pattern) before handing it to router-match /
-;;; pattern-free. For middleware it is 0 and for sub-app items it is a sub-app
-;;; handle, so the accessor itself stays :int.
-;;;
-;;; Parameters:
-;;;   r -- :int Route handle
-;;;
-;;; Returns:
-;;;   :int -- raw payload slot (a Pattern for real routes, 0 / sub-app handle
-;;;           otherwise)
-;;;
-;;; Since: v0.1.0
-(defn route-pattern [r : int] : int
-  ```c
-  struct __tourist_route { char *method; int64_t pattern; int64_t handler; };
+  ;;; route-pattern -- generic payload slot of a Route.
+  ;;;
+  ;;; For real routes this is a compiled pattern; bridge it back to a Pattern
+  ;;; with (:: (route-pattern r) :Pattern) before handing it to router-match /
+  ;;; pattern-free. For middleware it is 0 and for sub-app items it is a sub-app
+  ;;; handle, so the accessor itself stays :int.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- :int Route handle
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- raw payload slot (a Pattern for real routes, 0 / sub-app handle
+  ;;;           otherwise)
+  ;;;
+  ;;; Since: v0.1.0
+  (defn route-pattern [r : int] : int
+    ```c
+    struct __tourist_route { char *method; int64_t pattern; int64_t handler; };
   return ((struct __tourist_route *)(intptr_t)r)->pattern;
   ```)
-
-;;; route-handler -- raw handler function value of a Route.
-;;;
-;;; Parameters:
-;;;   r -- :int Route handle
-;;;
-;;; Returns:
-;;;   :int -- Turmeric function value; call via route-call-handler
-;;;
-;;; Since: v0.1.0
-(defn route-handler [r : int] : int
-  ```c
-  struct __tourist_route { char *method; int64_t pattern; int64_t handler; };
+  ;;; route-handler -- raw handler function value of a Route.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- :int Route handle
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- Turmeric function value; call via route-call-handler
+  ;;;
+  ;;; Since: v0.1.0
+  (defn route-handler [r : int] : int
+    ```c
+    struct __tourist_route { char *method; int64_t pattern; int64_t handler; };
   return ((struct __tourist_route *)(intptr_t)r)->handler;
   ```)
-
-;;; route-call-handler -- invoke a Route's handler with a request.
-;;;
-;;; Dispatches via the standard fat-closure protocol (TUR_APPLY1), so the
-;;; handler's captured environment is preserved across the call. The stored
-;;; handler is a fat-closure handle (the env box pointer); slot 0 carries the
-;;; lifted thunk.
-;;;
-;;; Parameters:
-;;;   r   -- :int Route handle
-;;;   req -- :int Request handle (from httpd/request or tourist ctx)
-;;;
-;;; Returns:
-;;;   :int -- Response handle returned by the handler
-;;;
-;;; Example:
-;;;   (route-call-handler route req)
-;;;
-;;; Since: v0.1.0 (TUR_APPLY1 dispatch: fat-closure ABI audit, 2026-06-23)
-(defn route-call-handler [r : int req : int] : int
-  ```c
-  struct __tourist_route { char *method; int64_t pattern; int64_t handler; };
+  ;;; route-call-handler -- invoke a Route's handler with a request.
+  ;;;
+  ;;; Dispatches via the standard fat-closure protocol (TUR_APPLY1), so the
+  ;;; handler's captured environment is preserved across the call. The stored
+  ;;; handler is a fat-closure handle (the env box pointer); slot 0 carries the
+  ;;; lifted thunk.
+  ;;;
+  ;;; Parameters:
+  ;;;   r   -- :int Route handle
+  ;;;   req -- :int Request handle (from httpd/request or tourist ctx)
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- Response handle returned by the handler
+  ;;;
+  ;;; Example:
+  ;;;   (route-call-handler route req)
+  ;;;
+  ;;; Since: v0.1.0 (TUR_APPLY1 dispatch: fat-closure ABI audit, 2026-06-23)
+  (defn route-call-handler [r : int req : int] : int
+    ```c
+    struct __tourist_route { char *method; int64_t pattern; int64_t handler; };
   struct __tourist_route *rt = (struct __tourist_route *)(intptr_t)r;
   return TUR_APPLY1(rt->handler, (int64_t)req);
   ```)
-
-;;; route-free -- release a Route handle, its compiled pattern and its handler.
-;;;
-;;; Only for a real route (get!/post!/put!/delete!/any!): middleware and
-;;; sub-app items carry something else in the pattern slot.
-;;;
-;;; Parameters:
-;;;   r -- :int Route handle, or 0 (no-op)
-;;;
-;;; Returns:
-;;;   :void
-;;;
-;;; Example:
-;;;   (route-free r)
-;;;
-;;; Since: v0.1.0
-(defn route-free [r : int] : void
-  (when (not= r 0)
-    (do
-      (pattern-free (:: (route-pattern r) :Pattern))
-      (__route-drop-handler r)
-      (__route-free-struct r))))
-
-;; -- Internal: release the handler closure a route owns ---------------------
-;; get!/post!/... move the caller's closure into the route, so the route is its
-;; only owner.  TUR_CLOSURE_DROP also handles the static box a bare top-level
-;; fn is normalized into (its drop is a no-op).
-(defn __route-drop-handler [r : int] : void
-  ```c
-  struct __tourist_route { char *method; int64_t pattern; int64_t handler; };
+  ;;; route-free -- release a Route handle, its compiled pattern and its handler.
+  ;;;
+  ;;; Only for a real route (get!/post!/put!/delete!/any!): middleware and
+  ;;; sub-app items carry something else in the pattern slot.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- :int Route handle, or 0 (no-op)
+  ;;;
+  ;;; Returns:
+  ;;;   :void
+  ;;;
+  ;;; Example:
+  ;;;   (route-free r)
+  ;;;
+  ;;; Since: v0.1.0
+  (defn route-free [r : int] : void
+    (when (not= r 0)
+      (do
+        (pattern-free (:: (route-pattern r) :Pattern))
+        (__route-drop-handler r)
+        (__route-free-struct r))))
+  ;; -- Internal: release the handler closure a route owns ---------------------
+  ;; get!/post!/... move the caller's closure into the route, so the route is its
+  ;; only owner.  TUR_CLOSURE_DROP also handles the static box a bare top-level
+  ;; fn is normalized into (its drop is a no-op).
+  (defn __route-drop-handler [r : int] : void
+    ```c
+    struct __tourist_route { char *method; int64_t pattern; int64_t handler; };
   struct __tourist_route *rt = (struct __tourist_route *)(intptr_t)r;
   if (rt && rt->handler) { TUR_CLOSURE_DROP(rt->handler); rt->handler = 0; }
   ```)
-
-;; -- Internal: convert a typed fat-closure handler to an int64_t for storage --
-;; The route struct stores the handler as an int64_t (a fat-closure box ptr);
-;; the DSL surface takes a (fn [Ctx] Response) for type safety, and we narrow
-;; to the carrier at the boundary. route-call-handler then dispatches the
-;; stored value through TUR_APPLY1 so any captured environment survives.
-
-(defn __handler->int [h : (fn [Ctx] Response)] : int
-  ```c
-  return (int64_t)(intptr_t)h;
+  ;; -- Internal: convert a typed fat-closure handler to an int64_t for storage --
+  ;; The route struct stores the handler as an int64_t (a fat-closure box ptr);
+  ;; the DSL surface takes a (fn [Ctx] Response) for type safety, and we narrow
+  ;; to the carrier at the boundary. route-call-handler then dispatches the
+  ;; stored value through TUR_APPLY1 so any captured environment survives.
+  (defn __handler->int [h : (fn [Ctx] Response)] : int
+    ```c
+    return (int64_t)(intptr_t)h;
   ```)
-
-;; -- DSL constructors ------------------------------------------------------
-
-;;; get! -- declare a GET route.
-;;;
-;;; Parameters:
-;;;   pattern -- route pattern string, e.g. "/hello/:name"
-;;;   handler -- (fn [Ctx] Response) request handler -- may capture
-;;;
-;;; Returns:
-;;;   :int -- Route handle; consumed by tourist
-;;;
-;;; Example:
-;;;   (get! "/hello/:name"
-;;;     (fn [req] (text "hi")))
-;;;
-;;; Since: v0.1.0
-(defn get! [pattern : cstr handler : (fn [Ctx] Response)] : int
-  (route-new "GET" (:: (router-compile pattern) :int) (__handler->int handler)))
-
-;;; post! -- declare a POST route.
-;;;
-;;; Parameters:
-;;;   pattern -- route pattern string
-;;;   handler -- (fn [Ctx] Response) request handler -- may capture
-;;;
-;;; Returns:
-;;;   :int -- Route handle
-;;;
-;;; Since: v0.1.0
-(defn post! [pattern : cstr handler : (fn [Ctx] Response)] : int
-  (route-new "POST" (:: (router-compile pattern) :int) (__handler->int handler)))
-
-;;; put! -- declare a PUT route.
-;;;
-;;; Parameters:
-;;;   pattern -- route pattern string
-;;;   handler -- (fn [Ctx] Response) request handler -- may capture
-;;;
-;;; Returns:
-;;;   :int -- Route handle
-;;;
-;;; Since: v0.1.0
-(defn put! [pattern : cstr handler : (fn [Ctx] Response)] : int
-  (route-new "PUT" (:: (router-compile pattern) :int) (__handler->int handler)))
-
-;;; delete! -- declare a DELETE route.
-;;;
-;;; Parameters:
-;;;   pattern -- route pattern string
-;;;   handler -- (fn [Ctx] Response) request handler -- may capture
-;;;
-;;; Returns:
-;;;   :int -- Route handle
-;;;
-;;; Since: v0.1.0
-(defn delete! [pattern : cstr handler : (fn [Ctx] Response)] : int
-  (route-new "DELETE" (:: (router-compile pattern) :int) (__handler->int handler)))
-
-;;; any! -- declare a route matching any HTTP method.
-;;;
-;;; Parameters:
-;;;   pattern -- route pattern string
-;;;   handler -- (fn [Ctx] Response) request handler -- may capture
-;;;
-;;; Returns:
-;;;   :int -- Route handle
-;;;
-;;; Example:
-;;;   (any! "/catch-all" (fn [req] (text "ok")))
-;;;
-;;; Since: v0.1.0
-(defn any! [pattern : cstr handler : (fn [Ctx] Response)] : int
-  (route-new "" (:: (router-compile pattern) :int) (__handler->int handler)))
-
-) ;; end defmodule tourist/dsl
+  ;; -- DSL constructors ------------------------------------------------------
+  ;;; get! -- declare a GET route.
+  ;;;
+  ;;; Parameters:
+  ;;;   pattern -- route pattern string, e.g. "/hello/:name"
+  ;;;   handler -- (fn [Ctx] Response) request handler -- may capture
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- Route handle; consumed by tourist
+  ;;;
+  ;;; Example:
+  ;;;   (get! "/hello/:name"
+  ;;;     (fn [req] (text "hi")))
+  ;;;
+  ;;; Since: v0.1.0
+  (defn get! [pattern : cstr handler : (fn [Ctx] Response)] : int
+    (route-new "GET"
+      (:: (router-compile pattern) :int)
+      (__handler->int handler)))
+  ;;; post! -- declare a POST route.
+  ;;;
+  ;;; Parameters:
+  ;;;   pattern -- route pattern string
+  ;;;   handler -- (fn [Ctx] Response) request handler -- may capture
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- Route handle
+  ;;;
+  ;;; Since: v0.1.0
+  (defn post! [pattern : cstr handler : (fn [Ctx] Response)] : int
+    (route-new "POST"
+      (:: (router-compile pattern) :int)
+      (__handler->int handler)))
+  ;;; put! -- declare a PUT route.
+  ;;;
+  ;;; Parameters:
+  ;;;   pattern -- route pattern string
+  ;;;   handler -- (fn [Ctx] Response) request handler -- may capture
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- Route handle
+  ;;;
+  ;;; Since: v0.1.0
+  (defn put! [pattern : cstr handler : (fn [Ctx] Response)] : int
+    (route-new "PUT"
+      (:: (router-compile pattern) :int)
+      (__handler->int handler)))
+  ;;; delete! -- declare a DELETE route.
+  ;;;
+  ;;; Parameters:
+  ;;;   pattern -- route pattern string
+  ;;;   handler -- (fn [Ctx] Response) request handler -- may capture
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- Route handle
+  ;;;
+  ;;; Since: v0.1.0
+  (defn delete! [pattern : cstr handler : (fn [Ctx] Response)] : int
+    (route-new "DELETE"
+      (:: (router-compile pattern) :int)
+      (__handler->int handler)))
+  ;;; any! -- declare a route matching any HTTP method.
+  ;;;
+  ;;; Parameters:
+  ;;;   pattern -- route pattern string
+  ;;;   handler -- (fn [Ctx] Response) request handler -- may capture
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- Route handle
+  ;;;
+  ;;; Example:
+  ;;;   (any! "/catch-all" (fn [req] (text "ok")))
+  ;;;
+  ;;; Since: v0.1.0
+  (defn any! [pattern : cstr handler : (fn [Ctx] Response)] : int
+    (route-new "" (:: (router-compile pattern) :int) (__handler->int handler)))) ;; end defmodule tourist/dsl

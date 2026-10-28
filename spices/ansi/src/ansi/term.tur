@@ -3,14 +3,17 @@
 ;; Owns the inline-C bridge to termios, TIOCGWINSZ, SIGWINCH via self-pipe,
 ;; and select()-based key reading.  All other ansi/* modules emit ANSI escape
 ;; sequences to stdout; this module manages process-wide terminal state.
-
 (defmodule ansi/term
   (import ansi/keys :refer [parse-key-bytes])
-  (export term-size term-enable-raw term-disable-raw
-          term-read-key term-read-key-timeout
-          term-color-support term-no-color?
-          term-image-protocol term-on-resize)
-
+  (export term-size
+    term-enable-raw
+    term-disable-raw
+    term-read-key
+    term-read-key-timeout
+    term-color-support
+    term-no-color?
+    term-image-protocol
+    term-on-resize)
   ;;; term-size -- return terminal dimensions as a (cons rows cols) pair.
   ;;;
   ;;; Returns:
@@ -21,7 +24,9 @@
   ;;;   (let [sz (term-size)] ...)  ; head/tail extract rows/cols
   ;;;
   ;;; Since: tur-ansi AN0
-  (defn term-size [] #fx{Unsafe} : int
+  (defn term-size []
+    #fx{Unsafe}
+    : int
     ```c
     /* __tur_include__: #include <sys/ioctl.h> */
     /* __tur_include__: #include <unistd.h> */
@@ -36,17 +41,17 @@
     pair->tail = cols;
     return (int64_t)(intptr_t)pair;
     ```)
-
   ;;; term-no-color? -- 1 when $NO_COLOR is set and non-empty, 0 otherwise.
   ;;;
   ;;; See https://no-color.org/ for the convention.
-  (defn term-no-color? [] #fx{Unsafe} : int
+  (defn term-no-color? []
+    #fx{Unsafe}
+    : int
     ```c
     /* __tur_include__: #include <stdlib.h> */
     const char *nc = getenv("NO_COLOR");
     return (nc && nc[0]) ? 1 : 0;
     ```)
-
   ;;; term-color-support -- detect color depth from environment.
   ;;;
   ;;; Returns:
@@ -54,7 +59,9 @@
   ;;;   1 = 4-bit (16 colors)
   ;;;   2 = 8-bit (256-color palette)
   ;;;   3 = 24-bit true-color
-  (defn term-color-support [] #fx{Unsafe} : int
+  (defn term-color-support []
+    #fx{Unsafe}
+    : int
     ```c
     /* __tur_include__: #include <string.h> */
     const char *nc = getenv("NO_COLOR");
@@ -70,7 +77,6 @@
     /* Modern terminals not advertising via $TERM still typically support 4-bit. */
     return 1;
     ```)
-
   ;;; term-image-protocol -- detect inline-image protocol support.
   ;;;
   ;;; Returns:
@@ -78,7 +84,9 @@
   ;;;
   ;;; Detection is conservative; callers may still fall back to a text
   ;;; placeholder when a non-zero result fails at runtime.
-  (defn term-image-protocol [] #fx{Unsafe} : int
+  (defn term-image-protocol []
+    #fx{Unsafe}
+    : int
     ```c
     const char *term = getenv("TERM");
     const char *prog = getenv("TERM_PROGRAM");
@@ -88,7 +96,6 @@
     if (term && strstr(term, "sixel")) return 3;
     return 0;
     ```)
-
   ;;
   ;; Raw mode + SIGWINCH self-pipe.
   ;;
@@ -96,13 +103,14 @@
   ;; directives so the SIGWINCH handler (also file-scope) and all four
   ;; functions that read or update terminal state can share it.
   ;;
-
   ;;; term-enable-raw -- enable raw terminal mode and install SIGWINCH self-pipe.
   ;;;
   ;;; Idempotent: a second call while already in raw mode is a no-op.  If
   ;;; stdin is not a tty (e.g. under a test harness with $TUR_ANSI_TEST_KEYS)
   ;;; the call is also a no-op so scripted tests don't try to ioctl a pipe.
-  (defn term-enable-raw [] #fx{Unsafe} : void
+  (defn term-enable-raw []
+    #fx{Unsafe}
+    : void
     ```c
     /* __tur_include__: #include <termios.h> */
     /* __tur_include__: #include <signal.h> */
@@ -153,11 +161,12 @@
       }
     }
     ```)
-
   ;;; term-disable-raw -- restore cooked mode and tear down the SIGWINCH self-pipe.
   ;;;
   ;;; Idempotent: safe to call without a matching term-enable-raw.
-  (defn term-disable-raw [] #fx{Unsafe} : void
+  (defn term-disable-raw []
+    #fx{Unsafe}
+    : void
     ```c
     const char *scripted = getenv("TUR_ANSI_TEST_KEYS");
     if (scripted && scripted[0]) return;
@@ -172,7 +181,6 @@
     if (g_ansi_winch_wfd >= 0) { close(g_ansi_winch_wfd); g_ansi_winch_wfd = -1; }
     g_ansi_resize_cb = 0;
     ```)
-
   ;;; term-on-resize -- register a callback invoked on SIGWINCH.
   ;;;
   ;;; Parameters:
@@ -182,17 +190,17 @@
   ;;; The callback fires from inside term-read-key (after the resize byte
   ;;; has been drained from the self-pipe and before "<Resize>" is returned),
   ;;; so it runs in normal process context, not from the signal handler.
-  (defn term-on-resize [callback : ptr<void>] #fx{Unsafe} : void
+  (defn term-on-resize [callback : ptr<void>]
+    #fx{Unsafe}
+    : void
     ```c
     g_ansi_resize_cb = (void (*)(void))callback;
     ```)
-
   ;;
   ;; Key reading.  Returns a freshly malloc'd cstr per call.  The state
   ;; machine here is intentionally small for AN0; AN2 expands it to cover
   ;; the full key-name table (F1-F12, Ctrl modifiers, Shift-Tab, etc.).
   ;;
-
   ;; Internal byte-collection state.  __ansi-collect reads bytes into the
   ;; file-scope g_ansi_keybuf and returns a code; the Turmeric-level
   ;; __ansi-read-key-impl dispatches and (for the common path) calls
@@ -200,14 +208,15 @@
   ;; cross-module call at the Turmeric level (rather than from inline-C)
   ;; keeps the bundler happy when callers reach ansi/term through the
   ;; ansi/ansi facade.
-
   ;; Return codes:
   ;;   -3 = SIGWINCH delivered (caller returns "<Resize>")
   ;;   -2 = EOF or read error
   ;;   -1 = scripted-input path (TUR_ANSI_TEST_KEYS)
   ;;    0 = timeout
   ;;   >0 = number of bytes written to g_ansi_keybuf
-  (defn __ansi-collect [timeout-ms : int] #fx{Unsafe} : int
+  (defn __ansi-collect [timeout-ms : int]
+    #fx{Unsafe}
+    : int
     ```c
     /* __tur_include__: #include <sys/select.h> */
     /* __tur_include__: static unsigned char g_ansi_keybuf[32]; */
@@ -281,9 +290,10 @@
     }
     return total;
     ```)
-
   ;; Pop the next scripted key from $TUR_ANSI_TEST_KEYS, advancing the offset.
-  (defn __ansi-scripted-pop [] #fx{Unsafe} : cstr
+  (defn __ansi-scripted-pop []
+    #fx{Unsafe}
+    : cstr
     ```c
     if (!g_ansi_script_cache || !g_ansi_script_cache[g_ansi_script_off]) {
       return strdup("<EOF>");
@@ -298,31 +308,35 @@
     }
     return strdup(start);
     ```)
-
   ;; Pointer to the static byte buffer filled by __ansi-collect.
-  (defn __ansi-keybuf-ptr [] #fx{Unsafe} : cstr
+  (defn __ansi-keybuf-ptr []
+    #fx{Unsafe}
+    : cstr
     ```c return (const char *)g_ansi_keybuf; ```)
-
-  (defn __ansi-strdup-cstr [s : cstr] #fx{Unsafe} : cstr
+  (defn __ansi-strdup-cstr [s : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c return strdup((const char *)s); ```)
-
   ;;; term-read-key -- block until one keypress; return a normalized key string.
   ;;;
   ;;; Returns one of: a single-character cstr ("a", "A", " "), a bracketed
   ;;; key name ("<Enter>", "<Up>", "<Resize>"), or "<EOF>" when stdin closes.
-  (defn term-read-key [] #fx{Unsafe} : cstr
-    (__ansi-read-key-impl -1))
-
+  (defn term-read-key [] #fx{Unsafe} : cstr (__ansi-read-key-impl -1))
   ;;; term-read-key-timeout -- like term-read-key but returns "" after ms millis.
-  (defn term-read-key-timeout [ms : int] #fx{Unsafe} : cstr
+  (defn term-read-key-timeout [ms : int]
+    #fx{Unsafe}
+    : cstr
     (__ansi-read-key-impl ms))
-
-  (defn __ansi-read-key-impl [timeout-ms : int] #fx{Unsafe} : cstr
+  (defn __ansi-read-key-impl [timeout-ms : int]
+    #fx{Unsafe}
+    : cstr
     (let [r (__ansi-collect timeout-ms)]
-      (if (= r -3) (__ansi-strdup-cstr "<Resize>")
-        (if (= r -2) (__ansi-strdup-cstr "<EOF>")
-          (if (= r -1) (__ansi-scripted-pop)
-            (if (= r  0) (__ansi-strdup-cstr "")
-              (parse-key-bytes (__ansi-keybuf-ptr) r)))))))
-
-) ;; end defmodule ansi/term
+      (if (= r -3)
+        (__ansi-strdup-cstr "<Resize>")
+        (if (= r -2)
+          (__ansi-strdup-cstr "<EOF>")
+          (if (= r -1)
+            (__ansi-scripted-pop)
+            (if (= r 0)
+              (__ansi-strdup-cstr "")
+              (parse-key-bytes (__ansi-keybuf-ptr) r)))))))) ;; end defmodule ansi/term

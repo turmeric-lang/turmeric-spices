@@ -13,51 +13,61 @@
 ;; So `#reads` + `frozen` is load-bearing here, not inert.
 ;;
 ;; Expected output: 42
-(defmodule re1_alive_frozen (export)
-(import ecs/entity :refer [Entity entity-new entity-index entity-generation
-                           slot-new slot->int generation-new generation->int])
-(import ecs/freeze :refer [frozen])
-
-(defn gens-new [] #fx{} : int
-  ```c
-  return (int64_t)(intptr_t)calloc(64, sizeof(int64_t));
+(defmodule re1_alive_frozen
+  (export)
+  (import ecs/entity
+    :refer
+    [Entity
+     entity-new
+     entity-index
+     entity-generation
+     slot-new
+     slot->int
+     generation-new
+     generation->int])
+  (import ecs/freeze :refer [frozen])
+  (defn gens-new []
+    #fx{}
+    : int
+    ```c
+    return (int64_t)(intptr_t)calloc(64, sizeof(int64_t));
   ```)
-(defn gen-of [gens : int idx : int] #fx{} : int
-  ```c
-  int64_t* g = (int64_t*)(intptr_t)gens; return g[idx];
+  (defn gen-of [gens : int idx : int]
+    #fx{}
+    : int
+    ```c
+    int64_t* g = (int64_t*)(intptr_t)gens; return g[idx];
   ```)
-(defn bump-gen [gens : int idx : int] #fx{} : int
-  ```c
-  int64_t* g = (int64_t*)(intptr_t)gens; g[idx]++; return 0;
+  (defn bump-gen [gens : int idx : int]
+    #fx{}
+    : int
+    ```c
+    int64_t* g = (int64_t*)(intptr_t)gens; g[idx]++; return 0;
   ```)
-
-;; A minimal game world: an opaque liveness array + one component (Pos.x).
-(defstruct GameWorld [gens : int  posx : int])
-
-;; alive? reads liveness through the opaque handle -> impure -> needs #reads.
-(defn alive? [^borrow w : GameWorld e : Entity] #reads w : bool
-  (= (gen-of (.gens w) (slot->int (entity-index e)))
-     (generation->int (entity-generation e))))
-
-;; despawn bumps the generation -- EXCLUSIVE access, locked out inside `frozen`.
-(defn despawn! [^unique ^mut w : GameWorld e : Entity] : int
-  (bump-gen (.gens w) (slot->int (entity-index e))))
-
-;; The refined accessor: its entity parameter must be proven alive.
-(defn get-x! [^borrow w : GameWorld e : #refine{ x : Entity | (alive? w x) }] : int
-  (.posx w))
-
-(defn main [] : int
-  (let [^mut w (GameWorld (gens-new) 42)
-        e (entity-new (slot-new 0) (generation-new 0))]
-    (let [pos (frozen w
-                (if (alive? w e)
-                  (get-x! w e)      ;; discharges from the guard, through the macro
-                  -1))]
-      (println pos)
-      ;; The printed 42 used to be checked only by a human reading the
-      ;; `Expected output:` header. Return it as the exit status instead: the
-      ;; whole point of this fixture is that the guard discharges and the
-      ;; refined accessor yields the live value, and -1 is the other branch.
-      (if (= pos 42) 0 1))))
-)
+  ;; A minimal game world: an opaque liveness array + one component (Pos.x).
+  (defstruct GameWorld [gens : int posx : int])
+  ;; alive? reads liveness through the opaque handle -> impure -> needs #reads.
+  (defn alive? [^borrow w : GameWorld e : Entity]
+    #reads w
+    : bool
+    (= (gen-of (.gens w) (slot->int (entity-index e)))
+      (generation->int (entity-generation e))))
+  ;; despawn bumps the generation -- EXCLUSIVE access, locked out inside `frozen`.
+  (defn despawn! [^unique ^mut w : GameWorld e : Entity] : int
+    (bump-gen (.gens w) (slot->int (entity-index e))))
+  ;; The refined accessor: its entity parameter must be proven alive.
+  (defn get-x! [^borrow w : GameWorld e : #refine{ x : Entity | (alive? w x) }] : int
+    (.posx w))
+  (defn main [] : int
+    (let [^mut w (GameWorld (gens-new) 42)
+          e      (entity-new (slot-new 0) (generation-new 0))]
+      (let [pos (frozen w
+                  (if (alive? w e)
+                    (get-x! w e) ;; discharges from the guard, through the macro
+                    -1))]
+        (println pos)
+        ;; The printed 42 used to be checked only by a human reading the
+        ;; `Expected output:` header. Return it as the exit status instead: the
+        ;; whole point of this fixture is that the guard discharges and the
+        ;; refined accessor yields the live value, and -1 is the other branch.
+        (if (= pos 42) 0 1)))))

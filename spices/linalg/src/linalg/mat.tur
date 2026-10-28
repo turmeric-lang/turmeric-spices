@@ -5,337 +5,402 @@
 ;;; handles, no `sizeof`, no `float64*` indexing). The struct owns its buffer,
 ;;; so it is move-only: readers take the receiver `^borrow` and `mat-free`
 ;;; consumes it. Element reads go through `(:: (vec-get ...) :float)`.
-
 (defmodule linalg/mat
-  (export mat mat-new mat-new-zeroed mat-identity mat-diag mat-of mat-wrap
-          mat-copy mat-free mat-rows mat-cols mat-shape mat-get mat-set!
-          mat-row mat-col mat-submat mat-add mat-sub mat-scale mat-mul
-          mat-mul-vec mat-transpose mat-trace mat-norm-fro mat-norm-max
-          mat-square? mat-approx-eq? la-vec-outer)
-
-  (import linalg/vec :refer [lavec la-vec-new la-vec-len la-vec-get la-vec-set!
-                             sqrt fabs])
-
-;;; mat -- a row-major rows x cols float64 matrix over a heap (Vec float).
-(defstruct mat [rows : int  cols : int  data : (Vec float)])
-
-;;; Private: build a zero-filled (Vec float) of length n.
-(defn __mzeros [n : int] : (Vec float)
-  (let [d (:: (vec-new) (Vec float))
-        ^mut i 0]
-    (letrec [go (fn [] : int
-                  (if (>= i n) 0
-                    (do (vec-push! d 0.0) (set! i (+ i 1)) (go))))]
-      (go))
-    d))
-
-;;; mat-new -- create a zero-initialized rows x cols matrix.
-(defn mat-new [rows : int  cols : int] : mat
-  (make-struct mat rows cols (__mzeros (* rows cols))))
-
-;;; mat-new-zeroed -- create a zero-initialized rows x cols matrix.
-(defn mat-new-zeroed [rows : int  cols : int] : mat
-  (make-struct mat rows cols (__mzeros (* rows cols))))
-
-;;; mat-wrap -- take ownership of a (Vec float) of rows*cols elements as a mat.
-(defn mat-wrap [rows : int  cols : int  d : (Vec float)] : mat
-  (make-struct mat rows cols d))
-
-;;; mat-of -- build a rows x cols matrix from row-major float literals.
-;;;   (mat-of 2 2  1.0 2.0  3.0 4.0)
-;;; Lowers through the stdlib `(vec-of ...)` float-literal builder (turmeric
-;;; main #473), retiring the hand-rolled `__mpush` push-loop that existed only
-;;; because a `(Vec float)` literal could not be spelled before.
-(defmacro mat-of [rows cols & xs]
-  `(mat-wrap ~rows ~cols (:: (vec-of ~@xs) (Vec float))))
-
-;;; mat-rows / mat-cols -- shape accessors.
-(defn mat-rows [^borrow m : mat] : int (.rows m))
-(defn mat-cols [^borrow m : mat] : int (.cols m))
-
-;;; mat-shape -- (cons rows cols).
-(defn mat-shape [^borrow m : mat] : int (cons (.rows m) (.cols m)))
-
-;;; mat-get -- element at (r, c), row-major. Bounds-checked by the backing Vec.
-(defn mat-get [^borrow m : mat  r : int  c : int] : float
-  (:: (vec-get (.data m) (+ (* r (.cols m)) c)) :float))
-
-;;; mat-set! -- set element at (r, c).
-(defn mat-set! [^borrow m : mat  r : int  c : int  v : float] : void
-  (vec-set! (.data m) (+ (* r (.cols m)) c) v))
-
-;;; mat-free -- free the matrix and its backing buffer.
-(defn mat-free [m : mat] : void (vec-free (.data m)))
-
-;;; mat-identity -- n x n identity matrix.
-(defn mat-identity [n : int] : mat
-  (let [m (mat-new n n)
-        ^mut i 0]
-    (letrec [go (fn [] : int
-                  (if (>= i n) 0
-                    (do (mat-set! m i i 1.0) (set! i (+ i 1)) (go))))]
-      (go))
-    m))
-
-;;; mat-diag -- n x n diagonal matrix from a vector's elements.
-(defn mat-diag [^borrow v : lavec] : mat
-  (let [n (la-vec-len v)
-        m (mat-new n n)
-        ^mut i 0]
-    (letrec [go (fn [] : int
-                  (if (>= i n) 0
-                    (do (mat-set! m i i (la-vec-get v i)) (set! i (+ i 1)) (go))))]
-      (go))
-    m))
-
-;;; mat-copy -- deep copy.
-(defn mat-copy [^borrow m : mat] : mat
-  (let [rows (.rows m)
-        cols (.cols m)
-        c (mat-new rows cols)
-        n (* rows cols)
-        ^mut i 0]
-    (letrec [go (fn [] : int
-                  (if (>= i n) 0
-                    (do (vec-set! (.data c) i (:: (vec-get (.data m) i) :float))
-                        (set! i (+ i 1)) (go))))]
-      (go))
-    c))
-
-;;; mat-row -- copy of row r as a vector.
-(defn mat-row [^borrow m : mat  r : int] : lavec
-  (let [cols (.cols m)
-        v (la-vec-new cols)
-        ^mut c 0]
-    (letrec [go (fn [] : int
-                  (if (>= c cols) 0
-                    (do (la-vec-set! v c (mat-get m r c)) (set! c (+ c 1)) (go))))]
-      (go))
-    v))
-
-;;; mat-col -- copy of column c as a vector.
-(defn mat-col [^borrow m : mat  c : int] : lavec
-  (let [rows (.rows m)
-        v (la-vec-new rows)
-        ^mut r 0]
-    (letrec [go (fn [] : int
-                  (if (>= r rows) 0
-                    (do (la-vec-set! v r (mat-get m r c)) (set! r (+ r 1)) (go))))]
-      (go))
-    v))
-
-;;; mat-submat -- copy of submatrix [r0,r1) x [c0,c1).
-(defn mat-submat [^borrow m : mat  r0 : int  c0 : int  r1 : int  c1 : int] : mat
-  (let [sr (- r1 r0)
-        sc (- c1 c0)
-        sub (mat-new sr sc)
-        ^mut i 0]
-    (letrec [gor (fn [] : int
-                   (if (>= i sr) 0
-                     (let [^mut j 0]
-                       (letrec [goc (fn [] : int
-                                      (if (>= j sc) 0
-                                        (do (mat-set! sub i j (mat-get m (+ r0 i) (+ c0 j)))
-                                            (set! j (+ j 1)) (goc))))]
-                         (goc))
-                       (set! i (+ i 1)) (gor))))]
-      (gor))
-    sub))
-
-;;; LA1 -- arithmetic
-
-;;; Private: element-wise binary op over equal-shaped matrices producing a new
-;;; matrix. `op` is applied as a flat index walk over the shared length.
-(defn __mat-zipwith-add [^borrow a : mat  ^borrow b : mat] : mat
-  (let [rows (.rows a)
-        cols (.cols a)
-        c (mat-new rows cols)
-        n (* rows cols)
-        ^mut i 0]
-    (letrec [go (fn [] : int
-                  (if (>= i n) 0
-                    (do (vec-set! (.data c) i (+ (:: (vec-get (.data a) i) :float)
-                                                 (:: (vec-get (.data b) i) :float)))
-                        (set! i (+ i 1)) (go))))]
-      (go))
-    c))
-
-;;; mat-add -- element-wise addition (dimensions must match).
-(defn mat-add [^borrow a : mat  ^borrow b : mat] : mat
-  (when (or (not= (.rows a) (.rows b)) (not= (.cols a) (.cols b)))
-    (panic "mat-add: dimension mismatch"))
-  (__mat-zipwith-add a b))
-
-;;; mat-sub -- element-wise subtraction.
-(defn mat-sub [^borrow a : mat  ^borrow b : mat] : mat
-  (when (or (not= (.rows a) (.rows b)) (not= (.cols a) (.cols b)))
-    (panic "mat-sub: dimension mismatch"))
-  (let [rows (.rows a)
-        cols (.cols a)
-        c (mat-new rows cols)
-        n (* rows cols)
-        ^mut i 0]
-    (letrec [go (fn [] : int
-                  (if (>= i n) 0
-                    (do (vec-set! (.data c) i (- (:: (vec-get (.data a) i) :float)
-                                                 (:: (vec-get (.data b) i) :float)))
-                        (set! i (+ i 1)) (go))))]
-      (go))
-    c))
-
-;;; mat-scale -- scalar multiplication.
-(defn mat-scale [^borrow m : mat  s : float] : mat
-  (let [rows (.rows m)
-        cols (.cols m)
-        c (mat-new rows cols)
-        n (* rows cols)
-        ^mut i 0]
-    (letrec [go (fn [] : int
-                  (if (>= i n) 0
-                    (do (vec-set! (.data c) i (* (:: (vec-get (.data m) i) :float) s))
-                        (set! i (+ i 1)) (go))))]
-      (go))
-    c))
-
-;;; mat-mul -- matrix multiplication: (m x n) * (n x p) -> (m x p).
-;;; Accumulation is done in place on the result's heap buffer (writes through
-;;; the shared buffer escape the loop closures).
-(defn mat-mul [^borrow a : mat  ^borrow b : mat] : mat
-  (when (not= (.cols a) (.rows b))
-    (panic "mat-mul: incompatible dimensions"))
-  (let [arows (.rows a)
-        acols (.cols a)
-        bcols (.cols b)
-        c (mat-new-zeroed arows bcols)
-        ^mut i 0]
-    (letrec [goi (fn [] : int
-                   (if (>= i arows) 0
-                     (let [^mut k 0]
-                       (letrec [gok (fn [] : int
-                                      (if (>= k acols) 0
-                                        (let [aik (mat-get a i k)
-                                              ^mut j 0]
-                                          (letrec [goj (fn [] : int
-                                                         (if (>= j bcols) 0
-                                                           (let [idx (+ (* i bcols) j)]
-                                                             (vec-set! (.data c) idx
-                                                               (+ (:: (vec-get (.data c) idx) :float)
-                                                                  (* aik (mat-get b k j))))
-                                                             (set! j (+ j 1)) (goj))))]
-                                            (goj))
-                                          (set! k (+ k 1)) (gok))))]
-                         (gok))
-                       (set! i (+ i 1)) (goi))))]
-      (goi))
-    c))
-
-;;; mat-mul-vec -- matrix-vector multiplication: (m x n) * n-vec -> m-vec.
-(defn mat-mul-vec [^borrow m : mat  ^borrow v : lavec] : lavec
-  (when (not= (.cols m) (la-vec-len v))
-    (panic "mat-mul-vec: incompatible dimensions"))
-  (let [mrows (.rows m)
-        mcols (.cols m)
-        result (la-vec-new mrows)
-        ^mut i 0]
-    (letrec [goi (fn [] : int
-                   (if (>= i mrows) 0
-                     (let [^mut k 0]
-                       (letrec [gok (fn [] : int
-                                      (if (>= k mcols) 0
-                                        (do (la-vec-set! result i
-                                              (+ (la-vec-get result i)
-                                                 (* (mat-get m i k) (la-vec-get v k))))
-                                            (set! k (+ k 1)) (gok))))]
-                         (gok))
-                       (set! i (+ i 1)) (goi))))]
-      (goi))
-    result))
-
-;;; mat-transpose -- transpose: (m x n) -> (n x m).
-(defn mat-transpose [^borrow m : mat] : mat
-  (let [rows (.rows m)
-        cols (.cols m)
-        t (mat-new cols rows)
-        ^mut r 0]
-    (letrec [gor (fn [] : int
-                   (if (>= r rows) 0
-                     (let [^mut c 0]
-                       (letrec [goc (fn [] : int
-                                      (if (>= c cols) 0
-                                        (do (mat-set! t c r (mat-get m r c))
-                                            (set! c (+ c 1)) (goc))))]
-                         (goc))
-                       (set! r (+ r 1)) (gor))))]
-      (gor))
-    t))
-
-;;; mat-trace -- sum of diagonal elements (square matrices).
-(defn mat-trace [^borrow m : mat] : float
-  (when (not= (.rows m) (.cols m))
-    (panic "mat-trace: matrix must be square"))
-  (let [n (.rows m)]
-    (letrec [go (fn [i : int  acc : float] : float
-                  (if (>= i n)
-                    acc
-                    (go (+ i 1) (+ acc (mat-get m i i)))))]
-      (go 0 0.0))))
-
-;;; mat-norm-fro -- Frobenius norm.
-(defn mat-norm-fro [^borrow m : mat] : float
-  (let [n (* (.rows m) (.cols m))]
-    (letrec [go (fn [i : int  acc : float] : float
-                  (if (>= i n)
-                    acc
-                    (let [x (:: (vec-get (.data m) i) :float)]
-                      (go (+ i 1) (+ acc (* x x))))))]
-      (sqrt (go 0 0.0)))))
-
-;;; mat-norm-max -- maximum absolute element.
-(defn mat-norm-max [^borrow m : mat] : float
-  (let [n (* (.rows m) (.cols m))]
-    (letrec [go (fn [i : int  acc : float] : float
-                  (if (>= i n)
-                    acc
-                    (let [a (fabs (:: (vec-get (.data m) i) :float))]
-                      (go (+ i 1) (if (> a acc) a acc)))))]
-      (go 0 0.0))))
-
-;;; mat-square? -- 1 if rows == cols else 0.
-(defn mat-square? [^borrow m : mat] : int
-  (if (= (.rows m) (.cols m)) 1 0))
-
-;;; mat-approx-eq? -- 1 if all elements within tol and shapes match, else 0.
-(defn mat-approx-eq? [^borrow a : mat  ^borrow b : mat  tol : float] : int
-  (if (or (not= (.rows a) (.rows b)) (not= (.cols a) (.cols b)))
-    0
-    (let [n (* (.rows a) (.cols a))]
-      (letrec [go (fn [i : int] : int
-                    (if (>= i n)
-                      1
-                      (if (> (fabs (- (:: (vec-get (.data a) i) :float)
-                                      (:: (vec-get (.data b) i) :float))) tol)
-                        0
-                        (go (+ i 1)))))]
-        (go 0)))))
-
-;;; la-vec-outer -- outer product of two vectors: a (len m) (x) b (len n)
-;;; -> (m x n) matrix. (Lives here, not in linalg/vec, because it produces a
-;;; mat; keeping it here avoids a vec<->mat module import cycle.)
-(defn la-vec-outer [^borrow a : lavec  ^borrow b : lavec] : mat
-  (let [am (la-vec-len a)
-        bn (la-vec-len b)
-        c (mat-new am bn)
-        ^mut i 0]
-    (letrec [goi (fn [] : int
-                   (if (>= i am) 0
-                     (let [^mut j 0]
-                       (letrec [goj (fn [] : int
-                                      (if (>= j bn) 0
-                                        (do (mat-set! c i j (* (la-vec-get a i) (la-vec-get b j)))
-                                            (set! j (+ j 1)) (goj))))]
-                         (goj))
-                       (set! i (+ i 1)) (goi))))]
-      (goi))
-    c))
-
-) ;; end defmodule linalg/mat
+  (export mat
+    mat-new
+    mat-new-zeroed
+    mat-identity
+    mat-diag
+    mat-of
+    mat-wrap
+    mat-copy
+    mat-free
+    mat-rows
+    mat-cols
+    mat-shape
+    mat-get
+    mat-set!
+    mat-row
+    mat-col
+    mat-submat
+    mat-add
+    mat-sub
+    mat-scale
+    mat-mul
+    mat-mul-vec
+    mat-transpose
+    mat-trace
+    mat-norm-fro
+    mat-norm-max
+    mat-square?
+    mat-approx-eq?
+    la-vec-outer)
+  (import linalg/vec
+    :refer
+    [lavec la-vec-new la-vec-len la-vec-get la-vec-set! sqrt fabs])
+  ;;; mat -- a row-major rows x cols float64 matrix over a heap (Vec float).
+  (defstruct mat [rows : int cols : int data : (Vec float)])
+  ;;; Private: build a zero-filled (Vec float) of length n.
+  (defn __mzeros [n : int] : (Vec float)
+    (let [d      (:: (vec-new) (Vec float))
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n) 0 (do (vec-push! d 0.0) (set! i (+ i 1)) (go))))]
+        (go))
+      d))
+  ;;; mat-new -- create a zero-initialized rows x cols matrix.
+  (defn mat-new [rows : int cols : int] : mat
+    (make-struct mat rows cols (__mzeros (* rows cols))))
+  ;;; mat-new-zeroed -- create a zero-initialized rows x cols matrix.
+  (defn mat-new-zeroed [rows : int cols : int] : mat
+    (make-struct mat rows cols (__mzeros (* rows cols))))
+  ;;; mat-wrap -- take ownership of a (Vec float) of rows*cols elements as a mat.
+  (defn mat-wrap [rows : int cols : int d : (Vec float)] : mat
+    (make-struct mat rows cols d))
+  ;;; mat-of -- build a rows x cols matrix from row-major float literals.
+  ;;;   (mat-of 2 2  1.0 2.0  3.0 4.0)
+  ;;; Lowers through the stdlib `(vec-of ...)` float-literal builder (turmeric
+  ;;; main #473), retiring the hand-rolled `__mpush` push-loop that existed only
+  ;;; because a `(Vec float)` literal could not be spelled before.
+  (defmacro mat-of [rows cols & xs]
+    `(mat-wrap ~rows ~cols (:: (vec-of ~@xs) (Vec float))))
+  ;;; mat-rows / mat-cols -- shape accessors.
+  (defn mat-rows [^borrow m : mat] : int (.rows m))
+  (defn mat-cols [^borrow m : mat] : int (.cols m))
+  ;;; mat-shape -- (cons rows cols).
+  (defn mat-shape [^borrow m : mat] : int (cons (.rows m) (.cols m)))
+  ;;; mat-get -- element at (r, c), row-major. Bounds-checked by the backing Vec.
+  (defn mat-get [^borrow m : mat r : int c : int] : float
+    (:: (vec-get (.data m) (+ (* r (.cols m)) c)) :float))
+  ;;; mat-set! -- set element at (r, c).
+  (defn mat-set! [^borrow m : mat r : int c : int v : float] : void
+    (vec-set! (.data m) (+ (* r (.cols m)) c) v))
+  ;;; mat-free -- free the matrix and its backing buffer.
+  (defn mat-free [m : mat] : void (vec-free (.data m)))
+  ;;; mat-identity -- n x n identity matrix.
+  (defn mat-identity [n : int] : mat
+    (let [m      (mat-new n n)
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n) 0 (do (mat-set! m i i 1.0) (set! i (+ i 1)) (go))))]
+        (go))
+      m))
+  ;;; mat-diag -- n x n diagonal matrix from a vector's elements.
+  (defn mat-diag [^borrow v : lavec] : mat
+    (let [n      (la-vec-len v)
+          m      (mat-new n n)
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n)
+                   0
+                   (do (mat-set! m i i (la-vec-get v i)) (set! i (+ i 1)) (go))))]
+        (go))
+      m))
+  ;;; mat-copy -- deep copy.
+  (defn mat-copy [^borrow m : mat] : mat
+    (let [rows   (.rows m)
+          cols   (.cols m)
+          c      (mat-new rows cols)
+          n      (* rows cols)
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n)
+                   0
+                   (do
+                     (vec-set! (.data c) i (:: (vec-get (.data m) i) :float))
+                     (set! i (+ i 1))
+                     (go))))]
+        (go))
+      c))
+  ;;; mat-row -- copy of row r as a vector.
+  (defn mat-row [^borrow m : mat r : int] : lavec
+    (let [cols   (.cols m)
+          v      (la-vec-new cols)
+          ^mut c 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= c cols)
+                   0
+                   (do (la-vec-set! v c (mat-get m r c)) (set! c (+ c 1)) (go))))]
+        (go))
+      v))
+  ;;; mat-col -- copy of column c as a vector.
+  (defn mat-col [^borrow m : mat c : int] : lavec
+    (let [rows   (.rows m)
+          v      (la-vec-new rows)
+          ^mut r 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= r rows)
+                   0
+                   (do (la-vec-set! v r (mat-get m r c)) (set! r (+ r 1)) (go))))]
+        (go))
+      v))
+  ;;; mat-submat -- copy of submatrix [r0,r1) x [c0,c1).
+  (defn mat-submat [^borrow m : mat r0 : int c0 : int r1 : int c1 : int] : mat
+    (let [sr     (- r1 r0)
+          sc     (- c1 c0)
+          sub    (mat-new sr sc)
+          ^mut i 0]
+      (letrec [gor
+               (fn [] : int
+                 (if (>= i sr)
+                   0
+                   (let [^mut j 0]
+                     (letrec [goc
+                              (fn [] : int
+                                (if (>= j sc)
+                                  0
+                                  (do
+                                    (mat-set! sub
+                                      i
+                                      j
+                                      (mat-get m (+ r0 i) (+ c0 j)))
+                                    (set! j (+ j 1))
+                                    (goc))))]
+                       (goc))
+                     (set! i (+ i 1))
+                     (gor))))]
+        (gor))
+      sub))
+  ;;; LA1 -- arithmetic
+  ;;; Private: element-wise binary op over equal-shaped matrices producing a new
+  ;;; matrix. `op` is applied as a flat index walk over the shared length.
+  (defn __mat-zipwith-add [^borrow a : mat ^borrow b : mat] : mat
+    (let [rows   (.rows a)
+          cols   (.cols a)
+          c      (mat-new rows cols)
+          n      (* rows cols)
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n)
+                   0
+                   (do
+                     (vec-set! (.data c)
+                       i
+                       (+ (:: (vec-get (.data a) i) :float)
+                         (:: (vec-get (.data b) i) :float)))
+                     (set! i (+ i 1))
+                     (go))))]
+        (go))
+      c))
+  ;;; mat-add -- element-wise addition (dimensions must match).
+  (defn mat-add [^borrow a : mat ^borrow b : mat] : mat
+    (when (or (not= (.rows a) (.rows b)) (not= (.cols a) (.cols b)))
+      (panic "mat-add: dimension mismatch"))
+    (__mat-zipwith-add a b))
+  ;;; mat-sub -- element-wise subtraction.
+  (defn mat-sub [^borrow a : mat ^borrow b : mat] : mat
+    (when (or (not= (.rows a) (.rows b)) (not= (.cols a) (.cols b)))
+      (panic "mat-sub: dimension mismatch"))
+    (let [rows   (.rows a)
+          cols   (.cols a)
+          c      (mat-new rows cols)
+          n      (* rows cols)
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n)
+                   0
+                   (do
+                     (vec-set! (.data c)
+                       i
+                       (- (:: (vec-get (.data a) i) :float)
+                         (:: (vec-get (.data b) i) :float)))
+                     (set! i (+ i 1))
+                     (go))))]
+        (go))
+      c))
+  ;;; mat-scale -- scalar multiplication.
+  (defn mat-scale [^borrow m : mat s : float] : mat
+    (let [rows   (.rows m)
+          cols   (.cols m)
+          c      (mat-new rows cols)
+          n      (* rows cols)
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n)
+                   0
+                   (do
+                     (vec-set! (.data c)
+                       i
+                       (* (:: (vec-get (.data m) i) :float) s))
+                     (set! i (+ i 1))
+                     (go))))]
+        (go))
+      c))
+  ;;; mat-mul -- matrix multiplication: (m x n) * (n x p) -> (m x p).
+  ;;; Accumulation is done in place on the result's heap buffer (writes through
+  ;;; the shared buffer escape the loop closures).
+  (defn mat-mul [^borrow a : mat ^borrow b : mat] : mat
+    (when (not= (.cols a) (.rows b)) (panic "mat-mul: incompatible dimensions"))
+    (let [arows  (.rows a)
+          acols  (.cols a)
+          bcols  (.cols b)
+          c      (mat-new-zeroed arows bcols)
+          ^mut i 0]
+      (letrec [goi
+               (fn [] : int
+                 (if (>= i arows)
+                   0
+                   (let [^mut k 0]
+                     (letrec [gok
+                              (fn [] : int
+                                (if (>= k acols)
+                                  0
+                                  (let [aik    (mat-get a i k)
+                                        ^mut j 0]
+                                    (letrec [goj
+                                             (fn [] : int
+                                               (if (>= j bcols)
+                                                 0
+                                                 (let [idx (+ (* i bcols) j)]
+                                                   (vec-set! (.data c)
+                                                     idx
+                                                     (+ (:: (vec-get (.data c)
+                                                              idx)
+                                                          :float)
+                                                       (* aik (mat-get b k j))))
+                                                   (set! j (+ j 1))
+                                                   (goj))))]
+                                      (goj))
+                                    (set! k (+ k 1))
+                                    (gok))))]
+                       (gok))
+                     (set! i (+ i 1))
+                     (goi))))]
+        (goi))
+      c))
+  ;;; mat-mul-vec -- matrix-vector multiplication: (m x n) * n-vec -> m-vec.
+  (defn mat-mul-vec [^borrow m : mat ^borrow v : lavec] : lavec
+    (when (not= (.cols m) (la-vec-len v))
+      (panic "mat-mul-vec: incompatible dimensions"))
+    (let [mrows  (.rows m)
+          mcols  (.cols m)
+          result (la-vec-new mrows)
+          ^mut i 0]
+      (letrec [goi
+               (fn [] : int
+                 (if (>= i mrows)
+                   0
+                   (let [^mut k 0]
+                     (letrec [gok
+                              (fn [] : int
+                                (if (>= k mcols)
+                                  0
+                                  (do
+                                    (la-vec-set! result
+                                      i
+                                      (+ (la-vec-get result i)
+                                        (* (mat-get m i k) (la-vec-get v k))))
+                                    (set! k (+ k 1))
+                                    (gok))))]
+                       (gok))
+                     (set! i (+ i 1))
+                     (goi))))]
+        (goi))
+      result))
+  ;;; mat-transpose -- transpose: (m x n) -> (n x m).
+  (defn mat-transpose [^borrow m : mat] : mat
+    (let [rows   (.rows m)
+          cols   (.cols m)
+          t      (mat-new cols rows)
+          ^mut r 0]
+      (letrec [gor
+               (fn [] : int
+                 (if (>= r rows)
+                   0
+                   (let [^mut c 0]
+                     (letrec [goc
+                              (fn [] : int
+                                (if (>= c cols)
+                                  0
+                                  (do
+                                    (mat-set! t c r (mat-get m r c))
+                                    (set! c (+ c 1))
+                                    (goc))))]
+                       (goc))
+                     (set! r (+ r 1))
+                     (gor))))]
+        (gor))
+      t))
+  ;;; mat-trace -- sum of diagonal elements (square matrices).
+  (defn mat-trace [^borrow m : mat] : float
+    (when (not= (.rows m) (.cols m)) (panic "mat-trace: matrix must be square"))
+    (let [n (.rows m)]
+      (letrec [go
+               (fn [i : int acc : float] : float
+                 (if (>= i n) acc (go (+ i 1) (+ acc (mat-get m i i)))))]
+        (go 0 0.0))))
+  ;;; mat-norm-fro -- Frobenius norm.
+  (defn mat-norm-fro [^borrow m : mat] : float
+    (let [n (* (.rows m) (.cols m))]
+      (letrec [go
+               (fn [i : int acc : float] : float
+                 (if (>= i n)
+                   acc
+                   (let [x (:: (vec-get (.data m) i) :float)]
+                     (go (+ i 1) (+ acc (* x x))))))]
+        (sqrt (go 0 0.0)))))
+  ;;; mat-norm-max -- maximum absolute element.
+  (defn mat-norm-max [^borrow m : mat] : float
+    (let [n (* (.rows m) (.cols m))]
+      (letrec [go
+               (fn [i : int acc : float] : float
+                 (if (>= i n)
+                   acc
+                   (let [a (fabs (:: (vec-get (.data m) i) :float))]
+                     (go (+ i 1) (if (> a acc) a acc)))))]
+        (go 0 0.0))))
+  ;;; mat-square? -- 1 if rows == cols else 0.
+  (defn mat-square? [^borrow m : mat] : int (if (= (.rows m) (.cols m)) 1 0))
+  ;;; mat-approx-eq? -- 1 if all elements within tol and shapes match, else 0.
+  (defn mat-approx-eq? [^borrow a : mat ^borrow b : mat tol : float] : int
+    (if (or (not= (.rows a) (.rows b)) (not= (.cols a) (.cols b)))
+      0
+      (let [n (* (.rows a) (.cols a))]
+        (letrec [go
+                 (fn [i : int] : int
+                   (if (>= i n)
+                     1
+                     (if (> (fabs (- (:: (vec-get (.data a) i) :float)
+                                    (:: (vec-get (.data b) i) :float)))
+                           tol)
+                       0
+                       (go (+ i 1)))))]
+          (go 0)))))
+  ;;; la-vec-outer -- outer product of two vectors: a (len m) (x) b (len n)
+  ;;; -> (m x n) matrix. (Lives here, not in linalg/vec, because it produces a
+  ;;; mat; keeping it here avoids a vec<->mat module import cycle.)
+  (defn la-vec-outer [^borrow a : lavec ^borrow b : lavec] : mat
+    (let [am     (la-vec-len a)
+          bn     (la-vec-len b)
+          c      (mat-new am bn)
+          ^mut i 0]
+      (letrec [goi
+               (fn [] : int
+                 (if (>= i am)
+                   0
+                   (let [^mut j 0]
+                     (letrec [goj
+                              (fn [] : int
+                                (if (>= j bn)
+                                  0
+                                  (do
+                                    (mat-set! c
+                                      i
+                                      j
+                                      (* (la-vec-get a i) (la-vec-get b j)))
+                                    (set! j (+ j 1))
+                                    (goj))))]
+                       (goj))
+                     (set! i (+ i 1))
+                     (goi))))]
+        (goi))
+      c))) ;; end defmodule linalg/mat

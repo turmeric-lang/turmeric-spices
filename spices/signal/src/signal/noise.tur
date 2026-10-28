@@ -40,73 +40,72 @@
 ;; ignores `t`. Sample it once per sample, in order; two consumers of one
 ;; instance each see only half of the stream. See signal/delay for the same
 ;; contract.
-
 (defmodule signal/noise
   (export rng
-          white-from pink-from brown-from blue-from violet-from
-          white pink brown blue violet)
-
-;; =============================================================================
-;; Seeded source
-;; =============================================================================
-
-;;; __noise_rng_alloc -- allocate a PRNG state cell holding `seed`.
-(defn __noise_rng_alloc [seed :int] :int
-  ```c
-  uint64_t *p = (uint64_t *)calloc(1, sizeof(uint64_t));
+    white-from
+    pink-from
+    brown-from
+    blue-from
+    violet-from
+    white
+    pink
+    brown
+    blue
+    violet)
+  ;; =============================================================================
+  ;; Seeded source
+  ;; =============================================================================
+  ;;; __noise_rng_alloc -- allocate a PRNG state cell holding `seed`.
+  (defn __noise_rng_alloc [seed :int] :int
+    ```c
+    uint64_t *p = (uint64_t *)calloc(1, sizeof(uint64_t));
   if (!p) { fprintf(stderr, "noise: state alloc failed\n"); abort(); }
   *p = (uint64_t)seed;
   return (int64_t)(intptr_t)p;
   ```)
-
-;;; __noise_rng_next -- SplitMix64 step, mapped to a double in [-1, 1).
-;;;
-;;; The top 53 bits become the mantissa, so every value is exactly
-;;; representable and 0.0 is as likely as any other grid point. Any seed
-;;; (including 0) is fine: SplitMix64 has no bad seeds.
-(defn __noise_rng_next [cell :int] :float
-  ```c
-  uint64_t *p = (uint64_t *)(intptr_t)cell;
+  ;;; __noise_rng_next -- SplitMix64 step, mapped to a double in [-1, 1).
+  ;;;
+  ;;; The top 53 bits become the mantissa, so every value is exactly
+  ;;; representable and 0.0 is as likely as any other grid point. Any seed
+  ;;; (including 0) is fine: SplitMix64 has no bad seeds.
+  (defn __noise_rng_next [cell :int] :float
+    ```c
+    uint64_t *p = (uint64_t *)(intptr_t)cell;
   uint64_t z = (*p += 0x9E3779B97F4A7C15ULL);
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
   z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
   z = z ^ (z >> 31);
   return (double)(z >> 11) * (2.0 / 9007199254740992.0) - 1.0;
   ```)
-
-;;; rng -- seeded white-noise source.
-;;;
-;;; Parameters:
-;;;   seed -- any int; equal seeds give equal streams
-;;;
-;;; Returns:
-;;;   A thunk emitting a fresh uniform sample in [-1, 1) per call.
-;;;
-;;; Example:
-;;;   (let [r (rng 42)] (r))
-(defn rng [seed :int]
-  (let [cell (__noise_rng_alloc seed)]
-    (fn [] :float (__noise_rng_next cell))))
-
-;; =============================================================================
-;; Coloring
-;; =============================================================================
-
-;;; __noise_alloc -- allocate a zeroed filter-state cell.
-;;;
-;;; Layout (doubles): [0..6] Kellet pink poles b0..b6, [7] previous pink
-;;; output, [8] previous white input, [9] brown integrator.
-(defn __noise_alloc [] :int
-  ```c
-  double *p = (double *)calloc(16, sizeof(double));
+  ;;; rng -- seeded white-noise source.
+  ;;;
+  ;;; Parameters:
+  ;;;   seed -- any int; equal seeds give equal streams
+  ;;;
+  ;;; Returns:
+  ;;;   A thunk emitting a fresh uniform sample in [-1, 1) per call.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (rng 42)] (r))
+  (defn rng [seed :int]
+    (let [cell (__noise_rng_alloc seed)] (fn [] :float (__noise_rng_next cell))))
+  ;; =============================================================================
+  ;; Coloring
+  ;; =============================================================================
+  ;;; __noise_alloc -- allocate a zeroed filter-state cell.
+  ;;;
+  ;;; Layout (doubles): [0..6] Kellet pink poles b0..b6, [7] previous pink
+  ;;; output, [8] previous white input, [9] brown integrator.
+  (defn __noise_alloc [] :int
+    ```c
+    double *p = (double *)calloc(16, sizeof(double));
   if (!p) { fprintf(stderr, "noise: state alloc failed\n"); abort(); }
   return (int64_t)(intptr_t)p;
   ```)
-
-;;; noise-pink-step -- one step of Kellet's refined pink filter, in [-1, 1].
-(defn noise-pink-step [state :int w :float] :float
-  ```c
-  double *s = (double *)(intptr_t)state;
+  ;;; noise-pink-step -- one step of Kellet's refined pink filter, in [-1, 1].
+  (defn noise-pink-step [state :int w :float] :float
+    ```c
+    double *s = (double *)(intptr_t)state;
   s[0] = 0.99886 * s[0] + w * 0.0555179;
   s[1] = 0.99332 * s[1] + w * 0.0750759;
   s[2] = 0.96900 * s[2] + w * 0.1538520;
@@ -117,15 +116,14 @@
   s[6] = w * 0.115926;
   return y;
   ```)
-
-;;; __noise_step -- color one white sample `w` according to `kind`.
-;;;
-;;; kind: 0 white, 1 pink, 2 brown, 3 blue, 4 violet. The result is clamped to
-;;; [-1, 1] so a misbehaving injected source cannot push the signal out of
-;;; range. NaN input is mapped to 0.
-(defn __noise_step [state :int kind :int w0 :float] :float
-  ```c
-  double *s = (double *)(intptr_t)state;
+  ;;; __noise_step -- color one white sample `w` according to `kind`.
+  ;;;
+  ;;; kind: 0 white, 1 pink, 2 brown, 3 blue, 4 violet. The result is clamped to
+  ;;; [-1, 1] so a misbehaving injected source cannot push the signal out of
+  ;;; range. NaN input is mapped to 0.
+  (defn __noise_step [state :int kind :int w0 :float] :float
+    ```c
+    double *s = (double *)(intptr_t)state;
   double w = w0;
   if (w != w) w = 0.0;
   double y;
@@ -141,72 +139,58 @@
   if (y < -1.0) y = -1.0;
   return y;
   ```)
-
-;; =============================================================================
-;; Injected-source constructors
-;; =============================================================================
-
-;;; white-from -- white noise from an injected source.
-;;;
-;;; Parameters:
-;;;   src -- `(fn [] #fx{e} float)` emitting raw samples in [-1, 1]
-;;;
-;;; Returns:
-;;;   An SF with row #fx{e}. Pass `(rng seed)` for a pure, repeatable signal.
-(defn white-from [^fat src : (fn [] #fx{e} float)]
-  (let [sv src]
-    (fn [^fat sig]
-      (let [state (__noise_alloc)]
-        (fn [t :float] :float (__noise_step state 0 (sv)))))))
-
-;;; pink-from -- pink (1/f) noise from an injected white source.
-(defn pink-from [^fat src : (fn [] #fx{e} float)]
-  (let [sv src]
-    (fn [^fat sig]
-      (let [state (__noise_alloc)]
-        (fn [t :float] :float (__noise_step state 1 (sv)))))))
-
-;;; brown-from -- brown (1/f^2, "red") noise from an injected white source.
-(defn brown-from [^fat src : (fn [] #fx{e} float)]
-  (let [sv src]
-    (fn [^fat sig]
-      (let [state (__noise_alloc)]
-        (fn [t :float] :float (__noise_step state 2 (sv)))))))
-
-;;; blue-from -- blue (+3 dB/oct) noise from an injected white source.
-(defn blue-from [^fat src : (fn [] #fx{e} float)]
-  (let [sv src]
-    (fn [^fat sig]
-      (let [state (__noise_alloc)]
-        (fn [t :float] :float (__noise_step state 3 (sv)))))))
-
-;;; violet-from -- violet (+6 dB/oct) noise from an injected white source.
-(defn violet-from [^fat src : (fn [] #fx{e} float)]
-  (let [sv src]
-    (fn [^fat sig]
-      (let [state (__noise_alloc)]
-        (fn [t :float] :float (__noise_step state 4 (sv)))))))
-
-;; =============================================================================
-;; Seeded constructors
-;; =============================================================================
-
-;;; white -- seeded white noise, uniform in [-1, 1).
-;;;
-;;; Example:
-;;;   ((white 1) (constant 0.0))
-(defn white [seed :int] (white-from (rng seed)))
-
-;;; pink -- seeded pink (1/f) noise.
-(defn pink [seed :int] (pink-from (rng seed)))
-
-;;; brown -- seeded brown (1/f^2) noise.
-(defn brown [seed :int] (brown-from (rng seed)))
-
-;;; blue -- seeded blue noise.
-(defn blue [seed :int] (blue-from (rng seed)))
-
-;;; violet -- seeded violet noise.
-(defn violet [seed :int] (violet-from (rng seed)))
-
-) ;; end defmodule signal/noise
+  ;; =============================================================================
+  ;; Injected-source constructors
+  ;; =============================================================================
+  ;;; white-from -- white noise from an injected source.
+  ;;;
+  ;;; Parameters:
+  ;;;   src -- `(fn [] #fx{e} float)` emitting raw samples in [-1, 1]
+  ;;;
+  ;;; Returns:
+  ;;;   An SF with row #fx{e}. Pass `(rng seed)` for a pure, repeatable signal.
+  (defn white-from [^fat src : (fn [] #fx{e} float)]
+    (let [sv src]
+      (fn [^fat sig]
+        (let [state (__noise_alloc)]
+          (fn [t :float] :float (__noise_step state 0 (sv)))))))
+  ;;; pink-from -- pink (1/f) noise from an injected white source.
+  (defn pink-from [^fat src : (fn [] #fx{e} float)]
+    (let [sv src]
+      (fn [^fat sig]
+        (let [state (__noise_alloc)]
+          (fn [t :float] :float (__noise_step state 1 (sv)))))))
+  ;;; brown-from -- brown (1/f^2, "red") noise from an injected white source.
+  (defn brown-from [^fat src : (fn [] #fx{e} float)]
+    (let [sv src]
+      (fn [^fat sig]
+        (let [state (__noise_alloc)]
+          (fn [t :float] :float (__noise_step state 2 (sv)))))))
+  ;;; blue-from -- blue (+3 dB/oct) noise from an injected white source.
+  (defn blue-from [^fat src : (fn [] #fx{e} float)]
+    (let [sv src]
+      (fn [^fat sig]
+        (let [state (__noise_alloc)]
+          (fn [t :float] :float (__noise_step state 3 (sv)))))))
+  ;;; violet-from -- violet (+6 dB/oct) noise from an injected white source.
+  (defn violet-from [^fat src : (fn [] #fx{e} float)]
+    (let [sv src]
+      (fn [^fat sig]
+        (let [state (__noise_alloc)]
+          (fn [t :float] :float (__noise_step state 4 (sv)))))))
+  ;; =============================================================================
+  ;; Seeded constructors
+  ;; =============================================================================
+  ;;; white -- seeded white noise, uniform in [-1, 1).
+  ;;;
+  ;;; Example:
+  ;;;   ((white 1) (constant 0.0))
+  (defn white [seed :int] (white-from (rng seed)))
+  ;;; pink -- seeded pink (1/f) noise.
+  (defn pink [seed :int] (pink-from (rng seed)))
+  ;;; brown -- seeded brown (1/f^2) noise.
+  (defn brown [seed :int] (brown-from (rng seed)))
+  ;;; blue -- seeded blue noise.
+  (defn blue [seed :int] (blue-from (rng seed)))
+  ;;; violet -- seeded violet noise.
+  (defn violet [seed :int] (violet-from (rng seed)))) ;; end defmodule signal/noise

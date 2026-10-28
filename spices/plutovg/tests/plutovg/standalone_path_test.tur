@@ -7,25 +7,42 @@
 ;; Every `it` returns the conjunction of its checks after the destroy calls.
 ;; Ending on `(path-destroy p)` hands `it` a nil where it wants a bool, and
 ;; the file does not compile.
-
 (defmodule plutovg/tests/standalone-path
-  (import test/suite      :refer [describe it])
-  (import test/assert     :refer [assert-eq assert-true])
-  (import test/runner     :refer [run-all-status])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-eq assert-true])
+  (import test/runner :refer [run-all-status])
   (import plutovg/surface :refer [surface-create surface-destroy])
-  (import plutovg/canvas  :refer [canvas-create canvas-destroy
-                                  canvas-set-source-color
-                                  canvas-fill-path canvas-stroke-path
-                                  canvas-add-path canvas-fill])
-  (import plutovg/path    :refer [path-create path-destroy
-                                  path-add-rect path-add-circle
-                                  path-add-round-rect
-                                  path-move-to path-line-to path-close
-                                  path-quad-to path-cubic-to
-                                  path-clone path-clone-flatten
-                                  path-extents path-length path-parse
-                                  rect-destroy rect-x rect-y rect-w rect-h])
-
+  (import plutovg/canvas
+    :refer
+    [canvas-create
+     canvas-destroy
+     canvas-set-source-color
+     canvas-fill-path
+     canvas-stroke-path
+     canvas-add-path
+     canvas-fill])
+  (import plutovg/path
+    :refer
+    [path-create
+     path-destroy
+     path-add-rect
+     path-add-circle
+     path-add-round-rect
+     path-move-to
+     path-line-to
+     path-close
+     path-quad-to
+     path-cubic-to
+     path-clone
+     path-clone-flatten
+     path-extents
+     path-length
+     path-parse
+     rect-destroy
+     rect-x
+     rect-y
+     rect-w
+     rect-h])
   ;; Convenience: read byte at offset n from a plutovg surface buffer.
   (defn surface-byte [s : int n : int] : int
     ```c
@@ -33,7 +50,6 @@
     unsigned char *p = plutovg_surface_get_data((plutovg_surface_t *)(intptr_t)s);
     return (int64_t)p[(int)n];
     ```)
-
   ;; Local float-equality helper (no stdlib epsilon in scope).
   (defn fapprox [a : float b : float] : bool
     ```c
@@ -41,7 +57,6 @@
     if (d < 0) d = -d;
     return d < 0.001;
     ```)
-
   ;; Local float helpers (avoid pulling in stdlib comparisons).
   (defn >f [a : float b : float] : bool
     ```c
@@ -56,130 +71,121 @@
     double d = (double)a - (double)b;
     return d < 0 ? -d : d;
     ```)
-
-;;; px-is? -- are the four bytes at `off` the given B, G, R, A?
+  ;;; px-is? -- are the four bytes at `off` the given B, G, R, A?
   (defn px-is? [s : int off : int b : int g : int r : int a : int] : bool
     (let [kb (assert-eq b (surface-byte s off))
           kg (assert-eq g (surface-byte s (+ off 1)))
           kr (assert-eq r (surface-byte s (+ off 2)))
           ka (assert-eq a (surface-byte s (+ off 3)))]
       (and kb (and kg (and kr ka)))))
-
   (defn __all-tests [] : void
-   (describe "plutovg/path construction + extents"
-     (it "computes the bounding box of an axis-aligned rect path"
-       (let [r (path-create)]
-         (if (not (ok? r))
-           (assert-true false)
-           (let [p (ok-val r)]
-             (path-add-rect p 2.0 3.0 4.0 5.0)
-             (let [er (path-extents p)
-                   ke (assert-true (ok? er))]
-               (if (not ke)
-                 (do (path-destroy p) false)
-                 (let [box (ok-val er)
-                       kx  (assert-true (fapprox (rect-x box) 2.0))
-                       ky  (assert-true (fapprox (rect-y box) 3.0))
-                       kw  (assert-true (fapprox (rect-w box) 4.0))
-                       kh  (assert-true (fapprox (rect-h box) 5.0))]
-                   (rect-destroy box)
-                   (path-destroy p)
-                   (and kx (and ky (and kw kh)))))))))))
-
-   (describe "plutovg/path length"
-     (it "measures the perimeter of a triangle (3-4-5 right triangle)"
-       (let [r (path-create)]
-         (if (not (ok? r))
-           (assert-true false)
-           (let [p (ok-val r)]
-             (path-move-to p 0.0 0.0)
-             (path-line-to p 3.0 0.0)
-             (path-line-to p 3.0 4.0)
-             (path-close p)
-             ;; perimeter = 3 + 4 + 5 = 12
-             (let [k (assert-true (fapprox (path-length p) 12.0))]
-               (path-destroy p)
-               k))))))
-
-   (describe "plutovg/path SVG parsing"
-     ;; This case used to parse "M 0 0 H 4 V 4 Z", call it "a closed unit
-     ;; square" and expect a perimeter of 12.  That data traces a right
-     ;; triangle -- (0,0) -> (4,0) -> (4,4) and Z back to the origin -- whose
-     ;; perimeter is 4 + 4 + 4*sqrt(2) = 13.657.  12 is neither the triangle's
-     ;; perimeter nor a square's; nothing ever evaluated it.  Both shapes are
-     ;; checked below, at the lengths they actually have.
-     (it "parses 'M 0 0 H 4 V 4 Z' into a triangle closed by Z"
-       (let [r (path-create)]
-         (if (not (ok? r))
-           (assert-true false)
-           (let [p      (ok-val r)
-                 parsed (assert-true (ok? (path-parse p "M 0 0 H 4 V 4 Z")))
-                 ;; 4 + 4 + hypotenuse 4*sqrt(2)
-                 len    (assert-true (fapprox (path-length p) 13.656855))]
-             (path-destroy p)
-             (and parsed len)))))
-
-     (it "parses 'M 0 0 H 4 V 4 H 0 Z' into a closed 4x4 square"
-       (let [r (path-create)]
-         (if (not (ok? r))
-           (assert-true false)
-           (let [p      (ok-val r)
-                 parsed (assert-true (ok? (path-parse p "M 0 0 H 4 V 4 H 0 Z")))
-                 ;; three explicit sides of 4, plus the Z edge back up to (0,0)
-                 len    (assert-true (fapprox (path-length p) 16.0))]
-             (path-destroy p)
-             (and parsed len))))))
-
-   (describe "plutovg/path clone-flatten"
-     (it "approximates a quadratic curve with line segments and keeps a sensible length"
-       (let [r (path-create)]
-         (if (not (ok? r))
-           (assert-true false)
-           (let [p (ok-val r)]
-             (path-move-to p 0.0 0.0)
-             (path-quad-to p 5.0 0.0 5.0 5.0)
-             ;; length of the curve from (0,0) -> (5,0) -> (5,5) via the
-             ;; control point is bounded between the chord (~7.07) and the
-             ;; control-net (5 + 5 = 10).
-             (let [lc   (path-length p)
-                   lo   (assert-true (>f lc 7.0))
-                   hi   (assert-true (<f lc 10.5))
-                   fr   (path-clone-flatten p)
-                   made (assert-true (ok? fr))]
-               (if (not made)
-                 (do (path-destroy p) false)
-                 (let [flat (ok-val fr)
-                       ;; The flattened path approximates the same arc; its
-                       ;; length should be very close to the original within
-                       ;; rounding.
-                       near (assert-true (<f (fabs-diff (path-length flat) lc) 0.5))]
-                   (path-destroy flat)
-                   (path-destroy p)
-                   (and lo (and hi near))))))))))
-
-   (describe "plutovg/canvas + path bridge"
-     (it "fills a standalone path via canvas-fill-path"
-       (let [sr (surface-create 4 4)]
-         (if (not (ok? sr))
-           (assert-true false)
-           (let [s  (ok-val sr)
-                 cr (canvas-create s)
-                 pr (path-create)
-                 k  (assert-true (and (ok? cr) (ok? pr)))]
-             (if (not k)
-               (do (surface-destroy s) false)
-               (let [c    (ok-val cr)
-                     path (ok-val pr)]
-                 (path-add-rect path 0.0 0.0 4.0 4.0)
-                 (canvas-set-source-color c 1.0 0.0 0.0 1.0)
-                 (canvas-fill-path c path)
-                 ;; pixel (0,0) should be opaque red (B G R A = 0 0 255 255)
-                 (let [red (px-is? s 0 0 0 255 255)]
-                   (path-destroy path)
-                   (canvas-destroy c)
-                   (surface-destroy s)
-                   red)))))))))
-
-  (defn main [] : int
-    (__all-tests)
-    (run-all-status)))
+    (describe "plutovg/path construction + extents"
+      (it "computes the bounding box of an axis-aligned rect path"
+        (let [r (path-create)]
+          (if (not (ok? r))
+            (assert-true false)
+            (let [p (ok-val r)]
+              (path-add-rect p 2.0 3.0 4.0 5.0)
+              (let [er (path-extents p)
+                    ke (assert-true (ok? er))]
+                (if (not ke)
+                  (do (path-destroy p) false)
+                  (let [box (ok-val er)
+                        kx  (assert-true (fapprox (rect-x box) 2.0))
+                        ky  (assert-true (fapprox (rect-y box) 3.0))
+                        kw  (assert-true (fapprox (rect-w box) 4.0))
+                        kh  (assert-true (fapprox (rect-h box) 5.0))]
+                    (rect-destroy box)
+                    (path-destroy p)
+                    (and kx (and ky (and kw kh)))))))))))
+    (describe "plutovg/path length"
+      (it "measures the perimeter of a triangle (3-4-5 right triangle)"
+        (let [r (path-create)]
+          (if (not (ok? r))
+            (assert-true false)
+            (let [p (ok-val r)]
+              (path-move-to p 0.0 0.0)
+              (path-line-to p 3.0 0.0)
+              (path-line-to p 3.0 4.0)
+              (path-close p)
+              ;; perimeter = 3 + 4 + 5 = 12
+              (let [k (assert-true (fapprox (path-length p) 12.0))]
+                (path-destroy p)
+                k))))))
+    (describe "plutovg/path SVG parsing"
+      ;; This case used to parse "M 0 0 H 4 V 4 Z", call it "a closed unit
+      ;; square" and expect a perimeter of 12.  That data traces a right
+      ;; triangle -- (0,0) -> (4,0) -> (4,4) and Z back to the origin -- whose
+      ;; perimeter is 4 + 4 + 4*sqrt(2) = 13.657.  12 is neither the triangle's
+      ;; perimeter nor a square's; nothing ever evaluated it.  Both shapes are
+      ;; checked below, at the lengths they actually have.
+      (it "parses 'M 0 0 H 4 V 4 Z' into a triangle closed by Z"
+        (let [r (path-create)]
+          (if (not (ok? r))
+            (assert-true false)
+            (let [p      (ok-val r)
+                  parsed (assert-true (ok? (path-parse p "M 0 0 H 4 V 4 Z")))
+                  ;; 4 + 4 + hypotenuse 4*sqrt(2)
+                  len    (assert-true (fapprox (path-length p) 13.656855))]
+              (path-destroy p)
+              (and parsed len)))))
+      (it "parses 'M 0 0 H 4 V 4 H 0 Z' into a closed 4x4 square"
+        (let [r (path-create)]
+          (if (not (ok? r))
+            (assert-true false)
+            (let [p      (ok-val r)
+                  parsed (assert-true (ok? (path-parse p "M 0 0 H 4 V 4 H 0 Z")))
+                  ;; three explicit sides of 4, plus the Z edge back up to (0,0)
+                  len    (assert-true (fapprox (path-length p) 16.0))]
+              (path-destroy p)
+              (and parsed len))))))
+    (describe "plutovg/path clone-flatten"
+      (it "approximates a quadratic curve with line segments and keeps a sensible length"
+        (let [r (path-create)]
+          (if (not (ok? r))
+            (assert-true false)
+            (let [p (ok-val r)]
+              (path-move-to p 0.0 0.0)
+              (path-quad-to p 5.0 0.0 5.0 5.0)
+              ;; length of the curve from (0,0) -> (5,0) -> (5,5) via the
+              ;; control point is bounded between the chord (~7.07) and the
+              ;; control-net (5 + 5 = 10).
+              (let [lc   (path-length p)
+                    lo   (assert-true (>f lc 7.0))
+                    hi   (assert-true (<f lc 10.5))
+                    fr   (path-clone-flatten p)
+                    made (assert-true (ok? fr))]
+                (if (not made)
+                  (do (path-destroy p) false)
+                  (let [flat (ok-val fr)
+                        ;; The flattened path approximates the same arc; its
+                        ;; length should be very close to the original within
+                        ;; rounding.
+                        near (assert-true (<f (fabs-diff (path-length flat) lc)
+                                            0.5))]
+                    (path-destroy flat)
+                    (path-destroy p)
+                    (and lo (and hi near))))))))))
+    (describe "plutovg/canvas + path bridge"
+      (it "fills a standalone path via canvas-fill-path"
+        (let [sr (surface-create 4 4)]
+          (if (not (ok? sr))
+            (assert-true false)
+            (let [s  (ok-val sr)
+                  cr (canvas-create s)
+                  pr (path-create)
+                  k  (assert-true (and (ok? cr) (ok? pr)))]
+              (if (not k)
+                (do (surface-destroy s) false)
+                (let [c    (ok-val cr)
+                      path (ok-val pr)]
+                  (path-add-rect path 0.0 0.0 4.0 4.0)
+                  (canvas-set-source-color c 1.0 0.0 0.0 1.0)
+                  (canvas-fill-path c path)
+                  ;; pixel (0,0) should be opaque red (B G R A = 0 0 255 255)
+                  (let [red (px-is? s 0 0 0 255 255)]
+                    (path-destroy path)
+                    (canvas-destroy c)
+                    (surface-destroy s)
+                    red)))))))))
+  (defn main [] : int (__all-tests) (run-all-status)))

@@ -22,149 +22,166 @@
 ;;
 ;; or copy the body into a program of your own; raylib must be on the
 ;; cmake-deps path either way.
-
-(defmodule demo-bouncing-balls (export)
-
-(import ecs/entity   :refer [entity-index])
-(import ecs/storage  :refer [dense-new dense-set! dense-get])
-(import ecs/world    :refer [defworld world-alloc-entity!])
-(import ecs/query    :refer [for-each])
-(import ecs-raylib/components :refer [Pos2 Vel2 Radius Tint
-                                       pos2-make pos2-x pos2-y
-                                       vel2-make vel2-x vel2-y
-                                       radius-make
-                                       tint-make
-                                       pos2-add!])
-(import raylib/types :refer [Color])
-(import ecs-raylib/systems    :refer [integrate-2d])
-(import ecs-raylib/render     :refer [render-circles __raylib-draw-circle])
-(import ecs-raylib/loop       :refer [with-game-loop])
-(import raylib/color :refer [red blue green orange purple])
-
-;; The Component instances live in ecs-raylib/components now.  Declaring them
-;; here made them orphan instances (TUR-E0013), and `(defcomponent Color)` is
-;; an orphan wherever it is written: Component belongs to ecs/world and Color
-;; to raylib/types, so no module in this spice owns either.  The colour
-;; component is `Tint`, which ecs-raylib does own.
-(defworld Scene [Pos2 Vel2 Radius Tint])
-
-;; Emit the standard integrate + render systems against Scene.
-(integrate-2d  integrate Scene)
-(render-circles render   Scene)
-
-;; bounce-walls: per-frame system that flips velocity at window edges.
-;; Written by hand (not yet a standard system) so the demo exercises a
-;; mix of stock and bespoke systems.
-(defn bounce-walls [^borrow w : Scene wmax : float hmax : float] : nil
-  (for-each w [Pos2 Vel2 Radius] [e p v r]
-    (let [px (pos2-x (:: p Pos2))
-          py (pos2-y (:: p Pos2))
-          vx (vel2-x (:: v Vel2))
-          vy (vel2-y (:: v Vel2))
-          rv (radius-value (:: r Radius))
-          flip-x (or (and (< px rv)             (< vx 0.0))
-                     (and (> px (- wmax rv))    (> vx 0.0)))
-          flip-y (or (and (< py rv)             (< vy 0.0))
-                     (and (> py (- hmax rv))    (> vy 0.0)))
-          nvx (if flip-x (* vx -1.0) vx)
-          nvy (if flip-y (* vy -1.0) vy)]
-      (dense-set! (.Vel2 w) e (vel2-make nvx nvy)))))
-
-(defn radius-value [r : Radius] : float
-  ```c
-  return ((double)r) / 1000.0;
+(defmodule demo-bouncing-balls
+  (export)
+  (import ecs/entity :refer [entity-index])
+  (import ecs/storage :refer [dense-new dense-set! dense-get])
+  (import ecs/world :refer [defworld world-alloc-entity!])
+  (import ecs/query :refer [for-each])
+  (import ecs-raylib/components
+    :refer
+    [Pos2
+     Vel2
+     Radius
+     Tint
+     pos2-make
+     pos2-x
+     pos2-y
+     vel2-make
+     vel2-x
+     vel2-y
+     radius-make
+     tint-make
+     pos2-add!])
+  (import raylib/types :refer [Color])
+  (import ecs-raylib/systems :refer [integrate-2d])
+  (import ecs-raylib/render :refer [render-circles __raylib-draw-circle])
+  (import ecs-raylib/loop :refer [with-game-loop])
+  (import raylib/color :refer [red blue green orange purple])
+  ;; The Component instances live in ecs-raylib/components now.  Declaring them
+  ;; here made them orphan instances (TUR-E0013), and `(defcomponent Color)` is
+  ;; an orphan wherever it is written: Component belongs to ecs/world and Color
+  ;; to raylib/types, so no module in this spice owns either.  The colour
+  ;; component is `Tint`, which ecs-raylib does own.
+  (defworld Scene [Pos2 Vel2 Radius Tint])
+  ;; Emit the standard integrate + render systems against Scene.
+  (integrate-2d integrate Scene)
+  (render-circles render Scene)
+  ;; bounce-walls: per-frame system that flips velocity at window edges.
+  ;; Written by hand (not yet a standard system) so the demo exercises a
+  ;; mix of stock and bespoke systems.
+  (defn bounce-walls [^borrow w : Scene wmax : float hmax : float] : nil
+    (for-each w
+      [Pos2 Vel2 Radius]
+      [e p v r]
+      (let [px     (pos2-x (:: p Pos2))
+            py     (pos2-y (:: p Pos2))
+            vx     (vel2-x (:: v Vel2))
+            vy     (vel2-y (:: v Vel2))
+            rv     (radius-value (:: r Radius))
+            flip-x (or (and (< px rv) (< vx 0.0))
+                     (and (> px (- wmax rv)) (> vx 0.0)))
+            flip-y (or (and (< py rv) (< vy 0.0))
+                     (and (> py (- hmax rv)) (> vy 0.0)))
+            nvx    (if flip-x (* vx -1.0) vx)
+            nvy    (if flip-y (* vy -1.0) vy)]
+        (dense-set! (.Vel2 w) e (vel2-make nvx nvy)))))
+  (defn radius-value [r : Radius] : float
+    ```c
+    return ((double)r) / 1000.0;
   ```)
-
-;; Spawn one entity with the supplied position / velocity / radius / color.
-(defn spawn-ball [^borrow w : Scene
-                  px : float py : float
-                  vx : float vy : float
-                  r  : float c  : Color] : nil
-  (let [ent (world-alloc-entity! (.gens w))
-        idx (entity-index ent)]
-    (dense-set! (.Pos2   w) idx (pos2-make px py))
-    (dense-set! (.Vel2   w) idx (vel2-make vx vy))
-    (dense-set! (.Radius w) idx (radius-make r))
-    ;; `c` is a raylib Color; the stored component is Tint.  Passing the bare
-    ;; handle here is what produced "dense-set! arg 3: expected tyvar, got int".
-    (dense-set! (.Tint   w) idx (tint-make c))))
-
-(defn demo-main [] : int
-  (let [w (make-struct Scene (vec-new)
-            (dense-new) (dense-new) (dense-new) (dense-new))]
-    (do
-      (spawn-ball w 100.0  80.0  220.0  170.0 20.0 (red))
-      (spawn-ball w 200.0 200.0 -150.0  240.0 24.0 (blue))
-      (spawn-ball w 350.0 130.0  190.0 -210.0 28.0 (green))
-      (spawn-ball w 500.0 320.0 -280.0 -140.0 16.0 (orange))
-      (spawn-ball w 640.0  60.0   80.0  300.0 30.0 (purple))
-      (with-game-loop w "tur-ecs-raylib :: bouncing-balls" 800 600 60
-        (do
-          (integrate    w dt)
-          (bounce-walls w 800.0 600.0)
-          (render       w)))
-      0)))
-
-;;; step-n -- run `n` frames of integrate + bounce-walls at 1/60 s.
-;;;
-;;; Returns int with an explicit `0` base case rather than `nil`: a `: nil`
-;;; self-recursive defn makes codegen emit `__auto_type __ps = (step_hyn(...))`
-;;; around a void call, which cc rejects with "variable or field declared
-;;; void".  Same shape as ws-server's hub-send-each.
-(defn step-n [^borrow w : Scene n : int] : int
-  (if (> n 0)
-    (do
-      (integrate w 0.0166667)
-      (bounce-walls w 800.0 600.0)
-      (step-n w (- n 1)))
-    0))
-
-;;; all-inside? -- is every ball still within the 800x600 window, allowing a
-;;; half-radius of overshoot for the frame in which the bounce is detected?
-;;;
-;;; This is the property the demo is really claiming: bounce-walls keeps the
-;;; simulation bounded.  Without it the balls fly off and the numbers grow
-;;; without limit, which is exactly what a run of 200 frames would expose.
-(defn all-inside? [^borrow w : Scene] : bool
-  (let [^mut ok true]
-    (do
-      (for-each w [Pos2 Radius] [e p r]
-        (let [px (pos2-x (:: p Pos2))
-              py (pos2-y (:: p Pos2))
-              rv (radius-value (:: r Radius))]
-          (when (or (< px (- 0.0 rv)) (or (> px (+ 800.0 rv))
-                    (or (< py (- 0.0 rv)) (> py (+ 600.0 rv)))))
-            (set! ok false))))
-      ok)))
-
-;;; any-reversed? -- did at least one ball's x velocity change sign relative
-;;; to the values spawn set up?  All five start with a known vx; if none has
-;;; flipped after 200 frames, bounce-walls never fired and "all inside" would
-;;; be passing for the wrong reason.
-(defn any-reversed? [^borrow w : Scene] : bool
-  (let [^mut hit false]
-    (do
-      (for-each w [Vel2] [e v]
-        (let [vx (vel2-x (:: v Vel2))]
-          ;; ball 2 and ball 4 start with vx < 0; balls 1, 3, 5 with vx > 0.
-          ;; After 200 frames at least one must have reversed, so the set of
-          ;; signs cannot still be exactly {+,-,+,-,+}.  Checking for any
-          ;; ball moving left that started right is enough.
-          (when (< vx 0.0) (set! hit true))))
-      hit)))
-
-(defn main [] : int
-  (let [w (make-struct Scene (vec-new)
-            (dense-new) (dense-new) (dense-new) (dense-new))]
-    (do
-      (spawn-ball w 100.0  80.0  220.0  170.0 20.0 (red))
-      (spawn-ball w 200.0 200.0 -150.0  240.0 24.0 (blue))
-      (spawn-ball w 350.0 130.0  190.0 -210.0 28.0 (green))
-      (spawn-ball w 500.0 320.0 -280.0 -140.0 16.0 (orange))
-      (spawn-ball w 640.0  60.0   80.0  300.0 30.0 (purple))
-      (step-n w 200)
-      (if (and (all-inside? w) (any-reversed? w))
-        (do (println "ok - 200 frames stay inside the window and a ball bounced") 0)
-        (do (println "not ok - bouncing-balls physics left the window") 1)))))
-
-) ;; end defmodule
+  ;; Spawn one entity with the supplied position / velocity / radius / color.
+  (defn spawn-ball [^borrow w : Scene
+                    px : float
+                    py : float
+                    vx : float
+                    vy : float
+                    r : float
+                    c : Color] : nil
+    (let [ent (world-alloc-entity! (.gens w))
+          idx (entity-index ent)]
+      (dense-set! (.Pos2 w) idx (pos2-make px py))
+      (dense-set! (.Vel2 w) idx (vel2-make vx vy))
+      (dense-set! (.Radius w) idx (radius-make r))
+      ;; `c` is a raylib Color; the stored component is Tint.  Passing the bare
+      ;; handle here is what produced "dense-set! arg 3: expected tyvar, got int".
+      (dense-set! (.Tint w) idx (tint-make c))))
+  (defn demo-main [] : int
+    (let [w (make-struct Scene
+              (vec-new)
+              (dense-new)
+              (dense-new)
+              (dense-new)
+              (dense-new))]
+      (do
+        (spawn-ball w 1e+02 8e+01 2.2e+02 1.7e+02 2e+01 (red))
+        (spawn-ball w 2e+02 2e+02 -1.5e+02 2.4e+02 24.0 (blue))
+        (spawn-ball w 3.5e+02 1.3e+02 1.9e+02 -2.1e+02 28.0 (green))
+        (spawn-ball w 5e+02 3.2e+02 -2.8e+02 -1.4e+02 16.0 (orange))
+        (spawn-ball w 6.4e+02 6e+01 8e+01 3e+02 3e+01 (purple))
+        (with-game-loop w
+          "tur-ecs-raylib :: bouncing-balls"
+          800
+          600
+          60
+          (do (integrate w dt) (bounce-walls w 8e+02 6e+02) (render w)))
+        0)))
+  ;;; step-n -- run `n` frames of integrate + bounce-walls at 1/60 s.
+  ;;;
+  ;;; Returns int with an explicit `0` base case rather than `nil`: a `: nil`
+  ;;; self-recursive defn makes codegen emit `__auto_type __ps = (step_hyn(...))`
+  ;;; around a void call, which cc rejects with "variable or field declared
+  ;;; void".  Same shape as ws-server's hub-send-each.
+  (defn step-n [^borrow w : Scene n : int] : int
+    (if (> n 0)
+      (do
+        (integrate w 0.0166667)
+        (bounce-walls w 8e+02 6e+02)
+        (step-n w (- n 1)))
+      0))
+  ;;; all-inside? -- is every ball still within the 800x600 window, allowing a
+  ;;; half-radius of overshoot for the frame in which the bounce is detected?
+  ;;;
+  ;;; This is the property the demo is really claiming: bounce-walls keeps the
+  ;;; simulation bounded.  Without it the balls fly off and the numbers grow
+  ;;; without limit, which is exactly what a run of 200 frames would expose.
+  (defn all-inside? [^borrow w : Scene] : bool
+    (let [^mut ok true]
+      (do
+        (for-each w
+          [Pos2 Radius]
+          [e p r]
+          (let [px (pos2-x (:: p Pos2))
+                py (pos2-y (:: p Pos2))
+                rv (radius-value (:: r Radius))]
+            (when (or (< px (- 0.0 rv))
+                    (or (> px (+ 8e+02 rv))
+                      (or (< py (- 0.0 rv)) (> py (+ 6e+02 rv)))))
+              (set! ok false))))
+        ok)))
+  ;;; any-reversed? -- did at least one ball's x velocity change sign relative
+  ;;; to the values spawn set up?  All five start with a known vx; if none has
+  ;;; flipped after 200 frames, bounce-walls never fired and "all inside" would
+  ;;; be passing for the wrong reason.
+  (defn any-reversed? [^borrow w : Scene] : bool
+    (let [^mut hit false]
+      (do
+        (for-each w
+          [Vel2]
+          [e v]
+          (let [vx (vel2-x (:: v Vel2))]
+            ;; ball 2 and ball 4 start with vx < 0; balls 1, 3, 5 with vx > 0.
+            ;; After 200 frames at least one must have reversed, so the set of
+            ;; signs cannot still be exactly {+,-,+,-,+}.  Checking for any
+            ;; ball moving left that started right is enough.
+            (when (< vx 0.0) (set! hit true))))
+        hit)))
+  (defn main [] : int
+    (let [w (make-struct Scene
+              (vec-new)
+              (dense-new)
+              (dense-new)
+              (dense-new)
+              (dense-new))]
+      (do
+        (spawn-ball w 1e+02 8e+01 2.2e+02 1.7e+02 2e+01 (red))
+        (spawn-ball w 2e+02 2e+02 -1.5e+02 2.4e+02 24.0 (blue))
+        (spawn-ball w 3.5e+02 1.3e+02 1.9e+02 -2.1e+02 28.0 (green))
+        (spawn-ball w 5e+02 3.2e+02 -2.8e+02 -1.4e+02 16.0 (orange))
+        (spawn-ball w 6.4e+02 6e+01 8e+01 3e+02 3e+01 (purple))
+        (step-n w 200)
+        (if (and (all-inside? w) (any-reversed? w))
+          (do
+            (println "ok - 200 frames stay inside the window and a ball bounced")
+            0)
+          (do (println "not ok - bouncing-balls physics left the window") 1)))))) ;; end defmodule

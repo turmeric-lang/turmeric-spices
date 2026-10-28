@@ -12,93 +12,100 @@
 ;; Every float probe has a non-zero fractional part. MessagePack keeps integers
 ;; and floats in distinct wire formats, so an integral probe like 7.0 would
 ;; encode to bytes that look right whether or not the float path is reached.
-
-(defmodule encode_golden_test (export)
-
-(import msgpack/buf    :refer [Buf buf-free buf->hex])
-(import msgpack/encode :refer [derive-msgpack])
-(import test/suite     :refer [describe it])
-(import test/assert    :refer [assert-true])
-(import test/runner    :refer [run-all-status])
-
-(defn cstr-eq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+(defmodule encode_golden_test
+  (export)
+  (import msgpack/buf :refer [Buf buf-free buf->hex])
+  (import msgpack/encode :refer [derive-msgpack])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true])
+  (import test/runner :refer [run-all-status])
+  (defn cstr-eq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn cstr-free [p : cstr] : nil
-  ```c
-  free((void *)(intptr_t)p);
+  (defn cstr-free [p : cstr] : nil
+    ```c
+    free((void *)(intptr_t)p);
   ```)
-
-;; hex=? -- does `b` render to `expect`? CONSUMES b, so each case is one line.
-(defn hex=? [b : Buf expect : cstr] : bool
-  (let [h (buf->hex b)
-        r (cstr-eq? expect h)]
-    (cstr-free h)
-    (buf-free b)
-    r))
-
-(defn a31 [] : cstr "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-(defn a32 [] : cstr "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-
-(defn __int-tests [] : void
-  (describe "msgpack EncodeMp [int] -- narrowest format that fits"
-    (it "0 is a positive fixint"          (assert-true (hex=? (encode-mp 0) "00")))
-    (it "127 is the last fixint"          (assert-true (hex=? (encode-mp 127) "7f")))
-    (it "128 promotes to uint8"           (assert-true (hex=? (encode-mp 128) "cc80")))
-    (it "255 is the last uint8"           (assert-true (hex=? (encode-mp 255) "ccff")))
-    (it "256 promotes to uint16"          (assert-true (hex=? (encode-mp 256) "cd0100")))
-    (it "65535 is the last uint16"        (assert-true (hex=? (encode-mp 65535) "cdffff")))
-    (it "65536 promotes to uint32"        (assert-true (hex=? (encode-mp 65536) "ce00010000")))
-    (it "4294967295 is the last uint32"   (assert-true (hex=? (encode-mp 4294967295) "ceffffffff")))
-    (it "4294967296 promotes to uint64"   (assert-true (hex=? (encode-mp 4294967296) "cf0000000100000000")))
-    (it "int64 max is a uint64"           (assert-true (hex=? (encode-mp 9223372036854775807) "cf7fffffffffffffff")))
-    (it "-1 is a negative fixint"         (assert-true (hex=? (encode-mp -1) "ff")))
-    (it "-32 is the last negative fixint" (assert-true (hex=? (encode-mp -32) "e0")))
-    (it "-33 promotes to int8"            (assert-true (hex=? (encode-mp -33) "d0df")))
-    (it "-128 is the last int8"           (assert-true (hex=? (encode-mp -128) "d080")))
-    (it "-129 promotes to int16"          (assert-true (hex=? (encode-mp -129) "d1ff7f")))
-    (it "-32768 is the last int16"        (assert-true (hex=? (encode-mp -32768) "d18000")))
-    (it "-32769 promotes to int32"        (assert-true (hex=? (encode-mp -32769) "d2ffff7fff")))
-    (it "-2147483648 is the last int32"   (assert-true (hex=? (encode-mp -2147483648) "d280000000")))
-    (it "-2147483649 promotes to int64"   (assert-true (hex=? (encode-mp -2147483649) "d3ffffffff7fffffff")))))
-
-(defn __scalar-tests [] : void
-  (describe "msgpack EncodeMp -- bool, float, cstr"
-    (it "true is 0xc3"                    (assert-true (hex=? (encode-mp true) "c3")))
-    (it "false is 0xc2"                   (assert-true (hex=? (encode-mp false) "c2")))
-    (it "7.1 is a float64"                (assert-true (hex=? (encode-mp 7.1) "cb401c666666666666")))
-    (it "3.25 is a float64"               (assert-true (hex=? (encode-mp 3.25) "cb400a000000000000")))
-    (it "-0.5 keeps its sign bit"         (assert-true (hex=? (encode-mp -0.5) "cbbfe0000000000000")))
-    (it "an integral double stays a float64"
-                                          (assert-true (hex=? (encode-mp 0.0) "cb0000000000000000")))
-    (it "the empty string is a fixstr"    (assert-true (hex=? (encode-mp "") "a0")))
-    (it "a short string is a fixstr"      (assert-true (hex=? (encode-mp "hi") "a26869")))
-    (it "31 chars is the last fixstr"
-      (assert-true (hex=? (encode-mp (a31))
-                          "bf61616161616161616161616161616161616161616161616161616161616161")))
-    (it "32 chars promotes to str8"
-      (assert-true (hex=? (encode-mp (a32))
-                          "d9206161616161616161616161616161616161616161616161616161616161616161")))))
-
-(defstruct Pt   [x : int  y : int])
-(defstruct User [id : int  name : cstr  active : bool])
-(derive-msgpack Pt   (x int) (y int))
-(derive-msgpack User (id int) (name cstr) (active bool))
-
-(defn __struct-tests [] : void
-  (describe "msgpack derive-msgpack -- a struct is a map with string keys"
-    (it "a 2-field struct is a fixmap"
-      (assert-true (hex=? (encode-mp (make-struct Pt 1 2)) "82a17801a17902")))
-    (it "a 3-field struct keeps declaration order"
-      (assert-true (hex=? (encode-mp (make-struct User 7 "alice" true))
-                          "83a2696407a46e616d65a5616c696365a6616374697665c3")))))
-
-(defn main [] : int
-  (__int-tests)
-  (__scalar-tests)
-  (__struct-tests)
-  (run-all-status))
-)
+  ;; hex=? -- does `b` render to `expect`? CONSUMES b, so each case is one line.
+  (defn hex=? [b : Buf expect : cstr] : bool
+    (let [h (buf->hex b)
+          r (cstr-eq? expect h)]
+      (cstr-free h)
+      (buf-free b)
+      r))
+  (defn a31 [] : cstr "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+  (defn a32 [] : cstr "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+  (defn __int-tests [] : void
+    (describe "msgpack EncodeMp [int] -- narrowest format that fits"
+      (it "0 is a positive fixint" (assert-true (hex=? (encode-mp 0) "00")))
+      (it "127 is the last fixint" (assert-true (hex=? (encode-mp 127) "7f")))
+      (it "128 promotes to uint8" (assert-true (hex=? (encode-mp 128) "cc80")))
+      (it "255 is the last uint8" (assert-true (hex=? (encode-mp 255) "ccff")))
+      (it "256 promotes to uint16"
+        (assert-true (hex=? (encode-mp 256) "cd0100")))
+      (it "65535 is the last uint16"
+        (assert-true (hex=? (encode-mp 65535) "cdffff")))
+      (it "65536 promotes to uint32"
+        (assert-true (hex=? (encode-mp 65536) "ce00010000")))
+      (it "4294967295 is the last uint32"
+        (assert-true (hex=? (encode-mp 4294967295) "ceffffffff")))
+      (it "4294967296 promotes to uint64"
+        (assert-true (hex=? (encode-mp 4294967296) "cf0000000100000000")))
+      (it "int64 max is a uint64"
+        (assert-true (hex=? (encode-mp 9223372036854775807)
+                       "cf7fffffffffffffff")))
+      (it "-1 is a negative fixint" (assert-true (hex=? (encode-mp -1) "ff")))
+      (it "-32 is the last negative fixint"
+        (assert-true (hex=? (encode-mp -32) "e0")))
+      (it "-33 promotes to int8" (assert-true (hex=? (encode-mp -33) "d0df")))
+      (it "-128 is the last int8" (assert-true (hex=? (encode-mp -128) "d080")))
+      (it "-129 promotes to int16"
+        (assert-true (hex=? (encode-mp -129) "d1ff7f")))
+      (it "-32768 is the last int16"
+        (assert-true (hex=? (encode-mp -32768) "d18000")))
+      (it "-32769 promotes to int32"
+        (assert-true (hex=? (encode-mp -32769) "d2ffff7fff")))
+      (it "-2147483648 is the last int32"
+        (assert-true (hex=? (encode-mp -2147483648) "d280000000")))
+      (it "-2147483649 promotes to int64"
+        (assert-true (hex=? (encode-mp -2147483649) "d3ffffffff7fffffff")))))
+  (defn __scalar-tests [] : void
+    (describe "msgpack EncodeMp -- bool, float, cstr"
+      (it "true is 0xc3" (assert-true (hex=? (encode-mp true) "c3")))
+      (it "false is 0xc2" (assert-true (hex=? (encode-mp false) "c2")))
+      (it "7.1 is a float64"
+        (assert-true (hex=? (encode-mp 7.1) "cb401c666666666666")))
+      (it "3.25 is a float64"
+        (assert-true (hex=? (encode-mp 3.25) "cb400a000000000000")))
+      (it "-0.5 keeps its sign bit"
+        (assert-true (hex=? (encode-mp -0.5) "cbbfe0000000000000")))
+      (it "an integral double stays a float64"
+        (assert-true (hex=? (encode-mp 0.0) "cb0000000000000000")))
+      (it "the empty string is a fixstr"
+        (assert-true (hex=? (encode-mp "") "a0")))
+      (it "a short string is a fixstr"
+        (assert-true (hex=? (encode-mp "hi") "a26869")))
+      (it "31 chars is the last fixstr"
+        (assert-true (hex=? (encode-mp (a31))
+                       "bf61616161616161616161616161616161616161616161616161616161616161")))
+      (it "32 chars promotes to str8"
+        (assert-true (hex=? (encode-mp (a32))
+                       "d9206161616161616161616161616161616161616161616161616161616161616161")))))
+  (defstruct Pt [x : int y : int])
+  (defstruct User [id : int name : cstr active : bool])
+  (derive-msgpack Pt (x int) (y int))
+  (derive-msgpack User (id int) (name cstr) (active bool))
+  (defn __struct-tests [] : void
+    (describe "msgpack derive-msgpack -- a struct is a map with string keys"
+      (it "a 2-field struct is a fixmap"
+        (assert-true (hex=? (encode-mp (make-struct Pt 1 2)) "82a17801a17902")))
+      (it "a 3-field struct keeps declaration order"
+        (assert-true (hex=? (encode-mp (make-struct User 7 "alice" true))
+                       "83a2696407a46e616d65a5616c696365a6616374697665c3")))))
+  (defn main [] : int
+    (__int-tests)
+    (__scalar-tests)
+    (__struct-tests)
+    (run-all-status)))

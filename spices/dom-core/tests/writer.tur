@@ -2,129 +2,150 @@
 ;; file sink, and sax-transform-handler's ownership rule.  The parsers live in
 ;; tur-xml / tur-html, so the identity round trips through a parser are in
 ;; those spices; here the events are built by hand.
-
-(defmodule dom_core_writer_test (export)
-
-(import dom/ownstr :refer [String from-cstr to-cstr release])
-(import dom/event  :refer [SaxEvent SaxControl Attr StartElement EndElement
-                           Chars Comment Pi StartCdata EndCdata Doctype
-                           Continue Stop sax-event-release sax-event-retain])
-(import dom/edit   :refer [DomFlavor XmlFlavor HtmlFlavor EditError
-                           BadPlacement WrongKind BadName BadContent
-                           OutOfMemory])
-(import dom/writer :refer [SaxWriter WriteError Rejected IoFailed
-                           write-error-message TransformError InputError
-                           OutputError transform-error-message
-                           sax-writer-new sax-writer-to-file sax-write!
-                           sax-write-all! sax-writer-finish! sax-writer-free
-                           sax-transform-handler sax-keep])
-(import test/suite  :refer [describe it])
-(import test/assert :refer [assert-true assert-eq])
-(import test/runner :refer [run-all-status])
-
-;;; __eq? -- byte equality of two cstrs.
-(defn __eq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+(defmodule dom_core_writer_test
+  (export)
+  (import dom/ownstr :refer [String from-cstr to-cstr release])
+  (import dom/event
+    :refer
+    [SaxEvent
+     SaxControl
+     Attr
+     StartElement
+     EndElement
+     Chars
+     Comment
+     Pi
+     StartCdata
+     EndCdata
+     Doctype
+     Continue
+     Stop
+     sax-event-release
+     sax-event-retain])
+  (import dom/edit
+    :refer
+    [DomFlavor
+     XmlFlavor
+     HtmlFlavor
+     EditError
+     BadPlacement
+     WrongKind
+     BadName
+     BadContent
+     OutOfMemory])
+  (import dom/writer
+    :refer
+    [SaxWriter
+     WriteError
+     Rejected
+     IoFailed
+     write-error-message
+     TransformError
+     InputError
+     OutputError
+     transform-error-message
+     sax-writer-new
+     sax-writer-to-file
+     sax-write!
+     sax-write-all!
+     sax-writer-finish!
+     sax-writer-free
+     sax-transform-handler
+     sax-keep])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true assert-eq])
+  (import test/runner :refer [run-all-status])
+  ;;; __eq? -- byte equality of two cstrs.
+  (defn __eq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   #include <stdio.h>
   if (strcmp((const char *)a, (const char *)b) == 0) return true;
   fprintf(stderr, "# got:  [%s]\n# want: [%s]\n", (const char *)a, (const char *)b);
   return false;
   ```)
-
-;;; __rc -- a String's reference count (the runtime's header layout).
-(defn __rc [s : String] : int
-  ```c
-  return *(const int64_t *)(intptr_t)s;
+  ;;; __rc -- a String's reference count (the runtime's header layout).
+  (defn __rc [s : String] : int
+    ```c
+    return *(const int64_t *)(intptr_t)s;
   ```)
-
-;;; code -- a WriteError as a number, so tests can compare them.
-(defn code [e : WriteError] : int
-  (match e
-    (Rejected (BadPlacement)) 4
-    (Rejected (WrongKind))    6
-    (Rejected (BadName))      8
-    (Rejected (BadContent))   9
-    (Rejected (OutOfMemory))  7
-    (Rejected _)              99
-    (IoFailed)                10))
-
-;;; xw -- a fresh XML writer (it must succeed).
-(defn xw [] : SaxWriter
-  (match (sax-writer-new (XmlFlavor))
-    (Some w) w
-    (None)   (xw)))
-
-;;; hw -- a fresh HTML writer.
-(defn hw [] : SaxWriter
-  (match (sax-writer-new (HtmlFlavor))
-    (Some w) w
-    (None)   (hw)))
-
-;; Hand-built events. Their Strings are released by `put`.
-
-;;; ev-s -- StartElement with no attributes.
-(defn ev-s [name : cstr] : SaxEvent
-  (StartElement (from-cstr name) (tnil)))
-
-;;; ev-sa -- StartElement with one attribute.
-(defn ev-sa [name : cstr k : cstr v : cstr] : SaxEvent
-  (StartElement (from-cstr name)
-                (tcons-of (Attr (from-cstr k) (from-cstr v)) (tnil))))
-
-;;; ev-e -- EndElement.
-(defn ev-e [name : cstr] : SaxEvent
-  (EndElement (from-cstr name)))
-
-;;; ev-t -- Chars.
-(defn ev-t [s : cstr] : SaxEvent
-  (Chars (from-cstr s)))
-
-;;; put -- write one hand-built event and release it; did it go through?
-(defn put [w : SaxWriter ev : SaxEvent] : bool
-  (let [r (sax-write! w ev)]
-    (sax-event-release ev)
-    (match r (Ok _) true (Err _) false)))
-
-;;; put-code -- write one hand-built event and release it; 0 or the code.
-(defn put-code [w : SaxWriter ev : SaxEvent] : int
-  (let [r (sax-write! w ev)]
-    (sax-event-release ev)
-    (match r (Ok _) 0 (Err e) (code e))))
-
-;;; out-is? -- finish w (then free it): is the output exactly want?
-(defn out-is? [w : SaxWriter want : cstr] : bool
-  (let [ok (match (sax-writer-finish! w)
-             (Ok s)  (let [b (__eq? (to-cstr s) want)] (release s) b)
-             (Err e) (do (__eq? (write-error-message e) want) false))]
-    (sax-writer-free w)
-    ok))
-
-;;; finish-code -- finish w (then free it): 0, or the refusal's code.
-(defn finish-code [w : SaxWriter] : int
-  (let [c (match (sax-writer-finish! w)
-            (Ok s)  (do (release s) 0)
-            (Err e) (code e))]
-    (sax-writer-free w)
-    c))
-
-;; File helpers.
-
-;;; tmp-path -- a per-process scratch file name (malloc'd).
-(defn tmp-path [] : cstr
-  ```c
-  #include <stdio.h>
+  ;;; code -- a WriteError as a number, so tests can compare them.
+  (defn code [e : WriteError] : int
+    (match e
+      (Rejected (BadPlacement))
+      4
+      (Rejected (WrongKind))
+      6
+      (Rejected (BadName))
+      8
+      (Rejected (BadContent))
+      9
+      (Rejected (OutOfMemory))
+      7
+      (Rejected _)
+      99
+      (IoFailed)
+      10))
+  ;;; xw -- a fresh XML writer (it must succeed).
+  (defn xw [] : SaxWriter
+    (match (sax-writer-new (XmlFlavor)) (Some w) w (None) (xw)))
+  ;;; hw -- a fresh HTML writer.
+  (defn hw [] : SaxWriter
+    (match (sax-writer-new (HtmlFlavor)) (Some w) w (None) (hw)))
+  ;; Hand-built events. Their Strings are released by `put`.
+  ;;; ev-s -- StartElement with no attributes.
+  (defn ev-s [name : cstr] : SaxEvent (StartElement (from-cstr name) (tnil)))
+  ;;; ev-sa -- StartElement with one attribute.
+  (defn ev-sa [name : cstr k : cstr v : cstr] : SaxEvent
+    (StartElement (from-cstr name)
+      (tcons-of (Attr (from-cstr k) (from-cstr v)) (tnil))))
+  ;;; ev-e -- EndElement.
+  (defn ev-e [name : cstr] : SaxEvent (EndElement (from-cstr name)))
+  ;;; ev-t -- Chars.
+  (defn ev-t [s : cstr] : SaxEvent (Chars (from-cstr s)))
+  ;;; put -- write one hand-built event and release it; did it go through?
+  (defn put [w : SaxWriter ev : SaxEvent] : bool
+    (let [r (sax-write! w ev)]
+      (sax-event-release ev)
+      (match r (Ok _) true (Err _) false)))
+  ;;; put-code -- write one hand-built event and release it; 0 or the code.
+  (defn put-code [w : SaxWriter ev : SaxEvent] : int
+    (let [r (sax-write! w ev)]
+      (sax-event-release ev)
+      (match r (Ok _) 0 (Err e) (code e))))
+  ;;; out-is? -- finish w (then free it): is the output exactly want?
+  (defn out-is? [w : SaxWriter want : cstr] : bool
+    (let [ok (match (sax-writer-finish! w)
+               (Ok s)
+               (let [b (__eq? (to-cstr s) want)] (release s) b)
+               (Err e)
+               (do (__eq? (write-error-message e) want) false))]
+      (sax-writer-free w)
+      ok))
+  ;;; finish-code -- finish w (then free it): 0, or the refusal's code.
+  (defn finish-code [w : SaxWriter] : int
+    (let [c (match (sax-writer-finish! w)
+              (Ok s)
+              (do (release s) 0)
+              (Err e)
+              (code e))]
+      (sax-writer-free w)
+      c))
+  ;; File helpers.
+  ;;; tmp-path -- a per-process scratch file name (malloc'd).
+  (defn tmp-path [] : cstr
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   #include <unistd.h>
   char *p = (char *)malloc(64);
   snprintf(p, 64, "/tmp/tur-dom-writer-%ld.out", (long)getpid());
   return p;
   ```)
-
-;;; file-is? -- does the file hold exactly want? Removes it.
-(defn file-is? [path : cstr want : cstr] : bool
-  ```c
-  #include <stdio.h>
+  ;;; file-is? -- does the file hold exactly want? Removes it.
+  (defn file-is? [path : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
   #include <string.h>
   FILE *f = fopen((const char *)path, "rb");
   if (!f) return false;
@@ -137,253 +158,285 @@
   free(buf);
   return ok;
   ```)
-
-;; Transforms for sax-transform-handler.
-
-;;; rename-a -- a -> b; drops comments; everything else kept.
-(defn rename-a [ev : SaxEvent] : (Cons SaxEvent)
-  (match ev
-    (StartElement n as) (if (= (str-cmp (to-cstr n) "a") 0)
-                          (do (release n)
-                              (tcons-of (StartElement (from-cstr "b") as) (tnil)))
-                          (sax-keep ev))
-    (EndElement n)      (if (= (str-cmp (to-cstr n) "a") 0)
-                          (do (release n)
-                              (tcons-of (EndElement (from-cstr "b")) (tnil)))
-                          (sax-keep ev))
-    (Comment _)         (do (sax-event-release ev) (tnil))
-    _                   (sax-keep ev)))
-
-;;; wrap-text -- every text run inside <em>...</em>.
-(defn wrap-text [ev : SaxEvent] : (Cons SaxEvent)
-  (match ev
-    (Chars _) (tcons-of (ev-s "em") (tcons-of ev (tcons-of (ev-e "em") (tnil))))
-    _         (sax-keep ev)))
-
-;;; leak -- drops every event without releasing it (the forbidden shape).
-(defn leak [ev : SaxEvent] : (Cons SaxEvent)
-  (tnil))
-
-;;; str-cmp -- strcmp.
-(defn str-cmp [a : cstr b : cstr] : int
-  ```c
-  #include <string.h>
+  ;; Transforms for sax-transform-handler.
+  ;;; rename-a -- a -> b; drops comments; everything else kept.
+  (defn rename-a [ev : SaxEvent] : (Cons SaxEvent)
+    (match ev
+      (StartElement n as)
+      (if (= (str-cmp (to-cstr n) "a") 0)
+        (do (release n) (tcons-of (StartElement (from-cstr "b") as) (tnil)))
+        (sax-keep ev))
+      (EndElement n)
+      (if (= (str-cmp (to-cstr n) "a") 0)
+        (do (release n) (tcons-of (EndElement (from-cstr "b")) (tnil)))
+        (sax-keep ev))
+      (Comment _)
+      (do (sax-event-release ev) (tnil))
+      _
+      (sax-keep ev)))
+  ;;; wrap-text -- every text run inside <em>...</em>.
+  (defn wrap-text [ev : SaxEvent] : (Cons SaxEvent)
+    (match ev
+      (Chars _)
+      (tcons-of (ev-s "em") (tcons-of ev (tcons-of (ev-e "em") (tnil))))
+      _
+      (sax-keep ev)))
+  ;;; leak -- drops every event without releasing it (the forbidden shape).
+  (defn leak [ev : SaxEvent] : (Cons SaxEvent) (tnil))
+  ;;; str-cmp -- strcmp.
+  (defn str-cmp [a : cstr b : cstr] : int
+    ```c
+    #include <string.h>
   return (int64_t)strcmp((const char *)a, (const char *)b);
   ```)
-
-;;; drive -- what a SAX driver does: hand the event over, then release it.
-(defn drive [h : (fn [SaxEvent] SaxControl) ev : SaxEvent] : bool
-  (let [c (h ev)]
-    (sax-event-release ev)
-    (match c (Continue) true (Stop) false)))
-
-(defn __all-tests [] : void
-  (describe "sax-write! -- XML"
-    (it "writes elements, attributes and text with the serializer's escaping"
-      (let [w (xw)]
-        (put w (ev-sa "r" "k" "1&\"<"))
-        (put w (ev-t "t&<>"))
-        (put w (ev-s "e")) (put w (ev-e "e"))
-        (put w (Comment (from-cstr "c")))
-        (put w (Pi (from-cstr "p") (from-cstr "d")))
-        (put w (StartCdata)) (put w (ev-t "x<")) (put w (EndCdata))
-        (put w (ev-e "r"))
-        (out-is? w "<r k=\"1&amp;&quot;&lt;\">t&amp;&lt;&gt;<e/><!--c--><?p d?><![CDATA[x<]]></r>")))
-    (it "writes the prolog: a doctype with its ids, comments"
-      (let [w (xw)]
-        (put w (Doctype (from-cstr "r") (from-cstr "-//P//EN") (from-cstr "r.dtd")))
-        (put w (Comment (from-cstr "c")))
-        (put w (ev-s "r")) (put w (ev-e "r"))
-        (out-is? w "<!DOCTYPE r PUBLIC \"-//P//EN\" \"r.dtd\"><!--c--><r/>")))
-    (it "declares namespaces for Clark names"
-      (let [w (xw)]
-        (put w (ev-sa "{urn:u}r" "{urn:v}k" "1"))
-        (put w (ev-s "{urn:u}c")) (put w (ev-e "{urn:u}c"))
-        (put w (ev-s "plain")) (put w (ev-e "plain"))
-        (put w (ev-e "{urn:u}r"))
-        (out-is? w "<r xmlns=\"urn:u\" xmlns:ns1=\"urn:v\" ns1:k=\"1\"><c/><plain xmlns=\"\"/></r>")))
-    (it "honours an explicit prefix declaration on the same tag"
-      (let [w (xw)]
-        (put w (ev-sa "{urn:u}r" "xmlns:u" "urn:u"))
-        (put w (ev-e "{urn:u}r"))
-        (out-is? w "<u:r xmlns:u=\"urn:u\"/>")))
-    (it "sax-write-all! writes a list in order"
-      (let [w   (xw)
-            evs (tcons-of (ev-s "r") (tcons-of (ev-t "x") (tcons-of (ev-e "r") (tnil))))
-            ok  (match (sax-write-all! w evs) (Ok _) true (Err _) false)]
-        (sax-event-release (thead evs))
-        (sax-event-release (thead (ttail evs)))
-        (sax-event-release (thead (ttail (ttail evs))))
-        (assert-true (and ok (out-is? w "<r>x</r>"))))))
-
-  (describe "sax-write! -- refusals stick"
-    (it "an end tag that does not match is BadPlacement, then every call says so"
-      (let [w  (xw)
-            _  (put w (ev-s "r"))
-            c1 (put-code w (ev-e "x"))
-            c2 (put-code w (ev-t "y"))
-            c3 (finish-code w)]
-        (and (assert-eq 4 c1) (assert-eq 4 c2) (assert-eq 4 c3))))
-    (it "a second root, text outside it, no root at all"
-      (let [w1 (xw)
-            w2 (xw)
-            w3 (xw)
-            _  (put w1 (ev-s "r"))
-            _  (put w1 (ev-e "r"))
-            c1 (put-code w1 (ev-s "s"))
-            c2 (put-code w2 (ev-t "x"))
-            _  (put w3 (Comment (from-cstr "c")))
-            f1 (finish-code w1)
-            f2 (finish-code w2)
-            f3 (finish-code w3)]
-        (and (assert-eq 4 c1) (assert-eq 4 c2)
-             (assert-eq 4 f1) (assert-eq 4 f2) (assert-eq 4 f3))))
-    (it "an element left open fails at finish"
-      (let [w (xw)
-            _ (put w (ev-s "r"))]
-        (assert-eq 4 (finish-code w))))
-    (it "names and bodies that cannot be written back"
-      (let [w1 (xw)
-            w2 (xw)
-            w3 (xw)
-            w4 (xw)
-            c1 (put-code w1 (ev-s "a b"))
-            _  (put w2 (ev-s "r"))
-            c2 (put-code w2 (Comment (from-cstr "a--b")))
-            _  (put w3 (ev-s "r"))
-            _  (put w3 (StartCdata))
-            c3 (put-code w3 (ev-t "]]>"))
-            _  (put w4 (ev-s "r"))
-            c4 (put-code w4 (Pi (from-cstr "xml") (from-cstr "v")))
-            f1 (finish-code w1)
-            f2 (finish-code w2)
-            f3 (finish-code w3)
-            f4 (finish-code w4)]
-        (and (assert-eq 8 c1) (assert-eq 9 c2) (assert-eq 9 c3) (assert-eq 8 c4)
-             (assert-eq 8 f1) (assert-eq 9 f2) (assert-eq 9 f3) (assert-eq 8 f4))))
-    (it "a duplicate attribute is BadName when the tag closes"
-      (let [w  (xw)
-            _  (put w (StartElement (from-cstr "r")
-                                    (tcons-of (Attr (from-cstr "k") (from-cstr "1"))
-                                              (tcons-of (Attr (from-cstr "k") (from-cstr "2"))
-                                                        (tnil)))))
-            c1 (put-code w (ev-e "r"))
-            f1 (finish-code w)]
-        (and (assert-eq 8 c1) (assert-eq 8 f1))))
-    (it "every refusal has a message"
-      (assert-true (and (> (str-cmp (write-error-message (Rejected (BadPlacement))) "") 0)
-                        (> (str-cmp (write-error-message (Rejected (BadName))) "") 0)
-                        (> (str-cmp (write-error-message (IoFailed)) "") 0)
-                        (> (str-cmp (transform-error-message (OutputError (IoFailed))) "") 0)))))
-
-  (describe "sax-write! -- HTML"
-    (it "writes a token stream: void elements, unbalanced end tags, raw text"
-      (let [w (hw)]
-        (put w (ev-s "p")) (put w (ev-t "a<b&\"c"))
-        (put w (ev-s "br")) (put w (ev-e "br"))
-        (put w (ev-s "img"))
-        (put w (ev-e "div"))
-        (put w (ev-s "script")) (put w (ev-t "if (a<b) {}")) (put w (ev-e "script"))
-        (out-is? w "<p>a&lt;b&amp;\"c<br/><img></div><script>if (a<b) {}</script>")))
-    (it "keeps a doctype's ids"
-      (let [w (hw)]
-        (put w (Doctype (from-cstr "html") (from-cstr "") (from-cstr "about:legacy-compat")))
-        (out-is? w "<!DOCTYPE html SYSTEM \"about:legacy-compat\">")))
-    (it "refuses a </script> breakout, CDATA and PIs"
-      (let [w1 (hw)
-            w2 (hw)
-            w3 (hw)
-            _  (put w1 (ev-s "script"))
-            _  (put w1 (ev-t "x</script><b>"))
-            c1 (put-code w1 (ev-e "script"))
-            c2 (put-code w2 (StartCdata))
-            c3 (put-code w3 (Pi (from-cstr "p") (from-cstr "d")))
-            f1 (finish-code w1)
-            f2 (finish-code w2)
-            f3 (finish-code w3)]
-        (and (assert-eq 9 c1) (assert-eq 4 c2) (assert-eq 4 c3)
-             (assert-eq 9 f1) (assert-eq 4 f2) (assert-eq 4 f3)))))
-
-  (describe "sax-writer-to-file"
-    (it "streams the document to the file; finish returns an empty String"
-      (let [path (tmp-path)]
-        (match (sax-writer-to-file (XmlFlavor) path)
-          (Err _) (assert-true false)
-          (Ok w)  (let [_  (put w (ev-sa "r" "k" "v"))
-                        _  (put w (ev-t "text"))
-                        _  (put w (ev-e "r"))
-                        o1 (out-is? w "")
-                        o2 (file-is? path "<r k=\"v\">text</r>")]
-                    (and (assert-true o1) (assert-true o2))))))
-    (it "an uncreatable file is IoFailed"
-      (assert-eq 10 (match (sax-writer-to-file (XmlFlavor) "/nonexistent-dir-tur/x.xml")
-                      (Ok w)  (do (sax-writer-free w) 0)
-                      (Err e) (code e)))))
-
-  (describe "sax-transform-handler"
-    (it "runs each event through the transform and writes what comes back"
-      (let [w (xw)
-            h (sax-transform-handler w rename-a)]
-        (drive h (ev-s "r"))
-        (drive h (ev-sa "a" "k" "v"))
-        (drive h (Comment (from-cstr "gone")))
-        (drive h (ev-t "x"))
-        (drive h (ev-e "a"))
-        (drive h (ev-e "r"))
-        (out-is? w "<r><b k=\"v\">x</b></r>")))
-    (it "a transform may return several events, built or passed through"
-      (let [w (xw)
-            h (sax-transform-handler w wrap-text)]
-        (drive h (ev-s "r"))
-        (drive h (ev-t "x"))
-        (drive h (ev-e "r"))
-        (out-is? w "<r><em>x</em></r>")))
-    (it "stops the parse at the writer's first refusal"
-      (let [w  (xw)
-            h  (sax-transform-handler w sax-keep)
-            c1 (drive h (ev-s "r"))
-            c2 (drive h (ev-e "x"))
-            c3 (drive h (ev-t "after"))
-            f1 (finish-code w)]
-        (and (assert-true (and c1 (not c2) (not c3))) (assert-eq 4 f1))))
-    (it "kept, rebuilt and dropped events leave the input's Strings balanced"
-      (let [w    (xw)
-            h    (sax-transform-handler w rename-a)
-            keep (from-cstr "r")
-            ren  (from-cstr "a")
-            drop (from-cstr "gone")
-            _    (h (StartElement keep (tnil)))
-            _    (h (StartElement ren (tnil)))
-            _    (h (Comment drop))
-            ;; A driver holds one reference; the transform's went back.
-            r1   (__rc keep)
-            r2   (__rc ren)
-            r3   (__rc drop)]
-        (release keep) (release ren) (release drop)
-        (sax-writer-free w)
-        (and (assert-eq 1 r1) (assert-eq 1 r2) (assert-eq 1 r3))))
-    (it "a transform that drops without releasing leaks one reference"
-      (let [w  (xw)
-            h  (sax-transform-handler w leak)
-            s  (from-cstr "r")
-            _  (h (StartElement s (tnil)))
-            r1 (__rc s)]
-        (release s) (release s)
-        (sax-writer-free w)
-        (assert-eq 2 r1)))
-    (it "sax-event-retain takes one reference per String"
-      (let [n  (from-cstr "r")
-            k  (from-cstr "k")
-            v  (from-cstr "v")
-            ev (StartElement n (tcons-of (Attr k v) (tnil)))]
-        (sax-event-retain ev)
-        (let [ok (and (= (__rc n) 2) (= (__rc k) 2) (= (__rc v) 2))]
-          (sax-event-release ev)
-          (sax-event-release ev)
-          (assert-true ok))))))
-
-(defn main [] : int
-  (__all-tests)
-  (run-all-status))
-
-) ;; end defmodule dom_core_writer_test
+  ;;; drive -- what a SAX driver does: hand the event over, then release it.
+  (defn drive [h : (fn [SaxEvent] SaxControl) ev : SaxEvent] : bool
+    (let [c (h ev)]
+      (sax-event-release ev)
+      (match c (Continue) true (Stop) false)))
+  (defn __all-tests [] : void
+    (describe "sax-write! -- XML"
+      (it "writes elements, attributes and text with the serializer's escaping"
+        (let [w (xw)]
+          (put w (ev-sa "r" "k" "1&\"<"))
+          (put w (ev-t "t&<>"))
+          (put w (ev-s "e"))
+          (put w (ev-e "e"))
+          (put w (Comment (from-cstr "c")))
+          (put w (Pi (from-cstr "p") (from-cstr "d")))
+          (put w (StartCdata))
+          (put w (ev-t "x<"))
+          (put w (EndCdata))
+          (put w (ev-e "r"))
+          (out-is? w
+            "<r k=\"1&amp;&quot;&lt;\">t&amp;&lt;&gt;<e/><!--c--><?p d?><![CDATA[x<]]></r>")))
+      (it "writes the prolog: a doctype with its ids, comments"
+        (let [w (xw)]
+          (put w
+            (Doctype (from-cstr "r") (from-cstr "-//P//EN") (from-cstr "r.dtd")))
+          (put w (Comment (from-cstr "c")))
+          (put w (ev-s "r"))
+          (put w (ev-e "r"))
+          (out-is? w "<!DOCTYPE r PUBLIC \"-//P//EN\" \"r.dtd\"><!--c--><r/>")))
+      (it "declares namespaces for Clark names"
+        (let [w (xw)]
+          (put w (ev-sa "{urn:u}r" "{urn:v}k" "1"))
+          (put w (ev-s "{urn:u}c"))
+          (put w (ev-e "{urn:u}c"))
+          (put w (ev-s "plain"))
+          (put w (ev-e "plain"))
+          (put w (ev-e "{urn:u}r"))
+          (out-is? w
+            "<r xmlns=\"urn:u\" xmlns:ns1=\"urn:v\" ns1:k=\"1\"><c/><plain xmlns=\"\"/></r>")))
+      (it "honours an explicit prefix declaration on the same tag"
+        (let [w (xw)]
+          (put w (ev-sa "{urn:u}r" "xmlns:u" "urn:u"))
+          (put w (ev-e "{urn:u}r"))
+          (out-is? w "<u:r xmlns:u=\"urn:u\"/>")))
+      (it "sax-write-all! writes a list in order"
+        (let [w   (xw)
+              evs (tcons-of (ev-s "r")
+                    (tcons-of (ev-t "x") (tcons-of (ev-e "r") (tnil))))
+              ok  (match (sax-write-all! w evs) (Ok _) true (Err _) false)]
+          (sax-event-release (thead evs))
+          (sax-event-release (thead (ttail evs)))
+          (sax-event-release (thead (ttail (ttail evs))))
+          (assert-true (and ok (out-is? w "<r>x</r>"))))))
+    (describe "sax-write! -- refusals stick"
+      (it "an end tag that does not match is BadPlacement, then every call says so"
+        (let [w  (xw)
+              _  (put w (ev-s "r"))
+              c1 (put-code w (ev-e "x"))
+              c2 (put-code w (ev-t "y"))
+              c3 (finish-code w)]
+          (and (assert-eq 4 c1) (assert-eq 4 c2) (assert-eq 4 c3))))
+      (it "a second root, text outside it, no root at all"
+        (let [w1 (xw)
+              w2 (xw)
+              w3 (xw)
+              _  (put w1 (ev-s "r"))
+              _  (put w1 (ev-e "r"))
+              c1 (put-code w1 (ev-s "s"))
+              c2 (put-code w2 (ev-t "x"))
+              _  (put w3 (Comment (from-cstr "c")))
+              f1 (finish-code w1)
+              f2 (finish-code w2)
+              f3 (finish-code w3)]
+          (and (assert-eq 4 c1)
+            (assert-eq 4 c2)
+            (assert-eq 4 f1)
+            (assert-eq 4 f2)
+            (assert-eq 4 f3))))
+      (it "an element left open fails at finish"
+        (let [w (xw)
+              _ (put w (ev-s "r"))]
+          (assert-eq 4 (finish-code w))))
+      (it "names and bodies that cannot be written back"
+        (let [w1 (xw)
+              w2 (xw)
+              w3 (xw)
+              w4 (xw)
+              c1 (put-code w1 (ev-s "a b"))
+              _  (put w2 (ev-s "r"))
+              c2 (put-code w2 (Comment (from-cstr "a--b")))
+              _  (put w3 (ev-s "r"))
+              _  (put w3 (StartCdata))
+              c3 (put-code w3 (ev-t "]]>"))
+              _  (put w4 (ev-s "r"))
+              c4 (put-code w4 (Pi (from-cstr "xml") (from-cstr "v")))
+              f1 (finish-code w1)
+              f2 (finish-code w2)
+              f3 (finish-code w3)
+              f4 (finish-code w4)]
+          (and (assert-eq 8 c1)
+            (assert-eq 9 c2)
+            (assert-eq 9 c3)
+            (assert-eq 8 c4)
+            (assert-eq 8 f1)
+            (assert-eq 9 f2)
+            (assert-eq 9 f3)
+            (assert-eq 8 f4))))
+      (it "a duplicate attribute is BadName when the tag closes"
+        (let [w  (xw)
+              _  (put w
+                   (StartElement (from-cstr "r")
+                     (tcons-of (Attr (from-cstr "k") (from-cstr "1"))
+                       (tcons-of (Attr (from-cstr "k") (from-cstr "2")) (tnil)))))
+              c1 (put-code w (ev-e "r"))
+              f1 (finish-code w)]
+          (and (assert-eq 8 c1) (assert-eq 8 f1))))
+      (it "every refusal has a message"
+        (assert-true (and (> (str-cmp (write-error-message (Rejected (BadPlacement)))
+                               "")
+                            0)
+                       (> (str-cmp (write-error-message (Rejected (BadName)))
+                            "")
+                         0)
+                       (> (str-cmp (write-error-message (IoFailed)) "") 0)
+                       (> (str-cmp (transform-error-message (OutputError (IoFailed)))
+                            "")
+                         0)))))
+    (describe "sax-write! -- HTML"
+      (it "writes a token stream: void elements, unbalanced end tags, raw text"
+        (let [w (hw)]
+          (put w (ev-s "p"))
+          (put w (ev-t "a<b&\"c"))
+          (put w (ev-s "br"))
+          (put w (ev-e "br"))
+          (put w (ev-s "img"))
+          (put w (ev-e "div"))
+          (put w (ev-s "script"))
+          (put w (ev-t "if (a<b) {}"))
+          (put w (ev-e "script"))
+          (out-is? w
+            "<p>a&lt;b&amp;\"c<br/><img></div><script>if (a<b) {}</script>")))
+      (it "keeps a doctype's ids"
+        (let [w (hw)]
+          (put w
+            (Doctype (from-cstr "html")
+              (from-cstr "")
+              (from-cstr "about:legacy-compat")))
+          (out-is? w "<!DOCTYPE html SYSTEM \"about:legacy-compat\">")))
+      (it "refuses a </script> breakout, CDATA and PIs"
+        (let [w1 (hw)
+              w2 (hw)
+              w3 (hw)
+              _  (put w1 (ev-s "script"))
+              _  (put w1 (ev-t "x</script><b>"))
+              c1 (put-code w1 (ev-e "script"))
+              c2 (put-code w2 (StartCdata))
+              c3 (put-code w3 (Pi (from-cstr "p") (from-cstr "d")))
+              f1 (finish-code w1)
+              f2 (finish-code w2)
+              f3 (finish-code w3)]
+          (and (assert-eq 9 c1)
+            (assert-eq 4 c2)
+            (assert-eq 4 c3)
+            (assert-eq 9 f1)
+            (assert-eq 4 f2)
+            (assert-eq 4 f3)))))
+    (describe "sax-writer-to-file"
+      (it "streams the document to the file; finish returns an empty String"
+        (let [path (tmp-path)]
+          (match (sax-writer-to-file (XmlFlavor) path)
+            (Err _)
+            (assert-true false)
+            (Ok w)
+            (let [_  (put w (ev-sa "r" "k" "v"))
+                  _  (put w (ev-t "text"))
+                  _  (put w (ev-e "r"))
+                  o1 (out-is? w "")
+                  o2 (file-is? path "<r k=\"v\">text</r>")]
+              (and (assert-true o1) (assert-true o2))))))
+      (it "an uncreatable file is IoFailed"
+        (assert-eq 10
+          (match (sax-writer-to-file (XmlFlavor) "/nonexistent-dir-tur/x.xml")
+            (Ok w)
+            (do (sax-writer-free w) 0)
+            (Err e)
+            (code e)))))
+    (describe "sax-transform-handler"
+      (it "runs each event through the transform and writes what comes back"
+        (let [w (xw)
+              h (sax-transform-handler w rename-a)]
+          (drive h (ev-s "r"))
+          (drive h (ev-sa "a" "k" "v"))
+          (drive h (Comment (from-cstr "gone")))
+          (drive h (ev-t "x"))
+          (drive h (ev-e "a"))
+          (drive h (ev-e "r"))
+          (out-is? w "<r><b k=\"v\">x</b></r>")))
+      (it "a transform may return several events, built or passed through"
+        (let [w (xw)
+              h (sax-transform-handler w wrap-text)]
+          (drive h (ev-s "r"))
+          (drive h (ev-t "x"))
+          (drive h (ev-e "r"))
+          (out-is? w "<r><em>x</em></r>")))
+      (it "stops the parse at the writer's first refusal"
+        (let [w  (xw)
+              h  (sax-transform-handler w sax-keep)
+              c1 (drive h (ev-s "r"))
+              c2 (drive h (ev-e "x"))
+              c3 (drive h (ev-t "after"))
+              f1 (finish-code w)]
+          (and (assert-true (and c1 (not c2) (not c3))) (assert-eq 4 f1))))
+      (it "kept, rebuilt and dropped events leave the input's Strings balanced"
+        (let [w    (xw)
+              h    (sax-transform-handler w rename-a)
+              keep (from-cstr "r")
+              ren  (from-cstr "a")
+              drop (from-cstr "gone")
+              _    (h (StartElement keep (tnil)))
+              _    (h (StartElement ren (tnil)))
+              _    (h (Comment drop))
+              ;; A driver holds one reference; the transform's went back.
+              r1   (__rc keep)
+              r2   (__rc ren)
+              r3   (__rc drop)]
+          (release keep)
+          (release ren)
+          (release drop)
+          (sax-writer-free w)
+          (and (assert-eq 1 r1) (assert-eq 1 r2) (assert-eq 1 r3))))
+      (it "a transform that drops without releasing leaks one reference"
+        (let [w  (xw)
+              h  (sax-transform-handler w leak)
+              s  (from-cstr "r")
+              _  (h (StartElement s (tnil)))
+              r1 (__rc s)]
+          (release s)
+          (release s)
+          (sax-writer-free w)
+          (assert-eq 2 r1)))
+      (it "sax-event-retain takes one reference per String"
+        (let [n  (from-cstr "r")
+              k  (from-cstr "k")
+              v  (from-cstr "v")
+              ev (StartElement n (tcons-of (Attr k v) (tnil)))]
+          (sax-event-retain ev)
+          (let [ok (and (= (__rc n) 2) (= (__rc k) 2) (= (__rc v) 2))]
+            (sax-event-release ev)
+            (sax-event-release ev)
+            (assert-true ok))))))
+  (defn main [] : int (__all-tests) (run-all-status))) ;; end defmodule dom_core_writer_test

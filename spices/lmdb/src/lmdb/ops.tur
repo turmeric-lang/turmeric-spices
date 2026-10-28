@@ -14,31 +14,27 @@
 ;;;
 ;;; Since: 0.1.0
 ;; lmdb/ops
-
 (defmodule lmdb/ops
   (import lmdb/error :refer [LmdbError KeyTooLong lmdb-error-of])
-  (import lmdb/txn   :refer [Txn])
-  (import lmdb/dbi   :refer [Dbi])
+  (import lmdb/txn :refer [Txn])
+  (import lmdb/dbi :refer [Dbi])
   (export get has? put! put-new! put-append! del! del-dup!)
-
-;; -------------------------------------------------------------------------
-;; Private
-;; -------------------------------------------------------------------------
-
-;;; over-key-limit -- the key's length when it exceeds the env's limit, else -1.
-(defn over-key-limit [^borrow txn : Txn key : cstr] : int
-  ```c
-  #include <lmdb.h>
+  ;; -------------------------------------------------------------------------
+  ;; Private
+  ;; -------------------------------------------------------------------------
+  ;;; over-key-limit -- the key's length when it exceeds the env's limit, else -1.
+  (defn over-key-limit [^borrow txn : Txn key : cstr] : int
+    ```c
+    #include <lmdb.h>
   #include <string.h>
   size_t n = strlen((const char *)key);
   int max = mdb_env_get_maxkeysize(mdb_txn_env((MDB_txn *)(intptr_t)txn));
   return n > (size_t)max ? (int64_t)n : -1;
   ```)
-
-;;; put-flag -- 0 none, 1 MDB_NOOVERWRITE, 2 MDB_APPEND, 3 MDB_APPENDDUP.
-(defn put-flag [i : int] : int
-  ```c
-  #include <lmdb.h>
+  ;;; put-flag -- 0 none, 1 MDB_NOOVERWRITE, 2 MDB_APPEND, 3 MDB_APPENDDUP.
+  (defn put-flag [i : int] : int
+    ```c
+    #include <lmdb.h>
   switch (i) {
     case 1: return MDB_NOOVERWRITE;
     case 2: return MDB_APPEND;
@@ -46,87 +42,86 @@
     default: return 0;
   }
   ```)
-
-;;; put-raw -- mdb_put of two cstrs (no NULs stored); the code.
-(defn put-raw [^borrow txn : Txn dbi : Dbi key : cstr val : cstr flags : int] : int
-  ```c
-  #include <lmdb.h>
+  ;;; put-raw -- mdb_put of two cstrs (no NULs stored); the code.
+  (defn put-raw [^borrow txn : Txn dbi : Dbi key : cstr val : cstr flags : int] : int
+    ```c
+    #include <lmdb.h>
   #include <string.h>
   MDB_val k = { strlen((const char *)key), (void *)key };
   MDB_val v = { strlen((const char *)val), (void *)val };
   return (int64_t)mdb_put((MDB_txn *)(intptr_t)txn, (MDB_dbi)dbi, &k, &v,
                           (unsigned int)flags);
   ```)
-
-;;; del-raw -- mdb_del; with-val false deletes every value of the key.
-(defn del-raw [^borrow txn : Txn dbi : Dbi key : cstr val : cstr with-val : bool] : int
-  ```c
-  #include <lmdb.h>
+  ;;; del-raw -- mdb_del; with-val false deletes every value of the key.
+  (defn del-raw [^borrow txn : Txn
+                 dbi : Dbi
+                 key : cstr
+                 val : cstr
+                 with-val : bool] : int
+    ```c
+    #include <lmdb.h>
   #include <string.h>
   MDB_val k = { strlen((const char *)key), (void *)key };
   MDB_val v = { strlen((const char *)val), (void *)val };
   return (int64_t)mdb_del((MDB_txn *)(intptr_t)txn, (MDB_dbi)dbi, &k,
                           with_val ? &v : NULL);
   ```)
-
-;;; is-keyexist -- rc == MDB_KEYEXIST.
-(defn is-keyexist [rc : int] : bool
-  ```c
-  #include <lmdb.h>
+  ;;; is-keyexist -- rc == MDB_KEYEXIST.
+  (defn is-keyexist [rc : int] : bool
+    ```c
+    #include <lmdb.h>
   return rc == MDB_KEYEXIST;
   ```)
-
-;;; is-notfound -- rc == MDB_NOTFOUND.
-(defn is-notfound [rc : int] : bool
-  ```c
-  #include <lmdb.h>
+  ;;; is-notfound -- rc == MDB_NOTFOUND.
+  (defn is-notfound [rc : int] : bool
+    ```c
+    #include <lmdb.h>
   return rc == MDB_NOTFOUND;
   ```)
-
-;;; put-with -- put with flag index fi; Ok true written, Ok false key existed.
-(defn put-with [^borrow txn : Txn dbi : Dbi key : cstr val : cstr fi : int]
-               : (Result bool LmdbError)
-  (let [over (over-key-limit txn key)]
-    (if (>= over 0)
-      (err (KeyTooLong over))
-      (let [rc (put-raw txn dbi key val (put-flag fi))]
-        (cond (= rc 0)         (ok true)
-              (is-keyexist rc) (ok false)
-              :else            (err (lmdb-error-of rc)))))))
-
-;;; del-with -- delete; Ok false when absent.
-(defn del-with [^borrow txn : Txn dbi : Dbi key : cstr val : cstr with-val : bool]
-               : (Result bool LmdbError)
-  (let [rc (del-raw txn dbi key val with-val)]
-    (cond (= rc 0)         (ok true)
-          (is-notfound rc) (ok false)
-          :else            (err (lmdb-error-of rc)))))
-
-;; -------------------------------------------------------------------------
-;; Public
-;; -------------------------------------------------------------------------
-
-;;; get -- the value stored under key, copied out.
-;;;
-;;; In a dup-sort database this is the key's first (smallest) value;
-;;; walk the rest with a cursor.
-;;;
-;;; Parameters:
-;;;   txn -- a Txn, borrowed
-;;;   dbi -- the database
-;;;   key -- the key
-;;;
-;;; Returns:
-;;;   (Option cstr) -- (some value), or (none) when the key is absent (or
-;;;   longer than any key the env can hold).
-;;;
-;;; Example:
-;;;   (get txn dbi "hello")  ; => (some "world")
-;;;
-;;; Since: 0.1.0
-(defn get [^borrow txn : Txn dbi : Dbi key : cstr] : (Option cstr)
-  ```c
-  #include <lmdb.h>
+  ;;; put-with -- put with flag index fi; Ok true written, Ok false key existed.
+  (defn put-with [^borrow txn : Txn dbi : Dbi key : cstr val : cstr fi : int] : (Result bool
+                                                                                  LmdbError)
+    (let [over (over-key-limit txn key)]
+      (if (>= over 0)
+        (err (KeyTooLong over))
+        (let [rc (put-raw txn dbi key val (put-flag fi))]
+          (cond (= rc 0)         (ok true)
+                (is-keyexist rc) (ok false)
+                :else            (err (lmdb-error-of rc)))))))
+  ;;; del-with -- delete; Ok false when absent.
+  (defn del-with [^borrow txn : Txn
+                  dbi : Dbi
+                  key : cstr
+                  val : cstr
+                  with-val : bool] : (Result bool LmdbError)
+    (let [rc (del-raw txn dbi key val with-val)]
+      (cond (= rc 0)         (ok true)
+            (is-notfound rc) (ok false)
+            :else            (err (lmdb-error-of rc)))))
+  ;; -------------------------------------------------------------------------
+  ;; Public
+  ;; -------------------------------------------------------------------------
+  ;;; get -- the value stored under key, copied out.
+  ;;;
+  ;;; In a dup-sort database this is the key's first (smallest) value;
+  ;;; walk the rest with a cursor.
+  ;;;
+  ;;; Parameters:
+  ;;;   txn -- a Txn, borrowed
+  ;;;   dbi -- the database
+  ;;;   key -- the key
+  ;;;
+  ;;; Returns:
+  ;;;   (Option cstr) -- (some value), or (none) when the key is absent (or
+  ;;;   longer than any key the env can hold).
+  ;;;
+  ;;; Example:
+  ;;;   (get txn dbi "hello")  ; => (some "world")
+  ;;;
+  ;;; Since: 0.1.0
+  (defn get [^borrow txn : Txn dbi : Dbi key : cstr] : (Option cstr)
+    ```c
+    #include <lmdb.h>
   #include <stdlib.h>
   #include <string.h>
   MDB_txn *t = (MDB_txn *)(intptr_t)txn;
@@ -139,24 +134,23 @@
   copy[v.mv_size] = '\0';
   return tur_some_ptr(copy);
   ```)
-
-;;; has? -- is key present?
-;;;
-;;; Parameters:
-;;;   txn -- a Txn, borrowed
-;;;   dbi -- the database
-;;;   key -- the key
-;;;
-;;; Returns:
-;;;   true when get would find a value. Copies nothing out.
-;;;
-;;; Example:
-;;;   (has? txn dbi "hello")  ; => true
-;;;
-;;; Since: 0.1.0
-(defn has? [^borrow txn : Txn dbi : Dbi key : cstr] : bool
-  ```c
-  #include <lmdb.h>
+  ;;; has? -- is key present?
+  ;;;
+  ;;; Parameters:
+  ;;;   txn -- a Txn, borrowed
+  ;;;   dbi -- the database
+  ;;;   key -- the key
+  ;;;
+  ;;; Returns:
+  ;;;   true when get would find a value. Copies nothing out.
+  ;;;
+  ;;; Example:
+  ;;;   (has? txn dbi "hello")  ; => true
+  ;;;
+  ;;; Since: 0.1.0
+  (defn has? [^borrow txn : Txn dbi : Dbi key : cstr] : bool
+    ```c
+    #include <lmdb.h>
   #include <string.h>
   MDB_txn *t = (MDB_txn *)(intptr_t)txn;
   size_t n = strlen((const char *)key);
@@ -164,107 +158,104 @@
   MDB_val k = { n, (void *)key }, v;
   return mdb_get(t, (MDB_dbi)dbi, &k, &v) == 0;
   ```)
-
-;;; put! -- store val under key, replacing any value already there.
-;;;
-;;; In a dup-sort database it adds val to the key's values instead (a
-;;; value the key already holds is left as it is).
-;;;
-;;; Parameters:
-;;;   txn -- a write Txn, borrowed
-;;;   dbi -- the database
-;;;   key -- the key, at most env-max-key-size bytes
-;;;   val -- the value
-;;;
-;;; Returns:
-;;;   (Result nil LmdbError) -- `MapFull`, `KeyTooLong`, `ReadOnly`, ...
-;;;
-;;; Example:
-;;;   (put! txn dbi "hello" "world")
-;;;
-;;; Since: 0.1.0
-(defn put! [^borrow txn : Txn dbi : Dbi key : cstr val : cstr] : (Result nil LmdbError)
-  (let [r (put-with txn dbi key val 0)]
-    (if (ok? r) (Ok nil) (err (err-val r)))))
-
-;;; put-new! -- store val under key only if key is absent (MDB_NOOVERWRITE).
-;;;
-;;; Parameters:
-;;;   txn -- a write Txn, borrowed
-;;;   dbi -- the database
-;;;   key -- the key
-;;;   val -- the value
-;;;
-;;; Returns:
-;;;   (Result bool LmdbError) -- ok true when written, ok false when the key
-;;;   was already present (nothing changed).
-;;;
-;;; Example:
-;;;   (put-new! txn dbi "hello" "again")  ; => (ok false)
-;;;
-;;; Since: 0.1.0
-(defn put-new! [^borrow txn : Txn dbi : Dbi key : cstr val : cstr] : (Result bool LmdbError)
-  (put-with txn dbi key val 1))
-
-;;; put-append! -- bulk-load put (MDB_APPEND): key must sort after every
-;;; key already in the database.
-;;;
-;;; Much faster than put! for loading pre-sorted data. A key out of order
-;;; is refused with `Io` (MDB_KEYEXIST's code) rather than stored, so a
-;;; mistake cannot corrupt the order.
-;;;
-;;; Parameters:
-;;;   txn -- a write Txn, borrowed
-;;;   dbi -- the database
-;;;   key -- the key, greater than the current last key
-;;;   val -- the value
-;;;
-;;; Returns:
-;;;   (Result nil LmdbError)
-;;;
-;;; Example:
-;;;   (put-append! txn dbi "k0001" "a")
-;;;
-;;; Since: 0.1.0
-(defn put-append! [^borrow txn : Txn dbi : Dbi key : cstr val : cstr] : (Result nil LmdbError)
-  (let [r (put-with txn dbi key val 2)]
-    (if (ok? r)
-      (if (ok-val r) (Ok nil) (err (lmdb-error-of -30799)))
-      (err (err-val r)))))
-
-;;; del! -- delete key (every value of it, in a dup-sort database).
-;;;
-;;; Parameters:
-;;;   txn -- a write Txn, borrowed
-;;;   dbi -- the database
-;;;   key -- the key
-;;;
-;;; Returns:
-;;;   (Result bool LmdbError) -- ok true when deleted, ok false when absent.
-;;;
-;;; Example:
-;;;   (del! txn dbi "hello")  ; => (ok true)
-;;;
-;;; Since: 0.1.0
-(defn del! [^borrow txn : Txn dbi : Dbi key : cstr] : (Result bool LmdbError)
-  (del-with txn dbi key "" false))
-
-;;; del-dup! -- delete one value of a dup-sort key.
-;;;
-;;; Parameters:
-;;;   txn -- a write Txn, borrowed
-;;;   dbi -- a dup-sort database
-;;;   key -- the key
-;;;   val -- the value to remove
-;;;
-;;; Returns:
-;;;   (Result bool LmdbError) -- ok false when the key does not hold val.
-;;;
-;;; Example:
-;;;   (del-dup! txn tags "post-1" "lisp")  ; => (ok true)
-;;;
-;;; Since: 0.1.0
-(defn del-dup! [^borrow txn : Txn dbi : Dbi key : cstr val : cstr] : (Result bool LmdbError)
-  (del-with txn dbi key val true))
-
-) ;; end defmodule lmdb/ops
+  ;;; put! -- store val under key, replacing any value already there.
+  ;;;
+  ;;; In a dup-sort database it adds val to the key's values instead (a
+  ;;; value the key already holds is left as it is).
+  ;;;
+  ;;; Parameters:
+  ;;;   txn -- a write Txn, borrowed
+  ;;;   dbi -- the database
+  ;;;   key -- the key, at most env-max-key-size bytes
+  ;;;   val -- the value
+  ;;;
+  ;;; Returns:
+  ;;;   (Result nil LmdbError) -- `MapFull`, `KeyTooLong`, `ReadOnly`, ...
+  ;;;
+  ;;; Example:
+  ;;;   (put! txn dbi "hello" "world")
+  ;;;
+  ;;; Since: 0.1.0
+  (defn put! [^borrow txn : Txn dbi : Dbi key : cstr val : cstr] : (Result nil
+                                                                     LmdbError)
+    (let [r (put-with txn dbi key val 0)]
+      (if (ok? r) (Ok nil) (err (err-val r)))))
+  ;;; put-new! -- store val under key only if key is absent (MDB_NOOVERWRITE).
+  ;;;
+  ;;; Parameters:
+  ;;;   txn -- a write Txn, borrowed
+  ;;;   dbi -- the database
+  ;;;   key -- the key
+  ;;;   val -- the value
+  ;;;
+  ;;; Returns:
+  ;;;   (Result bool LmdbError) -- ok true when written, ok false when the key
+  ;;;   was already present (nothing changed).
+  ;;;
+  ;;; Example:
+  ;;;   (put-new! txn dbi "hello" "again")  ; => (ok false)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn put-new! [^borrow txn : Txn dbi : Dbi key : cstr val : cstr] : (Result bool
+                                                                         LmdbError)
+    (put-with txn dbi key val 1))
+  ;;; put-append! -- bulk-load put (MDB_APPEND): key must sort after every
+  ;;; key already in the database.
+  ;;;
+  ;;; Much faster than put! for loading pre-sorted data. A key out of order
+  ;;; is refused with `Io` (MDB_KEYEXIST's code) rather than stored, so a
+  ;;; mistake cannot corrupt the order.
+  ;;;
+  ;;; Parameters:
+  ;;;   txn -- a write Txn, borrowed
+  ;;;   dbi -- the database
+  ;;;   key -- the key, greater than the current last key
+  ;;;   val -- the value
+  ;;;
+  ;;; Returns:
+  ;;;   (Result nil LmdbError)
+  ;;;
+  ;;; Example:
+  ;;;   (put-append! txn dbi "k0001" "a")
+  ;;;
+  ;;; Since: 0.1.0
+  (defn put-append! [^borrow txn : Txn dbi : Dbi key : cstr val : cstr] : (Result nil
+                                                                            LmdbError)
+    (let [r (put-with txn dbi key val 2)]
+      (if (ok? r)
+        (if (ok-val r) (Ok nil) (err (lmdb-error-of -30799)))
+        (err (err-val r)))))
+  ;;; del! -- delete key (every value of it, in a dup-sort database).
+  ;;;
+  ;;; Parameters:
+  ;;;   txn -- a write Txn, borrowed
+  ;;;   dbi -- the database
+  ;;;   key -- the key
+  ;;;
+  ;;; Returns:
+  ;;;   (Result bool LmdbError) -- ok true when deleted, ok false when absent.
+  ;;;
+  ;;; Example:
+  ;;;   (del! txn dbi "hello")  ; => (ok true)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn del! [^borrow txn : Txn dbi : Dbi key : cstr] : (Result bool LmdbError)
+    (del-with txn dbi key "" false))
+  ;;; del-dup! -- delete one value of a dup-sort key.
+  ;;;
+  ;;; Parameters:
+  ;;;   txn -- a write Txn, borrowed
+  ;;;   dbi -- a dup-sort database
+  ;;;   key -- the key
+  ;;;   val -- the value to remove
+  ;;;
+  ;;; Returns:
+  ;;;   (Result bool LmdbError) -- ok false when the key does not hold val.
+  ;;;
+  ;;; Example:
+  ;;;   (del-dup! txn tags "post-1" "lisp")  ; => (ok true)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn del-dup! [^borrow txn : Txn dbi : Dbi key : cstr val : cstr] : (Result bool
+                                                                         LmdbError)
+    (del-with txn dbi key val true))) ;; end defmodule lmdb/ops

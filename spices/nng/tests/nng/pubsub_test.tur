@@ -8,256 +8,262 @@
 ;;
 ;; Distinct inproc names per case, for the same reason socket_test.tur uses
 ;; them: one process, and a live listen owns its address.
-
-(defmodule nng/tests/pubsub (export)
-
-(import nng/socket :refer [Socket
-                           pub-open sub-open bus-open pair-open
-                           surveyor-open respondent-open
-                           dial listen close
-                           set-recv-timeout-ms timed-out?])
-(import nng/msg    :refer [send-str recv-str sub-subscribe sub-unsubscribe])
-(import test/suite  :refer [describe it])
-(import test/assert :refer [assert-true assert-false])
-(import test/runner :refer [run-all-status])
-
-;; Per-attempt receive budget. Small, because the point is to retry quickly;
-;; `attempts` below is what bounds the total wait.
-(def poll-ms 50)
-
-;; 40 x 50ms = 2s of headroom before a case gives up, which is the same budget
-;; msg_test.tur gives a single blocking receive.
-(def attempts 40)
-
-(defn cstr-eq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+(defmodule nng/tests/pubsub
+  (export)
+  (import nng/socket
+    :refer
+    [Socket
+     pub-open
+     sub-open
+     bus-open
+     pair-open
+     surveyor-open
+     respondent-open
+     dial
+     listen
+     close
+     set-recv-timeout-ms
+     timed-out?])
+  (import nng/msg :refer [send-str recv-str sub-subscribe sub-unsubscribe])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true assert-false])
+  (import test/runner :refer [run-all-status])
+  ;; Per-attempt receive budget. Small, because the point is to retry quickly;
+  ;; `attempts` below is what bounds the total wait.
+  (def poll-ms 50)
+  ;; 40 x 50ms = 2s of headroom before a case gives up, which is the same budget
+  ;; msg_test.tur gives a single blocking receive.
+  (def attempts 40)
+  (defn cstr-eq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn cstr-free [p : cstr] : nil
-  ```c
-  free((void *)(intptr_t)p);
+  (defn cstr-free [p : cstr] : nil
+    ```c
+    free((void *)(intptr_t)p);
   ```)
-
-;; recv-str=? -- receive one message and compare it, freeing it either way.
-;; False on any error, including a timeout.
-(defn recv-str=? [^borrow s : Socket expect : cstr] : bool
-  (let [r (recv-str s)]
-    (if (ok? r)
-      (let [got (ok-val r)
-            eq  (cstr-eq? expect got)]
-        (cstr-free got)
-        eq)
-      false)))
-
-;; timed-out-on-recv? -- did a receive fail specifically because the deadline
-;; expired? The assertion a "this peer must NOT see that message" case wants:
-;; it distinguishes "nothing arrived" from "the socket is broken".
-(defn timed-out-on-recv? [^borrow s : Socket] : bool
-  (let [r (recv-str s)]
-    (if (ok? r)
-      (do (cstr-free (ok-val r)) false)
-      (timed-out? (err-val r)))))
-
-;; send-until-received? -- the slow-joiner mitigation. Re-send `msg` on `tx`
-;; and re-try a short receive on `rx` until one lands or `tries` runs out.
-;;
-;; The receive goes through `recv-str=?` because twelve call sites across this
-;; file and msg_test.tur want exactly that receive-compare-free sequence -- not,
-;; any longer, to dodge a compiler defect. Writing the `let` inline here used to
-;; fail the C compile, because a `let` binding a carrier-returning Result inside
-;; a SELF-TAIL-RECURSIVE body was emitted without its carrier-to-by-value
-;; bridge; that is fixed upstream and pinned by
-;; `tests/fixtures/tail-recursive-let-carrier-bridge`, which is the right home
-;; for that regression. Inlining it back here would duplicate a twelve-caller
-;; helper to re-prove something a fixture already covers.
-(defn send-until-received? [^borrow tx : Socket ^borrow rx : Socket
-                            msg : cstr expect : cstr tries : int] : bool
-  (if (<= tries 0)
-    false
-    (do
-      (send-str tx msg)
-      (if (recv-str=? rx expect)
-        true
-        (send-until-received? tx rx msg expect (- tries 1))))))
-
-;; both-received? -- the fan-out form of the same mitigation.
-;;
-;; `send-until-received?` is NOT enough for a two-peer broadcast, and the
-;; difference is a race rather than a detail: that loop stops the instant the
-;; FIRST peer's pipe is up, which on a loaded runner can be a round or more
-;; before the second peer's. The second peer's single receive then finds an
-;; empty queue and the case fails with nothing wrong with the product -- which
-;; is exactly how this one failed on CI after passing locally. Both peers have
-;; to be satisfied by the same loop.
-;;
-;; `or` short-circuits, so a peer that has already received is not asked again
-;; and costs no further timeout.
-(defn both-received? [^borrow hub : Socket ^borrow b : Socket ^borrow c : Socket
-                      msg : cstr got-b : bool got-c : bool tries : int] : bool
-  (if (and got-b got-c)
-    true
+  ;; recv-str=? -- receive one message and compare it, freeing it either way.
+  ;; False on any error, including a timeout.
+  (defn recv-str=? [^borrow s : Socket expect : cstr] : bool
+    (let [r (recv-str s)]
+      (if (ok? r)
+        (let [got (ok-val r)
+              eq  (cstr-eq? expect got)]
+          (cstr-free got)
+          eq)
+        false)))
+  ;; timed-out-on-recv? -- did a receive fail specifically because the deadline
+  ;; expired? The assertion a "this peer must NOT see that message" case wants:
+  ;; it distinguishes "nothing arrived" from "the socket is broken".
+  (defn timed-out-on-recv? [^borrow s : Socket] : bool
+    (let [r (recv-str s)]
+      (if (ok? r) (do (cstr-free (ok-val r)) false) (timed-out? (err-val r)))))
+  ;; send-until-received? -- the slow-joiner mitigation. Re-send `msg` on `tx`
+  ;; and re-try a short receive on `rx` until one lands or `tries` runs out.
+  ;;
+  ;; The receive goes through `recv-str=?` because twelve call sites across this
+  ;; file and msg_test.tur want exactly that receive-compare-free sequence -- not,
+  ;; any longer, to dodge a compiler defect. Writing the `let` inline here used to
+  ;; fail the C compile, because a `let` binding a carrier-returning Result inside
+  ;; a SELF-TAIL-RECURSIVE body was emitted without its carrier-to-by-value
+  ;; bridge; that is fixed upstream and pinned by
+  ;; `tests/fixtures/tail-recursive-let-carrier-bridge`, which is the right home
+  ;; for that regression. Inlining it back here would duplicate a twelve-caller
+  ;; helper to re-prove something a fixture already covers.
+  (defn send-until-received? [^borrow tx : Socket
+                              ^borrow rx : Socket
+                              msg : cstr
+                              expect : cstr
+                              tries : int] : bool
     (if (<= tries 0)
       false
       (do
-        (send-str hub msg)
-        (both-received? hub b c msg
-                        (or got-b (recv-str=? b msg))
-                        (or got-c (recv-str=? c msg))
-                        (- tries 1))))))
-
-;; survey-round? -- one full survey exchange, re-run as a WHOLE on failure.
-;;
-;; Not a per-step retry, because a surveyor that re-asks CANCELS its previous
-;; survey: an answer to the superseded question is discarded by the surveyor,
-;; so a round that half-completed cannot be rescued from either end. Ask,
-;; answer, hear -- or start over.
-(defn survey-round? [^borrow srv : Socket ^borrow rsp : Socket tries : int] : bool
-  (if (<= tries 0)
-    false
-    (do
-      (send-str srv "are-you-there")
-      (if (recv-str=? rsp "are-you-there")
+        (send-str tx msg)
+        (if (recv-str=? rx expect)
+          true
+          (send-until-received? tx rx msg expect (- tries 1))))))
+  ;; both-received? -- the fan-out form of the same mitigation.
+  ;;
+  ;; `send-until-received?` is NOT enough for a two-peer broadcast, and the
+  ;; difference is a race rather than a detail: that loop stops the instant the
+  ;; FIRST peer's pipe is up, which on a loaded runner can be a round or more
+  ;; before the second peer's. The second peer's single receive then finds an
+  ;; empty queue and the case fails with nothing wrong with the product -- which
+  ;; is exactly how this one failed on CI after passing locally. Both peers have
+  ;; to be satisfied by the same loop.
+  ;;
+  ;; `or` short-circuits, so a peer that has already received is not asked again
+  ;; and costs no further timeout.
+  (defn both-received? [^borrow hub : Socket
+                        ^borrow b : Socket
+                        ^borrow c : Socket
+                        msg : cstr
+                        got-b : bool
+                        got-c : bool
+                        tries : int] : bool
+    (if (and got-b got-c)
+      true
+      (if (<= tries 0)
+        false
         (do
-          (send-str rsp "yes")
-          (if (recv-str=? srv "yes")
-            true
-            (survey-round? srv rsp (- tries 1))))
-        (survey-round? srv rsp (- tries 1))))))
-
-(defn __all-tests [] : void
-  (describe "nng/msg -- pub / sub"
-
-    (it "delivers a published message to a subscriber taking everything"
-      (let [pub (ok-val (pub-open))
-            sub (ok-val (sub-open))
-            _   (listen pub "inproc://ng3-all")
-            _   (dial sub "inproc://ng3-all")
-            _   (sub-subscribe sub "")
-            _   (set-recv-timeout-ms sub poll-ms)
-            r   (assert-true (send-until-received? pub sub "tick" "tick" attempts))]
-        (close sub)
-        (close pub)
-        r))
-
-    (it "delivers to a subscriber whose topic prefix matches"
-      (let [pub (ok-val (pub-open))
-            sub (ok-val (sub-open))
-            _   (listen pub "inproc://ng3-match")
-            _   (dial sub "inproc://ng3-match")
-            _   (sub-subscribe sub "temp:")
-            _   (set-recv-timeout-ms sub poll-ms)
-            r   (assert-true (send-until-received? pub sub "temp:20" "temp:20" attempts))]
-        (close sub)
-        (close pub)
-        r))
-
-    ;; The two negative cases below each carry a POSITIVE control on the same
-    ;; publisher, and that is not belt-and-braces: without one, "nothing
-    ;; arrived" is satisfied just as well by a subscriber whose pipe was never
-    ;; up as by the topic filter doing its job, so the case passes for the
-    ;; wrong reason on exactly the loaded runner where it matters. Proving the
-    ;; publisher is live AND delivering matching traffic first is what makes
-    ;; the silence mean something.
-
-    (it "withholds a message from a subscriber whose topic does not match"
-      (let [pub  (ok-val (pub-open))
-            mine (ok-val (sub-open))
-            them (ok-val (sub-open))
-            _    (listen pub "inproc://ng3-disjoint")
-            _    (dial mine "inproc://ng3-disjoint")
-            _    (dial them "inproc://ng3-disjoint")
-            _    (sub-subscribe mine "temp:")
-            _    (sub-subscribe them "hum:")
-            _    (set-recv-timeout-ms mine poll-ms)
-            _    (set-recv-timeout-ms them poll-ms)
-            ;; the control: this publisher is live and "temp:20" is going out
-            got  (send-until-received? pub mine "temp:20" "temp:20" attempts)
-            ;; the assertion: and "hum:" still saw none of it
-            r    (assert-true (and got (timed-out-on-recv? them)))]
-        (close them)
-        (close mine)
-        (close pub)
-        r))
-
-    (it "delivers nothing at all to a subscriber with no subscription"
-      (let [pub  (ok-val (pub-open))
-            mine (ok-val (sub-open))
-            sub  (ok-val (sub-open))
-            _    (listen pub "inproc://ng3-nosub")
-            _    (dial mine "inproc://ng3-nosub")
-            _    (dial sub "inproc://ng3-nosub")
-            _    (sub-subscribe mine "")
-            _    (set-recv-timeout-ms mine poll-ms)
-            _    (set-recv-timeout-ms sub poll-ms)
-            got  (send-until-received? pub mine "anything" "anything" attempts)
-            r    (assert-true (and got (timed-out-on-recv? sub)))]
-        (close sub)
-        (close mine)
-        (close pub)
-        r))
-
-    (it "stops delivering after the subscription is dropped"
-      (let [pub (ok-val (pub-open))
-            sub (ok-val (sub-open))
-            _   (listen pub "inproc://ng3-unsub")
-            _   (dial sub "inproc://ng3-unsub")
-            _   (sub-subscribe sub "temp:")
-            _   (set-recv-timeout-ms sub poll-ms)
-            got (send-until-received? pub sub "temp:20" "temp:20" attempts)
-            _   (sub-unsubscribe sub "temp:")
-            _   (send-str pub "temp:21")
-            r   (assert-true (and got (timed-out-on-recv? sub)))]
-        (close sub)
-        (close pub)
-        r))
-
-    (it "refuses a subscription on a socket that is not a SUB socket"
-      (let [s (ok-val (pair-open))
-            r (assert-false (ok? (sub-subscribe s "temp:")))]
-        (close s)
-        r))
-
-    (it "refuses to drop a subscription that was never added"
-      (let [s (ok-val (sub-open))
-            r (assert-false (ok? (sub-unsubscribe s "never-added")))]
-        (close s)
-        r)))
-
-  (describe "nng/socket -- bus"
-
-    (it "fans one message out to every directly connected peer"
-      (let [hub (ok-val (bus-open))
-            b   (ok-val (bus-open))
-            c   (ok-val (bus-open))
-            _   (listen hub "inproc://ng3-bus")
-            _   (dial b "inproc://ng3-bus")
-            _   (dial c "inproc://ng3-bus")
-            _   (set-recv-timeout-ms b poll-ms)
-            _   (set-recv-timeout-ms c poll-ms)
-            r   (assert-true (both-received? hub b c "broadcast"
-                                             false false attempts))]
-        (close c)
-        (close b)
-        (close hub)
-        r)))
-
-  (describe "nng/socket -- surveyor / respondent"
-
-    (it "collects a response to a survey"
-      (let [srv (ok-val (surveyor-open))
-            rsp (ok-val (respondent-open))
-            _   (listen srv "inproc://ng3-survey")
-            _   (dial rsp "inproc://ng3-survey")
-            _   (set-recv-timeout-ms srv poll-ms)
-            _   (set-recv-timeout-ms rsp poll-ms)
-            r   (assert-true (survey-round? srv rsp attempts))]
-        (close rsp)
-        (close srv)
-        r))))
-
-(defn main [] : int
-  (__all-tests)
-  (run-all-status))
-)
+          (send-str hub msg)
+          (both-received? hub
+            b
+            c
+            msg
+            (or got-b (recv-str=? b msg))
+            (or got-c (recv-str=? c msg))
+            (- tries 1))))))
+  ;; survey-round? -- one full survey exchange, re-run as a WHOLE on failure.
+  ;;
+  ;; Not a per-step retry, because a surveyor that re-asks CANCELS its previous
+  ;; survey: an answer to the superseded question is discarded by the surveyor,
+  ;; so a round that half-completed cannot be rescued from either end. Ask,
+  ;; answer, hear -- or start over.
+  (defn survey-round? [^borrow srv : Socket ^borrow rsp : Socket tries : int] : bool
+    (if (<= tries 0)
+      false
+      (do
+        (send-str srv "are-you-there")
+        (if (recv-str=? rsp "are-you-there")
+          (do
+            (send-str rsp "yes")
+            (if (recv-str=? srv "yes") true (survey-round? srv rsp (- tries 1))))
+          (survey-round? srv rsp (- tries 1))))))
+  (defn __all-tests [] : void
+    (describe "nng/msg -- pub / sub"
+      (it "delivers a published message to a subscriber taking everything"
+        (let [pub (ok-val (pub-open))
+              sub (ok-val (sub-open))
+              _   (listen pub "inproc://ng3-all")
+              _   (dial sub "inproc://ng3-all")
+              _   (sub-subscribe sub "")
+              _   (set-recv-timeout-ms sub poll-ms)
+              r   (assert-true (send-until-received? pub
+                                 sub
+                                 "tick"
+                                 "tick"
+                                 attempts))]
+          (close sub)
+          (close pub)
+          r))
+      (it "delivers to a subscriber whose topic prefix matches"
+        (let [pub (ok-val (pub-open))
+              sub (ok-val (sub-open))
+              _   (listen pub "inproc://ng3-match")
+              _   (dial sub "inproc://ng3-match")
+              _   (sub-subscribe sub "temp:")
+              _   (set-recv-timeout-ms sub poll-ms)
+              r   (assert-true (send-until-received? pub
+                                 sub
+                                 "temp:20"
+                                 "temp:20"
+                                 attempts))]
+          (close sub)
+          (close pub)
+          r))
+      ;; The two negative cases below each carry a POSITIVE control on the same
+      ;; publisher, and that is not belt-and-braces: without one, "nothing
+      ;; arrived" is satisfied just as well by a subscriber whose pipe was never
+      ;; up as by the topic filter doing its job, so the case passes for the
+      ;; wrong reason on exactly the loaded runner where it matters. Proving the
+      ;; publisher is live AND delivering matching traffic first is what makes
+      ;; the silence mean something.
+      (it "withholds a message from a subscriber whose topic does not match"
+        (let [pub  (ok-val (pub-open))
+              mine (ok-val (sub-open))
+              them (ok-val (sub-open))
+              _    (listen pub "inproc://ng3-disjoint")
+              _    (dial mine "inproc://ng3-disjoint")
+              _    (dial them "inproc://ng3-disjoint")
+              _    (sub-subscribe mine "temp:")
+              _    (sub-subscribe them "hum:")
+              _    (set-recv-timeout-ms mine poll-ms)
+              _    (set-recv-timeout-ms them poll-ms)
+              ;; the control: this publisher is live and "temp:20" is going out
+              got  (send-until-received? pub mine "temp:20" "temp:20" attempts)
+              ;; the assertion: and "hum:" still saw none of it
+              r    (assert-true (and got (timed-out-on-recv? them)))]
+          (close them)
+          (close mine)
+          (close pub)
+          r))
+      (it "delivers nothing at all to a subscriber with no subscription"
+        (let [pub  (ok-val (pub-open))
+              mine (ok-val (sub-open))
+              sub  (ok-val (sub-open))
+              _    (listen pub "inproc://ng3-nosub")
+              _    (dial mine "inproc://ng3-nosub")
+              _    (dial sub "inproc://ng3-nosub")
+              _    (sub-subscribe mine "")
+              _    (set-recv-timeout-ms mine poll-ms)
+              _    (set-recv-timeout-ms sub poll-ms)
+              got  (send-until-received? pub
+                     mine
+                     "anything"
+                     "anything"
+                     attempts)
+              r    (assert-true (and got (timed-out-on-recv? sub)))]
+          (close sub)
+          (close mine)
+          (close pub)
+          r))
+      (it "stops delivering after the subscription is dropped"
+        (let [pub (ok-val (pub-open))
+              sub (ok-val (sub-open))
+              _   (listen pub "inproc://ng3-unsub")
+              _   (dial sub "inproc://ng3-unsub")
+              _   (sub-subscribe sub "temp:")
+              _   (set-recv-timeout-ms sub poll-ms)
+              got (send-until-received? pub sub "temp:20" "temp:20" attempts)
+              _   (sub-unsubscribe sub "temp:")
+              _   (send-str pub "temp:21")
+              r   (assert-true (and got (timed-out-on-recv? sub)))]
+          (close sub)
+          (close pub)
+          r))
+      (it "refuses a subscription on a socket that is not a SUB socket"
+        (let [s (ok-val (pair-open))
+              r (assert-false (ok? (sub-subscribe s "temp:")))]
+          (close s)
+          r))
+      (it "refuses to drop a subscription that was never added"
+        (let [s (ok-val (sub-open))
+              r (assert-false (ok? (sub-unsubscribe s "never-added")))]
+          (close s)
+          r)))
+    (describe "nng/socket -- bus"
+      (it "fans one message out to every directly connected peer"
+        (let [hub (ok-val (bus-open))
+              b   (ok-val (bus-open))
+              c   (ok-val (bus-open))
+              _   (listen hub "inproc://ng3-bus")
+              _   (dial b "inproc://ng3-bus")
+              _   (dial c "inproc://ng3-bus")
+              _   (set-recv-timeout-ms b poll-ms)
+              _   (set-recv-timeout-ms c poll-ms)
+              r   (assert-true (both-received? hub
+                                 b
+                                 c
+                                 "broadcast"
+                                 false
+                                 false
+                                 attempts))]
+          (close c)
+          (close b)
+          (close hub)
+          r)))
+    (describe "nng/socket -- surveyor / respondent"
+      (it "collects a response to a survey"
+        (let [srv (ok-val (surveyor-open))
+              rsp (ok-val (respondent-open))
+              _   (listen srv "inproc://ng3-survey")
+              _   (dial rsp "inproc://ng3-survey")
+              _   (set-recv-timeout-ms srv poll-ms)
+              _   (set-recv-timeout-ms rsp poll-ms)
+              r   (assert-true (survey-round? srv rsp attempts))]
+          (close rsp)
+          (close srv)
+          r))))
+  (defn main [] : int (__all-tests) (run-all-status)))

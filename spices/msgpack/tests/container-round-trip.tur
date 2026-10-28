@@ -6,126 +6,128 @@
 ;; instance with `@Cons`, exactly as the json spice's list tests do.
 ;;
 ;; Expected hex cross-generated with CPython's `msgpack` 1.2.2.
-
-(defmodule container_round_trip_test (export)
-
-(import msgpack/buf    :refer [Buf buf-free buf->hex hex->buf])
-(import msgpack/decode :refer [MpTree MpNode mp-parse mp-tree-root mp-tree-free])
-(import msgpack/encode :refer [decode-mp-list derive-msgpack])
-(import test/suite     :refer [describe it])
-(import test/assert    :refer [assert-true assert-eq])
-(import test/runner    :refer [run-all-status])
-
-(defn cstr-eq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+(defmodule container_round_trip_test
+  (export)
+  (import msgpack/buf :refer [Buf buf-free buf->hex hex->buf])
+  (import msgpack/decode
+    :refer
+    [MpTree MpNode mp-parse mp-tree-root mp-tree-free])
+  (import msgpack/encode :refer [decode-mp-list derive-msgpack])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true assert-eq])
+  (import test/runner :refer [run-all-status])
+  (defn cstr-eq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn cstr-free [p : cstr] : nil
-  ```c
-  free((void *)(intptr_t)p);
+  (defn cstr-free [p : cstr] : nil
+    ```c
+    free((void *)(intptr_t)p);
   ```)
-
-(defn hex=? [b : Buf expect : cstr] : bool
-  (let [h (buf->hex b)
-        r (cstr-eq? expect h)]
-    (cstr-free h)
-    (buf-free b)
-    r))
-
-(defn parse [b : Buf] : MpTree
-  (let [r (mp-parse b)]
-    (buf-free b)
-    (ok-val r)))
-
-;; rt-ints -- hex array -> (Cons int) -> hex array. Both halves must agree.
-(defn rt-ints [h : cstr] : Buf
-  (let [t  (parse (hex->buf h))
-        xs (:: (decode-mp-list t (mp-tree-root t)) (Cons int))
-        out (encode-mp @Cons (:: xs (Cons int)))]
-    (mp-tree-free t)
-    out))
-
-(defn rt-floats [h : cstr] : Buf
-  (let [t  (parse (hex->buf h))
-        xs (:: (decode-mp-list t (mp-tree-root t)) (Cons float))
-        out (encode-mp @Cons (:: xs (Cons float)))]
-    (mp-tree-free t)
-    out))
-
-(defn rt-strs [h : cstr] : Buf
-  (let [t  (parse (hex->buf h))
-        xs (:: (decode-mp-list t (mp-tree-root t)) (Cons cstr))
-        out (encode-mp @Cons (:: xs (Cons cstr)))]
-    (mp-tree-free t)
-    out))
-
-(defn __list-tests [] : void
-  (describe "msgpack EncodeMp [Cons] -- a list is a msgpack array"
-    (it "an int list is a fixarray"
-      (assert-true (hex=? (encode-mp @Cons (:: (list 1 2 3) (Cons int))) "93010203")))
-    (it "a singleton"
-      (assert-true (hex=? (encode-mp @Cons (:: (list 42) (Cons int))) "912a")))
-    (it "the empty list is a bare 0x90"
-      (assert-true (hex=? (encode-mp @Cons (:: (tnil) (Cons int))) "90")))
-    (it "a float list keeps each element a float64"
-      (assert-true (hex=? (encode-mp @Cons (:: (list 7.1 2.5) (Cons float)))
-                          "92cb401c666666666666cb4004000000000000")))
-    (it "a string list"
-      (assert-true (hex=? (encode-mp @Cons (:: (list "a" "bb") (Cons cstr)))
-                          "92a161a26262")))))
-
-(defn __list-round-trip-tests [] : void
-  (describe "msgpack decode-mp-list -- array round trip"
-    (it "an int array round-trips"     (assert-true (hex=? (rt-ints "93010203") "93010203")))
-    (it "an empty array round-trips"   (assert-true (hex=? (rt-ints "90") "90")))
-    (it "a string array round-trips"   (assert-true (hex=? (rt-strs "92a161a26262") "92a161a26262")))
-    (it "a float array round-trips"
-      (assert-true (hex=? (rt-floats "92cb3ff8000000000000cb4004000000000000")
-                          "92cb3ff8000000000000cb4004000000000000")))
-    (it "an array16 round-trips past the fixarray boundary"
-      (assert-true (hex=? (rt-ints "dc0010000102030405060708090a0b0c0d0e0f")
-                          "dc0010000102030405060708090a0b0c0d0e0f")))
-    (it "a non-array decodes to the empty list rather than failing"
-      (assert-true (hex=? (rt-ints "07") "90")))))
-
-(defn __option-tests [] : void
-  (describe "msgpack EncodeMp [Option] -- present is the element, absent is nil"
-    (it "some int is the bare int"    (assert-true (hex=? (encode-mp (:: (some 42) (Option int))) "2a")))
-    (it "none int is nil"             (assert-true (hex=? (encode-mp (:: (none) (Option int))) "c0")))
-    (it "some cstr is the bare str"   (assert-true (hex=? (encode-mp (:: (some "hi") (Option cstr))) "a26869")))
-    (it "none cstr is nil"            (assert-true (hex=? (encode-mp (:: (none) (Option cstr))) "c0")))
-    (it "some float is the bare float64"
-                                      (assert-true (hex=? (encode-mp (:: (some 3.5) (Option float)))
-                                                          "cb400c000000000000")))
-    (it "none float is nil"           (assert-true (hex=? (encode-mp (:: (none) (Option float))) "c0")))))
-
-(defn __option-decode-tests [] : void
-  (describe "msgpack DecodeMp [Option] -- nil and a missing key both give none"
-    (it "an int decodes to some"
-      (let [t (parse (hex->buf "2a"))
-            o (ok-val (:: (decode-mp t (mp-tree-root t)) (Result (Option int) cstr)))
-            r (assert-true (and (some? o) (= 42 (unwrap o))))]
-        (mp-tree-free t)
-        r))
-    (it "an explicit nil decodes to none"
-      (let [t (parse (hex->buf "c0"))
-            o (ok-val (:: (decode-mp t (mp-tree-root t)) (Result (Option int) cstr)))
-            r (assert-true (not (some? o)))]
-        (mp-tree-free t)
-        r))
-    (it "a string decodes to some"
-      (let [t (parse (hex->buf "a26869"))
-            o (ok-val (:: (decode-mp t (mp-tree-root t)) (Result (Option cstr) cstr)))
-            r (assert-true (and (some? o) (cstr-eq? "hi" (unwrap o))))]
-        (mp-tree-free t)
-        r))))
-
-(defn main [] : int
-  (__list-tests)
-  (__list-round-trip-tests)
-  (__option-tests)
-  (__option-decode-tests)
-  (run-all-status))
-)
+  (defn hex=? [b : Buf expect : cstr] : bool
+    (let [h (buf->hex b)
+          r (cstr-eq? expect h)]
+      (cstr-free h)
+      (buf-free b)
+      r))
+  (defn parse [b : Buf] : MpTree (let [r (mp-parse b)] (buf-free b) (ok-val r)))
+  ;; rt-ints -- hex array -> (Cons int) -> hex array. Both halves must agree.
+  (defn rt-ints [h : cstr] : Buf
+    (let [t   (parse (hex->buf h))
+          xs  (:: (decode-mp-list t (mp-tree-root t)) (Cons int))
+          out (encode-mp (deref Cons) (:: xs (Cons int)))]
+      (mp-tree-free t)
+      out))
+  (defn rt-floats [h : cstr] : Buf
+    (let [t   (parse (hex->buf h))
+          xs  (:: (decode-mp-list t (mp-tree-root t)) (Cons float))
+          out (encode-mp (deref Cons) (:: xs (Cons float)))]
+      (mp-tree-free t)
+      out))
+  (defn rt-strs [h : cstr] : Buf
+    (let [t   (parse (hex->buf h))
+          xs  (:: (decode-mp-list t (mp-tree-root t)) (Cons cstr))
+          out (encode-mp (deref Cons) (:: xs (Cons cstr)))]
+      (mp-tree-free t)
+      out))
+  (defn __list-tests [] : void
+    (describe "msgpack EncodeMp [Cons] -- a list is a msgpack array"
+      (it "an int list is a fixarray"
+        (assert-true (hex=? (encode-mp (deref Cons)
+                              (:: (list 1 2 3) (Cons int)))
+                       "93010203")))
+      (it "a singleton"
+        (assert-true (hex=? (encode-mp (deref Cons) (:: (list 42) (Cons int)))
+                       "912a")))
+      (it "the empty list is a bare 0x90"
+        (assert-true (hex=? (encode-mp (deref Cons) (:: (tnil) (Cons int)))
+                       "90")))
+      (it "a float list keeps each element a float64"
+        (assert-true (hex=? (encode-mp (deref Cons)
+                              (:: (list 7.1 2.5) (Cons float)))
+                       "92cb401c666666666666cb4004000000000000")))
+      (it "a string list"
+        (assert-true (hex=? (encode-mp (deref Cons)
+                              (:: (list "a" "bb") (Cons cstr)))
+                       "92a161a26262")))))
+  (defn __list-round-trip-tests [] : void
+    (describe "msgpack decode-mp-list -- array round trip"
+      (it "an int array round-trips"
+        (assert-true (hex=? (rt-ints "93010203") "93010203")))
+      (it "an empty array round-trips"
+        (assert-true (hex=? (rt-ints "90") "90")))
+      (it "a string array round-trips"
+        (assert-true (hex=? (rt-strs "92a161a26262") "92a161a26262")))
+      (it "a float array round-trips"
+        (assert-true (hex=? (rt-floats "92cb3ff8000000000000cb4004000000000000")
+                       "92cb3ff8000000000000cb4004000000000000")))
+      (it "an array16 round-trips past the fixarray boundary"
+        (assert-true (hex=? (rt-ints "dc0010000102030405060708090a0b0c0d0e0f")
+                       "dc0010000102030405060708090a0b0c0d0e0f")))
+      (it "a non-array decodes to the empty list rather than failing"
+        (assert-true (hex=? (rt-ints "07") "90")))))
+  (defn __option-tests [] : void
+    (describe "msgpack EncodeMp [Option] -- present is the element, absent is nil"
+      (it "some int is the bare int"
+        (assert-true (hex=? (encode-mp (:: (some 42) (Option int))) "2a")))
+      (it "none int is nil"
+        (assert-true (hex=? (encode-mp (:: (none) (Option int))) "c0")))
+      (it "some cstr is the bare str"
+        (assert-true (hex=? (encode-mp (:: (some "hi") (Option cstr))) "a26869")))
+      (it "none cstr is nil"
+        (assert-true (hex=? (encode-mp (:: (none) (Option cstr))) "c0")))
+      (it "some float is the bare float64"
+        (assert-true (hex=? (encode-mp (:: (some 3.5) (Option float)))
+                       "cb400c000000000000")))
+      (it "none float is nil"
+        (assert-true (hex=? (encode-mp (:: (none) (Option float))) "c0")))))
+  (defn __option-decode-tests [] : void
+    (describe "msgpack DecodeMp [Option] -- nil and a missing key both give none"
+      (it "an int decodes to some"
+        (let [t (parse (hex->buf "2a"))
+              o (ok-val (:: (decode-mp t (mp-tree-root t))
+                          (Result (Option int) cstr)))
+              r (assert-true (and (some? o) (= 42 (unwrap o))))]
+          (mp-tree-free t)
+          r))
+      (it "an explicit nil decodes to none"
+        (let [t (parse (hex->buf "c0"))
+              o (ok-val (:: (decode-mp t (mp-tree-root t))
+                          (Result (Option int) cstr)))
+              r (assert-true (not (some? o)))]
+          (mp-tree-free t)
+          r))
+      (it "a string decodes to some"
+        (let [t (parse (hex->buf "a26869"))
+              o (ok-val (:: (decode-mp t (mp-tree-root t))
+                          (Result (Option cstr) cstr)))
+              r (assert-true (and (some? o) (cstr-eq? "hi" (unwrap o))))]
+          (mp-tree-free t)
+          r))))
+  (defn main [] : int
+    (__list-tests)
+    (__list-round-trip-tests)
+    (__option-tests)
+    (__option-decode-tests)
+    (run-all-status)))

@@ -7,64 +7,67 @@
 ;; the whole design rests on.
 ;;
 ;; main returns the failure count so `tur test` reports a non-zero exit.
-
 (defmodule crdt/tests/test_counter
   (import crdt/replica :refer [ReplicaId replica replica-sym])
-  (import crdt/counter :refer [gcounter-new gcounter-bump gcounter-value
-                               pncounter-new pncounter-inc pncounter-dec
-                               pncounter-value])
+  (import crdt/counter
+    :refer
+    [gcounter-new
+     gcounter-bump
+     gcounter-value
+     pncounter-new
+     pncounter-inc
+     pncounter-dec
+     pncounter-value])
   (import crdt/lattice :refer [join-all])
-
-(defn fail-if [cond : bool label : cstr] : int
-  (if cond (do (println label) 1) 0))
-
-(defn main [] : int
-  (let [alice (replica (quote alice))
-        bob   (replica (quote bob))
-        carol (replica (quote carol))
-
-        ;; Two replicas that have seen DIFFERENT updates.
-        ra (gcounter-bump (gcounter-bump (gcounter-new) alice 3) bob 1)
-        rb (gcounter-bump (gcounter-bump (gcounter-new) bob 5) carol 2)
-
-        ;; Counter states hold a Map handle, so they are affine: each join
-        ;; CONSUMES its arguments.  Divergent states are rebuilt per assertion
-        ;; rather than reused, which is the honest way to write this -- a CRDT
-        ;; replica does not hand its state away and keep using it either.
-        ra2 (gcounter-bump (gcounter-bump (gcounter-new) alice 3) bob 1)
-        rb2 (gcounter-bump (gcounter-bump (gcounter-new) bob 5) carol 2)
-        ra3 (gcounter-bump (gcounter-bump (gcounter-new) alice 3) bob 1)
-        rb3 (gcounter-bump (gcounter-bump (gcounter-new) bob 5) carol 2)
-        rb4 (gcounter-bump (gcounter-bump (gcounter-new) bob 5) carol 2)
-
-        ;; alice=3, bob=max(1,5)=5, carol=2  -> 10
-        m1 (join ra rb)
-        m2 (join rb3 ra3)
-
-        ;; PN-Counter: 5 up on alice, 2 down on bob -> 3
-        p  (pncounter-dec (pncounter-inc (pncounter-new) alice 5) bob 2)
-        q  (pncounter-inc (pncounter-new) carol 4)
-        pq (join p q)
-
-        fails
-        (+ (fail-if (not (= (gcounter-value ra) 4))  "gcounter ra value")
-           (fail-if (not (= (gcounter-value rb) 7))  "gcounter rb value")
-           (fail-if (not (= (gcounter-value m1) 10)) "gcounter merged value")
-           ;; commutative: merging the other way round gives the same reading
-           (fail-if (not (= (gcounter-value m2) 10)) "gcounter join not commutative")
-           ;; idempotent: re-delivering a state changes nothing.  This is the
-           ;; law a CRDT actually leans on -- duplicate delivery is normal.
-           (fail-if (not (= (gcounter-value (join m1 rb4)) 10))
+  (defn fail-if [cond : bool label : cstr] : int
+    (if cond (do (println label) 1) 0))
+  (defn main [] : int
+    (let [alice (replica (quote alice))
+          bob   (replica (quote bob))
+          carol (replica (quote carol))
+          ;; Two replicas that have seen DIFFERENT updates.
+          ra    (gcounter-bump (gcounter-bump (gcounter-new) alice 3) bob 1)
+          rb    (gcounter-bump (gcounter-bump (gcounter-new) bob 5) carol 2)
+          ;; Counter states hold a Map handle, so they are affine: each join
+          ;; CONSUMES its arguments.  Divergent states are rebuilt per assertion
+          ;; rather than reused, which is the honest way to write this -- a CRDT
+          ;; replica does not hand its state away and keep using it either.
+          ra2   (gcounter-bump (gcounter-bump (gcounter-new) alice 3) bob 1)
+          rb2   (gcounter-bump (gcounter-bump (gcounter-new) bob 5) carol 2)
+          ra3   (gcounter-bump (gcounter-bump (gcounter-new) alice 3) bob 1)
+          rb3   (gcounter-bump (gcounter-bump (gcounter-new) bob 5) carol 2)
+          rb4   (gcounter-bump (gcounter-bump (gcounter-new) bob 5) carol 2)
+          ;; alice=3, bob=max(1,5)=5, carol=2  -> 10
+          m1    (join ra rb)
+          m2    (join rb3 ra3)
+          ;; PN-Counter: 5 up on alice, 2 down on bob -> 3
+          p     (pncounter-dec (pncounter-inc (pncounter-new) alice 5) bob 2)
+          q     (pncounter-inc (pncounter-new) carol 4)
+          pq    (join p q)
+          fails (+ (fail-if (not (= (gcounter-value ra) 4)) "gcounter ra value")
+                  (fail-if (not (= (gcounter-value rb) 7)) "gcounter rb value")
+                  (fail-if (not (= (gcounter-value m1) 10))
+                    "gcounter merged value")
+                  ;; commutative: merging the other way round gives the same reading
+                  (fail-if (not (= (gcounter-value m2) 10))
+                    "gcounter join not commutative")
+                  ;; idempotent: re-delivering a state changes nothing.  This is the
+                  ;; law a CRDT actually leans on -- duplicate delivery is normal.
+                  (fail-if (not (= (gcounter-value (join m1 rb4)) 10))
                     "gcounter join not idempotent")
-           ;; join-all over a Vec, from bottom -- order-independent by the laws
-           (fail-if (not (= (gcounter-value (join-all (vec-of ra2 rb2))) 10))
+                  ;; join-all over a Vec, from bottom -- order-independent by the laws
+                  (fail-if (not (= (gcounter-value (join-all (vec-of ra2 rb2)))
+                                  10))
                     "join-all")
-           (fail-if (not (= (gcounter-value (join-all (:: (vec-of) (Vec GCounter)))) 0))
+                  (fail-if (not (= (gcounter-value (join-all (:: (vec-of)
+                                                               (Vec GCounter))))
+                                  0))
                     "join-all of empty is not bottom")
-           (fail-if (not (= (pncounter-value p) 3))  "pncounter value")
-           (fail-if (not (= (pncounter-value q) 4))  "pncounter q value")
-           (fail-if (not (= (pncounter-value pq) 7)) "pncounter merged value"))]
-    (if (= fails 0) (println "test_counter: ok") (println "test_counter: FAILURES"))
-    fails))
-
-) ;; end defmodule
+                  (fail-if (not (= (pncounter-value p) 3)) "pncounter value")
+                  (fail-if (not (= (pncounter-value q) 4)) "pncounter q value")
+                  (fail-if (not (= (pncounter-value pq) 7))
+                    "pncounter merged value"))]
+      (if (= fails 0)
+        (println "test_counter: ok")
+        (println "test_counter: FAILURES"))
+      fails))) ;; end defmodule

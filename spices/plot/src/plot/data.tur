@@ -7,41 +7,44 @@
 ;;; draw (or one bounds query) and `__free-cells` releases them after, so the
 ;;; drawing code never depends on how a Vec stores its elements.
 ;; Typed renderer data and its lowering for the C draw pass.
-
 (defmodule plot/data
-  (export Point Rect ErrorBar Arrow Bar Group Cells
-          __points->cells __values->cells __error-bars->cells __arrows->cells
-          __rects->cells __bars->cells __groups->cells __labels->cells
-          __free-cells __free-groups)
-
+  (export Point
+    Rect
+    ErrorBar
+    Arrow
+    Bar
+    Group
+    Cells
+    __points->cells
+    __values->cells
+    __error-bars->cells
+    __arrows->cells
+    __rects->cells
+    __bars->cells
+    __groups->cells
+    __labels->cells
+    __free-cells
+    __free-groups)
   ;;; Point -- a data point, or (for a vector field's callback) a direction.
-  (defstruct ^copy Point [x : float  y : float])
-
+  (defstruct ^copy Point [x : float y : float])
   ;;; Rect -- the axis-aligned rectangle between x0..x1 and y0..y1 (either end
   ;;; may be the larger).
-  (defstruct ^copy Rect [x0 : float  x1 : float  y0 : float  y1 : float])
-
+  (defstruct ^copy Rect [x0 : float x1 : float y0 : float y1 : float])
   ;;; ErrorBar -- a value y at x with symmetric error `err`.
-  (defstruct ^copy ErrorBar [x : float  y : float  err : float])
-
+  (defstruct ^copy ErrorBar [x : float y : float err : float])
   ;;; Arrow -- an arrow from (x0, y0) to (x1, y1), head at the second point.
-  (defstruct ^copy Arrow [x0 : float  y0 : float  x1 : float  y1 : float])
-
+  (defstruct ^copy Arrow [x0 : float y0 : float x1 : float y1 : float])
   ;;; Bar -- one category of a discrete histogram: its tick label and height.
-  (defstruct ^copy Bar [label : cstr  height : float])
-
+  (defstruct ^copy Bar [label : cstr height : float])
   ;;; Group -- one category of a stacked histogram: its tick label and the
   ;;; heights of its layers, bottom first.
-  (defstruct ^copy Group [label : cstr  values : (Vec float)])
-
+  (defstruct ^copy Group [label : cstr values : (Vec float)])
   ;;; Cells -- internal: a renderer's data lowered to the cons cells the C draw
   ;;; pass reads. Built by a `__*->cells` adapter, released by `__free-cells`.
   (defopaque Cells :ptr<void>)
-
   ;; --- cell builders ---------------------------------------------------------
-
   ;;; __cell -- internal: a fresh cons cell (head . tail), as a word.
-  (defn __cell [head : int  tail : int] : int
+  (defn __cell [head : int tail : int] : int
     ```c
     #include <stdlib.h>
     typedef struct { int64_t head; int64_t tail; } Cons;
@@ -49,108 +52,106 @@
     c->head = head; c->tail = tail;
     return (int64_t)(intptr_t)c;
     ```)
-
   ;;; __bits -- internal: a double's bit pattern, as the cells store it.
   (defn __bits [x : float] : int
     ```c union { double d; int64_t i; } u; u.d = x; return u.i; ```)
-
   ;;; __text-word -- internal: a cstr's pointer, as the cells store it.
-  (defn __text-word [s : cstr] : int
-    ```c return (int64_t)(intptr_t)s; ```)
-
+  (defn __text-word [s : cstr] : int ```c return (int64_t)(intptr_t)s; ```)
   ;;; __cells-raw -- internal: a built cell list's word as a bare pointer.
-  (defn __cells-raw [w : int] : ptr<void>
-    ```c return (void *)(intptr_t)w; ```)
+  (defn __cells-raw [w : int] : ptr<void> ```c return (void *)(intptr_t)w; ```)
   ;;; __as-cells -- internal: a built cell list as Cells.
   (defn __as-cells [w : int] : Cells (:: (__cells-raw w) Cells))
-
   ;; Each lowering folds from the last element, consing onto the list built
   ;; so far, so the cells come out in Vec order.
-
-  (defn __points-from [v : (Vec Point)  i : int  acc : int] : int
-    (if (< i 0) acc
+  (defn __points-from [v : (Vec Point) i : int acc : int] : int
+    (if (< i 0)
+      acc
       (let [p (vec-get v i)]
-        (__points-from v (- i 1) (__cell (__cell (__bits (.x p)) (__bits (.y p))) acc)))))
-
+        (__points-from v
+          (- i 1)
+          (__cell (__cell (__bits (.x p)) (__bits (.y p))) acc)))))
   ;;; __points->cells -- internal: ((x . y) ...), one pair per point.
   (defn __points->cells [v : (Vec Point)] : Cells
     (__as-cells (__points-from v (- (vec-len v) 1) 0)))
-
-  (defn __values-from [v : (Vec float)  i : int  acc : int] : int
-    (if (< i 0) acc
+  (defn __values-from [v : (Vec float) i : int acc : int] : int
+    (if (< i 0)
+      acc
       (__values-from v (- i 1) (__cell (__bits (vec-get v i)) acc))))
-
   ;;; __values->cells -- internal: (v ...), one bit pattern per value.
   (defn __values->cells [v : (Vec float)] : Cells
     (__as-cells (__values-from v (- (vec-len v) 1) 0)))
-
-  (defn __error-bars-from [v : (Vec ErrorBar)  i : int  acc : int] : int
-    (if (< i 0) acc
+  (defn __error-bars-from [v : (Vec ErrorBar) i : int acc : int] : int
+    (if (< i 0)
+      acc
       (let [b (vec-get v i)]
-        (__error-bars-from v (- i 1)
-                           (__cell (__cell (__bits (.x b)) (__cell (__bits (.y b)) (__bits (.err b))))
-                                   acc)))))
-
+        (__error-bars-from v
+          (- i 1)
+          (__cell (__cell (__bits (.x b))
+                    (__cell (__bits (.y b)) (__bits (.err b))))
+            acc)))))
   ;;; __error-bars->cells -- internal: ((x . (y . err)) ...).
   (defn __error-bars->cells [v : (Vec ErrorBar)] : Cells
     (__as-cells (__error-bars-from v (- (vec-len v) 1) 0)))
-
   ;;; __quad -- internal: the cells (a . (b . (c . d))).
-  (defn __quad [a : float  b : float  c : float  d : float] : int
+  (defn __quad [a : float b : float c : float d : float] : int
     (__cell (__bits a) (__cell (__bits b) (__cell (__bits c) (__bits d)))))
-
-  (defn __arrows-from [v : (Vec Arrow)  i : int  acc : int] : int
-    (if (< i 0) acc
+  (defn __arrows-from [v : (Vec Arrow) i : int acc : int] : int
+    (if (< i 0)
+      acc
       (let [a (vec-get v i)]
-        (__arrows-from v (- i 1) (__cell (__quad (.x0 a) (.y0 a) (.x1 a) (.y1 a)) acc)))))
-
+        (__arrows-from v
+          (- i 1)
+          (__cell (__quad (.x0 a) (.y0 a) (.x1 a) (.y1 a)) acc)))))
   ;;; __arrows->cells -- internal: ((x0 . (y0 . (x1 . y1))) ...).
   (defn __arrows->cells [v : (Vec Arrow)] : Cells
     (__as-cells (__arrows-from v (- (vec-len v) 1) 0)))
-
-  (defn __rects-from [v : (Vec Rect)  i : int  acc : int] : int
-    (if (< i 0) acc
+  (defn __rects-from [v : (Vec Rect) i : int acc : int] : int
+    (if (< i 0)
+      acc
       (let [r (vec-get v i)]
-        (__rects-from v (- i 1) (__cell (__quad (.x0 r) (.x1 r) (.y0 r) (.y1 r)) acc)))))
-
+        (__rects-from v
+          (- i 1)
+          (__cell (__quad (.x0 r) (.x1 r) (.y0 r) (.y1 r)) acc)))))
   ;;; __rects->cells -- internal: ((x0 . (x1 . (y0 . y1))) ...).
   (defn __rects->cells [v : (Vec Rect)] : Cells
     (__as-cells (__rects-from v (- (vec-len v) 1) 0)))
-
-  (defn __bars-from [v : (Vec Bar)  i : int  acc : int] : int
-    (if (< i 0) acc
+  (defn __bars-from [v : (Vec Bar) i : int acc : int] : int
+    (if (< i 0)
+      acc
       (let [b (vec-get v i)]
-        (__bars-from v (- i 1) (__cell (__cell (__text-word (.label b)) (__bits (.height b))) acc)))))
-
+        (__bars-from v
+          (- i 1)
+          (__cell (__cell (__text-word (.label b)) (__bits (.height b))) acc)))))
   ;;; __bars->cells -- internal: ((label . height) ...).
   (defn __bars->cells [v : (Vec Bar)] : Cells
     (__as-cells (__bars-from v (- (vec-len v) 1) 0)))
-
-  (defn __groups-from [v : (Vec Group)  i : int  acc : int] : int
-    (if (< i 0) acc
-      (let [g (vec-get v i)
+  (defn __groups-from [v : (Vec Group) i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (let [g  (vec-get v i)
             vs (.values g)]
-        (__groups-from v (- i 1)
-                       (__cell (__cell (__text-word (.label g)) (__values-from vs (- (vec-len vs) 1) 0))
-                               acc)))))
-
+        (__groups-from v
+          (- i 1)
+          (__cell (__cell (__text-word (.label g))
+                    (__values-from vs (- (vec-len vs) 1) 0))
+            acc)))))
   ;;; __groups->cells -- internal: ((label . (v ...)) ...); free with __free-groups.
   (defn __groups->cells [v : (Vec Group)] : Cells
     (__as-cells (__groups-from v (- (vec-len v) 1) 0)))
-
-  (defn __labels-from [v : (Vec cstr)  i : int  acc : int] : int
-    (if (< i 0) acc
-      (__labels-from v (- i 1) (__cell (__cell (__text-word (vec-get v i)) 0) acc))))
-
+  (defn __labels-from [v : (Vec cstr) i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (__labels-from v
+        (- i 1)
+        (__cell (__cell (__text-word (vec-get v i)) 0) acc))))
   ;;; __labels->cells -- internal: ((label . 0) ...), the category ticks' shape.
   (defn __labels->cells [v : (Vec cstr)] : Cells
     (__as-cells (__labels-from v (- (vec-len v) 1) 0)))
-
   ;;; __free-cells -- internal: free a lowered list whose elements are chains of
   ;;; `depth` cells linked through their tails (0: the heads are values, 1: a
   ;;; pair per element, 2: an error bar, 3: a quad). The labels the cells point
   ;;; at belong to the typed data.
-  (defn __free-cells [cells : Cells  depth : int] : void
+  (defn __free-cells [cells : Cells depth : int] : void
     ```c
     #include <stdlib.h>
     typedef struct { int64_t head; int64_t tail; } Cons;
@@ -167,7 +168,6 @@
       p = next;
     }
     ```)
-
   ;;; __free-groups -- internal: free a list built by `__groups->cells`.
   (defn __free-groups [cells : Cells] : void
     ```c
@@ -185,6 +185,4 @@
       free(p);
       p = next;
     }
-    ```)
-
-) ;; end defmodule plot/data
+    ```)) ;; end defmodule plot/data

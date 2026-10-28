@@ -18,29 +18,51 @@
 ;;
 ;; The generator is seeded, so a failure names the iteration that reproduces
 ;; it: TUR_FUZZ_ITERS and TUR_FUZZ_SEED override the defaults.
-
-(defmodule xml_fuzz_fixture (export)
-
-(import dom/ownstr :refer [String to-cstr release])
-(import dom/core   :refer [Document ParseError dom-node dom-free dom-serialize
-                           dom-equal? parse-error-release])
-(import dom/event  :refer [SaxEvent SaxControl Attr StartElement EndElement
-                           Chars Comment Pi StartCdata EndCdata Doctype
-                           Continue])
-(import xml/sax    :refer [SaxParser sax-parse-string sax-parser-new sax-feed!
-                           sax-finish! sax-parser-free])
-(import xml/dom    :refer [dom-parse-string dom-parse-string-opts])
-(import xml/sax    :refer [ParseOpts default-parse-opts])
-(import xml/transform :refer [sax-transform sax-transform-opts])
-(import dom/writer :refer [TransformError transform-error-message
-                           transform-error-release sax-keep])
-
-;; ---- traces (0 = one-shot, 1 = push) --------------------------------------
-
-;;; __t-reset -- clear trace `which` and make it current.
-(defn __t-reset [which : int] : nil
-  ```c
-  /* __tur_include__: #include <stddef.h> */
+(defmodule xml_fuzz_fixture
+  (export)
+  (import dom/ownstr :refer [String to-cstr release])
+  (import dom/core
+    :refer
+    [Document
+     ParseError
+     dom-node
+     dom-free
+     dom-serialize
+     dom-equal?
+     parse-error-release])
+  (import dom/event
+    :refer
+    [SaxEvent
+     SaxControl
+     Attr
+     StartElement
+     EndElement
+     Chars
+     Comment
+     Pi
+     StartCdata
+     EndCdata
+     Doctype
+     Continue])
+  (import xml/sax
+    :refer
+    [SaxParser
+     sax-parse-string
+     sax-parser-new
+     sax-feed!
+     sax-finish!
+     sax-parser-free])
+  (import xml/dom :refer [dom-parse-string dom-parse-string-opts])
+  (import xml/sax :refer [ParseOpts default-parse-opts])
+  (import xml/transform :refer [sax-transform sax-transform-opts])
+  (import dom/writer
+    :refer
+    [TransformError transform-error-message transform-error-release sax-keep])
+  ;; ---- traces (0 = one-shot, 1 = push) --------------------------------------
+  ;;; __t-reset -- clear trace `which` and make it current.
+  (defn __t-reset [which : int] : nil
+    ```c
+    /* __tur_include__: #include <stddef.h> */
   /* __tur_include__: #include <stdint.h> */
   /* __tur_include__: static char *g_tr[2] = {0, 0}; */
   /* __tur_include__: static size_t g_tr_len[2] = {0, 0}, g_tr_cap[2] = {0, 0}; */
@@ -49,11 +71,10 @@
   if (g_tr[which]) g_tr[which][0] = '\0';
   g_tr_cur = (int)which;
   ```)
-
-;;; __t-put -- append to the current trace.
-(defn __t-put [s : cstr] : nil
-  ```c
-  int w = g_tr_cur;
+  ;;; __t-put -- append to the current trace.
+  (defn __t-put [s : cstr] : nil
+    ```c
+    int w = g_tr_cur;
   size_t n = strlen((const char *)s);
   if (g_tr_len[w] + n + 1 > g_tr_cap[w]) {
     size_t cap = g_tr_cap[w] ? g_tr_cap[w] : 256;
@@ -65,68 +86,83 @@
   g_tr_len[w] += n;
   g_tr[w][g_tr_len[w]] = '\0';
   ```)
-
-;;; __t-same? -- are both traces identical?
-(defn __t-same? [] : bool
-  ```c
-  const char *a = g_tr[0] ? g_tr[0] : "", *b = g_tr[1] ? g_tr[1] : "";
+  ;;; __t-same? -- are both traces identical?
+  (defn __t-same? [] : bool
+    ```c
+    const char *a = g_tr[0] ? g_tr[0] : "", *b = g_tr[1] ? g_tr[1] : "";
   return strcmp(a, b) == 0;
   ```)
-
-;;; __trace-attrs -- record attributes.
-(defn __trace-attrs [xs : (Cons Attr)] : nil
-  (if (tnil? xs)
-    nil
-    (do (__t-put " ") (__t-put (to-cstr (.name (thead xs))))
-        (__t-put "=") (__t-put (to-cstr (.value (thead xs))))
+  ;;; __trace-attrs -- record attributes.
+  (defn __trace-attrs [xs : (Cons Attr)] : nil
+    (if (tnil? xs)
+      nil
+      (do
+        (__t-put " ")
+        (__t-put (to-cstr (.name (thead xs))))
+        (__t-put "=")
+        (__t-put (to-cstr (.value (thead xs))))
         (__trace-attrs (ttail xs)))))
-
-;;; trace -- record one event.
-(defn trace [e : SaxEvent] : SaxControl
-  (do
-    (match e
-      (StartElement n as) (do (__t-put "S ") (__t-put (to-cstr n))
-                              (__trace-attrs as) (__t-put "|"))
-      (EndElement n)      (do (__t-put "E ") (__t-put (to-cstr n)) (__t-put "|"))
-      (Chars t)           (do (__t-put "T ") (__t-put (to-cstr t)) (__t-put "|"))
-      (Comment t)         (do (__t-put "C ") (__t-put (to-cstr t)) (__t-put "|"))
-      (Pi t d)            (do (__t-put "P ") (__t-put (to-cstr t)) (__t-put " ")
-                              (__t-put (to-cstr d)) (__t-put "|"))
-      (StartCdata)        (__t-put "[|")
-      (EndCdata)          (__t-put "]|")
-      (Doctype n p s)     (do (__t-put "D ") (__t-put (to-cstr n)) (__t-put " ")
-                              (__t-put (to-cstr p)) (__t-put " ")
-                              (__t-put (to-cstr s)) (__t-put "|")))
-    (Continue)))
-
-;; ---- generator ------------------------------------------------------------
-
-;;; __seed-rng -- seed the generator.
-(defn __seed-rng [seed : int] : nil
-  ```c
-  /* __tur_include__: static uint64_t g_fz = 1; */
+  ;;; trace -- record one event.
+  (defn trace [e : SaxEvent] : SaxControl
+    (do
+      (match e
+        (StartElement n as)
+        (do
+          (__t-put "S ")
+          (__t-put (to-cstr n))
+          (__trace-attrs as)
+          (__t-put "|"))
+        (EndElement n)
+        (do (__t-put "E ") (__t-put (to-cstr n)) (__t-put "|"))
+        (Chars t)
+        (do (__t-put "T ") (__t-put (to-cstr t)) (__t-put "|"))
+        (Comment t)
+        (do (__t-put "C ") (__t-put (to-cstr t)) (__t-put "|"))
+        (Pi t d)
+        (do
+          (__t-put "P ")
+          (__t-put (to-cstr t))
+          (__t-put " ")
+          (__t-put (to-cstr d))
+          (__t-put "|"))
+        (StartCdata)
+        (__t-put "[|")
+        (EndCdata)
+        (__t-put "]|")
+        (Doctype n p s)
+        (do
+          (__t-put "D ")
+          (__t-put (to-cstr n))
+          (__t-put " ")
+          (__t-put (to-cstr p))
+          (__t-put " ")
+          (__t-put (to-cstr s))
+          (__t-put "|")))
+      (Continue)))
+  ;; ---- generator ------------------------------------------------------------
+  ;;; __seed-rng -- seed the generator.
+  (defn __seed-rng [seed : int] : nil
+    ```c
+    /* __tur_include__: static uint64_t g_fz = 1; */
   g_fz = (uint64_t)seed * 0x9E3779B97F4A7C15ULL + 0x632BE59BD9B4E019ULL;
   if (!g_fz) g_fz = 1;
   ```)
-
-;;; __rnd -- a value in [0, n).
-(defn __rnd [n : int] : int
-  ```c
-  g_fz ^= g_fz << 13; g_fz ^= g_fz >> 7; g_fz ^= g_fz << 17;
+  ;;; __rnd -- a value in [0, n).
+  (defn __rnd [n : int] : int
+    ```c
+    g_fz ^= g_fz << 13; g_fz ^= g_fz >> 7; g_fz ^= g_fz << 17;
   return n > 0 ? (int64_t)(g_fz % (uint64_t)n) : 0;
   ```)
-
-;;; __env-int -- an integer environment variable, or `dflt`.
-(defn __env-int [name : cstr dflt : int] : int
-  ```c
-  const char *v = getenv((const char *)name);
+  ;;; __env-int -- an integer environment variable, or `dflt`.
+  (defn __env-int [name : cstr dflt : int] : int
+    ```c
+    const char *v = getenv((const char *)name);
   return (v && *v) ? (int64_t)strtoll(v, NULL, 10) : dflt;
   ```)
-
-;;; __mutant -- a malloc'd mutation of seed document `which`.
-(defn __mutant [which : int] : cstr
-  ```c
-  static const char *seeds[] = {
+  ;;; __mutant -- a malloc'd mutation of seed document `which`.
+  (defn __mutant [which : int] : cstr
+    ```c
+    static const char *seeds[] = {
     "<?xml version=\"1.0\"?>\n<!DOCTYPE feed [<!ENTITY co \"T &amp; C\">]>\n"
     "<feed xmlns=\"urn:atom\" xmlns:m=\"urn:m\"><title type=\"t\">Caf\xC3\xA9 &co;</title>"
     "<entry m:id=\"1\"><![CDATA[<raw>]]><?pi d?><!-- c --></entry></feed>",
@@ -179,182 +215,204 @@
   s[len] = '\0';
   return s;
   ```)
-
-;;; __len -- byte length.
-(defn __len [s : cstr] : int
-  ```c
-  return (int64_t)strlen((const char *)s);
+  ;;; __len -- byte length.
+  (defn __len [s : cstr] : int
+    ```c
+    return (int64_t)strlen((const char *)s);
   ```)
-
-;;; __slice -- malloc'd copy of s[off, off+n).
-(defn __slice [s : cstr off : int n : int] : cstr
-  ```c
-  char *p = (char *)malloc((size_t)n + 1);
+  ;;; __slice -- malloc'd copy of s[off, off+n).
+  (defn __slice [s : cstr off : int n : int] : cstr
+    ```c
+    char *p = (char *)malloc((size_t)n + 1);
   memcpy(p, (const char *)s + off, (size_t)n);
   p[n] = '\0';
   return p;
   ```)
-
-;;; __free-cstr -- free a malloc'd cstr.
-(defn __free-cstr [s : cstr] : nil
-  ```c
-  free((void *)s);
+  ;;; __free-cstr -- free a malloc'd cstr.
+  (defn __free-cstr [s : cstr] : nil
+    ```c
+    free((void *)s);
   ```)
-
-;;; __report -- print a failing case to stderr.
-(defn __report [what : cstr iter : int doc : cstr] : nil
-  ```c
-  #include <stdio.h>
+  ;;; __report -- print a failing case to stderr.
+  (defn __report [what : cstr iter : int doc : cstr] : nil
+    ```c
+    #include <stdio.h>
   fprintf(stderr, "FUZZ FAILURE (%s) at iteration %lld; input:\n%s\n---\n",
           what, (long long)iter, doc);
   ```)
-
-;; ---- one iteration --------------------------------------------------------
-
-;;; feed-random -- push src in random chunks; true when every feed was ok.
-;;;
-;;; A while loop, not self-recursion: sax-feed! calls the handler closure, so
-;;; a recursive feeder is CPS-converted and nests one frame chain per chunk.
-(defn feed-random [p : SaxParser src : cstr len : int] : bool
-  (let [^mut off 0
-        ^mut ok  true]
-    (while (< off len)
-      (let [want  (+ 1 (__rnd 13))
-            n     (if (> (+ off want) len) (- len off) want)
-            chunk (__slice src off n)
-            r     (sax-feed! p chunk)]
-        (__free-cstr chunk)
-        (match r (Ok _) nil (Err e) (do (parse-error-release e) (set! ok false)))
-        (set! off (+ off n))))
-    ok))
-
-;;; ok-release? -- did a parse succeed? Releases the error when it did not.
-(defn ok-release? [r : (Result nil ParseError)] : bool
-  (match r (Ok _) true (Err e) (do (parse-error-release e) false)))
-
-;;; push-ok? -- push-parse src into trace 1; true when it succeeded.
-(defn push-ok? [src : cstr] : bool
-  (do (__t-reset 1)
+  ;; ---- one iteration --------------------------------------------------------
+  ;;; feed-random -- push src in random chunks; true when every feed was ok.
+  ;;;
+  ;;; A while loop, not self-recursion: sax-feed! calls the handler closure, so
+  ;;; a recursive feeder is CPS-converted and nests one frame chain per chunk.
+  (defn feed-random [p : SaxParser src : cstr len : int] : bool
+    (let [^mut off 0
+          ^mut ok  true]
+      (while (< off len)
+        (let [want  (+ 1 (__rnd 13))
+              n     (if (> (+ off want) len) (- len off) want)
+              chunk (__slice src off n)
+              r     (sax-feed! p chunk)]
+          (__free-cstr chunk)
+          (match r
+            (Ok _)
+            nil
+            (Err e)
+            (do (parse-error-release e) (set! ok false)))
+          (set! off (+ off n))))
+      ok))
+  ;;; ok-release? -- did a parse succeed? Releases the error when it did not.
+  (defn ok-release? [r : (Result nil ParseError)] : bool
+    (match r (Ok _) true (Err e) (do (parse-error-release e) false)))
+  ;;; push-ok? -- push-parse src into trace 1; true when it succeeded.
+  (defn push-ok? [src : cstr] : bool
+    (do
+      (__t-reset 1)
       (match (sax-parser-new trace)
-        (Err _) false
-        (Ok p)  (let [fed (feed-random p src (__len src))
-                      fin (sax-finish! p)]
-                  (sax-parser-free p)
-                  (and fed (ok-release? fin))))))
-
-;;; roundtrip-ok? -- serialize d, reparse, compare.
-(defn roundtrip-ok? [d : Document] : bool
-  (let [s (dom-serialize (dom-node d))]
-    (match (dom-parse-string (to-cstr s))
-      (Ok d2) (let [eq (dom-equal? (dom-node d) (dom-node d2))]
-                (dom-free d2)
-                (release s)
-                eq)
-      (Err e) (do (parse-error-release e) (release s) false))))
-
-;;; __note -- print a line to stderr.
-(defn __note [s : cstr] : nil
-  ```c
-  #include <stdio.h>
+        (Err _)
+        false
+        (Ok p)
+        (let [fed (feed-random p src (__len src))
+              fin (sax-finish! p)]
+          (sax-parser-free p)
+          (and fed (ok-release? fin))))))
+  ;;; roundtrip-ok? -- serialize d, reparse, compare.
+  (defn roundtrip-ok? [d : Document] : bool
+    (let [s (dom-serialize (dom-node d))]
+      (match (dom-parse-string (to-cstr s))
+        (Ok d2)
+        (let [eq (dom-equal? (dom-node d) (dom-node d2))]
+          (dom-free d2)
+          (release s)
+          eq)
+        (Err e)
+        (do (parse-error-release e) (release s) false))))
+  ;;; __note -- print a line to stderr.
+  (defn __note [s : cstr] : nil
+    ```c
+    #include <stdio.h>
   fprintf(stderr, "#   %s\n", (const char *)s);
   ```)
-
-;;; __cstr= -- byte equality.
-(defn __cstr= [a : cstr b : cstr] : bool
-  ```c
-  return strcmp((const char *)a, (const char *)b) == 0;
+  ;;; __cstr= -- byte equality.
+  (defn __cstr= [a : cstr b : cstr] : bool
+    ```c
+    return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-;;; refused -- note why a transform failed; false.
-(defn refused [e : TransformError] : bool
-  (do (__note (transform-error-message e))
-      (transform-error-release e)
-      false))
-
-;;; ns-off -- XML 1.0 without Namespaces.
-(defn ns-off [] : ParseOpts
-  (with (default-parse-opts) [namespaces false]))
-
-;;; identity-off-ok? -- property 5: when doc parses with namespaces off,
-;;; sax-keep through a SaxWriter reproduces dom-serialize byte for byte.
-(defn identity-off-ok? [doc : cstr] : bool
-  (match (dom-parse-string-opts doc (ns-off))
-    (Err e) (do (parse-error-release e) true)
-    (Ok d)  (let [want (dom-serialize (dom-node d))
-                  ok   (match (sax-transform-opts doc (ns-off) sax-keep)
-                         (Ok out) (let [b (__cstr= (to-cstr out) (to-cstr want))]
-                                    (if b nil (do (__note (to-cstr out)) (__note (to-cstr want))))
-                                    (release out)
-                                    b)
-                         (Err e)  (refused e))]
-              (release want)
-              (dom-free d)
-              ok)))
-
-;;; identity-on-ok? -- property 6: when doc parsed (trace 0 holds its
-;;; events, namespaces on), the identity output parses to the same events.
-(defn identity-on-ok? [doc : cstr sax-ok : bool] : bool
-  (if (not sax-ok)
-    true
-    (match (sax-transform doc sax-keep)
-      (Err e)  (refused e)
-      (Ok out) (do (__t-reset 1)
-                   (let [p    (ok-release? (sax-parse-string (to-cstr out) trace))
-                         same (__t-same?)]
-                     (if (and p same) nil (__note (to-cstr out)))
+  ;;; refused -- note why a transform failed; false.
+  (defn refused [e : TransformError] : bool
+    (do (__note (transform-error-message e)) (transform-error-release e) false))
+  ;;; ns-off -- XML 1.0 without Namespaces.
+  (defn ns-off [] : ParseOpts (with (default-parse-opts) [namespaces false]))
+  ;;; identity-off-ok? -- property 5: when doc parses with namespaces off,
+  ;;; sax-keep through a SaxWriter reproduces dom-serialize byte for byte.
+  (defn identity-off-ok? [doc : cstr] : bool
+    (match (dom-parse-string-opts doc (ns-off))
+      (Err e)
+      (do (parse-error-release e) true)
+      (Ok d)
+      (let [want (dom-serialize (dom-node d))
+            ok   (match (sax-transform-opts doc (ns-off) sax-keep)
+                   (Ok out)
+                   (let [b (__cstr= (to-cstr out) (to-cstr want))]
+                     (if b
+                       nil
+                       (do (__note (to-cstr out)) (__note (to-cstr want))))
                      (release out)
-                     (and p same))))))
-
-;;; one -- run every check on one mutant; true when all hold.
-(defn one [iter : int] : bool
-  (let [doc     (__mutant (__rnd 4))
-        sax-ok  (do (__t-reset 0)
-                    (ok-release? (sax-parse-string doc trace)))
-        push-ok (push-ok? doc)
-        same    (__t-same?)
-        good    (if (not same)
-                  (do (__report "one-shot and push events differ" iter doc) false)
-                  (if (not (= sax-ok push-ok))
-                    (do (__report "one-shot and push disagree on success" iter doc) false)
-                    (match (dom-parse-string doc)
-                      (Ok d)  (let [rt (roundtrip-ok? d)]
-                                (dom-free d)
-                                (if (not sax-ok)
-                                  (do (__report "DOM accepted what SAX rejected" iter doc) false)
-                                  (if rt
-                                    true
-                                    (do (__report "serialize -> reparse not equal" iter doc) false))))
-                      (Err e) (do (parse-error-release e)
-                                  (if sax-ok
-                                    (do (__report "DOM rejected what SAX accepted" iter doc) false)
-                                    true)))))
-        id-off  (if (identity-off-ok? doc)
-                  true
-                  (do (__report "identity (namespaces off) differs from dom-serialize" iter doc)
+                     b)
+                   (Err e)
+                   (refused e))]
+        (release want)
+        (dom-free d)
+        ok)))
+  ;;; identity-on-ok? -- property 6: when doc parsed (trace 0 holds its
+  ;;; events, namespaces on), the identity output parses to the same events.
+  (defn identity-on-ok? [doc : cstr sax-ok : bool] : bool
+    (if (not sax-ok)
+      true
+      (match (sax-transform doc sax-keep)
+        (Err e)
+        (refused e)
+        (Ok out)
+        (do
+          (__t-reset 1)
+          (let [p    (ok-release? (sax-parse-string (to-cstr out) trace))
+                same (__t-same?)]
+            (if (and p same) nil (__note (to-cstr out)))
+            (release out)
+            (and p same))))))
+  ;;; one -- run every check on one mutant; true when all hold.
+  (defn one [iter : int] : bool
+    (let [doc     (__mutant (__rnd 4))
+          sax-ok  (do (__t-reset 0) (ok-release? (sax-parse-string doc trace)))
+          push-ok (push-ok? doc)
+          same    (__t-same?)
+          good    (if (not same)
+                    (do
+                      (__report "one-shot and push events differ" iter doc)
+                      false)
+                    (if (not (= sax-ok push-ok))
+                      (do
+                        (__report "one-shot and push disagree on success"
+                          iter
+                          doc)
+                        false)
+                      (match (dom-parse-string doc)
+                        (Ok d)
+                        (let [rt (roundtrip-ok? d)]
+                          (dom-free d)
+                          (if (not sax-ok)
+                            (do
+                              (__report "DOM accepted what SAX rejected"
+                                iter
+                                doc)
+                              false)
+                            (if rt
+                              true
+                              (do
+                                (__report "serialize -> reparse not equal"
+                                  iter
+                                  doc)
+                                false))))
+                        (Err e)
+                        (do
+                          (parse-error-release e)
+                          (if sax-ok
+                            (do
+                              (__report "DOM rejected what SAX accepted"
+                                iter
+                                doc)
+                              false)
+                            true)))))
+          id-off  (if (identity-off-ok? doc)
+                    true
+                    (do
+                      (__report "identity (namespaces off) differs from dom-serialize"
+                        iter
+                        doc)
                       false))
-        id-on   (if (identity-on-ok? doc sax-ok)
-                  true
-                  (do (__report "identity (namespaces on) changed the events" iter doc)
+          id-on   (if (identity-on-ok? doc sax-ok)
+                    true
+                    (do
+                      (__report "identity (namespaces on) changed the events"
+                        iter
+                        doc)
                       false))]
-    (__free-cstr doc)
-    (and good id-off id-on)))
-
-(defn main [] : int
-  ;; The iteration loop lives in main on purpose. Every SAX entry point calls
-  ;; a handler closure, so its callers are CPS-converted, and continuation
-  ;; frames are reclaimed when the outermost direct-style call returns. A
-  ;; loop inside a helper defn would keep every iteration's frames (~4 KiB
-  ;; each here) until the helper returned; main is direct, so each call to
-  ;; `one` hands its frames back as it returns.
-  (let [iters    (__env-int "TUR_FUZZ_ITERS" 3000)
-        ^mut i     0
-        ^mut fails 0]
-    (__seed-rng (__env-int "TUR_FUZZ_SEED" 20261010))
-    (while (< i iters)
-      (if (one i) nil (set! fails (+ fails 1)))
-      (set! i (+ i 1)))
-    (if (= fails 0)
-      (do (println "ok - xml fuzz: every property held") 0)
-      (do (println "not ok - xml fuzz: property failures") 1))))
-
-) ;; end defmodule xml_fuzz_fixture
+      (__free-cstr doc)
+      (and good id-off id-on)))
+  (defn main [] : int
+    ;; The iteration loop lives in main on purpose. Every SAX entry point calls
+    ;; a handler closure, so its callers are CPS-converted, and continuation
+    ;; frames are reclaimed when the outermost direct-style call returns. A
+    ;; loop inside a helper defn would keep every iteration's frames (~4 KiB
+    ;; each here) until the helper returned; main is direct, so each call to
+    ;; `one` hands its frames back as it returns.
+    (let [iters      (__env-int "TUR_FUZZ_ITERS" 3000)
+          ^mut i     0
+          ^mut fails 0]
+      (__seed-rng (__env-int "TUR_FUZZ_SEED" 20261010))
+      (while (< i iters)
+        (if (one i) nil (set! fails (+ fails 1)))
+        (set! i (+ i 1)))
+      (if (= fails 0)
+        (do (println "ok - xml fuzz: every property held") 0)
+        (do (println "not ok - xml fuzz: property failures") 1))))) ;; end defmodule xml_fuzz_fixture

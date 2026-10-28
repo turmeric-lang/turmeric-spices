@@ -6,158 +6,158 @@
 ;; against either the original builder applied to the same operands or the
 ;; literal string that builder is documented to emit.
 (defmodule c-dsl/tests/ir
-  (import c-dsl/ir    :refer [ce-raw ce-var ce-lit ce-binop ce-unop ce-addr
-                              ce-deref ce-ternary ce-index ce-cast
-                              cs-raw cs-expr cs-return cs-return-void cs-set
-                              cs-if cs-if-only cs-while cs-do-while cs-seq
-                              node->c node-size])
-  (import c-dsl/core  :refer [c-binop c-unop c-ternary c-if c-if-only
-                              c-while c-do-while c-return c-set!])
-  (import c-dsl/mem   :refer [c-index c-addr c-deref c-cast])
+  (import c-dsl/ir
+    :refer
+    [ce-raw
+     ce-var
+     ce-lit
+     ce-binop
+     ce-unop
+     ce-addr
+     ce-deref
+     ce-ternary
+     ce-index
+     ce-cast
+     cs-raw
+     cs-expr
+     cs-return
+     cs-return-void
+     cs-set
+     cs-if
+     cs-if-only
+     cs-while
+     cs-do-while
+     cs-seq
+     node->c
+     node-size])
+  (import c-dsl/core
+    :refer
+    [c-binop c-unop c-ternary c-if c-if-only c-while c-do-while c-return c-set!])
+  (import c-dsl/mem :refer [c-index c-addr c-deref c-cast])
   (import test/assert :refer [assert-true])
-  (import test/suite  :refer [describe it])
+  (import test/suite :refer [describe it])
   (import test/runner :refer [run-all-status])
-
   (defn cstr= [a : cstr b : cstr] : bool
     ```c
     #include <string.h>
     return strcmp((const char*)(intptr_t)a, (const char*)(intptr_t)b) == 0;
     ```)
-
   (defn int= [a : int b : int] : bool (= a b))
-
   ;; describe/it register a test only when executed at runtime, so the suites
   ;; live inside `main` (like sized_test), not at top-level module scope.
   (defn main [] : int
-   (do
-
-  ;; --- expression folds: byte-identical to the flat builders --------------
-
-  (describe "node->c expressions"
-    (it "raw leaf passes through verbatim"
-      (assert-true (cstr= (node->c (ce-var "x")) "x")))
-
-    (it "binop matches c-binop"
-      (assert-true (cstr= (node->c (ce-binop "+" (ce-var "a") (ce-var "b")))
-                          (c-binop "+" "a" "b"))))
-
-    (it "unop matches c-unop"
-      (assert-true (cstr= (node->c (ce-unop "!" (ce-var "flag")))
-                          (c-unop "!" "flag"))))
-
-    (it "addr matches c-addr"
-      (assert-true (cstr= (node->c (ce-addr (ce-var "x"))) (c-addr "x"))))
-
-    (it "deref matches c-deref"
-      (assert-true (cstr= (node->c (ce-deref (ce-var "ptr"))) (c-deref "ptr"))))
-
-    (it "ternary matches c-ternary"
-      (assert-true (cstr= (node->c (ce-ternary (ce-var "x") (ce-lit "1") (ce-lit "-1")))
-                          (c-ternary "x" "1" "-1"))))
-
-    (it "index matches c-index"
-      (assert-true (cstr= (node->c (ce-index (ce-var "arr") (ce-var "i")))
-                          (c-index "arr" "i"))))
-
-    (it "cast matches c-cast"
-      (assert-true (cstr= (node->c (ce-cast (ce-var "ptr") ":void*"))
-                          (c-cast "ptr" ":void*"))))
-
-    ;; the payoff: nested trees fold without any per-node scaffolding, and the
-    ;; result matches the equivalent nested builder calls.
-    (it "nested binop folds recursively"
-      (assert-true
-        (cstr= (node->c (ce-binop "*"
-                          (ce-binop "+" (ce-var "a") (ce-var "b"))
-                          (ce-var "c")))
-               (c-binop "*" (c-binop "+" "a" "b") "c"))))
-
-    (it "nested binop matches the literal C string"
-      (assert-true
-        (cstr= (node->c (ce-binop "*"
-                          (ce-binop "+" (ce-var "a") (ce-var "b"))
-                          (ce-var "c")))
-               "((a + b) * c)")))
-
-    (it "deep mixed expression"
-      (assert-true
-        (cstr= (node->c (ce-index
-                          (ce-cast (ce-var "p") ":int*")
-                          (ce-binop "+" (ce-var "i") (ce-lit "1"))))
-               "((int*)p)[(i + 1)]"))))
-
-  ;; --- statement folds: byte-identical to the flat builders ---------------
-
-  (describe "node->c statements"
-    (it "return matches c-return"
-      (assert-true (cstr= (node->c (cs-return (ce-binop "+" (ce-var "x") (ce-lit "1"))))
-                          (c-return "(x + 1)"))))
-
-    (it "return-void"
-      (assert-true (cstr= (node->c (cs-return-void)) "return;")))
-
-    (it "set matches c-set!"
-      (assert-true (cstr= (node->c (cs-set (ce-var "x") (ce-lit "42")))
-                          (c-set! "x" "42"))))
-
-    (it "expr statement appends semicolon"
-      (assert-true (cstr= (node->c (cs-expr (ce-var "x"))) "x;")))
-
-    (it "raw statement passes through"
-      (assert-true (cstr= (node->c (cs-raw "i++;")) "i++;")))
-
-    (it "if/else matches c-if"
-      (assert-true
-        (cstr= (node->c (cs-if (ce-binop ">" (ce-var "x") (ce-lit "0"))
-                               (cs-set (ce-var "y") (ce-lit "1"))
-                               (cs-set (ce-var "y") (ce-lit "-1"))))
-               (c-if "(x > 0)" "y = 1;" "y = -1;"))))
-
-    (it "if-only matches c-if-only"
-      (assert-true
-        (cstr= (node->c (cs-if-only (ce-var "ready") (cs-raw "go();")))
-               (c-if-only "ready" "go();"))))
-
-    (it "while matches c-while"
-      (assert-true
-        (cstr= (node->c (cs-while (ce-binop "<" (ce-var "i") (ce-var "n"))
-                                  (cs-raw "i++;")))
-               (c-while "(i < n)" "i++;"))))
-
-    (it "do-while matches c-do-while"
-      (assert-true
-        (cstr= (node->c (cs-do-while (cs-raw "step();")
-                                     (ce-binop "<" (ce-var "i") (ce-var "n"))))
-               (c-do-while "step();" "(i < n)"))))
-
-    (it "seq joins statements with a newline"
-      (assert-true
-        (cstr= (node->c (cs-seq (cs-raw "a();") (cs-raw "b();")))
-               "a();\nb();")))
-
-    ;; a compound statement whose body is itself a sequence -- the cata
-    ;; indents the folded body exactly as the flat builder would.
-    (it "if with a multi-statement body"
-      (assert-true
-        (cstr= (node->c (cs-if-only (ce-var "ok")
-                          (cs-seq (cs-raw "a();") (cs-raw "b();"))))
-               "if (ok) {\n    a();\n    b();\n}"))))
-
-  ;; --- a second fold over the same driver ---------------------------------
-
-  (describe "node-size"
-    (it "counts a single leaf as one"
-      (assert-true (int= (node-size (ce-var "x")) 1)))
-
-    (it "counts nested expression nodes"
-      ;; (a + b) * c  ->  CBinF, CBinF, CRawF, CRawF, CRawF = 5
-      (assert-true (int= (node-size (ce-binop "*"
-                                      (ce-binop "+" (ce-var "a") (ce-var "b"))
-                                      (ce-var "c")))
+    (do
+      ;; --- expression folds: byte-identical to the flat builders --------------
+      (describe "node->c expressions"
+        (it "raw leaf passes through verbatim"
+          (assert-true (cstr= (node->c (ce-var "x")) "x")))
+        (it "binop matches c-binop"
+          (assert-true (cstr= (node->c (ce-binop "+" (ce-var "a") (ce-var "b")))
+                         (c-binop "+" "a" "b"))))
+        (it "unop matches c-unop"
+          (assert-true (cstr= (node->c (ce-unop "!" (ce-var "flag")))
+                         (c-unop "!" "flag"))))
+        (it "addr matches c-addr"
+          (assert-true (cstr= (node->c (ce-addr (ce-var "x"))) (c-addr "x"))))
+        (it "deref matches c-deref"
+          (assert-true (cstr= (node->c (ce-deref (ce-var "ptr")))
+                         (c-deref "ptr"))))
+        (it "ternary matches c-ternary"
+          (assert-true (cstr= (node->c (ce-ternary (ce-var "x")
+                                         (ce-lit "1")
+                                         (ce-lit "-1")))
+                         (c-ternary "x" "1" "-1"))))
+        (it "index matches c-index"
+          (assert-true (cstr= (node->c (ce-index (ce-var "arr") (ce-var "i")))
+                         (c-index "arr" "i"))))
+        (it "cast matches c-cast"
+          (assert-true (cstr= (node->c (ce-cast (ce-var "ptr") ":void*"))
+                         (c-cast "ptr" ":void*"))))
+        ;; the payoff: nested trees fold without any per-node scaffolding, and the
+        ;; result matches the equivalent nested builder calls.
+        (it "nested binop folds recursively"
+          (assert-true (cstr= (node->c (ce-binop "*"
+                                         (ce-binop "+"
+                                           (ce-var "a")
+                                           (ce-var "b"))
+                                         (ce-var "c")))
+                         (c-binop "*" (c-binop "+" "a" "b") "c"))))
+        (it "nested binop matches the literal C string"
+          (assert-true (cstr= (node->c (ce-binop "*"
+                                         (ce-binop "+"
+                                           (ce-var "a")
+                                           (ce-var "b"))
+                                         (ce-var "c")))
+                         "((a + b) * c)")))
+        (it "deep mixed expression"
+          (assert-true (cstr= (node->c (ce-index (ce-cast (ce-var "p") ":int*")
+                                         (ce-binop "+"
+                                           (ce-var "i")
+                                           (ce-lit "1"))))
+                         "((int*)p)[(i + 1)]"))))
+      ;; --- statement folds: byte-identical to the flat builders ---------------
+      (describe "node->c statements"
+        (it "return matches c-return"
+          (assert-true (cstr= (node->c (cs-return (ce-binop "+"
+                                                    (ce-var "x")
+                                                    (ce-lit "1"))))
+                         (c-return "(x + 1)"))))
+        (it "return-void"
+          (assert-true (cstr= (node->c (cs-return-void)) "return;")))
+        (it "set matches c-set!"
+          (assert-true (cstr= (node->c (cs-set (ce-var "x") (ce-lit "42")))
+                         (c-set! "x" "42"))))
+        (it "expr statement appends semicolon"
+          (assert-true (cstr= (node->c (cs-expr (ce-var "x"))) "x;")))
+        (it "raw statement passes through"
+          (assert-true (cstr= (node->c (cs-raw "i++;")) "i++;")))
+        (it "if/else matches c-if"
+          (assert-true (cstr= (node->c (cs-if (ce-binop ">"
+                                                (ce-var "x")
+                                                (ce-lit "0"))
+                                         (cs-set (ce-var "y") (ce-lit "1"))
+                                         (cs-set (ce-var "y") (ce-lit "-1"))))
+                         (c-if "(x > 0)" "y = 1;" "y = -1;"))))
+        (it "if-only matches c-if-only"
+          (assert-true (cstr= (node->c (cs-if-only (ce-var "ready")
+                                         (cs-raw "go();")))
+                         (c-if-only "ready" "go();"))))
+        (it "while matches c-while"
+          (assert-true (cstr= (node->c (cs-while (ce-binop "<"
+                                                   (ce-var "i")
+                                                   (ce-var "n"))
+                                         (cs-raw "i++;")))
+                         (c-while "(i < n)" "i++;"))))
+        (it "do-while matches c-do-while"
+          (assert-true (cstr= (node->c (cs-do-while (cs-raw "step();")
+                                         (ce-binop "<"
+                                           (ce-var "i")
+                                           (ce-var "n"))))
+                         (c-do-while "step();" "(i < n)"))))
+        (it "seq joins statements with a newline"
+          (assert-true (cstr= (node->c (cs-seq (cs-raw "a();") (cs-raw "b();")))
+                         "a();\nb();")))
+        ;; a compound statement whose body is itself a sequence -- the cata
+        ;; indents the folded body exactly as the flat builder would.
+        (it "if with a multi-statement body"
+          (assert-true (cstr= (node->c (cs-if-only (ce-var "ok")
+                                         (cs-seq (cs-raw "a();")
+                                           (cs-raw "b();"))))
+                         "if (ok) {\n    a();\n    b();\n}"))))
+      ;; --- a second fold over the same driver ---------------------------------
+      (describe "node-size"
+        (it "counts a single leaf as one"
+          (assert-true (int= (node-size (ce-var "x")) 1)))
+        (it "counts nested expression nodes"
+          ;; (a + b) * c  ->  CBinF, CBinF, CRawF, CRawF, CRawF = 5
+          (assert-true (int= (node-size (ce-binop "*"
+                                          (ce-binop "+"
+                                            (ce-var "a")
+                                            (ce-var "b"))
+                                          (ce-var "c")))
                          5)))
-
-    (it "counts statement nodes"
-      ;; CSeqF over two CRawSF = 2
-      (assert-true (int= (node-size (cs-seq (cs-raw "a();") (cs-raw "b();"))) 2))))
-
-    (run-all-status))))
+        (it "counts statement nodes"
+          ;; CSeqF over two CRawSF = 2
+          (assert-true (int= (node-size (cs-seq (cs-raw "a();") (cs-raw "b();")))
+                         2))))
+      (run-all-status))))

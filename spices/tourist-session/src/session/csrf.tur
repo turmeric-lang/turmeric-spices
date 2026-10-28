@@ -15,49 +15,39 @@
 ;;;
 ;;; Since: v0.2.0
 (defmodule session/csrf
-  (import session/ctx    :refer [session-get session-set!])
-  (import session/id     :refer [session-id-new])
+  (import session/ctx :refer [session-get session-set!])
+  (import session/id :refer [session-id-new])
   (import session/ownstr :refer [to-cstr release])
-  (import session/hmac   :refer [ct-eq?])
-  (import tourist/types      :refer [Ctx])
-  (import httpd/types        :refer [Response])
-  (import httpd/response     :refer [response])
-  (export CsrfOpts csrf-opts default-csrf-opts
-          csrf-token csrf-check csrf-mw)
-
-(def __CSRF-KEY "__csrf")
-
-;; -- options ----------------------------------------------------------------
-
-;;; CsrfOpts -- CSRF middleware configuration.
-;;;
-;;; Fields:
-;;;   field-name -- the form field carrying the token on classic form posts
-;;;                 (default "csrf_token"). The `X-Csrf-Token` header is always
-;;;                 accepted too, for SPAs.
-(defstruct ^copy CsrfOpts
-  [field-name :cstr])
-
-;;; csrf-opts -- CsrfOpts with a custom form field name.
-;;;
-;;; Since: v0.2.0
-(defn csrf-opts [field-name : cstr] : CsrfOpts
-  (make-struct CsrfOpts field-name))
-
-;;; default-csrf-opts -- CsrfOpts with the default "csrf_token" form field.
-;;;
-;;; Since: v0.2.0
-(defn default-csrf-opts [] : CsrfOpts
-  (make-struct CsrfOpts "csrf_token"))
-
-;; -- process-global form-field name -----------------------------------------
-;; The before-middleware is a bare fn pointer (no captured env), exactly like
-;; the session middleware, so the configured form-field name is stashed in a
-;; process-global set once by csrf-mw before the server starts.
-
-(defn __csrf-reg [op : int v : cstr] : cstr
-  ```c
-  #include <stdlib.h>
+  (import session/hmac :refer [ct-eq?])
+  (import tourist/types :refer [Ctx])
+  (import httpd/types :refer [Response])
+  (import httpd/response :refer [response])
+  (export CsrfOpts csrf-opts default-csrf-opts csrf-token csrf-check csrf-mw)
+  (def __CSRF-KEY "__csrf")
+  ;; -- options ----------------------------------------------------------------
+  ;;; CsrfOpts -- CSRF middleware configuration.
+  ;;;
+  ;;; Fields:
+  ;;;   field-name -- the form field carrying the token on classic form posts
+  ;;;                 (default "csrf_token"). The `X-Csrf-Token` header is always
+  ;;;                 accepted too, for SPAs.
+  (defstruct ^copy CsrfOpts [field-name :cstr])
+  ;;; csrf-opts -- CsrfOpts with a custom form field name.
+  ;;;
+  ;;; Since: v0.2.0
+  (defn csrf-opts [field-name : cstr] : CsrfOpts
+    (make-struct CsrfOpts field-name))
+  ;;; default-csrf-opts -- CsrfOpts with the default "csrf_token" form field.
+  ;;;
+  ;;; Since: v0.2.0
+  (defn default-csrf-opts [] : CsrfOpts (make-struct CsrfOpts "csrf_token"))
+  ;; -- process-global form-field name -----------------------------------------
+  ;; The before-middleware is a bare fn pointer (no captured env), exactly like
+  ;; the session middleware, so the configured form-field name is stashed in a
+  ;; process-global set once by csrf-mw before the server starts.
+  (defn __csrf-reg [op : int v : cstr] : cstr
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   static char *field = 0;
   if (op == 1) {                 /* set (copy) */
@@ -68,48 +58,39 @@
   if (!field) field = strdup("csrf_token");   /* default if read before set */
   return (const char *)field;
   ```)
-
-(defn __csrf-set-field! [name : cstr] : void
-  (__csrf-discard (__csrf-reg 1 name)))
-
-(defn __csrf-get-field [] : cstr (__csrf-reg 0 ""))
-
-(defn __csrf-discard [s : cstr] : void
-  ```c
-  (void)s;
+  (defn __csrf-set-field! [name : cstr] : void
+    (__csrf-discard (__csrf-reg 1 name)))
+  (defn __csrf-get-field [] : cstr (__csrf-reg 0 ""))
+  (defn __csrf-discard [s : cstr] : void
+    ```c
+    (void)s;
   ```)
-
-;; -- small cstr / ctx helpers -----------------------------------------------
-
-(defn __null? [s : cstr] : bool
-  ```c
-  return ((const char *)s) == 0;
+  ;; -- small cstr / ctx helpers -----------------------------------------------
+  (defn __null? [s : cstr] : bool
+    ```c
+    return ((const char *)s) == 0;
   ```)
-
-(defn __cstr-free [s : cstr] : void
-  ```c
-  #include <stdlib.h>
+  (defn __cstr-free [s : cstr] : void
+    ```c
+    #include <stdlib.h>
   free((void *)(intptr_t)s);
   ```)
-
-;;; __ctx-method -- request method string (borrowed).
-(defn __ctx-method [ctx : Ctx] : cstr
-  ```c
-  struct __tourist_ctx_h { char *method; char *path; char *query; char *body; };
+  ;;; __ctx-method -- request method string (borrowed).
+  (defn __ctx-method [ctx : Ctx] : cstr
+    ```c
+    struct __tourist_ctx_h { char *method; char *path; char *query; char *body; };
   return (const char *)((struct __tourist_ctx_h *)(intptr_t)ctx)->method;
   ```)
-
-;;; __ctx-body -- request body string (borrowed; NULL if absent).
-(defn __ctx-body [ctx : Ctx] : cstr
-  ```c
-  struct __tourist_ctx_h { char *method; char *path; char *query; char *body; };
+  ;;; __ctx-body -- request body string (borrowed; NULL if absent).
+  (defn __ctx-body [ctx : Ctx] : cstr
+    ```c
+    struct __tourist_ctx_h { char *method; char *path; char *query; char *body; };
   return (const char *)((struct __tourist_ctx_h *)(intptr_t)ctx)->body;
   ```)
-
-;;; __ctx-header -- case-insensitive request header lookup (NULL if absent).
-(defn __ctx-header [ctx : Ctx name : cstr] : cstr
-  ```c
-  #include <strings.h>
+  ;;; __ctx-header -- case-insensitive request header lookup (NULL if absent).
+  (defn __ctx-header [ctx : Ctx name : cstr] : cstr
+    ```c
+    #include <strings.h>
   struct __tourist_ctx_h {
     char  *method; char *path; char *query; char *body;
     char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
@@ -122,23 +103,21 @@
   }
   return (const char *)0;
   ```)
-
-;;; __protected? -- true for state-changing methods (POST/PUT/PATCH/DELETE).
-(defn __protected? [method : cstr] : bool
-  ```c
-  #include <string.h>
+  ;;; __protected? -- true for state-changing methods (POST/PUT/PATCH/DELETE).
+  (defn __protected? [method : cstr] : bool
+    ```c
+    #include <string.h>
   const char *m = (const char *)method;
   return strcmp(m,"POST")==0 || strcmp(m,"PUT")==0
       || strcmp(m,"PATCH")==0 || strcmp(m,"DELETE")==0;
   ```)
-
-;;; __form-token -- value of `field` in an x-www-form-urlencoded body, or NULL.
-;;;
-;;; Tokens are hex (see session-id-new) so no percent-decoding is needed; a '+'
-;;; or %XX would only ever appear in other fields.
-(defn __form-token [body : cstr field : cstr] : cstr
-  ```c
-  #include <stdlib.h>
+  ;;; __form-token -- value of `field` in an x-www-form-urlencoded body, or NULL.
+  ;;;
+  ;;; Tokens are hex (see session-id-new) so no percent-decoding is needed; a '+'
+  ;;; or %XX would only ever appear in other fields.
+  (defn __form-token [body : cstr field : cstr] : cstr
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   const char *b = (const char *)body;
   const char *f = (const char *)field;
@@ -163,103 +142,94 @@
   }
   return (const char *)0;
   ```)
-
-;; -- public API -------------------------------------------------------------
-
-;;; csrf-token -- the current session's CSRF token, minting one on first use.
-;;;
-;;; Embed it in forms (a hidden field) or hand it to a SPA to echo back in the
-;;; `X-Csrf-Token` header. The returned string is borrowed from the session map
-;;; (valid until the response flush); copy it if you need it longer.
-;;;
-;;; Parameters:
-;;;   ctx -- tourist context
-;;;
-;;; Returns:
-;;;   :cstr -- the per-session token (64-char hex).
-;;;
-;;; Since: v0.2.0
-(defn csrf-token [ctx : Ctx] : cstr
-  (let [r (session-get ctx __CSRF-KEY)]
-    (if (ok? r)
-      (ok-val r)
-      ;; session-id-new returns an owned String; session-set! copies its bytes
-      ;; into the map, then we release the String.
-      (let [tok (session-id-new)]
-        (do
-          (session-set! ctx __CSRF-KEY (to-cstr tok))   ;; copies tok into the map
-          (release tok)
-          (ok-val (session-get ctx __CSRF-KEY)))))))
-
-;;; csrf-check -- constant-time compare a submitted token to the session's.
-;;;
-;;; Returns false when no token has been minted for the session yet (so a
-;;; request before any csrf-token call cannot pass).
-;;;
-;;; Parameters:
-;;;   ctx       -- tourist context
-;;;   submitted -- the token supplied by the request
-;;;
-;;; Since: v0.2.0
-(defn csrf-check [ctx : Ctx submitted : cstr] : bool
-  (let [r (session-get ctx __CSRF-KEY)]
-    (if (ok? r) (ct-eq? submitted (ok-val r)) false)))
-
-;;; __csrf-pass? -- does this request carry a valid token (header or form)?
-(defn __csrf-pass? [ctx : Ctx] : bool
-  (let [hdr (__ctx-header ctx "X-Csrf-Token")]
-    (if (not (__null? hdr))
-      (csrf-check ctx hdr)
-      (let [body (__ctx-body ctx)]
-        (if (__null? body)
-          false
-          (let [tok (__form-token body (__csrf-get-field))]
-            (if (__null? tok)
-              false
-              (let [ok (csrf-check ctx tok)]
-                (do (__cstr-free tok) ok)))))))))
-
-;;; __csrf-before -- the before-middleware decision for one request.
-;;;
-;;; Returns (none) to let dispatch continue, or (some 403-response) to
-;;; short-circuit. Safe methods always pass; protected methods must carry a
-;;; valid token. This is the function csrf-mw hands back for `use!`.
-(defn __csrf-before [ctx : Ctx] : (Option Response)
-  (if (__protected? (__ctx-method ctx))
-    (if (__csrf-pass? ctx)
-      (:: (none) (Option Response))
-      (:: (some (:: (response 403 "text/plain"
-                              "CSRF token missing or invalid") :Response))
+  ;; -- public API -------------------------------------------------------------
+  ;;; csrf-token -- the current session's CSRF token, minting one on first use.
+  ;;;
+  ;;; Embed it in forms (a hidden field) or hand it to a SPA to echo back in the
+  ;;; `X-Csrf-Token` header. The returned string is borrowed from the session map
+  ;;; (valid until the response flush); copy it if you need it longer.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- tourist context
+  ;;;
+  ;;; Returns:
+  ;;;   :cstr -- the per-session token (64-char hex).
+  ;;;
+  ;;; Since: v0.2.0
+  (defn csrf-token [ctx : Ctx] : cstr
+    (let [r (session-get ctx __CSRF-KEY)]
+      (if (ok? r)
+        (ok-val r)
+        ;; session-id-new returns an owned String; session-set! copies its bytes
+        ;; into the map, then we release the String.
+        (let [tok (session-id-new)]
+          (do
+            (session-set! ctx __CSRF-KEY (to-cstr tok)) ;; copies tok into the map
+            (release tok)
+            (ok-val (session-get ctx __CSRF-KEY)))))))
+  ;;; csrf-check -- constant-time compare a submitted token to the session's.
+  ;;;
+  ;;; Returns false when no token has been minted for the session yet (so a
+  ;;; request before any csrf-token call cannot pass).
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx       -- tourist context
+  ;;;   submitted -- the token supplied by the request
+  ;;;
+  ;;; Since: v0.2.0
+  (defn csrf-check [ctx : Ctx submitted : cstr] : bool
+    (let [r (session-get ctx __CSRF-KEY)]
+      (if (ok? r) (ct-eq? submitted (ok-val r)) false)))
+  ;;; __csrf-pass? -- does this request carry a valid token (header or form)?
+  (defn __csrf-pass? [ctx : Ctx] : bool
+    (let [hdr (__ctx-header ctx "X-Csrf-Token")]
+      (if (not (__null? hdr))
+        (csrf-check ctx hdr)
+        (let [body (__ctx-body ctx)]
+          (if (__null? body)
+            false
+            (let [tok (__form-token body (__csrf-get-field))]
+              (if (__null? tok)
+                false
+                (let [ok (csrf-check ctx tok)] (do (__cstr-free tok) ok)))))))))
+  ;;; __csrf-before -- the before-middleware decision for one request.
+  ;;;
+  ;;; Returns (none) to let dispatch continue, or (some 403-response) to
+  ;;; short-circuit. Safe methods always pass; protected methods must carry a
+  ;;; valid token. This is the function csrf-mw hands back for `use!`.
+  (defn __csrf-before [ctx : Ctx] : (Option Response)
+    (if (__protected? (__ctx-method ctx))
+      (if (__csrf-pass? ctx)
+        (:: (none) (Option Response))
+        (:: (some (:: (response 403
+                        "text/plain"
+                        "CSRF token missing or invalid")
+                    :Response))
           (Option Response)))
-    (:: (none) (Option Response))))
-
-;;; csrf-mw -- the CSRF before-middleware function; wire it with tourist's use!.
-;;;
-;;; Configures the form-field name from `opts` and returns the middleware
-;;; function. Register it with `use!` alongside session-mw. Any
-;;; POST/PUT/PATCH/DELETE without a valid token (an `X-Csrf-Token` header or the
-;;; configured form field) is rejected with 403 before the route handler runs;
-;;; safe methods (GET/HEAD/OPTIONS) always pass.
-;;;
-;;; Returning the function (rather than an item handle) keeps the middleware
-;;; decision directly testable and lets the caller place it explicitly:
-;;;
-;;;   (tourist 3000
-;;;     (session-mw (memory-store-new) (default-session-config))
-;;;     (use! (csrf-mw (default-csrf-opts)))
-;;;     (get!  "/form" render-form)     ;; embeds (csrf-token ctx)
-;;;     (post! "/save" save-handler))   ;; rejected unless the token matches
-;;;
-;;; Parameters:
-;;;   opts -- CsrfOpts (default-csrf-opts / csrf-opts)
-;;;
-;;; Returns:
-;;;   (fn [Ctx] (Option Response)) -- pass to use!.
-;;;
-;;; Since: v0.2.0
-(defn csrf-mw [opts : CsrfOpts] : (fn [Ctx] (Option Response))
-  (do
-    (__csrf-set-field! (.field-name opts))
-    __csrf-before))
-
-) ;; end defmodule session/csrf
+      (:: (none) (Option Response))))
+  ;;; csrf-mw -- the CSRF before-middleware function; wire it with tourist's use!.
+  ;;;
+  ;;; Configures the form-field name from `opts` and returns the middleware
+  ;;; function. Register it with `use!` alongside session-mw. Any
+  ;;; POST/PUT/PATCH/DELETE without a valid token (an `X-Csrf-Token` header or the
+  ;;; configured form field) is rejected with 403 before the route handler runs;
+  ;;; safe methods (GET/HEAD/OPTIONS) always pass.
+  ;;;
+  ;;; Returning the function (rather than an item handle) keeps the middleware
+  ;;; decision directly testable and lets the caller place it explicitly:
+  ;;;
+  ;;;   (tourist 3000
+  ;;;     (session-mw (memory-store-new) (default-session-config))
+  ;;;     (use! (csrf-mw (default-csrf-opts)))
+  ;;;     (get!  "/form" render-form)     ;; embeds (csrf-token ctx)
+  ;;;     (post! "/save" save-handler))   ;; rejected unless the token matches
+  ;;;
+  ;;; Parameters:
+  ;;;   opts -- CsrfOpts (default-csrf-opts / csrf-opts)
+  ;;;
+  ;;; Returns:
+  ;;;   (fn [Ctx] (Option Response)) -- pass to use!.
+  ;;;
+  ;;; Since: v0.2.0
+  (defn csrf-mw [opts : CsrfOpts] : (fn [Ctx] (Option Response))
+    (do (__csrf-set-field! (.field-name opts)) __csrf-before))) ;; end defmodule session/csrf

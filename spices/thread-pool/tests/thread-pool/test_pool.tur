@@ -26,15 +26,21 @@
 ;; parameter will not unify with a concrete nominal opaque when T is also bound
 ;; through the `(Pool T)` wrapper. int / cstr / ptr<void> / scalar carriers all
 ;; work; carry an opaque as a ptr<void> (as case 5 does) until that is fixed.
-
 (defmodule thread-pool/tests/test_pool
-  (import thread-pool/pool :refer [Pool pool-new pool-submit pool-stop pool-new-raw pool-submit-raw pool-stop-raw])
-
-;; Mutex-guarded accumulator shared across worker threads.  acc-bump is a
-;; NON-static (external) function so its address can be taken for the raw-hatch
-;; callback; the typed callbacks call it through the closure boundary.
-```c
-#include <stdlib.h>
+  (import thread-pool/pool
+    :refer
+    [Pool
+     pool-new
+     pool-submit
+     pool-stop
+     pool-new-raw
+     pool-submit-raw
+     pool-stop-raw])
+  ;; Mutex-guarded accumulator shared across worker threads.  acc-bump is a
+  ;; NON-static (external) function so its address can be taken for the raw-hatch
+  ;; callback; the typed callbacks call it through the closure boundary.
+  ```c
+  #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 static pthread_mutex_t g_mu    = PTHREAD_MUTEX_INITIALIZER;
@@ -55,113 +61,105 @@ void tp_test_raw_cb(void *item) {
   free(v);
 }
 ```
-
-;; acc-reset / acc-sum / acc-count -- accumulator snapshot helpers.
-(defn acc-reset [] : void
-  ```c
-  pthread_mutex_lock(&g_mu); g_sum = 0; g_count = 0; pthread_mutex_unlock(&g_mu);
+  ;; acc-reset / acc-sum / acc-count -- accumulator snapshot helpers.
+  (defn acc-reset [] : void
+    ```c
+    pthread_mutex_lock(&g_mu); g_sum = 0; g_count = 0; pthread_mutex_unlock(&g_mu);
   ```)
-(defn acc-bump [v : int] : void
-  ```c
-  tp_acc_bump((long)v);
+  (defn acc-bump [v : int] : void
+    ```c
+    tp_acc_bump((long)v);
   ```)
-(defn acc-sum [] : int
-  ```c
-  long v; pthread_mutex_lock(&g_mu); v = g_sum; pthread_mutex_unlock(&g_mu); return (int)v;
+  (defn acc-sum [] : int
+    ```c
+    long v; pthread_mutex_lock(&g_mu); v = g_sum; pthread_mutex_unlock(&g_mu); return (int)v;
   ```)
-(defn acc-count [] : int
-  ```c
-  long v; pthread_mutex_lock(&g_mu); v = g_count; pthread_mutex_unlock(&g_mu); return (int)v;
+  (defn acc-count [] : int
+    ```c
+    long v; pthread_mutex_lock(&g_mu); v = g_count; pthread_mutex_unlock(&g_mu); return (int)v;
   ```)
-
-;; cstr-len -- length of a cstr item (so the cstr pool does observable work).
-(defn cstr-len [s : cstr] : int
-  ```c
-  return (int)strlen(s);
+  ;; cstr-len -- length of a cstr item (so the cstr pool does observable work).
+  (defn cstr-len [s : cstr] : int
+    ```c
+    return (int)strlen(s);
   ```)
-
-;; A heap cell carried by ptr<void> to prove item identity round-trips: the
-;; worker reads the value the producer stored and frees the cell.
-(defn cell-of [n : int] : ptr<void>
-  ```c
-  int *p = (int *)malloc(sizeof(int)); if (p) *p = (int)n; return (void *)p;
+  ;; A heap cell carried by ptr<void> to prove item identity round-trips: the
+  ;; worker reads the value the producer stored and frees the cell.
+  (defn cell-of [n : int] : ptr<void>
+    ```c
+    int *p = (int *)malloc(sizeof(int)); if (p) *p = (int)n; return (void *)p;
   ```)
-(defn cell-take [c : ptr<void>] : int
-  ```c
-  int *p = (int *)c; int v = p ? *p : -1; free(p); return v;
+  (defn cell-take [c : ptr<void>] : int
+    ```c
+    int *p = (int *)c; int v = p ? *p : -1; free(p); return v;
   ```)
-
-(defn fail-if [cond : bool label : cstr] : int
-  (if cond (do (println label) 1) 0))
-
-;; submit-int-n -- submit `n` int items each carrying value 1.
-(defn submit-int-n [^borrow p : (Pool int) n : int] : void
-  (when (> n 0)
-    (do (pool-submit p 1) (submit-int-n p (- n 1)))))
-
-;; run-drain-case -- submit `n` int items into a `workers`-thread typed pool,
-;; stop (drains + joins), return the failure count for sum/count.
-(defn run-drain-case [workers : int n : int label : cstr] : int
-  (do
-    (acc-reset)
-    (let [p (pool-new workers (fn [x : int] : void (acc-bump x)))]
-      (do
-        (submit-int-n p n)
-        (pool-stop p)
-        (+ (fail-if (not= (acc-sum) n) label)
-           (fail-if (not= (acc-count) n) label))))))
-
-;; raw-cb-ptr -- address of the raw-hatch callback as a ptr<void>.
-(defn raw-cb-ptr [] : ptr<void>
-  ```c
-  extern void tp_test_raw_cb(void *);
+  (defn fail-if [cond : bool label : cstr] : int
+    (if cond (do (println label) 1) 0))
+  ;; submit-int-n -- submit `n` int items each carrying value 1.
+  (defn submit-int-n [^borrow p : (Pool int) n : int] : void
+    (when (> n 0) (do (pool-submit p 1) (submit-int-n p (- n 1)))))
+  ;; run-drain-case -- submit `n` int items into a `workers`-thread typed pool,
+  ;; stop (drains + joins), return the failure count for sum/count.
+  (defn run-drain-case [workers : int n : int label : cstr] : int
+    (do
+      (acc-reset)
+      (let [p (pool-new workers (fn [x : int] : void (acc-bump x)))]
+        (do
+          (submit-int-n p n)
+          (pool-stop p)
+          (+ (fail-if (not= (acc-sum) n) label)
+            (fail-if (not= (acc-count) n) label))))))
+  ;; raw-cb-ptr -- address of the raw-hatch callback as a ptr<void>.
+  (defn raw-cb-ptr [] : ptr<void>
+    ```c
+    extern void tp_test_raw_cb(void *);
   return (void *)tp_test_raw_cb;
   ```)
-(defn make-int-item [v : int] : ptr<void>
-  ```c
-  int *p = (int *)malloc(sizeof(int)); if (p) *p = (int)v; return (void *)p;
+  (defn make-int-item [v : int] : ptr<void>
+    ```c
+    int *p = (int *)malloc(sizeof(int)); if (p) *p = (int)v; return (void *)p;
   ```)
-(defn submit-raw-n [pool : ptr<void> n : int] : void
-  (when (> n 0)
-    (do (pool-submit-raw pool (make-int-item 1)) (submit-raw-n pool (- n 1)))))
-
-(defn main [] : int
-  (let [;; 1. Basic submit + drain.
-        f1 (run-drain-case 4 10 "FAIL: basic submit+drain")
-        ;; 2. Back-pressure: 4 workers => cap 64; submit 500 to force waits.
-        f2 (run-drain-case 4 500 "FAIL: back-pressure drain")
-        ;; 3. size = 0 clamps to 1 worker.
-        f3 (run-drain-case 0 50 "FAIL: size=0 clamps to 1")
-        ;; 4. Stop with queue non-empty (submit then immediately stop).
-        f4 (run-drain-case 2 200 "FAIL: stop with queue non-empty")
-        ;; 5. Multiple distinct (Pool T) types in one translation unit.
-        f5 (do
-             (acc-reset)
-             (let [pi (pool-new 2 (fn [x : int]       : void (acc-bump x)))
-                   ps (pool-new 2 (fn [s : cstr]      : void (acc-bump (cstr-len s))))
-                   pc (pool-new 2 (fn [c : ptr<void>] : void (acc-bump (cell-take c))))]
-               (do
-                 (pool-submit pi 5)
-                 (pool-submit ps "abc")        ;; len 3
-                 (pool-submit pc (cell-of 9))  ;; identity round-trip => 9
-                 (pool-stop pi)
-                 (pool-stop ps)
-                 (pool-stop pc)
-                 (+ (fail-if (not= (acc-sum) 17) "FAIL: multi-type pools sum")
-                    (fail-if (not= (acc-count) 3) "FAIL: multi-type pools count")))))
-        ;; 6. Raw C-interop hatch.
-        f6 (do
-             (acc-reset)
-             (let [pool (pool-new-raw 3 (raw-cb-ptr))]
-               (do
-                 (submit-raw-n pool 120)
-                 (pool-stop-raw pool)
-                 (+ (fail-if (not= (acc-sum) 120) "FAIL: raw hatch sum")
-                    (fail-if (not= (acc-count) 120) "FAIL: raw hatch count")))))
-        f  (+ f1 (+ f2 (+ f3 (+ f4 (+ f5 f6)))))]
-    (if (= f 0)
-      (println "PASS test_pool")
-      (println "test_pool: failures above"))
-    f))
-
-) ;; end defmodule thread-pool/tests/test_pool
+  (defn submit-raw-n [pool : ptr<void> n : int] : void
+    (when (> n 0)
+      (do (pool-submit-raw pool (make-int-item 1)) (submit-raw-n pool (- n 1)))))
+  (defn main [] : int
+    (let [ ;; 1. Basic submit + drain.
+          f1 (run-drain-case 4 10 "FAIL: basic submit+drain")
+          ;; 2. Back-pressure: 4 workers => cap 64; submit 500 to force waits.
+          f2 (run-drain-case 4 500 "FAIL: back-pressure drain")
+          ;; 3. size = 0 clamps to 1 worker.
+          f3 (run-drain-case 0 50 "FAIL: size=0 clamps to 1")
+          ;; 4. Stop with queue non-empty (submit then immediately stop).
+          f4 (run-drain-case 2 200 "FAIL: stop with queue non-empty")
+          ;; 5. Multiple distinct (Pool T) types in one translation unit.
+          f5 (do
+               (acc-reset)
+               (let [pi (pool-new 2 (fn [x : int] : void (acc-bump x)))
+                     ps (pool-new 2
+                          (fn [s : cstr] : void (acc-bump (cstr-len s))))
+                     pc (pool-new 2
+                          (fn [c : ptr<void>] : void (acc-bump (cell-take c))))]
+                 (do
+                   (pool-submit pi 5)
+                   (pool-submit ps "abc") ;; len 3
+                   (pool-submit pc (cell-of 9)) ;; identity round-trip => 9
+                   (pool-stop pi)
+                   (pool-stop ps)
+                   (pool-stop pc)
+                   (+ (fail-if (not= (acc-sum) 17) "FAIL: multi-type pools sum")
+                     (fail-if (not= (acc-count) 3)
+                       "FAIL: multi-type pools count")))))
+          ;; 6. Raw C-interop hatch.
+          f6 (do
+               (acc-reset)
+               (let [pool (pool-new-raw 3 (raw-cb-ptr))]
+                 (do
+                   (submit-raw-n pool 120)
+                   (pool-stop-raw pool)
+                   (+ (fail-if (not= (acc-sum) 120) "FAIL: raw hatch sum")
+                     (fail-if (not= (acc-count) 120) "FAIL: raw hatch count")))))
+          f  (+ f1 (+ f2 (+ f3 (+ f4 (+ f5 f6)))))]
+      (if (= f 0)
+        (println "PASS test_pool")
+        (println "test_pool: failures above"))
+      f))) ;; end defmodule thread-pool/tests/test_pool

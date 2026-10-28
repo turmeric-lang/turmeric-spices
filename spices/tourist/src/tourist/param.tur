@@ -47,29 +47,34 @@
 ;;
 ;;   struct __tourist_attr { char *key;  int64_t val;  struct __tourist_attr *next; };
 ;;   struct __tourist_hdr  { char *name; char  *value; struct __tourist_hdr  *next; };
-
 (defmodule tourist/param
   (import tourist/router :refer [captures-get captures-free])
-  (import tourist/types  :refer [Ctx Captures ItemList])
-  (import httpd/types    :refer [Request])
-  (export param capture
-          tourist-ctx-new tourist-ctx-free
-          tourist-ctx-caps
-          tourist-ctx-strip-path req-full-path
-          ctx-attr-get ctx-attr-set! ctx-add-header!
-          tourist-ctx-resp-headers tourist-ctx-clear-resp-headers
-          tourist-ctx-req tourist-ctx-around-rest tourist-ctx-set-around-rest!
-          tourist-ctx-own!)
-
-;; -- Internal: query-string parser ----------------------------------------
-
-;;; __parse-qp -- parse a raw query string into parallel key/value arrays.
-;;;
-;;; Parses "k1=v1&k2=v2" in place; writes malloc'd copies of keys and
-;;; values into the ctx's qp_keys / qp_vals fields.
-(defn __parse-qp [ctx : Ctx] : void
-  ```c
-  #include <stdlib.h>
+  (import tourist/types :refer [Ctx Captures ItemList])
+  (import httpd/types :refer [Request])
+  (export param
+    capture
+    tourist-ctx-new
+    tourist-ctx-free
+    tourist-ctx-caps
+    tourist-ctx-strip-path
+    req-full-path
+    ctx-attr-get
+    ctx-attr-set!
+    ctx-add-header!
+    tourist-ctx-resp-headers
+    tourist-ctx-clear-resp-headers
+    tourist-ctx-req
+    tourist-ctx-around-rest
+    tourist-ctx-set-around-rest!
+    tourist-ctx-own!)
+  ;; -- Internal: query-string parser ----------------------------------------
+  ;;; __parse-qp -- parse a raw query string into parallel key/value arrays.
+  ;;;
+  ;;; Parses "k1=v1&k2=v2" in place; writes malloc'd copies of keys and
+  ;;; values into the ctx's qp_keys / qp_vals fields.
+  (defn __parse-qp [ctx : Ctx] : void
+    ```c
+    #include <stdlib.h>
   #include <string.h>
 
   struct __tourist_ctx {
@@ -115,21 +120,19 @@
     q = amp + 1;
   }
   ```)
-
-;; -- Internal: raw caps handle accessor (used by tourist-ctx-free) ---------
-
-;;; tourist-ctx-caps -- raw __tourist_caps handle stored in a ctx.
-;;;
-;;; Parameters:
-;;;   ctx -- :int tourist context handle
-;;;
-;;; Returns:
-;;;   Captures -- captures handle (may be the null handle, i.e. (:: 0 :Captures))
-;;;
-;;; Since: v0.1.0 (typed as Captures in v0.2.1; ctx retyped to Ctx in v0.2.6)
-(defn tourist-ctx-caps [ctx : Ctx] : Captures
-  ```c
-  struct __tourist_ctx {
+  ;; -- Internal: raw caps handle accessor (used by tourist-ctx-free) ---------
+  ;;; tourist-ctx-caps -- raw __tourist_caps handle stored in a ctx.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- :int tourist context handle
+  ;;;
+  ;;; Returns:
+  ;;;   Captures -- captures handle (may be the null handle, i.e. (:: 0 :Captures))
+  ;;;
+  ;;; Since: v0.1.0 (typed as Captures in v0.2.1; ctx retyped to Ctx in v0.2.6)
+  (defn tourist-ctx-caps [ctx : Ctx] : Captures
+    ```c
+    struct __tourist_ctx {
     char  *method; char *path; char *query; char *body;
     char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
     int64_t caps;
@@ -138,29 +141,28 @@
   };
   return ((struct __tourist_ctx *)(intptr_t)ctx)->caps;
   ```)
-
-;;; tourist-ctx-strip-path -- swap ctx->path with new-path and return the old.
-;;;
-;;; Used by url-map! to make req-path return a path with the mount prefix
-;;; removed. The caller is responsible for calling tourist-ctx-strip-path
-;;; again with the original pointer to restore ctx->path after the sub-app
-;;; returns. new-path may be a pointer into the borrowed httpd request
-;;; buffer (e.g. ctx->path + prefix-len) or a string literal such as "/".
-;;;
-;;; The original (pre-strip) path remains available via req-full-path; it is
-;;; recorded once at ctx construction time and is not affected by this call.
-;;;
-;;; Parameters:
-;;;   ctx      -- :int tourist ctx handle
-;;;   new-path -- :cstr new value for ctx->path
-;;;
-;;; Returns:
-;;;   :cstr -- previous ctx->path value; pass it back in to restore.
-;;;
-;;; Since: v0.2.0
-(defn tourist-ctx-strip-path [ctx : Ctx new-path : cstr] : cstr
-  ```c
-  struct __tourist_ctx {
+  ;;; tourist-ctx-strip-path -- swap ctx->path with new-path and return the old.
+  ;;;
+  ;;; Used by url-map! to make req-path return a path with the mount prefix
+  ;;; removed. The caller is responsible for calling tourist-ctx-strip-path
+  ;;; again with the original pointer to restore ctx->path after the sub-app
+  ;;; returns. new-path may be a pointer into the borrowed httpd request
+  ;;; buffer (e.g. ctx->path + prefix-len) or a string literal such as "/".
+  ;;;
+  ;;; The original (pre-strip) path remains available via req-full-path; it is
+  ;;; recorded once at ctx construction time and is not affected by this call.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx      -- :int tourist ctx handle
+  ;;;   new-path -- :cstr new value for ctx->path
+  ;;;
+  ;;; Returns:
+  ;;;   :cstr -- previous ctx->path value; pass it back in to restore.
+  ;;;
+  ;;; Since: v0.2.0
+  (defn tourist-ctx-strip-path [ctx : Ctx new-path : cstr] : cstr
+    ```c
+    struct __tourist_ctx {
     char  *method; char *path; char *query; char *body;
     char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
     int64_t caps;
@@ -172,28 +174,27 @@
   c->path = (char *)(intptr_t)new_path;
   return (const char *)prev;
   ```)
-
-;;; req-full-path -- original request path before any url-map! stripping.
-;;;
-;;; Inside a url-map! sub-app, req-path returns the path with the matched
-;;; mount prefix stripped. req-full-path always returns the original path
-;;; as received by the server.
-;;;
-;;; Parameters:
-;;;   ctx -- :int tourist ctx handle
-;;;
-;;; Returns:
-;;;   :cstr -- the original (unstripped) request path
-;;;
-;;; Example:
-;;;   ;; Request: GET /api/users  ;; sub-app mounted at /api
-;;;   (req-path      ctx)  ;; => "/users"
-;;;   (req-full-path ctx)  ;; => "/api/users"
-;;;
-;;; Since: v0.2.0
-(defn req-full-path [ctx : Ctx] : cstr
-  ```c
-  struct __tourist_ctx {
+  ;;; req-full-path -- original request path before any url-map! stripping.
+  ;;;
+  ;;; Inside a url-map! sub-app, req-path returns the path with the matched
+  ;;; mount prefix stripped. req-full-path always returns the original path
+  ;;; as received by the server.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- :int tourist ctx handle
+  ;;;
+  ;;; Returns:
+  ;;;   :cstr -- the original (unstripped) request path
+  ;;;
+  ;;; Example:
+  ;;;   ;; Request: GET /api/users  ;; sub-app mounted at /api
+  ;;;   (req-path      ctx)  ;; => "/users"
+  ;;;   (req-full-path ctx)  ;; => "/api/users"
+  ;;;
+  ;;; Since: v0.2.0
+  (defn req-full-path [ctx : Ctx] : cstr
+    ```c
+    struct __tourist_ctx {
     char  *method; char *path; char *query; char *body;
     char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
     int64_t caps;
@@ -203,39 +204,36 @@
   struct __tourist_ctx *c = (struct __tourist_ctx *)(intptr_t)ctx;
   return c->full_path ? c->full_path : c->path;
   ```)
-
-;; -- Context lifecycle -----------------------------------------------------
-
-;;; tourist-ctx-new -- wrap an httpd request + captures into a tourist ctx.
-;;;
-;;; The ctx borrows the httpd req's string fields (method, path, etc.) --
-;;; it does NOT copy them; they remain valid as long as the original req
-;;; handle is alive. The ctx takes ownership of the caps handle and frees
-;;; it in tourist-ctx-free.
-;;;
-;;; Query params are pre-parsed from req->query into qp_keys/qp_vals so
-;;; that param lookups are O(n) without re-parsing on each call.
-;;;
-;;; Parameters:
-;;;   req  -- :int httpd request handle (caller retains ownership)
-;;;   caps -- :int captures handle from router-match (ctx takes ownership)
-;;;
-;;; Returns:
-;;;   Ctx -- tourist ctx handle; free with tourist-ctx-free
-;;;
-;;; Example:
-;;;   (let [ctx (tourist-ctx-new req caps)]
-;;;     ...)
-;;;
-;;; Since: v0.1.0 (return retyped to Ctx in v0.2.6)
-(defn tourist-ctx-new [req : int caps : int] : Ctx
-  (let [ctx (__tourist-ctx-alloc req caps)]
-    (__parse-qp (:: ctx :Ctx))
-    (:: ctx :Ctx)))
-
-(defn __tourist-ctx-alloc [req : int caps : int] : int
-  ```c
-  #include <stdlib.h>
+  ;; -- Context lifecycle -----------------------------------------------------
+  ;;; tourist-ctx-new -- wrap an httpd request + captures into a tourist ctx.
+  ;;;
+  ;;; The ctx borrows the httpd req's string fields (method, path, etc.) --
+  ;;; it does NOT copy them; they remain valid as long as the original req
+  ;;; handle is alive. The ctx takes ownership of the caps handle and frees
+  ;;; it in tourist-ctx-free.
+  ;;;
+  ;;; Query params are pre-parsed from req->query into qp_keys/qp_vals so
+  ;;; that param lookups are O(n) without re-parsing on each call.
+  ;;;
+  ;;; Parameters:
+  ;;;   req  -- :int httpd request handle (caller retains ownership)
+  ;;;   caps -- :int captures handle from router-match (ctx takes ownership)
+  ;;;
+  ;;; Returns:
+  ;;;   Ctx -- tourist ctx handle; free with tourist-ctx-free
+  ;;;
+  ;;; Example:
+  ;;;   (let [ctx (tourist-ctx-new req caps)]
+  ;;;     ...)
+  ;;;
+  ;;; Since: v0.1.0 (return retyped to Ctx in v0.2.6)
+  (defn tourist-ctx-new [req : int caps : int] : Ctx
+    (let [ctx (__tourist-ctx-alloc req caps)]
+      (__parse-qp (:: ctx :Ctx))
+      (:: ctx :Ctx)))
+  (defn __tourist-ctx-alloc [req : int caps : int] : int
+    ```c
+    #include <stdlib.h>
 
   struct __httpd_req {
     char  *method; char *path; char *query; char *body;
@@ -280,37 +278,35 @@
 
   return (int64_t)(intptr_t)c;
   ```)
-
-;;; tourist-ctx-free -- release a tourist ctx and its owned resources.
-;;;
-;;; Frees the ctx struct, the captures handle (via captures-free), and
-;;; the parsed query-param key/value arrays. Does NOT free the original
-;;; httpd req string fields (those belong to the httpd req handle).
-;;;
-;;; Parameters:
-;;;   ctx -- :int tourist ctx handle, or 0 (no-op)
-;;;
-;;; Returns:
-;;;   :void
-;;;
-;;; Example:
-;;;   (tourist-ctx-free ctx)
-;;;
-;;; Since: v0.1.0
-(defn tourist-ctx-free [ctx : Ctx] : void
-  (when (not= (:: ctx :int) 0)
-    (do
-      (captures-free (tourist-ctx-caps ctx))
-      (__ctx-free-qp ctx)
-      (__ctx-free-attrs ctx)
-      (__ctx-free-resp-headers ctx)
-      (__ctx-free-owned ctx)
-      (__ctx-free-struct ctx))))
-
-;;; __ctx-free-attrs -- release the attrs cons list (keys are owned cstr copies).
-(defn __ctx-free-attrs [ctx : Ctx] : void
-  ```c
-  #include <stdlib.h>
+  ;;; tourist-ctx-free -- release a tourist ctx and its owned resources.
+  ;;;
+  ;;; Frees the ctx struct, the captures handle (via captures-free), and
+  ;;; the parsed query-param key/value arrays. Does NOT free the original
+  ;;; httpd req string fields (those belong to the httpd req handle).
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- :int tourist ctx handle, or 0 (no-op)
+  ;;;
+  ;;; Returns:
+  ;;;   :void
+  ;;;
+  ;;; Example:
+  ;;;   (tourist-ctx-free ctx)
+  ;;;
+  ;;; Since: v0.1.0
+  (defn tourist-ctx-free [ctx : Ctx] : void
+    (when (not= (:: ctx :int) 0)
+      (do
+        (captures-free (tourist-ctx-caps ctx))
+        (__ctx-free-qp ctx)
+        (__ctx-free-attrs ctx)
+        (__ctx-free-resp-headers ctx)
+        (__ctx-free-owned ctx)
+        (__ctx-free-struct ctx))))
+  ;;; __ctx-free-attrs -- release the attrs cons list (keys are owned cstr copies).
+  (defn __ctx-free-attrs [ctx : Ctx] : void
+    ```c
+    #include <stdlib.h>
   struct __tourist_attr { char *key; int64_t val; struct __tourist_attr *next; };
   struct __tourist_ctx_h {
     char  *method; char *path; char *query; char *body;
@@ -332,11 +328,10 @@
   }
   c->attrs = 0;
   ```)
-
-;;; __ctx-free-resp-headers -- release the resp_headers cons list (owned cstrs).
-(defn __ctx-free-resp-headers [ctx : Ctx] : void
-  ```c
-  #include <stdlib.h>
+  ;;; __ctx-free-resp-headers -- release the resp_headers cons list (owned cstrs).
+  (defn __ctx-free-resp-headers [ctx : Ctx] : void
+    ```c
+    #include <stdlib.h>
   struct __tourist_hdr { char *name; char *value; struct __tourist_hdr *next; };
   struct __tourist_ctx_h {
     char  *method; char *path; char *query; char *body;
@@ -359,10 +354,9 @@
   }
   c->resp_headers = 0;
   ```)
-
-(defn __ctx-free-qp [ctx : Ctx] : void
-  ```c
-  #include <stdlib.h>
+  (defn __ctx-free-qp [ctx : Ctx] : void
+    ```c
+    #include <stdlib.h>
   struct __tourist_ctx {
     char  *method; char *path; char *query; char *body;
     char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
@@ -379,36 +373,33 @@
   free(c->qp_keys);
   free(c->qp_vals);
   ```)
-
-(defn __ctx-free-struct [ctx : Ctx] : void
-  ```c
-  #include <stdlib.h>
+  (defn __ctx-free-struct [ctx : Ctx] : void
+    ```c
+    #include <stdlib.h>
   if (ctx != 0) free((void *)(intptr_t)ctx);
   ```)
-
-;; -- Public API ------------------------------------------------------------
-
-;;; param -- look up a query parameter by key.
-;;;
-;;; Reads from the pre-parsed query-param table in the tourist ctx.
-;;; The returned ok_val string is owned by the ctx; do not free it
-;;; independently.
-;;;
-;;; Parameters:
-;;;   ctx -- :Ctx tourist context (from tourist-ctx-new or passed by app)
-;;;   key -- query parameter name, e.g. "q" for ?q=hello
-;;;
-;;; Returns:
-;;;   (Result cstr cstr) -- ok(value) if found, err("missing") otherwise
-;;;
-;;; Example:
-;;;   (let [r (param req "q")]
-;;;     (when (ok? r) (ok-val r)))
-;;;
-;;; Since: v0.1.0 (typed as Result in 0.2.0; ctx retyped to Ctx in 0.2.2)
-(defn param [ctx : Ctx key : cstr] : (Result cstr cstr)
-  ```c
-  #include <stdlib.h>
+  ;; -- Public API ------------------------------------------------------------
+  ;;; param -- look up a query parameter by key.
+  ;;;
+  ;;; Reads from the pre-parsed query-param table in the tourist ctx.
+  ;;; The returned ok_val string is owned by the ctx; do not free it
+  ;;; independently.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- :Ctx tourist context (from tourist-ctx-new or passed by app)
+  ;;;   key -- query parameter name, e.g. "q" for ?q=hello
+  ;;;
+  ;;; Returns:
+  ;;;   (Result cstr cstr) -- ok(value) if found, err("missing") otherwise
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (param req "q")]
+  ;;;     (when (ok? r) (ok-val r)))
+  ;;;
+  ;;; Since: v0.1.0 (typed as Result in 0.2.0; ctx retyped to Ctx in 0.2.2)
+  (defn param [ctx : Ctx key : cstr] : (Result cstr cstr)
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   struct __tourist_ctx {
     char  *method; char *path; char *query; char *body;
@@ -426,50 +417,47 @@
   }
   return tur_box_err((int64_t)(intptr_t)"missing");
   ```)
-
-;;; capture -- look up a path-segment capture by name.
-;;;
-;;; Delegates to captures-get on the ctx's captures handle. The returned
-;;; ok_val string is owned by the ctx; do not free it independently.
-;;;
-;;; Parameters:
-;;;   ctx  -- :Ctx tourist context
-;;;   name -- capture name, e.g. "id" for ":id", or "*" for wildcard
-;;;
-;;; Returns:
-;;;   (Result cstr cstr) -- ok(value) if found, err("missing") otherwise
-;;;
-;;; Example:
-;;;   (let [r (capture req "name")]
-;;;     (when (ok? r) (ok-val r)))
-;;;
-;;; Since: v0.1.0 (typed as Result in 0.2.0; ctx retyped to Ctx in 0.2.2)
-(defn capture [ctx : Ctx name : cstr] : (Result cstr cstr)
-  (captures-get (tourist-ctx-caps ctx) name))
-
-;; -- v0.2.0: per-request attrs and deferred response headers ---------------
-
-;;; ctx-attr-get -- look up a per-request attribute by key.
-;;;
-;;; Attributes are middleware-attached pieces of state (a session ID, a
-;;; request ID, a parsed auth principal) that route handlers can read
-;;; back. Values are int64-sized; callers cast pointers in/out as needed.
-;;;
-;;; Parameters:
-;;;   ctx -- :Ctx tourist context
-;;;   key -- attribute name (key compared by strcmp)
-;;;
-;;; Returns:
-;;;   (Option int) -- (some value) if set, (none) otherwise
-;;;
-;;; Example:
-;;;   (let [o (ctx-attr-get ctx "request-id")]
-;;;     (when (some? o) (println-int (unwrap o))))
-;;;
-;;; Since: v0.2.0
-(defn ctx-attr-get [ctx : Ctx key : cstr] : (Option int)
-  ```c
-  #include <stdlib.h>
+  ;;; capture -- look up a path-segment capture by name.
+  ;;;
+  ;;; Delegates to captures-get on the ctx's captures handle. The returned
+  ;;; ok_val string is owned by the ctx; do not free it independently.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx  -- :Ctx tourist context
+  ;;;   name -- capture name, e.g. "id" for ":id", or "*" for wildcard
+  ;;;
+  ;;; Returns:
+  ;;;   (Result cstr cstr) -- ok(value) if found, err("missing") otherwise
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (capture req "name")]
+  ;;;     (when (ok? r) (ok-val r)))
+  ;;;
+  ;;; Since: v0.1.0 (typed as Result in 0.2.0; ctx retyped to Ctx in 0.2.2)
+  (defn capture [ctx : Ctx name : cstr] : (Result cstr cstr)
+    (captures-get (tourist-ctx-caps ctx) name))
+  ;; -- v0.2.0: per-request attrs and deferred response headers ---------------
+  ;;; ctx-attr-get -- look up a per-request attribute by key.
+  ;;;
+  ;;; Attributes are middleware-attached pieces of state (a session ID, a
+  ;;; request ID, a parsed auth principal) that route handlers can read
+  ;;; back. Values are int64-sized; callers cast pointers in/out as needed.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- :Ctx tourist context
+  ;;;   key -- attribute name (key compared by strcmp)
+  ;;;
+  ;;; Returns:
+  ;;;   (Option int) -- (some value) if set, (none) otherwise
+  ;;;
+  ;;; Example:
+  ;;;   (let [o (ctx-attr-get ctx "request-id")]
+  ;;;     (when (some? o) (println-int (unwrap o))))
+  ;;;
+  ;;; Since: v0.2.0
+  (defn ctx-attr-get [ctx : Ctx key : cstr] : (Option int)
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   struct __tourist_attr { char *key; int64_t val; struct __tourist_attr *next; };
   struct __tourist_ctx_h {
@@ -491,29 +479,28 @@
   }
   return (int64_t)0;
   ```)
-
-;;; ctx-attr-set! -- set or replace a per-request attribute.
-;;;
-;;; If key already exists, its value is overwritten in place (the original
-;;; key cstr is kept and the cell is reused). Otherwise a new (key, value)
-;;; entry is prepended to the list. The key string is copied; the caller
-;;; retains ownership of the original buffer.
-;;;
-;;; Parameters:
-;;;   ctx -- :Ctx tourist context
-;;;   key -- attribute name (will be strdup'd)
-;;;   val -- :int payload (any int64-sized value, including cast pointers)
-;;;
-;;; Returns:
-;;;   :void
-;;;
-;;; Example:
-;;;   (ctx-attr-set! ctx "request-id" 0x1234)
-;;;
-;;; Since: v0.2.0
-(defn ctx-attr-set! [ctx : Ctx key : cstr val : int] : void
-  ```c
-  #include <stdlib.h>
+  ;;; ctx-attr-set! -- set or replace a per-request attribute.
+  ;;;
+  ;;; If key already exists, its value is overwritten in place (the original
+  ;;; key cstr is kept and the cell is reused). Otherwise a new (key, value)
+  ;;; entry is prepended to the list. The key string is copied; the caller
+  ;;; retains ownership of the original buffer.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- :Ctx tourist context
+  ;;;   key -- attribute name (will be strdup'd)
+  ;;;   val -- :int payload (any int64-sized value, including cast pointers)
+  ;;;
+  ;;; Returns:
+  ;;;   :void
+  ;;;
+  ;;; Example:
+  ;;;   (ctx-attr-set! ctx "request-id" 0x1234)
+  ;;;
+  ;;; Since: v0.2.0
+  (defn ctx-attr-set! [ctx : Ctx key : cstr val : int] : void
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   struct __tourist_attr { char *key; int64_t val; struct __tourist_attr *next; };
   struct __tourist_ctx_h {
@@ -542,30 +529,29 @@
   n->next = (struct __tourist_attr *)(intptr_t)c->attrs;
   c->attrs = (int64_t)(intptr_t)n;
   ```)
-
-;;; ctx-add-header! -- queue a response header to be applied after dispatch.
-;;;
-;;; Use from middleware (or any handler) to append a header to the response
-;;; without having to thread the response object through the call stack.
-;;; Tourist applies the queued headers to the final response after the route
-;;; (and any after-middleware) returns; headers are written in insertion
-;;; order. Both `name` and `value` are copied; caller retains ownership.
-;;;
-;;; Parameters:
-;;;   ctx   -- :Ctx tourist context
-;;;   name  -- HTTP header name (e.g. "X-Request-Id")
-;;;   value -- header value
-;;;
-;;; Returns:
-;;;   :void
-;;;
-;;; Example:
-;;;   (ctx-add-header! ctx "X-Request-Id" "abc-123")
-;;;
-;;; Since: v0.2.0
-(defn ctx-add-header! [ctx : Ctx name : cstr value : cstr] : void
-  ```c
-  #include <stdlib.h>
+  ;;; ctx-add-header! -- queue a response header to be applied after dispatch.
+  ;;;
+  ;;; Use from middleware (or any handler) to append a header to the response
+  ;;; without having to thread the response object through the call stack.
+  ;;; Tourist applies the queued headers to the final response after the route
+  ;;; (and any after-middleware) returns; headers are written in insertion
+  ;;; order. Both `name` and `value` are copied; caller retains ownership.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx   -- :Ctx tourist context
+  ;;;   name  -- HTTP header name (e.g. "X-Request-Id")
+  ;;;   value -- header value
+  ;;;
+  ;;; Returns:
+  ;;;   :void
+  ;;;
+  ;;; Example:
+  ;;;   (ctx-add-header! ctx "X-Request-Id" "abc-123")
+  ;;;
+  ;;; Since: v0.2.0
+  (defn ctx-add-header! [ctx : Ctx name : cstr value : cstr] : void
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   struct __tourist_hdr { char *name; char *value; struct __tourist_hdr *next; };
   struct __tourist_ctx_h {
@@ -591,22 +577,21 @@
   while (*tail) tail = &(*tail)->next;
   *tail = h;
   ```)
-
-;;; tourist-ctx-resp-headers -- raw head pointer of the resp_headers cons list.
-;;;
-;;; Exposed for tourist/app to walk the queued headers after dispatch and
-;;; apply them to the response. Not part of the user-facing API.
-;;;
-;;; Parameters:
-;;;   ctx -- :int tourist context handle
-;;;
-;;; Returns:
-;;;   :int -- head cell pointer, or 0 if no headers were queued
-;;;
-;;; Since: v0.2.0
-(defn tourist-ctx-resp-headers [ctx : Ctx] : int
-  ```c
-  struct __tourist_ctx_h {
+  ;;; tourist-ctx-resp-headers -- raw head pointer of the resp_headers cons list.
+  ;;;
+  ;;; Exposed for tourist/app to walk the queued headers after dispatch and
+  ;;; apply them to the response. Not part of the user-facing API.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- :int tourist context handle
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- head cell pointer, or 0 if no headers were queued
+  ;;;
+  ;;; Since: v0.2.0
+  (defn tourist-ctx-resp-headers [ctx : Ctx] : int
+    ```c
+    struct __tourist_ctx_h {
     char  *method; char *path; char *query; char *body;
     char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
     int64_t caps;
@@ -617,42 +602,38 @@
   };
   return ((struct __tourist_ctx_h *)(intptr_t)ctx)->resp_headers;
   ```)
-
-;;; tourist-ctx-clear-resp-headers -- free the resp_headers list and reset to 0.
-;;;
-;;; Used by tourist/app after the queued headers have been applied to the
-;;; response so the same ctx (in pathological reentrant flows) does not
-;;; double-apply them. Safe to call on an empty list.
-;;;
-;;; Parameters:
-;;;   ctx -- :int tourist context handle
-;;;
-;;; Returns:
-;;;   :void
-;;;
-;;; Since: v0.2.0
-(defn tourist-ctx-clear-resp-headers [ctx : Ctx] : void
-  (__ctx-free-resp-headers ctx))
-
-
-;; -- v0.3.0: the trailing fields ---------------------------------------------
-
-;;; tourist-ctx-req -- the httpd Request a ctx was built from.
-;;;
-;;; The Ctx itself reads like a Request for the leading fields (method, path,
-;;; headers, ...); this is the real one, for what needs the server behind it
-;;; (httpd/request's req-remote-addr, request-conn).
-;;;
-;;; Parameters:
-;;;   ctx -- tourist ctx
-;;;
-;;; Returns:
-;;;   Request -- the request handle (valid while the request is served)
-;;;
-;;; Since: v0.3.0
-(defn tourist-ctx-req [ctx : Ctx] : Request
-  ```c
-  struct __tourist_ctx_f {
+  ;;; tourist-ctx-clear-resp-headers -- free the resp_headers list and reset to 0.
+  ;;;
+  ;;; Used by tourist/app after the queued headers have been applied to the
+  ;;; response so the same ctx (in pathological reentrant flows) does not
+  ;;; double-apply them. Safe to call on an empty list.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- :int tourist context handle
+  ;;;
+  ;;; Returns:
+  ;;;   :void
+  ;;;
+  ;;; Since: v0.2.0
+  (defn tourist-ctx-clear-resp-headers [ctx : Ctx] : void
+    (__ctx-free-resp-headers ctx))
+  ;; -- v0.3.0: the trailing fields ---------------------------------------------
+  ;;; tourist-ctx-req -- the httpd Request a ctx was built from.
+  ;;;
+  ;;; The Ctx itself reads like a Request for the leading fields (method, path,
+  ;;; headers, ...); this is the real one, for what needs the server behind it
+  ;;; (httpd/request's req-remote-addr, request-conn).
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- tourist ctx
+  ;;;
+  ;;; Returns:
+  ;;;   Request -- the request handle (valid while the request is served)
+  ;;;
+  ;;; Since: v0.3.0
+  (defn tourist-ctx-req [ctx : Ctx] : Request
+    ```c
+    struct __tourist_ctx_f {
     char  *method; char *path; char *query; char *body;
     char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
     int64_t caps;
@@ -663,11 +644,10 @@
   };
   return ((struct __tourist_ctx_f *)(intptr_t)ctx)->req;
   ```)
-
-;;; tourist-ctx-around-rest -- internal: use-around! items still to run.
-(defn tourist-ctx-around-rest [ctx : Ctx] : ItemList
-  ```c
-  struct __tourist_ctx_f {
+  ;;; tourist-ctx-around-rest -- internal: use-around! items still to run.
+  (defn tourist-ctx-around-rest [ctx : Ctx] : ItemList
+    ```c
+    struct __tourist_ctx_f {
     char  *method; char *path; char *query; char *body;
     char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
     int64_t caps;
@@ -678,11 +658,10 @@
   };
   return ((struct __tourist_ctx_f *)(intptr_t)ctx)->around_rest;
   ```)
-
-;;; tourist-ctx-set-around-rest! -- internal: record the use-around! position.
-(defn tourist-ctx-set-around-rest! [ctx : Ctx rest : ItemList] : void
-  ```c
-  struct __tourist_ctx_f {
+  ;;; tourist-ctx-set-around-rest! -- internal: record the use-around! position.
+  (defn tourist-ctx-set-around-rest! [ctx : Ctx rest : ItemList] : void
+    ```c
+    struct __tourist_ctx_f {
     char  *method; char *path; char *query; char *body;
     char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
     int64_t caps;
@@ -693,24 +672,23 @@
   };
   ((struct __tourist_ctx_f *)(intptr_t)ctx)->around_rest = (int64_t)rest;
   ```)
-
-;;; tourist-ctx-own! -- internal: make a malloc'd string the ctx's, freed
-;;; with it.
-;;;
-;;; For the request helpers (tourist/request) that hand out a value the
-;;; caller must not free: it lives exactly as long as the request.
-;;;
-;;; Parameters:
-;;;   ctx -- tourist ctx
-;;;   s   -- a malloc'd string (ownership moves to the ctx)
-;;;
-;;; Returns:
-;;;   :cstr -- s
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn tourist-ctx-own! [ctx : Ctx s : cstr] : cstr
-  ```c
-  struct __tourist_owned { char *s; struct __tourist_owned *next; };
+  ;;; tourist-ctx-own! -- internal: make a malloc'd string the ctx's, freed
+  ;;; with it.
+  ;;;
+  ;;; For the request helpers (tourist/request) that hand out a value the
+  ;;; caller must not free: it lives exactly as long as the request.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- tourist ctx
+  ;;;   s   -- a malloc'd string (ownership moves to the ctx)
+  ;;;
+  ;;; Returns:
+  ;;;   :cstr -- s
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn tourist-ctx-own! [ctx : Ctx s : cstr] : cstr
+    ```c
+    struct __tourist_owned { char *s; struct __tourist_owned *next; };
   struct __tourist_ctx_f {
     char  *method; char *path; char *query; char *body;
     char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
@@ -729,11 +707,10 @@
   c->owned = (int64_t)(intptr_t)o;
   return s;
   ```)
-
-;;; __ctx-free-owned -- release the strings tourist-ctx-own! collected.
-(defn __ctx-free-owned [ctx : Ctx] : void
-  ```c
-  struct __tourist_owned { char *s; struct __tourist_owned *next; };
+  ;;; __ctx-free-owned -- release the strings tourist-ctx-own! collected.
+  (defn __ctx-free-owned [ctx : Ctx] : void
+    ```c
+    struct __tourist_owned { char *s; struct __tourist_owned *next; };
   struct __tourist_ctx_f {
     char  *method; char *path; char *query; char *body;
     char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
@@ -753,6 +730,4 @@
     o = nx;
   }
   c->owned = 0;
-  ```)
-
-) ;; end defmodule tourist/param
+  ```)) ;; end defmodule tourist/param

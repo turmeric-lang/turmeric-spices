@@ -1,183 +1,194 @@
 ;; MP2: the reader -- parse golden bytes and pull typed primitives back out,
 ;; through both the raw msgpack/decode API and the DecodeMp typeclass.
-
-(defmodule decode_primitives_test (export)
-
-(import msgpack/buf    :refer [Buf buf-free hex->buf])
-(import msgpack/decode :refer [MpTree MpNode mp-parse mp-tree-root mp-tree-free
-                               mp-map-get mp-arr-size mp-arr-get mp-type-name
-                               mp-absent? mp-nil? mp-int? mp-str? mp-bool?
-                               mp-num? mp-float? mp-arr? mp-map?
-                               mp-get-int mp-get-bool mp-get-float mp-get-str])
-(import msgpack/encode :refer [])
-(import test/suite     :refer [describe it])
-(import test/assert    :refer [assert-true assert-eq])
-(import test/runner    :refer [run-all-status])
-
-(defn cstr-eq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+(defmodule decode_primitives_test
+  (export)
+  (import msgpack/buf :refer [Buf buf-free hex->buf])
+  (import msgpack/decode
+    :refer
+    [MpTree
+     MpNode
+     mp-parse
+     mp-tree-root
+     mp-tree-free
+     mp-map-get
+     mp-arr-size
+     mp-arr-get
+     mp-type-name
+     mp-absent?
+     mp-nil?
+     mp-int?
+     mp-str?
+     mp-bool?
+     mp-num?
+     mp-float?
+     mp-arr?
+     mp-map?
+     mp-get-int
+     mp-get-bool
+     mp-get-float
+     mp-get-str])
+  (import msgpack/encode :refer [])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true assert-eq])
+  (import test/runner :refer [run-all-status])
+  (defn cstr-eq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn cstr-free [p : cstr] : nil
-  ```c
-  free((void *)(intptr_t)p);
+  (defn cstr-free [p : cstr] : nil
+    ```c
+    free((void *)(intptr_t)p);
   ```)
-
-(defn float-eq? [a : float b : float] : bool
-  ```c
-  double d = (double)a - (double)b;
+  (defn float-eq? [a : float b : float] : bool
+    ```c
+    double d = (double)a - (double)b;
   return (d < 0.0 ? -d : d) < 1e-12;
   ```)
-
-;; parse-hex -- hex literal -> MpTree. The fixtures below are all well-formed,
-;; so this unwraps; the malformed cases live in decode-malformed.tur.
-(defn parse-hex [h : cstr] : MpTree
-  (let [b (hex->buf h)
-        r (mp-parse b)]
-    (buf-free b)
-    (ok-val r)))
-
-;; int-of -- decode the root of `h` as an int, then release the tree.
-(defn int-of [h : cstr] : int
-  (let [t (parse-hex h)
-        v (ok-val (:: (decode-mp t (mp-tree-root t)) (Result int cstr)))]
-    (mp-tree-free t)
-    v))
-
-;; type-of=? -- does the root of `h` report type name `want`?
-(defn type-of=? [h : cstr want : cstr] : bool
-  (let [t (parse-hex h)
-        r (cstr-eq? want (mp-type-name t (mp-tree-root t)))]
-    (mp-tree-free t)
-    r))
-
-(defn __int-tests [] : void
-  (describe "msgpack DecodeMp [int] -- every integer format"
-    (it "positive fixint"     (assert-eq 127 (int-of "7f")))
-    (it "uint8"               (assert-eq 128 (int-of "cc80")))
-    (it "uint16"              (assert-eq 256 (int-of "cd0100")))
-    (it "uint32"              (assert-eq 65536 (int-of "ce00010000")))
-    (it "uint64"              (assert-eq 4294967296 (int-of "cf0000000100000000")))
-    (it "int64 max"           (assert-eq 9223372036854775807 (int-of "cf7fffffffffffffff")))
-    (it "negative fixint"     (assert-eq -32 (int-of "e0")))
-    (it "int8"                (assert-eq -33 (int-of "d0df")))
-    (it "int16"               (assert-eq -129 (int-of "d1ff7f")))
-    (it "int32"               (assert-eq -32769 (int-of "d2ffff7fff")))
-    (it "int64"               (assert-eq -2147483649 (int-of "d3ffffffff7fffffff")))
-    (it "int64 min"           (assert-eq -9223372036854775808 (int-of "d38000000000000000")))
-    (it "a uint64 above int64 max is an error, not a wrapped negative"
-      (let [t (parse-hex "cfffffffffffffffff")
-            r (err? (:: (decode-mp t (mp-tree-root t)) (Result int cstr)))]
-        (mp-tree-free t)
-        (assert-true r)))))
-
-(defn __scalar-tests [] : void
-  (describe "msgpack DecodeMp -- bool, float, cstr"
-    (it "true"
-      (let [t (parse-hex "c3")
-            r (ok-val (:: (decode-mp t (mp-tree-root t)) (Result bool cstr)))]
-        (mp-tree-free t)
-        (assert-true r)))
-    (it "false"
-      (let [t (parse-hex "c2")
-            r (ok-val (:: (decode-mp t (mp-tree-root t)) (Result bool cstr)))]
-        (mp-tree-free t)
-        (assert-true (not r))))
-    (it "a float64 keeps its fractional part"
-      (let [t (parse-hex "cb401c666666666666")
-            v (ok-val (:: (decode-mp t (mp-tree-root t)) (Result float cstr)))]
-        (mp-tree-free t)
-        (assert-true (float-eq? 7.1 v))))
-    (it "an integer widens to a float"
-      (let [t (parse-hex "07")
-            v (ok-val (:: (decode-mp t (mp-tree-root t)) (Result float cstr)))]
-        (mp-tree-free t)
-        (assert-true (float-eq? 7.0 v))))
-    (it "a float is NOT an integer -- the wire formats are distinct"
-      (let [t (parse-hex "cb401c666666666666")
-            r (err? (:: (decode-mp t (mp-tree-root t)) (Result int cstr)))]
-        (mp-tree-free t)
-        (assert-true r)))
-    (it "a fixstr"
-      (let [t (parse-hex "a26869")
-            s (ok-val (:: (decode-mp t (mp-tree-root t)) (Result cstr cstr)))
-            r (cstr-eq? "hi" s)]
-        (mp-tree-free t)
-        (cstr-free s)
-        (assert-true r)))
-    (it "the decoded string survives mp-tree-free"
-      (let [t (parse-hex "a5616c696365")
-            s (ok-val (:: (decode-mp t (mp-tree-root t)) (Result cstr cstr)))]
-        (mp-tree-free t)
-        (let [r (cstr-eq? "alice" s)]
+  ;; parse-hex -- hex literal -> MpTree. The fixtures below are all well-formed,
+  ;; so this unwraps; the malformed cases live in decode-malformed.tur.
+  (defn parse-hex [h : cstr] : MpTree
+    (let [b (hex->buf h)
+          r (mp-parse b)]
+      (buf-free b)
+      (ok-val r)))
+  ;; int-of -- decode the root of `h` as an int, then release the tree.
+  (defn int-of [h : cstr] : int
+    (let [t (parse-hex h)
+          v (ok-val (:: (decode-mp t (mp-tree-root t)) (Result int cstr)))]
+      (mp-tree-free t)
+      v))
+  ;; type-of=? -- does the root of `h` report type name `want`?
+  (defn type-of=? [h : cstr want : cstr] : bool
+    (let [t (parse-hex h)
+          r (cstr-eq? want (mp-type-name t (mp-tree-root t)))]
+      (mp-tree-free t)
+      r))
+  (defn __int-tests [] : void
+    (describe "msgpack DecodeMp [int] -- every integer format"
+      (it "positive fixint" (assert-eq 127 (int-of "7f")))
+      (it "uint8" (assert-eq 128 (int-of "cc80")))
+      (it "uint16" (assert-eq 256 (int-of "cd0100")))
+      (it "uint32" (assert-eq 65536 (int-of "ce00010000")))
+      (it "uint64" (assert-eq 4294967296 (int-of "cf0000000100000000")))
+      (it "int64 max"
+        (assert-eq 9223372036854775807 (int-of "cf7fffffffffffffff")))
+      (it "negative fixint" (assert-eq -32 (int-of "e0")))
+      (it "int8" (assert-eq -33 (int-of "d0df")))
+      (it "int16" (assert-eq -129 (int-of "d1ff7f")))
+      (it "int32" (assert-eq -32769 (int-of "d2ffff7fff")))
+      (it "int64" (assert-eq -2147483649 (int-of "d3ffffffff7fffffff")))
+      (it "int64 min"
+        (assert-eq -9223372036854775808 (int-of "d38000000000000000")))
+      (it "a uint64 above int64 max is an error, not a wrapped negative"
+        (let [t (parse-hex "cfffffffffffffffff")
+              r (err? (:: (decode-mp t (mp-tree-root t)) (Result int cstr)))]
+          (mp-tree-free t)
+          (assert-true r)))))
+  (defn __scalar-tests [] : void
+    (describe "msgpack DecodeMp -- bool, float, cstr"
+      (it "true"
+        (let [t (parse-hex "c3")
+              r (ok-val (:: (decode-mp t (mp-tree-root t)) (Result bool cstr)))]
+          (mp-tree-free t)
+          (assert-true r)))
+      (it "false"
+        (let [t (parse-hex "c2")
+              r (ok-val (:: (decode-mp t (mp-tree-root t)) (Result bool cstr)))]
+          (mp-tree-free t)
+          (assert-true (not r))))
+      (it "a float64 keeps its fractional part"
+        (let [t (parse-hex "cb401c666666666666")
+              v (ok-val (:: (decode-mp t (mp-tree-root t)) (Result float cstr)))]
+          (mp-tree-free t)
+          (assert-true (float-eq? 7.1 v))))
+      (it "an integer widens to a float"
+        (let [t (parse-hex "07")
+              v (ok-val (:: (decode-mp t (mp-tree-root t)) (Result float cstr)))]
+          (mp-tree-free t)
+          (assert-true (float-eq? 7.0 v))))
+      (it "a float is NOT an integer -- the wire formats are distinct"
+        (let [t (parse-hex "cb401c666666666666")
+              r (err? (:: (decode-mp t (mp-tree-root t)) (Result int cstr)))]
+          (mp-tree-free t)
+          (assert-true r)))
+      (it "a fixstr"
+        (let [t (parse-hex "a26869")
+              s (ok-val (:: (decode-mp t (mp-tree-root t)) (Result cstr cstr)))
+              r (cstr-eq? "hi" s)]
+          (mp-tree-free t)
           (cstr-free s)
-          (assert-true r))))
-    (it "a bin is not a string"
-      (let [t (parse-hex "c40101")
-            r (err? (:: (decode-mp t (mp-tree-root t)) (Result cstr cstr)))]
-        (mp-tree-free t)
-        (assert-true r)))))
-
-(defn __type-name-tests [] : void
-  (describe "msgpack mp-type-name -- the stdlib/schema.tur vocabulary"
-    (it "nil is null"        (assert-true (type-of=? "c0" "null")))
-    (it "a bool is bool"     (assert-true (type-of=? "c3" "bool")))
-    (it "an int is int"      (assert-true (type-of=? "07" "int")))
-    (it "a float is float"   (assert-true (type-of=? "cb401c666666666666" "float")))
-    (it "a str is string"    (assert-true (type-of=? "a26869" "string")))
-    (it "an array is array"  (assert-true (type-of=? "93010203" "array")))
-    (it "a map is object, matching the json spice's word for it"
-                             (assert-true (type-of=? "82a17801a17902" "object")))))
-
-(defn __nav-tests [] : void
-  (describe "msgpack navigation -- map lookup and array indexing"
-    (it "finds a present key"
-      (let [t (parse-hex "82a17801a17902")
-            r (some? (mp-map-get t (mp-tree-root t) "x"))]
-        (mp-tree-free t)
-        (assert-true r)))
-    (it "reports an absent key as none, not as a zero node"
-      (let [t (parse-hex "82a17801a17902")
-            r (some? (mp-map-get t (mp-tree-root t) "zzz"))]
-        (mp-tree-free t)
-        (assert-true (not r))))
-    (it "a lookup in a non-map is none"
-      (let [t (parse-hex "93010203")
-            r (some? (mp-map-get t (mp-tree-root t) "x"))]
-        (mp-tree-free t)
-        (assert-true (not r))))
-    (it "finds a key in a map16 (past the fixmap boundary)"
-      (let [t (parse-hex "de0010a16100a16201a16302a16403a16504a16605a16706a16807a16908a16a09a16b0aa16c0ba16d0ca16e0da16f0ea1700f")
-            v (ok-val (:: (decode-mp t (unwrap (mp-map-get t (mp-tree-root t) "p"))) (Result int cstr)))]
-        (mp-tree-free t)
-        (assert-eq 15 v)))
-    (it "reports array length"
-      (let [t (parse-hex "93010203")
-            n (unwrap (mp-arr-size t (mp-tree-root t)))]
-        (mp-tree-free t)
-        (assert-eq 3 n)))
-    (it "a length on a non-array is none"
-      (let [t (parse-hex "07")
-            r (some? (mp-arr-size t (mp-tree-root t)))]
-        (mp-tree-free t)
-        (assert-true (not r))))
-    (it "indexes into an array16 (past the fixarray boundary)"
-      (let [t (parse-hex "dc0010000102030405060708090a0b0c0d0e0f")
-            v (ok-val (:: (decode-mp t (unwrap (mp-arr-get t (mp-tree-root t) 15))) (Result int cstr)))]
-        (mp-tree-free t)
-        (assert-eq 15 v)))
-    (it "an out-of-range index is none"
-      (let [t (parse-hex "93010203")
-            r (some? (mp-arr-get t (mp-tree-root t) 3))]
-        (mp-tree-free t)
-        (assert-true (not r))))))
-
-(defn main [] : int
-  (__int-tests)
-  (__scalar-tests)
-  (__type-name-tests)
-  (__nav-tests)
-  (run-all-status))
-)
+          (assert-true r)))
+      (it "the decoded string survives mp-tree-free"
+        (let [t (parse-hex "a5616c696365")
+              s (ok-val (:: (decode-mp t (mp-tree-root t)) (Result cstr cstr)))]
+          (mp-tree-free t)
+          (let [r (cstr-eq? "alice" s)] (cstr-free s) (assert-true r))))
+      (it "a bin is not a string"
+        (let [t (parse-hex "c40101")
+              r (err? (:: (decode-mp t (mp-tree-root t)) (Result cstr cstr)))]
+          (mp-tree-free t)
+          (assert-true r)))))
+  (defn __type-name-tests [] : void
+    (describe "msgpack mp-type-name -- the stdlib/schema.tur vocabulary"
+      (it "nil is null" (assert-true (type-of=? "c0" "null")))
+      (it "a bool is bool" (assert-true (type-of=? "c3" "bool")))
+      (it "an int is int" (assert-true (type-of=? "07" "int")))
+      (it "a float is float"
+        (assert-true (type-of=? "cb401c666666666666" "float")))
+      (it "a str is string" (assert-true (type-of=? "a26869" "string")))
+      (it "an array is array" (assert-true (type-of=? "93010203" "array")))
+      (it "a map is object, matching the json spice's word for it"
+        (assert-true (type-of=? "82a17801a17902" "object")))))
+  (defn __nav-tests [] : void
+    (describe "msgpack navigation -- map lookup and array indexing"
+      (it "finds a present key"
+        (let [t (parse-hex "82a17801a17902")
+              r (some? (mp-map-get t (mp-tree-root t) "x"))]
+          (mp-tree-free t)
+          (assert-true r)))
+      (it "reports an absent key as none, not as a zero node"
+        (let [t (parse-hex "82a17801a17902")
+              r (some? (mp-map-get t (mp-tree-root t) "zzz"))]
+          (mp-tree-free t)
+          (assert-true (not r))))
+      (it "a lookup in a non-map is none"
+        (let [t (parse-hex "93010203")
+              r (some? (mp-map-get t (mp-tree-root t) "x"))]
+          (mp-tree-free t)
+          (assert-true (not r))))
+      (it "finds a key in a map16 (past the fixmap boundary)"
+        (let [t (parse-hex "de0010a16100a16201a16302a16403a16504a16605a16706a16807a16908a16a09a16b0aa16c0ba16d0ca16e0da16f0ea1700f")
+              v (ok-val (:: (decode-mp t
+                              (unwrap (mp-map-get t (mp-tree-root t) "p")))
+                          (Result int cstr)))]
+          (mp-tree-free t)
+          (assert-eq 15 v)))
+      (it "reports array length"
+        (let [t (parse-hex "93010203")
+              n (unwrap (mp-arr-size t (mp-tree-root t)))]
+          (mp-tree-free t)
+          (assert-eq 3 n)))
+      (it "a length on a non-array is none"
+        (let [t (parse-hex "07")
+              r (some? (mp-arr-size t (mp-tree-root t)))]
+          (mp-tree-free t)
+          (assert-true (not r))))
+      (it "indexes into an array16 (past the fixarray boundary)"
+        (let [t (parse-hex "dc0010000102030405060708090a0b0c0d0e0f")
+              v (ok-val (:: (decode-mp t
+                              (unwrap (mp-arr-get t (mp-tree-root t) 15)))
+                          (Result int cstr)))]
+          (mp-tree-free t)
+          (assert-eq 15 v)))
+      (it "an out-of-range index is none"
+        (let [t (parse-hex "93010203")
+              r (some? (mp-arr-get t (mp-tree-root t) 3))]
+          (mp-tree-free t)
+          (assert-true (not r))))))
+  (defn main [] : int
+    (__int-tests)
+    (__scalar-tests)
+    (__type-name-tests)
+    (__nav-tests)
+    (run-all-status)))

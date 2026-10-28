@@ -9,36 +9,38 @@
 ;;;
 ;;; Factor type names are hyphen-free (`cholfac`/`lufac`/`qrfac`) because a
 ;;; hyphen in a struct type name does not survive C codegen.
-
 (defmodule linalg/decomp
-  (export cholfac lufac qrfac
-          chol chol-free lu lu-free qr qr-free)
-
-  (import linalg/mat :refer [mat mat-new mat-new-zeroed mat-identity mat-copy
-                             mat-free mat-rows mat-cols mat-square?])
-
-;;; Factor structs (move-only: they own their mats / pivot).
-(defstruct cholfac [L : mat])
-(defstruct lufac [L : mat  U : mat  piv : (Vec int)])
-(defstruct qrfac [Q : mat  R : mat])
-
-;;; Private: a (Vec int) of n zeros (LU pivot scratch).
-(defn __izeros [n : int] : (Vec int)
-  (let [d (:: (vec-new) (Vec int))
-        ^mut i 0]
-    (letrec [go (fn [] : int
-                  (if (>= i n) 0
-                    (do (vec-push! d 0) (set! i (+ i 1)) (go))))]
-      (go))
-    d))
-
-;;; LA3 -- Cholesky (Cholesky-Banachiewicz): A = L L', A symmetric pos-def.
-
-;;; __chol-kernel -- write lower-triangular L into Ld from Ad (both n x n,
-;;; row-major). Returns 0 on success, -1 if A is not positive definite.
-(defn __chol-kernel [Ld : (Vec float)  Ad : (Vec float)  n : int] : int
-  ```c
-  struct __V { int64_t *data; int64_t len; int64_t cap; };
+  (export cholfac lufac qrfac chol chol-free lu lu-free qr qr-free)
+  (import linalg/mat
+    :refer
+    [mat
+     mat-new
+     mat-new-zeroed
+     mat-identity
+     mat-copy
+     mat-free
+     mat-rows
+     mat-cols
+     mat-square?])
+  ;;; Factor structs (move-only: they own their mats / pivot).
+  (defstruct cholfac [L : mat])
+  (defstruct lufac [L : mat U : mat piv : (Vec int)])
+  (defstruct qrfac [Q : mat R : mat])
+  ;;; Private: a (Vec int) of n zeros (LU pivot scratch).
+  (defn __izeros [n : int] : (Vec int)
+    (let [d      (:: (vec-new) (Vec int))
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n) 0 (do (vec-push! d 0) (set! i (+ i 1)) (go))))]
+        (go))
+      d))
+  ;;; LA3 -- Cholesky (Cholesky-Banachiewicz): A = L L', A symmetric pos-def.
+  ;;; __chol-kernel -- write lower-triangular L into Ld from Ad (both n x n,
+  ;;; row-major). Returns 0 on success, -1 if A is not positive definite.
+  (defn __chol-kernel [Ld : (Vec float) Ad : (Vec float) n : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
   double *L = (double*)(void*)((struct __V*)(intptr_t)Ld)->data;
   double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
   for (int64_t i = 0; i < n; i++) {
@@ -56,32 +58,29 @@
   }
   return 0;
   ```)
-
-;;; chol -- Cholesky decomposition A = L L'. Panics if A is not square or not
-;;; symmetric positive-definite.
-(defn chol [^borrow a : mat] : cholfac
-  (when (not (= (mat-square? a) 1))
-    (panic "chol: matrix must be square"))
-  (let [n (mat-rows a)
-        l (mat-new-zeroed n n)
-        status (__chol-kernel (.data l) (.data a) n)]
-    (when (< status 0)
-      (do (mat-free l)
-          (panic "chol: matrix is not positive definite")))
-    (make-struct cholfac l)))
-
-;;; chol-free -- free a Cholesky factor.
-(defn chol-free [f : cholfac] : void (mat-free (.L f)))
-
-;;; LA4 -- LU with partial pivoting (Doolittle): P A = L U.
-
-;;; __lu-kernel -- factor A (n x n) into unit-lower L, upper U, and a row
-;;; permutation piv (piv[i] = original row now at position i). Returns 0 ok,
-;;; -1 if singular.
-(defn __lu-kernel [Ld : (Vec float)  Ud : (Vec float)  pivd : (Vec int)
-                   Ad : (Vec float)  n : int] : int
-  ```c
-  struct __V { int64_t *data; int64_t len; int64_t cap; };
+  ;;; chol -- Cholesky decomposition A = L L'. Panics if A is not square or not
+  ;;; symmetric positive-definite.
+  (defn chol [^borrow a : mat] : cholfac
+    (when (not (= (mat-square? a) 1)) (panic "chol: matrix must be square"))
+    (let [n      (mat-rows a)
+          l      (mat-new-zeroed n n)
+          status (__chol-kernel (.data l) (.data a) n)]
+      (when (< status 0)
+        (do (mat-free l) (panic "chol: matrix is not positive definite")))
+      (make-struct cholfac l)))
+  ;;; chol-free -- free a Cholesky factor.
+  (defn chol-free [f : cholfac] : void (mat-free (.L f)))
+  ;;; LA4 -- LU with partial pivoting (Doolittle): P A = L U.
+  ;;; __lu-kernel -- factor A (n x n) into unit-lower L, upper U, and a row
+  ;;; permutation piv (piv[i] = original row now at position i). Returns 0 ok,
+  ;;; -1 if singular.
+  (defn __lu-kernel [Ld : (Vec float)
+                     Ud : (Vec float)
+                     pivd : (Vec int)
+                     Ad : (Vec float)
+                     n : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
   double *L = (double*)(void*)((struct __V*)(intptr_t)Ld)->data;
   double *U = (double*)(void*)((struct __V*)(intptr_t)Ud)->data;
   int64_t *piv = (int64_t*)(void*)((struct __V*)(intptr_t)pivd)->data;
@@ -116,33 +115,33 @@
   free(M);
   return 0;
   ```)
-
-;;; lu -- LU decomposition P A = L U with partial pivoting. Panics if A is not
-;;; square or is singular.
-(defn lu [^borrow a : mat] : lufac
-  (when (not (= (mat-square? a) 1))
-    (panic "lu: matrix must be square"))
-  (let [n (mat-rows a)
-        l (mat-new-zeroed n n)
-        u (mat-new-zeroed n n)
-        piv (__izeros n)
-        status (__lu-kernel (.data l) (.data u) piv (.data a) n)]
-    (when (< status 0)
-      (do (mat-free l) (mat-free u) (vec-free piv)
+  ;;; lu -- LU decomposition P A = L U with partial pivoting. Panics if A is not
+  ;;; square or is singular.
+  (defn lu [^borrow a : mat] : lufac
+    (when (not (= (mat-square? a) 1)) (panic "lu: matrix must be square"))
+    (let [n      (mat-rows a)
+          l      (mat-new-zeroed n n)
+          u      (mat-new-zeroed n n)
+          piv    (__izeros n)
+          status (__lu-kernel (.data l) (.data u) piv (.data a) n)]
+      (when (< status 0)
+        (do
+          (mat-free l)
+          (mat-free u)
+          (vec-free piv)
           (panic "lu: matrix is singular")))
-    (make-struct lufac l u piv)))
-
-;;; lu-free -- free an LU factor.
-(defn lu-free [f : lufac] : void
-  (mat-free (.L f)) (mat-free (.U f)) (vec-free (.piv f)))
-
-;;; LA5 -- QR via Householder reflections: A = Q R (Q m x m, R m x n).
-
-;;; __qr-kernel -- given Q preset to the m x m identity and R preset to a copy
-;;; of A (m x n), overwrite them in place with the Householder QR.
-(defn __qr-kernel [Qd : (Vec float)  Rd : (Vec float)  m : int  n : int] : int
-  ```c
-  struct __V { int64_t *data; int64_t len; int64_t cap; };
+      (make-struct lufac l u piv)))
+  ;;; lu-free -- free an LU factor.
+  (defn lu-free [f : lufac] : void
+    (mat-free (.L f))
+    (mat-free (.U f))
+    (vec-free (.piv f)))
+  ;;; LA5 -- QR via Householder reflections: A = Q R (Q m x m, R m x n).
+  ;;; __qr-kernel -- given Q preset to the m x m identity and R preset to a copy
+  ;;; of A (m x n), overwrite them in place with the Householder QR.
+  (defn __qr-kernel [Qd : (Vec float) Rd : (Vec float) m : int n : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
   double *Q = (double*)(void*)((struct __V*)(intptr_t)Qd)->data;
   double *R = (double*)(void*)((struct __V*)(intptr_t)Rd)->data;
   int64_t lim = (m < n) ? m : n;
@@ -172,19 +171,14 @@
   free(v);
   return 0;
   ```)
-
-;;; qr -- QR decomposition A = Q R via Householder. Panics if rows < cols.
-(defn qr [^borrow a : mat] : qrfac
-  (let [m (mat-rows a)
-        n (mat-cols a)]
-    (when (< m n)
-      (panic "qr: rows must be >= cols"))
-    (let [q (mat-identity m)
-          r (mat-copy a)]
-      (__qr-kernel (.data q) (.data r) m n)
-      (make-struct qrfac q r))))
-
-;;; qr-free -- free a QR factor.
-(defn qr-free [f : qrfac] : void (mat-free (.Q f)) (mat-free (.R f)))
-
-) ;; end defmodule linalg/decomp
+  ;;; qr -- QR decomposition A = Q R via Householder. Panics if rows < cols.
+  (defn qr [^borrow a : mat] : qrfac
+    (let [m (mat-rows a)
+          n (mat-cols a)]
+      (when (< m n) (panic "qr: rows must be >= cols"))
+      (let [q (mat-identity m)
+            r (mat-copy a)]
+        (__qr-kernel (.data q) (.data r) m n)
+        (make-struct qrfac q r))))
+  ;;; qr-free -- free a QR factor.
+  (defn qr-free [f : qrfac] : void (mat-free (.Q f)) (mat-free (.R f)))) ;; end defmodule linalg/decomp

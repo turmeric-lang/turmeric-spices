@@ -7,22 +7,20 @@
 ;;     request carrying a valid token (header OR form field), and 403s a
 ;;     protected request that is missing/wrong.
 (defmodule session/tests/csrf
-  (import test/suite  :refer [describe it])
+  (import test/suite :refer [describe it])
   (import test/assert :refer [assert-true assert-eq])
   (import test/runner :refer [run-all-status])
   (import session/memory-store :refer [memory-store-new])
-  (import session/config       :refer [dev-session-config])
-  (import session/mw           :refer [session-mw session-flush])
-  (import session/ctx          :refer [session-set! session-id])
-  (import session/csrf         :refer [csrf-token csrf-check csrf-mw
-                                       default-csrf-opts])
-  (import tourist/param        :refer [tourist-ctx-new tourist-ctx-free])
-  (import tourist/types        :refer [Ctx])
-  (import tourist/helpers      :refer [text])
-  (import httpd/types          :refer [Response])
-
-```c
-/* Leak detection is off for this suite.  It fabricates requests, contexts
+  (import session/config :refer [dev-session-config])
+  (import session/mw :refer [session-mw session-flush])
+  (import session/ctx :refer [session-set! session-id])
+  (import session/csrf :refer [csrf-token csrf-check csrf-mw default-csrf-opts])
+  (import tourist/param :refer [tourist-ctx-new tourist-ctx-free])
+  (import tourist/types :refer [Ctx])
+  (import tourist/helpers :refer [text])
+  (import httpd/types :refer [Response])
+  ```c
+  /* Leak detection is off for this suite.  It fabricates requests, contexts
    and responses it never frees, and installs a store and config per case
    (session-mw); none of that was checked until session/ctx began importing
    tourist/request (tourist-on-stdlib-httpd H5), which links libturi and so
@@ -31,27 +29,25 @@
 const char *__asan_default_options(void);
 const char *__asan_default_options(void) { return "detect_leaks=0"; }
 ```
-
-(defn seq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+  (defn seq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn cdup [s : cstr] : cstr
-  ```c #include <string.h>
+  (defn cdup [s : cstr] : cstr
+    ```c
+    #include <string.h>
   return (const char *)strdup((const char *)s); ```)
-
-(defn clen [s : cstr] : int
-  ```c #include <string.h>
+  (defn clen [s : cstr] : int
+    ```c
+    #include <string.h>
   return (int64_t)strlen((const char *)s); ```)
-
-;; fabricate a request with a method, optional Cookie / X-Csrf-Token headers
-;; (empty string = omit), and an optional body. Mirrors integration_test's
-;; fake-req but parameterised for the CSRF paths.
-(defn fake-req [method : cstr cookie : cstr csrf : cstr body : cstr] : int
-  ```c
-  #include <stdlib.h>
+  ;; fabricate a request with a method, optional Cookie / X-Csrf-Token headers
+  ;; (empty string = omit), and an optional body. Mirrors integration_test's
+  ;; fake-req but parameterised for the CSRF paths.
+  (defn fake-req [method : cstr cookie : cstr csrf : cstr body : cstr] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   struct __httpd_req {
     char *method; char *path; char *query; char *body;
@@ -74,158 +70,143 @@ const char *__asan_default_options(void) { return "detect_leaks=0"; }
   r->body_len = (int)strlen((const char *)body);
   return (int64_t)(intptr_t)r;
   ```)
-
-(defn mk-ctx [method : cstr cookie : cstr csrf : cstr body : cstr] : Ctx
-  (:: (tourist-ctx-new (fake-req method cookie csrf body) 0) :Ctx))
-
-(defn cookie-of [id : cstr] : cstr
-  ```c
-  #include <stdlib.h>
+  (defn mk-ctx [method : cstr cookie : cstr csrf : cstr body : cstr] : Ctx
+    (:: (tourist-ctx-new (fake-req method cookie csrf body) 0) :Ctx))
+  (defn cookie-of [id : cstr] : cstr
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   const char *i = (const char *)id;
   char *out = malloc(strlen(i) + 16);
   sprintf(out, "tur_session=%s", i);
   return (const char *)out;
   ```)
-
-(defn form-of [field : cstr token : cstr] : cstr
-  ```c
-  #include <stdlib.h>
+  (defn form-of [field : cstr token : cstr] : cstr
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   const char *f=(const char*)field, *t=(const char*)token;
   char *out=malloc(strlen(f)+strlen(t)+8);
   sprintf(out, "a=1&%s=%s", f, t);
   return (const char *)out;
   ```)
-
-;; status of the httpd Response handle (its first field).
-(defn resp-status [r : Response] : int
-  ```c
-  struct __httpd_resp { int status; };
+  ;; status of the httpd Response handle (its first field).
+  (defn resp-status [r : Response] : int
+    ```c
+    struct __httpd_resp { int status; };
   return ((struct __httpd_resp *)(intptr_t)r)->status;
   ```)
-
-;; (some resp) -> true; (none) -> false.
-(defn opt-some? [o : (Option Response)] : bool (some? o))
-
-;; status code of the Response inside (some resp); 0 for (none).
-(defn opt-status [o : (Option Response)] : int
-  (if (some? o) (resp-status (unwrap o)) 0))
-
-;; seed a session holding a CSRF token; returns a freshly-allocated copy of the
-;; (id, token) pair via out-params is awkward here, so we mint, capture both,
-;; flush, and hand back through a tiny struct-free pair of helpers: instead we
-;; just return the token and read the id separately in the caller.
-(defn main [] : int
- (do
-  (describe "session/csrf"
-    ;; -- token + check (unit) --
-    (it "csrf-token mints the same token within a session"
-      (let [_ (session-mw (memory-store-new) (dev-session-config))
-            c (mk-ctx "GET" "" "" "")
-            t1 (cdup (csrf-token c))
-            t2 (cdup (csrf-token c))
-            ok (seq? t1 t2)]
-        (tourist-ctx-free c)
-        (assert-true ok)))
-
-    (it "csrf-token is a 64-char hex token"
-      (let [_ (session-mw (memory-store-new) (dev-session-config))
-            c (mk-ctx "GET" "" "" "")
-            n (clen (csrf-token c))]
-        (tourist-ctx-free c)
-        (assert-eq n 64)))
-
-    (it "csrf-check accepts the minted token, rejects others"
-      (let [_ (session-mw (memory-store-new) (dev-session-config))
-            c (mk-ctx "GET" "" "" "")
-            t (cdup (csrf-token c))
-            good (csrf-check c t)
-            bad  (csrf-check c "not-the-token")]
-        (tourist-ctx-free c)
-        (assert-true (if good (if bad false true) false))))
-
-    (it "csrf-check rejects when no token was minted"
-      (let [_ (session-mw (memory-store-new) (dev-session-config))
-            c (mk-ctx "GET" "" "" "")]
-        (session-set! c "x" "y")          ;; session exists, but no __csrf
-        (let [bad (csrf-check c "anything")]
-          (tourist-ctx-free c)
-          (assert-true (if bad false true)))))
-
-    ;; -- middleware decision (mint on a GET, then POST against the store) --
-    (it "safe methods pass through the middleware"
-      (let [_  (session-mw (memory-store-new) (dev-session-config))
-            mw (csrf-mw (default-csrf-opts))
-            c  (mk-ctx "GET" "" "" "")
-            passed (if (opt-some? (mw c)) false true)]
-        (tourist-ctx-free c)
-        (assert-true passed)))
-
-    (it "protected POST with a valid header token passes"
-      (let [s  (memory-store-new)
-            _  (session-mw s (dev-session-config))
-            mw (csrf-mw (default-csrf-opts))
-            g  (mk-ctx "GET" "" "" "")]
-        (let [tok (cdup (csrf-token g))
-              id  (cdup (session-id g))]
-          (session-flush g (:: (text "ok") :Response))
-          (tourist-ctx-free g)
-          (let [c (mk-ctx "POST" (cookie-of id) tok "")
+  ;; (some resp) -> true; (none) -> false.
+  (defn opt-some? [o : (Option Response)] : bool (some? o))
+  ;; status code of the Response inside (some resp); 0 for (none).
+  (defn opt-status [o : (Option Response)] : int
+    (if (some? o) (resp-status (unwrap o)) 0))
+  ;; seed a session holding a CSRF token; returns a freshly-allocated copy of the
+  ;; (id, token) pair via out-params is awkward here, so we mint, capture both,
+  ;; flush, and hand back through a tiny struct-free pair of helpers: instead we
+  ;; just return the token and read the id separately in the caller.
+  (defn main [] : int
+    (do
+      (describe "session/csrf"
+        ;; -- token + check (unit) --
+        (it "csrf-token mints the same token within a session"
+          (let [_  (session-mw (memory-store-new) (dev-session-config))
+                c  (mk-ctx "GET" "" "" "")
+                t1 (cdup (csrf-token c))
+                t2 (cdup (csrf-token c))
+                ok (seq? t1 t2)]
+            (tourist-ctx-free c)
+            (assert-true ok)))
+        (it "csrf-token is a 64-char hex token"
+          (let [_ (session-mw (memory-store-new) (dev-session-config))
+                c (mk-ctx "GET" "" "" "")
+                n (clen (csrf-token c))]
+            (tourist-ctx-free c)
+            (assert-eq n 64)))
+        (it "csrf-check accepts the minted token, rejects others"
+          (let [_    (session-mw (memory-store-new) (dev-session-config))
+                c    (mk-ctx "GET" "" "" "")
+                t    (cdup (csrf-token c))
+                good (csrf-check c t)
+                bad  (csrf-check c "not-the-token")]
+            (tourist-ctx-free c)
+            (assert-true (if good (if bad false true) false))))
+        (it "csrf-check rejects when no token was minted"
+          (let [_ (session-mw (memory-store-new) (dev-session-config))
+                c (mk-ctx "GET" "" "" "")]
+            (session-set! c "x" "y") ;; session exists, but no __csrf
+            (let [bad (csrf-check c "anything")]
+              (tourist-ctx-free c)
+              (assert-true (if bad false true)))))
+        ;; -- middleware decision (mint on a GET, then POST against the store) --
+        (it "safe methods pass through the middleware"
+          (let [_      (session-mw (memory-store-new) (dev-session-config))
+                mw     (csrf-mw (default-csrf-opts))
+                c      (mk-ctx "GET" "" "" "")
                 passed (if (opt-some? (mw c)) false true)]
             (tourist-ctx-free c)
-            (assert-true passed)))))
-
-    (it "protected POST with a valid form-field token passes"
-      (let [s  (memory-store-new)
-            _  (session-mw s (dev-session-config))
-            mw (csrf-mw (default-csrf-opts))
-            g  (mk-ctx "GET" "" "" "")]
-        (let [tok (cdup (csrf-token g))
-              id  (cdup (session-id g))]
-          (session-flush g (:: (text "ok") :Response))
-          (tourist-ctx-free g)
-          (let [c (mk-ctx "POST" (cookie-of id) "" (form-of "csrf_token" tok))
-                passed (if (opt-some? (mw c)) false true)]
-            (tourist-ctx-free c)
-            (assert-true passed)))))
-
-    (it "protected POST with the session but no token is 403"
-      (let [s  (memory-store-new)
-            _  (session-mw s (dev-session-config))
-            mw (csrf-mw (default-csrf-opts))
-            g  (mk-ctx "GET" "" "" "")]
-        (let [_t (csrf-token g)
-              id (cdup (session-id g))]
-          (session-flush g (:: (text "ok") :Response))
-          (tourist-ctx-free g)
-          (let [c (mk-ctx "POST" (cookie-of id) "" "")
-                o (mw c)
-                got (opt-status o)]
-            (tourist-ctx-free c)
-            (assert-eq got 403)))))
-
-    (it "protected POST with no session and no token is 403"
-      (let [_  (session-mw (memory-store-new) (dev-session-config))
-            mw (csrf-mw (default-csrf-opts))
-            c  (mk-ctx "POST" "" "" "")
-            got (opt-status (mw c))]
-        (tourist-ctx-free c)
-        (assert-eq got 403)))
-
-    (it "protected POST with a wrong header token is 403"
-      (let [s  (memory-store-new)
-            _  (session-mw s (dev-session-config))
-            mw (csrf-mw (default-csrf-opts))
-            g  (mk-ctx "GET" "" "" "")]
-        (let [_t (csrf-token g)
-              id (cdup (session-id g))]
-          (session-flush g (:: (text "ok") :Response))
-          (tourist-ctx-free g)
-          (let [c (mk-ctx "POST" (cookie-of id) "deadbeef" "")
+            (assert-true passed)))
+        (it "protected POST with a valid header token passes"
+          (let [s  (memory-store-new)
+                _  (session-mw s (dev-session-config))
+                mw (csrf-mw (default-csrf-opts))
+                g  (mk-ctx "GET" "" "" "")]
+            (let [tok (cdup (csrf-token g))
+                  id  (cdup (session-id g))]
+              (session-flush g (:: (text "ok") :Response))
+              (tourist-ctx-free g)
+              (let [c      (mk-ctx "POST" (cookie-of id) tok "")
+                    passed (if (opt-some? (mw c)) false true)]
+                (tourist-ctx-free c)
+                (assert-true passed)))))
+        (it "protected POST with a valid form-field token passes"
+          (let [s  (memory-store-new)
+                _  (session-mw s (dev-session-config))
+                mw (csrf-mw (default-csrf-opts))
+                g  (mk-ctx "GET" "" "" "")]
+            (let [tok (cdup (csrf-token g))
+                  id  (cdup (session-id g))]
+              (session-flush g (:: (text "ok") :Response))
+              (tourist-ctx-free g)
+              (let [c      (mk-ctx "POST"
+                             (cookie-of id)
+                             ""
+                             (form-of "csrf_token" tok))
+                    passed (if (opt-some? (mw c)) false true)]
+                (tourist-ctx-free c)
+                (assert-true passed)))))
+        (it "protected POST with the session but no token is 403"
+          (let [s  (memory-store-new)
+                _  (session-mw s (dev-session-config))
+                mw (csrf-mw (default-csrf-opts))
+                g  (mk-ctx "GET" "" "" "")]
+            (let [_t (csrf-token g)
+                  id (cdup (session-id g))]
+              (session-flush g (:: (text "ok") :Response))
+              (tourist-ctx-free g)
+              (let [c   (mk-ctx "POST" (cookie-of id) "" "")
+                    o   (mw c)
+                    got (opt-status o)]
+                (tourist-ctx-free c)
+                (assert-eq got 403)))))
+        (it "protected POST with no session and no token is 403"
+          (let [_   (session-mw (memory-store-new) (dev-session-config))
+                mw  (csrf-mw (default-csrf-opts))
+                c   (mk-ctx "POST" "" "" "")
                 got (opt-status (mw c))]
             (tourist-ctx-free c)
-            (assert-eq got 403))))))
-  (run-all-status)))
-
-) ;; end module
+            (assert-eq got 403)))
+        (it "protected POST with a wrong header token is 403"
+          (let [s  (memory-store-new)
+                _  (session-mw s (dev-session-config))
+                mw (csrf-mw (default-csrf-opts))
+                g  (mk-ctx "GET" "" "" "")]
+            (let [_t (csrf-token g)
+                  id (cdup (session-id g))]
+              (session-flush g (:: (text "ok") :Response))
+              (tourist-ctx-free g)
+              (let [c   (mk-ctx "POST" (cookie-of id) "deadbeef" "")
+                    got (opt-status (mw c))]
+                (tourist-ctx-free c)
+                (assert-eq got 403))))))
+      (run-all-status)))) ;; end module

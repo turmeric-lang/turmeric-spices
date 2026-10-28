@@ -25,91 +25,81 @@
 ;; Delays are clamped to [1, 16777216] samples (128 MB of doubles at most). The
 ;; buffers are never freed; like the filter state cells, they live for the
 ;; process.
-
 (defmodule signal/delay
   (export delay-n delay comb-ff-n comb-ff comb-n comb allpass-n allpass)
-
-;; =============================================================================
-;; Ring buffer cell
-;; =============================================================================
-;;
-;; One calloc'd block: [int64 len][int64 idx][double buf[len]]. `idx` is both
-;; the read and the write slot, so a buffer of `len` samples reads back what
-;; was written exactly `len` steps ago.
-
-;;; __delay_clamp -- clamp a delay length to the supported range.
-(defn __delay_clamp [n :int] :int
-  (if (< n 1) 1 (if (> n 16777216) 16777216 n)))
-
-;;; __delay_to_int -- truncate a (non-negative, bounded) double to int.
-(defn __delay_to_int [x :float] :int
-  ```c
-  return (int64_t)x;
+  ;; =============================================================================
+  ;; Ring buffer cell
+  ;; =============================================================================
+  ;;
+  ;; One calloc'd block: [int64 len][int64 idx][double buf[len]]. `idx` is both
+  ;; the read and the write slot, so a buffer of `len` samples reads back what
+  ;; was written exactly `len` steps ago.
+  ;;; __delay_clamp -- clamp a delay length to the supported range.
+  (defn __delay_clamp [n :int] :int
+    (if (< n 1) 1 (if (> n 16777216) 16777216 n)))
+  ;;; __delay_to_int -- truncate a (non-negative, bounded) double to int.
+  (defn __delay_to_int [x :float] :int
+    ```c
+    return (int64_t)x;
   ```)
-
-;;; __delay_seconds_to_samples -- round seconds * sample-rate to whole samples.
-;;;
-;;; A non-positive or NaN product degrades to the 1-sample minimum rather
-;;; than failing.
-(defn __delay_seconds_to_samples [sample-rate :float seconds :float] :int
-  (let [x (* sample-rate seconds)]
-    (if (>= x 1.0)
-      (if (> x 16777216.0) 16777216 (__delay_to_int (+ x 0.5)))
-      1)))
-
-;;; __delay_alloc -- allocate a zeroed ring-buffer cell of `n` samples.
-(defn __delay_alloc [n :int] :int
-  ```c
-  int64_t len = n;
+  ;;; __delay_seconds_to_samples -- round seconds * sample-rate to whole samples.
+  ;;;
+  ;;; A non-positive or NaN product degrades to the 1-sample minimum rather
+  ;;; than failing.
+  (defn __delay_seconds_to_samples [sample-rate :float seconds :float] :int
+    (let [x (* sample-rate seconds)]
+      (if (>= x 1.0)
+        (if (> x 16777216.0) 16777216 (__delay_to_int (+ x 0.5)))
+        1)))
+  ;;; __delay_alloc -- allocate a zeroed ring-buffer cell of `n` samples.
+  (defn __delay_alloc [n :int] :int
+    ```c
+    int64_t len = n;
   int64_t *p = (int64_t *)calloc(2 * sizeof(int64_t) + (size_t)len * sizeof(double), 1);
   if (!p) { fprintf(stderr, "delay: buffer alloc failed\n"); abort(); }
   p[0] = len;
   p[1] = 0;
   return (int64_t)(intptr_t)p;
   ```)
-
-;;; __delay_step -- plain delay: emit the sample written `len` steps ago.
-(defn __delay_step [state :int x :float] :float
-  ```c
-  int64_t *p = (int64_t *)(intptr_t)state;
+  ;;; __delay_step -- plain delay: emit the sample written `len` steps ago.
+  (defn __delay_step [state :int x :float] :float
+    ```c
+    int64_t *p = (int64_t *)(intptr_t)state;
   double *buf = (double *)(p + 2);
   double d = buf[p[1]];
   buf[p[1]] = x;
   p[1] = (p[1] + 1) % p[0];
   return d;
   ```)
-
-;;; __delay_comb_ff_step -- feedforward comb: y = x + g * x[n-D].
-(defn __delay_comb_ff_step [state :int g :float x :float] :float
-  ```c
-  int64_t *p = (int64_t *)(intptr_t)state;
+  ;;; __delay_comb_ff_step -- feedforward comb: y = x + g * x[n-D].
+  (defn __delay_comb_ff_step [state :int g :float x :float] :float
+    ```c
+    int64_t *p = (int64_t *)(intptr_t)state;
   double *buf = (double *)(p + 2);
   double d = buf[p[1]];
   buf[p[1]] = x;
   p[1] = (p[1] + 1) % p[0];
   return x + g * d;
   ```)
-
-;;; __delay_comb_fb_step -- feedback comb: y = x + g * y[n-D].
-(defn __delay_comb_fb_step [state :int g :float x :float] :float
-  ```c
-  int64_t *p = (int64_t *)(intptr_t)state;
+  ;;; __delay_comb_fb_step -- feedback comb: y = x + g * y[n-D].
+  (defn __delay_comb_fb_step [state :int g :float x :float] :float
+    ```c
+    int64_t *p = (int64_t *)(intptr_t)state;
   double *buf = (double *)(p + 2);
   double y = x + g * buf[p[1]];
   buf[p[1]] = y;
   p[1] = (p[1] + 1) % p[0];
   return y;
   ```)
-
-;;; __delay_allpass_step -- Schroeder allpass.
-;;;
-;;;   v[n] = x[n] + g * v[n-D]
-;;;   y[n] = -g * v[n] + v[n-D]
-;;;
-;;; |H(w)| = 1 at every frequency: it changes phase, not magnitude.
-(defn __delay_allpass_step [state :int g :float x :float] :float
-  ```c
-  int64_t *p = (int64_t *)(intptr_t)state;
+  ;;; __delay_allpass_step -- Schroeder allpass.
+  ;;;
+  ;;;   v[n] = x[n] + g * v[n-D]
+  ;;;   y[n] = -g * v[n] + v[n-D]
+  ;;;
+  ;;; |H(w)| = 1 at every frequency: it changes phase, not magnitude.
+  (defn __delay_allpass_step [state :int g :float x :float] :float
+    ```c
+    int64_t *p = (int64_t *)(intptr_t)state;
   double *buf = (double *)(p + 2);
   double d = buf[p[1]];
   double v = x + g * d;
@@ -117,93 +107,80 @@
   p[1] = (p[1] + 1) % p[0];
   return d - g * v;
   ```)
-
-;; =============================================================================
-;; Sample-counted constructors
-;; =============================================================================
-
-;;; delay-n -- delay the input by `n` whole samples.
-;;;
-;;; The first `n` outputs are 0.0 (the buffer starts silent).
-;;;
-;;; Example:
-;;;   ((delay-n 441) (sine 440.0 0.0))
-(defn delay-n [n :int]
-  (let [nv (__delay_clamp n)]
-    (fn [^fat sig : (fn [float] float)]
-      (let [state (__delay_alloc nv)]
-        (fn [t :float] :float
-          (__delay_step state (sig t)))))))
-
-;;; comb-ff-n -- feedforward comb filter, delay in samples.
-;;;
-;;; y[n] = x[n] + gain * x[n - D]. Always stable (finite impulse response).
-;;;
-;;; Parameters:
-;;;   n    -- delay in samples
-;;;   gain -- amount of the delayed input added back
-(defn comb-ff-n [n :int gain :float]
-  (let [nv (__delay_clamp n) gv gain]
-    (fn [^fat sig : (fn [float] float)]
-      (let [state (__delay_alloc nv)]
-        (fn [t :float] :float
-          (__delay_comb_ff_step state gv (sig t)))))))
-
-;;; comb-n -- feedback comb filter, delay in samples.
-;;;
-;;; y[n] = x[n] + feedback * y[n - D]. An impulse produces a train of echoes
-;;; spaced D samples apart, each `feedback` times the last. Stable only for
-;;; |feedback| < 1.
-;;;
-;;; Parameters:
-;;;   n        -- delay in samples
-;;;   feedback -- echo decay factor, |feedback| < 1
-(defn comb-n [n :int feedback :float]
-  (let [nv (__delay_clamp n) gv feedback]
-    (fn [^fat sig : (fn [float] float)]
-      (let [state (__delay_alloc nv)]
-        (fn [t :float] :float
-          (__delay_comb_fb_step state gv (sig t)))))))
-
-;;; allpass-n -- Schroeder allpass filter, delay in samples.
-;;;
-;;; Passes every frequency at unit gain but smears its phase, which is what
-;;; makes it the diffusion stage of a reverb. Stable only for |gain| < 1.
-;;;
-;;; Parameters:
-;;;   n    -- delay in samples
-;;;   gain -- allpass coefficient, |gain| < 1
-(defn allpass-n [n :int gain :float]
-  (let [nv (__delay_clamp n) gv gain]
-    (fn [^fat sig : (fn [float] float)]
-      (let [state (__delay_alloc nv)]
-        (fn [t :float] :float
-          (__delay_allpass_step state gv (sig t)))))))
-
-;; =============================================================================
-;; Seconds-based constructors
-;; =============================================================================
-
-;;; delay -- delay the input by `seconds`, at `sample-rate` Hz.
-;;;
-;;; Example:
-;;;   ((delay 44100.0 0.25) (sine 440.0 0.0))
-(defn delay [sample-rate :float seconds :float]
-  (delay-n (__delay_seconds_to_samples sample-rate seconds)))
-
-;;; comb-ff -- feedforward comb filter, delay in seconds.
-(defn comb-ff [sample-rate :float seconds :float gain :float]
-  (comb-ff-n (__delay_seconds_to_samples sample-rate seconds) gain))
-
-;;; comb -- feedback comb filter, delay in seconds.
-;;;
-;;; Example:
-;;;   ((comb 44100.0 0.0297 0.805) input)   ;; a classic Schroeder reverb comb
-(defn comb [sample-rate :float seconds :float feedback :float]
-  (comb-n (__delay_seconds_to_samples sample-rate seconds) feedback))
-
-;;; allpass -- Schroeder allpass filter, delay in seconds.
-(defn allpass [sample-rate :float seconds :float gain :float]
-  (allpass-n (__delay_seconds_to_samples sample-rate seconds) gain))
-
-) ;; end defmodule signal/delay
+  ;; =============================================================================
+  ;; Sample-counted constructors
+  ;; =============================================================================
+  ;;; delay-n -- delay the input by `n` whole samples.
+  ;;;
+  ;;; The first `n` outputs are 0.0 (the buffer starts silent).
+  ;;;
+  ;;; Example:
+  ;;;   ((delay-n 441) (sine 440.0 0.0))
+  (defn delay-n [n :int]
+    (let [nv (__delay_clamp n)]
+      (fn [^fat sig : (fn [float] float)]
+        (let [state (__delay_alloc nv)]
+          (fn [t :float] :float (__delay_step state (sig t)))))))
+  ;;; comb-ff-n -- feedforward comb filter, delay in samples.
+  ;;;
+  ;;; y[n] = x[n] + gain * x[n - D]. Always stable (finite impulse response).
+  ;;;
+  ;;; Parameters:
+  ;;;   n    -- delay in samples
+  ;;;   gain -- amount of the delayed input added back
+  (defn comb-ff-n [n :int gain :float]
+    (let [nv (__delay_clamp n)
+          gv gain]
+      (fn [^fat sig : (fn [float] float)]
+        (let [state (__delay_alloc nv)]
+          (fn [t :float] :float (__delay_comb_ff_step state gv (sig t)))))))
+  ;;; comb-n -- feedback comb filter, delay in samples.
+  ;;;
+  ;;; y[n] = x[n] + feedback * y[n - D]. An impulse produces a train of echoes
+  ;;; spaced D samples apart, each `feedback` times the last. Stable only for
+  ;;; |feedback| < 1.
+  ;;;
+  ;;; Parameters:
+  ;;;   n        -- delay in samples
+  ;;;   feedback -- echo decay factor, |feedback| < 1
+  (defn comb-n [n :int feedback :float]
+    (let [nv (__delay_clamp n)
+          gv feedback]
+      (fn [^fat sig : (fn [float] float)]
+        (let [state (__delay_alloc nv)]
+          (fn [t :float] :float (__delay_comb_fb_step state gv (sig t)))))))
+  ;;; allpass-n -- Schroeder allpass filter, delay in samples.
+  ;;;
+  ;;; Passes every frequency at unit gain but smears its phase, which is what
+  ;;; makes it the diffusion stage of a reverb. Stable only for |gain| < 1.
+  ;;;
+  ;;; Parameters:
+  ;;;   n    -- delay in samples
+  ;;;   gain -- allpass coefficient, |gain| < 1
+  (defn allpass-n [n :int gain :float]
+    (let [nv (__delay_clamp n)
+          gv gain]
+      (fn [^fat sig : (fn [float] float)]
+        (let [state (__delay_alloc nv)]
+          (fn [t :float] :float (__delay_allpass_step state gv (sig t)))))))
+  ;; =============================================================================
+  ;; Seconds-based constructors
+  ;; =============================================================================
+  ;;; delay -- delay the input by `seconds`, at `sample-rate` Hz.
+  ;;;
+  ;;; Example:
+  ;;;   ((delay 44100.0 0.25) (sine 440.0 0.0))
+  (defn delay [sample-rate :float seconds :float]
+    (delay-n (__delay_seconds_to_samples sample-rate seconds)))
+  ;;; comb-ff -- feedforward comb filter, delay in seconds.
+  (defn comb-ff [sample-rate :float seconds :float gain :float]
+    (comb-ff-n (__delay_seconds_to_samples sample-rate seconds) gain))
+  ;;; comb -- feedback comb filter, delay in seconds.
+  ;;;
+  ;;; Example:
+  ;;;   ((comb 44100.0 0.0297 0.805) input)   ;; a classic Schroeder reverb comb
+  (defn comb [sample-rate :float seconds :float feedback :float]
+    (comb-n (__delay_seconds_to_samples sample-rate seconds) feedback))
+  ;;; allpass -- Schroeder allpass filter, delay in seconds.
+  (defn allpass [sample-rate :float seconds :float gain :float]
+    (allpass-n (__delay_seconds_to_samples sample-rate seconds) gain))) ;; end defmodule signal/delay

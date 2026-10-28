@@ -7,43 +7,54 @@
 ;;
 ;; This is the "off-screen render, compare pixel output" deliverable from
 ;; the PV7 plan, run as a single end-to-end scenario.
-
 (defmodule plutovg/tests/integration
-  (import test/suite      :refer [describe it])
-  (import test/assert     :refer [assert-eq assert-true])
-  (import plutovg/types   :refer [Canvas])
-  (import test/runner     :refer [run-all-status])
-  (import plutovg/surface :refer [surface-create surface-destroy
-                                  surface-write-png])
-  (import plutovg/canvas  :refer [canvas-create canvas-destroy
-                                  canvas-set-source-color
-                                  canvas-rect canvas-round-rect canvas-circle
-                                  canvas-fill canvas-stroke
-                                  canvas-set-line-width
-                                  canvas-save canvas-restore])
-  (import plutovg/paint   :refer [paint-create-color paint-create-color-hex
-                                  paint-destroy canvas-set-source
-                                  gradient-stops-create gradient-stops-add
-                                  gradient-stops-destroy
-                                  paint-create-linear-gradient])
-  (import plutovg/path    :refer [path-create path-destroy
-                                  path-move-to path-line-to path-close
-                                  path-length])
-  (import plutovg/font    :refer [font-face-load-from-file font-face-destroy
-                                  canvas-set-font canvas-fill-text])
-
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-eq assert-true])
+  (import plutovg/types :refer [Canvas])
+  (import test/runner :refer [run-all-status])
+  (import plutovg/surface
+    :refer
+    [surface-create surface-destroy surface-write-png])
+  (import plutovg/canvas
+    :refer
+    [canvas-create
+     canvas-destroy
+     canvas-set-source-color
+     canvas-rect
+     canvas-round-rect
+     canvas-circle
+     canvas-fill
+     canvas-stroke
+     canvas-set-line-width
+     canvas-save
+     canvas-restore])
+  (import plutovg/paint
+    :refer
+    [paint-create-color
+     paint-create-color-hex
+     paint-destroy
+     canvas-set-source
+     gradient-stops-create
+     gradient-stops-add
+     gradient-stops-destroy
+     paint-create-linear-gradient])
+  (import plutovg/path
+    :refer
+    [path-create path-destroy path-move-to path-line-to path-close path-length])
+  (import plutovg/font
+    :refer
+    [font-face-load-from-file
+     font-face-destroy
+     canvas-set-font
+     canvas-fill-text])
   (defn surface-byte [s : int n : int] : int
     ```c
     #include <plutovg.h>
     unsigned char *p = plutovg_surface_get_data((plutovg_surface_t *)(intptr_t)s);
     return (int64_t)p[(int)n];
     ```)
-
   (load "stdlib/fs.tur")
-
-  (defn file-exists? [path : cstr] : bool
-    (fs/exists? path))
-
+  (defn file-exists? [path : cstr] : bool (fs/exists? path))
   (defn file-size [path : cstr] : int
     ```c
     #include <sys/stat.h>
@@ -51,13 +62,11 @@
     if (stat((const char *)(intptr_t)path, &st) != 0) return -1;
     return (int64_t)st.st_size;
     ```)
-
   (defn unlink-file [path : cstr] : void
     ```c
     #include <unistd.h>
     unlink((const char *)(intptr_t)path);
     ```)
-
   (defn probe-font-path [] : cstr
     ```c
     #include <unistd.h>
@@ -74,115 +83,118 @@
     }
     return NULL;
     ```)
-
   (defn have-font? [p : cstr] : bool
     ```c
     return p != NULL && ((const char *)(intptr_t)p)[0] != '\0';
     ```)
-
   ;; Helper: paint a horizontal red->blue linear gradient over the whole
   ;; surface and then fill an opaque rounded rect on top.  Returns void.
   ;;
   ;; `c` is a Canvas, not an int -- declaring it int made every canvas-* call
   ;; in the body "expected Canvas, got int".
   (defn paint-gradient-background [c : Canvas w : float h : float] : void
-    (unsafe
-      (let [stops (ok-val (gradient-stops-create))]
-        (gradient-stops-add stops 0.0  1.0 0.0 0.0 1.0)  ; red
-        (gradient-stops-add stops 1.0  0.0 0.0 1.0 1.0)  ; blue
-        (let [paint (ok-val (paint-create-linear-gradient
-                              0.0 0.0  w 0.0  ":pad" stops))]
-          (canvas-set-source c paint)
-          (canvas-rect c 0.0 0.0 w h)
-          (canvas-fill c)
-          (paint-destroy paint))
-        (gradient-stops-destroy stops))))
-
+    (unsafe (let [stops (ok-val (gradient-stops-create))]
+              (gradient-stops-add stops 0.0 1.0 0.0 0.0 1.0) ; red
+              (gradient-stops-add stops 1.0 0.0 0.0 1.0 1.0) ; blue
+              (let [paint (ok-val (paint-create-linear-gradient 0.0
+                                    0.0
+                                    w
+                                    0.0
+                                    ":pad"
+                                    stops))]
+                (canvas-set-source c paint)
+                (canvas-rect c 0.0 0.0 w h)
+                (canvas-fill c)
+                (paint-destroy paint))
+              (gradient-stops-destroy stops))))
   (defn __all-tests [] : void
-   (describe "plutovg end-to-end render"
-     (it "draws a gradient + shapes + (optional) text and writes a PNG"
-       (let [sr  (surface-create 64 32)
-             png "/tmp/plutovg-integration.png"]
-         (if (not (ok? sr))
-           (assert-true false)
-           (let [s  (ok-val sr)
-                 cr (canvas-create s)
-                 k  (assert-true (ok? cr))]
-             (if (not k)
-               (do (surface-destroy s) false)
-               (let [c (ok-val cr)]
-                 (unlink-file png)
-
-                 ;; 1. Gradient background.
-                 (paint-gradient-background c 64.0 32.0)
-
-                 ;; 2. White rounded-rect outline near the center.
-                 (canvas-save c)
-                 (canvas-set-source-color c 1.0 1.0 1.0 1.0)
-                 (canvas-set-line-width c 1.0)
-                 (canvas-round-rect c 8.0 8.0 48.0 16.0 4.0 4.0)
-                 (canvas-stroke c)
-                 (canvas-restore c)
-
-                 ;; 3. A standalone path: a small triangle filled with the
-                 ;;    paint-create-color-hex helper.
-                 (let [pr  (path-create)
-                       tr  (paint-create-color-hex "#22aa22")
-                       kp  (assert-true (and (ok? pr) (ok? tr)))
-                       p   (ok-val pr)
-                       tri (ok-val tr)]
-                   (path-move-to p 4.0 28.0)
-                   (path-line-to p 12.0 16.0)
-                   (path-line-to p 20.0 28.0)
-                   (path-close p)
-                   (let [;; sanity: closed triangle perimeter > 0
-                         perim (assert-true (>f (path-length p) 0.0))]
-                     (canvas-set-source c tri)
-                     (canvas-rect c 4.0 16.0 16.0 12.0)
-                     (canvas-fill c)
-                     (paint-destroy tri)
-                     (path-destroy p)
-
-                     ;; 4. Text rendering (only if a system font is reachable).
-                     (let [fpath (probe-font-path)
-                           text  (if (have-font? fpath)
-                                   (let [fr (font-face-load-from-file fpath 0)
-                                         kf (assert-true (ok? fr))]
-                                     (if (not kf)
-                                       false
-                                       (let [ff (ok-val fr)]
-                                         (canvas-set-font c ff 10.0)
-                                         (canvas-set-source-color c 1.0 1.0 1.0 1.0)
-                                         (canvas-fill-text c "hi" ":utf8" 28.0 20.0)
-                                         (font-face-destroy ff)
-                                         true)))
-                                   (do (println "  (skipped: no system font available for text test)")
-                                       true))]
-                       (canvas-destroy c)
-
-                       ;; 5. Export and verify.
-                       (let [wrote  (assert-true (ok? (surface-write-png s png)))
-                             exists (assert-true (file-exists? png))
-                             sized  (assert-true (>i (file-size png) 50))
-
-                             ;; 6. Pixel sanity: pixel (0, 0) sits on the red end
-                             ;;    of the gradient.  Premultiplied ARGB => memory
-                             ;;    layout B G R A.  The exact value depends on
-                             ;;    rasterisation but the R byte should dominate
-                             ;;    the B byte at the left edge.
-                             left   (assert-true (>i (surface-byte s 2) (surface-byte s 0)))
-                             ;; And the rightmost-column pixel (col 63 on row 0)
-                             ;; should have its B byte dominate R.  Offset 252..255.
-                             right  (assert-true (>i (surface-byte s 252) (surface-byte s 254)))]
-                         (unlink-file png)
-                         (surface-destroy s)
-                         (and kp (and perim (and text
-                           (and wrote (and exists (and sized
-                             (and left right)))))))))))))))))))
-
+    (describe "plutovg end-to-end render"
+      (it "draws a gradient + shapes + (optional) text and writes a PNG"
+        (let [sr  (surface-create 64 32)
+              png "/tmp/plutovg-integration.png"]
+          (if (not (ok? sr))
+            (assert-true false)
+            (let [s  (ok-val sr)
+                  cr (canvas-create s)
+                  k  (assert-true (ok? cr))]
+              (if (not k)
+                (do (surface-destroy s) false)
+                (let [c (ok-val cr)]
+                  (unlink-file png)
+                  ;; 1. Gradient background.
+                  (paint-gradient-background c 64.0 32.0)
+                  ;; 2. White rounded-rect outline near the center.
+                  (canvas-save c)
+                  (canvas-set-source-color c 1.0 1.0 1.0 1.0)
+                  (canvas-set-line-width c 1.0)
+                  (canvas-round-rect c 8.0 8.0 48.0 16.0 4.0 4.0)
+                  (canvas-stroke c)
+                  (canvas-restore c)
+                  ;; 3. A standalone path: a small triangle filled with the
+                  ;;    paint-create-color-hex helper.
+                  (let [pr  (path-create)
+                        tr  (paint-create-color-hex "#22aa22")
+                        kp  (assert-true (and (ok? pr) (ok? tr)))
+                        p   (ok-val pr)
+                        tri (ok-val tr)]
+                    (path-move-to p 4.0 28.0)
+                    (path-line-to p 12.0 16.0)
+                    (path-line-to p 2e+01 28.0)
+                    (path-close p)
+                    (let [ ;; sanity: closed triangle perimeter > 0
+                          perim (assert-true (>f (path-length p) 0.0))]
+                      (canvas-set-source c tri)
+                      (canvas-rect c 4.0 16.0 16.0 12.0)
+                      (canvas-fill c)
+                      (paint-destroy tri)
+                      (path-destroy p)
+                      ;; 4. Text rendering (only if a system font is reachable).
+                      (let [fpath (probe-font-path)
+                            text  (if (have-font? fpath)
+                                    (let [fr (font-face-load-from-file fpath 0)
+                                          kf (assert-true (ok? fr))]
+                                      (if (not kf)
+                                        false
+                                        (let [ff (ok-val fr)]
+                                          (canvas-set-font c ff 1e+01)
+                                          (canvas-set-source-color c
+                                            1.0
+                                            1.0
+                                            1.0
+                                            1.0)
+                                          (canvas-fill-text c
+                                            "hi"
+                                            ":utf8"
+                                            28.0
+                                            2e+01)
+                                          (font-face-destroy ff)
+                                          true)))
+                                    (do
+                                      (println "  (skipped: no system font available for text test)")
+                                      true))]
+                        (canvas-destroy c)
+                        ;; 5. Export and verify.
+                        (let [wrote  (assert-true (ok? (surface-write-png s png)))
+                              exists (assert-true (file-exists? png))
+                              sized  (assert-true (>i (file-size png) 50))
+                              ;; 6. Pixel sanity: pixel (0, 0) sits on the red end
+                              ;;    of the gradient.  Premultiplied ARGB => memory
+                              ;;    layout B G R A.  The exact value depends on
+                              ;;    rasterisation but the R byte should dominate
+                              ;;    the B byte at the left edge.
+                              left   (assert-true (>i (surface-byte s 2)
+                                                    (surface-byte s 0)))
+                              ;; And the rightmost-column pixel (col 63 on row 0)
+                              ;; should have its B byte dominate R.  Offset 252..255.
+                              right  (assert-true (>i (surface-byte s 252)
+                                                    (surface-byte s 254)))]
+                          (unlink-file png)
+                          (surface-destroy s)
+                          (and kp
+                            (and perim
+                              (and text
+                                (and wrote
+                                  (and exists (and sized (and left right)))))))))))))))))))
   (defn >i [a : int b : int] : bool ```c return (int)a > (int)b; ```)
   (defn >f [a : float b : float] : bool ```c return (double)a > (double)b; ```)
-
-  (defn main [] : int
-    (__all-tests)
-    (run-all-status)))
+  (defn main [] : int (__all-tests) (run-all-status)))

@@ -1,24 +1,35 @@
 ;; tests/session_test.tur -- NB4 tests for notebook/session.
-
 (defmodule notebook/tests/session
-  (import notebook/session :refer [session-open session-open-for session-close session-reset
-                                   session-eval session-cell-imports?
-                                   output-status-ok output-status-error
-                                   cell-output-status cell-output-stdout
-                                   cell-output-value-repr cell-output-error-msg
-                                   cell-output-free])
-
-  (defn cstr-eq? [a : cstr b : cstr] #fx{Unsafe} : bool
+  (import notebook/session
+    :refer
+    [session-open
+     session-open-for
+     session-close
+     session-reset
+     session-eval
+     session-cell-imports?
+     output-status-ok
+     output-status-error
+     cell-output-status
+     cell-output-stdout
+     cell-output-value-repr
+     cell-output-error-msg
+     cell-output-free])
+  (defn cstr-eq? [a : cstr b : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     return strcmp((const char *)a, (const char *)b) == 0;
     ```)
-
-  (defn tap-line [idx : int name : cstr ok : bool] #fx{Unsafe} : void
+  (defn tap-line [idx : int name : cstr ok : bool]
+    #fx{Unsafe}
+    : void
     ```c
     printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
     ```)
-
-  (defn tap-plan [count : int fails : int] #fx{Unsafe} : void
+  (defn tap-plan [count : int fails : int]
+    #fx{Unsafe}
+    : void
     ```c
     printf("1..%lld\n", (long long)count);
     if (fails == 0) {
@@ -27,38 +38,34 @@
       fprintf(stderr, "# %lld notebook session tests failed.\n", (long long)fails);
     }
     ```)
-
-  (defn bool->fail [ok : bool] : int
-    (if ok 0 1))
-
-  (defn run-case [idx : int name : cstr ok : bool] #fx{Unsafe} : int
-    (do
-      (tap-line idx name ok)
-      (bool->fail ok)))
-
-  (defn tap-skip [idx : int name : cstr why : cstr] #fx{Unsafe} : int
+  (defn bool->fail [ok : bool] : int (if ok 0 1))
+  (defn run-case [idx : int name : cstr ok : bool]
+    #fx{Unsafe}
+    : int
+    (do (tap-line idx name ok) (bool->fail ok)))
+  (defn tap-skip [idx : int name : cstr why : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     printf("ok %lld - %s # SKIP %s\n", (long long)idx, (const char *)name, (const char *)why);
     return 0;
     ```)
-
   ;; Every session-eval hands back a cell-output the caller owns; each of
   ;; these used to drop it on the floor, which is what AddressSanitizer was
   ;; reporting.  The verdict is computed before the free, because
   ;; cell-output-value-repr hands back a pointer into the struct.
-  (defn test-persistent-env [] #fx{Unsafe} : bool
+  (defn test-persistent-env []
+    #fx{Unsafe}
+    : bool
     (let [s   (session-open)
           d   (session-eval s "(def answer 41)" 0)
           out (session-eval s "(+ answer 1)" 0)
           ok  (and (= (cell-output-status out) (output-status-ok))
-                   (cstr-eq? (cell-output-value-repr out) "42"))]
-      (do
-        (cell-output-free d)
-        (cell-output-free out)
-        (session-close s)
-        ok)))
-
-  (defn test-reset [] #fx{Unsafe} : bool
+                (cstr-eq? (cell-output-value-repr out) "42"))]
+      (do (cell-output-free d) (cell-output-free out) (session-close s) ok)))
+  (defn test-reset []
+    #fx{Unsafe}
+    : bool
     (let [s (session-open)
           d (session-eval s "(def answer 41)" 0)]
       (do
@@ -66,68 +73,73 @@
         (session-reset s)
         (let [out (session-eval s "(+ answer 1)" 0)
               ok  (and (= (cell-output-status out) (output-status-error))
-                       (not (cstr-eq? (cell-output-error-msg out) "")))]
+                    (not (cstr-eq? (cell-output-error-msg out) "")))]
           (cell-output-free out)
           (session-close s)
           ok))))
-
-  (defn test-stdout-capture [] #fx{Unsafe} : bool
+  (defn test-stdout-capture []
+    #fx{Unsafe}
+    : bool
     (let [s   (session-open)
           out (session-eval s "(do (println \"hi\") 7)" 0)
           ok  (and (= (cell-output-status out) (output-status-ok))
-                   (and (cstr-eq? (cell-output-value-repr out) "7")
-                        (not (cstr-eq? (cell-output-stdout out) ""))))]
-      (do
-        (cell-output-free out)
-        (session-close s)
-        ok)))
-
-  (defn test-sweet-exp [] #fx{Unsafe} : bool
+                (and (cstr-eq? (cell-output-value-repr out) "7")
+                  (not (cstr-eq? (cell-output-stdout out) ""))))]
+      (do (cell-output-free out) (session-close s) ok)))
+  (defn test-sweet-exp []
+    #fx{Unsafe}
+    : bool
     (let [s   (session-open)
           out (session-eval s "+(5 3)" 1)
           ok  (and (= (cell-output-status out) (output-status-ok))
-                   (cstr-eq? (cell-output-value-repr out) "8"))]
-      (do
-        (cell-output-free out)
-        (session-close s)
-        ok)))
-
+                (cstr-eq? (cell-output-value-repr out) "8"))]
+      (do (cell-output-free out) (session-close s) ok)))
   ;; One cell imports at the top level and a later cell calls what it
   ;; referred -- the Jupyter model.  Every import used to fail: the session
   ;; searched only the process cwd, and an import outside a defmodule was an
   ;; error.  session-open-for searches the way `tur run` does for a file in
   ;; this spice, so linalg (a :path dep in build.tur) resolves, and the
   ;; search path outlives a session-reset.
-  (defn test-import-across-cells [] #fx{Unsafe} : bool
+  (defn test-import-across-cells []
+    #fx{Unsafe}
+    : bool
     (let [s   (session-open-for "tests/session_test.tur")
-          imp (session-eval s "(import linalg/mat :refer [mat-identity mat-rows])" 0)
+          imp (session-eval s
+                "(import linalg/mat :refer [mat-identity mat-rows])"
+                0)
           out (session-eval s "(mat-rows (mat-identity 3))" 0)
           ok1 (and (= (cell-output-status imp) (output-status-ok))
-                   (and (= (cell-output-status out) (output-status-ok))
-                        (cstr-eq? (cell-output-value-repr out) "3")))]
+                (and (= (cell-output-status out) (output-status-ok))
+                  (cstr-eq? (cell-output-value-repr out) "3")))]
       (do
         (cell-output-free imp)
         (cell-output-free out)
         (session-reset s)
-        (let [again (session-eval s "(import linalg/mat :as m) (m/mat-cols (m/mat-identity 2))" 0)
+        (let [again (session-eval s
+                      "(import linalg/mat :as m) (m/mat-cols (m/mat-identity 2))"
+                      0)
               ok2   (and (= (cell-output-status again) (output-status-ok))
-                         (cstr-eq? (cell-output-value-repr again) "2"))]
+                      (cstr-eq? (cell-output-value-repr again) "2"))]
           (cell-output-free again)
           (session-close s)
           (and ok1 ok2)))))
-
-  (defn main [] #fx{Unsafe} : int
-    (let [f1 (run-case 1 "persists definitions across eval calls" (test-persistent-env))
+  (defn main []
+    #fx{Unsafe}
+    : int
+    (let [f1 (run-case 1
+               "persists definitions across eval calls"
+               (test-persistent-env))
           f2 (run-case 2 "resets the embedded session" (test-reset))
           f3 (run-case 3 "captures stdout and value repr" (test-stdout-capture))
           f4 (run-case 4 "evaluates sweet-exp cells" (test-sweet-exp))
           ;; Spice CI builds against turmeric main, whose libturi may predate
           ;; the API; session.tur then falls back and cells cannot import.
           f5 (if (session-cell-imports?)
-               (run-case 5 "imports in one cell, calls in the next" (test-import-across-cells))
-               (tap-skip 5 "imports in one cell, calls in the next"
-                         "libturi lacks TURI_HAS_SEARCH_PATH_FOR"))]
+               (run-case 5
+                 "imports in one cell, calls in the next"
+                 (test-import-across-cells))
+               (tap-skip 5
+                 "imports in one cell, calls in the next"
+                 "libturi lacks TURI_HAS_SEARCH_PATH_FOR"))]
       (tap-plan 5 (+ f1 (+ f2 (+ f3 (+ f4 f5)))))
-      (if (= (+ f1 (+ f2 (+ f3 (+ f4 f5)))) 0) 0 1)))
-
-) ;; end defmodule notebook/tests/session
+      (if (= (+ f1 (+ f2 (+ f3 (+ f4 f5)))) 0) 0 1)))) ;; end defmodule notebook/tests/session

@@ -28,226 +28,226 @@
 ;;; reserved special form (effect/error handling) in turmeric.
 ;;;
 ;;; Since: U2 (Handler typeclass)
-
 (defmodule httpd/handler
-  (import httpd/types    :refer [Request Response Conn])
-  (import httpd/server   :refer [server-start server-start-pool server-start-spawn
-                                 server-start-conn server-start-pool-conn])
-  (import httpd/request  :refer [req-body])
+  (import httpd/types :refer [Request Response Conn])
+  (import httpd/server
+    :refer
+    [server-start
+     server-start-pool
+     server-start-spawn
+     server-start-conn
+     server-start-pool-conn])
+  (import httpd/request :refer [req-body])
   (import httpd/response :refer [resp-ok response bad-request])
   ;; json/encode brings the EncodeJson/DecodeJson classes (and the `encode-json`/`decode-json`
   ;; methods) into scope; json/decode brings the yyjson document handles the
   ;; body codecs parse against. yyjson is re-declared in httpd's build.tur
   ;; :cmake-deps because a workspace-sibling's native deps are not propagated.
-  (import json/encode    :refer [derive-json])
-  (import json/decode    :refer [json-parse-doc json-doc-free json-doc-root])
-  (export serve serve-pool serve-spawn
-          serve-conn serve-pool-conn
-          req-decode json-ok json-resp with-json-body)
-
-;;; Handler -- typeclass for a typed HTTP request handler.
-;;;
-;;; The single method maps a parsed `Request` to a `Response`. The `self`
-;;; argument is the instance witness (it selects the instance and carries no
-;;; per-request state); dispatch is value-directed on its type, mirroring the
-;;; json `EncodeJson`/`DecodeJson` and ansi `Color` precedent.
-;;;
-;;; Method:
-;;;   respond : self -> Request -> Response
-;;;
-;;; Example:
-;;;   (defopaque Hello :int)
-;;;   (definstance Handler [Hello]
-;;;     (respond [self req] (resp-ok "text/plain" "hi")))
-;;;   ;; (respond (:: 0 Hello) req)  => a 200 text/plain Response
-(defclass Handler [a]
-  (respond [self  req : Request] : Response))
-
-;; ---------------------------------------------------------------------------
-;; serve: bridge a Handler instance to the server's (c-fn [int] int) contract.
-;;
-;; The three server entry points all take `(c-fn [int] int)` -- a captureless
-;; C-ABI function pointer (Request handle in, Response handle out, types
-;; erased to int). A `Handler` method is `(self, Request) -> Response`, so we
-;; generate a per-type top-level trampoline that rebuilds the opaque witness,
-;; dispatches `respond`, and re-erases the types to int:
-;;
-;;   (serve port T) expands to roughly:
-;;     (do
-;;       (defn __httpd-trampoline-T [req : int] : int
-;;         (:: (respond (:: 0 T) (:: req Request)) :int))
-;;       (server-start port __httpd-trampoline-T))
-;;
-;; The trampoline is a top-level `defn` (named uniquely from the type), so it
-;; compiles to the captureless function pointer `server-start` requires --
-;; the same standalone-helper idiom json's `derive-json-sum` uses. Because it
-;; introduces a top-level binding, `serve` must be used at module top level,
-;; not nested in an expression.
-;; ---------------------------------------------------------------------------
-
-;;; serve -- start a pool-dispatched server whose handler is the `Handler`
-;;; instance for witness type `T`. Top-level form; binds a server handle.
-;;;
-;;; Syntax:
-;;;   (def srv (serve 8080 Hello))
-;;;
-;;; Returns the `:ptr<void>` server handle (pass to `server-stop`), or NULL
-;;; if the listener could not be created -- exactly like `server-start`.
-(defmacro serve [port type-name]
-  (let [tramp (str->sym (str-append "__httpd-trampoline-" (symbol-name type-name)))]
-    `(do
-       (defn ~tramp [req : int] : int
-         (:: (respond (:: 0 ~type-name) (:: req Request)) :int))
-       (server-start ~port ~tramp))))
-
-;;; serve-pool -- like `serve` but with an explicit worker-pool size,
-;;; bridging to `server-start-pool`.
-;;;
-;;; Syntax:
-;;;   (def srv (serve-pool 8080 Hello 32))
-(defmacro serve-pool [port type-name size]
-  (let [tramp (str->sym (str-append "__httpd-trampoline-pool-" (symbol-name type-name)))]
-    `(do
-       (defn ~tramp [req : int] : int
-         (:: (respond (:: 0 ~type-name) (:: req Request)) :int))
-       (server-start-pool ~port ~tramp ~size))))
-
-;;; serve-spawn -- like `serve` but using the thread-per-connection
-;;; dispatcher, bridging to `server-start-spawn`.
-;;;
-;;; Syntax:
-;;;   (def srv (serve-spawn 8080 Hello))
-(defmacro serve-spawn [port type-name]
-  (let [tramp (str->sym (str-append "__httpd-trampoline-spawn-" (symbol-name type-name)))]
-    `(do
-       (defn ~tramp [req : int] : int
-         (:: (respond (:: 0 ~type-name) (:: req Request)) :int))
-       (server-start-spawn ~port ~tramp))))
-
-;; ---------------------------------------------------------------------------
-;; serve-conn: the upgrade-aware counterpart of serve.
-;;
-;; Where Handler maps a Request to a Response, ConnHandler maps a (Conn,
-;; Request) pair to a Response -- the extra Conn lets the handler reach the raw
-;; fd and perform a protocol upgrade (see httpd/conn and the ws-server spice).
-;; serve-conn / serve-pool-conn emit a captureless two-arg trampoline matching
-;; server-start-conn's `(c-fn [int int] int)` contract, exactly mirroring how
-;; serve bridges Handler to server-start.
-;; ---------------------------------------------------------------------------
-
-;;; ConnHandler -- typeclass for an upgrade-aware HTTP request handler.
-;;;
-;;; The single method maps a `(Conn, Request)` pair to a `Response`. `self` is
-;;; the instance witness (it selects the instance and carries no per-request
-;;; state); dispatch is value-directed on its type, mirroring `Handler`.
-;;;
-;;; Method:
-;;;   respond-conn : self -> Conn -> Request -> Response
-;;;
-;;; Example:
-;;;   (defopaque WsEcho :int)
-;;;   (definstance ConnHandler [WsEcho]
-;;;     (respond-conn [self conn req] (ws-upgrade conn req ...)))
-(defclass ConnHandler [a]
-  (respond-conn [self  conn : Conn  req : Request] : Response))
-
-;;; serve-conn -- start a pool-dispatched, upgrade-aware server whose handler
-;;; is the `ConnHandler` instance for witness type `T`. Top-level form.
-;;;
-;;; Syntax:
-;;;   (def srv (serve-conn 8080 WsEcho))
-(defmacro serve-conn [port type-name]
-  (let [tramp (str->sym (str-append "__httpd-conn-trampoline-" (symbol-name type-name)))]
-    `(do
-       (defn ~tramp [conn : int  req : int] : int
-         (:: (respond-conn (:: 0 ~type-name) (:: conn Conn) (:: req Request)) :int))
-       (server-start-conn ~port ~tramp))))
-
-;;; serve-pool-conn -- like `serve-conn` but with an explicit worker-pool size,
-;;; bridging to `server-start-pool-conn`.
-;;;
-;;; Syntax:
-;;;   (def srv (serve-pool-conn 8080 WsEcho 32))
-(defmacro serve-pool-conn [port type-name size]
-  (let [tramp (str->sym (str-append "__httpd-conn-trampoline-pool-" (symbol-name type-name)))]
-    `(do
-       (defn ~tramp [conn : int  req : int] : int
-         (:: (respond-conn (:: 0 ~type-name) (:: conn Conn) (:: req Request)) :int))
-       (server-start-pool-conn ~port ~tramp ~size))))
-
-;; ---------------------------------------------------------------------------
-;; JSON body codecs (P3): decode a typed request body and encode a typed
-;; response body through json's `DecodeJson`/`EncodeJson` typeclasses, so a JSON
-;; endpoint is a few lines instead of inline-C body parsing.
-;;
-;; The request type is decoded with `req-decode` (or the `with-json-body`
-;; convenience), the response is built with `json-ok` / `json-resp`. Both
-;; sides reuse the already-shipped json codec surface; the only httpd-side
-;; glue is wiring `(req-body req)` into the parser and the encoded fragment
-;; into a Response with `Content-Type: application/json`.
-;; ---------------------------------------------------------------------------
-
-;;; __cstr-free -- release a malloc'd JSON fragment returned by `encode-json`.
-;;; json's contract is caller-owns; the Response constructors copy the body,
-;;; so the fragment is freed immediately after it is handed to `resp-ok` /
-;;; `response`.
-(defn __cstr-free [p : cstr] #fx{Unsafe} : void
-  ```c free((void *)(intptr_t)p); ```)
-
-;;; req-decode -- parse a request body as JSON and decode it into `T` via the
-;;; json `DecodeJson [T]` instance. Returns `(Result T cstr)`: `ok` with the
-;;; decoded value, or `err` with a message when the body is not valid JSON.
-;;;
-;;; A macro (not a function) because the target type drives instance selection
-;;; through the `(Result T cstr)` ascription, mirroring json's own decode
-;;; idiom. The yyjson document is freed before returning; json's `DecodeJson`
-;;; instances copy strings out, so the decoded value outlives the document.
-;;;
-;;; Syntax:
-;;;   (req-decode req EchoReq)   ;; => (Result EchoReq cstr)
-(defmacro req-decode [req type-name]
-  `(let [__doc (unsafe (json-parse-doc (req-body ~req)))]
-     (if (= __doc 0)
-       (:: (err "req-decode: request body is not valid JSON") (Result ~type-name cstr))
-       (let [__root (unsafe (json-doc-root __doc))
-             __res  (:: (decode-json __doc __root) (Result ~type-name cstr))]
-         (unsafe (json-doc-free __doc))
-         __res))))
-
-;;; json-ok -- a 200 response whose body is `x` encoded as JSON, with
-;;; `Content-Type: application/json`. Generic over any `EncodeJson` instance.
-;;;
-;;; Example:
-;;;   (json-ok (make-struct EchoResp "hi" 2))
-(defn json-ok [^EncodeJson T  x : T] : Response
-  (let [frag (encode-json x)
-        resp (resp-ok "application/json" frag)]
-    (unsafe (__cstr-free frag))
-    resp))
-
-;;; json-resp -- like `json-ok` but with an explicit status code (e.g. 201,
-;;; 422). Body is `x` encoded as JSON with `Content-Type: application/json`.
-;;;
-;;; Example:
-;;;   (json-resp 201 (make-struct Created (.id row)))
-(defn json-resp [^EncodeJson T  status : int  x : T] : Response
-  (let [frag (encode-json x)
-        resp (response status "application/json" frag)]
-    (unsafe (__cstr-free frag))
-    resp))
-
-;;; with-json-body -- decode the request body into `T` and, on success, call
-;;; `f` with the decoded value (which must return a `Response`). On a decode
-;;; failure, short-circuit to a `400 Bad Request` carrying the error message,
-;;; so the handler happy path stays one expression.
-;;;
-;;; Syntax:
-;;;   (with-json-body req EchoReq
-;;;     (fn [r] (json-ok (make-struct EchoResp (.msg r) (str-len (.msg r))))))
-(defmacro with-json-body [req type-name f]
-  `(let [__r (req-decode ~req ~type-name)]
-     (if (ok? __r)
-       (~f (ok-val __r))
-       (bad-request (err-val __r)))))
-
-) ;; end defmodule httpd/handler
+  (import json/encode :refer [derive-json])
+  (import json/decode :refer [json-parse-doc json-doc-free json-doc-root])
+  (export serve
+    serve-pool
+    serve-spawn
+    serve-conn
+    serve-pool-conn
+    req-decode
+    json-ok
+    json-resp
+    with-json-body)
+  ;;; Handler -- typeclass for a typed HTTP request handler.
+  ;;;
+  ;;; The single method maps a parsed `Request` to a `Response`. The `self`
+  ;;; argument is the instance witness (it selects the instance and carries no
+  ;;; per-request state); dispatch is value-directed on its type, mirroring the
+  ;;; json `EncodeJson`/`DecodeJson` and ansi `Color` precedent.
+  ;;;
+  ;;; Method:
+  ;;;   respond : self -> Request -> Response
+  ;;;
+  ;;; Example:
+  ;;;   (defopaque Hello :int)
+  ;;;   (definstance Handler [Hello]
+  ;;;     (respond [self req] (resp-ok "text/plain" "hi")))
+  ;;;   ;; (respond (:: 0 Hello) req)  => a 200 text/plain Response
+  (defclass Handler [a] (respond [self req : Request] : Response))
+  ;; ---------------------------------------------------------------------------
+  ;; serve: bridge a Handler instance to the server's (c-fn [int] int) contract.
+  ;;
+  ;; The three server entry points all take `(c-fn [int] int)` -- a captureless
+  ;; C-ABI function pointer (Request handle in, Response handle out, types
+  ;; erased to int). A `Handler` method is `(self, Request) -> Response`, so we
+  ;; generate a per-type top-level trampoline that rebuilds the opaque witness,
+  ;; dispatches `respond`, and re-erases the types to int:
+  ;;
+  ;;   (serve port T) expands to roughly:
+  ;;     (do
+  ;;       (defn __httpd-trampoline-T [req : int] : int
+  ;;         (:: (respond (:: 0 T) (:: req Request)) :int))
+  ;;       (server-start port __httpd-trampoline-T))
+  ;;
+  ;; The trampoline is a top-level `defn` (named uniquely from the type), so it
+  ;; compiles to the captureless function pointer `server-start` requires --
+  ;; the same standalone-helper idiom json's `derive-json-sum` uses. Because it
+  ;; introduces a top-level binding, `serve` must be used at module top level,
+  ;; not nested in an expression.
+  ;; ---------------------------------------------------------------------------
+  ;;; serve -- start a pool-dispatched server whose handler is the `Handler`
+  ;;; instance for witness type `T`. Top-level form; binds a server handle.
+  ;;;
+  ;;; Syntax:
+  ;;;   (def srv (serve 8080 Hello))
+  ;;;
+  ;;; Returns the `:ptr<void>` server handle (pass to `server-stop`), or NULL
+  ;;; if the listener could not be created -- exactly like `server-start`.
+  (defmacro serve [port type-name]
+    (let [tramp (str->sym (str-append "__httpd-trampoline-"
+                            (symbol-name type-name)))]
+      `(do
+         (defn ~tramp [req : int] : int
+           (:: (respond (:: 0 ~type-name) (:: req Request)) :int))
+         (server-start ~port ~tramp))))
+  ;;; serve-pool -- like `serve` but with an explicit worker-pool size,
+  ;;; bridging to `server-start-pool`.
+  ;;;
+  ;;; Syntax:
+  ;;;   (def srv (serve-pool 8080 Hello 32))
+  (defmacro serve-pool [port type-name size]
+    (let [tramp (str->sym (str-append "__httpd-trampoline-pool-"
+                            (symbol-name type-name)))]
+      `(do
+         (defn ~tramp [req : int] : int
+           (:: (respond (:: 0 ~type-name) (:: req Request)) :int))
+         (server-start-pool ~port ~tramp ~size))))
+  ;;; serve-spawn -- like `serve` but using the thread-per-connection
+  ;;; dispatcher, bridging to `server-start-spawn`.
+  ;;;
+  ;;; Syntax:
+  ;;;   (def srv (serve-spawn 8080 Hello))
+  (defmacro serve-spawn [port type-name]
+    (let [tramp (str->sym (str-append "__httpd-trampoline-spawn-"
+                            (symbol-name type-name)))]
+      `(do
+         (defn ~tramp [req : int] : int
+           (:: (respond (:: 0 ~type-name) (:: req Request)) :int))
+         (server-start-spawn ~port ~tramp))))
+  ;; ---------------------------------------------------------------------------
+  ;; serve-conn: the upgrade-aware counterpart of serve.
+  ;;
+  ;; Where Handler maps a Request to a Response, ConnHandler maps a (Conn,
+  ;; Request) pair to a Response -- the extra Conn lets the handler reach the raw
+  ;; fd and perform a protocol upgrade (see httpd/conn and the ws-server spice).
+  ;; serve-conn / serve-pool-conn emit a captureless two-arg trampoline matching
+  ;; server-start-conn's `(c-fn [int int] int)` contract, exactly mirroring how
+  ;; serve bridges Handler to server-start.
+  ;; ---------------------------------------------------------------------------
+  ;;; ConnHandler -- typeclass for an upgrade-aware HTTP request handler.
+  ;;;
+  ;;; The single method maps a `(Conn, Request)` pair to a `Response`. `self` is
+  ;;; the instance witness (it selects the instance and carries no per-request
+  ;;; state); dispatch is value-directed on its type, mirroring `Handler`.
+  ;;;
+  ;;; Method:
+  ;;;   respond-conn : self -> Conn -> Request -> Response
+  ;;;
+  ;;; Example:
+  ;;;   (defopaque WsEcho :int)
+  ;;;   (definstance ConnHandler [WsEcho]
+  ;;;     (respond-conn [self conn req] (ws-upgrade conn req ...)))
+  (defclass ConnHandler [a]
+    (respond-conn [self conn : Conn req : Request] : Response))
+  ;;; serve-conn -- start a pool-dispatched, upgrade-aware server whose handler
+  ;;; is the `ConnHandler` instance for witness type `T`. Top-level form.
+  ;;;
+  ;;; Syntax:
+  ;;;   (def srv (serve-conn 8080 WsEcho))
+  (defmacro serve-conn [port type-name]
+    (let [tramp (str->sym (str-append "__httpd-conn-trampoline-"
+                            (symbol-name type-name)))]
+      `(do
+         (defn ~tramp [conn : int req : int] : int
+           (:: (respond-conn (:: 0 ~type-name) (:: conn Conn) (:: req Request))
+             :int))
+         (server-start-conn ~port ~tramp))))
+  ;;; serve-pool-conn -- like `serve-conn` but with an explicit worker-pool size,
+  ;;; bridging to `server-start-pool-conn`.
+  ;;;
+  ;;; Syntax:
+  ;;;   (def srv (serve-pool-conn 8080 WsEcho 32))
+  (defmacro serve-pool-conn [port type-name size]
+    (let [tramp (str->sym (str-append "__httpd-conn-trampoline-pool-"
+                            (symbol-name type-name)))]
+      `(do
+         (defn ~tramp [conn : int req : int] : int
+           (:: (respond-conn (:: 0 ~type-name) (:: conn Conn) (:: req Request))
+             :int))
+         (server-start-pool-conn ~port ~tramp ~size))))
+  ;; ---------------------------------------------------------------------------
+  ;; JSON body codecs (P3): decode a typed request body and encode a typed
+  ;; response body through json's `DecodeJson`/`EncodeJson` typeclasses, so a JSON
+  ;; endpoint is a few lines instead of inline-C body parsing.
+  ;;
+  ;; The request type is decoded with `req-decode` (or the `with-json-body`
+  ;; convenience), the response is built with `json-ok` / `json-resp`. Both
+  ;; sides reuse the already-shipped json codec surface; the only httpd-side
+  ;; glue is wiring `(req-body req)` into the parser and the encoded fragment
+  ;; into a Response with `Content-Type: application/json`.
+  ;; ---------------------------------------------------------------------------
+  ;;; __cstr-free -- release a malloc'd JSON fragment returned by `encode-json`.
+  ;;; json's contract is caller-owns; the Response constructors copy the body,
+  ;;; so the fragment is freed immediately after it is handed to `resp-ok` /
+  ;;; `response`.
+  (defn __cstr-free [p : cstr]
+    #fx{Unsafe}
+    : void
+    ```c free((void *)(intptr_t)p); ```)
+  ;;; req-decode -- parse a request body as JSON and decode it into `T` via the
+  ;;; json `DecodeJson [T]` instance. Returns `(Result T cstr)`: `ok` with the
+  ;;; decoded value, or `err` with a message when the body is not valid JSON.
+  ;;;
+  ;;; A macro (not a function) because the target type drives instance selection
+  ;;; through the `(Result T cstr)` ascription, mirroring json's own decode
+  ;;; idiom. The yyjson document is freed before returning; json's `DecodeJson`
+  ;;; instances copy strings out, so the decoded value outlives the document.
+  ;;;
+  ;;; Syntax:
+  ;;;   (req-decode req EchoReq)   ;; => (Result EchoReq cstr)
+  (defmacro req-decode [req type-name]
+    `(let [__doc (unsafe (json-parse-doc (req-body ~req)))]
+       (if (= __doc 0)
+         (:: (err "req-decode: request body is not valid JSON")
+           (Result ~type-name cstr))
+         (let [__root (unsafe (json-doc-root __doc))
+               __res  (:: (decode-json __doc __root) (Result ~type-name cstr))]
+           (unsafe (json-doc-free __doc))
+           __res))))
+  ;;; json-ok -- a 200 response whose body is `x` encoded as JSON, with
+  ;;; `Content-Type: application/json`. Generic over any `EncodeJson` instance.
+  ;;;
+  ;;; Example:
+  ;;;   (json-ok (make-struct EchoResp "hi" 2))
+  (defn json-ok [^EncodeJson T x : T] : Response
+    (let [frag (encode-json x)
+          resp (resp-ok "application/json" frag)]
+      (unsafe (__cstr-free frag))
+      resp))
+  ;;; json-resp -- like `json-ok` but with an explicit status code (e.g. 201,
+  ;;; 422). Body is `x` encoded as JSON with `Content-Type: application/json`.
+  ;;;
+  ;;; Example:
+  ;;;   (json-resp 201 (make-struct Created (.id row)))
+  (defn json-resp [^EncodeJson T status : int x : T] : Response
+    (let [frag (encode-json x)
+          resp (response status "application/json" frag)]
+      (unsafe (__cstr-free frag))
+      resp))
+  ;;; with-json-body -- decode the request body into `T` and, on success, call
+  ;;; `f` with the decoded value (which must return a `Response`). On a decode
+  ;;; failure, short-circuit to a `400 Bad Request` carrying the error message,
+  ;;; so the handler happy path stays one expression.
+  ;;;
+  ;;; Syntax:
+  ;;;   (with-json-body req EchoReq
+  ;;;     (fn [r] (json-ok (make-struct EchoResp (.msg r) (str-len (.msg r))))))
+  (defmacro with-json-body [req type-name f]
+    `(let [__r (req-decode ~req ~type-name)]
+       (if (ok? __r) (~f (ok-val __r)) (bad-request (err-val __r)))))) ;; end defmodule httpd/handler

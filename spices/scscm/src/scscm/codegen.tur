@@ -1,57 +1,69 @@
 (defmodule scscm/codegen
   (export generate generate-all)
-  (import scscm/lexer :refer [cons head tail nil-value list-nil?
-                               scscm-list-rev scscm-cstr-eq?
-                               scscm-cstr-as-int scscm-int-as-cstr
-                               scscm-fn-head?])
-  (import scscm/parser :refer [ast-kind ast-symbol-name
-                                ast-number-value ast-string-value
-                                ast-list-len ast-list-get
-                                scscm-ast-value])
-
-;; scscm/codegen -- emit sclang text from an expanded AST.
-;;
-;; The target is sclang that a stock SuperCollider 3.13 `sclang` parses:
-;; every rule below exists because the obvious spelling does not parse, or
-;; parses to something else. The corpus under tests/corpus is checked with a
-;; real sclang (tests/corpus/check-sclang.sh).
-;;
-;; Core forms (everything else is a macro in scscm/expander):
-;;   (fn (a b) body...)          -> { |a, b| body }
-;;   (fn (freq 440 amp 0.1) ...) -> { |freq=440, amp=0.1| ... }   defaults
-;;   (fn (a . rest) ...)         -> { |a ...rest| ... }            rest param
-;;   (defn name (a) body...)     -> var name; name = { |a| body }
-;;   (var x v) / (def x v)       -> var x = v   (see "declarations" below)
-;;   (set! x v)                  -> x = v
-;;   (set! (. obj prop) v)       -> obj.prop = v
-;;   (let ((x 1) (y 2)) body...) -> { |x, y| body }.value(1, 2)
-;;   (if c t e)                  -> if (c) { t } { e }
-;;   (do a b)                    -> statements in a body; (a; b) in an expression
-;;   (. obj msg args...)         -> obj.msg(args)
-;;   (.dot Cls msg args...)      -> Cls.msg(args)
-;;   (list a b) / (array a b)    -> [a, b]
-;;   (dict :k v)                 -> (k: v) standalone; k: v as a call's last
-;;                                  argument; [\k, v] as Synth/set controls
-;;   'x / (quote x)              -> \x ; '(1 2) -> #[1, 2]
-;;   (+ a b c)                   -> a + b + c   (operands that are themselves
-;;                                  operator expressions are parenthesised:
-;;                                  sclang has no operator precedence)
-;;   (f a b)                     -> f.(a, b) when f is a variable in scope,
-;;                                  f(a, b) otherwise (a message to a)
-;;
-;; Declarations: sclang only accepts `var` at the start of a block. The vars
-;; a body declares up front stay `var x = v`; a `var`/`defn` after the first
-;; ordinary statement is hoisted to a leading `var x;` and becomes `x = v`.
-;;
-;; Names: foo-bar -> foo_bar, done? -> done_q, set! -> set (the reference
-;; compiler's mapping); :some-key -> \some_key.
-
-;; ---- C helpers: strings ----
-
-;;; scscm-sym-escape -- map a scscm identifier to a sclang identifier.
-(defn scscm-sym-escape [name : cstr] #fx{Unsafe} : cstr
-  ```c
-  const char *src = (const char*)(intptr_t)name;
+  (import scscm/lexer
+    :refer
+    [cons
+     head
+     tail
+     nil-value
+     list-nil?
+     scscm-list-rev
+     scscm-cstr-eq?
+     scscm-cstr-as-int
+     scscm-int-as-cstr
+     scscm-fn-head?])
+  (import scscm/parser
+    :refer
+    [ast-kind
+     ast-symbol-name
+     ast-number-value
+     ast-string-value
+     ast-list-len
+     ast-list-get
+     scscm-ast-value])
+  ;; scscm/codegen -- emit sclang text from an expanded AST.
+  ;;
+  ;; The target is sclang that a stock SuperCollider 3.13 `sclang` parses:
+  ;; every rule below exists because the obvious spelling does not parse, or
+  ;; parses to something else. The corpus under tests/corpus is checked with a
+  ;; real sclang (tests/corpus/check-sclang.sh).
+  ;;
+  ;; Core forms (everything else is a macro in scscm/expander):
+  ;;   (fn (a b) body...)          -> { |a, b| body }
+  ;;   (fn (freq 440 amp 0.1) ...) -> { |freq=440, amp=0.1| ... }   defaults
+  ;;   (fn (a . rest) ...)         -> { |a ...rest| ... }            rest param
+  ;;   (defn name (a) body...)     -> var name; name = { |a| body }
+  ;;   (var x v) / (def x v)       -> var x = v   (see "declarations" below)
+  ;;   (set! x v)                  -> x = v
+  ;;   (set! (. obj prop) v)       -> obj.prop = v
+  ;;   (let ((x 1) (y 2)) body...) -> { |x, y| body }.value(1, 2)
+  ;;   (if c t e)                  -> if (c) { t } { e }
+  ;;   (do a b)                    -> statements in a body; (a; b) in an expression
+  ;;   (. obj msg args...)         -> obj.msg(args)
+  ;;   (.dot Cls msg args...)      -> Cls.msg(args)
+  ;;   (list a b) / (array a b)    -> [a, b]
+  ;;   (dict :k v)                 -> (k: v) standalone; k: v as a call's last
+  ;;                                  argument; [\k, v] as Synth/set controls
+  ;;   'x / (quote x)              -> \x ; '(1 2) -> #[1, 2]
+  ;;   (+ a b c)                   -> a + b + c   (operands that are themselves
+  ;;                                  operator expressions are parenthesised:
+  ;;                                  sclang has no operator precedence)
+  ;;   (f a b)                     -> f.(a, b) when f is a variable in scope,
+  ;;                                  f(a, b) otherwise (a message to a)
+  ;;
+  ;; Declarations: sclang only accepts `var` at the start of a block. The vars
+  ;; a body declares up front stay `var x = v`; a `var`/`defn` after the first
+  ;; ordinary statement is hoisted to a leading `var x;` and becomes `x = v`.
+  ;;
+  ;; Names: foo-bar -> foo_bar, done? -> done_q, set! -> set (the reference
+  ;; compiler's mapping); :some-key -> \some_key.
+  ;; ---- C helpers: strings ----
+  ;;; scscm-sym-escape -- map a scscm identifier to a sclang identifier.
+  (defn scscm-sym-escape [name : cstr]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    const char *src = (const char*)(intptr_t)name;
   int len = (int)strlen(src);
   char *out = malloc(len + 3);
   int j = 0;
@@ -65,11 +77,12 @@
   out[j] = '\0';
   return out;
   ```)
-
-;;; scscm-concat -- concatenate two strings into a fresh buffer.
-(defn scscm-concat [a : cstr b : cstr] #fx{Unsafe} : cstr
-  ```c
-  const char *sa = (const char*)(intptr_t)a;
+  ;;; scscm-concat -- concatenate two strings into a fresh buffer.
+  (defn scscm-concat [a : cstr b : cstr]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    const char *sa = (const char*)(intptr_t)a;
   const char *sb = (const char*)(intptr_t)b;
   if (!sa) sa = ""; if (!sb) sb = "";
   size_t la = strlen(sa), lb = strlen(sb);
@@ -78,15 +91,17 @@
   out[la + lb] = '\0';
   return out;
   ```)
-
-;;; scscm-cat3 -- concatenate three strings.
-(defn scscm-cat3 [a : cstr b : cstr c : cstr] #fx{Unsafe} : cstr
-  (scscm-concat a (scscm-concat b c)))
-
-;;; scscm-join -- join a cons list of strings with a separator.
-(defn scscm-join [lst : int sep : cstr] #fx{Unsafe} : cstr
-  ```c
-  typedef struct { int64_t value; int64_t next; } Cell;
+  ;;; scscm-cat3 -- concatenate three strings.
+  (defn scscm-cat3 [a : cstr b : cstr c : cstr]
+    #fx{Unsafe}
+    : cstr
+    (scscm-concat a (scscm-concat b c)))
+  ;;; scscm-join -- join a cons list of strings with a separator.
+  (defn scscm-join [lst : int sep : cstr]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    typedef struct { int64_t value; int64_t next; } Cell;
   const char *s = (const char*)(intptr_t)sep;
   size_t ls = strlen(s), total = 1;
   for (Cell *c = (Cell*)(intptr_t)lst; c; c = (Cell*)(intptr_t)c->next)
@@ -103,37 +118,41 @@
   out[pos] = '\0';
   return out;
   ```)
-
-;;; scscm-num-text -- a number literal as sclang accepts it (no unary +).
-(defn scscm-num-text [raw : cstr] #fx{Unsafe} : cstr
-  ```c
-  const char *s = (const char*)(intptr_t)raw;
+  ;;; scscm-num-text -- a number literal as sclang accepts it (no unary +).
+  (defn scscm-num-text [raw : cstr]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    const char *s = (const char*)(intptr_t)raw;
   return (s && s[0] == '+') ? s + 1 : s;
   ```)
-
-;;; scscm-kw-name -- strip the leading colon of a keyword.
-(defn scscm-kw-name [raw : cstr] #fx{Unsafe} : cstr
-  ```c
-  const char *s = (const char*)(intptr_t)raw;
+  ;;; scscm-kw-name -- strip the leading colon of a keyword.
+  (defn scscm-kw-name [raw : cstr]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    const char *s = (const char*)(intptr_t)raw;
   if (s && s[0] == ':') return s + 1;
   return s ? s : "";
   ```)
-
-;;; scscm-ident? -- true when s is a plain sclang identifier.
-(defn scscm-ident? [s : cstr] #fx{Unsafe} : bool
-  ```c
-  const char *p = (const char*)(intptr_t)s;
+  ;;; scscm-ident? -- true when s is a plain sclang identifier.
+  (defn scscm-ident? [s : cstr]
+    #fx{Unsafe}
+    : bool
+    ```c
+    const char *p = (const char*)(intptr_t)s;
   if (!p || !((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z'))) return false;
   for (; *p; p++)
     if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
           (*p >= '0' && *p <= '9') || *p == '_')) return false;
   return true;
   ```)
-
-;;; scscm-sym-quoted -- 'text' with quotes and backslashes escaped.
-(defn scscm-sym-quoted [s : cstr] #fx{Unsafe} : cstr
-  ```c
-  const char *p = (const char*)(intptr_t)s;
+  ;;; scscm-sym-quoted -- 'text' with quotes and backslashes escaped.
+  (defn scscm-sym-quoted [s : cstr]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    const char *p = (const char*)(intptr_t)s;
   size_t n = strlen(p);
   char *out = malloc(2 * n + 3);
   size_t j = 0;
@@ -146,28 +165,28 @@
   out[j] = '\0';
   return out;
   ```)
-
-;; A symbol literal: \name when the escaped name is an identifier, else 'raw'.
-(defn scscm-symbol-literal [raw : cstr] #fx{Unsafe} : cstr
-  (let [esc (scscm-sym-escape raw)]
-    (if (scscm-ident? esc)
-      (scscm-concat "\\" esc)
-      (scscm-sym-quoted raw))))
-
-;;; scscm-upper-or-dotted? -- a class name (Synth) or Class.method (SinOsc.ar).
-(defn scscm-upper-or-dotted? [s : cstr] #fx{Unsafe} : bool
-  ```c
-  const char *p = (const char*)(intptr_t)s;
+  ;; A symbol literal: \name when the escaped name is an identifier, else 'raw'.
+  (defn scscm-symbol-literal [raw : cstr]
+    #fx{Unsafe}
+    : cstr
+    (let [esc (scscm-sym-escape raw)]
+      (if (scscm-ident? esc) (scscm-concat "\\" esc) (scscm-sym-quoted raw))))
+  ;;; scscm-upper-or-dotted? -- a class name (Synth) or Class.method (SinOsc.ar).
+  (defn scscm-upper-or-dotted? [s : cstr]
+    #fx{Unsafe}
+    : bool
+    ```c
+    const char *p = (const char*)(intptr_t)s;
   if (!p || !*p) return false;
   if (*p >= 'A' && *p <= 'Z') return true;
   return strchr(p + 1, '.') != NULL;
   ```)
-
-;; ---- C helpers: operators ----
-
-(defn scscm-is-binary-op? [name : cstr] #fx{Unsafe} : bool
-  ```c
-  const char *n = (const char*)(intptr_t)name;
+  ;; ---- C helpers: operators ----
+  (defn scscm-is-binary-op? [name : cstr]
+    #fx{Unsafe}
+    : bool
+    ```c
+    const char *n = (const char*)(intptr_t)name;
   if (!n) return false;
   static const char *ops[] = {
     "+","-","*","/","%","**","=","==","!=","<",">","<=",">=",
@@ -178,11 +197,12 @@
     if (strcmp(n, ops[i]) == 0) return true;
   return false;
   ```)
-
-;; Map a scscm operator to its sclang spelling.
-(defn scscm-sclang-op [name : cstr] #fx{Unsafe} : cstr
-  ```c
-  const char *n = (const char*)(intptr_t)name;
+  ;; Map a scscm operator to its sclang spelling.
+  (defn scscm-sclang-op [name : cstr]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    const char *n = (const char*)(intptr_t)name;
   if (strcmp(n,"=")==0)   return "==";
   if (strcmp(n,"and")==0) return "&&";
   if (strcmp(n,"or")==0)  return "||";
@@ -190,14 +210,15 @@
   if (strcmp(n,"rem")==0) return "%";
   return n;
   ```)
-
-;; ---- C helpers: lexical scope ----
-;;
-;; One stack of escaped names. op 0 reset, 1 push name, 2 mark (depth),
-;; 3 pop to depth k, 4 has name anywhere, 5 has name at or above depth k.
-(defn scscm-scope-op [op : int name : cstr k : int] #fx{Unsafe} : int
-  ```c
-  static char **names = NULL;
+  ;; ---- C helpers: lexical scope ----
+  ;;
+  ;; One stack of escaped names. op 0 reset, 1 push name, 2 mark (depth),
+  ;; 3 pop to depth k, 4 has name anywhere, 5 has name at or above depth k.
+  (defn scscm-scope-op [op : int name : cstr k : int]
+    #fx{Unsafe}
+    : int
+    ```c
+    static char **names = NULL;
   static int n = 0, cap = 0;
   const char *nm = (const char*)(intptr_t)name;
   switch (op) {
@@ -221,313 +242,376 @@
   }
   return 0;
   ```)
-
-(defn scscm-scope-reset [] #fx{Unsafe} : int (scscm-scope-op 0 "" 0))
-(defn scscm-scope-push [name : cstr] #fx{Unsafe} : int (scscm-scope-op 1 name 0))
-(defn scscm-scope-mark [] #fx{Unsafe} : int (scscm-scope-op 2 "" 0))
-(defn scscm-scope-pop [k : int] #fx{Unsafe} : int (scscm-scope-op 3 "" k))
-(defn scscm-in-scope? [name : cstr] #fx{Unsafe} : bool
-  (= (scscm-scope-op 4 name 0) 1))
-(defn scscm-in-scope-since? [name : cstr k : int] #fx{Unsafe} : bool
-  (= (scscm-scope-op 5 name k) 1))
-
-;; ---- AST predicates ----
-
-(defn scscm-kind? [node : int kind : cstr] #fx{Unsafe} : bool
-  (scscm-cstr-eq? (ast-kind node) kind))
-
-;; The head symbol of a non-empty list, or "".
-(defn scscm-head-name [node : int] #fx{Unsafe} : cstr
-  (if (and (scscm-kind? node ":list")
-           (> (ast-list-len node) 0)
-           (scscm-kind? (ast-list-get node 0) ":symbol"))
-    (ast-symbol-name (ast-list-get node 0))
-    ""))
-
-(defn scscm-form? [node : int name : cstr] #fx{Unsafe} : bool
-  (scscm-cstr-eq? (scscm-head-name node) name))
-
-;; A `var`/`def`/`defn` statement.
-(defn scscm-decl? [node : int] #fx{Unsafe} : bool
-  (or (scscm-form? node "var")
-      (or (scscm-form? node "def")
-          (scscm-form? node "defn"))))
-
-(defn scscm-decl-name [node : int] #fx{Unsafe} : cstr
-  (scscm-sym-escape (ast-symbol-name (ast-list-get node 1))))
-
-;; An expression that must be parenthesised as an operand or a receiver:
-;; binary operators (no precedence in sclang), if, and assignments. A
-;; (do x) of one statement generates as x, so it is judged by x.
-(defn scscm-operator-expr? [node : int] #fx{Unsafe} : bool
-  (let [h (scscm-head-name node)]
-    (cond
-      (scscm-cstr-eq? h "") false
-      (and (scscm-is-binary-op? h) (>= (ast-list-len node) 3)) true
-      (scscm-cstr-eq? h "do")
-        (let [stmts (scscm-drop-empty (scscm-flatten node 1 (nil-value)) (nil-value))]
-          (and (not (list-nil? stmts))
-               (list-nil? (tail stmts))
-               (scscm-operator-expr? (head stmts))))
-      :else (or (scscm-cstr-eq? h "if")
-                (or (scscm-cstr-eq? h "set!")
-                    (scscm-decl? node))))))
-
-;; ---- statements ----
-
-;; Collect node's children from i, splicing nested (do ...) forms, onto acc
-;; (reversed).
-(defn scscm-flatten [node : int i : int acc : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len node))
-    acc
-    (let [child (ast-list-get node i)]
-      (if (scscm-form? child "do")
-        (scscm-flatten node (+ i 1) (scscm-flatten child 1 acc))
-        (scscm-flatten node (+ i 1) (cons child acc))))))
-
-;; The same over a cons list of nodes.
-(defn scscm-flatten-cons [nodes : int acc : int] #fx{Unsafe} : int
-  (if (list-nil? nodes)
-    acc
-    (let [child (head nodes)]
-      (if (scscm-form? child "do")
-        (scscm-flatten-cons (tail nodes) (scscm-flatten child 1 acc))
-        (scscm-flatten-cons (tail nodes) (cons child acc))))))
-
-;; Drop the empty statements the expander leaves for consumed forms.
-(defn scscm-drop-empty [stmts : int acc : int] #fx{Unsafe} : int
-  (if (list-nil? stmts)
-    (scscm-list-rev acc (nil-value))
-    (let [s (head stmts)]
-      (if (and (scscm-kind? s ":list") (= (ast-list-len s) 0))
-        (scscm-drop-empty (tail stmts) acc)
-        (scscm-drop-empty (tail stmts) (cons s acc))))))
-
-;; Length of the leading run of declarations. A second declaration of a name
-;; in the run ends it (it becomes an assignment), as sclang rejects a
-;; duplicate `var`.
-(defn scscm-lead-count [stmts : int n : int seen : int] #fx{Unsafe} : int
-  (if (list-nil? stmts)
-    n
-    (let [s (head stmts)]
-      (if (and (scscm-decl? s) (not (scscm-names-has? seen (scscm-decl-name s))))
-        (scscm-lead-count (tail stmts) (+ n 1)
-                          (cons (scscm-cstr-as-int (scscm-decl-name s)) seen))
-        n))))
-
-;; Push every declared name in stmts that is not already declared at or
-;; above depth k. Returns the cons list (reversed) of the names pushed.
-(defn scscm-declare [stmts : int k : int acc : int] #fx{Unsafe} : int
-  (if (list-nil? stmts)
-    acc
-    (let [s (head stmts)]
-      (if (scscm-decl? s)
-        (let [nm (scscm-decl-name s)]
-          (if (scscm-in-scope-since? nm k)
-            (scscm-declare (tail stmts) k acc)
-            (do
-              (scscm-scope-push nm)
-              (scscm-declare (tail stmts) k (cons (scscm-cstr-as-int nm) acc)))))
-        (scscm-declare (tail stmts) k acc)))))
-
-;; Drop the first n elements of a cons list.
-(defn scscm-drop [lst : int n : int] #fx{Unsafe} : int
-  (if (or (= n 0) (list-nil? lst))
-    lst
-    (scscm-drop (tail lst) (- n 1))))
-
-;; The value side of a declaration: the expression, a fn for defn, or "".
-(defn scscm-decl-value [node : int] #fx{Unsafe} : cstr
-  (if (scscm-form? node "defn")
-    (scscm-gen-fn (ast-list-get node 2) node 3)
-    (if (>= (ast-list-len node) 3)
-      (generate (ast-list-get node 2))
-      "")))
-
-;; Leading declarations: var x = v (or bare var x).
-(defn scscm-gen-lead [stmts : int n : int acc : int] #fx{Unsafe} : int
-  (if (= n 0)
-    acc
-    (let [s   (head stmts)
-          nm  (scscm-decl-name s)
-          val (scscm-decl-value s)
-          txt (if (scscm-cstr-eq? val "")
-                (scscm-concat "var " nm)
-                (scscm-cat3 "var " nm (scscm-concat " = " val)))]
-      (scscm-gen-lead (tail stmts) (- n 1) (cons (scscm-cstr-as-int txt) acc)))))
-
-;; Statements after the leading declarations.
-(defn scscm-gen-rest [stmts : int acc : int] #fx{Unsafe} : int
-  (if (list-nil? stmts)
-    acc
-    (let [s   (head stmts)
-          txt (if (scscm-decl? s)
-                (let [val (scscm-decl-value s)]
-                  (scscm-cat3 (scscm-decl-name s) " = "
-                              (if (scscm-cstr-eq? val "") "nil" val)))
-                (generate s))]
-      (scscm-gen-rest (tail stmts) (cons (scscm-cstr-as-int txt) acc)))))
-
-;; Generate a statement list (in order) to a cons list of statement texts.
-;; Declares the body's names in the current scope; the caller marks and
-;; pops around it.
-(defn scscm-gen-stmt-list [stmts0 : int] #fx{Unsafe} : int
-  (let [stmts   (scscm-drop-empty stmts0 (nil-value))
-        k       (scscm-scope-mark)
-        lead-n  (scscm-lead-count stmts 0 (nil-value))
-        lead-nm (scscm-declare stmts k (nil-value))
-        hoisted (scscm-declare-after stmts lead-n k)
-        lead    (scscm-gen-lead stmts lead-n (nil-value))
-        rest    (scscm-gen-rest (scscm-drop stmts lead-n) (nil-value))
-        ;; lead and rest are reversed; lead ++ rest, in order:
-        body    (scscm-list-rev lead (scscm-list-rev rest (nil-value)))]
-    (if (list-nil? hoisted)
-      body
-      (cons (scscm-cstr-as-int
-              (scscm-concat "var " (scscm-join (scscm-list-rev hoisted (nil-value)) ", ")))
-            body))))
-
-;; Names declared after the leading run (already pushed by scscm-declare);
-;; collected so they can be hoisted. Names the leading run also declares are
-;; not repeated.
-(defn scscm-declare-after [stmts : int lead-n : int k : int] #fx{Unsafe} : int
-  (scscm-hoist-names (scscm-drop stmts lead-n)
-                     (scscm-take stmts lead-n (nil-value))
-                     (nil-value)))
-
-(defn scscm-take [lst : int n : int acc : int] #fx{Unsafe} : int
-  (if (or (= n 0) (list-nil? lst))
-    acc
-    (scscm-take (tail lst) (- n 1) (cons (head lst) acc))))
-
-;; True when some decl in stmts declares name.
-(defn scscm-declares? [stmts : int name : cstr] #fx{Unsafe} : bool
-  (if (list-nil? stmts)
-    false
-    (if (and (scscm-decl? (head stmts))
-             (scscm-cstr-eq? (scscm-decl-name (head stmts)) name))
-      true
-      (scscm-declares? (tail stmts) name))))
-
-(defn scscm-names-has? [names : int name : cstr] #fx{Unsafe} : bool
-  (if (list-nil? names)
-    false
-    (if (scscm-cstr-eq? (scscm-int-as-cstr (head names)) name)
-      true
-      (scscm-names-has? (tail names) name))))
-
-(defn scscm-hoist-names [stmts : int lead : int acc : int] #fx{Unsafe} : int
-  (if (list-nil? stmts)
-    acc
-    (let [s (head stmts)]
-      (if (scscm-decl? s)
-        (let [nm (scscm-decl-name s)]
-          (if (or (scscm-declares? lead nm) (scscm-names-has? acc nm))
-            (scscm-hoist-names (tail stmts) lead acc)
-            (scscm-hoist-names (tail stmts) lead (cons (scscm-cstr-as-int nm) acc))))
-        (scscm-hoist-names (tail stmts) lead acc)))))
-
-;; A body: node's children from start, as "s1; s2".
-(defn scscm-gen-body [node : int start : int] #fx{Unsafe} : cstr
-  (scscm-join (scscm-gen-stmt-list (scscm-list-rev (scscm-flatten node start (nil-value))
-                                                   (nil-value)))
-              "; "))
-
-;; True when a flattened statement list declares anything.
-(defn scscm-any-decl? [stmts : int] #fx{Unsafe} : bool
-  (if (list-nil? stmts)
-    false
-    (if (scscm-decl? (head stmts)) true (scscm-any-decl? (tail stmts)))))
-
-;; ---- expressions ----
-
-;; An operand or receiver: parenthesised when it is an operator expression.
-(defn scscm-gen-operand [node : int] #fx{Unsafe} : cstr
-  (if (scscm-operator-expr? node)
-    (scscm-cat3 "(" (generate node) ")")
-    (generate node)))
-
-;; (op a b c ...) -> a op b op c, left to right.
-(defn scscm-gen-binop-loop [node : int op : cstr i : int acc : cstr] #fx{Unsafe} : cstr
-  (if (>= i (ast-list-len node))
-    acc
-    (scscm-gen-binop-loop node op (+ i 1)
-      (scscm-cat3 acc (scscm-cat3 " " op " ") (scscm-gen-operand (ast-list-get node i))))))
-
-(defn scscm-gen-binop [node : int name : cstr] #fx{Unsafe} : cstr
-  (let [n (ast-list-len node)]
-    (cond
-      (= n 1) "nil"
-      (= n 2)
-        (let [x (scscm-gen-operand (ast-list-get node 1))]
-          (cond
-            (scscm-cstr-eq? name "-") (scscm-concat x ".neg")
-            (scscm-cstr-eq? name "/") (scscm-concat x ".reciprocal")
-            :else x))
-      :else
-        (scscm-gen-binop-loop node (scscm-sclang-op name) 2
-                              (scscm-gen-operand (ast-list-get node 1))))))
-
-;; "k: v, ..." from a dict node.
-(defn scscm-dict-kw [node : int i : int acc : int] #fx{Unsafe} : int
-  (if (>= (+ i 1) (ast-list-len node))
-    acc
-    (scscm-dict-kw node (+ i 2)
-      (cons (scscm-cstr-as-int
-              (scscm-cat3 (scscm-dict-key (ast-list-get node i)) ": "
-                          (generate (ast-list-get node (+ i 1)))))
-            acc))))
-
-;; "\k, v, ..." from a dict node.
-(defn scscm-dict-pairs [node : int i : int acc : int] #fx{Unsafe} : int
-  (if (>= (+ i 1) (ast-list-len node))
-    acc
-    (scscm-dict-pairs node (+ i 2)
-      (cons (scscm-cstr-as-int (generate (ast-list-get node (+ i 1))))
-            (cons (scscm-cstr-as-int
-                    (scscm-concat "\\" (scscm-dict-key (ast-list-get node i))))
-                  acc)))))
-
-(defn scscm-dict-key [key : int] #fx{Unsafe} : cstr
-  (cond
-    (scscm-kind? key ":keyword") (scscm-sym-escape (scscm-kw-name (scscm-ast-value key)))
-    (scscm-kind? key ":symbol")  (scscm-sym-escape (ast-symbol-name key))
-    :else                        (generate key)))
-
-(defn scscm-gen-dict [node : int] #fx{Unsafe} : cstr
-  (scscm-cat3 "("
-    (scscm-join (scscm-list-rev (scscm-dict-kw node 1 (nil-value)) (nil-value)) ", ")
-    ")"))
-
-;; Call arguments from index start. A trailing (dict ...) becomes keyword
-;; arguments, or a [\k, v] control array when pairs? is set.
-(defn scscm-gen-args-loop [node : int i : int pairs? : bool acc : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len node))
-    acc
-    (let [a    (ast-list-get node i)
-          last (= i (- (ast-list-len node) 1))]
-      (if (and last (scscm-form? a "dict"))
-        (if pairs?
-          (cons (scscm-cstr-as-int
-                  (scscm-cat3 "["
-                    (scscm-join (scscm-list-rev (scscm-dict-pairs a 1 (nil-value)) (nil-value)) ", ")
-                    "]"))
-                acc)
-          (if (< (ast-list-len a) 3)
-            acc
-            (cons (scscm-cstr-as-int
-                    (scscm-join (scscm-list-rev (scscm-dict-kw a 1 (nil-value)) (nil-value)) ", "))
-                  acc)))
-        (scscm-gen-args-loop node (+ i 1) pairs? (cons (scscm-cstr-as-int (generate a)) acc))))))
-
-(defn scscm-gen-args [node : int start : int pairs? : bool] #fx{Unsafe} : cstr
-  (scscm-join (scscm-list-rev (scscm-gen-args-loop node start pairs? (nil-value)) (nil-value))
-              ", "))
-
-;; Callees whose trailing dict is a list of synth controls.
-(defn scscm-controls-callee? [name : cstr] #fx{Unsafe} : bool
-  ```c
-  const char *n = (const char*)(intptr_t)name;
+  (defn scscm-scope-reset [] #fx{Unsafe} : int (scscm-scope-op 0 "" 0))
+  (defn scscm-scope-push [name : cstr]
+    #fx{Unsafe}
+    : int
+    (scscm-scope-op 1 name 0))
+  (defn scscm-scope-mark [] #fx{Unsafe} : int (scscm-scope-op 2 "" 0))
+  (defn scscm-scope-pop [k : int] #fx{Unsafe} : int (scscm-scope-op 3 "" k))
+  (defn scscm-in-scope? [name : cstr]
+    #fx{Unsafe}
+    : bool
+    (= (scscm-scope-op 4 name 0) 1))
+  (defn scscm-in-scope-since? [name : cstr k : int]
+    #fx{Unsafe}
+    : bool
+    (= (scscm-scope-op 5 name k) 1))
+  ;; ---- AST predicates ----
+  (defn scscm-kind? [node : int kind : cstr]
+    #fx{Unsafe}
+    : bool
+    (scscm-cstr-eq? (ast-kind node) kind))
+  ;; The head symbol of a non-empty list, or "".
+  (defn scscm-head-name [node : int]
+    #fx{Unsafe}
+    : cstr
+    (if (and (scscm-kind? node ":list")
+          (> (ast-list-len node) 0)
+          (scscm-kind? (ast-list-get node 0) ":symbol"))
+      (ast-symbol-name (ast-list-get node 0))
+      ""))
+  (defn scscm-form? [node : int name : cstr]
+    #fx{Unsafe}
+    : bool
+    (scscm-cstr-eq? (scscm-head-name node) name))
+  ;; A `var`/`def`/`defn` statement.
+  (defn scscm-decl? [node : int]
+    #fx{Unsafe}
+    : bool
+    (or (scscm-form? node "var")
+      (or (scscm-form? node "def") (scscm-form? node "defn"))))
+  (defn scscm-decl-name [node : int]
+    #fx{Unsafe}
+    : cstr
+    (scscm-sym-escape (ast-symbol-name (ast-list-get node 1))))
+  ;; An expression that must be parenthesised as an operand or a receiver:
+  ;; binary operators (no precedence in sclang), if, and assignments. A
+  ;; (do x) of one statement generates as x, so it is judged by x.
+  (defn scscm-operator-expr? [node : int]
+    #fx{Unsafe}
+    : bool
+    (let [h (scscm-head-name node)]
+      (cond (scscm-cstr-eq? h "")                                    false
+            (and (scscm-is-binary-op? h) (>= (ast-list-len node) 3)) true
+            (scscm-cstr-eq? h "do")                                  (let [stmts (scscm-drop-empty (scscm-flatten node
+                                                                                                     1
+                                                                                                     (nil-value))
+                                                                                   (nil-value))]
+                                                                       (and (not (list-nil? stmts))
+                                                                         (list-nil? (tail stmts))
+                                                                         (scscm-operator-expr? (head stmts))))
+            :else                                                    (or (scscm-cstr-eq? h
+                                                                           "if")
+                                                                       (or (scscm-cstr-eq? h
+                                                                             "set!")
+                                                                         (scscm-decl? node))))))
+  ;; ---- statements ----
+  ;; Collect node's children from i, splicing nested (do ...) forms, onto acc
+  ;; (reversed).
+  (defn scscm-flatten [node : int i : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len node))
+      acc
+      (let [child (ast-list-get node i)]
+        (if (scscm-form? child "do")
+          (scscm-flatten node (+ i 1) (scscm-flatten child 1 acc))
+          (scscm-flatten node (+ i 1) (cons child acc))))))
+  ;; The same over a cons list of nodes.
+  (defn scscm-flatten-cons [nodes : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (list-nil? nodes)
+      acc
+      (let [child (head nodes)]
+        (if (scscm-form? child "do")
+          (scscm-flatten-cons (tail nodes) (scscm-flatten child 1 acc))
+          (scscm-flatten-cons (tail nodes) (cons child acc))))))
+  ;; Drop the empty statements the expander leaves for consumed forms.
+  (defn scscm-drop-empty [stmts : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (list-nil? stmts)
+      (scscm-list-rev acc (nil-value))
+      (let [s (head stmts)]
+        (if (and (scscm-kind? s ":list") (= (ast-list-len s) 0))
+          (scscm-drop-empty (tail stmts) acc)
+          (scscm-drop-empty (tail stmts) (cons s acc))))))
+  ;; Length of the leading run of declarations. A second declaration of a name
+  ;; in the run ends it (it becomes an assignment), as sclang rejects a
+  ;; duplicate `var`.
+  (defn scscm-lead-count [stmts : int n : int seen : int]
+    #fx{Unsafe}
+    : int
+    (if (list-nil? stmts)
+      n
+      (let [s (head stmts)]
+        (if (and (scscm-decl? s)
+              (not (scscm-names-has? seen (scscm-decl-name s))))
+          (scscm-lead-count (tail stmts)
+            (+ n 1)
+            (cons (scscm-cstr-as-int (scscm-decl-name s)) seen))
+          n))))
+  ;; Push every declared name in stmts that is not already declared at or
+  ;; above depth k. Returns the cons list (reversed) of the names pushed.
+  (defn scscm-declare [stmts : int k : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (list-nil? stmts)
+      acc
+      (let [s (head stmts)]
+        (if (scscm-decl? s)
+          (let [nm (scscm-decl-name s)]
+            (if (scscm-in-scope-since? nm k)
+              (scscm-declare (tail stmts) k acc)
+              (do
+                (scscm-scope-push nm)
+                (scscm-declare (tail stmts) k (cons (scscm-cstr-as-int nm) acc)))))
+          (scscm-declare (tail stmts) k acc)))))
+  ;; Drop the first n elements of a cons list.
+  (defn scscm-drop [lst : int n : int]
+    #fx{Unsafe}
+    : int
+    (if (or (= n 0) (list-nil? lst)) lst (scscm-drop (tail lst) (- n 1))))
+  ;; The value side of a declaration: the expression, a fn for defn, or "".
+  (defn scscm-decl-value [node : int]
+    #fx{Unsafe}
+    : cstr
+    (if (scscm-form? node "defn")
+      (scscm-gen-fn (ast-list-get node 2) node 3)
+      (if (>= (ast-list-len node) 3) (generate (ast-list-get node 2)) "")))
+  ;; Leading declarations: var x = v (or bare var x).
+  (defn scscm-gen-lead [stmts : int n : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (= n 0)
+      acc
+      (let [s   (head stmts)
+            nm  (scscm-decl-name s)
+            val (scscm-decl-value s)
+            txt (if (scscm-cstr-eq? val "")
+                  (scscm-concat "var " nm)
+                  (scscm-cat3 "var " nm (scscm-concat " = " val)))]
+        (scscm-gen-lead (tail stmts) (- n 1) (cons (scscm-cstr-as-int txt) acc)))))
+  ;; Statements after the leading declarations.
+  (defn scscm-gen-rest [stmts : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (list-nil? stmts)
+      acc
+      (let [s   (head stmts)
+            txt (if (scscm-decl? s)
+                  (let [val (scscm-decl-value s)]
+                    (scscm-cat3 (scscm-decl-name s)
+                      " = "
+                      (if (scscm-cstr-eq? val "") "nil" val)))
+                  (generate s))]
+        (scscm-gen-rest (tail stmts) (cons (scscm-cstr-as-int txt) acc)))))
+  ;; Generate a statement list (in order) to a cons list of statement texts.
+  ;; Declares the body's names in the current scope; the caller marks and
+  ;; pops around it.
+  (defn scscm-gen-stmt-list [stmts0 : int]
+    #fx{Unsafe}
+    : int
+    (let [stmts   (scscm-drop-empty stmts0 (nil-value))
+          k       (scscm-scope-mark)
+          lead-n  (scscm-lead-count stmts 0 (nil-value))
+          lead-nm (scscm-declare stmts k (nil-value))
+          hoisted (scscm-declare-after stmts lead-n k)
+          lead    (scscm-gen-lead stmts lead-n (nil-value))
+          rest    (scscm-gen-rest (scscm-drop stmts lead-n) (nil-value))
+          ;; lead and rest are reversed; lead ++ rest, in order:
+          body    (scscm-list-rev lead (scscm-list-rev rest (nil-value)))]
+      (if (list-nil? hoisted)
+        body
+        (cons (scscm-cstr-as-int (scscm-concat "var "
+                                   (scscm-join (scscm-list-rev hoisted
+                                                 (nil-value))
+                                     ", ")))
+          body))))
+  ;; Names declared after the leading run (already pushed by scscm-declare);
+  ;; collected so they can be hoisted. Names the leading run also declares are
+  ;; not repeated.
+  (defn scscm-declare-after [stmts : int lead-n : int k : int]
+    #fx{Unsafe}
+    : int
+    (scscm-hoist-names (scscm-drop stmts lead-n)
+      (scscm-take stmts lead-n (nil-value))
+      (nil-value)))
+  (defn scscm-take [lst : int n : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (or (= n 0) (list-nil? lst))
+      acc
+      (scscm-take (tail lst) (- n 1) (cons (head lst) acc))))
+  ;; True when some decl in stmts declares name.
+  (defn scscm-declares? [stmts : int name : cstr]
+    #fx{Unsafe}
+    : bool
+    (if (list-nil? stmts)
+      false
+      (if (and (scscm-decl? (head stmts))
+            (scscm-cstr-eq? (scscm-decl-name (head stmts)) name))
+        true
+        (scscm-declares? (tail stmts) name))))
+  (defn scscm-names-has? [names : int name : cstr]
+    #fx{Unsafe}
+    : bool
+    (if (list-nil? names)
+      false
+      (if (scscm-cstr-eq? (scscm-int-as-cstr (head names)) name)
+        true
+        (scscm-names-has? (tail names) name))))
+  (defn scscm-hoist-names [stmts : int lead : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (list-nil? stmts)
+      acc
+      (let [s (head stmts)]
+        (if (scscm-decl? s)
+          (let [nm (scscm-decl-name s)]
+            (if (or (scscm-declares? lead nm) (scscm-names-has? acc nm))
+              (scscm-hoist-names (tail stmts) lead acc)
+              (scscm-hoist-names (tail stmts)
+                lead
+                (cons (scscm-cstr-as-int nm) acc))))
+          (scscm-hoist-names (tail stmts) lead acc)))))
+  ;; A body: node's children from start, as "s1; s2".
+  (defn scscm-gen-body [node : int start : int]
+    #fx{Unsafe}
+    : cstr
+    (scscm-join (scscm-gen-stmt-list (scscm-list-rev (scscm-flatten node
+                                                       start
+                                                       (nil-value))
+                                       (nil-value)))
+      "; "))
+  ;; True when a flattened statement list declares anything.
+  (defn scscm-any-decl? [stmts : int]
+    #fx{Unsafe}
+    : bool
+    (if (list-nil? stmts)
+      false
+      (if (scscm-decl? (head stmts)) true (scscm-any-decl? (tail stmts)))))
+  ;; ---- expressions ----
+  ;; An operand or receiver: parenthesised when it is an operator expression.
+  (defn scscm-gen-operand [node : int]
+    #fx{Unsafe}
+    : cstr
+    (if (scscm-operator-expr? node)
+      (scscm-cat3 "(" (generate node) ")")
+      (generate node)))
+  ;; (op a b c ...) -> a op b op c, left to right.
+  (defn scscm-gen-binop-loop [node : int op : cstr i : int acc : cstr]
+    #fx{Unsafe}
+    : cstr
+    (if (>= i (ast-list-len node))
+      acc
+      (scscm-gen-binop-loop node
+        op
+        (+ i 1)
+        (scscm-cat3 acc
+          (scscm-cat3 " " op " ")
+          (scscm-gen-operand (ast-list-get node i))))))
+  (defn scscm-gen-binop [node : int name : cstr]
+    #fx{Unsafe}
+    : cstr
+    (let [n (ast-list-len node)]
+      (cond (= n 1) "nil"
+            (= n 2) (let [x (scscm-gen-operand (ast-list-get node 1))]
+                      (cond (scscm-cstr-eq? name "-") (scscm-concat x ".neg")
+                            (scscm-cstr-eq? name "/") (scscm-concat x
+                                                        ".reciprocal")
+                            :else                     x))
+            :else   (scscm-gen-binop-loop node
+                      (scscm-sclang-op name)
+                      2
+                      (scscm-gen-operand (ast-list-get node 1))))))
+  ;; "k: v, ..." from a dict node.
+  (defn scscm-dict-kw [node : int i : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (>= (+ i 1) (ast-list-len node))
+      acc
+      (scscm-dict-kw node
+        (+ i 2)
+        (cons (scscm-cstr-as-int (scscm-cat3 (scscm-dict-key (ast-list-get node
+                                                               i))
+                                   ": "
+                                   (generate (ast-list-get node (+ i 1)))))
+          acc))))
+  ;; "\k, v, ..." from a dict node.
+  (defn scscm-dict-pairs [node : int i : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (>= (+ i 1) (ast-list-len node))
+      acc
+      (scscm-dict-pairs node
+        (+ i 2)
+        (cons (scscm-cstr-as-int (generate (ast-list-get node (+ i 1))))
+          (cons (scscm-cstr-as-int (scscm-concat "\\"
+                                     (scscm-dict-key (ast-list-get node i))))
+            acc)))))
+  (defn scscm-dict-key [key : int]
+    #fx{Unsafe}
+    : cstr
+    (cond (scscm-kind? key ":keyword") (scscm-sym-escape (scscm-kw-name (scscm-ast-value key)))
+          (scscm-kind? key ":symbol")  (scscm-sym-escape (ast-symbol-name key))
+          :else                        (generate key)))
+  (defn scscm-gen-dict [node : int]
+    #fx{Unsafe}
+    : cstr
+    (scscm-cat3 "("
+      (scscm-join (scscm-list-rev (scscm-dict-kw node 1 (nil-value))
+                    (nil-value))
+        ", ")
+      ")"))
+  ;; Call arguments from index start. A trailing (dict ...) becomes keyword
+  ;; arguments, or a [\k, v] control array when pairs? is set.
+  (defn scscm-gen-args-loop [node : int i : int pairs? : bool acc : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len node))
+      acc
+      (let [a    (ast-list-get node i)
+            last (= i (- (ast-list-len node) 1))]
+        (if (and last (scscm-form? a "dict"))
+          (if pairs?
+            (cons (scscm-cstr-as-int (scscm-cat3 "["
+                                       (scscm-join (scscm-list-rev (scscm-dict-pairs a
+                                                                     1
+                                                                     (nil-value))
+                                                     (nil-value))
+                                         ", ")
+                                       "]"))
+              acc)
+            (if (< (ast-list-len a) 3)
+              acc
+              (cons (scscm-cstr-as-int (scscm-join (scscm-list-rev (scscm-dict-kw a
+                                                                     1
+                                                                     (nil-value))
+                                                     (nil-value))
+                                         ", "))
+                acc)))
+          (scscm-gen-args-loop node
+            (+ i 1)
+            pairs?
+            (cons (scscm-cstr-as-int (generate a)) acc))))))
+  (defn scscm-gen-args [node : int start : int pairs? : bool]
+    #fx{Unsafe}
+    : cstr
+    (scscm-join (scscm-list-rev (scscm-gen-args-loop node
+                                  start
+                                  pairs?
+                                  (nil-value))
+                  (nil-value))
+      ", "))
+  ;; Callees whose trailing dict is a list of synth controls.
+  (defn scscm-controls-callee? [name : cstr]
+    #fx{Unsafe}
+    : bool
+    ```c
+    const char *n = (const char*)(intptr_t)name;
   static const char *names[] = {
     "Synth","Synth.new","Synth.after","Synth.before","Synth.head",
     "Synth.tail","Synth.replace","Synth.grain",NULL
@@ -535,71 +619,90 @@
   for (int i = 0; names[i]; i++) if (strcmp(n, names[i]) == 0) return true;
   return false;
   ```)
-
-;; Synth class selectors whose trailing dict is a list of synth controls.
-(defn scscm-controls-method? [name : cstr] #fx{Unsafe} : bool
-  (or (scscm-cstr-eq? name "grain")
+  ;; Synth class selectors whose trailing dict is a list of synth controls.
+  (defn scscm-controls-method? [name : cstr]
+    #fx{Unsafe}
+    : bool
+    (or (scscm-cstr-eq? name "grain")
       (or (scscm-cstr-eq? name "new")
-          (or (scscm-cstr-eq? name "after")
-              (or (scscm-cstr-eq? name "before")
-                  (or (scscm-cstr-eq? name "head")
-                      (or (scscm-cstr-eq? name "tail")
-                          (scscm-cstr-eq? name "replace"))))))))
-
-;; recv.msg or recv.msg(args)
-(defn scscm-gen-send [recv : cstr node : int msg-i : int pairs? : bool] #fx{Unsafe} : cstr
-  (let [msg (scscm-sym-escape (ast-symbol-name (ast-list-get node msg-i)))]
-    (if (<= (ast-list-len node) (+ msg-i 1))
-      (scscm-cat3 recv "." msg)
-      (scscm-cat3 recv "."
-        (scscm-cat3 msg "(" (scscm-concat (scscm-gen-args node (+ msg-i 1) pairs?) ")"))))))
-
-;; (. obj msg args...). A trailing dict is controls for node.set(...) and for
-;; Synth's constructors.
-(defn scscm-gen-dot [node : int] #fx{Unsafe} : cstr
-  (let [recv (scscm-gen-operand (ast-list-get node 1))]
-    (if (<= (ast-list-len node) 2)
-      recv
-      (let [sel (ast-symbol-name (ast-list-get node 2))]
-        (scscm-gen-send recv node 2
-          (or (scscm-cstr-eq? sel "set")
+        (or (scscm-cstr-eq? name "after")
+          (or (scscm-cstr-eq? name "before")
+            (or (scscm-cstr-eq? name "head")
+              (or (scscm-cstr-eq? name "tail") (scscm-cstr-eq? name "replace"))))))))
+  ;; recv.msg or recv.msg(args)
+  (defn scscm-gen-send [recv : cstr node : int msg-i : int pairs? : bool]
+    #fx{Unsafe}
+    : cstr
+    (let [msg (scscm-sym-escape (ast-symbol-name (ast-list-get node msg-i)))]
+      (if (<= (ast-list-len node) (+ msg-i 1))
+        (scscm-cat3 recv "." msg)
+        (scscm-cat3 recv
+          "."
+          (scscm-cat3 msg
+            "("
+            (scscm-concat (scscm-gen-args node (+ msg-i 1) pairs?) ")"))))))
+  ;; (. obj msg args...). A trailing dict is controls for node.set(...) and for
+  ;; Synth's constructors.
+  (defn scscm-gen-dot [node : int]
+    #fx{Unsafe}
+    : cstr
+    (let [recv (scscm-gen-operand (ast-list-get node 1))]
+      (if (<= (ast-list-len node) 2)
+        recv
+        (let [sel (ast-symbol-name (ast-list-get node 2))]
+          (scscm-gen-send recv
+            node
+            2
+            (or (scscm-cstr-eq? sel "set")
               (and (scscm-cstr-eq? recv "Synth") (scscm-controls-method? sel))))))))
-
-;; (.dot Cls msg args...)
-(defn scscm-gen-dotdot [node : int] #fx{Unsafe} : cstr
-  (let [cls (generate (ast-list-get node 1))]
-    (if (<= (ast-list-len node) 2)
-      cls
-      (scscm-gen-send cls node 2
-        (and (scscm-cstr-eq? cls "Synth")
-             (scscm-controls-method? (ast-symbol-name (ast-list-get node 2))))))))
-
-;; Parameter list text from a fn parameter node (list or vector), pushing
-;; each name into scope.
-(defn scscm-gen-params [params : int i : int acc : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len params))
-    acc
-    (let [p (ast-list-get params i)]
-      (if (scscm-kind? p ":symbol")
-        (if (scscm-cstr-eq? (ast-symbol-name p) ".")
-          (if (< (+ i 1) (ast-list-len params))
-            (let [rest (scscm-sym-escape (ast-symbol-name (ast-list-get params (+ i 1))))]
-              (scscm-scope-push rest)
-              (cons (scscm-cstr-as-int (scscm-concat "..." rest)) acc))
-            acc)
-          (let [nm   (scscm-sym-escape (ast-symbol-name p))
-                next (if (< (+ i 1) (ast-list-len params)) (ast-list-get params (+ i 1)) 0)]
-            (scscm-scope-push nm)
-            (if (and (not (= next 0)) (not (scscm-kind? next ":symbol")))
-              (scscm-gen-params params (+ i 2)
-                (cons (scscm-cstr-as-int (scscm-cat3 nm "=" (generate next))) acc))
-              (scscm-gen-params params (+ i 1) (cons (scscm-cstr-as-int nm) acc)))))
-        (scscm-gen-params params (+ i 1) acc)))))
-
-;; Join parameter texts; a rest parameter follows without a comma.
-(defn scscm-join-params [ps : int] #fx{Unsafe} : cstr
-  ```c
-  typedef struct { int64_t value; int64_t next; } Cell;
+  ;; (.dot Cls msg args...)
+  (defn scscm-gen-dotdot [node : int]
+    #fx{Unsafe}
+    : cstr
+    (let [cls (generate (ast-list-get node 1))]
+      (if (<= (ast-list-len node) 2)
+        cls
+        (scscm-gen-send cls
+          node
+          2
+          (and (scscm-cstr-eq? cls "Synth")
+            (scscm-controls-method? (ast-symbol-name (ast-list-get node 2))))))))
+  ;; Parameter list text from a fn parameter node (list or vector), pushing
+  ;; each name into scope.
+  (defn scscm-gen-params [params : int i : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len params))
+      acc
+      (let [p (ast-list-get params i)]
+        (if (scscm-kind? p ":symbol")
+          (if (scscm-cstr-eq? (ast-symbol-name p) ".")
+            (if (< (+ i 1) (ast-list-len params))
+              (let [rest (scscm-sym-escape (ast-symbol-name (ast-list-get params
+                                                              (+ i 1))))]
+                (scscm-scope-push rest)
+                (cons (scscm-cstr-as-int (scscm-concat "..." rest)) acc))
+              acc)
+            (let [nm   (scscm-sym-escape (ast-symbol-name p))
+                  next (if (< (+ i 1) (ast-list-len params))
+                         (ast-list-get params (+ i 1))
+                         0)]
+              (scscm-scope-push nm)
+              (if (and (not (= next 0)) (not (scscm-kind? next ":symbol")))
+                (scscm-gen-params params
+                  (+ i 2)
+                  (cons (scscm-cstr-as-int (scscm-cat3 nm "=" (generate next)))
+                    acc))
+                (scscm-gen-params params
+                  (+ i 1)
+                  (cons (scscm-cstr-as-int nm) acc)))))
+          (scscm-gen-params params (+ i 1) acc)))))
+  ;; Join parameter texts; a rest parameter follows without a comma.
+  (defn scscm-join-params [ps : int]
+    #fx{Unsafe}
+    : cstr
+    ```c
+    typedef struct { int64_t value; int64_t next; } Cell;
   size_t total = 1;
   for (Cell *c = (Cell*)(intptr_t)ps; c; c = (Cell*)(intptr_t)c->next)
     total += strlen((const char*)(intptr_t)c->value) + 2;
@@ -616,225 +719,296 @@
   out[pos] = '\0';
   return out;
   ```)
-
-;; { |params| body } from a parameter node and node's children from start.
-(defn scscm-gen-fn [params : int node : int start : int] #fx{Unsafe} : cstr
-  (let [k     (scscm-scope-mark)
-        ps    (if (or (scscm-kind? params ":list") (scscm-kind? params ":vector"))
-                (scscm-gen-params params 0 (nil-value))
-                (nil-value))
-        body  (scscm-gen-body node start)
-        txt   (if (list-nil? ps)
-                (if (scscm-cstr-eq? body "") "{ }" (scscm-cat3 "{ " body " }"))
-                (scscm-cat3 "{ |" (scscm-join-params (scscm-list-rev ps (nil-value)))
-                            (scscm-cat3 "| " body " }")))]
-    (scscm-scope-pop k)
-    txt))
-
-;; A branch of if: a one-statement body inside braces.
-(defn scscm-gen-branch [node : int] #fx{Unsafe} : cstr
-  (let [k   (scscm-scope-mark)
-        txt (scscm-join (scscm-gen-stmt-list (scscm-list-rev (scscm-flatten-cons (cons node (nil-value))
-                                                                                  (nil-value))
-                                                             (nil-value)))
-                        "; ")]
-    (scscm-scope-pop k)
-    (scscm-cat3 "{ " txt " }")))
-
-(defn scscm-gen-if [node : int] #fx{Unsafe} : cstr
-  (scscm-cat3 "if ("
-    (generate (ast-list-get node 1))
-    (scscm-cat3 ") "
-      (scscm-gen-branch (ast-list-get node 2))
-      (scscm-concat " "
-        (if (>= (ast-list-len node) 4)
-          (scscm-gen-branch (ast-list-get node 3))
-          "{ nil }")))))
-
-;; let bindings: pair style ((x 1) (y 2)) or flat style [x 1 y 2].
-(defn scscm-let-pairs? [b : int] #fx{Unsafe} : bool
-  (and (> (ast-list-len b) 0)
-       (or (scscm-kind? (ast-list-get b 0) ":list")
-           (scscm-kind? (ast-list-get b 0) ":vector"))))
-
-(defn scscm-let-collect [b : int i : int pairs : bool names : int vals : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len b))
-    (cons (scscm-list-rev names (nil-value)) (scscm-list-rev vals (nil-value)))
-    (if pairs
-      (let [bp (ast-list-get b i)]
-        (scscm-let-collect b (+ i 1) pairs
-          (cons (scscm-cstr-as-int (scscm-sym-escape (ast-symbol-name (ast-list-get bp 0)))) names)
-          (cons (scscm-cstr-as-int (generate (ast-list-get bp 1))) vals)))
-      (scscm-let-collect b (+ i 2) pairs
-        (cons (scscm-cstr-as-int (scscm-sym-escape (ast-symbol-name (ast-list-get b i)))) names)
-        (cons (scscm-cstr-as-int (generate (ast-list-get b (+ i 1)))) vals)))))
-
-(defn scscm-push-all [names : int] #fx{Unsafe} : int
-  (if (list-nil? names)
-    0
-    (do (scscm-scope-push (scscm-int-as-cstr (head names)))
-        (scscm-push-all (tail names)))))
-
-(defn scscm-gen-let [node : int] #fx{Unsafe} : cstr
-  (let [b     (ast-list-get node 1)
-        nv    (scscm-let-collect b 0 (scscm-let-pairs? b) (nil-value) (nil-value))
-        names (head nv)
-        vals  (tail nv)
-        k     (scscm-scope-mark)
-        _     (scscm-push-all names)
-        body  (scscm-gen-body node 2)
-        _2    (scscm-scope-pop k)]
+  ;; { |params| body } from a parameter node and node's children from start.
+  (defn scscm-gen-fn [params : int node : int start : int]
+    #fx{Unsafe}
+    : cstr
+    (let [k    (scscm-scope-mark)
+          ps   (if (or (scscm-kind? params ":list")
+                     (scscm-kind? params ":vector"))
+                 (scscm-gen-params params 0 (nil-value))
+                 (nil-value))
+          body (scscm-gen-body node start)
+          txt  (if (list-nil? ps)
+                 (if (scscm-cstr-eq? body "") "{ }" (scscm-cat3 "{ " body " }"))
+                 (scscm-cat3 "{ |"
+                   (scscm-join-params (scscm-list-rev ps (nil-value)))
+                   (scscm-cat3 "| " body " }")))]
+      (scscm-scope-pop k)
+      txt))
+  ;; A branch of if: a one-statement body inside braces.
+  (defn scscm-gen-branch [node : int]
+    #fx{Unsafe}
+    : cstr
+    (let [k   (scscm-scope-mark)
+          txt (scscm-join (scscm-gen-stmt-list (scscm-list-rev (scscm-flatten-cons (cons node
+                                                                                     (nil-value))
+                                                                 (nil-value))
+                                                 (nil-value)))
+                "; ")]
+      (scscm-scope-pop k)
+      (scscm-cat3 "{ " txt " }")))
+  (defn scscm-gen-if [node : int]
+    #fx{Unsafe}
+    : cstr
+    (scscm-cat3 "if ("
+      (generate (ast-list-get node 1))
+      (scscm-cat3 ") "
+        (scscm-gen-branch (ast-list-get node 2))
+        (scscm-concat " "
+          (if (>= (ast-list-len node) 4)
+            (scscm-gen-branch (ast-list-get node 3))
+            "{ nil }")))))
+  ;; let bindings: pair style ((x 1) (y 2)) or flat style [x 1 y 2].
+  (defn scscm-let-pairs? [b : int]
+    #fx{Unsafe}
+    : bool
+    (and (> (ast-list-len b) 0)
+      (or (scscm-kind? (ast-list-get b 0) ":list")
+        (scscm-kind? (ast-list-get b 0) ":vector"))))
+  (defn scscm-let-collect [b : int i : int pairs : bool names : int vals : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len b))
+      (cons (scscm-list-rev names (nil-value))
+        (scscm-list-rev vals (nil-value)))
+      (if pairs
+        (let [bp (ast-list-get b i)]
+          (scscm-let-collect b
+            (+ i 1)
+            pairs
+            (cons (scscm-cstr-as-int (scscm-sym-escape (ast-symbol-name (ast-list-get bp
+                                                                          0))))
+              names)
+            (cons (scscm-cstr-as-int (generate (ast-list-get bp 1))) vals)))
+        (scscm-let-collect b
+          (+ i 2)
+          pairs
+          (cons (scscm-cstr-as-int (scscm-sym-escape (ast-symbol-name (ast-list-get b
+                                                                        i))))
+            names)
+          (cons (scscm-cstr-as-int (generate (ast-list-get b (+ i 1)))) vals)))))
+  (defn scscm-push-all [names : int]
+    #fx{Unsafe}
+    : int
     (if (list-nil? names)
-      (scscm-cat3 "{ " body " }.value")
-      (scscm-cat3 "{ |" (scscm-join names ", ")
-        (scscm-cat3 "| " body
-          (scscm-cat3 " }.value(" (scscm-join vals ", ") ")"))))))
-
-;; (do a b) in an expression: (a; b), or a block when it declares.
-(defn scscm-gen-do-expr [node : int] #fx{Unsafe} : cstr
-  (let [stmts (scscm-drop-empty (scscm-list-rev (scscm-flatten node 1 (nil-value)) (nil-value))
-                                (nil-value))]
-    (cond
-      (list-nil? stmts) "nil"
-      (scscm-any-decl? stmts)
-        (let [k   (scscm-scope-mark)
-              txt (scscm-cat3 "{ " (scscm-gen-body node 1) " }.value")]
-          (scscm-scope-pop k)
-          txt)
-      (list-nil? (tail stmts)) (generate (head stmts))
-      :else (scscm-cat3 "(" (scscm-gen-body node 1) ")"))))
-
-;; (set! x v) / (set! (. obj prop) v)
-(defn scscm-gen-set [node : int] #fx{Unsafe} : cstr
-  (let [target (ast-list-get node 1)
-        val    (generate (ast-list-get node 2))]
-    (if (scscm-form? target ".")
-      (scscm-cat3 (scscm-gen-operand (ast-list-get target 1))
-                  (scscm-concat "." (scscm-sym-escape (ast-symbol-name (ast-list-get target 2))))
-                  (scscm-concat " = " val))
-      (scscm-cat3 (generate target) " = " val))))
-
-;; A quoted datum.
-(defn scscm-gen-literal [node : int] #fx{Unsafe} : cstr
-  (cond
-    (scscm-kind? node ":symbol")  (scscm-symbol-literal (ast-symbol-name node))
-    (scscm-kind? node ":keyword") (scscm-symbol-literal (scscm-kw-name (scscm-ast-value node)))
-    (or (scscm-kind? node ":list") (scscm-kind? node ":vector"))
-      (scscm-cat3 "[" (scscm-join (scscm-literal-elems node 0 (nil-value)) ", ") "]")
-    (scscm-kind? node ":quote") (scscm-gen-literal (ast-list-get node 0))
-    :else (generate node)))
-
-(defn scscm-literal-elems [node : int i : int acc : int] #fx{Unsafe} : int
-  (if (>= i (ast-list-len node))
-    (scscm-list-rev acc (nil-value))
-    (scscm-literal-elems node (+ i 1)
-      (cons (scscm-cstr-as-int (scscm-gen-literal (ast-list-get node i))) acc))))
-
-;; 'x -> \x ; '(1 2) -> #[1, 2]
-(defn scscm-gen-quote [inner : int] #fx{Unsafe} : cstr
-  (if (or (scscm-kind? inner ":list") (scscm-kind? inner ":vector"))
-    (scscm-concat "#" (scscm-gen-literal inner))
-    (scscm-gen-literal inner)))
-
-;; A call: f.(args) for a variable in scope, f(args) otherwise.
-(defn scscm-gen-call [node : int name : cstr] #fx{Unsafe} : cstr
-  (let [esc (scscm-sym-escape name)]
-    (if (and (scscm-in-scope? esc) (not (scscm-upper-or-dotted? name)))
-      (scscm-cat3 esc ".(" (scscm-concat (scscm-gen-args node 1 false) ")"))
-      (scscm-cat3 esc "(" (scscm-concat (scscm-gen-args node 1 (scscm-controls-callee? esc)) ")")))))
-
-;; ---- symbol dispatch: a list whose head is a symbol ----
-(defn scscm-gen-list-sym [node : int h : cstr] #fx{Unsafe} : cstr
-  (let [n (ast-list-len node)]
-    (cond
-      (scscm-fn-head? h)
-        (scscm-gen-fn (ast-list-get node 1) node 2)
-      (scscm-cstr-eq? h "defn")
-        (scscm-cat3 (scscm-decl-name node) " = " (scscm-decl-value node))
-      (or (scscm-cstr-eq? h "var") (scscm-cstr-eq? h "def"))
-        (scscm-cat3 (scscm-decl-name node) " = "
-                    (if (>= n 3) (generate (ast-list-get node 2)) "nil"))
-      (scscm-cstr-eq? h "set!")  (scscm-gen-set node)
-      (scscm-cstr-eq? h "let")   (scscm-gen-let node)
-      (scscm-cstr-eq? h "if")    (scscm-gen-if node)
-      (scscm-cstr-eq? h "do")    (scscm-gen-do-expr node)
-      (scscm-cstr-eq? h ".")     (scscm-gen-dot node)
-      (scscm-cstr-eq? h ".dot")  (scscm-gen-dotdot node)
-      (or (scscm-cstr-eq? h "list") (scscm-cstr-eq? h "array"))
-        (scscm-cat3 "[" (scscm-gen-args node 1 false) "]")
-      (scscm-cstr-eq? h "dict")  (scscm-gen-dict node)
-      (scscm-cstr-eq? h "quote") (scscm-gen-quote (ast-list-get node 1))
-      (scscm-cstr-eq? h "defmacro") ""
-      (scscm-is-binary-op? h)    (scscm-gen-binop node h)
-      :else                      (scscm-gen-call node h))))
-
-;; ---- list node ----
-(defn scscm-gen-list [node : int] #fx{Unsafe} : cstr
-  (if (= (ast-list-len node) 0)
-    "[]"
-    (let [h (ast-list-get node 0)]
-      (if (scscm-kind? h ":symbol")
-        (scscm-gen-list-sym node (ast-symbol-name h))
-        (scscm-cat3 (scscm-gen-operand h) ".(" (scscm-concat (scscm-gen-args node 1 false) ")"))))))
-
-;;; generate -- emit sclang text for a single AST node.
-;;;
-;;; Parameters:
-;;;   node -- AST node handle (expanded by scscm/expander)
-;;;
-;;; Returns:
-;;;   Heap-allocated :cstr of the sclang expression. Names bound by enclosing
-;;;   forms are those in the current scope; generate-all resets it.
-;;;
-;;; Example:
-;;;   (generate my-ast-node)  ; => "foo_bar(1, 2)"
-;;;
-;;; Since: SC2
-(defn generate [node : int] #fx{Unsafe} : cstr
-  (let [knd (ast-kind node)]
-    (cond
-      (scscm-cstr-eq? knd ":atom")    (scscm-ast-value node)
-      (scscm-cstr-eq? knd ":symbol")  (scscm-sym-escape (ast-symbol-name node))
-      (scscm-cstr-eq? knd ":keyword") (scscm-symbol-literal (scscm-kw-name (scscm-ast-value node)))
-      (scscm-cstr-eq? knd ":number")  (scscm-num-text (ast-number-value node))
-      (scscm-cstr-eq? knd ":string")  (scscm-cat3 "\"" (ast-string-value node) "\"")
-      (scscm-cstr-eq? knd ":list")    (scscm-gen-list node)
-      (or (scscm-cstr-eq? knd ":vector") (scscm-cstr-eq? knd ":hash-paren"))
-        (scscm-cat3 "[" (scscm-gen-args node 0 false) "]")
-      (scscm-cstr-eq? knd ":quote")   (scscm-gen-quote (ast-list-get node 0))
-      (or (scscm-cstr-eq? knd ":quasiquote")
-          (or (scscm-cstr-eq? knd ":unquote")
-              (scscm-cstr-eq? knd ":unquote-splice")))
-        ;; Fully expanded before codegen; emit the inner node as a fallback.
-        (generate (ast-list-get node 0))
-      :else "")))
-
-;; Terminate each top-level statement with ";\n".
-(defn scscm-terminate [stmts : int acc : cstr] #fx{Unsafe} : cstr
-  (if (list-nil? stmts)
-    acc
-    (scscm-terminate (tail stmts)
-      (scscm-cat3 acc (scscm-int-as-cstr (head stmts)) ";\n"))))
-
-;;; generate-all -- emit a sclang program for a top-level cons list of nodes.
-;;;
-;;; Parameters:
-;;;   nodes -- cons list of AST node handles (expanded)
-;;;
-;;; Returns:
-;;;   Heap-allocated :cstr: one statement per line, each ending in ";".
-;;;   Top-level var/defn names are declared up front (see the module header).
-;;;
-;;; Example:
-;;;   (generate-all top-level-nodes)  ; => "var x = 1;\nx.postln;\n"
-;;;
-;;; Since: SC2
-(defn generate-all [nodes : int] #fx{Unsafe} : cstr
-  (do
-    (scscm-scope-reset)
-    (let [stmts (scscm-gen-stmt-list (scscm-list-rev (scscm-flatten-cons nodes (nil-value))
-                                                     (nil-value)))]
+      0
+      (do
+        (scscm-scope-push (scscm-int-as-cstr (head names)))
+        (scscm-push-all (tail names)))))
+  (defn scscm-gen-let [node : int]
+    #fx{Unsafe}
+    : cstr
+    (let [b     (ast-list-get node 1)
+          nv    (scscm-let-collect b
+                  0
+                  (scscm-let-pairs? b)
+                  (nil-value)
+                  (nil-value))
+          names (head nv)
+          vals  (tail nv)
+          k     (scscm-scope-mark)
+          _     (scscm-push-all names)
+          body  (scscm-gen-body node 2)
+          _2    (scscm-scope-pop k)]
+      (if (list-nil? names)
+        (scscm-cat3 "{ " body " }.value")
+        (scscm-cat3 "{ |"
+          (scscm-join names ", ")
+          (scscm-cat3 "| "
+            body
+            (scscm-cat3 " }.value(" (scscm-join vals ", ") ")"))))))
+  ;; (do a b) in an expression: (a; b), or a block when it declares.
+  (defn scscm-gen-do-expr [node : int]
+    #fx{Unsafe}
+    : cstr
+    (let [stmts (scscm-drop-empty (scscm-list-rev (scscm-flatten node
+                                                    1
+                                                    (nil-value))
+                                    (nil-value))
+                  (nil-value))]
+      (cond (list-nil? stmts)        "nil"
+            (scscm-any-decl? stmts)  (let [k   (scscm-scope-mark)
+                                           txt (scscm-cat3 "{ "
+                                                 (scscm-gen-body node 1)
+                                                 " }.value")]
+                                       (scscm-scope-pop k)
+                                       txt)
+            (list-nil? (tail stmts)) (generate (head stmts))
+            :else                    (scscm-cat3 "("
+                                       (scscm-gen-body node 1)
+                                       ")"))))
+  ;; (set! x v) / (set! (. obj prop) v)
+  (defn scscm-gen-set [node : int]
+    #fx{Unsafe}
+    : cstr
+    (let [target (ast-list-get node 1)
+          val    (generate (ast-list-get node 2))]
+      (if (scscm-form? target ".")
+        (scscm-cat3 (scscm-gen-operand (ast-list-get target 1))
+          (scscm-concat "."
+            (scscm-sym-escape (ast-symbol-name (ast-list-get target 2))))
+          (scscm-concat " = " val))
+        (scscm-cat3 (generate target) " = " val))))
+  ;; A quoted datum.
+  (defn scscm-gen-literal [node : int]
+    #fx{Unsafe}
+    : cstr
+    (cond (scscm-kind? node ":symbol")                                 (scscm-symbol-literal (ast-symbol-name node))
+          (scscm-kind? node ":keyword")                                (scscm-symbol-literal (scscm-kw-name (scscm-ast-value node)))
+          (or (scscm-kind? node ":list") (scscm-kind? node ":vector")) (scscm-cat3 "["
+                                                                         (scscm-join (scscm-literal-elems node
+                                                                                       0
+                                                                                       (nil-value))
+                                                                           ", ")
+                                                                         "]")
+          (scscm-kind? node ":quote")                                  (scscm-gen-literal (ast-list-get node
+                                                                                            0))
+          :else                                                        (generate node)))
+  (defn scscm-literal-elems [node : int i : int acc : int]
+    #fx{Unsafe}
+    : int
+    (if (>= i (ast-list-len node))
+      (scscm-list-rev acc (nil-value))
+      (scscm-literal-elems node
+        (+ i 1)
+        (cons (scscm-cstr-as-int (scscm-gen-literal (ast-list-get node i))) acc))))
+  ;; 'x -> \x ; '(1 2) -> #[1, 2]
+  (defn scscm-gen-quote [inner : int]
+    #fx{Unsafe}
+    : cstr
+    (if (or (scscm-kind? inner ":list") (scscm-kind? inner ":vector"))
+      (scscm-concat "#" (scscm-gen-literal inner))
+      (scscm-gen-literal inner)))
+  ;; A call: f.(args) for a variable in scope, f(args) otherwise.
+  (defn scscm-gen-call [node : int name : cstr]
+    #fx{Unsafe}
+    : cstr
+    (let [esc (scscm-sym-escape name)]
+      (if (and (scscm-in-scope? esc) (not (scscm-upper-or-dotted? name)))
+        (scscm-cat3 esc ".(" (scscm-concat (scscm-gen-args node 1 false) ")"))
+        (scscm-cat3 esc
+          "("
+          (scscm-concat (scscm-gen-args node 1 (scscm-controls-callee? esc))
+            ")")))))
+  ;; ---- symbol dispatch: a list whose head is a symbol ----
+  (defn scscm-gen-list-sym [node : int h : cstr]
+    #fx{Unsafe}
+    : cstr
+    (let [n (ast-list-len node)]
+      (cond (scscm-fn-head? h)                                        (scscm-gen-fn (ast-list-get node
+                                                                                      1)
+                                                                        node
+                                                                        2)
+            (scscm-cstr-eq? h "defn")                                 (scscm-cat3 (scscm-decl-name node)
+                                                                        " = "
+                                                                        (scscm-decl-value node))
+            (or (scscm-cstr-eq? h "var") (scscm-cstr-eq? h "def"))    (scscm-cat3 (scscm-decl-name node)
+                                                                        " = "
+                                                                        (if (>= n
+                                                                              3)
+                                                                          (generate (ast-list-get node
+                                                                                      2))
+                                                                          "nil"))
+            (scscm-cstr-eq? h "set!")                                 (scscm-gen-set node)
+            (scscm-cstr-eq? h "let")                                  (scscm-gen-let node)
+            (scscm-cstr-eq? h "if")                                   (scscm-gen-if node)
+            (scscm-cstr-eq? h "do")                                   (scscm-gen-do-expr node)
+            (scscm-cstr-eq? h ".")                                    (scscm-gen-dot node)
+            (scscm-cstr-eq? h ".dot")                                 (scscm-gen-dotdot node)
+            (or (scscm-cstr-eq? h "list") (scscm-cstr-eq? h "array")) (scscm-cat3 "["
+                                                                        (scscm-gen-args node
+                                                                          1
+                                                                          false)
+                                                                        "]")
+            (scscm-cstr-eq? h "dict")                                 (scscm-gen-dict node)
+            (scscm-cstr-eq? h "quote")                                (scscm-gen-quote (ast-list-get node
+                                                                                         1))
+            (scscm-cstr-eq? h "defmacro")                             ""
+            (scscm-is-binary-op? h)                                   (scscm-gen-binop node
+                                                                        h)
+            :else                                                     (scscm-gen-call node
+                                                                        h))))
+  ;; ---- list node ----
+  (defn scscm-gen-list [node : int]
+    #fx{Unsafe}
+    : cstr
+    (if (= (ast-list-len node) 0)
+      "[]"
+      (let [h (ast-list-get node 0)]
+        (if (scscm-kind? h ":symbol")
+          (scscm-gen-list-sym node (ast-symbol-name h))
+          (scscm-cat3 (scscm-gen-operand h)
+            ".("
+            (scscm-concat (scscm-gen-args node 1 false) ")"))))))
+  ;;; generate -- emit sclang text for a single AST node.
+  ;;;
+  ;;; Parameters:
+  ;;;   node -- AST node handle (expanded by scscm/expander)
+  ;;;
+  ;;; Returns:
+  ;;;   Heap-allocated :cstr of the sclang expression. Names bound by enclosing
+  ;;;   forms are those in the current scope; generate-all resets it.
+  ;;;
+  ;;; Example:
+  ;;;   (generate my-ast-node)  ; => "foo_bar(1, 2)"
+  ;;;
+  ;;; Since: SC2
+  (defn generate [node : int]
+    #fx{Unsafe}
+    : cstr
+    (let [knd (ast-kind node)]
+      (cond (scscm-cstr-eq? knd ":atom")                                                                                        (scscm-ast-value node)
+            (scscm-cstr-eq? knd ":symbol")                                                                                      (scscm-sym-escape (ast-symbol-name node))
+            (scscm-cstr-eq? knd ":keyword")                                                                                     (scscm-symbol-literal (scscm-kw-name (scscm-ast-value node)))
+            (scscm-cstr-eq? knd ":number")                                                                                      (scscm-num-text (ast-number-value node))
+            (scscm-cstr-eq? knd ":string")                                                                                      (scscm-cat3 "\""
+                                                                                                                                  (ast-string-value node)
+                                                                                                                                  "\"")
+            (scscm-cstr-eq? knd ":list")                                                                                        (scscm-gen-list node)
+            (or (scscm-cstr-eq? knd ":vector")
+              (scscm-cstr-eq? knd ":hash-paren"))                                                                               (scscm-cat3 "["
+                                                                                                                                  (scscm-gen-args node
+                                                                                                                                    0
+                                                                                                                                    false)
+                                                                                                                                  "]")
+            (scscm-cstr-eq? knd ":quote")                                                                                       (scscm-gen-quote (ast-list-get node
+                                                                                                                                                   0))
+            (or (scscm-cstr-eq? knd ":quasiquote")
+              (or (scscm-cstr-eq? knd ":unquote")
+                (scscm-cstr-eq? knd ":unquote-splice")))
+            ;; Fully expanded before codegen; emit the inner node as a fallback.
+                                                                                                                                (generate (ast-list-get node
+                                                                                                                                            0))
+            :else                                                                                                               "")))
+  ;; Terminate each top-level statement with ";\n".
+  (defn scscm-terminate [stmts : int acc : cstr]
+    #fx{Unsafe}
+    : cstr
+    (if (list-nil? stmts)
+      acc
+      (scscm-terminate (tail stmts)
+        (scscm-cat3 acc (scscm-int-as-cstr (head stmts)) ";\n"))))
+  ;;; generate-all -- emit a sclang program for a top-level cons list of nodes.
+  ;;;
+  ;;; Parameters:
+  ;;;   nodes -- cons list of AST node handles (expanded)
+  ;;;
+  ;;; Returns:
+  ;;;   Heap-allocated :cstr: one statement per line, each ending in ";".
+  ;;;   Top-level var/defn names are declared up front (see the module header).
+  ;;;
+  ;;; Example:
+  ;;;   (generate-all top-level-nodes)  ; => "var x = 1;\nx.postln;\n"
+  ;;;
+  ;;; Since: SC2
+  (defn generate-all [nodes : int]
+    #fx{Unsafe}
+    : cstr
+    (do
       (scscm-scope-reset)
-      (scscm-terminate stmts ""))))
-
-) ;; end defmodule scscm/codegen
+      (let [stmts (scscm-gen-stmt-list (scscm-list-rev (scscm-flatten-cons nodes
+                                                         (nil-value))
+                                         (nil-value)))]
+        (scscm-scope-reset)
+        (scscm-terminate stmts ""))))) ;; end defmodule scscm/codegen

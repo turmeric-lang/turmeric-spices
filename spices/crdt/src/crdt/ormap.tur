@@ -21,741 +21,775 @@
 ;; over the same value type can merge differently where that is wanted.
 ;;
 ;; No inline C (crdt-spice-plan 2.5).
-
 (load "stdlib/typeclass-lattice.tur")
 
 (defmodule crdt/ormap
-  (import crdt/causal :refer [DotContext dotctx-new dotctx-witness dotctx-seen?
-                              dotctx-next dotctx-count mk-dot
-                              DotSet dotset-new dotset-add dotset-count
-                              dotset-union])
+  (import crdt/causal
+    :refer
+    [DotContext
+     dotctx-new
+     dotctx-witness
+     dotctx-seen?
+     dotctx-next
+     dotctx-count
+     mk-dot
+     DotSet
+     dotset-new
+     dotset-add
+     dotset-count
+     dotset-union])
   ;; Imported for the ambient DeltaCRDT methods (C4); a defclass is not an
   ;; exportable name, so the import anchor is `join-all`.
   (import crdt/lattice :refer [join-all])
   (import crdt/replica :refer [ReplicaId replica replica-sym])
-  (export ORMap ormap-new ormap-put ormap-get ormap-has? ormap-remove
-          ormap-count ormap-merge-with ormap-join ormap-keys-agree?
-          OrmapDelta ormap-delta-new ormap-delta-put ormap-delta-remove
-          ormap-delta-count ormap-delta-retracts ormap-apply)
-
-;;; ORMap -- an observed-remove map from Sym keys to CRDT values.
-;;;
-;;; Since: crdt-spice-plan C3
-;;
-;; `entries` maps a key to its value carrier.  `dots` and `dotr` together record
-;; the DOT that last wrote each key -- its counter and its replica.  Both halves
-;; are needed: a DotContext is keyed by REPLICA, so testing "has the other side
-;; seen this write" means looking up `ctx[replica] >= counter`.  Storing only the
-;; counter and indexing the context by KEY silently never matches, which makes
-;; every remove fail to propagate (caught by test_ormap's remove test).
-;; `ctx` is the causal history.  Splitting the
-;; dots out of the entries keeps the value carrier opaque to this module --
-;; nothing here interprets it except by calling the caller's merge.
-;; `:heap` -- like stdlib's Map/Vec/Set.  A parametric struct that is NOT heap
-;; becomes a distinct by-value C aggregate per instantiation
-;; (`tur_adt_ORMap__Sum`), and the by-value monomorphization path types the
-;; function's result temp at the int64 carrier while the constructor returns the
-;; aggregate, so the emitted C does not compile.  A :heap struct carries as a
-;; pointer regardless of its element type, which is also what every parametric
-;; container in the stdlib does.
-(defstruct ^heap ORMap [V] [entries : int dots : int dotr : int ctx : DotContext])
-
-;;; ormap-new -- an empty map.
-;;;
-;;; Returns:
-;;;   A map with no keys and an empty causal context.
-;;;
-;;; Example:
-;;;   (ormap-new)
-;;;
-;;; Since: crdt-spice-plan C3
-(defn ormap-new [V] [] : (ORMap V)
-  (ORMap (:: (map-new) int) (:: (map-new) int) (:: (map-new) int) (dotctx-new)))
-
-;;; ormap-put -- write a key, observing it in the causal context.
-;;;
-;;; Parameters:
-;;;   m -- the map
-;;;   r -- the replica doing the write
-;;;   k -- the key
-;;;   v -- the value carrier
-;;;
-;;; Returns:
-;;;   A map with k bound to v and a fresh dot recorded.
-;;;
-;;; Example:
-;;;   (ormap-put (ormap-new) (replica (quote alice)) (quote score) 5)
-;;;
-;;; Since: crdt-spice-plan C3
-(defn ormap-put [V] [^borrow m : (ORMap V) r : ReplicaId k : Sym v : V] : (ORMap V)
-  (let [d   (dotctx-next (.ctx m) r)
-        ctx (dotctx-witness (.ctx m) d)]
-    (ORMap (:: (map-assoc (:: (.entries m) (Map Sym int)) k (:: v int)) int)
-           (:: (map-assoc (:: (.dots m) (Map Sym int)) k (dot-ctr__om d)) int)
-           (:: (map-assoc (:: (.dotr m) (Map Sym int)) k (:: (replica-sym r) int)) int)
-           ctx)))
-
-;;; dot-ctr__om -- internal: a dot's counter, without importing Dot's accessors.
-(defn dot-ctr__om [d : Dot] : int (.counter d))
-
-;;; ormap-get -- the value carrier bound to a key.
-;;;
-;;; Parameters:
-;;;   m -- the map
-;;;   k -- the key
-;;;
-;;; Returns:
-;;;   The carrier, or 0 when the key is absent.
-;;;
-;;; Example:
-;;;   (ormap-get m (quote score))   ; => 5
-;;;
-;;; Since: crdt-spice-plan C3
-(defn ormap-get [V] [^borrow m : (ORMap V) k : Sym] : V
-  (:: (if (map-has? (:: (.entries m) (Map Sym int)) k)
-        (map-get (:: (.entries m) (Map Sym int)) k)
-        0)
+  (export ORMap
+    ormap-new
+    ormap-put
+    ormap-get
+    ormap-has?
+    ormap-remove
+    ormap-count
+    ormap-merge-with
+    ormap-join
+    ormap-keys-agree?
+    OrmapDelta
+    ormap-delta-new
+    ormap-delta-put
+    ormap-delta-remove
+    ormap-delta-count
+    ormap-delta-retracts
+    ormap-apply)
+  ;;; ORMap -- an observed-remove map from Sym keys to CRDT values.
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  ;;
+  ;; `entries` maps a key to its value carrier.  `dots` and `dotr` together record
+  ;; the DOT that last wrote each key -- its counter and its replica.  Both halves
+  ;; are needed: a DotContext is keyed by REPLICA, so testing "has the other side
+  ;; seen this write" means looking up `ctx[replica] >= counter`.  Storing only the
+  ;; counter and indexing the context by KEY silently never matches, which makes
+  ;; every remove fail to propagate (caught by test_ormap's remove test).
+  ;; `ctx` is the causal history.  Splitting the
+  ;; dots out of the entries keeps the value carrier opaque to this module --
+  ;; nothing here interprets it except by calling the caller's merge.
+  ;; `:heap` -- like stdlib's Map/Vec/Set.  A parametric struct that is NOT heap
+  ;; becomes a distinct by-value C aggregate per instantiation
+  ;; (`tur_adt_ORMap__Sum`), and the by-value monomorphization path types the
+  ;; function's result temp at the int64 carrier while the constructor returns the
+  ;; aggregate, so the emitted C does not compile.  A :heap struct carries as a
+  ;; pointer regardless of its element type, which is also what every parametric
+  ;; container in the stdlib does.
+  (defstruct ^heap ORMap
+    [V]
+    [entries : int dots : int dotr : int ctx : DotContext])
+  ;;; ormap-new -- an empty map.
+  ;;;
+  ;;; Returns:
+  ;;;   A map with no keys and an empty causal context.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-new)
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn ormap-new [V] [] : (ORMap V)
+    (ORMap (:: (map-new) int)
+      (:: (map-new) int)
+      (:: (map-new) int)
+      (dotctx-new)))
+  ;;; ormap-put -- write a key, observing it in the causal context.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the map
+  ;;;   r -- the replica doing the write
+  ;;;   k -- the key
+  ;;;   v -- the value carrier
+  ;;;
+  ;;; Returns:
+  ;;;   A map with k bound to v and a fresh dot recorded.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-put (ormap-new) (replica (quote alice)) (quote score) 5)
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn ormap-put [V] [^borrow m : (ORMap V) r : ReplicaId k : Sym v : V] : (ORMap V)
+    (let [d   (dotctx-next (.ctx m) r)
+          ctx (dotctx-witness (.ctx m) d)]
+      (ORMap (:: (map-assoc (:: (.entries m) (Map Sym int)) k (:: v int)) int)
+        (:: (map-assoc (:: (.dots m) (Map Sym int)) k (dot-ctr__om d)) int)
+        (:: (map-assoc (:: (.dotr m) (Map Sym int)) k (:: (replica-sym r) int))
+          int)
+        ctx)))
+  ;;; dot-ctr__om -- internal: a dot's counter, without importing Dot's accessors.
+  (defn dot-ctr__om [d : Dot] : int (.counter d))
+  ;;; ormap-get -- the value carrier bound to a key.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the map
+  ;;;   k -- the key
+  ;;;
+  ;;; Returns:
+  ;;;   The carrier, or 0 when the key is absent.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-get m (quote score))   ; => 5
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn ormap-get [V] [^borrow m : (ORMap V) k : Sym] : V
+    (:: (if (map-has? (:: (.entries m) (Map Sym int)) k)
+          (map-get (:: (.entries m) (Map Sym int)) k)
+          0)
       V))
-
-;;; ormap-has? -- is a key bound?
-;;;
-;;; Parameters:
-;;;   m -- the map
-;;;   k -- the key
-;;;
-;;; Returns:
-;;;   true when k is present.
-;;;
-;;; Example:
-;;;   (ormap-has? m (quote score))   ; => true
-;;;
-;;; Since: crdt-spice-plan C3
-(defn ormap-has? [V] [^borrow m : (ORMap V) k : Sym] : bool
-  (map-has? (:: (.entries m) (Map Sym int)) k))
-
-;;; ormap-remove -- drop a key that this replica has observed.
-;;;
-;;; Parameters:
-;;;   m -- the map
-;;;   k -- the key
-;;;
-;;; Returns:
-;;;   A map without k.  The causal context is KEPT, which is what makes the
-;;;   removal propagate instead of being undone by the next merge.
-;;;
-;;; Example:
-;;;   (ormap-remove m (quote score))
-;;;
-;;; Since: crdt-spice-plan C3
-(defn ormap-remove [V] [^borrow m : (ORMap V) k : Sym] : (ORMap V)
-  (ORMap (:: (map-dissoc (:: (.entries m) (Map Sym int)) k) int)
-         (:: (map-dissoc (:: (.dots m) (Map Sym int)) k) int)
-         (:: (map-dissoc (:: (.dotr m) (Map Sym int)) k) int)
-         (.ctx m)))
-
-;;; ormap-count -- how many keys are bound.
-;;;
-;;; Parameters:
-;;;   m -- the map
-;;;
-;;; Returns:
-;;;   The number of live keys.
-;;;
-;;; Example:
-;;;   (ormap-count m)   ; => 2
-;;;
-;;; Since: crdt-spice-plan C3
-(defn ormap-count [V] [^borrow m : (ORMap V)] : int
-  (map-count (:: (.entries m) (Map Sym int))))
-
-;;; ormap-keys-agree? -- do two maps bind exactly the same keys?
-;;;
-;;; Parameters:
-;;;   a -- first map
-;;;   b -- second map
-;;;
-;;; Returns:
-;;;   true when every key of each is present in the other.
-;;;
-;;; Example:
-;;;   (ormap-keys-agree? x y)   ; => true
-;;;
-;;; Since: crdt-spice-plan C3
-(defn ormap-keys-agree? [V] [^borrow a : (ORMap V) ^borrow b : (ORMap V)] : bool
-  (if (= (ormap-count a) (ormap-count b))
-    (__keys-subset? a b)
-    false))
-
-;;; __keys-subset? -- internal: every key of a is present in b.
-(defn __keys-subset? [V] [^borrow a : (ORMap V) ^borrow b : (ORMap V)] : bool
-  (let [it (hamt/iter-alloc (map-hamt (:: (.entries a) (Map Sym int))))
-        r  (__subset-loop b it true)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __subset-loop -- internal.
-(defn __subset-loop [V] [^borrow b : (ORMap V) it : ptr<void> acc : bool] : bool
-  (if (hamt/iter-advance! it)
-    (__subset-loop b it (and acc (ormap-has? b (:: (hamt/iter-cur-key it) Sym))))
-    acc))
-
-;;; ormap-merge-with -- merge two maps, combining shared values with `f`.
-;;;
-;;; Parameters:
-;;;   f -- how to merge two value carriers present on both sides
-;;;   a -- first map
-;;;   b -- second map
-;;;
-;;; Returns:
-;;;   The merged map.
-;;;
-;;; Example:
-;;;   (ormap-merge-with pn-join alice bob)
-;;;
-;;; Since: crdt-spice-plan C3
-;;
-;; `f` is applied ONLY where a key is live on both sides.  A key live on one
-;; side is kept or dropped by the causal test, never by `f` -- so a caller
-;; cannot accidentally resurrect a removed key by writing a lenient merge.
-;;
-;; Add-wins, same rule as crdt/set's ORSet: a key present on one side survives
-;; unless the OTHER side's context has seen its dot, which is what distinguishes
-;; "not yet delivered" (keep) from "deliberately removed" (drop).
-;;
-;; The helpers below thread raw CARRIERS (`entries`, `dots`, and a DotContext)
-;; rather than the ORMap struct, which is how crdt/orset's fold is written too.
-;; Passing the struct into a recursive helper moves it -- `^borrow` on the
-;; outer parameter does not make the onward pass a borrow -- and the second
-;; pass then fails with TUR-E0005 use-after-move.
-(defn ormap-merge-with [V] [f : (fn [int int] int) ^borrow a : (ORMap V) ^borrow b : (ORMap V)] : (ORMap V)
-  (let [ca  (.ctx a)        cb (.ctx b)
-        sa  (.seen ca)      sb (.seen cb)
-        ea  (.entries a)    da (.dots a)
-        eb  (.entries b)    db (.dots b)
-        ;; Pass 1 takes A's live keys, pass 2 adds B's.  `first` tells pass 2
-        ;; to skip a key both sides hold, which pass 1 already placed.
-        ;;
-        ;; That skip is an OPTIMIZATION, not a correctness guard -- measured:
-        ;; forcing it off leaves every test in test_ormap green.  Both passes
-        ;; compute `f` from the two ORIGINAL sides rather than from the
-        ;; accumulator, so re-merging a shared key recomputes the same value
-        ;; instead of compounding it.  Keeping the skip avoids the redundant
-        ;; call; do not add a comment claiming it prevents double-application.
-        ra  (.dotr a)       rb (.dotr b)
-        e1  (__side f ea da ra eb sb (:: (map-new) int) true)
-        e2  (__side f eb db rb ea sa e1 false)
-        ;; Dots are derived from the surviving keys rather than threaded
-        ;; through the fold, which keeps every helper single-valued (an int
-        ;; carrier in, an int carrier out) -- the shape crdt/orset uses.
-        dm  (__dots-for e2 da db)
-        rm  (__reps-for e2 ra rb da db)]
-    (ORMap e2 dm rm (join ca cb))))
-
-;;; __side -- internal: fold one side's live keys into the entry accumulator.
-(defn __side [f : (fn [int int] int) esrc : int dsrc : int rsrc : int
-              eoth : int coth : int acce : int first : bool] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: esrc (Map Sym int))))
-        r  (__side-loop f it dsrc rsrc eoth coth acce first)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __side-loop -- internal.
-(defn __side-loop [f : (fn [int int] int) it : ptr<void> dsrc : int rsrc : int
-                   eoth : int coth : int acc : int first : bool] : int
-  (if (hamt/iter-advance! it)
-    (let [k       (:: (hamt/iter-cur-key it) Sym)
-          mine    (:: (hamt/iter-cur-val it) int)
-          shared  (map-has? (:: eoth (Map Sym int)) k)
-          skip    (and (not first) shared)   ;; see the note in ormap-merge-with
-          ;; Add-wins: a key only this side has survives unless the OTHER
-          ;; side's context has already seen its dot -- which is what
-          ;; distinguishes "not yet delivered" from "deliberately removed".
-          dropped (and (not shared) (__seen? coth k dsrc rsrc))
-          val     (if shared (f mine (map-get (:: eoth (Map Sym int)) k)) mine)]
-      (__side-loop f it dsrc rsrc eoth coth
-                   (if (or skip dropped) acc (__put acc k val))
-                   first))
-    acc))
-
-;;; __vjoin -- internal: combine two value carriers at `V`'s own instance.
-;;
-;; Passed to the ONE fold below as its `f`.  That works because a constrained
-;; generic used as a function value now gets a per-instantiation clone; before
-;; that, this module carried a second copy of the whole fold whose only
-;; difference was this line.
-(defn __vjoin [V] [(JoinSemilattice V)] [x : int y : int] : int
-  (:: (join (:: x V) (:: y V)) int))
-
-;;; __dots-for -- internal: the dot map for the surviving keys.
-(defn __dots-for [ents : int da : int db : int] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: ents (Map Sym int))))
-        r  (__dots-loop it da db (:: (map-new) int))]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __dots-loop -- internal: keep the HIGHER of the two sides' dot counters.
-;;
-;; Higher, not either-one: the dot records how much of this key's history the
-;; merged map has observed, so taking the lower would let an already-delivered
-;; remove be replayed as an add.
-(defn __dots-loop [it : ptr<void> da : int db : int acc : int] : int
-  (if (hamt/iter-advance! it)
-    (let [k (:: (hamt/iter-cur-key it) Sym)
-          x (__dot-of da k)
-          y (__dot-of db k)]
-      (__dots-loop it da db (__put acc k (if (> x y) x y))))
-    acc))
-
-;;; __reps-for -- internal: the replica map for the surviving keys.
-;;
-;; Paired with __dots-for: the dot that survives is the HIGHER counter, so the
-;; replica recorded must be the one that minted THAT dot, not the other side's.
-(defn __reps-for [ents : int ra : int rb : int da : int db : int] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: ents (Map Sym int))))
-        r  (__reps-loop it ra rb da db (:: (map-new) int))]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __reps-loop -- internal.
-(defn __reps-loop [it : ptr<void> ra : int rb : int da : int db : int acc : int] : int
-  (if (hamt/iter-advance! it)
-    (let [k  (:: (hamt/iter-cur-key it) Sym)
-          ca (__dot-of da k)
-          cb (__dot-of db k)
-          ;; Whichever side holds the higher COUNTER is the side whose replica
-          ;; minted the surviving dot -- keep its replica, not merely the one
-          ;; that happens to be present.
-          rep (if (>= ca cb) (__dot-of ra k) (__dot-of rb k))]
-      (__reps-loop it ra rb da db (__put acc k rep)))
-    acc))
-
-;;; __seen? -- internal: has the other side's context observed src's dot for k?
-;;
-;; dotctx-seen?'s test, inlined against the raw `seen` carrier.  A DotContext
-;; is unique, so threading the STRUCT through the fold would move it -- and
-;; each side's context is needed twice here (once per pass, once for the final
-;; join).  crdt/orset threads its contexts as carriers for the same reason.
-(defn __seen? [coth : int k : Sym dsrc : int rsrc : int] : bool
-  (if (and (map-has? (:: dsrc (Map Sym int)) k)
-           (map-has? (:: rsrc (Map Sym int)) k))
-    (let [r (:: (map-get (:: rsrc (Map Sym int)) k) Sym)
-          c (map-get (:: dsrc (Map Sym int)) k)]
-      ;; The context is keyed by REPLICA, not by key.
-      (if (map-has? (:: coth (Map Sym int)) r)
-        (>= (map-get (:: coth (Map Sym int)) r) c)
-        false))
-    false))
-
-;;; __put -- internal: bind k in a carrier-held map, staying a carrier.
-;;
-;; Not inlined into the `if` below: a `map-assoc` result used directly as one
-;; arm makes the two arms a `Map*` and an int64 carrier, and the emitter
-;; assigns one to the other (`-Wint-conversion`).  Forcing the ascription
-;; through a typed helper keeps both arms plain carriers.
-(defn __put [acc : int k : Sym v : int] : int
-  (:: (map-assoc (:: acc (Map Sym int)) k v) int))
-
-;;; __dot-of -- internal: a key's recorded dot counter, or 0.
-(defn __dot-of [d : int k : Sym] : int
-  (if (map-has? (:: d (Map Sym int)) k)
-    (map-get (:: d (Map Sym int)) k)
-    0))
-
-;;; ormap-join -- merge two maps using `V`'s own JoinSemilattice instance.
-;;;
-;;; Parameters:
-;;;   a -- first map
-;;;   b -- second map
-;;;
-;;; Returns:
-;;;   The merged map.
-;;;
-;;; Example:
-;;;   (join alice bob)
-;;;
-;;; Since: crdt-spice-plan C3
-;;
-;; Same merge as ormap-merge-with, with the value combine coming from the
-;; element's instance instead of an argument -- crdt-spice-plan 2.3's design.
-;; An ORMap of PNCounters merges with no code specific to that pairing.
-(defn ormap-join [V] [(JoinSemilattice V)]
-                 [^borrow a : (ORMap V) ^borrow b : (ORMap V)] : (ORMap V)
-  (let [ca  (.ctx a)        cb (.ctx b)
-        sa  (.seen ca)      sb (.seen cb)
-        ea  (.entries a)    da (.dots a)   ra (.dotr a)
-        eb  (.entries b)    db (.dots b)   rb (.dotr b)
-        e1  (__side __vjoin ea da ra eb sb (:: (map-new) int) true)
-        e2  (__side __vjoin eb db rb ea sa e1 false)
-        dm  (__dots-for e2 da db)
-        rm  (__reps-for e2 ra rb da db)]
-    (ORMap e2 dm rm (join ca cb))))
-
-
-;;; OrmapDelta -- a key fragment plus the EXACT dots it retracts.
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; Same shape and same reason as crdt/orset's OrsetDelta: an ORMap carries a
-;; DotContext, which is a compacted version vector, and a delta that shipped
-;; one would claim to have observed every dot below the ones it names -- so
-;; the receiver would read its own untouched keys as deliberately removed and
-;; drop them silently.  A delta asserts an EXACT DotSet instead.
-;;
-;; `V` is PHANTOM here exactly as it is on ORMap: the value rides in `entries`
-;; as an int carrier, and the type parameter exists so `ormap-apply` can reach
-;; the element's own `join`.
-(defstruct ^heap OrmapDelta [V] [entries : int dots : int dotr : int rms : DotSet])
-
-;;; ormap-delta-new -- the empty delta.
-;;;
-;;; Returns:
-;;;   A delta that writes nothing and retracts nothing.
-;;;
-;;; Example:
-;;;   (:: (ormap-delta-new) (OrmapDelta MaxI))
-;;;
-;;; Since: crdt-spice-plan C4
-(defn ormap-delta-new [V] [] : (OrmapDelta V)
-  (OrmapDelta (:: (map-new) int) (:: (map-new) int) (:: (map-new) int)
-              (dotset-new)))
-
-;;; ormap-delta-count -- how many keys the delta writes.
-;;;
-;;; Parameters:
-;;;   d -- the delta
-;;;
-;;; Returns:
-;;;   Its key count.
-;;;
-;;; Example:
-;;;   (ormap-delta-count d)   ; => 1
-;;;
-;;; Since: crdt-spice-plan C4
-(defn ormap-delta-count [V] [^borrow d : (OrmapDelta V)] : int
-  (map-count (:: (.entries d) (Map Sym int))))
-
-;;; ormap-delta-retracts -- how many dots the delta withdraws.
-;;;
-;;; Parameters:
-;;;   d -- the delta
-;;;
-;;; Returns:
-;;;   Its retraction count.
-;;;
-;;; Example:
-;;;   (ormap-delta-retracts d)   ; => 1
-;;;
-;;; Since: crdt-spice-plan C4
-(defn ormap-delta-retracts [V] [^borrow d : (OrmapDelta V)] : int
-  (dotset-count (.rms d)))
-
-;;; ormap-delta-put -- the DELTA of writing a key.
-;;;
-;;; Parameters:
-;;;   m -- the map, read for the replica's next dot
-;;;   r -- the replica doing the write
-;;;   k -- the key
-;;;   v -- the value carrier
-;;;
-;;; Returns:
-;;;   A one-key delta carrying a fresh dot.
-;;;
-;;; Example:
-;;;   (ormap-delta-put m (replica (quote alice)) (quote score) (:: 5 MaxI))
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; The dot is minted from `m`, so the replica must apply the same write to its
-;; own state -- two deltas minted from one map would collide on the counter.
-(defn ormap-delta-put [V] [^borrow m : (ORMap V) r : ReplicaId k : Sym v : V] : (OrmapDelta V)
-  (let [d (dotctx-next (.ctx m) r)]
-    (OrmapDelta (:: (map-assoc (:: (map-new) (Map Sym int)) k (:: v int)) int)
-                (:: (map-assoc (:: (map-new) (Map Sym int)) k (dot-ctr__om d)) int)
-                (:: (map-assoc (:: (map-new) (Map Sym int)) k (:: (replica-sym r) int)) int)
-                (dotset-new))))
-
-;;; ormap-delta-remove -- the DELTA of dropping a key.
-;;;
-;;; Parameters:
-;;;   m -- the map, read for the key's recorded dot
-;;;   k -- the key
-;;;
-;;; Returns:
-;;;   A delta writing nothing and retracting exactly the dot this replica has
-;;;   for k.
-;;;
-;;; Example:
-;;;   (ormap-delta-remove m (quote score))
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; A remove of a key this replica does not hold retracts nothing and applies
-;; as a no-op, which is right: you cannot withdraw a write you never saw.
-;; The DotSet is built INLINE as the constructor's last argument rather than
-;; let-bound.  Inside a generic defn a let-bound `:heap` struct value is
-;; declared at the int64 carrier while the monomorphized constructor takes the
-;; pointer, and cc rejects the call (`-Wint-conversion`).  Note this is the
-;; OPPOSITE of the spelling crdt/orset needs for the same construction in a
-;; non-generic defn, where the inline form is the one that fails -- so copy
-;; whichever shape the neighbouring code already uses rather than assuming.
-(defn ormap-delta-remove [V] [^borrow m : (ORMap V) k : Sym] : (OrmapDelta V)
-  (OrmapDelta (:: (map-new) int) (:: (map-new) int) (:: (map-new) int)
-              (__rms-for-key (.dots m) (.dotr m) k)))
-
-;;; __rms-for-key -- internal: the single dot recorded for k, as an exact set.
-(defn __rms-for-key [dots : int dotr : int k : Sym] : DotSet
-  (if (and (map-has? (:: dots (Map Sym int)) k)
-           (map-has? (:: dotr (Map Sym int)) k))
-    (dotset-add (dotset-new)
-                (mk-dot (replica (:: (map-get (:: dotr (Map Sym int)) k) Sym))
-                        (map-get (:: dots (Map Sym int)) k)))
-    (dotset-new)))
-
-;;; ormap-apply -- fold a delta into a map, merging values at V's instance.
-;;;
-;;; Parameters:
-;;;   m -- the map
-;;;   d -- the delta
-;;;
-;;; Returns:
-;;;   The map with d's writes merged in and d's retractions withdrawn.
-;;;
-;;; Example:
-;;;   (ormap-apply mine (ormap-delta-put theirs (replica (quote bob)) (quote k) v))
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; WRITES FIRST, then retractions, as in crdt/orset -- a buffered group can
-;; carry a newer write and an older retraction, and the retraction names its
-;; dot exactly, so the newer write survives.
-;;
-;; A write whose dot the receiver's context has ALREADY SEEN is skipped when
-;; the key is absent, which is what keeps `apply-delta` idempotent: re-sending
-;; the write of a key the receiver has since removed must not resurrect it.
-;;
-;; Values of a key present on BOTH sides merge at `V`'s own JoinSemilattice
-;; instance, which is the same dispatch `ormap-join` makes and the thing
-;; test_ormap_join pins: a map that ignored its element's instance would
-;; converge on the wrong number.
-(defn ormap-apply [V] [(JoinSemilattice V)]
-                  [m : (ORMap V) ^borrow d : (OrmapDelta V)] : (ORMap V)
-  ;; `rms` is threaded as the raw carrier, not the DotSet struct: a DotSet
-  ;; holds a Map handle and is affine, so passing the struct into the fold
-  ;; would move it.  Same reason the contexts are threaded as carriers above.
-  (let [ctx0 (.ctx m)
-        seen (:: (.seen ctx0) int)
-        rms  (.dots (.rms d))
-        em   (.entries m)   dm (.dots m)   rm (.dotr m)
-        ed   (.entries d)   dd (.dots d)   rd (.dotr d)
-        e1   (__apply-writes em ed dd rd seen)
-        d1   (__apply-dots dm dd)
-        r1   (__apply-dots rm rd)
-        e2   (__drop-retracted e1 d1 r1 rms)
-        d2   (__keep-keys d1 e2)
-        r2   (__keep-keys r1 e2)]
-    ;; The context chain is built INLINE in the constructor call -- see the
-    ;; note on ormap-delta-remove for why a let-bound `:heap` value does not
-    ;; survive monomorphization here.
-    (ORMap e2 d2 r2 (__witness-rms__om (__witness-dots ctx0 dd rd) rms))))
-
-;;; __apply-writes -- internal: fold a delta's writes into the entry map.
-(defn __apply-writes [V] [(JoinSemilattice V)]
-                     [em : int ed : int dd : int rd : int seen : int] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: ed (Map Sym int))))
-        r  (__apply-writes-loop em it dd rd seen)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __apply-writes-loop -- internal.
-(defn __apply-writes-loop [V] [(JoinSemilattice V)]
-                          [acc : int it : ptr<void> dd : int rd : int seen : int] : int
-  (if (hamt/iter-advance! it)
-    (let [k    (:: (hamt/iter-cur-key it) Sym)
-          vnew (:: (hamt/iter-cur-val it) int)
-          held (map-has? (:: acc (Map Sym int)) k)
-          ;; Absent locally AND already witnessed: this write was delivered
-          ;; before and the key has since been removed.  Skip it.
-          stale (and (not held) (__seen? seen k dd rd))
-          merged (if held
-                   (:: (join (:: (map-get (:: acc (Map Sym int)) k) V) (:: vnew V)) int)
-                   vnew)]
-      (__apply-writes-loop (if stale acc (__put acc k merged)) it dd rd seen))
-    acc))
-
-;;; __apply-dots -- internal: overlay a delta's dot (or replica) map.
-;;
-;; The HIGHER counter wins, same rule as __dots-loop: the dot records how much
-;; of a key's history the map has observed, and taking the lower would let an
-;; already-delivered remove be replayed as a write.  The replica map is
-;; overlaid unconditionally alongside it, because a delta only ever carries a
-;; key it just wrote -- the pairing `__reps-for` has to reconstruct for a
-;; state merge is already right here.
-(defn __apply-dots [base : int over : int] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: over (Map Sym int))))
-        r  (__apply-dots-loop base it)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __apply-dots-loop -- internal.
-(defn __apply-dots-loop [acc : int it : ptr<void>] : int
-  (if (hamt/iter-advance! it)
-    (__apply-dots-loop
-      (__put acc (:: (hamt/iter-cur-key it) Sym) (:: (hamt/iter-cur-val it) int)) it)
-    acc))
-
-;;; __drop-retracted -- internal: drop every key whose dot the delta withdraws.
-;;
-;; EXACT match on (replica, counter), never "counter at or below": a lower
-;; counter for the same replica belongs to a different key's write.
-(defn __drop-retracted [ents : int dots : int reps : int rms : int] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: ents (Map Sym int))))
-        r  (__drop-loop (:: (map-new) int) it dots reps rms)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __drop-loop -- internal.
-(defn __drop-loop [acc : int it : ptr<void> dots : int reps : int rms : int] : int
-  (if (hamt/iter-advance! it)
-    (let [k    (:: (hamt/iter-cur-key it) Sym)
-          v    (:: (hamt/iter-cur-val it) int)
-          gone (__rms-has?__om rms (__rep-of reps k) (__dot-of dots k))]
-      (__drop-loop (if gone acc (__put acc k v)) it dots reps rms))
-    acc))
-
-;;; __rep-of -- internal: a key's recorded replica, or the empty name.
-(defn __rep-of [reps : int k : Sym] : Sym
-  (if (map-has? (:: reps (Map Sym int)) k)
-    (:: (map-get (:: reps (Map Sym int)) k) Sym)
-    (quote __none)))
-
-;;; __rms-has?__om -- internal: is this exact dot in a retraction carrier?
-(defn __rms-has?__om [rms : int r : Sym n : int] : bool
-  (if (map-has? (:: rms (Map Sym int)) r)
-    (map-has? (:: (:: (map-get (:: rms (Map Sym int)) r) int) (Map int int)) n)
-    false))
-
-;;; __keep-keys -- internal: restrict a side map to the surviving keys.
-(defn __keep-keys [side : int ents : int] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: ents (Map Sym int))))
-        r  (__keep-loop (:: (map-new) int) it side)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __keep-loop -- internal.
-(defn __keep-loop [acc : int it : ptr<void> side : int] : int
-  (if (hamt/iter-advance! it)
-    (let [k (:: (hamt/iter-cur-key it) Sym)]
-      (__keep-loop
-        (if (map-has? (:: side (Map Sym int)) k)
-          (__put acc k (map-get (:: side (Map Sym int)) k))
-          acc)
-        it side))
-    acc))
-
-;;; __witness-dots -- internal: record a delta's written dots in the context.
-(defn __witness-dots [ctx : DotContext dd : int rd : int] : DotContext
-  (let [it (hamt/iter-alloc (map-hamt (:: dd (Map Sym int))))
-        r  (__witness-dots-loop ctx it rd)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __witness-dots-loop -- internal.
-(defn __witness-dots-loop [acc : DotContext it : ptr<void> rd : int] : DotContext
-  (if (hamt/iter-advance! it)
-    (let [k (:: (hamt/iter-cur-key it) Sym)
-          n (:: (hamt/iter-cur-val it) int)
-          w (dotctx-witness acc (mk-dot (replica (__rep-of rd k)) n))]
-      (__witness-dots-loop w it rd))
-    acc))
-
-;;; __witness-rms__om -- internal: record a delta's retracted dots.
-;;
-;; The context COMPACTS, so this marks every dot below the ones named as seen
-;; too.  Exact under causal delivery; see crdt/causal's dotctx-witness-set.
-(defn __witness-rms__om [ctx : DotContext rms : int] : DotContext
-  (let [it (hamt/iter-alloc (map-hamt (:: rms (Map Sym int))))
-        r  (__witness-rms-loop__om ctx it)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __witness-rms-loop__om -- internal.
-(defn __witness-rms-loop__om [acc : DotContext it : ptr<void>] : DotContext
-  (if (hamt/iter-advance! it)
-    (let [r (:: (hamt/iter-cur-key it) Sym)
-          n (__max-ctr-of__om (:: (hamt/iter-cur-val it) int))
-          w (dotctx-witness acc (mk-dot (replica r) n))]
-      (__witness-rms-loop__om w it))
-    acc))
-
-;;; __max-ctr-of__om -- internal: the highest counter in a counter set.
-(defn __max-ctr-of__om [m : int] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: m (Map int int))))
-        r  (__max-ctr-loop__om it 0)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __max-ctr-loop__om -- internal.
-(defn __max-ctr-loop__om [it : ptr<void> acc : int] : int
-  (if (hamt/iter-advance! it)
-    (__max-ctr-loop__om it (if (> (:: (hamt/iter-cur-key it) int) acc)
-                             (:: (hamt/iter-cur-key it) int) acc))
-    acc))
-
-;;; JoinSemilattice [(OrmapDelta V)] -- write both sides, retract both sides.
-;;
-;; Lets a sender buffer deltas, and a relay holding no map at all combine them
-;; with `join-all`.  Values of a key both deltas write merge at `V`'s
-;; instance, same as the state merge.
-(definstance JoinSemilattice [(OrmapDelta V)]
-  (join [x y] (ormap-delta-merge x y)))
-
-;;; ormap-delta-merge -- internal: the delta join, spelled as a defn.
-;;
-;; A defn rather than an inline instance body so the `(JoinSemilattice V)`
-;; constraint has somewhere to live -- the constrained-instance shape ORMap
-;; itself uses for `ormap-join`.
-(defn ormap-delta-merge [V] [(JoinSemilattice V)]
-                        [^borrow a : (OrmapDelta V) ^borrow b : (OrmapDelta V)]
-                        : (OrmapDelta V)
-  (let [ea (.entries a)  da (.dots a)  ra (.dotr a)
-        eb (.entries b)  db (.dots b)  rb (.dotr b)
-        e1 (__merge-writes ea eb)
-        d1 (__apply-dots da db)
-        r1 (__apply-dots ra rb)]
-    (OrmapDelta e1 d1 r1 (dotset-union (.rms a) (.rms b)))))
-
-;;; __merge-writes -- internal: overlay b's writes onto a's, joining shared keys.
-(defn __merge-writes [V] [(JoinSemilattice V)] [a : int b : int] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: b (Map Sym int))))
-        r  (__merge-writes-loop a it)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __merge-writes-loop -- internal.
-(defn __merge-writes-loop [V] [(JoinSemilattice V)] [acc : int it : ptr<void>] : int
-  (if (hamt/iter-advance! it)
-    (let [k (:: (hamt/iter-cur-key it) Sym)
-          v (:: (hamt/iter-cur-val it) int)
-          m (if (map-has? (:: acc (Map Sym int)) k)
-              (:: (join (:: (map-get (:: acc (Map Sym int)) k) V) (:: v V)) int)
-              v)]
-      (__merge-writes-loop (__put acc k m) it))
-    acc))
-
-;;; DeltaCRDT [(ORMap V)] -- the delta is a key fragment plus exact retractions.
-(definstance DeltaCRDT [(ORMap V)]
-  (type Delta = (OrmapDelta V))
-  (delta-bottom [x] (ormap-delta-new))
-  (delta-join   [x d e] (ormap-delta-merge d e))
-  (apply-delta  [x d] (ormap-apply x d)))
-
-;;; JoinSemilattice [(ORMap V)] -- an ORMap is a lattice exactly when its values are.
-;;
-;; The constrained recursive instance crdt-spice-plan 2.3 asks for: it makes
-;; `join`, `join-all` and the lattice law helpers work on maps of any CRDT
-;; value, and it nests -- an ORMap of ORMaps merges by this same instance one
-;; level down.
-(definstance JoinSemilattice [(ORMap V)]
-  (join [x y] (ormap-join x y)))
-
-) ;; end defmodule crdt/ormap
+  ;;; ormap-has? -- is a key bound?
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the map
+  ;;;   k -- the key
+  ;;;
+  ;;; Returns:
+  ;;;   true when k is present.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-has? m (quote score))   ; => true
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn ormap-has? [V] [^borrow m : (ORMap V) k : Sym] : bool
+    (map-has? (:: (.entries m) (Map Sym int)) k))
+  ;;; ormap-remove -- drop a key that this replica has observed.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the map
+  ;;;   k -- the key
+  ;;;
+  ;;; Returns:
+  ;;;   A map without k.  The causal context is KEPT, which is what makes the
+  ;;;   removal propagate instead of being undone by the next merge.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-remove m (quote score))
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn ormap-remove [V] [^borrow m : (ORMap V) k : Sym] : (ORMap V)
+    (ORMap (:: (map-dissoc (:: (.entries m) (Map Sym int)) k) int)
+      (:: (map-dissoc (:: (.dots m) (Map Sym int)) k) int)
+      (:: (map-dissoc (:: (.dotr m) (Map Sym int)) k) int)
+      (.ctx m)))
+  ;;; ormap-count -- how many keys are bound.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the map
+  ;;;
+  ;;; Returns:
+  ;;;   The number of live keys.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-count m)   ; => 2
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn ormap-count [V] [^borrow m : (ORMap V)] : int
+    (map-count (:: (.entries m) (Map Sym int))))
+  ;;; ormap-keys-agree? -- do two maps bind exactly the same keys?
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- first map
+  ;;;   b -- second map
+  ;;;
+  ;;; Returns:
+  ;;;   true when every key of each is present in the other.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-keys-agree? x y)   ; => true
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn ormap-keys-agree? [V] [^borrow a : (ORMap V) ^borrow b : (ORMap V)] : bool
+    (if (= (ormap-count a) (ormap-count b)) (__keys-subset? a b) false))
+  ;;; __keys-subset? -- internal: every key of a is present in b.
+  (defn __keys-subset? [V] [^borrow a : (ORMap V) ^borrow b : (ORMap V)] : bool
+    (let [it (hamt/iter-alloc (map-hamt (:: (.entries a) (Map Sym int))))
+          r  (__subset-loop b it true)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __subset-loop -- internal.
+  (defn __subset-loop [V] [^borrow b : (ORMap V) it : ptr<void> acc : bool] : bool
+    (if (hamt/iter-advance! it)
+      (__subset-loop b
+        it
+        (and acc (ormap-has? b (:: (hamt/iter-cur-key it) Sym))))
+      acc))
+  ;;; ormap-merge-with -- merge two maps, combining shared values with `f`.
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- how to merge two value carriers present on both sides
+  ;;;   a -- first map
+  ;;;   b -- second map
+  ;;;
+  ;;; Returns:
+  ;;;   The merged map.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-merge-with pn-join alice bob)
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  ;;
+  ;; `f` is applied ONLY where a key is live on both sides.  A key live on one
+  ;; side is kept or dropped by the causal test, never by `f` -- so a caller
+  ;; cannot accidentally resurrect a removed key by writing a lenient merge.
+  ;;
+  ;; Add-wins, same rule as crdt/set's ORSet: a key present on one side survives
+  ;; unless the OTHER side's context has seen its dot, which is what distinguishes
+  ;; "not yet delivered" (keep) from "deliberately removed" (drop).
+  ;;
+  ;; The helpers below thread raw CARRIERS (`entries`, `dots`, and a DotContext)
+  ;; rather than the ORMap struct, which is how crdt/orset's fold is written too.
+  ;; Passing the struct into a recursive helper moves it -- `^borrow` on the
+  ;; outer parameter does not make the onward pass a borrow -- and the second
+  ;; pass then fails with TUR-E0005 use-after-move.
+  (defn ormap-merge-with [V] [f : (fn [int int] int)
+                              ^borrow a : (ORMap V)
+                              ^borrow b : (ORMap V)] : (ORMap V)
+    (let [ca (.ctx a)
+          cb (.ctx b)
+          sa (.seen ca)
+          sb (.seen cb)
+          ea (.entries a)
+          da (.dots a)
+          eb (.entries b)
+          db (.dots b)
+          ;; Pass 1 takes A's live keys, pass 2 adds B's.  `first` tells pass 2
+          ;; to skip a key both sides hold, which pass 1 already placed.
+          ;;
+          ;; That skip is an OPTIMIZATION, not a correctness guard -- measured:
+          ;; forcing it off leaves every test in test_ormap green.  Both passes
+          ;; compute `f` from the two ORIGINAL sides rather than from the
+          ;; accumulator, so re-merging a shared key recomputes the same value
+          ;; instead of compounding it.  Keeping the skip avoids the redundant
+          ;; call; do not add a comment claiming it prevents double-application.
+          ra (.dotr a)
+          rb (.dotr b)
+          e1 (__side f ea da ra eb sb (:: (map-new) int) true)
+          e2 (__side f eb db rb ea sa e1 false)
+          ;; Dots are derived from the surviving keys rather than threaded
+          ;; through the fold, which keeps every helper single-valued (an int
+          ;; carrier in, an int carrier out) -- the shape crdt/orset uses.
+          dm (__dots-for e2 da db)
+          rm (__reps-for e2 ra rb da db)]
+      (ORMap e2 dm rm (join ca cb))))
+  ;;; __side -- internal: fold one side's live keys into the entry accumulator.
+  (defn __side [f : (fn [int int] int)
+                esrc : int
+                dsrc : int
+                rsrc : int
+                eoth : int
+                coth : int
+                acce : int
+                first : bool] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: esrc (Map Sym int))))
+          r  (__side-loop f it dsrc rsrc eoth coth acce first)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __side-loop -- internal.
+  (defn __side-loop [f : (fn [int int] int)
+                     it : ptr<void>
+                     dsrc : int
+                     rsrc : int
+                     eoth : int
+                     coth : int
+                     acc : int
+                     first : bool] : int
+    (if (hamt/iter-advance! it)
+      (let [k       (:: (hamt/iter-cur-key it) Sym)
+            mine    (:: (hamt/iter-cur-val it) int)
+            shared  (map-has? (:: eoth (Map Sym int)) k)
+            skip    (and (not first) shared) ;; see the note in ormap-merge-with
+            ;; Add-wins: a key only this side has survives unless the OTHER
+            ;; side's context has already seen its dot -- which is what
+            ;; distinguishes "not yet delivered" from "deliberately removed".
+            dropped (and (not shared) (__seen? coth k dsrc rsrc))
+            val     (if shared
+                      (f mine (map-get (:: eoth (Map Sym int)) k))
+                      mine)]
+        (__side-loop f
+          it
+          dsrc
+          rsrc
+          eoth
+          coth
+          (if (or skip dropped) acc (__put acc k val))
+          first))
+      acc))
+  ;;; __vjoin -- internal: combine two value carriers at `V`'s own instance.
+  ;;
+  ;; Passed to the ONE fold below as its `f`.  That works because a constrained
+  ;; generic used as a function value now gets a per-instantiation clone; before
+  ;; that, this module carried a second copy of the whole fold whose only
+  ;; difference was this line.
+  (defn __vjoin [V] [(JoinSemilattice V)] [x : int y : int] : int
+    (:: (join (:: x V) (:: y V)) int))
+  ;;; __dots-for -- internal: the dot map for the surviving keys.
+  (defn __dots-for [ents : int da : int db : int] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: ents (Map Sym int))))
+          r  (__dots-loop it da db (:: (map-new) int))]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __dots-loop -- internal: keep the HIGHER of the two sides' dot counters.
+  ;;
+  ;; Higher, not either-one: the dot records how much of this key's history the
+  ;; merged map has observed, so taking the lower would let an already-delivered
+  ;; remove be replayed as an add.
+  (defn __dots-loop [it : ptr<void> da : int db : int acc : int] : int
+    (if (hamt/iter-advance! it)
+      (let [k (:: (hamt/iter-cur-key it) Sym)
+            x (__dot-of da k)
+            y (__dot-of db k)]
+        (__dots-loop it da db (__put acc k (if (> x y) x y))))
+      acc))
+  ;;; __reps-for -- internal: the replica map for the surviving keys.
+  ;;
+  ;; Paired with __dots-for: the dot that survives is the HIGHER counter, so the
+  ;; replica recorded must be the one that minted THAT dot, not the other side's.
+  (defn __reps-for [ents : int ra : int rb : int da : int db : int] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: ents (Map Sym int))))
+          r  (__reps-loop it ra rb da db (:: (map-new) int))]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __reps-loop -- internal.
+  (defn __reps-loop [it : ptr<void>
+                     ra : int
+                     rb : int
+                     da : int
+                     db : int
+                     acc : int] : int
+    (if (hamt/iter-advance! it)
+      (let [k   (:: (hamt/iter-cur-key it) Sym)
+            ca  (__dot-of da k)
+            cb  (__dot-of db k)
+            ;; Whichever side holds the higher COUNTER is the side whose replica
+            ;; minted the surviving dot -- keep its replica, not merely the one
+            ;; that happens to be present.
+            rep (if (>= ca cb) (__dot-of ra k) (__dot-of rb k))]
+        (__reps-loop it ra rb da db (__put acc k rep)))
+      acc))
+  ;;; __seen? -- internal: has the other side's context observed src's dot for k?
+  ;;
+  ;; dotctx-seen?'s test, inlined against the raw `seen` carrier.  A DotContext
+  ;; is unique, so threading the STRUCT through the fold would move it -- and
+  ;; each side's context is needed twice here (once per pass, once for the final
+  ;; join).  crdt/orset threads its contexts as carriers for the same reason.
+  (defn __seen? [coth : int k : Sym dsrc : int rsrc : int] : bool
+    (if (and (map-has? (:: dsrc (Map Sym int)) k)
+          (map-has? (:: rsrc (Map Sym int)) k))
+      (let [r (:: (map-get (:: rsrc (Map Sym int)) k) Sym)
+            c (map-get (:: dsrc (Map Sym int)) k)]
+        ;; The context is keyed by REPLICA, not by key.
+        (if (map-has? (:: coth (Map Sym int)) r)
+          (>= (map-get (:: coth (Map Sym int)) r) c)
+          false))
+      false))
+  ;;; __put -- internal: bind k in a carrier-held map, staying a carrier.
+  ;;
+  ;; Not inlined into the `if` below: a `map-assoc` result used directly as one
+  ;; arm makes the two arms a `Map*` and an int64 carrier, and the emitter
+  ;; assigns one to the other (`-Wint-conversion`).  Forcing the ascription
+  ;; through a typed helper keeps both arms plain carriers.
+  (defn __put [acc : int k : Sym v : int] : int
+    (:: (map-assoc (:: acc (Map Sym int)) k v) int))
+  ;;; __dot-of -- internal: a key's recorded dot counter, or 0.
+  (defn __dot-of [d : int k : Sym] : int
+    (if (map-has? (:: d (Map Sym int)) k) (map-get (:: d (Map Sym int)) k) 0))
+  ;;; ormap-join -- merge two maps using `V`'s own JoinSemilattice instance.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- first map
+  ;;;   b -- second map
+  ;;;
+  ;;; Returns:
+  ;;;   The merged map.
+  ;;;
+  ;;; Example:
+  ;;;   (join alice bob)
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  ;;
+  ;; Same merge as ormap-merge-with, with the value combine coming from the
+  ;; element's instance instead of an argument -- crdt-spice-plan 2.3's design.
+  ;; An ORMap of PNCounters merges with no code specific to that pairing.
+  (defn ormap-join [V] [(JoinSemilattice V)] [^borrow a : (ORMap V)
+                                              ^borrow b : (ORMap V)] : (ORMap V)
+    (let [ca (.ctx a)
+          cb (.ctx b)
+          sa (.seen ca)
+          sb (.seen cb)
+          ea (.entries a)
+          da (.dots a)
+          ra (.dotr a)
+          eb (.entries b)
+          db (.dots b)
+          rb (.dotr b)
+          e1 (__side __vjoin ea da ra eb sb (:: (map-new) int) true)
+          e2 (__side __vjoin eb db rb ea sa e1 false)
+          dm (__dots-for e2 da db)
+          rm (__reps-for e2 ra rb da db)]
+      (ORMap e2 dm rm (join ca cb))))
+  ;;; OrmapDelta -- a key fragment plus the EXACT dots it retracts.
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; Same shape and same reason as crdt/orset's OrsetDelta: an ORMap carries a
+  ;; DotContext, which is a compacted version vector, and a delta that shipped
+  ;; one would claim to have observed every dot below the ones it names -- so
+  ;; the receiver would read its own untouched keys as deliberately removed and
+  ;; drop them silently.  A delta asserts an EXACT DotSet instead.
+  ;;
+  ;; `V` is PHANTOM here exactly as it is on ORMap: the value rides in `entries`
+  ;; as an int carrier, and the type parameter exists so `ormap-apply` can reach
+  ;; the element's own `join`.
+  (defstruct ^heap OrmapDelta
+    [V]
+    [entries : int dots : int dotr : int rms : DotSet])
+  ;;; ormap-delta-new -- the empty delta.
+  ;;;
+  ;;; Returns:
+  ;;;   A delta that writes nothing and retracts nothing.
+  ;;;
+  ;;; Example:
+  ;;;   (:: (ormap-delta-new) (OrmapDelta MaxI))
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  (defn ormap-delta-new [V] [] : (OrmapDelta V)
+    (OrmapDelta (:: (map-new) int)
+      (:: (map-new) int)
+      (:: (map-new) int)
+      (dotset-new)))
+  ;;; ormap-delta-count -- how many keys the delta writes.
+  ;;;
+  ;;; Parameters:
+  ;;;   d -- the delta
+  ;;;
+  ;;; Returns:
+  ;;;   Its key count.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-delta-count d)   ; => 1
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  (defn ormap-delta-count [V] [^borrow d : (OrmapDelta V)] : int
+    (map-count (:: (.entries d) (Map Sym int))))
+  ;;; ormap-delta-retracts -- how many dots the delta withdraws.
+  ;;;
+  ;;; Parameters:
+  ;;;   d -- the delta
+  ;;;
+  ;;; Returns:
+  ;;;   Its retraction count.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-delta-retracts d)   ; => 1
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  (defn ormap-delta-retracts [V] [^borrow d : (OrmapDelta V)] : int
+    (dotset-count (.rms d)))
+  ;;; ormap-delta-put -- the DELTA of writing a key.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the map, read for the replica's next dot
+  ;;;   r -- the replica doing the write
+  ;;;   k -- the key
+  ;;;   v -- the value carrier
+  ;;;
+  ;;; Returns:
+  ;;;   A one-key delta carrying a fresh dot.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-delta-put m (replica (quote alice)) (quote score) (:: 5 MaxI))
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; The dot is minted from `m`, so the replica must apply the same write to its
+  ;; own state -- two deltas minted from one map would collide on the counter.
+  (defn ormap-delta-put [V] [^borrow m : (ORMap V) r : ReplicaId k : Sym v : V] : (OrmapDelta V)
+    (let [d (dotctx-next (.ctx m) r)]
+      (OrmapDelta (:: (map-assoc (:: (map-new) (Map Sym int)) k (:: v int)) int)
+        (:: (map-assoc (:: (map-new) (Map Sym int)) k (dot-ctr__om d)) int)
+        (:: (map-assoc (:: (map-new) (Map Sym int)) k (:: (replica-sym r) int))
+          int)
+        (dotset-new))))
+  ;;; ormap-delta-remove -- the DELTA of dropping a key.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the map, read for the key's recorded dot
+  ;;;   k -- the key
+  ;;;
+  ;;; Returns:
+  ;;;   A delta writing nothing and retracting exactly the dot this replica has
+  ;;;   for k.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-delta-remove m (quote score))
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; A remove of a key this replica does not hold retracts nothing and applies
+  ;; as a no-op, which is right: you cannot withdraw a write you never saw.
+  ;; The DotSet is built INLINE as the constructor's last argument rather than
+  ;; let-bound.  Inside a generic defn a let-bound `:heap` struct value is
+  ;; declared at the int64 carrier while the monomorphized constructor takes the
+  ;; pointer, and cc rejects the call (`-Wint-conversion`).  Note this is the
+  ;; OPPOSITE of the spelling crdt/orset needs for the same construction in a
+  ;; non-generic defn, where the inline form is the one that fails -- so copy
+  ;; whichever shape the neighbouring code already uses rather than assuming.
+  (defn ormap-delta-remove [V] [^borrow m : (ORMap V) k : Sym] : (OrmapDelta V)
+    (OrmapDelta (:: (map-new) int)
+      (:: (map-new) int)
+      (:: (map-new) int)
+      (__rms-for-key (.dots m) (.dotr m) k)))
+  ;;; __rms-for-key -- internal: the single dot recorded for k, as an exact set.
+  (defn __rms-for-key [dots : int dotr : int k : Sym] : DotSet
+    (if (and (map-has? (:: dots (Map Sym int)) k)
+          (map-has? (:: dotr (Map Sym int)) k))
+      (dotset-add (dotset-new)
+        (mk-dot (replica (:: (map-get (:: dotr (Map Sym int)) k) Sym))
+          (map-get (:: dots (Map Sym int)) k)))
+      (dotset-new)))
+  ;;; ormap-apply -- fold a delta into a map, merging values at V's instance.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the map
+  ;;;   d -- the delta
+  ;;;
+  ;;; Returns:
+  ;;;   The map with d's writes merged in and d's retractions withdrawn.
+  ;;;
+  ;;; Example:
+  ;;;   (ormap-apply mine (ormap-delta-put theirs (replica (quote bob)) (quote k) v))
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; WRITES FIRST, then retractions, as in crdt/orset -- a buffered group can
+  ;; carry a newer write and an older retraction, and the retraction names its
+  ;; dot exactly, so the newer write survives.
+  ;;
+  ;; A write whose dot the receiver's context has ALREADY SEEN is skipped when
+  ;; the key is absent, which is what keeps `apply-delta` idempotent: re-sending
+  ;; the write of a key the receiver has since removed must not resurrect it.
+  ;;
+  ;; Values of a key present on BOTH sides merge at `V`'s own JoinSemilattice
+  ;; instance, which is the same dispatch `ormap-join` makes and the thing
+  ;; test_ormap_join pins: a map that ignored its element's instance would
+  ;; converge on the wrong number.
+  (defn ormap-apply [V] [(JoinSemilattice V)] [m : (ORMap V)
+                                               ^borrow d : (OrmapDelta V)] : (ORMap V)
+    ;; `rms` is threaded as the raw carrier, not the DotSet struct: a DotSet
+    ;; holds a Map handle and is affine, so passing the struct into the fold
+    ;; would move it.  Same reason the contexts are threaded as carriers above.
+    (let [ctx0 (.ctx m)
+          seen (:: (.seen ctx0) int)
+          rms  (.dots (.rms d))
+          em   (.entries m)
+          dm   (.dots m)
+          rm   (.dotr m)
+          ed   (.entries d)
+          dd   (.dots d)
+          rd   (.dotr d)
+          e1   (__apply-writes em ed dd rd seen)
+          d1   (__apply-dots dm dd)
+          r1   (__apply-dots rm rd)
+          e2   (__drop-retracted e1 d1 r1 rms)
+          d2   (__keep-keys d1 e2)
+          r2   (__keep-keys r1 e2)]
+      ;; The context chain is built INLINE in the constructor call -- see the
+      ;; note on ormap-delta-remove for why a let-bound `:heap` value does not
+      ;; survive monomorphization here.
+      (ORMap e2 d2 r2 (__witness-rms__om (__witness-dots ctx0 dd rd) rms))))
+  ;;; __apply-writes -- internal: fold a delta's writes into the entry map.
+  (defn __apply-writes [V] [(JoinSemilattice V)] [em : int
+                                                  ed : int
+                                                  dd : int
+                                                  rd : int
+                                                  seen : int] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: ed (Map Sym int))))
+          r  (__apply-writes-loop em it dd rd seen)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __apply-writes-loop -- internal.
+  (defn __apply-writes-loop [V] [(JoinSemilattice V)] [acc : int
+                                                       it : ptr<void>
+                                                       dd : int
+                                                       rd : int
+                                                       seen : int] : int
+    (if (hamt/iter-advance! it)
+      (let [k      (:: (hamt/iter-cur-key it) Sym)
+            vnew   (:: (hamt/iter-cur-val it) int)
+            held   (map-has? (:: acc (Map Sym int)) k)
+            ;; Absent locally AND already witnessed: this write was delivered
+            ;; before and the key has since been removed.  Skip it.
+            stale  (and (not held) (__seen? seen k dd rd))
+            merged (if held
+                     (:: (join (:: (map-get (:: acc (Map Sym int)) k) V)
+                           (:: vnew V))
+                       int)
+                     vnew)]
+        (__apply-writes-loop (if stale acc (__put acc k merged)) it dd rd seen))
+      acc))
+  ;;; __apply-dots -- internal: overlay a delta's dot (or replica) map.
+  ;;
+  ;; The HIGHER counter wins, same rule as __dots-loop: the dot records how much
+  ;; of a key's history the map has observed, and taking the lower would let an
+  ;; already-delivered remove be replayed as a write.  The replica map is
+  ;; overlaid unconditionally alongside it, because a delta only ever carries a
+  ;; key it just wrote -- the pairing `__reps-for` has to reconstruct for a
+  ;; state merge is already right here.
+  (defn __apply-dots [base : int over : int] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: over (Map Sym int))))
+          r  (__apply-dots-loop base it)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __apply-dots-loop -- internal.
+  (defn __apply-dots-loop [acc : int it : ptr<void>] : int
+    (if (hamt/iter-advance! it)
+      (__apply-dots-loop (__put acc
+                           (:: (hamt/iter-cur-key it) Sym)
+                           (:: (hamt/iter-cur-val it) int))
+        it)
+      acc))
+  ;;; __drop-retracted -- internal: drop every key whose dot the delta withdraws.
+  ;;
+  ;; EXACT match on (replica, counter), never "counter at or below": a lower
+  ;; counter for the same replica belongs to a different key's write.
+  (defn __drop-retracted [ents : int dots : int reps : int rms : int] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: ents (Map Sym int))))
+          r  (__drop-loop (:: (map-new) int) it dots reps rms)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __drop-loop -- internal.
+  (defn __drop-loop [acc : int it : ptr<void> dots : int reps : int rms : int] : int
+    (if (hamt/iter-advance! it)
+      (let [k    (:: (hamt/iter-cur-key it) Sym)
+            v    (:: (hamt/iter-cur-val it) int)
+            gone (__rms-has?__om rms (__rep-of reps k) (__dot-of dots k))]
+        (__drop-loop (if gone acc (__put acc k v)) it dots reps rms))
+      acc))
+  ;;; __rep-of -- internal: a key's recorded replica, or the empty name.
+  (defn __rep-of [reps : int k : Sym] : Sym
+    (if (map-has? (:: reps (Map Sym int)) k)
+      (:: (map-get (:: reps (Map Sym int)) k) Sym)
+      (quote __none)))
+  ;;; __rms-has?__om -- internal: is this exact dot in a retraction carrier?
+  (defn __rms-has?__om [rms : int r : Sym n : int] : bool
+    (if (map-has? (:: rms (Map Sym int)) r)
+      (map-has? (:: (:: (map-get (:: rms (Map Sym int)) r) int) (Map int int))
+        n)
+      false))
+  ;;; __keep-keys -- internal: restrict a side map to the surviving keys.
+  (defn __keep-keys [side : int ents : int] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: ents (Map Sym int))))
+          r  (__keep-loop (:: (map-new) int) it side)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __keep-loop -- internal.
+  (defn __keep-loop [acc : int it : ptr<void> side : int] : int
+    (if (hamt/iter-advance! it)
+      (let [k (:: (hamt/iter-cur-key it) Sym)]
+        (__keep-loop (if (map-has? (:: side (Map Sym int)) k)
+                       (__put acc k (map-get (:: side (Map Sym int)) k))
+                       acc)
+          it
+          side))
+      acc))
+  ;;; __witness-dots -- internal: record a delta's written dots in the context.
+  (defn __witness-dots [ctx : DotContext dd : int rd : int] : DotContext
+    (let [it (hamt/iter-alloc (map-hamt (:: dd (Map Sym int))))
+          r  (__witness-dots-loop ctx it rd)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __witness-dots-loop -- internal.
+  (defn __witness-dots-loop [acc : DotContext it : ptr<void> rd : int] : DotContext
+    (if (hamt/iter-advance! it)
+      (let [k (:: (hamt/iter-cur-key it) Sym)
+            n (:: (hamt/iter-cur-val it) int)
+            w (dotctx-witness acc (mk-dot (replica (__rep-of rd k)) n))]
+        (__witness-dots-loop w it rd))
+      acc))
+  ;;; __witness-rms__om -- internal: record a delta's retracted dots.
+  ;;
+  ;; The context COMPACTS, so this marks every dot below the ones named as seen
+  ;; too.  Exact under causal delivery; see crdt/causal's dotctx-witness-set.
+  (defn __witness-rms__om [ctx : DotContext rms : int] : DotContext
+    (let [it (hamt/iter-alloc (map-hamt (:: rms (Map Sym int))))
+          r  (__witness-rms-loop__om ctx it)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __witness-rms-loop__om -- internal.
+  (defn __witness-rms-loop__om [acc : DotContext it : ptr<void>] : DotContext
+    (if (hamt/iter-advance! it)
+      (let [r (:: (hamt/iter-cur-key it) Sym)
+            n (__max-ctr-of__om (:: (hamt/iter-cur-val it) int))
+            w (dotctx-witness acc (mk-dot (replica r) n))]
+        (__witness-rms-loop__om w it))
+      acc))
+  ;;; __max-ctr-of__om -- internal: the highest counter in a counter set.
+  (defn __max-ctr-of__om [m : int] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: m (Map int int))))
+          r  (__max-ctr-loop__om it 0)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __max-ctr-loop__om -- internal.
+  (defn __max-ctr-loop__om [it : ptr<void> acc : int] : int
+    (if (hamt/iter-advance! it)
+      (__max-ctr-loop__om it
+        (if (> (:: (hamt/iter-cur-key it) int) acc)
+          (:: (hamt/iter-cur-key it) int)
+          acc))
+      acc))
+  ;;; JoinSemilattice [(OrmapDelta V)] -- write both sides, retract both sides.
+  ;;
+  ;; Lets a sender buffer deltas, and a relay holding no map at all combine them
+  ;; with `join-all`.  Values of a key both deltas write merge at `V`'s
+  ;; instance, same as the state merge.
+  (definstance JoinSemilattice [(OrmapDelta V)]
+    (join [x y] (ormap-delta-merge x y)))
+  ;;; ormap-delta-merge -- internal: the delta join, spelled as a defn.
+  ;;
+  ;; A defn rather than an inline instance body so the `(JoinSemilattice V)`
+  ;; constraint has somewhere to live -- the constrained-instance shape ORMap
+  ;; itself uses for `ormap-join`.
+  (defn ormap-delta-merge [V] [(JoinSemilattice V)] [^borrow a : (OrmapDelta V)
+                                                     ^borrow b : (OrmapDelta V)] : (OrmapDelta V)
+    (let [ea (.entries a)
+          da (.dots a)
+          ra (.dotr a)
+          eb (.entries b)
+          db (.dots b)
+          rb (.dotr b)
+          e1 (__merge-writes ea eb)
+          d1 (__apply-dots da db)
+          r1 (__apply-dots ra rb)]
+      (OrmapDelta e1 d1 r1 (dotset-union (.rms a) (.rms b)))))
+  ;;; __merge-writes -- internal: overlay b's writes onto a's, joining shared keys.
+  (defn __merge-writes [V] [(JoinSemilattice V)] [a : int b : int] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: b (Map Sym int))))
+          r  (__merge-writes-loop a it)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __merge-writes-loop -- internal.
+  (defn __merge-writes-loop [V] [(JoinSemilattice V)] [acc : int it : ptr<void>] : int
+    (if (hamt/iter-advance! it)
+      (let [k (:: (hamt/iter-cur-key it) Sym)
+            v (:: (hamt/iter-cur-val it) int)
+            m (if (map-has? (:: acc (Map Sym int)) k)
+                (:: (join (:: (map-get (:: acc (Map Sym int)) k) V) (:: v V))
+                  int)
+                v)]
+        (__merge-writes-loop (__put acc k m) it))
+      acc))
+  ;;; DeltaCRDT [(ORMap V)] -- the delta is a key fragment plus exact retractions.
+  (definstance DeltaCRDT [(ORMap V)]
+    (type Delta = (OrmapDelta V))
+    (delta-bottom [x] (ormap-delta-new))
+    (delta-join [x d e] (ormap-delta-merge d e))
+    (apply-delta [x d] (ormap-apply x d)))
+  ;;; JoinSemilattice [(ORMap V)] -- an ORMap is a lattice exactly when its values are.
+  ;;
+  ;; The constrained recursive instance crdt-spice-plan 2.3 asks for: it makes
+  ;; `join`, `join-all` and the lattice law helpers work on maps of any CRDT
+  ;; value, and it nests -- an ORMap of ORMaps merges by this same instance one
+  ;; level down.
+  (definstance JoinSemilattice [(ORMap V)] (join [x y] (ormap-join x y)))) ;; end defmodule crdt/ormap

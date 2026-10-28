@@ -15,46 +15,64 @@
 ;;   agg-max    -- maximum non-null (input type preserved; int64/float64 only)
 ;;
 ;; Coming later: first/last/median/std/var and utf8-aware reductions.
-
 (defmodule frame/group
-  (export group-by __group-by-cons grouped-count grouped-free
-          agg summarize
-          agg-count agg-sum agg-mean agg-min agg-max
-          agg-median agg-std agg-var)
-
-  (import frame/schema :refer [field field-name field-type field-nullable
-                                schema schema-arity schema-field-at
-                                schema-index-of])
-  (import frame/column :refer [column-length column-type column-int64-at
-                                column-float64-at column-builder
-                                builder-append-int64 builder-append-float64
-                                builder-append-null builder-finish])
-  (import frame/frame  :refer [frame frame-nrows frame-ncols frame-schema
-                                frame-column-at])
-  (import frame/sort   :refer [arrange-indices __so-take])
-
-;; ---------------------------------------------------------------------------
-;; Aggregation tags (small constants matching the plan).
-;; ---------------------------------------------------------------------------
-
-(defn agg-count  [] : int ```c return 0; ```)
-(defn agg-sum    [] : int ```c return 1; ```)
-(defn agg-mean   [] : int ```c return 2; ```)
-(defn agg-min    [] : int ```c return 3; ```)
-(defn agg-max    [] : int ```c return 4; ```)
-(defn agg-median [] : int ```c return 5; ```)
-(defn agg-std    [] : int ```c return 6; ```)
-(defn agg-var    [] : int ```c return 7; ```)
-
-;; ---------------------------------------------------------------------------
-;; Cons helpers.
-;; ---------------------------------------------------------------------------
-
-(defn __g-nil [] : int ```c return 0; ```)
-
-(defn __g-cons [v : int n : int] : int
-  ```c
-  #include <stdlib.h>
+  (export group-by
+    __group-by-cons
+    grouped-count
+    grouped-free
+    agg
+    summarize
+    agg-count
+    agg-sum
+    agg-mean
+    agg-min
+    agg-max
+    agg-median
+    agg-std
+    agg-var)
+  (import frame/schema
+    :refer
+    [field
+     field-name
+     field-type
+     field-nullable
+     schema
+     schema-arity
+     schema-field-at
+     schema-index-of])
+  (import frame/column
+    :refer
+    [column-length
+     column-type
+     column-int64-at
+     column-float64-at
+     column-builder
+     builder-append-int64
+     builder-append-float64
+     builder-append-null
+     builder-finish])
+  (import frame/frame
+    :refer
+    [frame frame-nrows frame-ncols frame-schema frame-column-at])
+  (import frame/sort :refer [arrange-indices __so-take])
+  ;; ---------------------------------------------------------------------------
+  ;; Aggregation tags (small constants matching the plan).
+  ;; ---------------------------------------------------------------------------
+  (defn agg-count [] : int ```c return 0; ```)
+  (defn agg-sum [] : int ```c return 1; ```)
+  (defn agg-mean [] : int ```c return 2; ```)
+  (defn agg-min [] : int ```c return 3; ```)
+  (defn agg-max [] : int ```c return 4; ```)
+  (defn agg-median [] : int ```c return 5; ```)
+  (defn agg-std [] : int ```c return 6; ```)
+  (defn agg-var [] : int ```c return 7; ```)
+  ;; ---------------------------------------------------------------------------
+  ;; Cons helpers.
+  ;; ---------------------------------------------------------------------------
+  (defn __g-nil [] : int ```c return 0; ```)
+  (defn __g-cons [v : int n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   struct __cons *c = (struct __cons *)malloc(sizeof(*c));
@@ -62,13 +80,12 @@
   c->value = v; c->next = n;
   return (int64_t)(intptr_t)c;
   ```)
-
-;;; __g-vec-to-cons -- convert a Vec[cstr] (or any Vec[int]) to a cons list.
-;;; Used at the group-by public boundary to adapt the Vec[cstr] callers
-;;; pass to the cons-list-shaped helpers that walk names internally.
-(defn __g-vec-to-cons [v : int] : int
-  ```c
-  #include <stdlib.h>
+  ;;; __g-vec-to-cons -- convert a Vec[cstr] (or any Vec[int]) to a cons list.
+  ;;; Used at the group-by public boundary to adapt the Vec[cstr] callers
+  ;;; pass to the cons-list-shaped helpers that walk names internally.
+  (defn __g-vec-to-cons [v : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   typedef struct { int64_t *data; size_t len; size_t cap; } CstrVec;
   struct __cons { int64_t value; int64_t next; };
@@ -84,19 +101,17 @@
   }
   return head;
   ```)
-
-(defn __g-list-length [xs : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __g-list-length [xs : int] : int
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t n = 0;
   for (struct __cons *p = (struct __cons *)(intptr_t)xs; p; p = (struct __cons *)(intptr_t)p->next) n++;
   return n;
   ```)
-
-(defn __g-list-nth-int [xs : int i : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __g-list-nth-int [xs : int i : int] : int
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t k = 0;
   for (struct __cons *p = (struct __cons *)(intptr_t)xs; p; p = (struct __cons *)(intptr_t)p->next, k++) {
@@ -104,10 +119,9 @@
   }
   return 0;
   ```)
-
-(defn __g-list-nth-cstr [xs : int i : int] : cstr
-  ```c
-  #include <stdint.h>
+  (defn __g-list-nth-cstr [xs : int i : int] : cstr
+    ```c
+    #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t k = 0;
   for (struct __cons *p = (struct __cons *)(intptr_t)xs; p; p = (struct __cons *)(intptr_t)p->next, k++) {
@@ -115,29 +129,30 @@
   }
   return (const char *)(intptr_t)"";
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Grouped-frame representation.
-;;
-;;   struct __grouped {
-;;     int64_t  frame;          // borrowed ref (not owned)
-;;     int64_t  n_keys;
-;;     int64_t *key_ixs;        // column indices for the group key, length n_keys
-;;     int64_t  n_rows;
-;;     int64_t *perm;           // permutation sorting rows by key, length n_rows
-;;     int64_t  n_groups;
-;;     int64_t *group_starts;   // length n_groups + 1; group g is rows perm[gs[g]..gs[g+1])
-;;   };
-;; ---------------------------------------------------------------------------
-
-;;; __g-build-grouped -- given a frame, the parallel int list of key column
-;;; indices, the perm array (from arrange-indices materialized to int*), and
-;;; n_rows, produce a grouped handle by walking the perm and emitting group
-;;; boundaries whenever the key changes.
-(defn __g-build-grouped [f : int key-ixs : int n-keys : int
-                         perm : int n-rows : int] : int
-  ```c
-  #include <stdlib.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Grouped-frame representation.
+  ;;
+  ;;   struct __grouped {
+  ;;     int64_t  frame;          // borrowed ref (not owned)
+  ;;     int64_t  n_keys;
+  ;;     int64_t *key_ixs;        // column indices for the group key, length n_keys
+  ;;     int64_t  n_rows;
+  ;;     int64_t *perm;           // permutation sorting rows by key, length n_rows
+  ;;     int64_t  n_groups;
+  ;;     int64_t *group_starts;   // length n_groups + 1; group g is rows perm[gs[g]..gs[g+1])
+  ;;   };
+  ;; ---------------------------------------------------------------------------
+  ;;; __g-build-grouped -- given a frame, the parallel int list of key column
+  ;;; indices, the perm array (from arrange-indices materialized to int*), and
+  ;;; n_rows, produce a grouped handle by walking the perm and emitting group
+  ;;; boundaries whenever the key changes.
+  (defn __g-build-grouped [f : int
+                           key-ixs : int
+                           n-keys : int
+                           perm : int
+                           n-rows : int] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
@@ -239,11 +254,10 @@
 
   return (int64_t)(intptr_t)gp;
   ```)
-
-;;; grouped-count -- number of distinct groups.  Since: FR5
-(defn grouped-count [g : int] : int
-  ```c
-  #include <stdint.h>
+  ;;; grouped-count -- number of distinct groups.  Since: FR5
+  (defn grouped-count [g : int] : int
+    ```c
+    #include <stdint.h>
   struct __grouped {
     int64_t frame; int64_t n_keys; int64_t *key_ixs;
     int64_t n_rows; int64_t *perm;
@@ -252,12 +266,11 @@
   if (!g) return 0;
   return ((struct __grouped *)(intptr_t)g)->n_groups;
   ```)
-
-;;; grouped-free -- release a grouped-frame handle (does NOT free the source frame).
-;;; Since: FR5
-(defn grouped-free [g : int] : void
-  ```c
-  #include <stdlib.h>
+  ;;; grouped-free -- release a grouped-frame handle (does NOT free the source frame).
+  ;;; Since: FR5
+  (defn grouped-free [g : int] : void
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __grouped {
     int64_t frame; int64_t n_keys; int64_t *key_ixs;
@@ -271,28 +284,20 @@
   if (gp->group_starts) free(gp->group_starts);
   free(gp);
   ```)
-
-;; ---------------------------------------------------------------------------
-;; Driver: convert names list to indices, ask sort for a perm, call __g-build.
-;; ---------------------------------------------------------------------------
-
-(defn __g-names-to-ixs [s : int names : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [nm (__g-list-nth-cstr names i)
-          ix (schema-index-of s nm)]
-      (if (< ix 0)
-        -1
-        (__g-names-to-ixs s names (- i 1) (__g-cons ix acc))))))
-
-(defn __g-zeros [n : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (__g-zeros n (- i 1) (__g-cons 0 acc))))
-
-(defn __g-list-to-perm-array [xs : int n : int] : int
-  ```c
-  #include <stdlib.h>
+  ;; ---------------------------------------------------------------------------
+  ;; Driver: convert names list to indices, ask sort for a perm, call __g-build.
+  ;; ---------------------------------------------------------------------------
+  (defn __g-names-to-ixs [s : int names : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (let [nm (__g-list-nth-cstr names i)
+            ix (schema-index-of s nm)]
+        (if (< ix 0) -1 (__g-names-to-ixs s names (- i 1) (__g-cons ix acc))))))
+  (defn __g-zeros [n : int i : int acc : int] : int
+    (if (< i 0) acc (__g-zeros n (- i 1) (__g-cons 0 acc))))
+  (defn __g-list-to-perm-array [xs : int n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   int64_t *p = (int64_t *)malloc((size_t)n * sizeof(int64_t));
@@ -303,55 +308,51 @@
   }
   return (int64_t)(intptr_t)p;
   ```)
-
-;;; __group-by-cons -- internal cons-list group-by, used by intra-spice
-;;; callers (e.g. `distinct`) that already have a cons list of names.
-(defn __group-by-cons [f : int names : int] : int
-  (let [src-sch (frame-schema f)
-        n-keys  (__g-list-length names)
-        key-ixs (__g-names-to-ixs src-sch names (- n-keys 1) (__g-nil))]
-    (if (= key-ixs -1)
-      0
-      (let [dirs     (__g-zeros n-keys (- n-keys 1) (__g-nil))
-            nrows    (frame-nrows f)
-            perm-lst (arrange-indices f names dirs)
-            perm     (__g-list-to-perm-array perm-lst nrows)]
-        (__g-build-grouped f key-ixs n-keys perm nrows)))))
-
-;;; group-by -- partition a frame's rows by the named key columns.
-;;;
-;;; Parameters:
-;;;   f     -- source frame
-;;;   names -- Vec[cstr] of key column names, built with (vec-of "k1" "k2" ...).
-;;;            (Was a cons list of cstrs prior to 0.2.0.)
-;;;
-;;; Returns:
-;;;   an opaque grouped-frame; release with grouped-free.
-;;;
-;;; Since: FR5
-(defn group-by [f : int names : int] : int
-  (__group-by-cons f (__g-vec-to-cons names)))
-
-;; ---------------------------------------------------------------------------
-;; Aggregations.
-;; ---------------------------------------------------------------------------
-
-;;; __g-reduce -- run an aggregation tag over a contiguous range of perm[lo..hi)
-;;; for the given source column.  Returns a tagged result via two output args:
-;;; the result type tag is stored in s_out_type, and the result value is
-;;; written via either s_out_int64 or s_out_float64 depending on type.
-;;; To keep the Turmeric/C boundary simple, we expose three accessor entry
-;;; points: __g-reduce-int64, __g-reduce-float64, __g-reduce-int64-count.
-;;;
-;;; For agg-count and aggregations on int64 columns whose output is int64
-;;; (sum/min/max), use __g-reduce-int64.  For agg-mean and aggregations on
-;;; float64 columns (sum/min/max), use __g-reduce-float64.
-;;; The result is well-defined only when at least one non-null value exists
-;;; in the group; for empty (all-null) groups the result is 0/0.0 and the
-;;; null bit on the output column should be set by the caller.
-(defn __g-reduce-int64 [g : int col-ix : int group-ix : int agg-tag : int] : int
-  ```c
-  #include <stdint.h>
+  ;;; __group-by-cons -- internal cons-list group-by, used by intra-spice
+  ;;; callers (e.g. `distinct`) that already have a cons list of names.
+  (defn __group-by-cons [f : int names : int] : int
+    (let [src-sch (frame-schema f)
+          n-keys  (__g-list-length names)
+          key-ixs (__g-names-to-ixs src-sch names (- n-keys 1) (__g-nil))]
+      (if (= key-ixs -1)
+        0
+        (let [dirs     (__g-zeros n-keys (- n-keys 1) (__g-nil))
+              nrows    (frame-nrows f)
+              perm-lst (arrange-indices f names dirs)
+              perm     (__g-list-to-perm-array perm-lst nrows)]
+          (__g-build-grouped f key-ixs n-keys perm nrows)))))
+  ;;; group-by -- partition a frame's rows by the named key columns.
+  ;;;
+  ;;; Parameters:
+  ;;;   f     -- source frame
+  ;;;   names -- Vec[cstr] of key column names, built with (vec-of "k1" "k2" ...).
+  ;;;            (Was a cons list of cstrs prior to 0.2.0.)
+  ;;;
+  ;;; Returns:
+  ;;;   an opaque grouped-frame; release with grouped-free.
+  ;;;
+  ;;; Since: FR5
+  (defn group-by [f : int names : int] : int
+    (__group-by-cons f (__g-vec-to-cons names)))
+  ;; ---------------------------------------------------------------------------
+  ;; Aggregations.
+  ;; ---------------------------------------------------------------------------
+  ;;; __g-reduce -- run an aggregation tag over a contiguous range of perm[lo..hi)
+  ;;; for the given source column.  Returns a tagged result via two output args:
+  ;;; the result type tag is stored in s_out_type, and the result value is
+  ;;; written via either s_out_int64 or s_out_float64 depending on type.
+  ;;; To keep the Turmeric/C boundary simple, we expose three accessor entry
+  ;;; points: __g-reduce-int64, __g-reduce-float64, __g-reduce-int64-count.
+  ;;;
+  ;;; For agg-count and aggregations on int64 columns whose output is int64
+  ;;; (sum/min/max), use __g-reduce-int64.  For agg-mean and aggregations on
+  ;;; float64 columns (sum/min/max), use __g-reduce-float64.
+  ;;; The result is well-defined only when at least one non-null value exists
+  ;;; in the group; for empty (all-null) groups the result is 0/0.0 and the
+  ;;; null bit on the output column should be set by the caller.
+  (defn __g-reduce-int64 [g : int col-ix : int group-ix : int agg-tag : int] : int
+    ```c
+    #include <stdint.h>
   #include <stdio.h>
   struct __grouped {
     int64_t frame; int64_t n_keys; int64_t *key_ixs;
@@ -401,10 +402,9 @@
     default: return 0;
   }
   ```)
-
-(defn __g-reduce-float64 [g : int col-ix : int group-ix : int agg-tag : int] : float
-  ```c
-  #include <stdint.h>
+  (defn __g-reduce-float64 [g : int col-ix : int group-ix : int agg-tag : int] : float
+    ```c
+    #include <stdint.h>
   #include <stdlib.h>
   struct __grouped {
     int64_t frame; int64_t n_keys; int64_t *key_ixs;
@@ -511,10 +511,9 @@
     default: return 0.0;
   }
   ```)
-
-(defn __g-group-empty? [g : int col-ix : int group-ix : int] : bool
-  ```c
-  #include <stdint.h>
+  (defn __g-group-empty? [g : int col-ix : int group-ix : int] : bool
+    ```c
+    #include <stdint.h>
   struct __grouped {
     int64_t frame; int64_t n_keys; int64_t *key_ixs;
     int64_t n_rows; int64_t *perm;
@@ -540,49 +539,51 @@
   }
   return true;
   ```)
-
-;;; __g-output-type -- determine the output column's type tag for an agg.
-;;; Rules:
-;;;   agg-count        -> int64 always
-;;;   agg-mean         -> float64 always
-;;;   agg-sum/min/max  -> follow input (int64 if input is int32/int64, else float64)
-(defn __g-output-type [in-type : int agg-tag : int] : int
-  (if (= agg-tag 0) 2
-    ;; mean, median, std, var -> float64
-    (if (or (= agg-tag 2) (or (= agg-tag 5) (or (= agg-tag 6) (= agg-tag 7))))
-      4
-      ;; sum, min, max follow input: int32/int64 -> int64; else float64
-      (if (or (= in-type 1) (= in-type 2)) 2 4))))
-
-;;; __g-fill-agg-col -- build a column for one aggregation over all groups.
-(defn __g-fill-agg-col [g : int col-ix : int agg-tag : int n-groups : int
-                        in-type : int gi : int b : int] : int
-  (if (>= gi n-groups)
-    (builder-finish b)
-    (let [out-type (__g-output-type in-type agg-tag)]
-      (if (and (not= agg-tag 0) (__g-group-empty? g col-ix gi))
-        (do
-          (builder-append-null b)
-          (__g-fill-agg-col g col-ix agg-tag n-groups in-type (+ gi 1) b))
-        (do
-          (if (= out-type 2)
-            (builder-append-int64   b (__g-reduce-int64   g col-ix gi agg-tag))
-            (builder-append-float64 b (__g-reduce-float64 g col-ix gi agg-tag)))
-          (__g-fill-agg-col g col-ix agg-tag n-groups in-type (+ gi 1) b))))))
-
-;; ---------------------------------------------------------------------------
-;; Build key columns for the result frame: for each key column, take one row
-;; from each group (the group's first row in perm order).
-;; ---------------------------------------------------------------------------
-
-(defn __g-key-col-builder [in-type : int n-groups : int] : int
-  (column-builder in-type n-groups))
-
-(defn __g-key-rep-rows [g : int n-groups : int] : int
-  ;; Returns int* of length n-groups; each entry is the original row index of
-  ;; the first member of that group (perm[group_starts[gi]]).
-  ```c
-  #include <stdlib.h>
+  ;;; __g-output-type -- determine the output column's type tag for an agg.
+  ;;; Rules:
+  ;;;   agg-count        -> int64 always
+  ;;;   agg-mean         -> float64 always
+  ;;;   agg-sum/min/max  -> follow input (int64 if input is int32/int64, else float64)
+  (defn __g-output-type [in-type : int agg-tag : int] : int
+    (if (= agg-tag 0)
+      2
+      ;; mean, median, std, var -> float64
+      (if (or (= agg-tag 2) (or (= agg-tag 5) (or (= agg-tag 6) (= agg-tag 7))))
+        4
+        ;; sum, min, max follow input: int32/int64 -> int64; else float64
+        (if (or (= in-type 1) (= in-type 2)) 2 4))))
+  ;;; __g-fill-agg-col -- build a column for one aggregation over all groups.
+  (defn __g-fill-agg-col [g : int
+                          col-ix : int
+                          agg-tag : int
+                          n-groups : int
+                          in-type : int
+                          gi : int
+                          b : int] : int
+    (if (>= gi n-groups)
+      (builder-finish b)
+      (let [out-type (__g-output-type in-type agg-tag)]
+        (if (and (not= agg-tag 0) (__g-group-empty? g col-ix gi))
+          (do
+            (builder-append-null b)
+            (__g-fill-agg-col g col-ix agg-tag n-groups in-type (+ gi 1) b))
+          (do
+            (if (= out-type 2)
+              (builder-append-int64 b (__g-reduce-int64 g col-ix gi agg-tag))
+              (builder-append-float64 b
+                (__g-reduce-float64 g col-ix gi agg-tag)))
+            (__g-fill-agg-col g col-ix agg-tag n-groups in-type (+ gi 1) b))))))
+  ;; ---------------------------------------------------------------------------
+  ;; Build key columns for the result frame: for each key column, take one row
+  ;; from each group (the group's first row in perm order).
+  ;; ---------------------------------------------------------------------------
+  (defn __g-key-col-builder [in-type : int n-groups : int] : int
+    (column-builder in-type n-groups))
+  (defn __g-key-rep-rows [g : int n-groups : int] : int
+    ;; Returns int* of length n-groups; each entry is the original row index of
+    ;; the first member of that group (perm[group_starts[gi]]).
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __grouped {
     int64_t frame; int64_t n_keys; int64_t *key_ixs;
@@ -595,54 +596,55 @@
   for (int64_t i = 0; i < n_groups; i++) out[i] = gp->perm[gp->group_starts[i]];
   return (int64_t)(intptr_t)out;
   ```)
-
-(defn __g-rep-rows-free [p : int] : void
-  ```c
-  #include <stdlib.h>
+  (defn __g-rep-rows-free [p : int] : void
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   if (p) free((void *)(intptr_t)p);
   ```)
-
-;;; __g-build-key-col -- materialize a key column for the result frame by
-;;; taking g->perm[group_starts[gi]] of the source column at col_ix.
-(defn __g-build-key-col [f : int col-ix : int rep-rows : int n-groups : int] : int
-  ;; The sort-take helper from frame/sort handles this exactly: take rows in
-  ;; the given order.  We piggyback on __so-take by treating rep-rows as a perm.
-  ;; Call it through the module system rather than a raw extern-C bridge so the
-  ;; compiler's reachability analysis keeps __so-take alive in whole-program
-  ;; (`tur test`) builds -- inline-C `extern` references are invisible to it.
-  (__so-take (frame-column-at f col-ix) rep-rows n-groups))
-
-;; ---------------------------------------------------------------------------
-;; Public: agg
-;; ---------------------------------------------------------------------------
-
-;;; agg -- run aggregations over a grouped frame.
-;;;
-;;; Parameters (three parallel cons lists):
-;;;   g          -- :int grouped-frame
-;;;   out-names  -- cons list of :cstr names for the output columns
-;;;   in-names   -- cons list of :cstr names of source columns (ignored for agg-count;
-;;;                 pass any existing column name)
-;;;   agg-tags   -- cons list of :int agg tags (agg-count, agg-sum, ...)
-;;;
-;;; Returns:
-;;;   :int  frame whose rows are one per group: [key-cols..., agg-outputs...].
-;;;
-;;; Since: FR5
-(defn agg [g : int out-names : int in-names : int agg-tags : int] : int
-  (let [n-aggs    (__g-list-length agg-tags)
-        n-groups  (grouped-count g)
-        f         (__g-source-frame g)
-        sch       (frame-schema f)
-        rep-rows  (__g-key-rep-rows g n-groups)]
-    (let [r        (__g-build-agg-frame g sch n-aggs out-names in-names agg-tags
-                                         n-groups rep-rows)]
-      (do (__g-rep-rows-free rep-rows) r))))
-
-(defn __g-source-frame [g : int] : int
-  ```c
-  #include <stdint.h>
+  ;;; __g-build-key-col -- materialize a key column for the result frame by
+  ;;; taking g->perm[group_starts[gi]] of the source column at col_ix.
+  (defn __g-build-key-col [f : int col-ix : int rep-rows : int n-groups : int] : int
+    ;; The sort-take helper from frame/sort handles this exactly: take rows in
+    ;; the given order.  We piggyback on __so-take by treating rep-rows as a perm.
+    ;; Call it through the module system rather than a raw extern-C bridge so the
+    ;; compiler's reachability analysis keeps __so-take alive in whole-program
+    ;; (`tur test`) builds -- inline-C `extern` references are invisible to it.
+    (__so-take (frame-column-at f col-ix) rep-rows n-groups))
+  ;; ---------------------------------------------------------------------------
+  ;; Public: agg
+  ;; ---------------------------------------------------------------------------
+  ;;; agg -- run aggregations over a grouped frame.
+  ;;;
+  ;;; Parameters (three parallel cons lists):
+  ;;;   g          -- :int grouped-frame
+  ;;;   out-names  -- cons list of :cstr names for the output columns
+  ;;;   in-names   -- cons list of :cstr names of source columns (ignored for agg-count;
+  ;;;                 pass any existing column name)
+  ;;;   agg-tags   -- cons list of :int agg tags (agg-count, agg-sum, ...)
+  ;;;
+  ;;; Returns:
+  ;;;   :int  frame whose rows are one per group: [key-cols..., agg-outputs...].
+  ;;;
+  ;;; Since: FR5
+  (defn agg [g : int out-names : int in-names : int agg-tags : int] : int
+    (let [n-aggs   (__g-list-length agg-tags)
+          n-groups (grouped-count g)
+          f        (__g-source-frame g)
+          sch      (frame-schema f)
+          rep-rows (__g-key-rep-rows g n-groups)]
+      (let [r (__g-build-agg-frame g
+                sch
+                n-aggs
+                out-names
+                in-names
+                agg-tags
+                n-groups
+                rep-rows)]
+        (do (__g-rep-rows-free rep-rows) r))))
+  (defn __g-source-frame [g : int] : int
+    ```c
+    #include <stdint.h>
   struct __grouped {
     int64_t frame; int64_t n_keys; int64_t *key_ixs;
     int64_t n_rows; int64_t *perm;
@@ -650,10 +652,9 @@
   };
   return ((struct __grouped *)(intptr_t)g)->frame;
   ```)
-
-(defn __g-n-keys [g : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __g-n-keys [g : int] : int
+    ```c
+    #include <stdint.h>
   struct __grouped {
     int64_t frame; int64_t n_keys; int64_t *key_ixs;
     int64_t n_rows; int64_t *perm;
@@ -661,10 +662,9 @@
   };
   return ((struct __grouped *)(intptr_t)g)->n_keys;
   ```)
-
-(defn __g-key-ix-at [g : int k : int] : int
-  ```c
-  #include <stdint.h>
+  (defn __g-key-ix-at [g : int k : int] : int
+    ```c
+    #include <stdint.h>
   struct __grouped {
     int64_t frame; int64_t n_keys; int64_t *key_ixs;
     int64_t n_rows; int64_t *perm;
@@ -672,73 +672,128 @@
   };
   return ((struct __grouped *)(intptr_t)g)->key_ixs[k];
   ```)
-
-(defn __g-build-agg-frame [g : int sch : int n-aggs : int out-names : int in-names : int
-                           agg-tags : int n-groups : int rep-rows : int] : int
-  (let [n-keys (__g-n-keys g)
-        f      (__g-source-frame g)
-        ;; Build cons list of key columns (one per key column).
-        kcols  (__g-build-key-cols g f sch n-keys rep-rows n-groups (- n-keys 1) (__g-nil))
-        ;; Build cons list of agg columns.
-        acols  (__g-build-agg-cols g sch in-names agg-tags n-groups
-                                    (- n-aggs 1) (__g-nil))
-        ;; Build cons list of fields: key fields first, then agg out fields.
-        kfds   (__g-build-key-fields sch g (- n-keys 1) (__g-nil))
-        afds   (__g-build-agg-fields f sch n-aggs out-names in-names agg-tags
-                                      (- n-aggs 1) (__g-nil))
-        all-cols   (__g-list-concat kcols acols)
-        all-fields (__g-list-concat kfds  afds)]
-    (frame (schema all-fields) all-cols)))
-
-(defn __g-build-key-cols [g : int f : int sch : int n-keys : int rep-rows : int
-                          n-groups : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [col-ix (__g-key-ix-at g i)
-          kc     (__g-build-key-col f col-ix rep-rows n-groups)]
-      (__g-build-key-cols g f sch n-keys rep-rows n-groups (- i 1) (__g-cons kc acc)))))
-
-(defn __g-build-key-fields [sch : int g : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [col-ix (__g-key-ix-at g i)
-          fd-i   (schema-field-at sch col-ix)
-          fd     (field (field-name fd-i) (field-type fd-i) (field-nullable fd-i))]
-      (__g-build-key-fields sch g (- i 1) (__g-cons fd acc)))))
-
-(defn __g-build-agg-cols [g : int sch : int in-names : int
-                          agg-tags : int n-groups : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [in-nm    (__g-list-nth-cstr in-names i)
-          agg-tag  (__g-list-nth-int agg-tags i)
-          in-ix    (schema-index-of sch in-nm)
-          in-fd    (schema-field-at sch in-ix)
-          in-type  (field-type in-fd)
-          out-type (__g-output-type in-type agg-tag)
-          b        (column-builder out-type n-groups)
-          col      (__g-fill-agg-col g in-ix agg-tag n-groups in-type 0 b)]
-      (__g-build-agg-cols g sch in-names agg-tags n-groups (- i 1)
-                          (__g-cons col acc)))))
-
-(defn __g-build-agg-fields [f : int sch : int n-aggs : int out-names : int in-names : int
-                            agg-tags : int i : int acc : int] : int
-  (if (< i 0)
-    acc
-    (let [out-nm   (__g-list-nth-cstr out-names i)
-          in-nm    (__g-list-nth-cstr in-names i)
-          agg-tag  (__g-list-nth-int agg-tags i)
-          in-ix    (schema-index-of sch in-nm)
-          in-fd    (schema-field-at sch in-ix)
-          in-type  (field-type in-fd)
-          out-type (__g-output-type in-type agg-tag)
-          fd       (field out-nm out-type 0)]
-      (__g-build-agg-fields f sch n-aggs out-names in-names agg-tags (- i 1)
-                            (__g-cons fd acc)))))
-
-(defn __g-list-concat [a : int b : int] : int
-  ```c
-  #include <stdlib.h>
+  (defn __g-build-agg-frame [g : int
+                             sch : int
+                             n-aggs : int
+                             out-names : int
+                             in-names : int
+                             agg-tags : int
+                             n-groups : int
+                             rep-rows : int] : int
+    (let [n-keys     (__g-n-keys g)
+          f          (__g-source-frame g)
+          ;; Build cons list of key columns (one per key column).
+          kcols      (__g-build-key-cols g
+                       f
+                       sch
+                       n-keys
+                       rep-rows
+                       n-groups
+                       (- n-keys 1)
+                       (__g-nil))
+          ;; Build cons list of agg columns.
+          acols      (__g-build-agg-cols g
+                       sch
+                       in-names
+                       agg-tags
+                       n-groups
+                       (- n-aggs 1)
+                       (__g-nil))
+          ;; Build cons list of fields: key fields first, then agg out fields.
+          kfds       (__g-build-key-fields sch g (- n-keys 1) (__g-nil))
+          afds       (__g-build-agg-fields f
+                       sch
+                       n-aggs
+                       out-names
+                       in-names
+                       agg-tags
+                       (- n-aggs 1)
+                       (__g-nil))
+          all-cols   (__g-list-concat kcols acols)
+          all-fields (__g-list-concat kfds afds)]
+      (frame (schema all-fields) all-cols)))
+  (defn __g-build-key-cols [g : int
+                            f : int
+                            sch : int
+                            n-keys : int
+                            rep-rows : int
+                            n-groups : int
+                            i : int
+                            acc : int] : int
+    (if (< i 0)
+      acc
+      (let [col-ix (__g-key-ix-at g i)
+            kc     (__g-build-key-col f col-ix rep-rows n-groups)]
+        (__g-build-key-cols g
+          f
+          sch
+          n-keys
+          rep-rows
+          n-groups
+          (- i 1)
+          (__g-cons kc acc)))))
+  (defn __g-build-key-fields [sch : int g : int i : int acc : int] : int
+    (if (< i 0)
+      acc
+      (let [col-ix (__g-key-ix-at g i)
+            fd-i   (schema-field-at sch col-ix)
+            fd     (field (field-name fd-i)
+                     (field-type fd-i)
+                     (field-nullable fd-i))]
+        (__g-build-key-fields sch g (- i 1) (__g-cons fd acc)))))
+  (defn __g-build-agg-cols [g : int
+                            sch : int
+                            in-names : int
+                            agg-tags : int
+                            n-groups : int
+                            i : int
+                            acc : int] : int
+    (if (< i 0)
+      acc
+      (let [in-nm    (__g-list-nth-cstr in-names i)
+            agg-tag  (__g-list-nth-int agg-tags i)
+            in-ix    (schema-index-of sch in-nm)
+            in-fd    (schema-field-at sch in-ix)
+            in-type  (field-type in-fd)
+            out-type (__g-output-type in-type agg-tag)
+            b        (column-builder out-type n-groups)
+            col      (__g-fill-agg-col g in-ix agg-tag n-groups in-type 0 b)]
+        (__g-build-agg-cols g
+          sch
+          in-names
+          agg-tags
+          n-groups
+          (- i 1)
+          (__g-cons col acc)))))
+  (defn __g-build-agg-fields [f : int
+                              sch : int
+                              n-aggs : int
+                              out-names : int
+                              in-names : int
+                              agg-tags : int
+                              i : int
+                              acc : int] : int
+    (if (< i 0)
+      acc
+      (let [out-nm   (__g-list-nth-cstr out-names i)
+            in-nm    (__g-list-nth-cstr in-names i)
+            agg-tag  (__g-list-nth-int agg-tags i)
+            in-ix    (schema-index-of sch in-nm)
+            in-fd    (schema-field-at sch in-ix)
+            in-type  (field-type in-fd)
+            out-type (__g-output-type in-type agg-tag)
+            fd       (field out-nm out-type 0)]
+        (__g-build-agg-fields f
+          sch
+          n-aggs
+          out-names
+          in-names
+          agg-tags
+          (- i 1)
+          (__g-cons fd acc)))))
+  (defn __g-list-concat [a : int b : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __cons { int64_t value; int64_t next; };
   /* Copy a, then append b (sharing b's tail). */
@@ -754,42 +809,38 @@
   tail->next = b;
   return (int64_t)(intptr_t)head;
   ```)
-
-;;; summarize -- whole-frame aggregation; returns a one-row frame.
-;;; Equivalent to (agg (group-by f (cons single-grouping-key 0)) out in tags)
-;;; but skips the grouping step entirely.  Since: FR5
-(defn summarize [f : int out-names : int in-names : int agg-tags : int] : int
-  ;; Implementation: build a one-group "grouped" handle covering all rows.
-  (let [n        (frame-nrows f)
-        perm     (__g-make-identity-perm n)
-        starts   (__g-make-starts-array n)
-        gp       (__g-make-trivial-grouped f n perm starts)
-        r        (agg gp out-names in-names agg-tags)]
-    (do (grouped-free gp) r)))
-
-(defn __g-make-identity-perm [n : int] : int
-  ```c
-  #include <stdlib.h>
+  ;;; summarize -- whole-frame aggregation; returns a one-row frame.
+  ;;; Equivalent to (agg (group-by f (cons single-grouping-key 0)) out in tags)
+  ;;; but skips the grouping step entirely.  Since: FR5
+  (defn summarize [f : int out-names : int in-names : int agg-tags : int] : int
+    ;; Implementation: build a one-group "grouped" handle covering all rows.
+    (let [n      (frame-nrows f)
+          perm   (__g-make-identity-perm n)
+          starts (__g-make-starts-array n)
+          gp     (__g-make-trivial-grouped f n perm starts)
+          r      (agg gp out-names in-names agg-tags)]
+      (do (grouped-free gp) r)))
+  (defn __g-make-identity-perm [n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   int64_t *p = (int64_t *)malloc((size_t)n * sizeof(int64_t));
   if (!p) return 0;
   for (int64_t i = 0; i < n; i++) p[i] = i;
   return (int64_t)(intptr_t)p;
   ```)
-
-(defn __g-make-starts-array [n : int] : int
-  ```c
-  #include <stdlib.h>
+  (defn __g-make-starts-array [n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   int64_t *s = (int64_t *)malloc(2 * sizeof(int64_t));
   if (!s) return 0;
   s[0] = 0; s[1] = n;
   return (int64_t)(intptr_t)s;
   ```)
-
-(defn __g-make-trivial-grouped [f : int n : int perm : int starts : int] : int
-  ```c
-  #include <stdlib.h>
+  (defn __g-make-trivial-grouped [f : int n : int perm : int starts : int] : int
+    ```c
+    #include <stdlib.h>
   #include <stdint.h>
   struct __grouped {
     int64_t frame; int64_t n_keys; int64_t *key_ixs;
@@ -806,6 +857,4 @@
   gp->n_groups = 1;
   gp->group_starts = (int64_t *)(intptr_t)starts;
   return (int64_t)(intptr_t)gp;
-  ```)
-
-) ;; end defmodule frame/group
+  ```)) ;; end defmodule frame/group

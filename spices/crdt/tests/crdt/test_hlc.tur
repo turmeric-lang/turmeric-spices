@@ -14,79 +14,88 @@
 ;; clock and the results are identical on every run and every machine.
 ;;
 ;; main returns the failure count so `tur test` reports a non-zero exit.
-
 (defmodule crdt/tests/test_hlc
   (import crdt/replica :refer [ReplicaId replica replica-sym])
-  (import crdt/hlc :refer [Hlc hlc-zero hlc-tick hlc-recv hlc-after?
-                           hlc-wall hlc-logical hlc-max-drift hlc-later])
-
-(defn fail-if [cond : bool label : cstr] : int
-  (if cond (do (println label) 1) 0))
-
-;; 1. Same millisecond -- the logical counter has to do the ordering.
-(defn test-same-ms [] : int
-  (let [a (hlc-tick (hlc-zero (replica (quote alice))) 1000)
-        b (hlc-tick a 1000)
-        c (hlc-tick b 1000)]
-    (+ (fail-if (not (hlc-after? b a)) "FAIL hlc: same-ms tick not strictly after")
-       (+ (fail-if (not (hlc-after? c b)) "FAIL hlc: third same-ms tick not after")
-          (+ (fail-if (not (= (hlc-wall c) 1000)) "FAIL hlc: wall drifted within a ms")
-             ;; 2, not 3: the FIRST tick moved the wall from 0 to 1000 and so
-             ;; reset the counter.  Only the two ticks that found the wall
-             ;; unchanged advanced it.
-             (fail-if (not (= (hlc-logical c) 2)) "FAIL hlc: logical did not advance"))))))
-
-;; 2. The clock runs backwards.  This is the case a naive stamp gets wrong:
-;;    `now` is LOWER than the last stamp, so taking `now` would move the stamp
-;;    backwards and an LWW keyed on it would resurrect an overwritten value.
-(defn test-backwards [] : int
-  (let [a (hlc-tick (hlc-zero (replica (quote alice))) 5000)
-        b (hlc-tick a 4000)]     ;; NTP stepped the clock back one second
-    (+ (fail-if (not (hlc-after? b a)) "FAIL hlc: backwards clock broke monotonicity")
-       (fail-if (not (= (hlc-wall b) 5000)) "FAIL hlc: backwards clock moved wall down"))))
-
-;; 3. A remote stamp from a replica whose clock is a year fast.  The local
-;;    clock must still advance past its own last stamp (so the event is
-;;    ordered) without adopting the bogus wall time (so it does not stay a year
-;;    fast forever).
-(defn test-drift-bound [] : int
-  (let [mine  (hlc-tick (hlc-zero (replica (quote alice))) 1000)
-        wild  (hlc-tick (hlc-zero (replica (quote bob))) (+ 1000 (* 10 (hlc-max-drift))))
-        after (hlc-recv mine wild 1000)]
-    (+ (fail-if (not (hlc-after? after mine)) "FAIL hlc: recv did not advance local clock")
-       (fail-if (> (hlc-wall after) (+ 1000 (hlc-max-drift)))
-                "FAIL hlc: adopted a remote clock beyond the drift bound"))))
-
-;; A remote stamp that is merely AHEAD but within the bound is legitimate --
-;; it is what causality transfer looks like -- and must be adopted, or two
-;; replicas exchanging messages never converge on an order.
-(defn test-drift-ok [] : int
-  (let [mine  (hlc-tick (hlc-zero (replica (quote alice))) 1000)
-        near  (hlc-tick (hlc-zero (replica (quote bob))) 1500)
-        after (hlc-recv mine near 1000)]
-    (+ (fail-if (not (hlc-after? after near)) "FAIL hlc: recv did not pass the remote stamp")
-       (fail-if (not (= (hlc-wall after) 1500)) "FAIL hlc: did not adopt an in-bound remote clock"))))
-
-;; The order must be TOTAL: two replicas stamping the same instant with the
-;; same logical counter still have to compare, or LWW has no winner to agree on.
-(defn test-total-order [] : int
-  (let [a (hlc-tick (hlc-zero (replica (quote alice))) 1000)
-        b (hlc-tick (hlc-zero (replica (quote bob))) 1000)]
-    (+ (fail-if (not (or (hlc-after? a b) (hlc-after? b a)))
-                "FAIL hlc: same instant, same logical -- incomparable")
-       (+ (fail-if (and (hlc-after? a b) (hlc-after? b a))
-                   "FAIL hlc: mutually after -- not an order")
+  (import crdt/hlc
+    :refer
+    [Hlc
+     hlc-zero
+     hlc-tick
+     hlc-recv
+     hlc-after?
+     hlc-wall
+     hlc-logical
+     hlc-max-drift
+     hlc-later])
+  (defn fail-if [cond : bool label : cstr] : int
+    (if cond (do (println label) 1) 0))
+  ;; 1. Same millisecond -- the logical counter has to do the ordering.
+  (defn test-same-ms [] : int
+    (let [a (hlc-tick (hlc-zero (replica (quote alice))) 1000)
+          b (hlc-tick a 1000)
+          c (hlc-tick b 1000)]
+      (+ (fail-if (not (hlc-after? b a))
+           "FAIL hlc: same-ms tick not strictly after")
+        (+ (fail-if (not (hlc-after? c b))
+             "FAIL hlc: third same-ms tick not after")
+          (+ (fail-if (not (= (hlc-wall c) 1000))
+               "FAIL hlc: wall drifted within a ms")
+            ;; 2, not 3: the FIRST tick moved the wall from 0 to 1000 and so
+            ;; reset the counter.  Only the two ticks that found the wall
+            ;; unchanged advanced it.
+            (fail-if (not (= (hlc-logical c) 2))
+              "FAIL hlc: logical did not advance"))))))
+  ;; 2. The clock runs backwards.  This is the case a naive stamp gets wrong:
+  ;;    `now` is LOWER than the last stamp, so taking `now` would move the stamp
+  ;;    backwards and an LWW keyed on it would resurrect an overwritten value.
+  (defn test-backwards [] : int
+    (let [a (hlc-tick (hlc-zero (replica (quote alice))) 5000)
+          b (hlc-tick a 4000)] ;; NTP stepped the clock back one second
+      (+ (fail-if (not (hlc-after? b a))
+           "FAIL hlc: backwards clock broke monotonicity")
+        (fail-if (not (= (hlc-wall b) 5000))
+          "FAIL hlc: backwards clock moved wall down"))))
+  ;; 3. A remote stamp from a replica whose clock is a year fast.  The local
+  ;;    clock must still advance past its own last stamp (so the event is
+  ;;    ordered) without adopting the bogus wall time (so it does not stay a year
+  ;;    fast forever).
+  (defn test-drift-bound [] : int
+    (let [mine  (hlc-tick (hlc-zero (replica (quote alice))) 1000)
+          wild  (hlc-tick (hlc-zero (replica (quote bob)))
+                  (+ 1000 (* 10 (hlc-max-drift))))
+          after (hlc-recv mine wild 1000)]
+      (+ (fail-if (not (hlc-after? after mine))
+           "FAIL hlc: recv did not advance local clock")
+        (fail-if (> (hlc-wall after) (+ 1000 (hlc-max-drift)))
+          "FAIL hlc: adopted a remote clock beyond the drift bound"))))
+  ;; A remote stamp that is merely AHEAD but within the bound is legitimate --
+  ;; it is what causality transfer looks like -- and must be adopted, or two
+  ;; replicas exchanging messages never converge on an order.
+  (defn test-drift-ok [] : int
+    (let [mine  (hlc-tick (hlc-zero (replica (quote alice))) 1000)
+          near  (hlc-tick (hlc-zero (replica (quote bob))) 1500)
+          after (hlc-recv mine near 1000)]
+      (+ (fail-if (not (hlc-after? after near))
+           "FAIL hlc: recv did not pass the remote stamp")
+        (fail-if (not (= (hlc-wall after) 1500))
+          "FAIL hlc: did not adopt an in-bound remote clock"))))
+  ;; The order must be TOTAL: two replicas stamping the same instant with the
+  ;; same logical counter still have to compare, or LWW has no winner to agree on.
+  (defn test-total-order [] : int
+    (let [a (hlc-tick (hlc-zero (replica (quote alice))) 1000)
+          b (hlc-tick (hlc-zero (replica (quote bob))) 1000)]
+      (+ (fail-if (not (or (hlc-after? a b) (hlc-after? b a)))
+           "FAIL hlc: same instant, same logical -- incomparable")
+        (+ (fail-if (and (hlc-after? a b) (hlc-after? b a))
+             "FAIL hlc: mutually after -- not an order")
           ;; hlc-later must agree with hlc-after?, and must be the same choice
           ;; regardless of the argument order it is handed.
-          (fail-if (not (= (hlc-wall (hlc-later a b)) (hlc-wall (hlc-later b a))))
-                   "FAIL hlc: hlc-later is not commutative")))))
-
-(defn main [] : int
-  (let [f (+ (test-same-ms)
-             (+ (test-backwards)
-                (+ (test-drift-bound)
-                   (+ (test-drift-ok) (test-total-order)))))]
-    (if (= f 0) (println "hlc: ok") (println "hlc: FAILURES"))
-    f))
-
-) ;; end defmodule
+          (fail-if (not (= (hlc-wall (hlc-later a b))
+                          (hlc-wall (hlc-later b a))))
+            "FAIL hlc: hlc-later is not commutative")))))
+  (defn main [] : int
+    (let [f (+ (test-same-ms)
+              (+ (test-backwards)
+                (+ (test-drift-bound) (+ (test-drift-ok) (test-total-order)))))]
+      (if (= f 0) (println "hlc: ok") (println "hlc: FAILURES"))
+      f))) ;; end defmodule

@@ -23,99 +23,86 @@
 ;; the world + both classes + both instances are one declaration.
 ;;
 ;; Same workload, same arithmetic, same checksum as every other variant.
-
 (defmodule integrate_poly_hoisted_bench
   (export)
-
-(import ecs/entity  :refer [Slot slot-new entity-index])
-(import ecs/storage :refer [dense-new dense-set! dense-get])
-(import ecs/world   :refer [defcomponent defworld-classes world-alloc-entity!])
-(import ecs/cap     :refer [WriteCap ReadCap make-write-cap make-read-cap])
-
-(defstruct Pos [x : float y : float])
-(defstruct Vel [x : float y : float])
-
-(defcomponent Pos)
-(defcomponent Vel)
-
-;; World + HasPos/HasVel + both per-(World, Comp) instances, in one form.
-(defworld-classes GameWorld [Pos Vel])
-
-(def N      100000)
-(def FRAMES 100)
-(def DT     0.25)
-
-(defn i->f [i : int] : float
-  ```c
-  return (double)i;
+  (import ecs/entity :refer [Slot slot-new entity-index])
+  (import ecs/storage :refer [dense-new dense-set! dense-get])
+  (import ecs/world :refer [defcomponent defworld-classes world-alloc-entity!])
+  (import ecs/cap :refer [WriteCap ReadCap make-write-cap make-read-cap])
+  (defstruct Pos [x : float y : float])
+  (defstruct Vel [x : float y : float])
+  (defcomponent Pos)
+  (defcomponent Vel)
+  ;; World + HasPos/HasVel + both per-(World, Comp) instances, in one form.
+  (defworld-classes GameWorld [Pos Vel])
+  (def N 100000)
+  (def FRAMES 100)
+  (def DT 0.25)
+  (defn i->f [i : int] : float
+    ```c
+    return (double)i;
   ```)
-
-(defn checksum [sum : float] : int
-  ```c
-  return (int64_t)(sum * 100.0);
+  (defn checksum [sum : float] : int
+    ```c
+    return (int64_t)(sum * 100.0);
   ```)
-
-(defn now-us [] : int
-  ```c
-  #include <time.h>
+  (defn now-us [] : int
+    ```c
+    #include <time.h>
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
   ```)
-
-;; Identical to `integrate-poly`, with ONE change: the two
-;; `<Comp>-storage-of` dictionary lookups are hoisted out of the loop, so
-;; the run costs 2 dispatches total instead of 2 * N * FRAMES.
-;;
-;; The gap between this and integrate-poly.tur is the entire practical
-;; value of the ECB plan's structural `(has ...)` bound. If it is small,
-;; ECB is buying nothing a `let` above the loop does not already buy.
-(defn integrate-poly-hoisted [W] [(HasPos W) (HasVel W)] [^borrow w : W n : int] : nil
-  (let [ps      (:: (Pos-storage-of w) (Storage Pos))
-        vs      (:: (Vel-storage-of w) (Storage Vel))
-        ^mut i  0]
-    (while (< i n)
-      (let [s (slot-new i)
-            p : Pos (dense-get ps s)
-            v : Vel (dense-get vs s)]
-        (dense-set! ps s (make-struct Pos
-                                      (+ (.x p) (* (.x v) DT))
-                                      (+ (.y p) (* (.y v) DT)))))
-      (set! i (+ i 1)))))
-
-(defn main [] : int
-  (let [w (make-struct GameWorld
-                       (vec-new)
-                       (:: (dense-new) (Storage Pos))
-                       (:: (dense-new) (Storage Vel)))]
-    (do
-      (let [^mut i 0]
-        (while (< i N)
-          (let [e (world-alloc-entity! (.gens w))
-                f (i->f i)]
-            (dense-set! (.Pos w) (entity-index e)
-                        (make-struct Pos (/ f 8.0) (/ f 4.0)))
-            (dense-set! (.Vel w) (entity-index e)
-                        (make-struct Vel 1.5 -0.5)))
-          (set! i (+ i 1))))
-
-      (let [t0 (now-us)]
-        (do
-          (let [^mut frame 0]
-            (while (< frame FRAMES)
+  ;; Identical to `integrate-poly`, with ONE change: the two
+  ;; `<Comp>-storage-of` dictionary lookups are hoisted out of the loop, so
+  ;; the run costs 2 dispatches total instead of 2 * N * FRAMES.
+  ;;
+  ;; The gap between this and integrate-poly.tur is the entire practical
+  ;; value of the ECB plan's structural `(has ...)` bound. If it is small,
+  ;; ECB is buying nothing a `let` above the loop does not already buy.
+  (defn integrate-poly-hoisted [W] [(HasPos W) (HasVel W)] [^borrow w : W
+                                                            n : int] : nil
+    (let [ps     (:: (Pos-storage-of w) (Storage Pos))
+          vs     (:: (Vel-storage-of w) (Storage Vel))
+          ^mut i 0]
+      (while (< i n)
+        (let [s                (slot-new i)
+              p                : Pos
+              (dense-get ps s) v
+              : Vel            (dense-get vs s)]
+          (dense-set! ps
+            s
+            (make-struct Pos (+ (.x p) (* (.x v) DT)) (+ (.y p) (* (.y v) DT)))))
+        (set! i (+ i 1)))))
+  (defn main [] : int
+    (let [w (make-struct GameWorld
+              (vec-new)
+              (:: (dense-new) (Storage Pos))
+              (:: (dense-new) (Storage Vel)))]
+      (do
+        (let [^mut i 0]
+          (while (< i N)
+            (let [e (world-alloc-entity! (.gens w))
+                  f (i->f i)]
+              (dense-set! (.Pos w)
+                (entity-index e)
+                (make-struct Pos (/ f 8.0) (/ f 4.0)))
+              (dense-set! (.Vel w) (entity-index e) (make-struct Vel 1.5 -0.5)))
+            (set! i (+ i 1))))
+        (let [t0 (now-us)]
+          (do
+            (let [^mut frame 0]
+              (while (< frame FRAMES)
+                (do (integrate-poly-hoisted w N) (set! frame (+ frame 1)))))
+            (let [t1       (now-us)
+                  ^mut sum 0.0
+                  ^mut j   0]
               (do
-                (integrate-poly-hoisted w N)
-                (set! frame (+ frame 1)))))
-          (let [t1       (now-us)
-                ^mut sum 0.0
-                ^mut j   0]
-            (do
-              (while (< j N)
-                (let [p : Pos (dense-get (.Pos w) (slot-new j))]
-                  (set! sum (+ sum (+ (.x p) (.y p)))))
-                (set! j (+ j 1)))
-              (println (- t1 t0))
-              (println (checksum sum))
-              0)))))))
-
-) ;; end defmodule integrate_poly_hoisted_bench
+                (while (< j N)
+                  (let [p                                 : Pos
+                        (dense-get (.Pos w) (slot-new j))]
+                    (set! sum (+ sum (+ (.x p) (.y p)))))
+                  (set! j (+ j 1)))
+                (println (- t1 t0))
+                (println (checksum sum))
+                0)))))))) ;; end defmodule integrate_poly_hoisted_bench

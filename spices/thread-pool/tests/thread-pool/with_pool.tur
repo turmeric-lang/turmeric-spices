@@ -12,52 +12,44 @@
 ;; a typed inline `(fn [x : int] ...)`, so name the callback and pass the name.
 ;;
 ;; main returns the failed-assertion count.
-
 (defmodule thread-pool/tests/with_pool
-  (import thread-pool/pool  :refer [Pool pool-new pool-submit])
+  (import thread-pool/pool :refer [Pool pool-new pool-submit])
   (import thread-pool/scope :refer [with-pool])
-
-```c
-#include <pthread.h>
+  ```c
+  #include <pthread.h>
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static long g_sum = 0;
 ```
-(defn acc-reset [] : void ```c pthread_mutex_lock(&g_mu); g_sum = 0; pthread_mutex_unlock(&g_mu); ```)
-(defn acc-bump [v : int] : void ```c pthread_mutex_lock(&g_mu); g_sum += v; pthread_mutex_unlock(&g_mu); ```)
-(defn acc-sum [] : int ```c long v; pthread_mutex_lock(&g_mu); v = g_sum; pthread_mutex_unlock(&g_mu); return (int)v; ```)
-
-;; Named worker callbacks (each pins T = int for its pool).
-(defn worker-a [x : int] : void (acc-bump x))
-(defn worker-b [y : int] : void (acc-bump y))
-
-(defn fail-if [cond : bool label : cstr] : int
-  (if cond (do (println label) 1) 0))
-
-(defn submit-n [^borrow p : (Pool int) n : int] : void
-  (when (> n 0) (do (pool-submit p 1) (submit-n p (- n 1)))))
-
-(defn main [] : int
-  (let [;; 1. Scope-exit stops the pool; the body value (here, 7) flows out.
-        f1 (do
-             (acc-reset)
-             (let [v (with-pool [p (pool-new 4 worker-a)]
-                       (submit-n p 250)
-                       7)]
-               (+ (fail-if (not= v 7)          "FAIL: with-pool body value")
-                  (fail-if (not= (acc-sum) 250) "FAIL: with-pool did not drain"))))
-        ;; 2. Nested with-pool: inner pool inside the outer pool's scope.
-        f2 (do
-             (acc-reset)
-             (with-pool [outer (pool-new 2 worker-a)]
-               (submit-n outer 100)
-               (with-pool [inner (pool-new 2 worker-b)]
-                 (submit-n inner 50)
-                 0))
-             (fail-if (not= (acc-sum) 150) "FAIL: nested with-pool drain"))
-        f (+ f1 f2)]
-    (if (= f 0)
-      (println "PASS with_pool")
-      (println "with_pool: failures above"))
-    f))
-
-) ;; end defmodule thread-pool/tests/with_pool
+  (defn acc-reset [] : void
+    ```c pthread_mutex_lock(&g_mu); g_sum = 0; pthread_mutex_unlock(&g_mu); ```)
+  (defn acc-bump [v : int] : void
+    ```c pthread_mutex_lock(&g_mu); g_sum += v; pthread_mutex_unlock(&g_mu); ```)
+  (defn acc-sum [] : int
+    ```c long v; pthread_mutex_lock(&g_mu); v = g_sum; pthread_mutex_unlock(&g_mu); return (int)v; ```)
+  ;; Named worker callbacks (each pins T = int for its pool).
+  (defn worker-a [x : int] : void (acc-bump x))
+  (defn worker-b [y : int] : void (acc-bump y))
+  (defn fail-if [cond : bool label : cstr] : int
+    (if cond (do (println label) 1) 0))
+  (defn submit-n [^borrow p : (Pool int) n : int] : void
+    (when (> n 0) (do (pool-submit p 1) (submit-n p (- n 1)))))
+  (defn main [] : int
+    (let [ ;; 1. Scope-exit stops the pool; the body value (here, 7) flows out.
+          f1 (do
+               (acc-reset)
+               (let [v (with-pool [p (pool-new 4 worker-a)] (submit-n p 250) 7)]
+                 (+ (fail-if (not= v 7) "FAIL: with-pool body value")
+                   (fail-if (not= (acc-sum) 250)
+                     "FAIL: with-pool did not drain"))))
+          ;; 2. Nested with-pool: inner pool inside the outer pool's scope.
+          f2 (do
+               (acc-reset)
+               (with-pool [outer (pool-new 2 worker-a)]
+                 (submit-n outer 100)
+                 (with-pool [inner (pool-new 2 worker-b)] (submit-n inner 50) 0))
+               (fail-if (not= (acc-sum) 150) "FAIL: nested with-pool drain"))
+          f  (+ f1 f2)]
+      (if (= f 0)
+        (println "PASS with_pool")
+        (println "with_pool: failures above"))
+      f))) ;; end defmodule thread-pool/tests/with_pool

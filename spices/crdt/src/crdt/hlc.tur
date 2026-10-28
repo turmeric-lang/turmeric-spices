@@ -27,193 +27,190 @@
 
 (defmodule crdt/hlc
   (import crdt/replica :refer [ReplicaId replica-sym])
-  (export Hlc hlc-zero hlc-wall hlc-logical hlc-replica
-          hlc-tick hlc-recv hlc-after? hlc-max-drift hlc-later)
-
-;;; Hlc -- a hybrid logical clock stamp.
-;;;
-;;; Since: crdt-spice-plan C3
-(defstruct Hlc [wall : int logical : int replica : ReplicaId])
-
-;;; hlc-max-drift -- how far ahead of local wall time a remote stamp may be.
-;;;
-;;; Returns:
-;;;   The bound, in the same unit the caller uses for wall time.
-;;;
-;;; Example:
-;;;   (hlc-max-drift)   ; => 60000
-;;;
-;;; Since: crdt-spice-plan C3
-;;
-;; A stamp further ahead than this is not merged into the local clock -- the
-;; remote's clock is wrong, and adopting it would drag this replica's clock
-;; forward permanently, which nothing walks back.  An HLC whose wall component
-;; runs away from real time is a correctness problem that looks like nothing
-;; until a restart, so the bound ships with the clock rather than later.
-(defn hlc-max-drift [] : int 60000)
-
-;;; hlc-zero -- a fresh clock for a replica.
-;;;
-;;; Parameters:
-;;;   r -- the replica
-;;;
-;;; Returns:
-;;;   A stamp at wall 0, logical 0.
-;;;
-;;; Example:
-;;;   (hlc-zero (replica (quote alice)))
-;;;
-;;; Since: crdt-spice-plan C3
-(defn hlc-zero [r : ReplicaId] : Hlc (Hlc 0 0 r))
-
-;;; hlc-wall -- the wall component.
-;;;
-;;; Parameters:
-;;;   h -- the stamp
-;;;
-;;; Returns:
-;;;   Its wall time.
-;;;
-;;; Example:
-;;;   (hlc-wall h)   ; => 1000
-;;;
-;;; Since: crdt-spice-plan C3
-(defn hlc-wall [^borrow h : Hlc] : int (.wall h))
-
-;;; hlc-logical -- the logical counter.
-;;;
-;;; Parameters:
-;;;   h -- the stamp
-;;;
-;;; Returns:
-;;;   Its logical component.
-;;;
-;;; Example:
-;;;   (hlc-logical h)   ; => 2
-;;;
-;;; Since: crdt-spice-plan C3
-(defn hlc-logical [^borrow h : Hlc] : int (.logical h))
-
-;;; hlc-replica -- the replica that issued the stamp.
-;;;
-;;; Parameters:
-;;;   h -- the stamp
-;;;
-;;; Returns:
-;;;   Its replica.
-;;;
-;;; Example:
-;;;   (replica-sym (hlc-replica h))   ; => alice
-;;;
-;;; Since: crdt-spice-plan C3
-(defn hlc-replica [^borrow h : Hlc] : ReplicaId (.replica h))
-
-;;; hlc-tick -- stamp a local event.
-;;;
-;;; Parameters:
-;;;   h   -- the replica's current clock
-;;;   now -- current wall time
-;;;
-;;; Returns:
-;;;   A stamp strictly after h.
-;;;
-;;; Example:
-;;;   (hlc-tick (hlc-zero (replica (quote alice))) 1000)
-;;;
-;;; Since: crdt-spice-plan C3
-;;
-;; When the wall clock has moved, the logical counter RESETS to 0; when it has
-;; not (two events in the same millisecond, or a clock that went backwards),
-;; the counter advances instead.  That is what keeps the stamp strictly
-;; increasing without trusting the wall clock to be monotonic.
-(defn hlc-tick [^borrow h : Hlc now : int] : Hlc
-  (if (> now (.wall h))
-    (Hlc now 0 (.replica h))
-    (Hlc (.wall h) (+ 1 (.logical h)) (.replica h))))
-
-;;; hlc-recv -- advance the local clock on receiving a remote stamp.
-;;;
-;;; Parameters:
-;;;   h   -- the replica's current clock
-;;;   m   -- the remote stamp
-;;;   now -- current wall time
-;;;
-;;; Returns:
-;;;   A stamp at least as large as both h and m.
-;;;
-;;; Example:
-;;;   (hlc-recv mine theirs 1000)
-;;;
-;;; Since: crdt-spice-plan C3
-;;
-;; A remote stamp further ahead than hlc-max-drift is IGNORED for the wall
-;; component -- see that function.  The local clock still ticks, so the event is
-;; ordered; it just does not inherit a wrong clock.
-(defn hlc-recv [^borrow h : Hlc ^borrow m : Hlc now : int] : Hlc
-  (let [usable (if (> (.wall m) (+ now (hlc-max-drift))) 0 (.wall m))
-        hi     (if (> (.wall h) usable) (.wall h) usable)
-        top    (if (> now hi) now hi)]
-    (if (> top hi)
-      (Hlc top 0 (.replica h))
-      (if (= (.wall h) usable)
-        (Hlc hi (+ 1 (if (> (.logical h) (.logical m)) (.logical h) (.logical m)))
-             (.replica h))
-        (if (> (.wall h) usable)
-          (Hlc hi (+ 1 (.logical h)) (.replica h))
-          (Hlc hi (+ 1 (.logical m)) (.replica h)))))))
-
-;;; hlc-after? -- is a strictly later than b in the total order?
-;;;
-;;; Parameters:
-;;;   a -- first stamp
-;;;   b -- second stamp
-;;;
-;;; Returns:
-;;;   true when a > b by (wall, logical, replica).
-;;;
-;;; Example:
-;;;   (hlc-after? later earlier)   ; => true
-;;;
-;;; Since: crdt-spice-plan C3
-;;
-;; The replica tiebreak is what makes this a TOTAL order.  Without it two
-;; replicas writing in the same millisecond with the same logical counter would
-;; be incomparable, and an LWW register would have to pick arbitrarily -- which
-;; is to say, differently on each replica.  Comparing interned names by their
-;; string form keeps the choice the same everywhere.
-(defn hlc-after? [^borrow a : Hlc ^borrow b : Hlc] : bool
-  (if (> (.wall a) (.wall b))
-    true
-    (if (< (.wall a) (.wall b))
-      false
-      (if (> (.logical a) (.logical b))
-        true
-        (if (< (.logical a) (.logical b))
-          false
-          (gt? (sym->str (replica-sym (.replica a)))
-               (sym->str (replica-sym (.replica b)))))))))
-
-;;; hlc-later -- the later of two stamps.
-;;;
-;;; Parameters:
-;;;   a -- first stamp
-;;;   b -- second stamp
-;;;
-;;; Returns:
-;;;   Whichever is later in the total order.
-;;;
-;;; Example:
-;;;   (hlc-later mine theirs)
-;;;
-;;; Since: crdt-spice-plan C3
-;;
-;; Lives here rather than at the call site because a `defstruct` constructor is
-;; not visible across a module boundary -- `crdt/register` importing the `Hlc`
-;; TYPE does not bring `ctor_Hlc_Hlc` with it, and building one there fails to
-;; compile.  Every Hlc is therefore built by this module.
-(defn hlc-later [^borrow a : Hlc ^borrow b : Hlc] : Hlc
-  (if (hlc-after? a b)
-    (Hlc (.wall a) (.logical a) (.replica a))
-    (Hlc (.wall b) (.logical b) (.replica b))))
-
-) ;; end defmodule crdt/hlc
+  (export Hlc
+    hlc-zero
+    hlc-wall
+    hlc-logical
+    hlc-replica
+    hlc-tick
+    hlc-recv
+    hlc-after?
+    hlc-max-drift
+    hlc-later)
+  ;;; Hlc -- a hybrid logical clock stamp.
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defstruct Hlc [wall : int logical : int replica : ReplicaId])
+  ;;; hlc-max-drift -- how far ahead of local wall time a remote stamp may be.
+  ;;;
+  ;;; Returns:
+  ;;;   The bound, in the same unit the caller uses for wall time.
+  ;;;
+  ;;; Example:
+  ;;;   (hlc-max-drift)   ; => 60000
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  ;;
+  ;; A stamp further ahead than this is not merged into the local clock -- the
+  ;; remote's clock is wrong, and adopting it would drag this replica's clock
+  ;; forward permanently, which nothing walks back.  An HLC whose wall component
+  ;; runs away from real time is a correctness problem that looks like nothing
+  ;; until a restart, so the bound ships with the clock rather than later.
+  (defn hlc-max-drift [] : int 60000)
+  ;;; hlc-zero -- a fresh clock for a replica.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- the replica
+  ;;;
+  ;;; Returns:
+  ;;;   A stamp at wall 0, logical 0.
+  ;;;
+  ;;; Example:
+  ;;;   (hlc-zero (replica (quote alice)))
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn hlc-zero [r : ReplicaId] : Hlc (Hlc 0 0 r))
+  ;;; hlc-wall -- the wall component.
+  ;;;
+  ;;; Parameters:
+  ;;;   h -- the stamp
+  ;;;
+  ;;; Returns:
+  ;;;   Its wall time.
+  ;;;
+  ;;; Example:
+  ;;;   (hlc-wall h)   ; => 1000
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn hlc-wall [^borrow h : Hlc] : int (.wall h))
+  ;;; hlc-logical -- the logical counter.
+  ;;;
+  ;;; Parameters:
+  ;;;   h -- the stamp
+  ;;;
+  ;;; Returns:
+  ;;;   Its logical component.
+  ;;;
+  ;;; Example:
+  ;;;   (hlc-logical h)   ; => 2
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn hlc-logical [^borrow h : Hlc] : int (.logical h))
+  ;;; hlc-replica -- the replica that issued the stamp.
+  ;;;
+  ;;; Parameters:
+  ;;;   h -- the stamp
+  ;;;
+  ;;; Returns:
+  ;;;   Its replica.
+  ;;;
+  ;;; Example:
+  ;;;   (replica-sym (hlc-replica h))   ; => alice
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn hlc-replica [^borrow h : Hlc] : ReplicaId (.replica h))
+  ;;; hlc-tick -- stamp a local event.
+  ;;;
+  ;;; Parameters:
+  ;;;   h   -- the replica's current clock
+  ;;;   now -- current wall time
+  ;;;
+  ;;; Returns:
+  ;;;   A stamp strictly after h.
+  ;;;
+  ;;; Example:
+  ;;;   (hlc-tick (hlc-zero (replica (quote alice))) 1000)
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  ;;
+  ;; When the wall clock has moved, the logical counter RESETS to 0; when it has
+  ;; not (two events in the same millisecond, or a clock that went backwards),
+  ;; the counter advances instead.  That is what keeps the stamp strictly
+  ;; increasing without trusting the wall clock to be monotonic.
+  (defn hlc-tick [^borrow h : Hlc now : int] : Hlc
+    (if (> now (.wall h))
+      (Hlc now 0 (.replica h))
+      (Hlc (.wall h) (+ 1 (.logical h)) (.replica h))))
+  ;;; hlc-recv -- advance the local clock on receiving a remote stamp.
+  ;;;
+  ;;; Parameters:
+  ;;;   h   -- the replica's current clock
+  ;;;   m   -- the remote stamp
+  ;;;   now -- current wall time
+  ;;;
+  ;;; Returns:
+  ;;;   A stamp at least as large as both h and m.
+  ;;;
+  ;;; Example:
+  ;;;   (hlc-recv mine theirs 1000)
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  ;;
+  ;; A remote stamp further ahead than hlc-max-drift is IGNORED for the wall
+  ;; component -- see that function.  The local clock still ticks, so the event is
+  ;; ordered; it just does not inherit a wrong clock.
+  (defn hlc-recv [^borrow h : Hlc ^borrow m : Hlc now : int] : Hlc
+    (let [usable (if (> (.wall m) (+ now (hlc-max-drift))) 0 (.wall m))
+          hi     (if (> (.wall h) usable) (.wall h) usable)
+          top    (if (> now hi) now hi)]
+      (if (> top hi)
+        (Hlc top 0 (.replica h))
+        (if (= (.wall h) usable)
+          (Hlc hi
+            (+ 1 (if (> (.logical h) (.logical m)) (.logical h) (.logical m)))
+            (.replica h))
+          (if (> (.wall h) usable)
+            (Hlc hi (+ 1 (.logical h)) (.replica h))
+            (Hlc hi (+ 1 (.logical m)) (.replica h)))))))
+  ;;; hlc-after? -- is a strictly later than b in the total order?
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- first stamp
+  ;;;   b -- second stamp
+  ;;;
+  ;;; Returns:
+  ;;;   true when a > b by (wall, logical, replica).
+  ;;;
+  ;;; Example:
+  ;;;   (hlc-after? later earlier)   ; => true
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  ;;
+  ;; The replica tiebreak is what makes this a TOTAL order.  Without it two
+  ;; replicas writing in the same millisecond with the same logical counter would
+  ;; be incomparable, and an LWW register would have to pick arbitrarily -- which
+  ;; is to say, differently on each replica.  Comparing interned names by their
+  ;; string form keeps the choice the same everywhere.
+  (defn hlc-after? [^borrow a : Hlc ^borrow b : Hlc] : bool
+    (if (> (.wall a) (.wall b))
+      true
+      (if (< (.wall a) (.wall b))
+        false
+        (if (> (.logical a) (.logical b))
+          true
+          (if (< (.logical a) (.logical b))
+            false
+            (gt? (sym->str (replica-sym (.replica a)))
+              (sym->str (replica-sym (.replica b)))))))))
+  ;;; hlc-later -- the later of two stamps.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- first stamp
+  ;;;   b -- second stamp
+  ;;;
+  ;;; Returns:
+  ;;;   Whichever is later in the total order.
+  ;;;
+  ;;; Example:
+  ;;;   (hlc-later mine theirs)
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  ;;
+  ;; Lives here rather than at the call site because a `defstruct` constructor is
+  ;; not visible across a module boundary -- `crdt/register` importing the `Hlc`
+  ;; TYPE does not bring `ctor_Hlc_Hlc` with it, and building one there fails to
+  ;; compile.  Every Hlc is therefore built by this module.
+  (defn hlc-later [^borrow a : Hlc ^borrow b : Hlc] : Hlc
+    (if (hlc-after? a b)
+      (Hlc (.wall a) (.logical a) (.replica a))
+      (Hlc (.wall b) (.logical b) (.replica b))))) ;; end defmodule crdt/hlc

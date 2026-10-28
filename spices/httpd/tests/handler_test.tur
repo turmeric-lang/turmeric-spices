@@ -5,59 +5,53 @@
 ;; the captureless trampoline and wires it to `server-start`). The round-trip
 ;; goes through the default pool dispatcher, same as echo_test, but the
 ;; handler is selected by typeclass dispatch rather than a bare `(c-fn ...)`.
-
 (defmodule httpd/tests/handler
-  (import httpd/handler  :refer [serve])
-  (import httpd/request  :refer [req-method req-path])
+  (import httpd/handler :refer [serve])
+  (import httpd/request :refer [req-method req-path])
   (import httpd/response :refer [resp-ok not-found])
-  (import httpd/server   :refer [server-stop])
-  (import httpd/types    :refer [Request Response])
-  (import http/client    :refer [http-get http-result-free])
-  (import http/response  :refer [response-status response-body response-header])
-  (import test/suite     :refer [describe it])
-  (import test/assert    :refer [assert-eq assert-true])
-  (import test/runner    :refer [run-all-status])
-
+  (import httpd/server :refer [server-stop])
+  (import httpd/types :refer [Request Response])
+  (import http/client :refer [http-get http-result-free])
+  (import http/response :refer [response-status response-body response-header])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-eq assert-true])
+  (import test/runner :refer [run-all-status])
   ;; ---------------------------------------------------------------------
   ;; Helpers: unwrap http/client's result<:int> and compare cstr equality.
   ;; ---------------------------------------------------------------------
-
   (defn __cr-ok? [r : ptr<void>] : bool
     ```c
     return tur_is_ok((int64_t)(intptr_t)r);
     ```)
-
   (defn __cr-val [r : ptr<void>] : int
     ```c
     return tur_ok_value((int64_t)(intptr_t)r);
     ```)
-
   (defn cstr-eq? [a : cstr b : cstr] : bool
     ```c
     #include <string.h>
     return strcmp((const char *)a, (const char *)b) == 0;
     ```)
-
   ;; ---------------------------------------------------------------------
   ;; Client result readers: read one thing, then free the result (the http
   ;; spice's http-result-free also frees the strings read from it).
   ;; ---------------------------------------------------------------------
-
   (defn status-of [r : ptr<void>] : int
     (let [s (if (__cr-ok? r) (response-status (__cr-val r)) -1)]
       (http-result-free r)
       s))
-
   (defn body-is? [r : ptr<void> want : cstr] : bool
-    (let [ok (if (__cr-ok? r) (cstr-eq? want (response-body (__cr-val r))) false)]
+    (let [ok (if (__cr-ok? r)
+               (cstr-eq? want (response-body (__cr-val r)))
+               false)]
       (http-result-free r)
       ok))
-
   (defn header-is? [r : ptr<void> name : cstr want : cstr] : bool
-    (let [ok (if (__cr-ok? r) (cstr-eq? want (response-header (__cr-val r) name)) false)]
+    (let [ok (if (__cr-ok? r)
+               (cstr-eq? want (response-header (__cr-val r) name))
+               false)]
       (http-result-free r)
       ok))
-
   ;; Local "<method> <path>" join -- stdlib/str-concat trips the elaborator
   ;; when reached transitively through several spices, so inline a tiny
   ;; purpose-built helper (mirrors echo_test).
@@ -75,16 +69,14 @@
     out[ml + 1 + pl] = '\0';
     return out;
     ```)
-
-  (defn cstr-free [s : cstr] : void
-    ```c free((void *)s); ```)
-
-  (defn sleep-ms [ms : int] #fx{Unsafe} : void
+  (defn cstr-free [s : cstr] : void ```c free((void *)s); ```)
+  (defn sleep-ms [ms : int]
+    #fx{Unsafe}
+    : void
     ```c
     #include <unistd.h>
     if (ms > 0) usleep((useconds_t)ms * 1000u);
     ```)
-
   ;; ---------------------------------------------------------------------
   ;; Typed handler: an opaque witness with a Handler instance.
   ;;
@@ -93,9 +85,7 @@
   ;; "<METHOD> <PATH>" with a 404, proving the handler reads the Request
   ;; and chooses a Response by type, not by an int tag.
   ;; ---------------------------------------------------------------------
-
   (defopaque Echo :int)
-
   (definstance Handler [Echo]
     (respond [self req]
       (let [r (:: req :Request)]
@@ -105,33 +95,29 @@
                 resp (not-found body)]
             (cstr-free body)
             resp)))))
-
   ;; ---------------------------------------------------------------------
   ;; Test driver -- `serve` generates the trampoline + starts the server.
   ;; ---------------------------------------------------------------------
-
   (defn main [] : int
     (let [srv (serve 18083 Echo)]
       (do
         (unsafe (sleep-ms 50))
-
         (describe "httpd Handler typeclass -- serve bridge"
-
           (it "GET /health returns 200"
-            (assert-eq 200 (status-of (http-get "http://127.0.0.1:18083/health"))))
-
+            (assert-eq 200
+              (status-of (http-get "http://127.0.0.1:18083/health"))))
           (it "GET /health body is 'ok'"
-            (assert-true (body-is? (http-get "http://127.0.0.1:18083/health") "ok")))
-
+            (assert-true (body-is? (http-get "http://127.0.0.1:18083/health")
+                           "ok")))
           (it "GET /missing returns 404"
-            (assert-eq 404 (status-of (http-get "http://127.0.0.1:18083/missing"))))
-
+            (assert-eq 404
+              (status-of (http-get "http://127.0.0.1:18083/missing"))))
           (it "GET /missing echoes 'GET /missing'"
-            (assert-true (body-is? (http-get "http://127.0.0.1:18083/missing") "GET /missing")))
-
+            (assert-true (body-is? (http-get "http://127.0.0.1:18083/missing")
+                           "GET /missing")))
           (it "Content-Type is text/plain"
-            (assert-true (header-is? (http-get "http://127.0.0.1:18083/health") "Content-Type" "text/plain"))))
-
-        (server-stop srv)
-        ))
+            (assert-true (header-is? (http-get "http://127.0.0.1:18083/health")
+                           "Content-Type"
+                           "text/plain"))))
+        (server-stop srv)))
     (run-all-status)))

@@ -50,153 +50,211 @@
 ;; the flat builders already fully parenthesize every binop/unop, no precedence
 ;; threading is needed to match their output, which also sidesteps the
 ;; function-typed-carrier lowering edge the regex matcher hit.
-
 (defmodule c-dsl/ir
-  (export CNodeF CNode
-          ;; expression smart constructors
-          ce-raw ce-var ce-lit ce-binop ce-unop ce-addr ce-deref
-          ce-ternary ce-index ce-cast
-          ;; statement smart constructors
-          cs-raw cs-expr cs-return cs-return-void cs-set cs-if cs-if-only
-          cs-while cs-do-while cs-seq
-          ;; catamorphism driver + folds
-          node-cata node->c node-size)
-
-  (import c-dsl/codegen :refer [c-cat2 c-cat3 c-indent
-                                 c-sprintf1 c-sprintf2 c-sprintf3])
-  (import c-dsl/types   :refer [c-type])
-
+  (export CNodeF
+    CNode
+    ;; expression smart constructors
+    ce-raw
+    ce-var
+    ce-lit
+    ce-binop
+    ce-unop
+    ce-addr
+    ce-deref
+    ce-ternary
+    ce-index
+    ce-cast
+    ;; statement smart constructors
+    cs-raw
+    cs-expr
+    cs-return
+    cs-return-void
+    cs-set
+    cs-if
+    cs-if-only
+    cs-while
+    cs-do-while
+    cs-seq
+    ;; catamorphism driver + folds
+    node-cata
+    node->c
+    node-size)
+  (import c-dsl/codegen
+    :refer
+    [c-cat2 c-cat3 c-indent c-sprintf1 c-sprintf2 c-sprintf3])
+  (import c-dsl/types :refer [c-type])
   ;; --- one layer of a c-dsl AST -------------------------------------------
   ;; A single tagged union over expressions and statements. `:copy` so an
   ;; immutable AST value can be folded more than once (the nodes are heap
   ;; pointers into an immutable tree; copying the handle is sound). Every
   ;; recursive child sits in a by-value `a` position.
-  (defdata ^copy CNodeF [a]
+  (defdata ^copy CNodeF
+    [a]
     ;; --- expression nodes ---
-    (CRawF  :cstr)     ;; verbatim leaf: identifier, literal, or pre-rendered call
-    (CBinF  :cstr a a) ;; (lhs op rhs)         -- op is the operator cstr
-    (CUnF   :cstr a)   ;; (op operand)         -- prefix &, *, !, -, ~, ...
-    (CTernF a a a)     ;; (cond ? then : else)
-    (CIdxF  a a)       ;; arr[idx]
-    (CCastF :cstr a)   ;; ((type)operand)      -- type already c-type-resolved
+    (CRawF :cstr) ;; verbatim leaf: identifier, literal, or pre-rendered call
+    (CBinF :cstr a a) ;; (lhs op rhs)         -- op is the operator cstr
+    (CUnF :cstr a) ;; (op operand)         -- prefix &, *, !, -, ~, ...
+    (CTernF a a a) ;; (cond ? then : else)
+    (CIdxF a a) ;; arr[idx]
+    (CCastF :cstr a) ;; ((type)operand)      -- type already c-type-resolved
     ;; --- statement nodes ---
-    (CRawSF      :cstr) ;; verbatim statement (escape hatch / leaf)
-    (CExprSF     a)     ;; <expr>;
-    (CReturnSF   a)     ;; return <expr>;
-    (CReturnVoidSF)     ;; return;
-    (CSetSF      a a)   ;; <lhs> = <rhs>;
-    (CIfSF       a a a) ;; if (c) { then } else { else }
-    (CIfOnlySF   a a)   ;; if (c) { then }
-    (CWhileSF    a a)   ;; while (c) { body }
-    (CDoWhileSF  a a)   ;; do { body } while (c);
-    (CSeqSF      a a))  ;; two statements joined by a newline
-
+    (CRawSF :cstr) ;; verbatim statement (escape hatch / leaf)
+    (CExprSF a) ;; <expr>;
+    (CReturnSF a) ;; return <expr>;
+    (CReturnVoidSF) ;; return;
+    (CSetSF a a) ;; <lhs> = <rhs>;
+    (CIfSF a a a) ;; if (c) { then } else { else }
+    (CIfOnlySF a a) ;; if (c) { then }
+    (CWhileSF a a) ;; while (c) { body }
+    (CDoWhileSF a a) ;; do { body } while (c);
+    (CSeqSF a a)) ;; two statements joined by a newline
   ;; --- by-value fixed point:  CNode ~= CNodeF CNode -----------------------
   (defdata ^copy CNode (Roll (CNodeF CNode)))
-
   ;; --- Functor: map over the recursive positions --------------------------
   (definstance Functor [CNodeF]
     (fmap [c g]
       (match c
-        (CRawF s)         (CRawF s)
-        (CBinF op a b)    (CBinF op (g a) (g b))
-        (CUnF op a)       (CUnF op (g a))
-        (CTernF a b d)    (CTernF (g a) (g b) (g d))
-        (CIdxF a b)       (CIdxF (g a) (g b))
-        (CCastF t a)      (CCastF t (g a))
-        (CRawSF s)        (CRawSF s)
-        (CExprSF a)       (CExprSF (g a))
-        (CReturnSF a)     (CReturnSF (g a))
-        (CReturnVoidSF)   (CReturnVoidSF)
-        (CSetSF a b)      (CSetSF (g a) (g b))
-        (CIfSF a b d)     (CIfSF (g a) (g b) (g d))
-        (CIfOnlySF a b)   (CIfOnlySF (g a) (g b))
-        (CWhileSF a b)    (CWhileSF (g a) (g b))
-        (CDoWhileSF a b)  (CDoWhileSF (g a) (g b))
-        (CSeqSF a b)      (CSeqSF (g a) (g b)))))
-
+        (CRawF s)
+        (CRawF s)
+        (CBinF op a b)
+        (CBinF op (g a) (g b))
+        (CUnF op a)
+        (CUnF op (g a))
+        (CTernF a b d)
+        (CTernF (g a) (g b) (g d))
+        (CIdxF a b)
+        (CIdxF (g a) (g b))
+        (CCastF t a)
+        (CCastF t (g a))
+        (CRawSF s)
+        (CRawSF s)
+        (CExprSF a)
+        (CExprSF (g a))
+        (CReturnSF a)
+        (CReturnSF (g a))
+        (CReturnVoidSF)
+        (CReturnVoidSF)
+        (CSetSF a b)
+        (CSetSF (g a) (g b))
+        (CIfSF a b d)
+        (CIfSF (g a) (g b) (g d))
+        (CIfOnlySF a b)
+        (CIfOnlySF (g a) (g b))
+        (CWhileSF a b)
+        (CWhileSF (g a) (g b))
+        (CDoWhileSF a b)
+        (CDoWhileSF (g a) (g b))
+        (CSeqSF a b)
+        (CSeqSF (g a) (g b)))))
   ;; unwrap one layer, recovering the recursive element type.
   (defn unroll-node [n : CNode] : (CNodeF CNode) (match n (Roll l) l))
-
   ;; --- the generic catamorphism (the U5 ideal) ----------------------------
   ;; cata alg = alg . fmap (cata alg) . unroll
   ;; Polymorphic in the carrier B, so a fold is *just* an F-algebra
   ;; `(CNodeF B) -> B` handed to this single driver -- no per-node scaffolding.
   ;; The `(:: ... (CNodeF B))` ascription pins `fmap`'s result type.
   (defn node-cata [B] [alg : (fn [(CNodeF B)] B) n : CNode] : B
-    (alg (:: (fmap (unroll-node n) (fn [c : CNode] : B (node-cata alg c))) (CNodeF B))))
-
+    (alg (:: (fmap (unroll-node n) (fn [c : CNode] : B (node-cata alg c)))
+           (CNodeF B))))
   ;; --- expression smart constructors --------------------------------------
-  (defn ce-raw     [s : cstr]                      : CNode (Roll (CRawF s)))
-  (defn ce-var     [name : cstr]                   : CNode (Roll (CRawF name)))
-  (defn ce-lit     [s : cstr]                      : CNode (Roll (CRawF s)))
-  (defn ce-binop   [op : cstr a : CNode b : CNode] : CNode (Roll (CBinF op a b)))
-  (defn ce-unop    [op : cstr a : CNode]           : CNode (Roll (CUnF op a)))
-  (defn ce-addr    [a : CNode]                      : CNode (Roll (CUnF "&" a)))
-  (defn ce-deref   [a : CNode]                      : CNode (Roll (CUnF "*" a)))
-  (defn ce-ternary [c : CNode t : CNode e : CNode] : CNode (Roll (CTernF c t e)))
-  (defn ce-index   [a : CNode i : CNode]           : CNode (Roll (CIdxF a i)))
+  (defn ce-raw [s : cstr] : CNode (Roll (CRawF s)))
+  (defn ce-var [name : cstr] : CNode (Roll (CRawF name)))
+  (defn ce-lit [s : cstr] : CNode (Roll (CRawF s)))
+  (defn ce-binop [op : cstr a : CNode b : CNode] : CNode (Roll (CBinF op a b)))
+  (defn ce-unop [op : cstr a : CNode] : CNode (Roll (CUnF op a)))
+  (defn ce-addr [a : CNode] : CNode (Roll (CUnF "&" a)))
+  (defn ce-deref [a : CNode] : CNode (Roll (CUnF "*" a)))
+  (defn ce-ternary [c : CNode t : CNode e : CNode] : CNode
+    (Roll (CTernF c t e)))
+  (defn ce-index [a : CNode i : CNode] : CNode (Roll (CIdxF a i)))
   ;; type keyword is resolved at construction so the algebra stays pure-string;
   ;; mirrors the flat `c-cast`, which applies `c-type` to its type argument.
-  (defn ce-cast    [a : CNode type : cstr]         : CNode (Roll (CCastF (c-type type) a)))
-
+  (defn ce-cast [a : CNode type : cstr] : CNode (Roll (CCastF (c-type type) a)))
   ;; --- statement smart constructors ---------------------------------------
-  (defn cs-raw         [s : cstr]                   : CNode (Roll (CRawSF s)))
-  (defn cs-expr        [e : CNode]                  : CNode (Roll (CExprSF e)))
-  (defn cs-return      [e : CNode]                  : CNode (Roll (CReturnSF e)))
-  (defn cs-return-void []                           : CNode (Roll (CReturnVoidSF)))
-  (defn cs-set         [lhs : CNode rhs : CNode]    : CNode (Roll (CSetSF lhs rhs)))
-  (defn cs-if          [c : CNode t : CNode e : CNode] : CNode (Roll (CIfSF c t e)))
-  (defn cs-if-only     [c : CNode t : CNode]        : CNode (Roll (CIfOnlySF c t)))
-  (defn cs-while       [c : CNode b : CNode]        : CNode (Roll (CWhileSF c b)))
-  (defn cs-do-while    [b : CNode c : CNode]        : CNode (Roll (CDoWhileSF b c)))
-  (defn cs-seq         [a : CNode b : CNode]        : CNode (Roll (CSeqSF a b)))
-
+  (defn cs-raw [s : cstr] : CNode (Roll (CRawSF s)))
+  (defn cs-expr [e : CNode] : CNode (Roll (CExprSF e)))
+  (defn cs-return [e : CNode] : CNode (Roll (CReturnSF e)))
+  (defn cs-return-void [] : CNode (Roll (CReturnVoidSF)))
+  (defn cs-set [lhs : CNode rhs : CNode] : CNode (Roll (CSetSF lhs rhs)))
+  (defn cs-if [c : CNode t : CNode e : CNode] : CNode (Roll (CIfSF c t e)))
+  (defn cs-if-only [c : CNode t : CNode] : CNode (Roll (CIfOnlySF c t)))
+  (defn cs-while [c : CNode b : CNode] : CNode (Roll (CWhileSF c b)))
+  (defn cs-do-while [b : CNode c : CNode] : CNode (Roll (CDoWhileSF b c)))
+  (defn cs-seq [a : CNode b : CNode] : CNode (Roll (CSeqSF a b)))
   ;; --- pretty-print algebra -----------------------------------------------
   ;; Each clause delegates to the same c-sprintf*/c-indent calls the flat
   ;; builder uses, so output is byte-identical to the pre-IR builders.
   (defn node->c-alg [l : (CNodeF cstr)] : cstr
     (match l
       ;; expressions
-      (CRawF s)         s
-      (CBinF op a b)    (c-sprintf3 "(%s %s %s)" a op b)
-      (CUnF op a)       (c-sprintf2 "(%s%s)" op a)
-      (CTernF c t e)    (c-sprintf3 "(%s ? %s : %s)" c t e)
-      (CIdxF a i)       (c-sprintf2 "%s[%s]" a i)
-      (CCastF t a)      (c-sprintf2 "((%s)%s)" t a)
+      (CRawF s)
+      s
+      (CBinF op a b)
+      (c-sprintf3 "(%s %s %s)" a op b)
+      (CUnF op a)
+      (c-sprintf2 "(%s%s)" op a)
+      (CTernF c t e)
+      (c-sprintf3 "(%s ? %s : %s)" c t e)
+      (CIdxF a i)
+      (c-sprintf2 "%s[%s]" a i)
+      (CCastF t a)
+      (c-sprintf2 "((%s)%s)" t a)
       ;; statements
-      (CRawSF s)        s
-      (CExprSF e)       (c-cat2 e ";")
-      (CReturnSF e)     (c-sprintf1 "return %s;" e)
-      (CReturnVoidSF)   "return;"
-      (CSetSF l2 r)     (c-sprintf2 "%s = %s;" l2 r)
-      (CIfSF c t e)     (c-sprintf3 "if (%s) {\n%s\n} else {\n%s\n}" c (c-indent t) (c-indent e))
-      (CIfOnlySF c t)   (c-sprintf2 "if (%s) {\n%s\n}" c (c-indent t))
-      (CWhileSF c b)    (c-sprintf2 "while (%s) {\n%s\n}" c (c-indent b))
-      (CDoWhileSF b c)  (c-sprintf2 "do {\n%s\n} while (%s);" (c-indent b) c)
-      (CSeqSF a b)      (c-cat3 a "\n" b)))
+      (CRawSF s)
+      s
+      (CExprSF e)
+      (c-cat2 e ";")
+      (CReturnSF e)
+      (c-sprintf1 "return %s;" e)
+      (CReturnVoidSF)
+      "return;"
+      (CSetSF l2 r)
+      (c-sprintf2 "%s = %s;" l2 r)
+      (CIfSF c t e)
+      (c-sprintf3 "if (%s) {\n%s\n} else {\n%s\n}" c (c-indent t) (c-indent e))
+      (CIfOnlySF c t)
+      (c-sprintf2 "if (%s) {\n%s\n}" c (c-indent t))
+      (CWhileSF c b)
+      (c-sprintf2 "while (%s) {\n%s\n}" c (c-indent b))
+      (CDoWhileSF b c)
+      (c-sprintf2 "do {\n%s\n} while (%s);" (c-indent b) c)
+      (CSeqSF a b)
+      (c-cat3 a "\n" b)))
   (defn node->c [n : CNode] : cstr (node-cata node->c-alg n))
-
   ;; --- a second fold, to show the driver is generic over the carrier ------
   ;; node count -- an int-carrier F-algebra over the same node-cata driver.
   (defn node-size-alg [l : (CNodeF int)] : int
     (match l
-      (CRawF s)         1
-      (CBinF op a b)    (+ 1 (+ a b))
-      (CUnF op a)       (+ 1 a)
-      (CTernF a b d)    (+ 1 (+ a (+ b d)))
-      (CIdxF a b)       (+ 1 (+ a b))
-      (CCastF t a)      (+ 1 a)
-      (CRawSF s)        1
-      (CExprSF e)       (+ 1 e)
-      (CReturnSF e)     (+ 1 e)
-      (CReturnVoidSF)   1
-      (CSetSF a b)      (+ 1 (+ a b))
-      (CIfSF a b d)     (+ 1 (+ a (+ b d)))
-      (CIfOnlySF a b)   (+ 1 (+ a b))
-      (CWhileSF a b)    (+ 1 (+ a b))
-      (CDoWhileSF a b)  (+ 1 (+ a b))
-      (CSeqSF a b)      (+ a b)))
-  (defn node-size [n : CNode] : int (node-cata node-size-alg n))
-
-) ;; end defmodule c-dsl/ir
+      (CRawF s)
+      1
+      (CBinF op a b)
+      (+ 1 (+ a b))
+      (CUnF op a)
+      (+ 1 a)
+      (CTernF a b d)
+      (+ 1 (+ a (+ b d)))
+      (CIdxF a b)
+      (+ 1 (+ a b))
+      (CCastF t a)
+      (+ 1 a)
+      (CRawSF s)
+      1
+      (CExprSF e)
+      (+ 1 e)
+      (CReturnSF e)
+      (+ 1 e)
+      (CReturnVoidSF)
+      1
+      (CSetSF a b)
+      (+ 1 (+ a b))
+      (CIfSF a b d)
+      (+ 1 (+ a (+ b d)))
+      (CIfOnlySF a b)
+      (+ 1 (+ a b))
+      (CWhileSF a b)
+      (+ 1 (+ a b))
+      (CDoWhileSF a b)
+      (+ 1 (+ a b))
+      (CSeqSF a b)
+      (+ a b)))
+  (defn node-size [n : CNode] : int (node-cata node-size-alg n))) ;; end defmodule c-dsl/ir

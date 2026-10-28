@@ -1,88 +1,122 @@
 ;;; notebook/tui -- command-mode terminal UI for .tur.md notebooks.
 ;; notebook/tui -- focus navigation, per-cell execution, and notebook redraws.
-
 (defmodule notebook/tui
-  (import notebook/format :refer [parse-file node-tag node-cell nodes->str nodes-update-cell nodes-free])
-  (import notebook/cell :refer [cell-make cells-assign-ids cell-id cell-lang cell-source
-                                cell-attrs cell-start-line cell-end-line cell-free attrs-copy])
-  (import notebook/session :refer [session-open-for session-close session-reset
-                                   cell-output-status cell-output-elapsed-ms cell-output-stdout
-                                   cell-output-value-repr cell-output-error-msg cell-output-free])
+  (import notebook/format
+    :refer
+    [parse-file node-tag node-cell nodes->str nodes-update-cell nodes-free])
+  (import notebook/cell
+    :refer
+    [cell-make
+     cells-assign-ids
+     cell-id
+     cell-lang
+     cell-source
+     cell-attrs
+     cell-start-line
+     cell-end-line
+     cell-free
+     attrs-copy])
+  (import notebook/session
+    :refer
+    [session-open-for
+     session-close
+     session-reset
+     cell-output-status
+     cell-output-elapsed-ms
+     cell-output-stdout
+     cell-output-value-repr
+     cell-output-error-msg
+     cell-output-free])
   (import notebook/eval :refer [eval-cell eval-all outputs-free])
-  (import ansi/term  :refer [term-enable-raw term-disable-raw term-read-key])
+  (import ansi/term :refer [term-enable-raw term-disable-raw term-read-key])
   (import ansi/style :refer [style-reset])
-  (import notebook/keys :refer [default-keybindings load-keybindings action-dispatch keybindings-free])
+  (import notebook/keys
+    :refer
+    [default-keybindings load-keybindings action-dispatch keybindings-free])
   (export tui-opts-free tui-opts-make default-tui-opts tui-run tui-run-nodes)
-
-  (defn __tui-nil-value [] #fx{Unsafe} : int
+  (defn __tui-nil-value []
+    #fx{Unsafe}
+    : int
     ```c
     return 0;
     ```)
-
-  (defn __tui-cons [value : int next : int] #fx{Unsafe} : int
+  (defn __tui-cons [value : int next : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t head; int64_t tail; } *cell = malloc(sizeof(*cell));
     cell->head = value;
     cell->tail = next;
     return (int64_t)(intptr_t)cell;
     ```)
-
-  (defn __tui-list-nil? [lst : int] #fx{Unsafe} : bool
+  (defn __tui-list-nil? [lst : int]
+    #fx{Unsafe}
+    : bool
     ```c
     return lst == 0;
     ```)
-
-  (defn __tui-head [lst : int] #fx{Unsafe} : int
+  (defn __tui-head [lst : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t head; int64_t tail; } *cell = (void *)(intptr_t)lst;
     return cell ? cell->head : 0;
     ```)
-
-  (defn __tui-tail [lst : int] #fx{Unsafe} : int
+  (defn __tui-tail [lst : int]
+    #fx{Unsafe}
+    : int
     ```c
     struct { int64_t head; int64_t tail; } *cell = (void *)(intptr_t)lst;
     return cell ? cell->tail : 0;
     ```)
-
-  (defn __tui-ok [value : int] #fx{Unsafe} : int
+  (defn __tui-ok [value : int]
+    #fx{Unsafe}
+    : int
     ```c
     return tur_box_ok(value);
     ```)
-
-  (defn __tui-err [value : cstr] #fx{Unsafe} : int
+  (defn __tui-err [value : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     return tur_err_ptr(value ? strdup((const char *)(intptr_t)value) : strdup("error"));
     ```)
-
-  (defn __tui-result-ok? [result : int] #fx{Unsafe} : bool
+  (defn __tui-result-ok? [result : int]
+    #fx{Unsafe}
+    : bool
     ```c
     return tur_is_ok(result);
     ```)
-
-  (defn __tui-result-ok-val [result : int] #fx{Unsafe} : int
+  (defn __tui-result-ok-val [result : int]
+    #fx{Unsafe}
+    : int
     ```c
     return result ? tur_ok_value(result) : 0;
     ```)
-
-  (defn __tui-result-err-val [result : int] #fx{Unsafe} : cstr
+  (defn __tui-result-err-val [result : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     return (result && !tur_is_ok(result)) ? (const char *)(intptr_t)tur_err_value(result) : "";
     ```)
-
-  (defn __tui-cstr-empty? [s : cstr] #fx{Unsafe} : bool
+  (defn __tui-cstr-empty? [s : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *src = s ? (const char *)(intptr_t)s : "";
     return src[0] == '\0';
     ```)
-
-  (defn __tui-cstr-eq? [a : cstr b : cstr] #fx{Unsafe} : bool
+  (defn __tui-cstr-eq? [a : cstr b : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *sa = a ? (const char *)(intptr_t)a : "";
     const char *sb = b ? (const char *)(intptr_t)b : "";
     return strcmp(sa, sb) == 0;
     ```)
-
-  (defn __tui-str-concat [a : cstr b : cstr] #fx{Unsafe} : cstr
+  (defn __tui-str-concat [a : cstr b : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *sa = a ? (const char *)(intptr_t)a : "";
     const char *sb = b ? (const char *)(intptr_t)b : "";
@@ -93,31 +127,32 @@
     out[la + lb] = '\0';
     return out;
     ```)
-
-;;; __tui-cstr-free -- release an owned string.  Safe on 0.
-  (defn __tui-cstr-free [s : cstr] #fx{Unsafe} : void
+  ;;; __tui-cstr-free -- release an owned string.  Safe on 0.
+  (defn __tui-cstr-free [s : cstr]
+    #fx{Unsafe}
+    : void
     ```c
     free((char *)(intptr_t)s);
     ```)
-
-;;; __tui-own -- copy a borrowed string so a concat can consume it.  Status
-;;; messages are built out of a mix of literals, borrowed cell fields and
-;;; freshly malloc'd pieces; making every operand owned is what lets
-;;; __tui-concat-owned free as it goes.
-  (defn __tui-own [s : cstr] #fx{Unsafe} : cstr
+  ;;; __tui-own -- copy a borrowed string so a concat can consume it.  Status
+  ;;; messages are built out of a mix of literals, borrowed cell fields and
+  ;;; freshly malloc'd pieces; making every operand owned is what lets
+  ;;; __tui-concat-owned free as it goes.
+  (defn __tui-own [s : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     return strdup(s ? (const char *)(intptr_t)s : "");
     ```)
-
-;;; __tui-concat-owned -- concatenate two owned strings, releasing both.
-  (defn __tui-concat-owned [a : cstr b : cstr] #fx{Unsafe} : cstr
+  ;;; __tui-concat-owned -- concatenate two owned strings, releasing both.
+  (defn __tui-concat-owned [a : cstr b : cstr]
+    #fx{Unsafe}
+    : cstr
     (let [out (__tui-str-concat a b)]
-      (do
-        (__tui-cstr-free a)
-        (__tui-cstr-free b)
-        out)))
-
-  (defn __tui-cstr-drop-last [s : cstr] #fx{Unsafe} : cstr
+      (do (__tui-cstr-free a) (__tui-cstr-free b) out)))
+  (defn __tui-cstr-drop-last [s : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *src = s ? (const char *)(intptr_t)s : "";
     size_t len = strlen(src);
@@ -127,8 +162,9 @@
     out[len - 1] = '\0';
     return out;
     ```)
-
-  (defn __tui-cstr-contains-ci? [haystack : cstr needle : cstr] #fx{Unsafe} : bool
+  (defn __tui-cstr-contains-ci? [haystack : cstr needle : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     /* __tur_include__: #include <ctype.h> */
     const char *hay = haystack ? (const char *)(intptr_t)haystack : "";
@@ -144,16 +180,21 @@
     }
     return false;
     ```)
-
-  (defn __tui-int->cstr [value : int] #fx{Unsafe} : cstr
+  (defn __tui-int->cstr [value : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     char buf[64];
     snprintf(buf, sizeof(buf), "%lld", (long long)value);
     return strdup(buf);
     ```)
-
   ;;; tui-opts-make -- build notebook/tui options.
-  (defn tui-opts-make [color : int cell_width : int scrollback : int keybindings_file : cstr] #fx{Unsafe} : int
+  (defn tui-opts-make [color : int
+                       cell_width : int
+                       scrollback : int
+                       keybindings_file : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       int64_t color;
@@ -168,8 +209,9 @@
     opts->keybindings_file = keybindings_file ? strdup((const char *)(intptr_t)keybindings_file) : strdup("");
     return (int64_t)(intptr_t)opts;
     ```)
-
-  (defn __tui-opts-color [opts : int] #fx{Unsafe} : int
+  (defn __tui-opts-color [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       int64_t color;
@@ -180,8 +222,9 @@
     NotebookTuiOpts *o = (NotebookTuiOpts *)(intptr_t)opts;
     return o ? o->color : 1;
     ```)
-
-  (defn __tui-opts-cell-width [opts : int] #fx{Unsafe} : int
+  (defn __tui-opts-cell-width [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       int64_t color;
@@ -192,8 +235,9 @@
     NotebookTuiOpts *o = (NotebookTuiOpts *)(intptr_t)opts;
     return o ? o->cell_width : 0;
     ```)
-
-  (defn __tui-opts-scrollback [opts : int] #fx{Unsafe} : int
+  (defn __tui-opts-scrollback [opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       int64_t color;
@@ -204,8 +248,9 @@
     NotebookTuiOpts *o = (NotebookTuiOpts *)(intptr_t)opts;
     return o ? o->scrollback : 1000;
     ```)
-
-  (defn __tui-opts-keybindings-file [opts : int] #fx{Unsafe} : cstr
+  (defn __tui-opts-keybindings-file [opts : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct {
       int64_t color;
@@ -216,12 +261,11 @@
     NotebookTuiOpts *o = (NotebookTuiOpts *)(intptr_t)opts;
     return (o && o->keybindings_file) ? o->keybindings_file : "";
     ```)
-
   ;;; default-tui-opts -- default options for the command-mode notebook TUI.
-  (defn default-tui-opts [] #fx{Unsafe} : int
-    (tui-opts-make 1 0 1000 ""))
-
-  (defn __tui-node-cell-make [cell : int] #fx{Unsafe} : int
+  (defn default-tui-opts [] #fx{Unsafe} : int (tui-opts-make 1 0 1000 ""))
+  (defn __tui-node-cell-make [cell : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { int64_t tag; int64_t prose; int64_t cell; } NotebookNode;
     NotebookNode *node = malloc(sizeof(*node));
@@ -230,31 +274,35 @@
     node->cell = cell;
     return (int64_t)(intptr_t)node;
     ```)
-
-;;; __tui-copy-cell -- a duplicate of `cell` under a new id and source.
-;;; cell-make stores the attrs list it is handed instead of copying it, so this
-;;; has to hand it a copy: sharing the original's list would leave the clipboard
-;;; cell and the pasted cell both owning it, and cell-free would run over it
-;;; twice.
-  (defn __tui-copy-cell [cell : int next_id : cstr next_source : cstr] #fx{Unsafe} : int
+  ;;; __tui-copy-cell -- a duplicate of `cell` under a new id and source.
+  ;;; cell-make stores the attrs list it is handed instead of copying it, so this
+  ;;; has to hand it a copy: sharing the original's list would leave the clipboard
+  ;;; cell and the pasted cell both owning it, and cell-free would run over it
+  ;;; twice.
+  (defn __tui-copy-cell [cell : int next_id : cstr next_source : cstr]
+    #fx{Unsafe}
+    : int
     (cell-make next_id
-               (cell-lang cell)
-               next_source
-               (attrs-copy (cell-attrs cell))
-               (cell-start-line cell)
-               (cell-end-line cell)))
-
-  (defn __tui-current-cell [state : int] #fx{Unsafe} : int
+      (cell-lang cell)
+      next_source
+      (attrs-copy (cell-attrs cell))
+      (cell-start-line cell)
+      (cell-end-line cell)))
+  (defn __tui-current-cell [state : int]
+    #fx{Unsafe}
+    : int
     (__tui-list-nth (__tui-state-cells state) (__tui-state-focus state)))
-
-  (defn __tui-cells-have-id? [cells : int want : cstr] #fx{Unsafe} : bool
+  (defn __tui-cells-have-id? [cells : int want : cstr]
+    #fx{Unsafe}
+    : bool
     (if (__tui-list-nil? cells)
       false
       (if (__tui-cstr-eq? (cell-id (__tui-head cells)) want)
         true
         (__tui-cells-have-id? (__tui-tail cells) want))))
-
-  (defn __tui-fresh-cell-id [cells : int] #fx{Unsafe} : cstr
+  (defn __tui-fresh-cell-id [cells : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     typedef struct {
@@ -279,15 +327,15 @@
       if (!found) return strdup(buf);
     }
     ```)
-
-;;; The four node-list editors below splice the existing spine rather than
-;;; rebuilding it.  The rebuilding versions they replace shared their tail with
-;;; the list they were derived from, which left the old spine unreachable but
-;;; not freeable -- half its cells were still live in the new one.  Editing in
-;;; place means there is only ever one spine, and __tui-state-free owns it.
-
-;;; __tui-append-node -- put new_node at the end, returning the (possibly new) head.
-  (defn __tui-append-node [nodes : int new_node : int] #fx{Unsafe} : int
+  ;;; The four node-list editors below splice the existing spine rather than
+  ;;; rebuilding it.  The rebuilding versions they replace shared their tail with
+  ;;; the list they were derived from, which left the old spine unreachable but
+  ;;; not freeable -- half its cells were still live in the new one.  Editing in
+  ;;; place means there is only ever one spine, and __tui-state-free owns it.
+  ;;; __tui-append-node -- put new_node at the end, returning the (possibly new) head.
+  (defn __tui-append-node [nodes : int new_node : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     Cons *fresh = malloc(sizeof(*fresh));
@@ -299,10 +347,11 @@
     cur->tail = (int64_t)(intptr_t)fresh;
     return nodes;
     ```)
-
-;;; __tui-insert-node-before -- splice new_node in ahead of the cell node with
-;;; target_id, or append it when there is no such cell.
-  (defn __tui-insert-node-before [nodes : int target_id : cstr new_node : int] #fx{Unsafe} : int
+  ;;; __tui-insert-node-before -- splice new_node in ahead of the cell node with
+  ;;; target_id, or append it when there is no such cell.
+  (defn __tui-insert-node-before [nodes : int target_id : cstr new_node : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     typedef struct { int64_t tag; int64_t prose; int64_t cell; } NotebookNode;
@@ -333,10 +382,11 @@
     prev->tail = (int64_t)(intptr_t)fresh;
     return nodes;
     ```)
-
-;;; __tui-insert-node-after -- splice new_node in behind the cell node with
-;;; target_id, or append it when there is no such cell.
-  (defn __tui-insert-node-after [nodes : int target_id : cstr new_node : int] #fx{Unsafe} : int
+  ;;; __tui-insert-node-after -- splice new_node in behind the cell node with
+  ;;; target_id, or append it when there is no such cell.
+  (defn __tui-insert-node-after [nodes : int target_id : cstr new_node : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     typedef struct { int64_t tag; int64_t prose; int64_t cell; } NotebookNode;
@@ -366,13 +416,14 @@
     last->tail = (int64_t)(intptr_t)fresh;
     return nodes;
     ```)
-
-;;; __tui-delete-node-pair -- unlink the cell node with target_id.  Returns a
-;;; cons of (remaining nodes . removed cell); the caller frees that cons with
-;;; __tui-cons-free.  The removed cell is handed on to the clipboard, so only
-;;; its node wrapper and cons cell are released here.  A missing target yields
-;;; a 0 cell and leaves the list alone.
-  (defn __tui-delete-node-pair [nodes : int target_id : cstr] #fx{Unsafe} : int
+  ;;; __tui-delete-node-pair -- unlink the cell node with target_id.  Returns a
+  ;;; cons of (remaining nodes . removed cell); the caller frees that cons with
+  ;;; __tui-cons-free.  The removed cell is handed on to the clipboard, so only
+  ;;; its node wrapper and cons cell are released here.  A missing target yields
+  ;;; a 0 cell and leaves the list alone.
+  (defn __tui-delete-node-pair [nodes : int target_id : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     typedef struct { int64_t tag; int64_t prose; int64_t cell; } NotebookNode;
@@ -403,27 +454,29 @@
     }
     return (int64_t)(intptr_t)pair;
     ```)
-
-;;; __tui-blank-cell -- a new empty cell with the next free id.  cell-make
-;;; copies the id, so the one __tui-fresh-cell-id malloc'd is released here.
-  (defn __tui-blank-cell [state : int current : int] #fx{Unsafe} : int
-    (let [lang (if (= current 0) 0 (cell-lang current))
+  ;;; __tui-blank-cell -- a new empty cell with the next free id.  cell-make
+  ;;; copies the id, so the one __tui-fresh-cell-id malloc'd is released here.
+  (defn __tui-blank-cell [state : int current : int]
+    #fx{Unsafe}
+    : int
+    (let [lang     (if (= current 0) 0 (cell-lang current))
           fresh_id (__tui-fresh-cell-id (__tui-state-cells state))
-          made (cell-make fresh_id lang "" (__tui-nil-value) 0 0)]
-      (do
-        (__tui-cstr-free fresh_id)
-        made)))
-
-  (defn __tui-cells-from-nodes-rev [nodes : int acc : int] #fx{Unsafe} : int
+          made     (cell-make fresh_id lang "" (__tui-nil-value) 0 0)]
+      (do (__tui-cstr-free fresh_id) made)))
+  (defn __tui-cells-from-nodes-rev [nodes : int acc : int]
+    #fx{Unsafe}
+    : int
     (if (__tui-list-nil? nodes)
       acc
       (let [node (__tui-head nodes)]
         (if (= (node-tag node) 1)
-          (__tui-cells-from-nodes-rev (__tui-tail nodes) (__tui-cons (node-cell node) acc))
+          (__tui-cells-from-nodes-rev (__tui-tail nodes)
+            (__tui-cons (node-cell node) acc))
           (__tui-cells-from-nodes-rev (__tui-tail nodes) acc)))))
-
-;;; __tui-reverse -- reverse a list, consuming its cons cells.
-  (defn __tui-reverse [lst : int acc : int] #fx{Unsafe} : int
+  ;;; __tui-reverse -- reverse a list, consuming its cons cells.
+  (defn __tui-reverse [lst : int acc : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     Cons *cur = (Cons *)(intptr_t)lst;
@@ -436,31 +489,33 @@
     }
     return out;
     ```)
-
-  (defn __tui-list-length [lst : int] #fx{Unsafe} : int
-    (if (__tui-list-nil? lst)
-      0
-      (+ 1 (__tui-list-length (__tui-tail lst)))))
-
-  (defn __tui-zero-list [count : int] #fx{Unsafe} : int
+  (defn __tui-list-length [lst : int]
+    #fx{Unsafe}
+    : int
+    (if (__tui-list-nil? lst) 0 (+ 1 (__tui-list-length (__tui-tail lst)))))
+  (defn __tui-zero-list [count : int]
+    #fx{Unsafe}
+    : int
     (if (<= count 0)
       (__tui-nil-value)
       (__tui-cons 0 (__tui-zero-list (- count 1)))))
-
-  (defn __tui-list-nth [lst : int idx : int] #fx{Unsafe} : int
+  (defn __tui-list-nth [lst : int idx : int]
+    #fx{Unsafe}
+    : int
     (if (__tui-list-nil? lst)
       0
       (if (<= idx 0)
         (__tui-head lst)
         (__tui-list-nth (__tui-tail lst) (- idx 1)))))
-
-;;; __tui-list-set -- set the idx-th element, extending with zeros if short.
-;;;
-;;; Mutates and returns the same list.  It used to rebuild the entire spine
-;;; on every call and the callers replaced the state's list without freeing
-;;; the old one -- so a whole spine leaked per keystroke that touched an
-;;; output.  That was most of the 890 allocations tui_test was leaking.
-  (defn __tui-list-set [lst : int idx : int value : int] #fx{Unsafe} : int
+  ;;; __tui-list-set -- set the idx-th element, extending with zeros if short.
+  ;;;
+  ;;; Mutates and returns the same list.  It used to rebuild the entire spine
+  ;;; on every call and the callers replaced the state's list without freeing
+  ;;; the old one -- so a whole spine leaked per keystroke that touched an
+  ;;; output.  That was most of the 890 allocations tui_test was leaking.
+  (defn __tui-list-set [lst : int idx : int value : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     Cons *head = (Cons *)(intptr_t)lst;
@@ -473,13 +528,16 @@
     cur->head = value;
     return (int64_t)(intptr_t)head;
     ```)
-
-  (defn __tui-concat-lists [left : int right : int] #fx{Unsafe} : int
+  (defn __tui-concat-lists [left : int right : int]
+    #fx{Unsafe}
+    : int
     (if (__tui-list-nil? left)
       right
-      (__tui-cons (__tui-head left) (__tui-concat-lists (__tui-tail left) right))))
-
-  (defn __tui-write-file [path : cstr text : cstr] #fx{Unsafe} : bool
+      (__tui-cons (__tui-head left)
+        (__tui-concat-lists (__tui-tail left) right))))
+  (defn __tui-write-file [path : cstr text : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     const char *dst = path ? (const char *)(intptr_t)path : "";
     const char *src = text ? (const char *)(intptr_t)text : "";
@@ -490,8 +548,14 @@
     fclose(fp);
     return wrote == want;
     ```)
-
-  (defn __tui-state-make [path : cstr nodes : int cells : int bindings : int session : int opts : int] #fx{Unsafe} : int
+  (defn __tui-state-make [path : cstr
+                          nodes : int
+                          cells : int
+                          bindings : int
+                          session : int
+                          opts : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -548,17 +612,19 @@
     st->help_visible = 0;
     return (int64_t)(intptr_t)st;
     ```)
-
-;;; __tui-cons-free -- free one cons cell, leaving its head and tail alone.
-;;; Returns 0 so it can sit in a `let` binding.
-  (defn __tui-cons-free [cell : int] #fx{Unsafe} : int
+  ;;; __tui-cons-free -- free one cons cell, leaving its head and tail alone.
+  ;;; Returns 0 so it can sit in a `let` binding.
+  (defn __tui-cons-free [cell : int]
+    #fx{Unsafe}
+    : int
     ```c
     if (cell) free((void *)(intptr_t)cell);
     return 0;
     ```)
-
-;;; __tui-spine-free -- free a cons spine, leaving the heads alone.
-  (defn __tui-spine-free [lst : int] #fx{Unsafe} : void
+  ;;; __tui-spine-free -- free a cons spine, leaving the heads alone.
+  (defn __tui-spine-free [lst : int]
+    #fx{Unsafe}
+    : void
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     Cons *node = (Cons *)(intptr_t)lst;
@@ -568,12 +634,13 @@
       node = next;
     }
     ```)
-
-;;; __tui-state-free -- release the TUI state and everything it owns: its two
-;;; strings, the node list, the cell spine (the Cells belong to the nodes),
-;;; the outputs, the output-hidden flags, the keybindings and the clipboard.
-;;; The session is closed by the caller.  Safe on 0.
-  (defn __tui-state-free [state : int] #fx{Unsafe} : void
+  ;;; __tui-state-free -- release the TUI state and everything it owns: its two
+  ;;; strings, the node list, the cell spine (the Cells belong to the nodes),
+  ;;; the outputs, the output-hidden flags, the keybindings and the clipboard.
+  ;;; The session is closed by the caller.  Safe on 0.
+  (defn __tui-state-free [state : int]
+    #fx{Unsafe}
+    : void
     (if (= state 0)
       (__tui-void)
       (do
@@ -584,9 +651,10 @@
         (cell-free (__tui-state-clipboard state))
         (nodes-free (__tui-state-nodes state))
         (__tui-state-free-shell state))))
-
-;;; __tui-state-free-shell -- free the state's own strings and struct.
-  (defn __tui-state-free-shell [state : int] #fx{Unsafe} : void
+  ;;; __tui-state-free-shell -- free the state's own strings and struct.
+  (defn __tui-state-free-shell [state : int]
+    #fx{Unsafe}
+    : void
     ```c
     typedef struct {
       char *path;
@@ -618,15 +686,17 @@
     free(st->search_query);
     free(st);
     ```)
-
-;;; __tui-void -- void no-op, so a cleanup-only `if` has void on both arms.
-  (defn __tui-void [] #fx{Unsafe} : void
+  ;;; __tui-void -- void no-op, so a cleanup-only `if` has void on both arms.
+  (defn __tui-void []
+    #fx{Unsafe}
+    : void
     ```c
     return;
     ```)
-
-;;; tui-opts-free -- release a TuiOpts.  Safe on 0.
-  (defn tui-opts-free [opts : int] #fx{Unsafe} : void
+  ;;; tui-opts-free -- release a TuiOpts.  Safe on 0.
+  (defn tui-opts-free [opts : int]
+    #fx{Unsafe}
+    : void
     ```c
     typedef struct {
       int64_t color;
@@ -639,16 +709,18 @@
     free(o->keybindings_file);
     free(o);
     ```)
-
-;;; __tui-box-free -- release a Result box after taking its payload out.
-;;; Returns 0 so it can sit in a `let` binding.
-  (defn __tui-box-free [r : int] #fx{Unsafe} : int
+  ;;; __tui-box-free -- release a Result box after taking its payload out.
+  ;;; Returns 0 so it can sit in a `let` binding.
+  (defn __tui-box-free [r : int]
+    #fx{Unsafe}
+    : int
     ```c
     if (r) free((void *)(intptr_t)r);
     return 0;
     ```)
-
-  (defn __tui-state-cells [state : int] #fx{Unsafe} : int
+  (defn __tui-state-cells [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -673,8 +745,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->cells : 0;
     ```)
-
-  (defn __tui-state-outputs [state : int] #fx{Unsafe} : int
+  (defn __tui-state-outputs [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -699,8 +772,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->outputs : 0;
     ```)
-
-  (defn __tui-state-set-outputs [state : int value : int] #fx{Unsafe} : int
+  (defn __tui-state-set-outputs [state : int value : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -726,8 +800,9 @@
     if (st) st->outputs = value;
     return state;
     ```)
-
-  (defn __tui-state-set-cells [state : int value : int] #fx{Unsafe} : int
+  (defn __tui-state-set-cells [state : int value : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -753,8 +828,9 @@
     if (st) st->cells = value;
     return state;
     ```)
-
-  (defn __tui-state-set-nodes [state : int value : int] #fx{Unsafe} : int
+  (defn __tui-state-set-nodes [state : int value : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -780,8 +856,9 @@
     if (st) st->nodes = value;
     return state;
     ```)
-
-  (defn __tui-state-set-cell-count [state : int value : int] #fx{Unsafe} : int
+  (defn __tui-state-set-cell-count [state : int value : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -807,8 +884,9 @@
     if (st) st->cell_count = value;
     return state;
     ```)
-
-  (defn __tui-state-set-focus [state : int value : int] #fx{Unsafe} : int
+  (defn __tui-state-set-focus [state : int value : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -844,8 +922,9 @@
     }
     return state;
     ```)
-
-  (defn __tui-state-focus [state : int] #fx{Unsafe} : int
+  (defn __tui-state-focus [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -867,8 +946,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->focus : 0;
     ```)
-
-  (defn __tui-state-cell-count [state : int] #fx{Unsafe} : int
+  (defn __tui-state-cell-count [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -890,8 +970,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->cell_count : 0;
     ```)
-
-  (defn __tui-state-session [state : int] #fx{Unsafe} : int
+  (defn __tui-state-session [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -913,8 +994,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->session : 0;
     ```)
-
-  (defn __tui-state-bindings [state : int] #fx{Unsafe} : int
+  (defn __tui-state-bindings [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -936,8 +1018,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->keybindings : 0;
     ```)
-
-  (defn __tui-state-path [state : int] #fx{Unsafe} : cstr
+  (defn __tui-state-path [state : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct {
       char *path;
@@ -959,8 +1042,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return (st && st->path) ? st->path : "";
     ```)
-
-  (defn __tui-state-nodes [state : int] #fx{Unsafe} : int
+  (defn __tui-state-nodes [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -982,8 +1066,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->nodes : 0;
     ```)
-
-  (defn __tui-state-status [state : int] #fx{Unsafe} : cstr
+  (defn __tui-state-status [state : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct {
       char *path;
@@ -1005,8 +1090,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return (st && st->status) ? st->status : "";
     ```)
-
-  (defn __tui-state-set-status [state : int value : cstr] #fx{Unsafe} : int
+  (defn __tui-state-set-status [state : int value : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1039,18 +1125,18 @@
     }
     return state;
     ```)
-
-;;; __tui-set-status-owned -- set the status from a string the caller hands
-;;; over.  __tui-state-set-status copies its argument, so every call site that
-;;; builds its message with __tui-str-concat has to release the original; this
-;;; is that call plus the free.
-  (defn __tui-set-status-owned [state : int value : cstr] #fx{Unsafe} : int
+  ;;; __tui-set-status-owned -- set the status from a string the caller hands
+  ;;; over.  __tui-state-set-status copies its argument, so every call site that
+  ;;; builds its message with __tui-str-concat has to release the original; this
+  ;;; is that call plus the free.
+  (defn __tui-set-status-owned [state : int value : cstr]
+    #fx{Unsafe}
+    : int
     (let [out (__tui-state-set-status state value)]
-      (do
-        (__tui-cstr-free value)
-        out)))
-
-  (defn __tui-state-pending-effect [state : int] #fx{Unsafe} : int
+      (do (__tui-cstr-free value) out)))
+  (defn __tui-state-pending-effect [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1072,8 +1158,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->pending_effect : 0;
     ```)
-
-  (defn __tui-state-set-pending-effect [state : int value : int] #fx{Unsafe} : int
+  (defn __tui-state-set-pending-effect [state : int value : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1096,8 +1183,9 @@
     if (st) st->pending_effect = value;
     return state;
     ```)
-
-  (defn __tui-state-exit-code [state : int] #fx{Unsafe} : int
+  (defn __tui-state-exit-code [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1122,8 +1210,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->exit_code : 0;
     ```)
-
-  (defn __tui-state-set-quit [state : int quit_requested : int exit_code : int] #fx{Unsafe} : int
+  (defn __tui-state-set-quit [state : int quit_requested : int exit_code : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1151,8 +1240,9 @@
     st->exit_code = exit_code;
     return state;
     ```)
-
-  (defn __tui-state-dirty [state : int] #fx{Unsafe} : int
+  (defn __tui-state-dirty [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1177,8 +1267,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->dirty : 0;
     ```)
-
-  (defn __tui-state-set-dirty [state : int value : int] #fx{Unsafe} : int
+  (defn __tui-state-set-dirty [state : int value : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1204,8 +1295,9 @@
     if (st) st->dirty = value;
     return state;
     ```)
-
-  (defn __tui-state-output-hidden [state : int] #fx{Unsafe} : int
+  (defn __tui-state-output-hidden [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1233,8 +1325,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->output_hidden : 0;
     ```)
-
-  (defn __tui-state-set-output-hidden [state : int value : int] #fx{Unsafe} : int
+  (defn __tui-state-set-output-hidden [state : int value : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1263,8 +1356,9 @@
     if (st) st->output_hidden = value;
     return state;
     ```)
-
-  (defn __tui-state-search-query [state : int] #fx{Unsafe} : cstr
+  (defn __tui-state-search-query [state : int]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct {
       char *path;
@@ -1292,8 +1386,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return (st && st->search_query) ? st->search_query : "";
     ```)
-
-  (defn __tui-state-set-search-query [state : int value : cstr] #fx{Unsafe} : int
+  (defn __tui-state-set-search-query [state : int value : cstr]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1324,8 +1419,9 @@
     st->search_query = value ? strdup((const char *)(intptr_t)value) : strdup("");
     return state;
     ```)
-
-  (defn __tui-state-help-visible [state : int] #fx{Unsafe} : int
+  (defn __tui-state-help-visible [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1353,8 +1449,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->help_visible : 0;
     ```)
-
-  (defn __tui-state-set-help-visible [state : int value : int] #fx{Unsafe} : int
+  (defn __tui-state-set-help-visible [state : int value : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1383,8 +1480,9 @@
     if (st) st->help_visible = value;
     return state;
     ```)
-
-  (defn __tui-state-clipboard [state : int] #fx{Unsafe} : int
+  (defn __tui-state-clipboard [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1409,8 +1507,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->clipboard : 0;
     ```)
-
-  (defn __tui-state-set-clipboard [state : int value : int] #fx{Unsafe} : int
+  (defn __tui-state-set-clipboard [state : int value : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1436,8 +1535,9 @@
     if (st) st->clipboard = value;
     return state;
     ```)
-
-  (defn __tui-state-quit-confirm [state : int] #fx{Unsafe} : int
+  (defn __tui-state-quit-confirm [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1462,8 +1562,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->quit_confirm : 0;
     ```)
-
-  (defn __tui-state-set-quit-confirm [state : int value : int] #fx{Unsafe} : int
+  (defn __tui-state-set-quit-confirm [state : int value : int]
+    #fx{Unsafe}
+    : int
     ```c
     typedef struct {
       char *path;
@@ -1489,8 +1590,9 @@
     if (st) st->quit_confirm = value;
     return state;
     ```)
-
-  (defn __tui-state-quit? [state : int] #fx{Unsafe} : bool
+  (defn __tui-state-quit? [state : int]
+    #fx{Unsafe}
+    : bool
     ```c
     typedef struct {
       char *path;
@@ -1512,8 +1614,9 @@
     NotebookTuiState *st = (NotebookTuiState *)(intptr_t)state;
     return st ? st->quit_requested != 0 : true;
     ```)
-
-  (defn __tui-binding-action [bindings : int key : cstr] #fx{Unsafe} : cstr
+  (defn __tui-binding-action [bindings : int key : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     typedef struct { char *key; char *action; } NotebookKeyBinding;
@@ -1526,8 +1629,9 @@
     }
     return "";
     ```)
-
-  (defn __tui-binding-has-prefix [bindings : int key : cstr] #fx{Unsafe} : bool
+  (defn __tui-binding-has-prefix [bindings : int key : cstr]
+    #fx{Unsafe}
+    : bool
     ```c
     typedef struct { int64_t head; int64_t tail; } Cons;
     typedef struct { char *key; char *action; } NotebookKeyBinding;
@@ -1540,35 +1644,38 @@
     }
     return false;
     ```)
-
-;;; __tui-output-message -- build the status line for a just-run cell.  The
-;;; result is owned by the caller; every intermediate is consumed on the way.
-;;; `elapsed` is only part of the success message, so the other two branches
-;;; release it before building their own.
-  (defn __tui-output-message [cell : int output : int] #fx{Unsafe} : cstr
+  ;;; __tui-output-message -- build the status line for a just-run cell.  The
+  ;;; result is owned by the caller; every intermediate is consumed on the way.
+  ;;; `elapsed` is only part of the success message, so the other two branches
+  ;;; release it before building their own.
+  (defn __tui-output-message [cell : int output : int]
+    #fx{Unsafe}
+    : cstr
     (let [cell-name (cell-id cell)
-          elapsed (__tui-int->cstr (cell-output-elapsed-ms output))]
+          elapsed   (__tui-int->cstr (cell-output-elapsed-ms output))]
       (if (= (cell-output-status output) 0)
         (__tui-concat-owned (__tui-own "ran ")
-                            (__tui-concat-owned (__tui-own cell-name)
-                                                (__tui-concat-owned (__tui-own " in ")
-                                                                    (__tui-concat-owned elapsed (__tui-own "ms")))))
+          (__tui-concat-owned (__tui-own cell-name)
+            (__tui-concat-owned (__tui-own " in ")
+              (__tui-concat-owned elapsed (__tui-own "ms")))))
         (do
           (__tui-cstr-free elapsed)
           (if (= (cell-output-status output) 2)
             (__tui-concat-owned (__tui-own "skipped ") (__tui-own cell-name))
             (__tui-concat-owned (__tui-own "error in ")
-                                (__tui-concat-owned (__tui-own cell-name)
-                                                    (__tui-concat-owned (__tui-own ": ")
-                                                                        (__tui-own (cell-output-error-msg output))))))))))
-
-  (defn __tui-cell-matches-query? [cell : int output : int query : cstr] #fx{Unsafe} : bool
+              (__tui-concat-owned (__tui-own cell-name)
+                (__tui-concat-owned (__tui-own ": ")
+                  (__tui-own (cell-output-error-msg output))))))))))
+  (defn __tui-cell-matches-query? [cell : int output : int query : cstr]
+    #fx{Unsafe}
+    : bool
     (or (__tui-cstr-contains-ci? (cell-source cell) query)
-        (__tui-cstr-contains-ci? (cell-output-stdout output) query)
-        (__tui-cstr-contains-ci? (cell-output-value-repr output) query)
-        (__tui-cstr-contains-ci? (cell-output-error-msg output) query)))
-
-  (defn __tui-wrap-index [idx : int count : int] #fx{Unsafe} : int
+      (__tui-cstr-contains-ci? (cell-output-stdout output) query)
+      (__tui-cstr-contains-ci? (cell-output-value-repr output) query)
+      (__tui-cstr-contains-ci? (cell-output-error-msg output) query)))
+  (defn __tui-wrap-index [idx : int count : int]
+    #fx{Unsafe}
+    : int
     ```c
     int64_t n = count;
     int64_t i = idx;
@@ -1577,18 +1684,32 @@
     while (i >= n) i -= n;
     return i;
     ```)
-
-  (defn __tui-find-match [cells : int outputs : int query : cstr idx : int step : int count : int remaining : int] #fx{Unsafe} : int
+  (defn __tui-find-match [cells : int
+                          outputs : int
+                          query : cstr
+                          idx : int
+                          step : int
+                          count : int
+                          remaining : int]
+    #fx{Unsafe}
+    : int
     (if (or (<= remaining 0) (__tui-cstr-empty? query))
       -1
       (let [wrapped (__tui-wrap-index idx count)
-            cell (__tui-list-nth cells wrapped)
-            output (__tui-list-nth outputs wrapped)]
+            cell    (__tui-list-nth cells wrapped)
+            output  (__tui-list-nth outputs wrapped)]
         (if (__tui-cell-matches-query? cell output query)
           wrapped
-          (__tui-find-match cells outputs query (+ wrapped step) step count (- remaining 1))))))
-
-  (defn __tui-read-search-query [] #fx{Unsafe} : cstr
+          (__tui-find-match cells
+            outputs
+            query
+            (+ wrapped step)
+            step
+            count
+            (- remaining 1))))))
+  (defn __tui-read-search-query []
+    #fx{Unsafe}
+    : cstr
     ```c
     const char *override = getenv("TURNB_TEST_SEARCH_QUERY");
     if (override) return strdup(override);
@@ -1604,8 +1725,9 @@
     }
     return strdup(buf);
     ```)
-
-  (defn __tui-search [state : int query : cstr step : int from-current? : bool] #fx{Unsafe} : int
+  (defn __tui-search [state : int query : cstr step : int from-current? : bool]
+    #fx{Unsafe}
+    : int
     (let [count (__tui-state-cell-count state)]
       (if (or (<= count 0) (__tui-cstr-empty? query))
         (__tui-state-set-status state "no active search")
@@ -1613,32 +1735,41 @@
                       (__tui-state-focus state)
                       (+ (__tui-state-focus state) step))
               found (__tui-find-match (__tui-state-cells state)
-                                      (__tui-state-outputs state)
-                                      query
-                                      start
-                                      step
-                                      count
-                                      count)]
+                      (__tui-state-outputs state)
+                      query
+                      start
+                      step
+                      count
+                      count)]
           (if (< found 0)
-            (__tui-set-status-owned state (__tui-str-concat "no matches for " query))
+            (__tui-set-status-owned state
+              (__tui-str-concat "no matches for " query))
             (do
               (__tui-state-set-focus state found)
               (__tui-set-status-owned state (__tui-str-concat "search: " query))))))))
-
-;;; __tui-rebuild-state -- swap in a new node list and recompute everything
-;;; derived from it.  `status` is owned by this function; every caller passes a
-;;; freshly built message.  The three lists being replaced are dropped here:
-;;; the cells and output-hidden spines are pure cons cells (the Cells belong to
-;;; the nodes), while the outputs are owned and go through outputs-free.  The
-;;; node list is edited in place by the __tui-*-node helpers, so there is no
-;;; old spine to release.
-  (defn __tui-rebuild-state [state : int new_nodes : int focus_idx : int status : cstr dirty_value : int] #fx{Unsafe} : int
-    (let [new_cells (cells-assign-ids (__tui-reverse (__tui-cells-from-nodes-rev new_nodes (__tui-nil-value))
-                                                     (__tui-nil-value)))
-          count (__tui-list-length new_cells)
+  ;;; __tui-rebuild-state -- swap in a new node list and recompute everything
+  ;;; derived from it.  `status` is owned by this function; every caller passes a
+  ;;; freshly built message.  The three lists being replaced are dropped here:
+  ;;; the cells and output-hidden spines are pure cons cells (the Cells belong to
+  ;;; the nodes), while the outputs are owned and go through outputs-free.  The
+  ;;; node list is edited in place by the __tui-*-node helpers, so there is no
+  ;;; old spine to release.
+  (defn __tui-rebuild-state [state : int
+                             new_nodes : int
+                             focus_idx : int
+                             status : cstr
+                             dirty_value : int]
+    #fx{Unsafe}
+    : int
+    (let [new_cells     (cells-assign-ids (__tui-reverse (__tui-cells-from-nodes-rev new_nodes
+                                                           (__tui-nil-value))
+                                            (__tui-nil-value)))
+          count         (__tui-list-length new_cells)
           clamped_focus (if (<= count 0)
                           0
-                          (if (>= focus_idx count) (- count 1) (if (< focus_idx 0) 0 focus_idx)))]
+                          (if (>= focus_idx count)
+                            (- count 1)
+                            (if (< focus_idx 0) 0 focus_idx)))]
       (do
         (outputs-free (__tui-state-outputs state))
         (__tui-spine-free (__tui-state-output-hidden state))
@@ -1648,14 +1779,18 @@
         (__tui-state-set-cell-count state count)
         (__tui-state-set-focus state clamped_focus)
         (session-reset (__tui-state-session state))
-        (__tui-state-set-outputs state (if (<= count 0) (__tui-nil-value) (eval-all (__tui-state-session state) new_cells 0 0)))
+        (__tui-state-set-outputs state
+          (if (<= count 0)
+            (__tui-nil-value)
+            (eval-all (__tui-state-session state) new_cells 0 0)))
         (__tui-state-set-output-hidden state (__tui-zero-list count))
         (__tui-state-set-dirty state dirty_value)
         (__tui-state-set-help-visible state 0)
         (__tui-state-set-quit-confirm state 0)
         (__tui-set-status-owned state status))))
-
-  (defn __tui-edit-source [source : cstr] #fx{Unsafe} : cstr
+  (defn __tui-edit-source [source : cstr]
+    #fx{Unsafe}
+    : cstr
     ```c
     /* __tur_include__: #include <unistd.h> */
     const char *override = getenv("TURNB_TEST_EDITOR_TEXT");
@@ -1700,39 +1835,44 @@
     buf[got] = '\0';
     return buf;
     ```)
-
-  (defn __tui-run-current [state : int move-next? : bool] #fx{Unsafe} : int
-    (let [idx (__tui-state-focus state)
-          cell (__tui-list-nth (__tui-state-cells state) idx)
+  (defn __tui-run-current [state : int move-next? : bool]
+    #fx{Unsafe}
+    : int
+    (let [idx    (__tui-state-focus state)
+          cell   (__tui-list-nth (__tui-state-cells state) idx)
           output (eval-cell (__tui-state-session state) cell 0)
           ;; The slot may already hold an output from an earlier run of this
           ;; cell; __tui-list-set overwrites it, so drop it first.
-          old (__tui-list-nth (__tui-state-outputs state) idx)]
+          old    (__tui-list-nth (__tui-state-outputs state) idx)]
       (do
         (cell-output-free old)
-        (__tui-state-set-outputs state (__tui-list-set (__tui-state-outputs state) idx output))
+        (__tui-state-set-outputs state
+          (__tui-list-set (__tui-state-outputs state) idx output))
         (__tui-state-set-quit-confirm state 0)
         (__tui-set-status-owned state (__tui-output-message cell output))
         (if (and move-next? (< (+ idx 1) (__tui-state-cell-count state)))
           (action-dispatch state "cell-next")
           state))))
-
-  (defn __tui-run-all [state : int] #fx{Unsafe} : int
+  (defn __tui-run-all [state : int]
+    #fx{Unsafe}
+    : int
     (do
       (outputs-free (__tui-state-outputs state))
       (session-reset (__tui-state-session state))
-      (__tui-state-set-outputs state (eval-all (__tui-state-session state) (__tui-state-cells state) 0 0))
+      (__tui-state-set-outputs state
+        (eval-all (__tui-state-session state) (__tui-state-cells state) 0 0))
       (__tui-state-set-quit-confirm state 0)
       (__tui-state-set-status state "reran notebook")
       state))
-
-  (defn __tui-save [state : int] #fx{Unsafe} : int
+  (defn __tui-save [state : int]
+    #fx{Unsafe}
+    : int
     (let [path (__tui-state-path state)]
       (if (__tui-cstr-empty? path)
         (__tui-state-set-status state "save unavailable for in-memory notebook")
         ;; nodes->str hands back a fresh serialisation; it is only needed for
         ;; the duration of the write.
-        (let [text (nodes->str (__tui-state-nodes state))
+        (let [text  (nodes->str (__tui-state-nodes state))
               wrote (__tui-write-file path text)]
           (do
             (__tui-cstr-free text)
@@ -1741,9 +1881,11 @@
                 (__tui-state-set-dirty state 0)
                 (__tui-state-set-quit-confirm state 0)
                 (__tui-set-status-owned state (__tui-str-concat "saved " path)))
-              (__tui-set-status-owned state (__tui-str-concat "failed to save " path))))))))
-
-  (defn __tui-edit-current [state : int] #fx{Unsafe} : int
+              (__tui-set-status-owned state
+                (__tui-str-concat "failed to save " path))))))))
+  (defn __tui-edit-current [state : int]
+    #fx{Unsafe}
+    : int
     (let [current (__tui-current-cell state)]
       (if (= current 0)
         (__tui-state-set-status state "no cell selected to edit")
@@ -1752,88 +1894,109 @@
           ;; __tui-edit-source returns a fresh buffer; nodes-update-cell copies
           ;; it into the cell, so it is ours to release on every path.  The
           ;; Result box it returns is ours too, once the node list is out.
-          (let [edited (__tui-edit-source (cell-source current))
+          (let [edited    (__tui-edit-source (cell-source current))
                 unchanged (__tui-cstr-eq? edited (cell-source current))]
             (do
               (term-enable-raw)
               (let [out (if (not (__tui-cstr-empty? edited))
                           (if unchanged
-                            (__tui-set-status-owned state (__tui-str-concat "no changes to " (cell-id current)))
-                            (let [updated (nodes-update-cell (__tui-state-nodes state) (cell-id current) edited)
-                                  ok (__tui-result-ok? updated)
-                                  nodes (__tui-result-ok-val updated)
-                                  _box (__tui-box-free updated)]
+                            (__tui-set-status-owned state
+                              (__tui-str-concat "no changes to "
+                                (cell-id current)))
+                            (let [updated (nodes-update-cell (__tui-state-nodes state)
+                                            (cell-id current)
+                                            edited)
+                                  ok      (__tui-result-ok? updated)
+                                  nodes   (__tui-result-ok-val updated)
+                                  _box    (__tui-box-free updated)]
                               (if ok
                                 (__tui-rebuild-state state
-                                                     nodes
-                                                     (__tui-state-focus state)
-                                                     (__tui-str-concat "edited " (cell-id current))
-                                                     1)
-                                (__tui-set-status-owned state (__tui-str-concat "failed to edit " (cell-id current))))))
-                          (__tui-set-status-owned state (__tui-str-concat "editor failed for " (cell-id current))))]
+                                  nodes
+                                  (__tui-state-focus state)
+                                  (__tui-str-concat "edited " (cell-id current))
+                                  1)
+                                (__tui-set-status-owned state
+                                  (__tui-str-concat "failed to edit "
+                                    (cell-id current))))))
+                          (__tui-set-status-owned state
+                            (__tui-str-concat "editor failed for "
+                              (cell-id current))))]
                 (__tui-cstr-free edited)
                 out)))))))
-
-  (defn __tui-add-cell [state : int above? : bool] #fx{Unsafe} : int
-    (let [current (__tui-current-cell state)
-          new_cell (__tui-blank-cell state current)
-          new_node (__tui-node-cell-make new_cell)
-          current_id (if (= current 0) "" (cell-id current))
+  (defn __tui-add-cell [state : int above? : bool]
+    #fx{Unsafe}
+    : int
+    (let [current     (__tui-current-cell state)
+          new_cell    (__tui-blank-cell state current)
+          new_node    (__tui-node-cell-make new_cell)
+          current_id  (if (= current 0) "" (cell-id current))
           current_idx (__tui-state-focus state)
-          new_nodes (if (= current 0)
-                      (__tui-append-node (__tui-state-nodes state) new_node)
-                      (if above?
-                        (__tui-insert-node-before (__tui-state-nodes state) current_id new_node)
-                        (__tui-insert-node-after (__tui-state-nodes state) current_id new_node)))
-          next_focus (if above? current_idx (+ current_idx 1))]
+          new_nodes   (if (= current 0)
+                        (__tui-append-node (__tui-state-nodes state) new_node)
+                        (if above?
+                          (__tui-insert-node-before (__tui-state-nodes state)
+                            current_id
+                            new_node)
+                          (__tui-insert-node-after (__tui-state-nodes state)
+                            current_id
+                            new_node)))
+          next_focus  (if above? current_idx (+ current_idx 1))]
       (__tui-rebuild-state state
-                           new_nodes
-                           (if (= current 0) 0 next_focus)
-                           (__tui-str-concat "inserted " (cell-id new_cell))
-                           1)))
-
-  (defn __tui-delete-current [state : int] #fx{Unsafe} : int
+        new_nodes
+        (if (= current 0) 0 next_focus)
+        (__tui-str-concat "inserted " (cell-id new_cell))
+        1)))
+  (defn __tui-delete-current [state : int]
+    #fx{Unsafe}
+    : int
     (let [current (__tui-current-cell state)]
       (if (= current 0)
         (__tui-state-set-status state "no cell selected to delete")
-        (let [deleted (__tui-delete-node-pair (__tui-state-nodes state) (cell-id current))
+        (let [deleted   (__tui-delete-node-pair (__tui-state-nodes state)
+                          (cell-id current))
               new_nodes (__tui-head deleted)
-              clip (__tui-tail deleted)
+              clip      (__tui-tail deleted)
               ;; __tui-delete-node-pair returns its two results in a cons cell
               ;; that nothing else points at.
-              _ (__tui-cons-free deleted)]
+              _         (__tui-cons-free deleted)]
           (if (= clip 0)
-            (__tui-set-status-owned state (__tui-str-concat "failed to delete " (cell-id current)))
+            (__tui-set-status-owned state
+              (__tui-str-concat "failed to delete " (cell-id current)))
             (do
               (__tui-state-set-clipboard state clip)
               (__tui-rebuild-state state
-                                   new_nodes
-                                   (__tui-state-focus state)
-                                   (__tui-str-concat "deleted " (cell-id current))
-                                   1)))))))
-
-  (defn __tui-paste-cell [state : int] #fx{Unsafe} : int
-    (let [clip (__tui-state-clipboard state)
+                new_nodes
+                (__tui-state-focus state)
+                (__tui-str-concat "deleted " (cell-id current))
+                1)))))))
+  (defn __tui-paste-cell [state : int]
+    #fx{Unsafe}
+    : int
+    (let [clip    (__tui-state-clipboard state)
           current (__tui-current-cell state)]
       (if (= clip 0)
         (__tui-state-set-status state "clipboard is empty")
-        (let [fresh_id (__tui-fresh-cell-id (__tui-state-cells state))
-              copy (__tui-copy-cell clip fresh_id (cell-source clip))
-              new_node (__tui-node-cell-make copy)
-              new_nodes (if (= current 0)
-                          (__tui-append-node (__tui-state-nodes state) new_node)
-                          (__tui-insert-node-after (__tui-state-nodes state) (cell-id current) new_node))
+        (let [fresh_id   (__tui-fresh-cell-id (__tui-state-cells state))
+              copy       (__tui-copy-cell clip fresh_id (cell-source clip))
+              new_node   (__tui-node-cell-make copy)
+              new_nodes  (if (= current 0)
+                           (__tui-append-node (__tui-state-nodes state)
+                             new_node)
+                           (__tui-insert-node-after (__tui-state-nodes state)
+                             (cell-id current)
+                             new_node))
               next_focus (if (= current 0) 0 (+ (__tui-state-focus state) 1))
               ;; __tui-copy-cell copies the id, and __tui-concat-owned consumes
               ;; it, so fresh_id is spent by the time rebuild-state runs.
-              out (__tui-rebuild-state state
-                                       new_nodes
-                                       next_focus
-                                       (__tui-concat-owned (__tui-own "pasted ") fresh_id)
-                                       1)]
+              out        (__tui-rebuild-state state
+                           new_nodes
+                           next_focus
+                           (__tui-concat-owned (__tui-own "pasted ") fresh_id)
+                           1)]
           out))))
-
-  (defn __tui-request-quit [state : int] #fx{Unsafe} : int
+  (defn __tui-request-quit [state : int]
+    #fx{Unsafe}
+    : int
     (if (= (__tui-state-dirty state) 1)
       (if (= (__tui-state-quit-confirm state) 1)
         (do
@@ -1841,12 +2004,14 @@
           (__tui-state-set-status state "quit with unsaved changes"))
         (do
           (__tui-state-set-quit-confirm state 1)
-          (__tui-state-set-status state "unsaved changes: press q again to quit or s to save")))
+          (__tui-state-set-status state
+            "unsaved changes: press q again to quit or s to save")))
       (do
         (__tui-state-set-quit state 1 0)
         (__tui-state-set-status state "quit"))))
-
-  (defn __tui-search-prompt [state : int] #fx{Unsafe} : int
+  (defn __tui-search-prompt [state : int]
+    #fx{Unsafe}
+    : int
     (do
       (__tui-state-set-status state "/")
       (__tui-render state)
@@ -1863,31 +2028,38 @@
                         (__tui-search state query 1 true)))]
             (__tui-cstr-free query)
             out)))))
-
-  (defn __tui-search-next [state : int] #fx{Unsafe} : int
+  (defn __tui-search-next [state : int]
+    #fx{Unsafe}
+    : int
     (__tui-search state (__tui-state-search-query state) 1 false))
-
-  (defn __tui-search-prev [state : int] #fx{Unsafe} : int
+  (defn __tui-search-prev [state : int]
+    #fx{Unsafe}
+    : int
     (__tui-search state (__tui-state-search-query state) -1 false))
-
-  (defn __tui-toggle-help [state : int] #fx{Unsafe} : int
+  (defn __tui-toggle-help [state : int]
+    #fx{Unsafe}
+    : int
     (let [next (if (= (__tui-state-help-visible state) 1) 0 1)]
       (do
         (__tui-state-set-help-visible state next)
-        (__tui-state-set-status state (if (= next 1) "help overlay" "command mode")))))
-
-  (defn __tui-toggle-output [state : int] #fx{Unsafe} : int
-    (let [idx (__tui-state-focus state)
-          hidden (__tui-state-output-hidden state)
-          next (if (= (__tui-list-nth hidden idx) 1) 0 1)
+        (__tui-state-set-status state
+          (if (= next 1) "help overlay" "command mode")))))
+  (defn __tui-toggle-output [state : int]
+    #fx{Unsafe}
+    : int
+    (let [idx     (__tui-state-focus state)
+          hidden  (__tui-state-output-hidden state)
+          next    (if (= (__tui-list-nth hidden idx) 1) 0 1)
           updated (__tui-list-set hidden idx next)]
       (do
         (__tui-state-set-output-hidden state updated)
-        (__tui-state-set-status state (if (= next 1) "hid output" "showed output")))))
-
-  (defn __tui-apply-effect [state : int] #fx{Unsafe} : int
+        (__tui-state-set-status state
+          (if (= next 1) "hid output" "showed output")))))
+  (defn __tui-apply-effect [state : int]
+    #fx{Unsafe}
+    : int
     (let [effect (__tui-state-pending-effect state)
-          _ (__tui-state-set-pending-effect state 0)]
+          _      (__tui-state-set-pending-effect state 0)]
       (if (= effect 1)
         (__tui-run-current state false)
         (if (= effect 2)
@@ -1919,8 +2091,9 @@
                                   (if (= effect 15)
                                     (__tui-toggle-output state)
                                     state)))))))))))))))))
-
-  (defn __tui-render [state : int] #fx{Unsafe} : int
+  (defn __tui-render [state : int]
+    #fx{Unsafe}
+    : int
     ```c
     /* __tur_include__: #include <sys/ioctl.h> */
     /* __tur_include__: #include <unistd.h> */
@@ -2158,96 +2331,104 @@
     fflush(stdout);
     return 0;
     ```)
-
-;;; __tui-handle-key -- process one keystroke.  `pending` is borrowed from the
-;;; loop; the returned prefix is owned by the caller, so every path builds it
-;;; with __tui-own / __tui-concat-owned and the branches that do not hand
-;;; `combo` back release it.
-  (defn __tui-handle-key [state : int pending : cstr key : cstr] #fx{Unsafe} : cstr
+  ;;; __tui-handle-key -- process one keystroke.  `pending` is borrowed from the
+  ;;; loop; the returned prefix is owned by the caller, so every path builds it
+  ;;; with __tui-own / __tui-concat-owned and the branches that do not hand
+  ;;; `combo` back release it.
+  (defn __tui-handle-key [state : int pending : cstr key : cstr]
+    #fx{Unsafe}
+    : cstr
     (if (= (__tui-state-help-visible state) 1)
       (do
         (__tui-state-set-help-visible state 0)
         (__tui-state-set-status state "command mode")
         (__tui-own ""))
-      (let [_ (if (and (= (__tui-state-quit-confirm state) 1)
-                     (not (__tui-cstr-eq? key "q")))
-              (__tui-state-set-quit-confirm state 0)
-              state)
-          bindings (__tui-state-bindings state)
-          combo (if (__tui-cstr-empty? pending)
-                  (__tui-own key)
-                  (__tui-concat-owned (__tui-own pending) (__tui-own key)))
-          combo-action (__tui-binding-action bindings combo)]
+      (let [_            (if (and (= (__tui-state-quit-confirm state) 1)
+                               (not (__tui-cstr-eq? key "q")))
+                           (__tui-state-set-quit-confirm state 0)
+                           state)
+            bindings     (__tui-state-bindings state)
+            combo        (if (__tui-cstr-empty? pending)
+                           (__tui-own key)
+                           (__tui-concat-owned (__tui-own pending)
+                             (__tui-own key)))
+            combo-action (__tui-binding-action bindings combo)]
         (if (not (__tui-cstr-empty? combo-action))
-        (do
-          (action-dispatch state combo-action)
-          (__tui-apply-effect state)
-          (__tui-cstr-free combo)
-          (__tui-own ""))
-        (if (__tui-binding-has-prefix bindings combo)
-          combo
-          (let [single-action (__tui-binding-action bindings key)]
+          (do
+            (action-dispatch state combo-action)
+            (__tui-apply-effect state)
             (__tui-cstr-free combo)
-            (if (not (__tui-cstr-empty? single-action))
-              (do
-                (action-dispatch state single-action)
-                (__tui-apply-effect state)
-                (__tui-own ""))
-              (do
-                (__tui-set-status-owned state (__tui-str-concat "unbound key: " key))
-                (__tui-own "")))))))))
-
-;;; __tui-loop -- read keys until the state asks to quit.  Each iteration owns
-;;; the pending prefix __tui-handle-key returned and releases it once the next
-;;; one has been built.
-  (defn __tui-loop [state : int pending : cstr] #fx{Unsafe} : int
+            (__tui-own ""))
+          (if (__tui-binding-has-prefix bindings combo)
+            combo
+            (let [single-action (__tui-binding-action bindings key)]
+              (__tui-cstr-free combo)
+              (if (not (__tui-cstr-empty? single-action))
+                (do
+                  (action-dispatch state single-action)
+                  (__tui-apply-effect state)
+                  (__tui-own ""))
+                (do
+                  (__tui-set-status-owned state
+                    (__tui-str-concat "unbound key: " key))
+                  (__tui-own "")))))))))
+  ;;; __tui-loop -- read keys until the state asks to quit.  Each iteration owns
+  ;;; the pending prefix __tui-handle-key returned and releases it once the next
+  ;;; one has been built.
+  (defn __tui-loop [state : int pending : cstr]
+    #fx{Unsafe}
+    : int
     (do
       (__tui-render state)
       (if (__tui-state-quit? state)
-        (do
-          (__tui-cstr-free pending)
-          (__tui-ok (__tui-state-exit-code state)))
+        (do (__tui-cstr-free pending) (__tui-ok (__tui-state-exit-code state)))
         ;; term-read-key hands back a fresh string for every keystroke, and
         ;; __tui-handle-key only ever copies it, so it is ours to release.
-        (let [key (term-read-key)
+        (let [key          (term-read-key)
               next-pending (__tui-handle-key state pending key)]
           (__tui-cstr-free key)
           (__tui-cstr-free pending)
           (__tui-loop state next-pending)))))
-
-;;; __tui-load-bindings -- the built-in bindings, with a file's overrides in
-;;; front of them when opts names one.  __tui-concat-lists copies the left
-;;; spine and shares the heads, so the loaded spine (but not the bindings it
-;;; points at, which the merged list now owns) and the Result box are dropped.
-  (defn __tui-load-bindings [opts : int] #fx{Unsafe} : int
+  ;;; __tui-load-bindings -- the built-in bindings, with a file's overrides in
+  ;;; front of them when opts names one.  __tui-concat-lists copies the left
+  ;;; spine and shares the heads, so the loaded spine (but not the bindings it
+  ;;; points at, which the merged list now owns) and the Result box are dropped.
+  (defn __tui-load-bindings [opts : int]
+    #fx{Unsafe}
+    : int
     (let [path (__tui-opts-keybindings-file opts)]
       (if (__tui-cstr-empty? path)
         (__tui-ok (default-keybindings))
         (let [loaded (load-keybindings path)]
           (if (__tui-result-ok? loaded)
-            (let [merged (__tui-concat-lists (__tui-result-ok-val loaded) (default-keybindings))]
+            (let [merged (__tui-concat-lists (__tui-result-ok-val loaded)
+                           (default-keybindings))]
               (__tui-spine-free (__tui-result-ok-val loaded))
               (__tui-box-free loaded)
               (__tui-ok merged))
             (let [message (__tui-result-err-val loaded)]
               (__tui-box-free loaded)
               (__tui-err message)))))))
-
-  (defn __tui-run-with-path [path : cstr nodes : int opts : int] #fx{Unsafe} : int
-    (let [cells (cells-assign-ids (__tui-reverse (__tui-cells-from-nodes-rev nodes (__tui-nil-value))
-                                                 (__tui-nil-value)))
+  (defn __tui-run-with-path [path : cstr nodes : int opts : int]
+    #fx{Unsafe}
+    : int
+    (let [cells           (cells-assign-ids (__tui-reverse (__tui-cells-from-nodes-rev nodes
+                                                             (__tui-nil-value))
+                                              (__tui-nil-value)))
           bindings-result (__tui-load-bindings opts)]
       (if (not (__tui-result-ok? bindings-result))
         (__tui-err (__tui-result-err-val bindings-result))
         (let [session (session-open-for path)
-              state (__tui-state-make path
-                                      nodes
-                                      cells
-                                      (__tui-result-ok-val bindings-result)
-                                      session
-                                      opts)
-              _ (__tui-state-set-outputs state (__tui-zero-list (__tui-state-cell-count state)))
-              _ (__tui-state-set-output-hidden state (__tui-zero-list (__tui-state-cell-count state)))]
+              state   (__tui-state-make path
+                        nodes
+                        cells
+                        (__tui-result-ok-val bindings-result)
+                        session
+                        opts)
+              _       (__tui-state-set-outputs state
+                        (__tui-zero-list (__tui-state-cell-count state)))
+              _       (__tui-state-set-output-hidden state
+                        (__tui-zero-list (__tui-state-cell-count state)))]
           (do
             (term-enable-raw)
             (let [result (__tui-loop state (__tui-own ""))]
@@ -2258,18 +2439,18 @@
                 (__tui-box-free bindings-result)
                 (__tui-state-free state)
                 result)))))))
-
   ;;; tui-run -- parse a notebook file and launch the command-mode TUI.
-  (defn tui-run [path : cstr opts : int] #fx{Unsafe} : int
+  (defn tui-run [path : cstr opts : int]
+    #fx{Unsafe}
+    : int
     (let [parsed (parse-file path)]
       (if (not (__tui-result-ok? parsed))
         (__tui-err "failed to parse notebook file")
         (let [nodes (__tui-result-ok-val parsed)
-              _box (__tui-box-free parsed)]
+              _box  (__tui-box-free parsed)]
           (__tui-run-with-path path nodes opts)))))
-
   ;;; tui-run-nodes -- launch the command-mode TUI with an already-parsed node list.
-  (defn tui-run-nodes [nodes : int opts : int] #fx{Unsafe} : int
-    (__tui-run-with-path "" nodes opts))
-
-) ;; end defmodule notebook/tui
+  (defn tui-run-nodes [nodes : int opts : int]
+    #fx{Unsafe}
+    : int
+    (__tui-run-with-path "" nodes opts))) ;; end defmodule notebook/tui

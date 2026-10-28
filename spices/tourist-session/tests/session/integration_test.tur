@@ -4,21 +4,21 @@
 ;; real session/ctx lazy loader and session/mw flush against a live store --
 ;; the full request lifecycle minus the socket.
 (defmodule session/tests/integration
-  (import test/suite  :refer [describe it])
+  (import test/suite :refer [describe it])
   (import test/assert :refer [assert-true assert-eq])
   (import test/runner :refer [run-all-status])
   (import session/memory-store :refer [memory-store-new memory-store-count])
-  (import session/config       :refer [dev-session-config])
-  (import session/mw           :refer [session-mw session-flush])
-  (import session/ctx          :refer [session-get session-set! session-id
-                                       session-destroy!])
-  (import tourist/param        :refer [tourist-ctx-new tourist-ctx-free])
-  (import tourist/types        :refer [Ctx])
-  (import tourist/helpers      :refer [text])
-  (import httpd/types          :refer [Response])
-
-```c
-/* Leak detection is off for this suite.  It fabricates requests, contexts
+  (import session/config :refer [dev-session-config])
+  (import session/mw :refer [session-mw session-flush])
+  (import session/ctx
+    :refer
+    [session-get session-set! session-id session-destroy!])
+  (import tourist/param :refer [tourist-ctx-new tourist-ctx-free])
+  (import tourist/types :refer [Ctx])
+  (import tourist/helpers :refer [text])
+  (import httpd/types :refer [Response])
+  ```c
+  /* Leak detection is off for this suite.  It fabricates requests, contexts
    and responses it never frees, and installs a store and config per case
    (session-mw); none of that was checked until session/ctx began importing
    tourist/request (tourist-on-stdlib-httpd H5), which links libturi and so
@@ -27,32 +27,28 @@
 const char *__asan_default_options(void);
 const char *__asan_default_options(void) { return "detect_leaks=0"; }
 ```
-
-(defn seq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+  (defn seq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn cdup [s : cstr] : cstr
-  ```c
-  #include <string.h>
+  (defn cdup [s : cstr] : cstr
+    ```c
+    #include <string.h>
   return (const char *)strdup((const char *)s);
   ```)
-
-(defn cookie-of [id : cstr] : cstr
-  ```c
-  #include <stdlib.h>
+  (defn cookie-of [id : cstr] : cstr
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   const char *i = (const char *)id;
   char *out = malloc(strlen(i) + 16);
   sprintf(out, "tur_session=%s", i);
   return (const char *)out;
   ```)
-
-(defn fake-req [cookie : cstr] : int
-  ```c
-  #include <stdlib.h>
+  (defn fake-req [cookie : cstr] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   struct __httpd_req {
     char *method; char *path; char *query; char *body;
@@ -70,69 +66,60 @@ const char *__asan_default_options(void) { return "detect_leaks=0"; }
   r->body_len = 0;
   return (int64_t)(intptr_t)r;
   ```)
-
-(defn mk-ctx [cookie : cstr] : Ctx
-  (:: (tourist-ctx-new (fake-req cookie) 0) :Ctx))
-
-(defn got-val? [r : (Result cstr cstr) want : cstr] : bool
-  (if (ok? r) (seq? (ok-val r) want) false))
-
-(defn main [] : int
- (do
-  (describe "session/integration"
-    (it "loads an existing session from its cookie"
-      (let [s (memory-store-new)
-            seed (session-mw s (dev-session-config))]  ;; installs store+config
-        ;; seed the store by persisting a write from a first request
-        (let [c0 (mk-ctx "")]
-          (session-set! c0 "user_id" "42")
-          (let [id (cdup (session-id c0))]
-            (session-flush c0 (:: (text "ok") :Response))
-            (tourist-ctx-free c0)
-            ;; second request presents the cookie -> value comes back
-            (let [c1 (mk-ctx (cookie-of id))
-                  ok (got-val? (session-get c1 "user_id") "42")]
-              (tourist-ctx-free c1)
-              (assert-true ok))))))
-
-    (it "mints a fresh 64-char id when no cookie is present"
-      (let [s (memory-store-new)
-            _ (session-mw s (dev-session-config))
-            c (mk-ctx "")
-            n (clen (session-id c))]
-        (tourist-ctx-free c)
-        (assert-eq n 64)))
-
-    (it "persists a dirty session and reports a miss for unknown ids"
-      (let [s (memory-store-new)
-            _ (session-mw s (dev-session-config))
-            c (mk-ctx "")]
-        (session-set! c "k" "v")
-        (let [id (cdup (session-id c))]
-          (session-flush c (:: (text "ok") :Response))
-          (tourist-ctx-free c)
-          (assert-eq (memory-store-count s) 1))))
-
-    (it "destroy deletes the stored session"
-      (let [s (memory-store-new)
-            _ (session-mw s (dev-session-config))
-            c (mk-ctx "")]
-        (session-set! c "k" "v")
-        (let [id (cdup (session-id c))]
-          (session-flush c (:: (text "ok") :Response))
-          (tourist-ctx-free c)
-          ;; destroy via a follow-up request carrying the cookie
-          (let [c2 (mk-ctx (cookie-of id))]
-            (session-destroy! c2)
-            (session-flush c2 (:: (text "ok") :Response))
-            (tourist-ctx-free c2)
-            (assert-eq (memory-store-count s) 0))))))
-  (run-all-status)))
-
-(defn clen [s : cstr] : int
-  ```c
-  #include <string.h>
+  (defn mk-ctx [cookie : cstr] : Ctx
+    (:: (tourist-ctx-new (fake-req cookie) 0) :Ctx))
+  (defn got-val? [r : (Result cstr cstr) want : cstr] : bool
+    (if (ok? r) (seq? (ok-val r) want) false))
+  (defn main [] : int
+    (do
+      (describe "session/integration"
+        (it "loads an existing session from its cookie"
+          (let [s    (memory-store-new)
+                seed (session-mw s (dev-session-config))] ;; installs store+config
+            ;; seed the store by persisting a write from a first request
+            (let [c0 (mk-ctx "")]
+              (session-set! c0 "user_id" "42")
+              (let [id (cdup (session-id c0))]
+                (session-flush c0 (:: (text "ok") :Response))
+                (tourist-ctx-free c0)
+                ;; second request presents the cookie -> value comes back
+                (let [c1 (mk-ctx (cookie-of id))
+                      ok (got-val? (session-get c1 "user_id") "42")]
+                  (tourist-ctx-free c1)
+                  (assert-true ok))))))
+        (it "mints a fresh 64-char id when no cookie is present"
+          (let [s (memory-store-new)
+                _ (session-mw s (dev-session-config))
+                c (mk-ctx "")
+                n (clen (session-id c))]
+            (tourist-ctx-free c)
+            (assert-eq n 64)))
+        (it "persists a dirty session and reports a miss for unknown ids"
+          (let [s (memory-store-new)
+                _ (session-mw s (dev-session-config))
+                c (mk-ctx "")]
+            (session-set! c "k" "v")
+            (let [id (cdup (session-id c))]
+              (session-flush c (:: (text "ok") :Response))
+              (tourist-ctx-free c)
+              (assert-eq (memory-store-count s) 1))))
+        (it "destroy deletes the stored session"
+          (let [s (memory-store-new)
+                _ (session-mw s (dev-session-config))
+                c (mk-ctx "")]
+            (session-set! c "k" "v")
+            (let [id (cdup (session-id c))]
+              (session-flush c (:: (text "ok") :Response))
+              (tourist-ctx-free c)
+              ;; destroy via a follow-up request carrying the cookie
+              (let [c2 (mk-ctx (cookie-of id))]
+                (session-destroy! c2)
+                (session-flush c2 (:: (text "ok") :Response))
+                (tourist-ctx-free c2)
+                (assert-eq (memory-store-count s) 0))))))
+      (run-all-status)))
+  (defn clen [s : cstr] : int
+    ```c
+    #include <string.h>
   return (int64_t)strlen((const char *)s);
-  ```)
-
-) ;; end module
+  ```)) ;; end module

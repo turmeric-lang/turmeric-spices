@@ -8,70 +8,71 @@
 ;;
 ;; Paint handles are opaque :int (cast from plutovg_paint_t* via intptr_t).
 ;; Stops handles are opaque :int into a malloc'd float buffer.
-
 (defmodule plutovg/paint
   (import plutovg/types :refer [Canvas Surface Paint GradientStops])
   (export ;; Solid colors
-          paint-create-color paint-create-color-hex paint-destroy
-          ;; Gradient-stop builder
-          gradient-stops-create gradient-stops-add
-          gradient-stops-destroy gradient-stops-count
-          ;; Gradient constructors
-          paint-create-linear-gradient paint-create-radial-gradient
-          ;; Texture
-          paint-create-texture
-          ;; Canvas binding
-          canvas-set-source)
-
-;; (Private spread/texture-type decoding is inlined directly into each
-;; constructor's inline-C body below.  We previously tried to share helpers
-;; via Turmeric `defn`s, but those get name-mangled in codegen and aren't
-;; callable from sibling inline-C blocks without going through the public
-;; module name.)
-
-;; -------------------------------------------------------------------------
-;; Solid colors
-;; -------------------------------------------------------------------------
-
-;;; paint-create-color -- create a paint with a solid RGBA color.
-;;;
-;;; Parameters:
-;;;   r -- red   in [0.0, 1.0]
-;;;   g -- green in [0.0, 1.0]
-;;;   b -- blue  in [0.0, 1.0]
-;;;   a -- alpha in [0.0, 1.0]
-;;;
-;;; Returns:
-;;;   (ok paint-handle) on success; (err 0) on allocation failure.
-;;;
-;;; Example:
-;;;   (paint-create-color 1.0 0.0 0.0 1.0)  ; opaque red
-;;;
-;;; Since: PV3
-(defn paint-create-color [r : float g : float b : float a : float] : (Result Paint int)
-  ```c
-  #include <plutovg.h>
+    paint-create-color
+    paint-create-color-hex
+    paint-destroy
+    ;; Gradient-stop builder
+    gradient-stops-create
+    gradient-stops-add
+    gradient-stops-destroy
+    gradient-stops-count
+    ;; Gradient constructors
+    paint-create-linear-gradient
+    paint-create-radial-gradient
+    ;; Texture
+    paint-create-texture
+    ;; Canvas binding
+    canvas-set-source)
+  ;; (Private spread/texture-type decoding is inlined directly into each
+  ;; constructor's inline-C body below.  We previously tried to share helpers
+  ;; via Turmeric `defn`s, but those get name-mangled in codegen and aren't
+  ;; callable from sibling inline-C blocks without going through the public
+  ;; module name.)
+  ;; -------------------------------------------------------------------------
+  ;; Solid colors
+  ;; -------------------------------------------------------------------------
+  ;;; paint-create-color -- create a paint with a solid RGBA color.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- red   in [0.0, 1.0]
+  ;;;   g -- green in [0.0, 1.0]
+  ;;;   b -- blue  in [0.0, 1.0]
+  ;;;   a -- alpha in [0.0, 1.0]
+  ;;;
+  ;;; Returns:
+  ;;;   (ok paint-handle) on success; (err 0) on allocation failure.
+  ;;;
+  ;;; Example:
+  ;;;   (paint-create-color 1.0 0.0 0.0 1.0)  ; opaque red
+  ;;;
+  ;;; Since: PV3
+  (defn paint-create-color [r : float g : float b : float a : float] : (Result Paint
+                                                                         int)
+    ```c
+    #include <plutovg.h>
   plutovg_paint_t *p = plutovg_paint_create_rgba((float)r, (float)g, (float)b, (float)a);
   if (!p) return tur_err_int(0);
   return tur_ok_ptr(p);
   ```)
-
-;;; paint-create-color-hex -- create a paint from a CSS-style color string.
-;;;
-;;; Parameters:
-;;;   hex -- color string, e.g. "#ff0000", "#ff0000ff", "red", "rgba(...)"
-;;;
-;;; Returns:
-;;;   (ok paint-handle) on success; (err 0) if plutovg cannot parse the
-;;;   string.
-;;;
-;;; Example:
-;;;   (paint-create-color-hex "#ff0000")
-;;;
-;;; Since: PV3
-(defn paint-create-color-hex [hex : cstr] : (Result Paint int)
-  ```c
-  #include <plutovg.h>
+  ;;; paint-create-color-hex -- create a paint from a CSS-style color string.
+  ;;;
+  ;;; Parameters:
+  ;;;   hex -- color string, e.g. "#ff0000", "#ff0000ff", "red", "rgba(...)"
+  ;;;
+  ;;; Returns:
+  ;;;   (ok paint-handle) on success; (err 0) if plutovg cannot parse the
+  ;;;   string.
+  ;;;
+  ;;; Example:
+  ;;;   (paint-create-color-hex "#ff0000")
+  ;;;
+  ;;; Since: PV3
+  (defn paint-create-color-hex [hex : cstr] : (Result Paint int)
+    ```c
+    #include <plutovg.h>
   plutovg_color_t col;
   const char *s = (const char *)(intptr_t)hex;
   int parsed = plutovg_color_parse(&col, s, -1);
@@ -80,48 +81,44 @@
   if (!p) return tur_err_int(0);
   return tur_ok_ptr(p);
   ```)
-
-;;; paint-destroy -- release a paint allocated by any paint-create-* call.
-;;;
-;;; Parameters:
-;;;   paint -- paint handle
-;;;
-;;; Returns:
-;;;   void
-;;;
-;;; Since: PV3
-(defn paint-destroy [paint : Paint] : void
-  ```c
-  #include <plutovg.h>
+  ;;; paint-destroy -- release a paint allocated by any paint-create-* call.
+  ;;;
+  ;;; Parameters:
+  ;;;   paint -- paint handle
+  ;;;
+  ;;; Returns:
+  ;;;   void
+  ;;;
+  ;;; Since: PV3
+  (defn paint-destroy [paint : Paint] : void
+    ```c
+    #include <plutovg.h>
   if (paint) plutovg_paint_destroy((plutovg_paint_t *)(intptr_t)paint);
   ```)
-
-;; -------------------------------------------------------------------------
-;; Gradient stops builder
-;; -------------------------------------------------------------------------
-
-;; gradient-stops is a heap-allocated buffer holding:
-;;   { int capacity; int count; float data[capacity * 5]; }
-;; where each stop is 5 floats laid out as: offset, r, g, b, a.
-;;
-;; We need a stable struct layout because plutovg_gradient_stop_t is
-;; literally { float offset; plutovg_color_t color; } and plutovg_color_t is
-;; { float r, g, b, a; } -- so 5 packed floats per stop.  When passing to
-;; plutovg we cast our float buffer to const plutovg_gradient_stop_t *.
-
-;;; gradient-stops-create -- allocate an empty stops buffer.
-;;;
-;;; Returns:
-;;;   (ok stops-handle) on success; (err 0) on allocation failure.
-;;;
-;;; Example:
-;;;   (let [s (gradient-stops-create)]
-;;;     (when (ok? s) (gradient-stops-destroy (ok-val s))))
-;;;
-;;; Since: PV3
-(defn gradient-stops-create [] : (Result GradientStops int)
-  ```c
-  #include <stdlib.h>
+  ;; -------------------------------------------------------------------------
+  ;; Gradient stops builder
+  ;; -------------------------------------------------------------------------
+  ;; gradient-stops is a heap-allocated buffer holding:
+  ;;   { int capacity; int count; float data[capacity * 5]; }
+  ;; where each stop is 5 floats laid out as: offset, r, g, b, a.
+  ;;
+  ;; We need a stable struct layout because plutovg_gradient_stop_t is
+  ;; literally { float offset; plutovg_color_t color; } and plutovg_color_t is
+  ;; { float r, g, b, a; } -- so 5 packed floats per stop.  When passing to
+  ;; plutovg we cast our float buffer to const plutovg_gradient_stop_t *.
+  ;;; gradient-stops-create -- allocate an empty stops buffer.
+  ;;;
+  ;;; Returns:
+  ;;;   (ok stops-handle) on success; (err 0) on allocation failure.
+  ;;;
+  ;;; Example:
+  ;;;   (let [s (gradient-stops-create)]
+  ;;;     (when (ok? s) (gradient-stops-destroy (ok-val s))))
+  ;;;
+  ;;; Since: PV3
+  (defn gradient-stops-create [] : (Result GradientStops int)
+    ```c
+    #include <stdlib.h>
   /* Header { int cap; int count; } + initial 8 stops (40 floats). */
   int initial_cap = 8;
   size_t bytes = sizeof(int) * 2 + (size_t)initial_cap * 5 * sizeof(float);
@@ -131,29 +128,32 @@
   ((int *)buf)[1] = 0;            /* count */
   return tur_ok_ptr(buf);
   ```)
-
-;;; gradient-stops-add -- append a stop to a stops buffer.
-;;;
-;;; Parameters:
-;;;   stops  -- stops buffer handle
-;;;   offset -- stop offset in [0.0, 1.0]
-;;;   r/g/b  -- color components in [0.0, 1.0]
-;;;   a      -- alpha in [0.0, 1.0]
-;;;
-;;; Returns:
-;;;   void  (the buffer is grown in place if capacity is exceeded; the
-;;;   handle stays valid, but callers must hold the result of any earlier
-;;;   gradient-stops-* call rather than caching the underlying pointer).
-;;;
-;;; Example:
-;;;   (gradient-stops-add s 0.0 1.0 0.0 0.0 1.0)
-;;;   (gradient-stops-add s 1.0 0.0 0.0 1.0 1.0)
-;;;
-;;; Since: PV3
-(defn gradient-stops-add [stops : GradientStops offset : float r : float g : float
-                          b : float a : float] : void
-  ```c
-  #include <stdlib.h>
+  ;;; gradient-stops-add -- append a stop to a stops buffer.
+  ;;;
+  ;;; Parameters:
+  ;;;   stops  -- stops buffer handle
+  ;;;   offset -- stop offset in [0.0, 1.0]
+  ;;;   r/g/b  -- color components in [0.0, 1.0]
+  ;;;   a      -- alpha in [0.0, 1.0]
+  ;;;
+  ;;; Returns:
+  ;;;   void  (the buffer is grown in place if capacity is exceeded; the
+  ;;;   handle stays valid, but callers must hold the result of any earlier
+  ;;;   gradient-stops-* call rather than caching the underlying pointer).
+  ;;;
+  ;;; Example:
+  ;;;   (gradient-stops-add s 0.0 1.0 0.0 0.0 1.0)
+  ;;;   (gradient-stops-add s 1.0 0.0 0.0 1.0 1.0)
+  ;;;
+  ;;; Since: PV3
+  (defn gradient-stops-add [stops : GradientStops
+                            offset : float
+                            r : float
+                            g : float
+                            b : float
+                            a : float] : void
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   char *buf = (char *)(intptr_t)stops;
   if (!buf) return;
@@ -184,59 +184,60 @@
   stop[4] = (float)a;
   header[1] = n + 1;
   ```)
-
-;;; gradient-stops-count -- return how many stops have been added.
-;;;
-;;; Since: PV3
-(defn gradient-stops-count [stops : GradientStops] : int
-  ```c
-  char *buf = (char *)(intptr_t)stops;
+  ;;; gradient-stops-count -- return how many stops have been added.
+  ;;;
+  ;;; Since: PV3
+  (defn gradient-stops-count [stops : GradientStops] : int
+    ```c
+    char *buf = (char *)(intptr_t)stops;
   if (!buf) return 0;
   return (int64_t)((int *)buf)[1];
   ```)
-
-;;; gradient-stops-destroy -- release a stops buffer.
-;;;
-;;; Since: PV3
-(defn gradient-stops-destroy [stops : GradientStops] : void
-  ```c
-  #include <stdlib.h>
+  ;;; gradient-stops-destroy -- release a stops buffer.
+  ;;;
+  ;;; Since: PV3
+  (defn gradient-stops-destroy [stops : GradientStops] : void
+    ```c
+    #include <stdlib.h>
   if (stops) free((void *)(intptr_t)stops);
   ```)
-
-;; -------------------------------------------------------------------------
-;; Linear and radial gradients
-;; -------------------------------------------------------------------------
-
-;;; paint-create-linear-gradient -- create a linear-gradient paint.
-;;;
-;;; Parameters:
-;;;   x1     -- gradient start x
-;;;   y1     -- gradient start y
-;;;   x2     -- gradient end   x
-;;;   y2     -- gradient end   y
-;;;   spread -- spread keyword ":pad" / ":reflect" / ":repeat"
-;;;   stops  -- gradient-stops buffer (must contain at least 2 stops)
-;;;
-;;; Returns:
-;;;   (ok paint-handle) on success; (err 0) on allocation failure.
-;;;   The buffer can be freed immediately after the call -- plutovg
-;;;   copies its stops internally.
-;;;
-;;; Example:
-;;;   (let [stops (ok-val (gradient-stops-create))]
-;;;     (gradient-stops-add stops 0.0 1.0 0.0 0.0 1.0)
-;;;     (gradient-stops-add stops 1.0 0.0 0.0 1.0 1.0)
-;;;     (let [p (ok-val (paint-create-linear-gradient 0.0 0.0 100.0 0.0 ":pad" stops))]
-;;;       (canvas-set-source c p)
-;;;       (gradient-stops-destroy stops)
-;;;       (paint-destroy p)))
-;;;
-;;; Since: PV3
-(defn paint-create-linear-gradient [x1 : float y1 : float x2 : float y2 : float
-                                    spread : cstr stops : GradientStops] : (Result Paint int)
-  ```c
-  #include <string.h>
+  ;; -------------------------------------------------------------------------
+  ;; Linear and radial gradients
+  ;; -------------------------------------------------------------------------
+  ;;; paint-create-linear-gradient -- create a linear-gradient paint.
+  ;;;
+  ;;; Parameters:
+  ;;;   x1     -- gradient start x
+  ;;;   y1     -- gradient start y
+  ;;;   x2     -- gradient end   x
+  ;;;   y2     -- gradient end   y
+  ;;;   spread -- spread keyword ":pad" / ":reflect" / ":repeat"
+  ;;;   stops  -- gradient-stops buffer (must contain at least 2 stops)
+  ;;;
+  ;;; Returns:
+  ;;;   (ok paint-handle) on success; (err 0) on allocation failure.
+  ;;;   The buffer can be freed immediately after the call -- plutovg
+  ;;;   copies its stops internally.
+  ;;;
+  ;;; Example:
+  ;;;   (let [stops (ok-val (gradient-stops-create))]
+  ;;;     (gradient-stops-add stops 0.0 1.0 0.0 0.0 1.0)
+  ;;;     (gradient-stops-add stops 1.0 0.0 0.0 1.0 1.0)
+  ;;;     (let [p (ok-val (paint-create-linear-gradient 0.0 0.0 100.0 0.0 ":pad" stops))]
+  ;;;       (canvas-set-source c p)
+  ;;;       (gradient-stops-destroy stops)
+  ;;;       (paint-destroy p)))
+  ;;;
+  ;;; Since: PV3
+  (defn paint-create-linear-gradient [x1 : float
+                                      y1 : float
+                                      x2 : float
+                                      y2 : float
+                                      spread : cstr
+                                      stops : GradientStops] : (Result Paint
+                                                                 int)
+    ```c
+    #include <string.h>
   #include <plutovg.h>
   char *buf = (char *)(intptr_t)stops;
   int n = buf ? ((int *)buf)[1] : 0;
@@ -256,28 +257,33 @@
   if (!p) return tur_err_int(0);
   return tur_ok_ptr(p);
   ```)
-
-;;; paint-create-radial-gradient -- create a radial-gradient paint.
-;;;
-;;; Parameters:
-;;;   cx     -- gradient center x
-;;;   cy     -- gradient center y
-;;;   cr     -- center-circle radius
-;;;   fx     -- focal point x
-;;;   fy     -- focal point y
-;;;   fr     -- focal-circle radius
-;;;   spread -- ":pad" / ":reflect" / ":repeat"
-;;;   stops  -- gradient-stops buffer
-;;;
-;;; Returns:
-;;;   (ok paint-handle) on success; (err 0) on allocation failure.
-;;;
-;;; Since: PV3
-(defn paint-create-radial-gradient [cx : float cy : float cr : float
-                                    fx : float fy : float fr : float
-                                    spread : cstr stops : GradientStops] : (Result Paint int)
-  ```c
-  #include <string.h>
+  ;;; paint-create-radial-gradient -- create a radial-gradient paint.
+  ;;;
+  ;;; Parameters:
+  ;;;   cx     -- gradient center x
+  ;;;   cy     -- gradient center y
+  ;;;   cr     -- center-circle radius
+  ;;;   fx     -- focal point x
+  ;;;   fy     -- focal point y
+  ;;;   fr     -- focal-circle radius
+  ;;;   spread -- ":pad" / ":reflect" / ":repeat"
+  ;;;   stops  -- gradient-stops buffer
+  ;;;
+  ;;; Returns:
+  ;;;   (ok paint-handle) on success; (err 0) on allocation failure.
+  ;;;
+  ;;; Since: PV3
+  (defn paint-create-radial-gradient [cx : float
+                                      cy : float
+                                      cr : float
+                                      fx : float
+                                      fy : float
+                                      fr : float
+                                      spread : cstr
+                                      stops : GradientStops] : (Result Paint
+                                                                 int)
+    ```c
+    #include <string.h>
   #include <plutovg.h>
   char *buf = (char *)(intptr_t)stops;
   int n = buf ? ((int *)buf)[1] : 0;
@@ -298,29 +304,28 @@
   if (!p) return tur_err_int(0);
   return tur_ok_ptr(p);
   ```)
-
-;; -------------------------------------------------------------------------
-;; Textures
-;; -------------------------------------------------------------------------
-
-;;; paint-create-texture -- create a paint backed by a surface.
-;;;
-;;; Parameters:
-;;;   surface  -- surface handle (from plutovg/surface)
-;;;   tex-type -- ":plain" (clamp / one-shot) or ":tiled" (repeat)
-;;;   opacity  -- :float in [0.0, 1.0]
-;;;
-;;; Returns:
-;;;   (ok paint-handle) on success; (err 0) on allocation failure.  The
-;;;   surface must outlive the paint.
-;;;
-;;; Example:
-;;;   (paint-create-texture s ":plain" 1.0)
-;;;
-;;; Since: PV3
-(defn paint-create-texture [surface : Surface tex-type : cstr opacity : float] : (Result Paint int)
-  ```c
-  #include <string.h>
+  ;; -------------------------------------------------------------------------
+  ;; Textures
+  ;; -------------------------------------------------------------------------
+  ;;; paint-create-texture -- create a paint backed by a surface.
+  ;;;
+  ;;; Parameters:
+  ;;;   surface  -- surface handle (from plutovg/surface)
+  ;;;   tex-type -- ":plain" (clamp / one-shot) or ":tiled" (repeat)
+  ;;;   opacity  -- :float in [0.0, 1.0]
+  ;;;
+  ;;; Returns:
+  ;;;   (ok paint-handle) on success; (err 0) on allocation failure.  The
+  ;;;   surface must outlive the paint.
+  ;;;
+  ;;; Example:
+  ;;;   (paint-create-texture s ":plain" 1.0)
+  ;;;
+  ;;; Since: PV3
+  (defn paint-create-texture [surface : Surface tex-type : cstr opacity : float] : (Result Paint
+                                                                                     int)
+    ```c
+    #include <string.h>
   #include <plutovg.h>
   const char *tk = (const char *)(intptr_t)tex_type;
   int tt = 0;
@@ -333,29 +338,25 @@
   if (!p) return tur_err_int(0);
   return tur_ok_ptr(p);
   ```)
-
-;; -------------------------------------------------------------------------
-;; Canvas binding
-;; -------------------------------------------------------------------------
-
-;;; canvas-set-source -- set the canvas's current paint.
-;;;
-;;; Parameters:
-;;;   c     -- canvas handle
-;;;   paint -- paint handle (any flavour)
-;;;
-;;; Returns:
-;;;   void
-;;;
-;;; Example:
-;;;   (canvas-set-source c my-paint)
-;;;
-;;; Since: PV3
-(defn canvas-set-source [c : Canvas paint : Paint] : void
-  ```c
-  #include <plutovg.h>
+  ;; -------------------------------------------------------------------------
+  ;; Canvas binding
+  ;; -------------------------------------------------------------------------
+  ;;; canvas-set-source -- set the canvas's current paint.
+  ;;;
+  ;;; Parameters:
+  ;;;   c     -- canvas handle
+  ;;;   paint -- paint handle (any flavour)
+  ;;;
+  ;;; Returns:
+  ;;;   void
+  ;;;
+  ;;; Example:
+  ;;;   (canvas-set-source c my-paint)
+  ;;;
+  ;;; Since: PV3
+  (defn canvas-set-source [c : Canvas paint : Paint] : void
+    ```c
+    #include <plutovg.h>
   plutovg_canvas_set_paint((plutovg_canvas_t *)(intptr_t)c,
                            (plutovg_paint_t *)(intptr_t)paint);
-  ```)
-
-) ;; end defmodule plutovg/paint
+  ```)) ;; end defmodule plutovg/paint

@@ -25,276 +25,264 @@
 (load "stdlib/typeclass-lattice.tur")
 
 (defmodule crdt/register
-  (import crdt/hlc :refer [Hlc hlc-zero hlc-tick hlc-after? hlc-later
-                           hlc-replica])
+  (import crdt/hlc
+    :refer
+    [Hlc hlc-zero hlc-tick hlc-after? hlc-later hlc-replica])
   ;; Imported for the ambient DeltaCRDT methods (C4); a defclass is not an
   ;; exportable name, so the import anchor is `join-all`.
   (import crdt/lattice :refer [join-all])
   (import crdt/replica :refer [ReplicaId])
-  (export LwwRegister lww-new lww-set lww-value lww-stamp lww-delta-set
-          MvRegister mv-new mv-set mv-values mv-count mv-delta-set)
-
-;;; LwwRegister -- one value, last writer wins by HLC stamp.
-;;;
-;;; Since: crdt-spice-plan C3
-(defstruct LwwRegister [value : int stamp : Hlc])
-
-;;; lww-new -- a register owned by a replica, holding 0.
-;;;
-;;; Parameters:
-;;;   r -- the replica
-;;;
-;;; Returns:
-;;;   A register at the zero stamp.
-;;;
-;;; Example:
-;;;   (lww-new (replica (quote alice)))
-;;;
-;;; Since: crdt-spice-plan C3
-(defn lww-new [r : ReplicaId] : LwwRegister
-  (LwwRegister 0 (hlc-zero r)))
-
-;;; lww-set -- write a value.
-;;;
-;;; Parameters:
-;;;   g   -- the register
-;;;   v   -- the new value
-;;;   now -- current wall time
-;;;
-;;; Returns:
-;;;   A register holding v, stamped strictly after the old one.
-;;;
-;;; Example:
-;;;   (lww-set (lww-new (replica (quote alice))) 42 1000)
-;;;
-;;; Since: crdt-spice-plan C3
-(defn lww-set [^borrow g : LwwRegister v : int now : int] : LwwRegister
-  (LwwRegister v (hlc-tick (.stamp g) now)))
-
-;;; lww-value -- the current value.
-;;;
-;;; Parameters:
-;;;   g -- the register
-;;;
-;;; Returns:
-;;;   Its value.
-;;;
-;;; Example:
-;;;   (lww-value g)   ; => 42
-;;;
-;;; Since: crdt-spice-plan C3
-(defn lww-value [^borrow g : LwwRegister] : int (.value g))
-
-;;; lww-stamp -- the stamp of the winning write.
-;;;
-;;; Parameters:
-;;;   g -- the register
-;;;
-;;; Returns:
-;;;   Its HLC stamp.
-;;;
-;;; Example:
-;;;   (lww-stamp g)
-;;;
-;;; Since: crdt-spice-plan C3
-(defn lww-stamp [^borrow g : LwwRegister] : Hlc (.stamp g))
-
-;;; __lww-pick -- internal: the later of two registers.
-;;
-;; A helper rather than an inline `if`, because a by-value struct PARAMETER used
-;; directly as an `if` arm is dereferenced by the emitter -- see
-;; docs/reported/byvalue-struct-param-as-if-arm-derefs.md.  Both arms are
-;; constructor calls here, which is the shape that compiles.
-(defn __lww-pick [^borrow x : LwwRegister ^borrow y : LwwRegister] : LwwRegister
-  (if (hlc-after? (.stamp x) (.stamp y))
-    (LwwRegister (.value x) (.stamp x))
-    (LwwRegister (.value y) (.stamp y))))
-
-;;; JoinSemilattice [LwwRegister] -- the later stamp wins.
-;;
-;; Idempotent because `hlc-after?` is STRICT: joining a register with itself
-;; takes the else arm and reproduces it.  A non-strict comparison here would
-;; still converge but would make the join depend on argument order, which is
-;; exactly what commutativity forbids.
-(definstance JoinSemilattice [LwwRegister]
-  (join [x y] (__lww-pick x y)))
-
-;;; Eq [LwwRegister] -- same value and same stamp.
-(definstance Eq [LwwRegister]
-  (eq? [^borrow x ^borrow y]
-    (and (= (.value x) (.value y))
-         (and (not (hlc-after? (.stamp x) (.stamp y)))
-              (not (hlc-after? (.stamp y) (.stamp x)))))))
-
-;;; lww-delta-set -- the DELTA of a write.
-;;;
-;;; Parameters:
-;;;   g   -- the register
-;;;   v   -- the new value
-;;;   now -- current wall time
-;;;
-;;; Returns:
-;;;   A register holding v, stamped strictly after g -- which is exactly the
-;;;   new state.
-;;;
-;;; Example:
-;;;   (lww-delta-set g 42 1000)
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; Identical to `lww-set`, and that is the honest answer rather than a
-;; placeholder: an LWW register's whole state is one value and one stamp, so
-;; there is nothing a delta could leave out.  The delta formulation saves
-;; nothing here and costs nothing either, and having the name means a caller
-;; can drive every type in this spice through the same `apply-delta` channel
-;; without special-casing the two registers.
-;;
-;; `Delta = LwwRegister` for the same reason: the register carries no causal
-;; context, so there is no downward-closed history for a delta to over-claim
-;; -- the trap that forces ORSet's delta to be a different type does not exist
-;; here.
-(defn lww-delta-set [^borrow g : LwwRegister v : int now : int] : LwwRegister
-  (lww-set g v now))
-
-;;; DeltaCRDT [LwwRegister] -- the delta is the register itself.
-(definstance DeltaCRDT [LwwRegister]
-  (type Delta = LwwRegister)
-  (delta-bottom [x] (lww-new (hlc-replica (.stamp x))))
-  (delta-join   [x d e] (join d e))
-  (apply-delta  [x d] (join x d)))
-
-;;; MvRegister -- every concurrent value, for the caller to resolve.
-;;;
-;;; Since: crdt-spice-plan C3
-(defstruct MvRegister [vals : int stamp : Hlc])
-
-;;; mv-new -- an empty multi-value register.
-;;;
-;;; Parameters:
-;;;   r -- the replica
-;;;
-;;; Returns:
-;;;   A register holding no values.
-;;;
-;;; Example:
-;;;   (mv-new (replica (quote alice)))
-;;;
-;;; Since: crdt-spice-plan C3
-(defn mv-new [r : ReplicaId] : MvRegister
-  (MvRegister (:: (map-new) int) (hlc-zero r)))
-
-;;; mv-set -- write a value, replacing everything this replica has observed.
-;;;
-;;; Parameters:
-;;;   g   -- the register
-;;;   v   -- the new value
-;;;   now -- current wall time
-;;;
-;;; Returns:
-;;;   A register holding only v.
-;;;
-;;; Example:
-;;;   (mv-set (mv-new (replica (quote alice))) 42 1000)
-;;;
-;;; Since: crdt-spice-plan C3
-;;
-;; A write SUPERSEDES what this replica has seen -- that is what makes a
-;; sequential write replace rather than accumulate.  Concurrent writes are not
-;; observed by each other, so the join keeps both.
-(defn mv-set [^borrow g : MvRegister v : int now : int] : MvRegister
-  (MvRegister (:: (map-assoc (:: (map-new) (Map int int)) v 1) int)
-              (hlc-tick (.stamp g) now)))
-
-;;; mv-values -- how many distinct concurrent values are held.
-;;;
-;;; Parameters:
-;;;   g -- the register
-;;;
-;;; Returns:
-;;;   The number of values; 1 when there is no conflict.
-;;;
-;;; Example:
-;;;   (mv-values g)   ; => 2
-;;;
-;;; Since: crdt-spice-plan C3
-(defn mv-values [^borrow g : MvRegister] : int
-  (map-count (:: (.vals g) (Map int int))))
-
-;;; mv-count -- alias for mv-values, for symmetry with the set types.
-;;;
-;;; Parameters:
-;;;   g -- the register
-;;;
-;;; Returns:
-;;;   The number of values held.
-;;;
-;;; Example:
-;;;   (mv-count g)   ; => 1
-;;;
-;;; Since: crdt-spice-plan C3
-(defn mv-count [^borrow g : MvRegister] : int (mv-values g))
-
-;;; __mv-merge -- internal: union the value sets.
-(defn __mv-merge [a : int b : int] : int
-  (let [it (hamt/iter-alloc (map-hamt (:: b (Map int int))))
-        r  (__mv-loop a it)]
-    (hamt/iter-destroy! it)
-    r))
-
-;;; __mv-loop -- internal.
-(defn __mv-loop [acc : int it : ptr<void>] : int
-  (if (hamt/iter-advance! it)
-    (__mv-loop (:: (map-assoc (:: acc (Map int int))
-                              (:: (hamt/iter-cur-key it) int) 1) int)
-               it)
-    acc))
-
-;;; JoinSemilattice [MvRegister] -- keep every value from both sides.
-;;
-;; The register that does NOT discard a concurrent write.  Union is idempotent
-;; and commutative for free, which is why this design needs no stamp comparison
-;; at all -- the stamp rides along only so a caller can see recency.
-(definstance JoinSemilattice [MvRegister]
-  (join [x y]
-    (MvRegister (__mv-merge (.vals x) (.vals y))
-                (hlc-later (.stamp x) (.stamp y)))))
-
-;;; Eq [MvRegister] -- same number of values.
-(definstance Eq [MvRegister]
-  (eq? [^borrow x ^borrow y] (= (mv-values x) (mv-values y))))
-
-;;; mv-delta-set -- the DELTA of a write.
-;;;
-;;; Parameters:
-;;;   g   -- the register
-;;;   v   -- the new value
-;;;   now -- current wall time
-;;;
-;;; Returns:
-;;;   A register holding only v.
-;;;
-;;; Example:
-;;;   (mv-delta-set g 42 1000)
-;;;
-;;; Since: crdt-spice-plan C4
-;;
-;; Identical to `mv-set`, and genuinely so: a write already replaces
-;; everything this replica observed, so the value it produces is as small as
-;; the state gets.
-;;
-;; The register's join is UNION, which is why this is not the whole story for
-;; the multi-value case: applying a write-delta to a replica that has since
-;; written something else concurrently leaves both values, exactly as merging
-;; the two full states would.  That is the type doing its job, not the delta
-;; channel losing information.
-(defn mv-delta-set [^borrow g : MvRegister v : int now : int] : MvRegister
-  (mv-set g v now))
-
-;;; DeltaCRDT [MvRegister] -- the delta is the register itself.
-(definstance DeltaCRDT [MvRegister]
-  (type Delta = MvRegister)
-  (delta-bottom [x] (mv-new (hlc-replica (.stamp x))))
-  (delta-join   [x d e] (join d e))
-  (apply-delta  [x d] (join x d)))
-
-) ;; end defmodule crdt/register
+  (export LwwRegister
+    lww-new
+    lww-set
+    lww-value
+    lww-stamp
+    lww-delta-set
+    MvRegister
+    mv-new
+    mv-set
+    mv-values
+    mv-count
+    mv-delta-set)
+  ;;; LwwRegister -- one value, last writer wins by HLC stamp.
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defstruct LwwRegister [value : int stamp : Hlc])
+  ;;; lww-new -- a register owned by a replica, holding 0.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- the replica
+  ;;;
+  ;;; Returns:
+  ;;;   A register at the zero stamp.
+  ;;;
+  ;;; Example:
+  ;;;   (lww-new (replica (quote alice)))
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn lww-new [r : ReplicaId] : LwwRegister (LwwRegister 0 (hlc-zero r)))
+  ;;; lww-set -- write a value.
+  ;;;
+  ;;; Parameters:
+  ;;;   g   -- the register
+  ;;;   v   -- the new value
+  ;;;   now -- current wall time
+  ;;;
+  ;;; Returns:
+  ;;;   A register holding v, stamped strictly after the old one.
+  ;;;
+  ;;; Example:
+  ;;;   (lww-set (lww-new (replica (quote alice))) 42 1000)
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn lww-set [^borrow g : LwwRegister v : int now : int] : LwwRegister
+    (LwwRegister v (hlc-tick (.stamp g) now)))
+  ;;; lww-value -- the current value.
+  ;;;
+  ;;; Parameters:
+  ;;;   g -- the register
+  ;;;
+  ;;; Returns:
+  ;;;   Its value.
+  ;;;
+  ;;; Example:
+  ;;;   (lww-value g)   ; => 42
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn lww-value [^borrow g : LwwRegister] : int (.value g))
+  ;;; lww-stamp -- the stamp of the winning write.
+  ;;;
+  ;;; Parameters:
+  ;;;   g -- the register
+  ;;;
+  ;;; Returns:
+  ;;;   Its HLC stamp.
+  ;;;
+  ;;; Example:
+  ;;;   (lww-stamp g)
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn lww-stamp [^borrow g : LwwRegister] : Hlc (.stamp g))
+  ;;; __lww-pick -- internal: the later of two registers.
+  ;;
+  ;; A helper rather than an inline `if`, because a by-value struct PARAMETER used
+  ;; directly as an `if` arm is dereferenced by the emitter -- see
+  ;; docs/reported/byvalue-struct-param-as-if-arm-derefs.md.  Both arms are
+  ;; constructor calls here, which is the shape that compiles.
+  (defn __lww-pick [^borrow x : LwwRegister ^borrow y : LwwRegister] : LwwRegister
+    (if (hlc-after? (.stamp x) (.stamp y))
+      (LwwRegister (.value x) (.stamp x))
+      (LwwRegister (.value y) (.stamp y))))
+  ;;; JoinSemilattice [LwwRegister] -- the later stamp wins.
+  ;;
+  ;; Idempotent because `hlc-after?` is STRICT: joining a register with itself
+  ;; takes the else arm and reproduces it.  A non-strict comparison here would
+  ;; still converge but would make the join depend on argument order, which is
+  ;; exactly what commutativity forbids.
+  (definstance JoinSemilattice [LwwRegister] (join [x y] (__lww-pick x y)))
+  ;;; Eq [LwwRegister] -- same value and same stamp.
+  (definstance Eq [LwwRegister]
+    (eq? [^borrow x ^borrow y]
+      (and (= (.value x) (.value y))
+        (and (not (hlc-after? (.stamp x) (.stamp y)))
+          (not (hlc-after? (.stamp y) (.stamp x)))))))
+  ;;; lww-delta-set -- the DELTA of a write.
+  ;;;
+  ;;; Parameters:
+  ;;;   g   -- the register
+  ;;;   v   -- the new value
+  ;;;   now -- current wall time
+  ;;;
+  ;;; Returns:
+  ;;;   A register holding v, stamped strictly after g -- which is exactly the
+  ;;;   new state.
+  ;;;
+  ;;; Example:
+  ;;;   (lww-delta-set g 42 1000)
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; Identical to `lww-set`, and that is the honest answer rather than a
+  ;; placeholder: an LWW register's whole state is one value and one stamp, so
+  ;; there is nothing a delta could leave out.  The delta formulation saves
+  ;; nothing here and costs nothing either, and having the name means a caller
+  ;; can drive every type in this spice through the same `apply-delta` channel
+  ;; without special-casing the two registers.
+  ;;
+  ;; `Delta = LwwRegister` for the same reason: the register carries no causal
+  ;; context, so there is no downward-closed history for a delta to over-claim
+  ;; -- the trap that forces ORSet's delta to be a different type does not exist
+  ;; here.
+  (defn lww-delta-set [^borrow g : LwwRegister v : int now : int] : LwwRegister
+    (lww-set g v now))
+  ;;; DeltaCRDT [LwwRegister] -- the delta is the register itself.
+  (definstance DeltaCRDT [LwwRegister]
+    (type Delta = LwwRegister)
+    (delta-bottom [x] (lww-new (hlc-replica (.stamp x))))
+    (delta-join [x d e] (join d e))
+    (apply-delta [x d] (join x d)))
+  ;;; MvRegister -- every concurrent value, for the caller to resolve.
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defstruct MvRegister [vals : int stamp : Hlc])
+  ;;; mv-new -- an empty multi-value register.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- the replica
+  ;;;
+  ;;; Returns:
+  ;;;   A register holding no values.
+  ;;;
+  ;;; Example:
+  ;;;   (mv-new (replica (quote alice)))
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn mv-new [r : ReplicaId] : MvRegister
+    (MvRegister (:: (map-new) int) (hlc-zero r)))
+  ;;; mv-set -- write a value, replacing everything this replica has observed.
+  ;;;
+  ;;; Parameters:
+  ;;;   g   -- the register
+  ;;;   v   -- the new value
+  ;;;   now -- current wall time
+  ;;;
+  ;;; Returns:
+  ;;;   A register holding only v.
+  ;;;
+  ;;; Example:
+  ;;;   (mv-set (mv-new (replica (quote alice))) 42 1000)
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  ;;
+  ;; A write SUPERSEDES what this replica has seen -- that is what makes a
+  ;; sequential write replace rather than accumulate.  Concurrent writes are not
+  ;; observed by each other, so the join keeps both.
+  (defn mv-set [^borrow g : MvRegister v : int now : int] : MvRegister
+    (MvRegister (:: (map-assoc (:: (map-new) (Map int int)) v 1) int)
+      (hlc-tick (.stamp g) now)))
+  ;;; mv-values -- how many distinct concurrent values are held.
+  ;;;
+  ;;; Parameters:
+  ;;;   g -- the register
+  ;;;
+  ;;; Returns:
+  ;;;   The number of values; 1 when there is no conflict.
+  ;;;
+  ;;; Example:
+  ;;;   (mv-values g)   ; => 2
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn mv-values [^borrow g : MvRegister] : int
+    (map-count (:: (.vals g) (Map int int))))
+  ;;; mv-count -- alias for mv-values, for symmetry with the set types.
+  ;;;
+  ;;; Parameters:
+  ;;;   g -- the register
+  ;;;
+  ;;; Returns:
+  ;;;   The number of values held.
+  ;;;
+  ;;; Example:
+  ;;;   (mv-count g)   ; => 1
+  ;;;
+  ;;; Since: crdt-spice-plan C3
+  (defn mv-count [^borrow g : MvRegister] : int (mv-values g))
+  ;;; __mv-merge -- internal: union the value sets.
+  (defn __mv-merge [a : int b : int] : int
+    (let [it (hamt/iter-alloc (map-hamt (:: b (Map int int))))
+          r  (__mv-loop a it)]
+      (hamt/iter-destroy! it)
+      r))
+  ;;; __mv-loop -- internal.
+  (defn __mv-loop [acc : int it : ptr<void>] : int
+    (if (hamt/iter-advance! it)
+      (__mv-loop (:: (map-assoc (:: acc (Map int int))
+                       (:: (hamt/iter-cur-key it) int)
+                       1)
+                   int)
+        it)
+      acc))
+  ;;; JoinSemilattice [MvRegister] -- keep every value from both sides.
+  ;;
+  ;; The register that does NOT discard a concurrent write.  Union is idempotent
+  ;; and commutative for free, which is why this design needs no stamp comparison
+  ;; at all -- the stamp rides along only so a caller can see recency.
+  (definstance JoinSemilattice [MvRegister]
+    (join [x y]
+      (MvRegister (__mv-merge (.vals x) (.vals y))
+        (hlc-later (.stamp x) (.stamp y)))))
+  ;;; Eq [MvRegister] -- same number of values.
+  (definstance Eq [MvRegister]
+    (eq? [^borrow x ^borrow y] (= (mv-values x) (mv-values y))))
+  ;;; mv-delta-set -- the DELTA of a write.
+  ;;;
+  ;;; Parameters:
+  ;;;   g   -- the register
+  ;;;   v   -- the new value
+  ;;;   now -- current wall time
+  ;;;
+  ;;; Returns:
+  ;;;   A register holding only v.
+  ;;;
+  ;;; Example:
+  ;;;   (mv-delta-set g 42 1000)
+  ;;;
+  ;;; Since: crdt-spice-plan C4
+  ;;
+  ;; Identical to `mv-set`, and genuinely so: a write already replaces
+  ;; everything this replica observed, so the value it produces is as small as
+  ;; the state gets.
+  ;;
+  ;; The register's join is UNION, which is why this is not the whole story for
+  ;; the multi-value case: applying a write-delta to a replica that has since
+  ;; written something else concurrently leaves both values, exactly as merging
+  ;; the two full states would.  That is the type doing its job, not the delta
+  ;; channel losing information.
+  (defn mv-delta-set [^borrow g : MvRegister v : int now : int] : MvRegister
+    (mv-set g v now))
+  ;;; DeltaCRDT [MvRegister] -- the delta is the register itself.
+  (definstance DeltaCRDT [MvRegister]
+    (type Delta = MvRegister)
+    (delta-bottom [x] (mv-new (hlc-replica (.stamp x))))
+    (delta-join [x d e] (join d e))
+    (apply-delta [x d] (join x d)))) ;; end defmodule crdt/register

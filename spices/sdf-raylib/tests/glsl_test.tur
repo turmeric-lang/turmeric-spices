@@ -2,135 +2,125 @@
 ;;;
 ;;; Since: Phase 3
 ;; -------------------------------------------------------------------------
-
 (defmodule glsl_test
   (export)
-
-(import sdf/colors  :refer [colored-sphere colored-box colored-cylinder
-                              colored-union colored-difference colored-translate
-                              csdf-free])
-(import glsl/codegen :refer [csdf->glsl csdf-glsl-free])
-
-;; ---- helpers ----
-
-
-;; Named check!, not assert!: stdlib's auto-loaded `contract` module defines a
-;; one-argument `assert!` MACRO, which wins at every call site and rejected
-;; these two-argument calls with "macro 'assert!' expects 1 arguments, got 2".
-(defn check! [cond : bool msg : cstr] : void
-  ```c
-  #include <stdio.h>
+  (import sdf/colors
+    :refer
+    [colored-sphere
+     colored-box
+     colored-cylinder
+     colored-union
+     colored-difference
+     colored-translate
+     csdf-free])
+  (import glsl/codegen :refer [csdf->glsl csdf-glsl-free])
+  ;; ---- helpers ----
+  ;; Named check!, not assert!: stdlib's auto-loaded `contract` module defines a
+  ;; one-argument `assert!` MACRO, which wins at every call site and rejected
+  ;; these two-argument calls with "macro 'assert!' expects 1 arguments, got 2".
+  (defn check! [cond : bool msg : cstr] : void
+    ```c
+    #include <stdio.h>
   #include <stdlib.h>
   if (!cond) {
     fprintf(stderr, "%s\n", (const char *)(intptr_t)msg);
     exit(1);
   }
   ```)
-
-(defn cstr-len [s : cstr] : int
-  ```c
-  #include <string.h>
+  (defn cstr-len [s : cstr] : int
+    ```c
+    #include <string.h>
   return s ? (int64_t)strlen((const char *)(intptr_t)s) : 0;
   ```)
-
-(defn cstr-contains [haystack : cstr needle : cstr] : bool
-  ```c
-  #include <string.h>
+  (defn cstr-contains [haystack : cstr needle : cstr] : bool
+    ```c
+    #include <string.h>
   if (!haystack || !needle) return 0;
   return strstr((const char *)(intptr_t)haystack,
                 (const char *)(intptr_t)needle) != NULL;
   ```)
-
-;; ---- test 1: single sphere emits sceneSDF with correct content ----
-
-(defn test-sphere-glsl [] : void
-  (let [scene (colored-sphere 0.0 0.0 0.0 1.5  1.0 0.0 0.0  1)
-        glsl  (csdf->glsl scene)]
-    (check! (> (cstr-len glsl) 0) "csdf->glsl should return non-empty string")
-    (check! (cstr-contains glsl "sceneSDF") "output should contain 'sceneSDF'")
-    (check! (cstr-contains glsl "length(") "sphere output should use length()")
-    (check! (cstr-contains glsl "1.500000") "sphere radius 1.5 should appear as literal")
-    (check! (cstr-contains glsl "objId") "output should assign objId")
-    (check! (cstr-contains glsl "col") "output should assign col")
-    (csdf-glsl-free glsl)
-    (csdf-free scene)))
-
-;; ---- test 2: box emits correct helper vars ----
-
-(defn test-box-glsl [] : void
-  (let [scene (colored-box -1.0 -1.0 -1.0  1.0 1.0 1.0  0.0 1.0 0.0  2)
-        glsl  (csdf->glsl scene)]
-    (check! (> (cstr-len glsl) 0) "box glsl should be non-empty")
-    (check! (cstr-contains glsl "bq_") "box output should declare bq_ temp var")
-    (check! (cstr-contains glsl "sceneSDF") "box output should contain sceneSDF")
-    (csdf-glsl-free glsl)
-    (csdf-free scene)))
-
-;; ---- test 3: cylinder emits .xy swizzle ----
-
-(defn test-cylinder-glsl [] : void
-  (let [scene (colored-cylinder 0.0 0.0 0.0 0.5  0.0 0.0 1.0  3)
-        glsl  (csdf->glsl scene)]
-    (check! (> (cstr-len glsl) 0) "cylinder glsl should be non-empty")
-    (check! (cstr-contains glsl ".xy") "cylinder should use .xy swizzle")
-    (csdf-glsl-free glsl)
-    (csdf-free scene)))
-
-;; ---- test 4: union of two spheres emits both leaves and combining block ----
-
-(defn test-union-glsl [] : void
-  (let [a    (colored-sphere -1.5 0.0 0.0 0.8  1.0 0.0 0.0  1)
-        b    (colored-sphere  1.5 0.0 0.0 0.8  0.0 0.0 1.0  2)
-        u    (colored-union a b)
-        glsl (csdf->glsl u)]
-    (check! (> (cstr-len glsl) 0) "union glsl should be non-empty")
-    (check! (cstr-contains glsl "d_0") "should emit d_0 for first leaf")
-    (check! (cstr-contains glsl "d_1") "should emit d_1 for second leaf")
-    (check! (cstr-contains glsl "if (d_") "union should emit an if statement")
-    (csdf-glsl-free glsl)
-    (csdf-free u)))
-
-;; ---- test 5: difference emits negated distance ----
-
-(defn test-difference-glsl [] : void
-  (let [base  (colored-box -2.0 -2.0 -2.0  2.0 2.0 2.0  0.8 0.8 0.8  1)
-        hole  (colored-sphere 0.0 0.0 0.0 1.0  0.0 0.0 0.0  2)
-        diff  (colored-difference base hole)
-        glsl  (csdf->glsl diff)]
-    (check! (> (cstr-len glsl) 0) "difference glsl should be non-empty")
-    (check! (cstr-contains glsl "_dRn") "difference should negate right distance")
-    (csdf-glsl-free glsl)
-    (csdf-free diff)))
-
-;; ---- test 6: translate emits p_ variable ----
-
-(defn test-translate-glsl [] : void
-  (let [s    (colored-sphere 0.0 0.0 0.0 1.0  0.0 1.0 0.0  1)
-        ts   (colored-translate s 3.0 0.0 0.0)
-        glsl (csdf->glsl ts)]
-    (check! (> (cstr-len glsl) 0) "translate glsl should be non-empty")
-    (check! (cstr-contains glsl "p_") "translate should emit p_ variable")
-    (check! (cstr-contains glsl "3.000000") "translate offset 3.0 should appear as literal")
-    (csdf-glsl-free glsl)
-    (csdf-free ts)))
-
-;; ---- main ----
-
-(defn main [] : int
-  (do
-    (test-sphere-glsl)
-    (println "test-sphere-glsl: PASS")
-    (test-box-glsl)
-    (println "test-box-glsl: PASS")
-    (test-cylinder-glsl)
-    (println "test-cylinder-glsl: PASS")
-    (test-union-glsl)
-    (println "test-union-glsl: PASS")
-    (test-difference-glsl)
-    (println "test-difference-glsl: PASS")
-    (test-translate-glsl)
-    (println "test-translate-glsl: PASS")
-    (println "All Phase 3 GLSL codegen tests passed.")
-    0))
-
-) ;; end defmodule glsl_test
+  ;; ---- test 1: single sphere emits sceneSDF with correct content ----
+  (defn test-sphere-glsl [] : void
+    (let [scene (colored-sphere 0.0 0.0 0.0 1.5 1.0 0.0 0.0 1)
+          glsl  (csdf->glsl scene)]
+      (check! (> (cstr-len glsl) 0) "csdf->glsl should return non-empty string")
+      (check! (cstr-contains glsl "sceneSDF")
+        "output should contain 'sceneSDF'")
+      (check! (cstr-contains glsl "length(")
+        "sphere output should use length()")
+      (check! (cstr-contains glsl "1.500000")
+        "sphere radius 1.5 should appear as literal")
+      (check! (cstr-contains glsl "objId") "output should assign objId")
+      (check! (cstr-contains glsl "col") "output should assign col")
+      (csdf-glsl-free glsl)
+      (csdf-free scene)))
+  ;; ---- test 2: box emits correct helper vars ----
+  (defn test-box-glsl [] : void
+    (let [scene (colored-box -1.0 -1.0 -1.0 1.0 1.0 1.0 0.0 1.0 0.0 2)
+          glsl  (csdf->glsl scene)]
+      (check! (> (cstr-len glsl) 0) "box glsl should be non-empty")
+      (check! (cstr-contains glsl "bq_")
+        "box output should declare bq_ temp var")
+      (check! (cstr-contains glsl "sceneSDF")
+        "box output should contain sceneSDF")
+      (csdf-glsl-free glsl)
+      (csdf-free scene)))
+  ;; ---- test 3: cylinder emits .xy swizzle ----
+  (defn test-cylinder-glsl [] : void
+    (let [scene (colored-cylinder 0.0 0.0 0.0 0.5 0.0 0.0 1.0 3)
+          glsl  (csdf->glsl scene)]
+      (check! (> (cstr-len glsl) 0) "cylinder glsl should be non-empty")
+      (check! (cstr-contains glsl ".xy") "cylinder should use .xy swizzle")
+      (csdf-glsl-free glsl)
+      (csdf-free scene)))
+  ;; ---- test 4: union of two spheres emits both leaves and combining block ----
+  (defn test-union-glsl [] : void
+    (let [a    (colored-sphere -1.5 0.0 0.0 0.8 1.0 0.0 0.0 1)
+          b    (colored-sphere 1.5 0.0 0.0 0.8 0.0 0.0 1.0 2)
+          u    (colored-union a b)
+          glsl (csdf->glsl u)]
+      (check! (> (cstr-len glsl) 0) "union glsl should be non-empty")
+      (check! (cstr-contains glsl "d_0") "should emit d_0 for first leaf")
+      (check! (cstr-contains glsl "d_1") "should emit d_1 for second leaf")
+      (check! (cstr-contains glsl "if (d_") "union should emit an if statement")
+      (csdf-glsl-free glsl)
+      (csdf-free u)))
+  ;; ---- test 5: difference emits negated distance ----
+  (defn test-difference-glsl [] : void
+    (let [base (colored-box -2.0 -2.0 -2.0 2.0 2.0 2.0 0.8 0.8 0.8 1)
+          hole (colored-sphere 0.0 0.0 0.0 1.0 0.0 0.0 0.0 2)
+          diff (colored-difference base hole)
+          glsl (csdf->glsl diff)]
+      (check! (> (cstr-len glsl) 0) "difference glsl should be non-empty")
+      (check! (cstr-contains glsl "_dRn")
+        "difference should negate right distance")
+      (csdf-glsl-free glsl)
+      (csdf-free diff)))
+  ;; ---- test 6: translate emits p_ variable ----
+  (defn test-translate-glsl [] : void
+    (let [s    (colored-sphere 0.0 0.0 0.0 1.0 0.0 1.0 0.0 1)
+          ts   (colored-translate s 3.0 0.0 0.0)
+          glsl (csdf->glsl ts)]
+      (check! (> (cstr-len glsl) 0) "translate glsl should be non-empty")
+      (check! (cstr-contains glsl "p_") "translate should emit p_ variable")
+      (check! (cstr-contains glsl "3.000000")
+        "translate offset 3.0 should appear as literal")
+      (csdf-glsl-free glsl)
+      (csdf-free ts)))
+  ;; ---- main ----
+  (defn main [] : int
+    (do
+      (test-sphere-glsl)
+      (println "test-sphere-glsl: PASS")
+      (test-box-glsl)
+      (println "test-box-glsl: PASS")
+      (test-cylinder-glsl)
+      (println "test-cylinder-glsl: PASS")
+      (test-union-glsl)
+      (println "test-union-glsl: PASS")
+      (test-difference-glsl)
+      (println "test-difference-glsl: PASS")
+      (test-translate-glsl)
+      (println "test-translate-glsl: PASS")
+      (println "All Phase 3 GLSL codegen tests passed.")
+      0))) ;; end defmodule glsl_test

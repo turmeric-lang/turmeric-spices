@@ -4,95 +4,99 @@
 ;; err carries 0 on a NULL reply or REDIS_REPLY_ERROR.
 ;; The reply-ptr is an opaque :int; use valkey/reply functions to inspect it.
 ;; Call reply-free when done with a reply to avoid memory leaks.
-
 (defmodule valkey/cmd
   (import valkey/client :refer [Client])
-  (import valkey/reply  :refer [Reply])
-  (export ValkeyArg vk-str vk-int vk-bytes
-          cmd cmd-get cmd-set cmd-del cmd-incr cmd-expire
-          cmd-hset cmd-hget cmd-lpush cmd-lrange)
-
-;; -------------------------------------------------------------------------
-;; Typed command arguments (U6 -- Track C / typed variadic builders)
-;; -------------------------------------------------------------------------
-
-;;; ValkeyArg -- a single typed argument to `cmd`. The sum discriminates a
-;;; string argument from a stringified integer and from a binary-safe blob,
-;;; so a mis-kinded value (e.g. a bare `Client` handle, or a freed reply
-;;; pointer that happens to lower to `:int`) is rejected at the elaborator
-;;; rather than marshalled onto the wire. `:copy` so the handle can be read
-;;; out of the variadic's cons list without a move.
-;;;
-;;; Construct with the smart constructors `vk-str` / `vk-int` / `vk-bytes`;
-;;; the raw variant constructors are intentionally not exported.
-;;;
-;;; The variant order is load-bearing: `__cmd-impl` discriminates on the
-;;; runtime tag (VkStr=0, VkInt=1, VkBytes=2) -- keep them in sync.
-;;;
-;;; Since: 0.5.0 (U6)
-(defdata ^copy ValkeyArg
-  (VkStr   :cstr)        ;; NUL-terminated string argument
-  (VkInt   :int)         ;; integer; formatted to decimal at send time
-  (VkBytes :cstr :int))  ;; (ptr, len) for a binary-safe argument
-
-;;; vk-str -- wrap a string as a typed command argument.
-;;; Example: (cmd c "SET" (vk-str "mykey") (vk-str "myval"))
-;;; Since: 0.5.0 (U6)
-(defn vk-str [s : cstr] : ValkeyArg (VkStr s))
-
-;;; vk-int -- wrap an integer as a typed command argument. The value is
-;;; formatted to its decimal string form when the command is sent, so
-;;; (cmd c "EXPIRE" (vk-str "k") (vk-int 60)) sends "60" on the wire.
-;;; Since: 0.5.0 (U6)
-(defn vk-int [n : int] : ValkeyArg (VkInt n))
-
-;;; vk-bytes -- wrap a (pointer, length) pair as a binary-safe argument.
-;;; The length is honored verbatim, so embedded NUL bytes flow through to
-;;; Valkey without truncation (protobuf / msgpack / arbitrary blobs).
-;;; Example: (cmd c "SET" (vk-str "blob") (vk-bytes payload n))
-;;; Since: 0.5.0 (U6)
-(defn vk-bytes [p : cstr len : int] : ValkeyArg (VkBytes p len))
-
-;; -------------------------------------------------------------------------
-;; Public API
-;; -------------------------------------------------------------------------
-
-;;; cmd -- send an arbitrary command with typed variadic arguments.
-;;;
-;;; Each argument is a `ValkeyArg` built with `vk-str` / `vk-int` /
-;;; `vk-bytes`, so a value of the wrong kind (a bare `Client`, a raw cstr,
-;;; a freed reply pointer) is a compile error at the call site rather than
-;;; a downstream `WRONGTYPE` or segfault. This replaces the old untyped
-;;; `(cmd c "SET" (cons "k" (cons "v" 0)))` cons-list form, which no longer
-;;; type-checks (that is the point of the typed surface).
-;;;
-;;; Parameters:
-;;;   c       -- ctx-ptr (ok-val from client-connect)
-;;;   command -- command name string (e.g. "SET")
-;;;   args    -- zero or more `ValkeyArg` values
-;;;
-;;; Returns:
-;;;   (ok reply-ptr) on success; (err 0) on error or NULL reply.
-;;;   Call reply-free on the reply-ptr when done.
-;;;
-;;; Example:
-;;;   (let [r (cmd c "SET" (vk-str "mykey") (vk-str "myval"))]
-;;;     (if (ok? r) (reply-free (ok-val r)) (println "cmd failed")))
-;;;   (cmd c "EXPIRE" (vk-str "mykey") (vk-int 60))
-;;;   (cmd c "SET" (vk-str "blob") (vk-bytes payload n))
-;;;
-;;; Since: VK0 (typed variadic surface in 0.5.0 / U6)
-(defn cmd [^borrow c : Client command : cstr & args : ValkeyArg] : (Result Reply int)
-  (__cmd-impl c command args))
-
-;;; __cmd-impl -- fixed-arity worker behind the variadic `cmd`. Walks the
-;;; rest-arg cons list (each cell value is a `ValkeyArg` pointer), formats
-;;; every argument into the parallel argv / argvlen arrays hiredis expects,
-;;; and sends one `redisCommandArgv`. The argvlen form is binary-safe, so
-;;; `VkBytes` flows embedded NULs through untouched.
-(defn __cmd-impl [^borrow c : Client command : cstr args : int] : (Result Reply int)
-  ```c
-  #include <stdlib.h>
+  (import valkey/reply :refer [Reply])
+  (export ValkeyArg
+    vk-str
+    vk-int
+    vk-bytes
+    cmd
+    cmd-get
+    cmd-set
+    cmd-del
+    cmd-incr
+    cmd-expire
+    cmd-hset
+    cmd-hget
+    cmd-lpush
+    cmd-lrange)
+  ;; -------------------------------------------------------------------------
+  ;; Typed command arguments (U6 -- Track C / typed variadic builders)
+  ;; -------------------------------------------------------------------------
+  ;;; ValkeyArg -- a single typed argument to `cmd`. The sum discriminates a
+  ;;; string argument from a stringified integer and from a binary-safe blob,
+  ;;; so a mis-kinded value (e.g. a bare `Client` handle, or a freed reply
+  ;;; pointer that happens to lower to `:int`) is rejected at the elaborator
+  ;;; rather than marshalled onto the wire. `:copy` so the handle can be read
+  ;;; out of the variadic's cons list without a move.
+  ;;;
+  ;;; Construct with the smart constructors `vk-str` / `vk-int` / `vk-bytes`;
+  ;;; the raw variant constructors are intentionally not exported.
+  ;;;
+  ;;; The variant order is load-bearing: `__cmd-impl` discriminates on the
+  ;;; runtime tag (VkStr=0, VkInt=1, VkBytes=2) -- keep them in sync.
+  ;;;
+  ;;; Since: 0.5.0 (U6)
+  (defdata ^copy ValkeyArg
+    (VkStr :cstr) ;; NUL-terminated string argument
+    (VkInt :int) ;; integer; formatted to decimal at send time
+    (VkBytes :cstr :int)) ;; (ptr, len) for a binary-safe argument
+  ;;; vk-str -- wrap a string as a typed command argument.
+  ;;; Example: (cmd c "SET" (vk-str "mykey") (vk-str "myval"))
+  ;;; Since: 0.5.0 (U6)
+  (defn vk-str [s : cstr] : ValkeyArg (VkStr s))
+  ;;; vk-int -- wrap an integer as a typed command argument. The value is
+  ;;; formatted to its decimal string form when the command is sent, so
+  ;;; (cmd c "EXPIRE" (vk-str "k") (vk-int 60)) sends "60" on the wire.
+  ;;; Since: 0.5.0 (U6)
+  (defn vk-int [n : int] : ValkeyArg (VkInt n))
+  ;;; vk-bytes -- wrap a (pointer, length) pair as a binary-safe argument.
+  ;;; The length is honored verbatim, so embedded NUL bytes flow through to
+  ;;; Valkey without truncation (protobuf / msgpack / arbitrary blobs).
+  ;;; Example: (cmd c "SET" (vk-str "blob") (vk-bytes payload n))
+  ;;; Since: 0.5.0 (U6)
+  (defn vk-bytes [p : cstr len : int] : ValkeyArg (VkBytes p len))
+  ;; -------------------------------------------------------------------------
+  ;; Public API
+  ;; -------------------------------------------------------------------------
+  ;;; cmd -- send an arbitrary command with typed variadic arguments.
+  ;;;
+  ;;; Each argument is a `ValkeyArg` built with `vk-str` / `vk-int` /
+  ;;; `vk-bytes`, so a value of the wrong kind (a bare `Client`, a raw cstr,
+  ;;; a freed reply pointer) is a compile error at the call site rather than
+  ;;; a downstream `WRONGTYPE` or segfault. This replaces the old untyped
+  ;;; `(cmd c "SET" (cons "k" (cons "v" 0)))` cons-list form, which no longer
+  ;;; type-checks (that is the point of the typed surface).
+  ;;;
+  ;;; Parameters:
+  ;;;   c       -- ctx-ptr (ok-val from client-connect)
+  ;;;   command -- command name string (e.g. "SET")
+  ;;;   args    -- zero or more `ValkeyArg` values
+  ;;;
+  ;;; Returns:
+  ;;;   (ok reply-ptr) on success; (err 0) on error or NULL reply.
+  ;;;   Call reply-free on the reply-ptr when done.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (cmd c "SET" (vk-str "mykey") (vk-str "myval"))]
+  ;;;     (if (ok? r) (reply-free (ok-val r)) (println "cmd failed")))
+  ;;;   (cmd c "EXPIRE" (vk-str "mykey") (vk-int 60))
+  ;;;   (cmd c "SET" (vk-str "blob") (vk-bytes payload n))
+  ;;;
+  ;;; Since: VK0 (typed variadic surface in 0.5.0 / U6)
+  (defn cmd [^borrow c : Client command : cstr & args : ValkeyArg] : (Result Reply
+                                                                       int)
+    (__cmd-impl c command args))
+  ;;; __cmd-impl -- fixed-arity worker behind the variadic `cmd`. Walks the
+  ;;; rest-arg cons list (each cell value is a `ValkeyArg` pointer), formats
+  ;;; every argument into the parallel argv / argvlen arrays hiredis expects,
+  ;;; and sends one `redisCommandArgv`. The argvlen form is binary-safe, so
+  ;;; `VkBytes` flows embedded NULs through untouched.
+  (defn __cmd-impl [^borrow c : Client command : cstr args : int] : (Result Reply
+                                                                      int)
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   #include <stdio.h>
   #include <hiredis/hiredis.h>
@@ -157,25 +161,24 @@
   }
   return tur_ok_ptr(reply);
   ```)
-
-;;; cmd-get -- send GET key.
-;;;
-;;; Parameters:
-;;;   c   -- ctx-ptr (ok-val from client-connect)
-;;;   key -- key name string
-;;;
-;;; Returns:
-;;;   (ok reply-ptr) on success; (err 0) on error.
-;;;   Call reply-free on the reply-ptr when done.
-;;;
-;;; Example:
-;;;   (let [r (cmd-get c "mykey")]
-;;;     (if (ok? r) (println (reply-string (ok-val r))) (println "get failed")))
-;;;
-;;; Since: VK0
-(defn cmd-get [^borrow c : Client key : cstr] : (Result Reply int)
-  ```c
-  #include <stdlib.h>
+  ;;; cmd-get -- send GET key.
+  ;;;
+  ;;; Parameters:
+  ;;;   c   -- ctx-ptr (ok-val from client-connect)
+  ;;;   key -- key name string
+  ;;;
+  ;;; Returns:
+  ;;;   (ok reply-ptr) on success; (err 0) on error.
+  ;;;   Call reply-free on the reply-ptr when done.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (cmd-get c "mykey")]
+  ;;;     (if (ok? r) (println (reply-string (ok-val r))) (println "get failed")))
+  ;;;
+  ;;; Since: VK0
+  (defn cmd-get [^borrow c : Client key : cstr] : (Result Reply int)
+    ```c
+    #include <stdlib.h>
   #include <hiredis/hiredis.h>
   redisContext *ctx = (redisContext *)(intptr_t)c;
   redisReply *reply = (redisReply *)redisCommand(ctx, "GET %s", (const char *)key);
@@ -185,25 +188,24 @@
   }
   return tur_ok_ptr(reply);
   ```)
-
-;;; cmd-set -- send SET key value.
-;;;
-;;; Parameters:
-;;;   c   -- ctx-ptr (ok-val from client-connect)
-;;;   key -- key name string
-;;;   val -- value string
-;;;
-;;; Returns:
-;;;   (ok reply-ptr) on success; (err 0) on error.
-;;;
-;;; Example:
-;;;   (let [r (cmd-set c "mykey" "hello")]
-;;;     (if (ok? r) (reply-free (ok-val r)) (println "set failed")))
-;;;
-;;; Since: VK0
-(defn cmd-set [^borrow c : Client key : cstr val : cstr] : (Result Reply int)
-  ```c
-  #include <stdlib.h>
+  ;;; cmd-set -- send SET key value.
+  ;;;
+  ;;; Parameters:
+  ;;;   c   -- ctx-ptr (ok-val from client-connect)
+  ;;;   key -- key name string
+  ;;;   val -- value string
+  ;;;
+  ;;; Returns:
+  ;;;   (ok reply-ptr) on success; (err 0) on error.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (cmd-set c "mykey" "hello")]
+  ;;;     (if (ok? r) (reply-free (ok-val r)) (println "set failed")))
+  ;;;
+  ;;; Since: VK0
+  (defn cmd-set [^borrow c : Client key : cstr val : cstr] : (Result Reply int)
+    ```c
+    #include <stdlib.h>
   #include <hiredis/hiredis.h>
   redisContext *ctx = (redisContext *)(intptr_t)c;
   redisReply *reply = (redisReply *)redisCommand(ctx, "SET %s %s",
@@ -215,24 +217,23 @@
   }
   return tur_ok_ptr(reply);
   ```)
-
-;;; cmd-del -- send DEL key.
-;;;
-;;; Parameters:
-;;;   c   -- ctx-ptr (ok-val from client-connect)
-;;;   key -- key name string
-;;;
-;;; Returns:
-;;;   (ok reply-ptr) on success; (err 0) on error.
-;;;
-;;; Example:
-;;;   (let [r (cmd-del c "mykey")]
-;;;     (if (ok? r) (reply-free (ok-val r)) (println "del failed")))
-;;;
-;;; Since: VK0
-(defn cmd-del [^borrow c : Client key : cstr] : (Result Reply int)
-  ```c
-  #include <stdlib.h>
+  ;;; cmd-del -- send DEL key.
+  ;;;
+  ;;; Parameters:
+  ;;;   c   -- ctx-ptr (ok-val from client-connect)
+  ;;;   key -- key name string
+  ;;;
+  ;;; Returns:
+  ;;;   (ok reply-ptr) on success; (err 0) on error.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (cmd-del c "mykey")]
+  ;;;     (if (ok? r) (reply-free (ok-val r)) (println "del failed")))
+  ;;;
+  ;;; Since: VK0
+  (defn cmd-del [^borrow c : Client key : cstr] : (Result Reply int)
+    ```c
+    #include <stdlib.h>
   #include <hiredis/hiredis.h>
   redisContext *ctx = (redisContext *)(intptr_t)c;
   redisReply *reply = (redisReply *)redisCommand(ctx, "DEL %s", (const char *)key);
@@ -242,24 +243,23 @@
   }
   return tur_ok_ptr(reply);
   ```)
-
-;;; cmd-incr -- send INCR key.
-;;;
-;;; Parameters:
-;;;   c   -- ctx-ptr (ok-val from client-connect)
-;;;   key -- key name string
-;;;
-;;; Returns:
-;;;   (ok reply-ptr) on success; (err 0) on error.
-;;;
-;;; Example:
-;;;   (let [r (cmd-incr c "counter")]
-;;;     (if (ok? r) (println (reply-int (ok-val r))) (println "incr failed")))
-;;;
-;;; Since: VK0
-(defn cmd-incr [^borrow c : Client key : cstr] : (Result Reply int)
-  ```c
-  #include <stdlib.h>
+  ;;; cmd-incr -- send INCR key.
+  ;;;
+  ;;; Parameters:
+  ;;;   c   -- ctx-ptr (ok-val from client-connect)
+  ;;;   key -- key name string
+  ;;;
+  ;;; Returns:
+  ;;;   (ok reply-ptr) on success; (err 0) on error.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (cmd-incr c "counter")]
+  ;;;     (if (ok? r) (println (reply-int (ok-val r))) (println "incr failed")))
+  ;;;
+  ;;; Since: VK0
+  (defn cmd-incr [^borrow c : Client key : cstr] : (Result Reply int)
+    ```c
+    #include <stdlib.h>
   #include <hiredis/hiredis.h>
   redisContext *ctx = (redisContext *)(intptr_t)c;
   redisReply *reply = (redisReply *)redisCommand(ctx, "INCR %s", (const char *)key);
@@ -269,25 +269,25 @@
   }
   return tur_ok_ptr(reply);
   ```)
-
-;;; cmd-expire -- send EXPIRE key seconds.
-;;;
-;;; Parameters:
-;;;   c       -- ctx-ptr (ok-val from client-connect)
-;;;   key     -- key name string
-;;;   seconds -- expiry duration as a decimal string (e.g. "60")
-;;;
-;;; Returns:
-;;;   (ok reply-ptr) on success; (err 0) on error.
-;;;
-;;; Example:
-;;;   (let [r (cmd-expire c "session" "3600")]
-;;;     (if (ok? r) (reply-free (ok-val r)) (println "expire failed")))
-;;;
-;;; Since: VK0
-(defn cmd-expire [^borrow c : Client key : cstr seconds : cstr] : (Result Reply int)
-  ```c
-  #include <stdlib.h>
+  ;;; cmd-expire -- send EXPIRE key seconds.
+  ;;;
+  ;;; Parameters:
+  ;;;   c       -- ctx-ptr (ok-val from client-connect)
+  ;;;   key     -- key name string
+  ;;;   seconds -- expiry duration as a decimal string (e.g. "60")
+  ;;;
+  ;;; Returns:
+  ;;;   (ok reply-ptr) on success; (err 0) on error.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (cmd-expire c "session" "3600")]
+  ;;;     (if (ok? r) (reply-free (ok-val r)) (println "expire failed")))
+  ;;;
+  ;;; Since: VK0
+  (defn cmd-expire [^borrow c : Client key : cstr seconds : cstr] : (Result Reply
+                                                                      int)
+    ```c
+    #include <stdlib.h>
   #include <hiredis/hiredis.h>
   redisContext *ctx = (redisContext *)(intptr_t)c;
   redisReply *reply = (redisReply *)redisCommand(ctx, "EXPIRE %s %s",
@@ -299,26 +299,26 @@
   }
   return tur_ok_ptr(reply);
   ```)
-
-;;; cmd-hset -- send HSET hash field value.
-;;;
-;;; Parameters:
-;;;   c     -- ctx-ptr (ok-val from client-connect)
-;;;   hash  -- hash key name
-;;;   field -- field name within the hash
-;;;   val   -- value string
-;;;
-;;; Returns:
-;;;   (ok reply-ptr) on success; (err 0) on error.
-;;;
-;;; Example:
-;;;   (let [r (cmd-hset c "user:1" "name" "Alice")]
-;;;     (if (ok? r) (reply-free (ok-val r)) (println "hset failed")))
-;;;
-;;; Since: VK0
-(defn cmd-hset [^borrow c : Client hash : cstr field : cstr val : cstr] : (Result Reply int)
-  ```c
-  #include <stdlib.h>
+  ;;; cmd-hset -- send HSET hash field value.
+  ;;;
+  ;;; Parameters:
+  ;;;   c     -- ctx-ptr (ok-val from client-connect)
+  ;;;   hash  -- hash key name
+  ;;;   field -- field name within the hash
+  ;;;   val   -- value string
+  ;;;
+  ;;; Returns:
+  ;;;   (ok reply-ptr) on success; (err 0) on error.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (cmd-hset c "user:1" "name" "Alice")]
+  ;;;     (if (ok? r) (reply-free (ok-val r)) (println "hset failed")))
+  ;;;
+  ;;; Since: VK0
+  (defn cmd-hset [^borrow c : Client hash : cstr field : cstr val : cstr] : (Result Reply
+                                                                              int)
+    ```c
+    #include <stdlib.h>
   #include <hiredis/hiredis.h>
   redisContext *ctx = (redisContext *)(intptr_t)c;
   redisReply *reply = (redisReply *)redisCommand(ctx, "HSET %s %s %s",
@@ -331,25 +331,25 @@
   }
   return tur_ok_ptr(reply);
   ```)
-
-;;; cmd-hget -- send HGET hash field.
-;;;
-;;; Parameters:
-;;;   c     -- ctx-ptr (ok-val from client-connect)
-;;;   hash  -- hash key name
-;;;   field -- field name within the hash
-;;;
-;;; Returns:
-;;;   (ok reply-ptr) on success; (err 0) on error.
-;;;
-;;; Example:
-;;;   (let [r (cmd-hget c "user:1" "name")]
-;;;     (if (ok? r) (println (reply-string (ok-val r))) (println "hget failed")))
-;;;
-;;; Since: VK0
-(defn cmd-hget [^borrow c : Client hash : cstr field : cstr] : (Result Reply int)
-  ```c
-  #include <stdlib.h>
+  ;;; cmd-hget -- send HGET hash field.
+  ;;;
+  ;;; Parameters:
+  ;;;   c     -- ctx-ptr (ok-val from client-connect)
+  ;;;   hash  -- hash key name
+  ;;;   field -- field name within the hash
+  ;;;
+  ;;; Returns:
+  ;;;   (ok reply-ptr) on success; (err 0) on error.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (cmd-hget c "user:1" "name")]
+  ;;;     (if (ok? r) (println (reply-string (ok-val r))) (println "hget failed")))
+  ;;;
+  ;;; Since: VK0
+  (defn cmd-hget [^borrow c : Client hash : cstr field : cstr] : (Result Reply
+                                                                   int)
+    ```c
+    #include <stdlib.h>
   #include <hiredis/hiredis.h>
   redisContext *ctx = (redisContext *)(intptr_t)c;
   redisReply *reply = (redisReply *)redisCommand(ctx, "HGET %s %s",
@@ -361,25 +361,25 @@
   }
   return tur_ok_ptr(reply);
   ```)
-
-;;; cmd-lpush -- send LPUSH list value.
-;;;
-;;; Parameters:
-;;;   c    -- ctx-ptr (ok-val from client-connect)
-;;;   list -- list key name
-;;;   val  -- value string to prepend
-;;;
-;;; Returns:
-;;;   (ok reply-ptr) on success; (err 0) on error.
-;;;
-;;; Example:
-;;;   (let [r (cmd-lpush c "mylist" "item")]
-;;;     (if (ok? r) (reply-free (ok-val r)) (println "lpush failed")))
-;;;
-;;; Since: VK0
-(defn cmd-lpush [^borrow c : Client list : cstr val : cstr] : (Result Reply int)
-  ```c
-  #include <stdlib.h>
+  ;;; cmd-lpush -- send LPUSH list value.
+  ;;;
+  ;;; Parameters:
+  ;;;   c    -- ctx-ptr (ok-val from client-connect)
+  ;;;   list -- list key name
+  ;;;   val  -- value string to prepend
+  ;;;
+  ;;; Returns:
+  ;;;   (ok reply-ptr) on success; (err 0) on error.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (cmd-lpush c "mylist" "item")]
+  ;;;     (if (ok? r) (reply-free (ok-val r)) (println "lpush failed")))
+  ;;;
+  ;;; Since: VK0
+  (defn cmd-lpush [^borrow c : Client list : cstr val : cstr] : (Result Reply
+                                                                  int)
+    ```c
+    #include <stdlib.h>
   #include <hiredis/hiredis.h>
   redisContext *ctx = (redisContext *)(intptr_t)c;
   redisReply *reply = (redisReply *)redisCommand(ctx, "LPUSH %s %s",
@@ -391,27 +391,27 @@
   }
   return tur_ok_ptr(reply);
   ```)
-
-;;; cmd-lrange -- send LRANGE list start stop.
-;;;
-;;; Parameters:
-;;;   c     -- ctx-ptr (ok-val from client-connect)
-;;;   list  -- list key name
-;;;   start -- 0-based start index (inclusive)
-;;;   stop  -- 0-based stop index (inclusive; -1 for last element)
-;;;
-;;; Returns:
-;;;   (ok reply-ptr) on success; (err 0) on error.
-;;;   Reply type is array; use reply-array-len and reply-array-get to iterate.
-;;;
-;;; Example:
-;;;   (let [r (cmd-lrange c "mylist" 0 -1)]
-;;;     (if (ok? r) (let [rep (ok-val r)] ...) (println "lrange failed")))
-;;;
-;;; Since: VK0
-(defn cmd-lrange [^borrow c : Client list : cstr start : int stop : int] : (Result Reply int)
-  ```c
-  #include <stdlib.h>
+  ;;; cmd-lrange -- send LRANGE list start stop.
+  ;;;
+  ;;; Parameters:
+  ;;;   c     -- ctx-ptr (ok-val from client-connect)
+  ;;;   list  -- list key name
+  ;;;   start -- 0-based start index (inclusive)
+  ;;;   stop  -- 0-based stop index (inclusive; -1 for last element)
+  ;;;
+  ;;; Returns:
+  ;;;   (ok reply-ptr) on success; (err 0) on error.
+  ;;;   Reply type is array; use reply-array-len and reply-array-get to iterate.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (cmd-lrange c "mylist" 0 -1)]
+  ;;;     (if (ok? r) (let [rep (ok-val r)] ...) (println "lrange failed")))
+  ;;;
+  ;;; Since: VK0
+  (defn cmd-lrange [^borrow c : Client list : cstr start : int stop : int] : (Result Reply
+                                                                               int)
+    ```c
+    #include <stdlib.h>
   #include <stdio.h>
   #include <hiredis/hiredis.h>
   redisContext *ctx = (redisContext *)(intptr_t)c;
@@ -426,6 +426,4 @@
     return tur_err_int(0);
   }
   return tur_ok_ptr(reply);
-  ```)
-
-) ;; end defmodule valkey/cmd
+  ```)) ;; end defmodule valkey/cmd

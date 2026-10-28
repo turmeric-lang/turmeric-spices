@@ -9,95 +9,115 @@
 ;;
 ;; main returns the failure count, so `tur test` reports a non-zero exit as a
 ;; failing test.
-
 (defmodule signal/tests/test_hf_osc
-  (import signal/core   :refer [constant sample])
-  (import signal/osc    :refer [sawtooth])
+  (import signal/core :refer [constant sample])
+  (import signal/osc :refer [sawtooth])
   (import signal/hf-osc :refer [hf-sawtooth hf-square hf-triangle])
-
-(defn near? [a :float b :float] :bool
-  (let [d (- a b)]
-    (if (< d 0.0) (< (- 0.0 d) 0.0001) (< d 0.0001))))
-
-(defn abs-f [x :float] :float (if (< x 0.0) (- 0.0 x) x))
-
-;;; to-float -- cast an int to float (int64_t -> double).
-(defn to-float [n : int] : float
-  ```c
-  return (double)n;
+  (defn near? [a :float b :float] :bool
+    (let [d (- a b)] (if (< d 0.0) (< (- 0.0 d) 0.0001) (< d 0.0001))))
+  (defn abs-f [x :float] :float (if (< x 0.0) (- 0.0 x) x))
+  ;;; to-float -- cast an int to float (int64_t -> double).
+  (defn to-float [n : int] : float
+    ```c
+    return (double)n;
   ```)
-
-(defn fail-unless [cond :bool label :cstr] :int
-  (if cond 0 (do (println label) 1)))
-
-;;; max-abs -- largest |s(i / sr)| for i in [i, n).
-(defn max-abs [s : (fn [float] float) n : int sr : float i : int acc : float] : float
-  (if (>= i n)
-    acc
-    (let [v (abs-f (s (/ (to-float i) sr)))]
-      (max-abs s n sr (+ i 1) (if (> v acc) v acc)))))
-
-;;; max-step -- largest |s((i+1)/sr) - s(i/sr)| for i in [i, n).
-(defn max-step [s : (fn [float] float) n : int sr : float i : int acc : float] : float
-  (if (>= i n)
-    acc
-    (let [d (abs-f (- (s (/ (to-float (+ i 1)) sr)) (s (/ (to-float i) sr))))]
-      (max-step s n sr (+ i 1) (if (> d acc) d acc)))))
-
-(defn main [] : int
-  (let [unused (constant 0.0)
-        sr     48000.0
-        ;; 1 kHz: dt = 1/48, so p = 0.25 is far from every correction window.
-        saw    ((hf-sawtooth 1000.0 sr) unused)
-        sq     ((hf-square 1000.0 0.5 sr) unused)
-        tri    ((hf-triangle 1000.0 sr) unused)
-        q      (/ 0.25 1000.0)
-        ;; 7919 Hz: a pitch whose naive shapes alias badly.
-        saw-hi  ((hf-sawtooth 7919.0 sr) unused)
-        sq-hi   ((hf-square 7919.0 0.5 sr) unused)
-        tri-hi  ((hf-triangle 7919.0 sr) unused)
-        naive-hi ((sawtooth 7919.0) unused)
-        ;; No sample rate given: must degrade to the naive shape, not NaN.
-        saw-0  ((hf-sawtooth 1000.0 0.0) unused)
-        f (+
-            ;; (a) away from edges: equals the naive shape.
-            (fail-unless (near? (sample saw q) -0.5)  "FAIL: hf-sawtooth @ p=0.25")
-            (fail-unless (near? (sample sq q) 1.0)    "FAIL: hf-square on-phase")
-            (fail-unless (near? (sample sq (/ 0.75 1000.0)) -1.0)
-                         "FAIL: hf-square off-phase")
-            (fail-unless (near? (sample tri q) 0.0)   "FAIL: hf-triangle @ p=0.25")
-            ;; (b) on the edge the step is split in half, not a full jump.
-            (fail-unless (near? (sample saw 0.0) 0.0)
-                         "FAIL: hf-sawtooth step centered at t=0")
-            (fail-unless (near? (sample sq 0.0) 0.0)
-                         "FAIL: hf-square rising edge centered at t=0")
-            ;; Triangle corners are rounded by 4*dt/3 (dt = 1/48 here): the
-            ;; trough is lifted and the peak lowered by exactly that.
-            (fail-unless (near? (sample tri 0.0) (+ -1.0 (/ 4.0 144.0)))
-                         "FAIL: hf-triangle trough should be rounded")
-            (fail-unless (near? (sample tri (/ 0.5 1000.0)) (- 1.0 (/ 4.0 144.0)))
-                         "FAIL: hf-triangle peak should be rounded")
-            ;; Across the wrap the smoothed sawtooth steps by less than the
-            ;; naive one (a ramp of 2 * 7919 / 48000 per sample, then a wrap).
-            (fail-unless (< (max-step (fn [t : float] : float (sample saw-hi t))
-                                      96 sr 0 0.0)
-                            (max-step (fn [t : float] : float
-                                        (- (* 2.0 (sample naive-hi t)) 1.0))
-                                      96 sr 0 0.0))
-                         "FAIL: hf-sawtooth should smooth the wrap step")
-            ;; (c) range: a band-limited shape may overshoot slightly, never wildly.
-            (fail-unless (< (max-abs (fn [t : float] : float (sample saw-hi t)) 480 sr 0 0.0) 1.2)
-                         "FAIL: hf-sawtooth range")
-            (fail-unless (< (max-abs (fn [t : float] : float (sample sq-hi t)) 480 sr 0 0.0) 1.2)
-                         "FAIL: hf-square range")
-            (fail-unless (< (max-abs (fn [t : float] : float (sample tri-hi t)) 480 sr 0 0.0) 1.2)
-                         "FAIL: hf-triangle range")
-            ;; (d) no sample rate: the naive bipolar ramp.
-            (fail-unless (near? (sample saw-0 q) -0.5)
-                         "FAIL: hf-sawtooth with sample-rate 0"))]
-    (if (= f 0)
-      (println "PASS test_hf_osc")
-      (println "test_hf_osc: failures above"))
-    f))
-
-) ;; end defmodule signal/tests/test_hf_osc
+  (defn fail-unless [cond :bool label :cstr] :int
+    (if cond 0 (do (println label) 1)))
+  ;;; max-abs -- largest |s(i / sr)| for i in [i, n).
+  (defn max-abs [s : (fn [float] float) n : int sr : float i : int acc : float] : float
+    (if (>= i n)
+      acc
+      (let [v (abs-f (s (/ (to-float i) sr)))]
+        (max-abs s n sr (+ i 1) (if (> v acc) v acc)))))
+  ;;; max-step -- largest |s((i+1)/sr) - s(i/sr)| for i in [i, n).
+  (defn max-step [s : (fn [float] float) n : int sr : float i : int acc : float] : float
+    (if (>= i n)
+      acc
+      (let [d (abs-f (- (s (/ (to-float (+ i 1)) sr)) (s (/ (to-float i) sr))))]
+        (max-step s n sr (+ i 1) (if (> d acc) d acc)))))
+  (defn main [] : int
+    (let [unused   (constant 0.0)
+          sr       4.8e+04
+          ;; 1 kHz: dt = 1/48, so p = 0.25 is far from every correction window.
+          saw      ((hf-sawtooth 1e+03 sr) unused)
+          sq       ((hf-square 1e+03 0.5 sr) unused)
+          tri      ((hf-triangle 1e+03 sr) unused)
+          q        (/ 0.25 1e+03)
+          ;; 7919 Hz: a pitch whose naive shapes alias badly.
+          saw-hi   ((hf-sawtooth 7919.0 sr) unused)
+          sq-hi    ((hf-square 7919.0 0.5 sr) unused)
+          tri-hi   ((hf-triangle 7919.0 sr) unused)
+          naive-hi ((sawtooth 7919.0) unused)
+          ;; No sample rate given: must degrade to the naive shape, not NaN.
+          saw-0    ((hf-sawtooth 1e+03 0.0) unused)
+          f        (+
+                     ;; (a) away from edges: equals the naive shape.
+                     (fail-unless (near? (sample saw q) -0.5)
+                       "FAIL: hf-sawtooth @ p=0.25")
+                     (fail-unless (near? (sample sq q) 1.0)
+                       "FAIL: hf-square on-phase")
+                     (fail-unless (near? (sample sq (/ 0.75 1e+03)) -1.0)
+                       "FAIL: hf-square off-phase")
+                     (fail-unless (near? (sample tri q) 0.0)
+                       "FAIL: hf-triangle @ p=0.25")
+                     ;; (b) on the edge the step is split in half, not a full jump.
+                     (fail-unless (near? (sample saw 0.0) 0.0)
+                       "FAIL: hf-sawtooth step centered at t=0")
+                     (fail-unless (near? (sample sq 0.0) 0.0)
+                       "FAIL: hf-square rising edge centered at t=0")
+                     ;; Triangle corners are rounded by 4*dt/3 (dt = 1/48 here): the
+                     ;; trough is lifted and the peak lowered by exactly that.
+                     (fail-unless (near? (sample tri 0.0)
+                                    (+ -1.0 (/ 4.0 144.0)))
+                       "FAIL: hf-triangle trough should be rounded")
+                     (fail-unless (near? (sample tri (/ 0.5 1e+03))
+                                    (- 1.0 (/ 4.0 144.0)))
+                       "FAIL: hf-triangle peak should be rounded")
+                     ;; Across the wrap the smoothed sawtooth steps by less than the
+                     ;; naive one (a ramp of 2 * 7919 / 48000 per sample, then a wrap).
+                     (fail-unless (< (max-step (fn [t : float] : float
+                                                 (sample saw-hi t))
+                                       96
+                                       sr
+                                       0
+                                       0.0)
+                                    (max-step (fn [t : float] : float
+                                                (- (* 2.0 (sample naive-hi t))
+                                                  1.0))
+                                      96
+                                      sr
+                                      0
+                                      0.0))
+                       "FAIL: hf-sawtooth should smooth the wrap step")
+                     ;; (c) range: a band-limited shape may overshoot slightly, never wildly.
+                     (fail-unless (< (max-abs (fn [t : float] : float
+                                                (sample saw-hi t))
+                                       480
+                                       sr
+                                       0
+                                       0.0)
+                                    1.2)
+                       "FAIL: hf-sawtooth range")
+                     (fail-unless (< (max-abs (fn [t : float] : float
+                                                (sample sq-hi t))
+                                       480
+                                       sr
+                                       0
+                                       0.0)
+                                    1.2)
+                       "FAIL: hf-square range")
+                     (fail-unless (< (max-abs (fn [t : float] : float
+                                                (sample tri-hi t))
+                                       480
+                                       sr
+                                       0
+                                       0.0)
+                                    1.2)
+                       "FAIL: hf-triangle range")
+                     ;; (d) no sample rate: the naive bipolar ramp.
+                     (fail-unless (near? (sample saw-0 q) -0.5)
+                       "FAIL: hf-sawtooth with sample-rate 0"))]
+      (if (= f 0)
+        (println "PASS test_hf_osc")
+        (println "test_hf_osc: failures above"))
+      f))) ;; end defmodule signal/tests/test_hf_osc

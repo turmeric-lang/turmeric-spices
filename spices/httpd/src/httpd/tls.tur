@@ -19,96 +19,99 @@
 ;;; not shut down, free or close them; ws-server's `wss-free` does.
 ;;;
 ;;; Since: WS4 (on stdlib httpd since tourist-on-stdlib-httpd H2)
-
 (load "stdlib/httpd.tur")
 
 (defmodule httpd/tls
-  (import tls/ctx       :refer [TlsCtx tls-ctx-null?
-                                tls-ctx-new tls-ctx-free
-                                tls-ctx-load-cert-pem tls-ctx-load-key-pem])
-  (import tls/httpd     :refer [tls-httpd-init])
-  (import tls/autolink  :refer [tls-autolink-hint])
-  (import httpd/server  :refer [serve-httpd-request-conn server-launch server-stop
-                                server-tls-ctx server-set-tls-ctx!])
+  (import tls/ctx
+    :refer
+    [TlsCtx
+     tls-ctx-null?
+     tls-ctx-new
+     tls-ctx-free
+     tls-ctx-load-cert-pem
+     tls-ctx-load-key-pem])
+  (import tls/httpd :refer [tls-httpd-init])
+  (import tls/autolink :refer [tls-autolink-hint])
+  (import httpd/server
+    :refer
+    [serve-httpd-request-conn
+     server-launch
+     server-stop
+     server-tls-ctx
+     server-set-tls-ctx!])
   (export server-start-tls-conn server-stop-tls)
-
-(defn htls-null-ptr [] : ptr<void>
-  ```c return NULL; ```)
-
-(defn htls-null? [p : ptr<void>] : bool
-  ```c return p == NULL; ```)
-
-;; Start the stdlib TLS server for a loaded context; the context is recorded
-;; on the handle so server-stop-tls can free it.  NULL (context freed) on
-;; failure.
-(defn htls-start [port : int ctx : TlsCtx handler : (c-fn [int int] int)] : ptr<void>
-  (let [s (server-launch
-            (httpd-new-tls port 8
-              (fn [c : ptr<void>] : nil (serve-httpd-request-conn c handler))
-              (:: ctx :int)))]
-    (if (htls-null? s)
-      (do (tls-ctx-free ctx) (htls-null-ptr))
-      (do (server-set-tls-ctx! s (:: ctx :int)) s))))
-
-;;; server-start-tls-conn -- bind a TLS listener and dispatch to a two-arg
-;;; (Conn, Request) -> Response handler over HTTPS.
-;;;
-;;; The TLS counterpart of httpd/server's `server-start-conn`: every accepted
-;;; connection is wrapped with the PEM cert + key at `cert-path` / `key-path`
-;;; (via tur-tls) and handshaken before the handler runs, and the `Conn` carries
-;;; the per-connection TLS state so an upgrade handler can lift it to `wss://`.
-;;;
-;;; Parameters:
-;;;   port      -- TCP port to bind on (127.0.0.1 unless the program called
-;;;                httpd-set-bind-any! / httpd-set-bind-addr!).
-;;;   cert-path -- filesystem path to a PEM server cert (+ optional chain).
-;;;   key-path  -- filesystem path to the matching PEM private key (unencrypted).
-;;;   handler   -- captureless `(c-fn [int int] int)`. Define it as a top-level
-;;;                `(defn h [conn : Conn req : Request] : Response ...)`.
-;;;
-;;; Returns:
-;;;   :ptr<void> -- opaque server handle for server-stop-tls, or NULL on bind /
-;;;   cert-load / thread-spawn failure.
-;;;
-;;; Example:
-;;;   (let [srv (server-start-tls-conn 8443 "cert.pem" "key.pem" ws-handler)]
-;;;     ;; ... wait / signal ...
-;;;     (server-stop-tls srv))
-;;;
-;;; Since: WS4
-(defn server-start-tls-conn [port : int cert-path : cstr key-path : cstr
-                             handler : (c-fn [int int] int)] : ptr<void>
-  ;; Force the tur-tls autolink hint into the build so the final binary links
-  ;; -lmbedtls / -lmbedx509 / -lmbedcrypto, and wire the tls spice's functions
-  ;; into stdlib httpd's TLS hook table (idempotent).
-  (let [_ (tls-autolink-hint)
-        _ (tls-httpd-init)
-        ctx (tls-ctx-new)]
-    (cond
-      (tls-ctx-null? ctx)
-        (htls-null-ptr)
-      (not (= (tls-ctx-load-cert-pem ctx cert-path) 0))
+  (defn htls-null-ptr [] : ptr<void> ```c return NULL; ```)
+  (defn htls-null? [p : ptr<void>] : bool ```c return p == NULL; ```)
+  ;; Start the stdlib TLS server for a loaded context; the context is recorded
+  ;; on the handle so server-stop-tls can free it.  NULL (context freed) on
+  ;; failure.
+  (defn htls-start [port : int ctx : TlsCtx handler : (c-fn [int int] int)] : ptr<void>
+    (let [s (server-launch (httpd-new-tls port
+                             8
+                             (fn [c : ptr<void>] : nil
+                               (serve-httpd-request-conn c handler))
+                             (:: ctx :int)))]
+      (if (htls-null? s)
         (do (tls-ctx-free ctx) (htls-null-ptr))
-      (not (= (tls-ctx-load-key-pem ctx key-path) 0))
-        (do (tls-ctx-free ctx) (htls-null-ptr))
-      :else
-        (htls-start port ctx handler))))
-
-;;; server-stop-tls -- shut down a TLS server started by server-start-tls-conn.
-;;;
-;;; Stops accepting, lets the workers finish the connections already queued,
-;;; joins every thread, frees the server and then the shared TLS context.
-;;; Connections a handler upgraded belong to it and are left alone.
-;;;
-;;; Parameters:
-;;;   srv -- handle from server-start-tls-conn (NULL is a safe no-op).
-;;;
-;;; Since: WS4
-(defn server-stop-tls [srv : ptr<void>] : void
-  (when (not (htls-null? srv))
-    (let [ctx (server-tls-ctx srv)]
-      (server-stop srv)
-      (when (not (= ctx 0))
-        (tls-ctx-free (:: ctx TlsCtx))))))
-
-) ;; end defmodule httpd/tls
+        (do (server-set-tls-ctx! s (:: ctx :int)) s))))
+  ;;; server-start-tls-conn -- bind a TLS listener and dispatch to a two-arg
+  ;;; (Conn, Request) -> Response handler over HTTPS.
+  ;;;
+  ;;; The TLS counterpart of httpd/server's `server-start-conn`: every accepted
+  ;;; connection is wrapped with the PEM cert + key at `cert-path` / `key-path`
+  ;;; (via tur-tls) and handshaken before the handler runs, and the `Conn` carries
+  ;;; the per-connection TLS state so an upgrade handler can lift it to `wss://`.
+  ;;;
+  ;;; Parameters:
+  ;;;   port      -- TCP port to bind on (127.0.0.1 unless the program called
+  ;;;                httpd-set-bind-any! / httpd-set-bind-addr!).
+  ;;;   cert-path -- filesystem path to a PEM server cert (+ optional chain).
+  ;;;   key-path  -- filesystem path to the matching PEM private key (unencrypted).
+  ;;;   handler   -- captureless `(c-fn [int int] int)`. Define it as a top-level
+  ;;;                `(defn h [conn : Conn req : Request] : Response ...)`.
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- opaque server handle for server-stop-tls, or NULL on bind /
+  ;;;   cert-load / thread-spawn failure.
+  ;;;
+  ;;; Example:
+  ;;;   (let [srv (server-start-tls-conn 8443 "cert.pem" "key.pem" ws-handler)]
+  ;;;     ;; ... wait / signal ...
+  ;;;     (server-stop-tls srv))
+  ;;;
+  ;;; Since: WS4
+  (defn server-start-tls-conn [port : int
+                               cert-path : cstr
+                               key-path : cstr
+                               handler : (c-fn [int int] int)] : ptr<void>
+    ;; Force the tur-tls autolink hint into the build so the final binary links
+    ;; -lmbedtls / -lmbedx509 / -lmbedcrypto, and wire the tls spice's functions
+    ;; into stdlib httpd's TLS hook table (idempotent).
+    (let [_   (tls-autolink-hint)
+          _   (tls-httpd-init)
+          ctx (tls-ctx-new)]
+      (cond (tls-ctx-null? ctx)                               (htls-null-ptr)
+            (not (= (tls-ctx-load-cert-pem ctx cert-path) 0)) (do
+                                                                (tls-ctx-free ctx)
+                                                                (htls-null-ptr))
+            (not (= (tls-ctx-load-key-pem ctx key-path) 0))   (do
+                                                                (tls-ctx-free ctx)
+                                                                (htls-null-ptr))
+            :else                                             (htls-start port
+                                                                ctx
+                                                                handler))))
+  ;;; server-stop-tls -- shut down a TLS server started by server-start-tls-conn.
+  ;;;
+  ;;; Stops accepting, lets the workers finish the connections already queued,
+  ;;; joins every thread, frees the server and then the shared TLS context.
+  ;;; Connections a handler upgraded belong to it and are left alone.
+  ;;;
+  ;;; Parameters:
+  ;;;   srv -- handle from server-start-tls-conn (NULL is a safe no-op).
+  ;;;
+  ;;; Since: WS4
+  (defn server-stop-tls [srv : ptr<void>] : void
+    (when (not (htls-null? srv))
+      (let [ctx (server-tls-ctx srv)]
+        (server-stop srv)
+        (when (not (= ctx 0)) (tls-ctx-free (:: ctx TlsCtx))))))) ;; end defmodule httpd/tls

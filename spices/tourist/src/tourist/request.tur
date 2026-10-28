@@ -27,22 +27,37 @@
 ;;; sent, never freed by the caller.
 ;;;
 ;;; Since: tourist-on-stdlib-httpd H5
-
 (defmodule tourist/request
-  (import tourist/types  :refer [Ctx])
-  (import tourist/param  :refer [tourist-ctx-req tourist-ctx-own! ctx-add-header!
-                                 ctx-attr-get ctx-attr-set!])
-  (import httpd/types    :refer [Request Response])
-  (import httpd/request  :refer [request-conn])
+  (import tourist/types :refer [Ctx])
+  (import tourist/param
+    :refer
+    [tourist-ctx-req
+     tourist-ctx-own!
+     ctx-add-header!
+     ctx-attr-get
+     ctx-attr-set!])
+  (import httpd/types :refer [Request Response])
+  (import httpd/request :refer [request-conn])
   (import httpd/response :refer [response with-header])
-  (export req-cookie set-cookie! form-param
-          Part req-file part-name part-filename part-content-type
-          part-data part-data-len
-          req-ip req-proto req-id
-          basic-auth auth-user body-limit guarded)
-
-```c
-#include <stdlib.h>
+  (export req-cookie
+    set-cookie!
+    form-param
+    Part
+    req-file
+    part-name
+    part-filename
+    part-content-type
+    part-data
+    part-data-len
+    req-ip
+    req-proto
+    req-id
+    basic-auth
+    auth-user
+    body-limit
+    guarded)
+  ```c
+  #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
@@ -53,29 +68,24 @@ struct __tourist_req_prefix {
   char **hdr_keys; char **hdr_vals; int hdr_count; int body_len;
 };
 ```
-
-;; -- Internal: the Ctx's own headers and body --------------------------------
-
-;; A request header's value (case-insensitive name), or NULL when absent.
-(defn __rq-header-raw [ctx : Ctx name : cstr] : cstr
-  ```c
-  struct __tourist_req_prefix *r = (struct __tourist_req_prefix *)(intptr_t)ctx;
+  ;; -- Internal: the Ctx's own headers and body --------------------------------
+  ;; A request header's value (case-insensitive name), or NULL when absent.
+  (defn __rq-header-raw [ctx : Ctx name : cstr] : cstr
+    ```c
+    struct __tourist_req_prefix *r = (struct __tourist_req_prefix *)(intptr_t)ctx;
   if (!r) return NULL;
   for (int i = 0; i < r->hdr_count; i++)
     if (strcasecmp(r->hdr_keys[i], name) == 0) return r->hdr_vals[i];
   return NULL;
   ```)
-
-(defn __rq-body [ctx : Ctx] : ptr<void>
-  ```c return ctx ? (void *)((struct __tourist_req_prefix *)(intptr_t)ctx)->body : NULL; ```)
-
-(defn __rq-body-len [ctx : Ctx] : int
-  ```c return ctx ? (int64_t)((struct __tourist_req_prefix *)(intptr_t)ctx)->body_len : 0; ```)
-
-;; The body is application/x-www-form-urlencoded (parameters allowed).
-(defn __rq-form-body? [ctx : Ctx] : bool
-  ```c
-  const char *ct = tourist__request___un_unrq_hyheader_hyraw(ctx, "Content-Type");
+  (defn __rq-body [ctx : Ctx] : ptr<void>
+    ```c return ctx ? (void *)((struct __tourist_req_prefix *)(intptr_t)ctx)->body : NULL; ```)
+  (defn __rq-body-len [ctx : Ctx] : int
+    ```c return ctx ? (int64_t)((struct __tourist_req_prefix *)(intptr_t)ctx)->body_len : 0; ```)
+  ;; The body is application/x-www-form-urlencoded (parameters allowed).
+  (defn __rq-form-body? [ctx : Ctx] : bool
+    ```c
+    const char *ct = tourist__request___un_unrq_hyheader_hyraw(ctx, "Content-Type");
   if (!ct) return false;
   while (*ct == ' ' || *ct == '\t') ct++;
   static const char want[] = "application/x-www-form-urlencoded";
@@ -83,404 +93,367 @@ struct __tourist_req_prefix {
   return strncasecmp(ct, want, wl) == 0 &&
          (ct[wl] == '\0' || ct[wl] == ';' || ct[wl] == ' ' || ct[wl] == '\t');
   ```)
-
-(defn __rq-null? [s : cstr] : bool
-  ```c return s == NULL; ```)
-
-(defn __rq-ptr-null? [p : ptr<void>] : bool
-  ```c return p == NULL; ```)
-
-(defn __rq-free [s : cstr] : void
-  ```c free((void *)s); ```)
-
-(defn __rq-empty? [s : cstr] : bool
-  ```c return s == NULL || s[0] == '\0'; ```)
-
-;; A malloc'd string as some(owned-by-the-ctx), NULL as none.
-(defn __rq-own-opt [ctx : Ctx s : cstr] : (Option cstr)
-  (if (__rq-null? s) (none) (some (tourist-ctx-own! ctx s))))
-
-;; -- Cookies -----------------------------------------------------------------
-
-;;; req-cookie -- the value of a cookie the request sent.
-;;;
-;;; Parses the Cookie header with stdlib httpd's cookie parser.  A cookie
-;;; sent with an empty value is some "", not none.
-;;;
-;;; Parameters:
-;;;   ctx  -- the request's Ctx
-;;;   name -- cookie name (case-sensitive, RFC 6265)
-;;;
-;;; Returns:
-;;;   (Option cstr) -- some(value), owned by the request, or none.
-;;;
-;;; Example:
-;;;   (let [s (req-cookie ctx "theme")]
-;;;     (text (if (some? s) (unwrap s) "light")))
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn req-cookie [ctx : Ctx name : cstr] : (Option cstr)
-  (__rq-own-opt ctx (httpd-cookie-parse-raw (__rq-header-raw ctx "Cookie") name)))
-
-;;; set-cookie! -- queue a Set-Cookie header for the response.
-;;;
-;;; Formats `opts` with stdlib httpd's Set-Cookie formatter (build it with
-;;; stdlib's `cookie` or `cookie-full`) and queues it like ctx-add-header!,
-;;; so it lands on whatever response goes out, a use! short-circuit included.
-;;; Several calls queue several cookies.
-;;;
-;;; Parameters:
-;;;   ctx  -- the request's Ctx
-;;;   opts -- CookieOpts
-;;;
-;;; A cookie with an empty name is not a cookie: nothing is queued.
-;;;
-;;; Example:
-;;;   (set-cookie! ctx (cookie "theme" "dark"))
-;;;   (set-cookie! ctx (cookie-full "sid" id "/" "" 3600 1 1 "Strict"))
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn set-cookie! [ctx : Ctx opts : CookieOpts] : void
-  (let [v (httpd-cookie-format opts)]
-    (when (not (__rq-null? v))
-      (ctx-add-header! ctx "Set-Cookie" v)
-      (__rq-free v))))
-
-;; -- Forms -------------------------------------------------------------------
-
-;;; form-param -- a field of a URL-encoded form body.
-;;;
-;;; The value is percent-decoded with `+` as a space (stdlib httpd's form
-;;; parser).  A field sent empty is ok "".
-;;;
-;;; Parameters:
-;;;   ctx -- the request's Ctx
-;;;   key -- field name (case-sensitive, as sent)
-;;;
-;;; Returns:
-;;;   (Result cstr cstr) -- ok(value), owned by the request; err when the body
-;;;   is not application/x-www-form-urlencoded or has no such field.
-;;;
-;;; Example:
-;;;   (let [r (form-param ctx "email")]
-;;;     (if (ok? r) (text (ok-val r)) (status 400 (text (err-val r)))))
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn form-param [ctx : Ctx key : cstr] : (Result cstr cstr)
-  (if (not (__rq-form-body? ctx))
-    (:: (err "request body is not application/x-www-form-urlencoded") (Result cstr cstr))
-    (let [v (httpd-form-parse-raw (__rq-body ctx) (__rq-body-len ctx) key)]
-      (if (__rq-null? v)
-        (:: (err "no such form field") (Result cstr cstr))
-        (:: (ok (tourist-ctx-own! ctx v)) (Result cstr cstr))))))
-
-;; -- Multipart uploads -------------------------------------------------------
-
-;;; Part -- one part of a multipart/form-data body (an uploaded file or a
-;;; field), valid until the response is sent.
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defopaque Part :int)
-
-(defn __part-ptr [p : Part] : ptr<void>
-  (:: (:: p :int) :ptr<void>))
-
-;;; req-file -- the multipart/form-data part with a given field name.
-;;;
-;;; The body is parsed on first use (stdlib httpd's multipart parser).
-;;;
-;;; Parameters:
-;;;   ctx   -- the request's Ctx
-;;;   field -- the form field name of the part
-;;;
-;;; Returns:
-;;;   (Option Part) -- some(part), or none when there is no such part, the
-;;;   body is not multipart, or the Ctx has no server-built request behind it.
-;;;
-;;; Example:
-;;;   (let [f (req-file ctx "avatar")]
-;;;     (if (some? f)
-;;;       (with-body-bytes (resp-ok (part-content-type (unwrap f)) "")
-;;;                        (part-data (unwrap f)) (part-data-len (unwrap f)))
-;;;       (status 400 (text "no file"))))
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn req-file [ctx : Ctx field : cstr] : (Option Part)
-  (let [c (request-conn (tourist-ctx-req ctx))]
-    (if (some? c)
-      (let [p (httpd-req-file (unwrap c) field)]
-        (if (__rq-ptr-null? p) (none) (some (:: (:: p :int) :Part))))
-      (none))))
-
-;;; part-name -- the part's form field name.
-;;;
-;;; Parameters:
-;;;   p -- Part
-;;;
-;;; Returns:
-;;;   :cstr -- the name
-;;;
-;;; Example:
-;;;   (part-name f)  ; => "avatar"
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn part-name [p : Part] : cstr
-  (httpd-part-name (__part-ptr p)))
-
-;;; part-filename -- the file name the client sent with the part.
-;;;
-;;; Parameters:
-;;;   p -- Part
-;;;
-;;; Returns:
-;;;   (Option cstr) -- some(name), or none for a plain field.
-;;;
-;;; Example:
-;;;   (part-filename f)  ; => some("me.png")
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn part-filename [p : Part] : (Option cstr)
-  (let [n (httpd-part-filename (__part-ptr p))]
-    (if (__rq-empty? n) (none) (some n))))
-
-;;; part-content-type -- the part's Content-Type ("" when it sent none).
-;;;
-;;; Parameters:
-;;;   p -- Part
-;;;
-;;; Returns:
-;;;   :cstr -- e.g. "image/png"
-;;;
-;;; Example:
-;;;   (part-content-type f)  ; => "image/png"
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn part-content-type [p : Part] : cstr
-  (httpd-part-content-type (__part-ptr p)))
-
-;;; part-data -- the part's bytes (may hold NULs; see part-data-len).
-;;;
-;;; Parameters:
-;;;   p -- Part
-;;;
-;;; Returns:
-;;;   :ptr<void> -- the bytes, valid until the response is sent
-;;;
-;;; Example:
-;;;   (with-body-bytes (resp-ok "image/png" "") (part-data f) (part-data-len f))
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn part-data [p : Part] : ptr<void>
-  (httpd-part-data (__part-ptr p)))
-
-;;; part-data-len -- the part's length in bytes.
-;;;
-;;; Parameters:
-;;;   p -- Part
-;;;
-;;; Returns:
-;;;   :int -- byte count
-;;;
-;;; Example:
-;;;   (part-data-len f)  ; => 5120
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn part-data-len [p : Part] : int
-  (httpd-part-data-len (__part-ptr p)))
-
-;; -- Client address, protocol, request id ------------------------------------
-
-;;; req-ip -- the client's IP address.
-;;;
-;;; stdlib httpd's httpd-req-ip: what an mw-trust-proxy in tourist-with's
-;;; stack resolved from X-Forwarded-For, else the peer address.
-;;;
-;;; Parameters:
-;;;   ctx -- the request's Ctx
-;;;
-;;; Returns:
-;;;   (Option cstr) -- some(address), or none when it is unknown or the Ctx
-;;;   has no server-built request behind it.
-;;;
-;;; Example:
-;;;   (let [ip (req-ip ctx)] (text (if (some? ip) (unwrap ip) "?")))
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn req-ip [ctx : Ctx] : (Option cstr)
-  (let [c (request-conn (tourist-ctx-req ctx))]
-    (if (some? c)
-      (let [ip (httpd-req-ip (unwrap c))]
-        (if (__rq-empty? ip) (none) (some ip)))
-      (none))))
-
-;;; req-proto -- "https" or "http".
-;;;
-;;; stdlib httpd's httpd-req-proto: X-Forwarded-Proto from a proxy an
-;;; mw-trust-proxy trusts, else the connection's own protocol.
-;;;
-;;; Parameters:
-;;;   ctx -- the request's Ctx
-;;;
-;;; Returns:
-;;;   :cstr -- "https" or "http" ("http" without a server-built request)
-;;;
-;;; Example:
-;;;   (req-proto ctx)  ; => "https"
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn req-proto [ctx : Ctx] : cstr
-  (let [c (request-conn (tourist-ctx-req ctx))]
-    (if (some? c) (httpd-req-proto (unwrap c)) "http")))
-
-;;; req-id -- the id mw-request-id gave this request.
-;;;
-;;; Parameters:
-;;;   ctx -- the request's Ctx
-;;;
-;;; Returns:
-;;;   (Option cstr) -- some(id), or none without mw-request-id in
-;;;   tourist-with's stack.
-;;;
-;;; Example:
-;;;   (let [id (req-id ctx)] (when (some? id) (log-with (unwrap id))))
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn req-id [ctx : Ctx] : (Option cstr)
-  (let [c (request-conn (tourist-ctx-req ctx))]
-    (if (some? c) (httpd-req-id (unwrap c)) (none))))
-
-;; -- Per-route checks --------------------------------------------------------
-
-;; Split a decoded "user:pass" in place at its first ':' (there always is
-;; one); the string itself is then the user.  Returns the password.
-(defn __auth-split! [raw : cstr] : cstr
-  ```c
-  char *colon = strchr((char *)raw, ':');
+  (defn __rq-null? [s : cstr] : bool ```c return s == NULL; ```)
+  (defn __rq-ptr-null? [p : ptr<void>] : bool ```c return p == NULL; ```)
+  (defn __rq-free [s : cstr] : void ```c free((void *)s); ```)
+  (defn __rq-empty? [s : cstr] : bool
+    ```c return s == NULL || s[0] == '\0'; ```)
+  ;; A malloc'd string as some(owned-by-the-ctx), NULL as none.
+  (defn __rq-own-opt [ctx : Ctx s : cstr] : (Option cstr)
+    (if (__rq-null? s) (none) (some (tourist-ctx-own! ctx s))))
+  ;; -- Cookies -----------------------------------------------------------------
+  ;;; req-cookie -- the value of a cookie the request sent.
+  ;;;
+  ;;; Parses the Cookie header with stdlib httpd's cookie parser.  A cookie
+  ;;; sent with an empty value is some "", not none.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx  -- the request's Ctx
+  ;;;   name -- cookie name (case-sensitive, RFC 6265)
+  ;;;
+  ;;; Returns:
+  ;;;   (Option cstr) -- some(value), owned by the request, or none.
+  ;;;
+  ;;; Example:
+  ;;;   (let [s (req-cookie ctx "theme")]
+  ;;;     (text (if (some? s) (unwrap s) "light")))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn req-cookie [ctx : Ctx name : cstr] : (Option cstr)
+    (__rq-own-opt ctx
+      (httpd-cookie-parse-raw (__rq-header-raw ctx "Cookie") name)))
+  ;;; set-cookie! -- queue a Set-Cookie header for the response.
+  ;;;
+  ;;; Formats `opts` with stdlib httpd's Set-Cookie formatter (build it with
+  ;;; stdlib's `cookie` or `cookie-full`) and queues it like ctx-add-header!,
+  ;;; so it lands on whatever response goes out, a use! short-circuit included.
+  ;;; Several calls queue several cookies.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx  -- the request's Ctx
+  ;;;   opts -- CookieOpts
+  ;;;
+  ;;; A cookie with an empty name is not a cookie: nothing is queued.
+  ;;;
+  ;;; Example:
+  ;;;   (set-cookie! ctx (cookie "theme" "dark"))
+  ;;;   (set-cookie! ctx (cookie-full "sid" id "/" "" 3600 1 1 "Strict"))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn set-cookie! [ctx : Ctx opts : CookieOpts] : void
+    (let [v (httpd-cookie-format opts)]
+      (when (not (__rq-null? v))
+        (ctx-add-header! ctx "Set-Cookie" v)
+        (__rq-free v))))
+  ;; -- Forms -------------------------------------------------------------------
+  ;;; form-param -- a field of a URL-encoded form body.
+  ;;;
+  ;;; The value is percent-decoded with `+` as a space (stdlib httpd's form
+  ;;; parser).  A field sent empty is ok "".
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- the request's Ctx
+  ;;;   key -- field name (case-sensitive, as sent)
+  ;;;
+  ;;; Returns:
+  ;;;   (Result cstr cstr) -- ok(value), owned by the request; err when the body
+  ;;;   is not application/x-www-form-urlencoded or has no such field.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (form-param ctx "email")]
+  ;;;     (if (ok? r) (text (ok-val r)) (status 400 (text (err-val r)))))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn form-param [ctx : Ctx key : cstr] : (Result cstr cstr)
+    (if (not (__rq-form-body? ctx))
+      (:: (err "request body is not application/x-www-form-urlencoded")
+        (Result cstr cstr))
+      (let [v (httpd-form-parse-raw (__rq-body ctx) (__rq-body-len ctx) key)]
+        (if (__rq-null? v)
+          (:: (err "no such form field") (Result cstr cstr))
+          (:: (ok (tourist-ctx-own! ctx v)) (Result cstr cstr))))))
+  ;; -- Multipart uploads -------------------------------------------------------
+  ;;; Part -- one part of a multipart/form-data body (an uploaded file or a
+  ;;; field), valid until the response is sent.
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defopaque Part :int)
+  (defn __part-ptr [p : Part] : ptr<void> (:: (:: p :int) :ptr<void>))
+  ;;; req-file -- the multipart/form-data part with a given field name.
+  ;;;
+  ;;; The body is parsed on first use (stdlib httpd's multipart parser).
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx   -- the request's Ctx
+  ;;;   field -- the form field name of the part
+  ;;;
+  ;;; Returns:
+  ;;;   (Option Part) -- some(part), or none when there is no such part, the
+  ;;;   body is not multipart, or the Ctx has no server-built request behind it.
+  ;;;
+  ;;; Example:
+  ;;;   (let [f (req-file ctx "avatar")]
+  ;;;     (if (some? f)
+  ;;;       (with-body-bytes (resp-ok (part-content-type (unwrap f)) "")
+  ;;;                        (part-data (unwrap f)) (part-data-len (unwrap f)))
+  ;;;       (status 400 (text "no file"))))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn req-file [ctx : Ctx field : cstr] : (Option Part)
+    (let [c (request-conn (tourist-ctx-req ctx))]
+      (if (some? c)
+        (let [p (httpd-req-file (unwrap c) field)]
+          (if (__rq-ptr-null? p) (none) (some (:: (:: p :int) :Part))))
+        (none))))
+  ;;; part-name -- the part's form field name.
+  ;;;
+  ;;; Parameters:
+  ;;;   p -- Part
+  ;;;
+  ;;; Returns:
+  ;;;   :cstr -- the name
+  ;;;
+  ;;; Example:
+  ;;;   (part-name f)  ; => "avatar"
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn part-name [p : Part] : cstr (httpd-part-name (__part-ptr p)))
+  ;;; part-filename -- the file name the client sent with the part.
+  ;;;
+  ;;; Parameters:
+  ;;;   p -- Part
+  ;;;
+  ;;; Returns:
+  ;;;   (Option cstr) -- some(name), or none for a plain field.
+  ;;;
+  ;;; Example:
+  ;;;   (part-filename f)  ; => some("me.png")
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn part-filename [p : Part] : (Option cstr)
+    (let [n (httpd-part-filename (__part-ptr p))]
+      (if (__rq-empty? n) (none) (some n))))
+  ;;; part-content-type -- the part's Content-Type ("" when it sent none).
+  ;;;
+  ;;; Parameters:
+  ;;;   p -- Part
+  ;;;
+  ;;; Returns:
+  ;;;   :cstr -- e.g. "image/png"
+  ;;;
+  ;;; Example:
+  ;;;   (part-content-type f)  ; => "image/png"
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn part-content-type [p : Part] : cstr
+    (httpd-part-content-type (__part-ptr p)))
+  ;;; part-data -- the part's bytes (may hold NULs; see part-data-len).
+  ;;;
+  ;;; Parameters:
+  ;;;   p -- Part
+  ;;;
+  ;;; Returns:
+  ;;;   :ptr<void> -- the bytes, valid until the response is sent
+  ;;;
+  ;;; Example:
+  ;;;   (with-body-bytes (resp-ok "image/png" "") (part-data f) (part-data-len f))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn part-data [p : Part] : ptr<void> (httpd-part-data (__part-ptr p)))
+  ;;; part-data-len -- the part's length in bytes.
+  ;;;
+  ;;; Parameters:
+  ;;;   p -- Part
+  ;;;
+  ;;; Returns:
+  ;;;   :int -- byte count
+  ;;;
+  ;;; Example:
+  ;;;   (part-data-len f)  ; => 5120
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn part-data-len [p : Part] : int (httpd-part-data-len (__part-ptr p)))
+  ;; -- Client address, protocol, request id ------------------------------------
+  ;;; req-ip -- the client's IP address.
+  ;;;
+  ;;; stdlib httpd's httpd-req-ip: what an mw-trust-proxy in tourist-with's
+  ;;; stack resolved from X-Forwarded-For, else the peer address.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- the request's Ctx
+  ;;;
+  ;;; Returns:
+  ;;;   (Option cstr) -- some(address), or none when it is unknown or the Ctx
+  ;;;   has no server-built request behind it.
+  ;;;
+  ;;; Example:
+  ;;;   (let [ip (req-ip ctx)] (text (if (some? ip) (unwrap ip) "?")))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn req-ip [ctx : Ctx] : (Option cstr)
+    (let [c (request-conn (tourist-ctx-req ctx))]
+      (if (some? c)
+        (let [ip (httpd-req-ip (unwrap c))]
+          (if (__rq-empty? ip) (none) (some ip)))
+        (none))))
+  ;;; req-proto -- "https" or "http".
+  ;;;
+  ;;; stdlib httpd's httpd-req-proto: X-Forwarded-Proto from a proxy an
+  ;;; mw-trust-proxy trusts, else the connection's own protocol.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- the request's Ctx
+  ;;;
+  ;;; Returns:
+  ;;;   :cstr -- "https" or "http" ("http" without a server-built request)
+  ;;;
+  ;;; Example:
+  ;;;   (req-proto ctx)  ; => "https"
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn req-proto [ctx : Ctx] : cstr
+    (let [c (request-conn (tourist-ctx-req ctx))]
+      (if (some? c) (httpd-req-proto (unwrap c)) "http")))
+  ;;; req-id -- the id mw-request-id gave this request.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- the request's Ctx
+  ;;;
+  ;;; Returns:
+  ;;;   (Option cstr) -- some(id), or none without mw-request-id in
+  ;;;   tourist-with's stack.
+  ;;;
+  ;;; Example:
+  ;;;   (let [id (req-id ctx)] (when (some? id) (log-with (unwrap id))))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn req-id [ctx : Ctx] : (Option cstr)
+    (let [c (request-conn (tourist-ctx-req ctx))]
+      (if (some? c) (httpd-req-id (unwrap c)) (none))))
+  ;; -- Per-route checks --------------------------------------------------------
+  ;; Split a decoded "user:pass" in place at its first ':' (there always is
+  ;; one); the string itself is then the user.  Returns the password.
+  (defn __auth-split! [raw : cstr] : cstr
+    ```c
+    char *colon = strchr((char *)raw, ':');
   *colon = '\0';
   return colon + 1;
   ```)
-
-;; The WWW-Authenticate value for a realm (malloc'd; the caller frees).
-(defn __auth-realm-value [realm : cstr] : cstr
-  ```c
-  const char *r = (realm && *realm) ? realm : "restricted";
+  ;; The WWW-Authenticate value for a realm (malloc'd; the caller frees).
+  (defn __auth-realm-value [realm : cstr] : cstr
+    ```c
+    const char *r = (realm && *realm) ? realm : "restricted";
   size_t n = strlen(r) + 32;
   char *v = (char *)malloc(n);
   if (v) snprintf(v, n, "Basic realm=\"%s\"", r);
   return v;
   ```)
-
-(defn __auth-challenge [realm : cstr] : Response
-  (let [v (__auth-realm-value realm)
-        r (with-header (response 401 "text/plain" "Unauthorized") "WWW-Authenticate" v)]
-    (__rq-free v)
-    r))
-
-;; Accept (true) or reject a decoded "user:pass"; on accept the user is
-;; recorded on the ctx, which then owns `raw`.
-(defn __auth-check [ctx : Ctx raw : cstr verify : (fn [cstr cstr] bool)] : bool
-  (let [pass (__auth-split! raw)]
-    (if (verify raw pass)
-      (do
-        (tourist-ctx-own! ctx raw)
-        (ctx-attr-set! ctx "__tourist_auth_user" (:: raw :int))
-        true)
-      (do
-        (__rq-free raw)
-        false))))
-
-;;; basic-auth -- a use! check for HTTP Basic authentication.
-;;;
-;;; Decodes `Authorization: Basic ...` with stdlib httpd's decoder and asks
-;;; `verify`; a request it does not accept gets 401 with
-;;; `WWW-Authenticate: Basic realm="<realm>"`, and the route never runs.  On
-;;; success the user is available to the route as auth-user.  Compare the
-;;; password with stdlib's constant-time `cstr-eq-const-time`.  Use it
-;;; app-wide with use!, or on one route with guarded.  Always behind TLS:
-;;; Basic credentials are only base64.
-;;;
-;;; Parameters:
-;;;   realm  -- the realm named in the challenge
-;;;   verify -- (fn [cstr cstr] bool): user, password -> accept?
-;;;
-;;; Returns:
-;;;   (fn [Ctx] (Option Response)) -- a use!-shaped check
-;;;
-;;; Example:
-;;;   (use! (basic-auth "admin"
-;;;           (fn [u : cstr p : cstr] : bool
-;;;             (= 1 (cstr-eq-const-time p admin-password)))))
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn basic-auth [realm : cstr verify : (fn [cstr cstr] bool)] : (fn [Ctx] (Option Response))
-  (fn [ctx : Ctx] : (Option Response)
-    (let [raw (httpd-basic-auth-decode-raw (__rq-header-raw ctx "Authorization"))]
-      (if (__rq-null? raw)
-        (some (__auth-challenge realm))
-        (if (__auth-check ctx raw verify)
-          (none)
-          (some (__auth-challenge realm)))))))
-
-;;; auth-user -- the user a basic-auth check accepted for this request.
-;;;
-;;; Parameters:
-;;;   ctx -- the request's Ctx
-;;;
-;;; Returns:
-;;;   (Option cstr) -- some(user), or none when no basic-auth check ran or it
-;;;   rejected the request.
-;;;
-;;; Example:
-;;;   (text (unwrap (auth-user ctx)))
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn auth-user [ctx : Ctx] : (Option cstr)
-  (let [a (ctx-attr-get ctx "__tourist_auth_user")]
-    (if (some? a) (some (:: (unwrap a) :cstr)) (none))))
-
-;;; body-limit -- a use! check that refuses bodies over `max-bytes`.
-;;;
-;;; Answers 413 Payload Too Large without running the route.  The server's
-;;; own cap (ServerOpts' max-body) applies before tourist sees the request;
-;;; this is a tighter limit for the routes it guards.
-;;;
-;;; Parameters:
-;;;   max-bytes -- the largest body accepted
-;;;
-;;; Returns:
-;;;   (fn [Ctx] (Option Response)) -- a use!-shaped check
-;;;
-;;; Example:
-;;;   (post! "/comment" (guarded (body-limit 4096) post-comment))
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn body-limit [max-bytes : int] : (fn [Ctx] (Option Response))
-  (fn [ctx : Ctx] : (Option Response)
-    (if (> (__rq-body-len ctx) max-bytes)
-      (some (response 413 "text/plain" "Payload Too Large"))
-      (none))))
-
-;;; guarded -- run a use!-shaped check in front of one route's handler.
-;;;
-;;; use! applies to every request; guarded applies a check where routing
-;;; matters -- basic-auth on the admin routes, a tighter body-limit on an
-;;; upload route.  When the guard answers, that is the response and the
-;;; handler does not run.
-;;;
-;;; Parameters:
-;;;   guard   -- (fn [Ctx] (Option Response)), e.g. basic-auth / body-limit
-;;;   handler -- the route's (fn [Ctx] Response)
-;;;
-;;; Returns:
-;;;   (fn [Ctx] Response) -- a route handler
-;;;
-;;; Example:
-;;;   (post! "/upload" (guarded (body-limit 1048576) upload))
-;;;
-;;; Since: tourist-on-stdlib-httpd H5
-(defn guarded [guard : (fn [Ctx] (Option Response)) handler : (fn [Ctx] Response)] : (fn [Ctx] Response)
-  (fn [ctx : Ctx] : Response
-    (let [r (guard ctx)]
-      (if (some? r) (unwrap r) (handler ctx)))))
-
-) ;; end defmodule tourist/request
+  (defn __auth-challenge [realm : cstr] : Response
+    (let [v (__auth-realm-value realm)
+          r (with-header (response 401 "text/plain" "Unauthorized")
+              "WWW-Authenticate"
+              v)]
+      (__rq-free v)
+      r))
+  ;; Accept (true) or reject a decoded "user:pass"; on accept the user is
+  ;; recorded on the ctx, which then owns `raw`.
+  (defn __auth-check [ctx : Ctx raw : cstr verify : (fn [cstr cstr] bool)] : bool
+    (let [pass (__auth-split! raw)]
+      (if (verify raw pass)
+        (do
+          (tourist-ctx-own! ctx raw)
+          (ctx-attr-set! ctx "__tourist_auth_user" (:: raw :int))
+          true)
+        (do (__rq-free raw) false))))
+  ;;; basic-auth -- a use! check for HTTP Basic authentication.
+  ;;;
+  ;;; Decodes `Authorization: Basic ...` with stdlib httpd's decoder and asks
+  ;;; `verify`; a request it does not accept gets 401 with
+  ;;; `WWW-Authenticate: Basic realm="<realm>"`, and the route never runs.  On
+  ;;; success the user is available to the route as auth-user.  Compare the
+  ;;; password with stdlib's constant-time `cstr-eq-const-time`.  Use it
+  ;;; app-wide with use!, or on one route with guarded.  Always behind TLS:
+  ;;; Basic credentials are only base64.
+  ;;;
+  ;;; Parameters:
+  ;;;   realm  -- the realm named in the challenge
+  ;;;   verify -- (fn [cstr cstr] bool): user, password -> accept?
+  ;;;
+  ;;; Returns:
+  ;;;   (fn [Ctx] (Option Response)) -- a use!-shaped check
+  ;;;
+  ;;; Example:
+  ;;;   (use! (basic-auth "admin"
+  ;;;           (fn [u : cstr p : cstr] : bool
+  ;;;             (= 1 (cstr-eq-const-time p admin-password)))))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn basic-auth [realm : cstr verify : (fn [cstr cstr] bool)] : (fn [Ctx]
+                                                                     (Option Response))
+    (fn [ctx : Ctx] : (Option Response)
+      (let [raw (httpd-basic-auth-decode-raw (__rq-header-raw ctx
+                                               "Authorization"))]
+        (if (__rq-null? raw)
+          (some (__auth-challenge realm))
+          (if (__auth-check ctx raw verify)
+            (none)
+            (some (__auth-challenge realm)))))))
+  ;;; auth-user -- the user a basic-auth check accepted for this request.
+  ;;;
+  ;;; Parameters:
+  ;;;   ctx -- the request's Ctx
+  ;;;
+  ;;; Returns:
+  ;;;   (Option cstr) -- some(user), or none when no basic-auth check ran or it
+  ;;;   rejected the request.
+  ;;;
+  ;;; Example:
+  ;;;   (text (unwrap (auth-user ctx)))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn auth-user [ctx : Ctx] : (Option cstr)
+    (let [a (ctx-attr-get ctx "__tourist_auth_user")]
+      (if (some? a) (some (:: (unwrap a) :cstr)) (none))))
+  ;;; body-limit -- a use! check that refuses bodies over `max-bytes`.
+  ;;;
+  ;;; Answers 413 Payload Too Large without running the route.  The server's
+  ;;; own cap (ServerOpts' max-body) applies before tourist sees the request;
+  ;;; this is a tighter limit for the routes it guards.
+  ;;;
+  ;;; Parameters:
+  ;;;   max-bytes -- the largest body accepted
+  ;;;
+  ;;; Returns:
+  ;;;   (fn [Ctx] (Option Response)) -- a use!-shaped check
+  ;;;
+  ;;; Example:
+  ;;;   (post! "/comment" (guarded (body-limit 4096) post-comment))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn body-limit [max-bytes : int] : (fn [Ctx] (Option Response))
+    (fn [ctx : Ctx] : (Option Response)
+      (if (> (__rq-body-len ctx) max-bytes)
+        (some (response 413 "text/plain" "Payload Too Large"))
+        (none))))
+  ;;; guarded -- run a use!-shaped check in front of one route's handler.
+  ;;;
+  ;;; use! applies to every request; guarded applies a check where routing
+  ;;; matters -- basic-auth on the admin routes, a tighter body-limit on an
+  ;;; upload route.  When the guard answers, that is the response and the
+  ;;; handler does not run.
+  ;;;
+  ;;; Parameters:
+  ;;;   guard   -- (fn [Ctx] (Option Response)), e.g. basic-auth / body-limit
+  ;;;   handler -- the route's (fn [Ctx] Response)
+  ;;;
+  ;;; Returns:
+  ;;;   (fn [Ctx] Response) -- a route handler
+  ;;;
+  ;;; Example:
+  ;;;   (post! "/upload" (guarded (body-limit 1048576) upload))
+  ;;;
+  ;;; Since: tourist-on-stdlib-httpd H5
+  (defn guarded [guard : (fn [Ctx] (Option Response))
+                 handler : (fn [Ctx] Response)] : (fn [Ctx] Response)
+    (fn [ctx : Ctx] : Response
+      (let [r (guard ctx)] (if (some? r) (unwrap r) (handler ctx)))))) ;; end defmodule tourist/request

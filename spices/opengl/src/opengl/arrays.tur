@@ -14,26 +14,28 @@
 ;; payload address without the caller tracking a count separately. Every
 ;; accessor is bounds-checked against that header; an out-of-range index is a
 ;; no-op (set) or 0.0 (get) rather than a read past the end.
-
 (defmodule opengl/arrays
-  (export FloatArray make-float-array delete-float-array
-          float-array-set! float-array-get
-          float-array-len float-array-bytes float-array-ptr
-          with-float-array)
-
-;;; FloatArray -- opaque handle to a heap block of packed 32-bit floats.
-;;;
-;;; `:linear` like the GPU handles in `opengl/types`: produced once by
-;;; `make-float-array` and consumed exactly once by `delete-float-array`.
-;;; Dropping one without deleting is `TUR-E0100`; using one after deleting is
-;;; `TUR-E0101`. Accessors take it by `^borrow` so reading leaves ownership
-;;; with the caller.
-(defopaque ^linear FloatArray :int)
-
-;;; __fa-alloc -- calloc a length header plus n float32 slots.
-(defn __fa-alloc [n : int] : int
-  ```c
-  #include <stdlib.h>
+  (export FloatArray
+    make-float-array
+    delete-float-array
+    float-array-set!
+    float-array-get
+    float-array-len
+    float-array-bytes
+    float-array-ptr
+    with-float-array)
+  ;;; FloatArray -- opaque handle to a heap block of packed 32-bit floats.
+  ;;;
+  ;;; `:linear` like the GPU handles in `opengl/types`: produced once by
+  ;;; `make-float-array` and consumed exactly once by `delete-float-array`.
+  ;;; Dropping one without deleting is `TUR-E0100`; using one after deleting is
+  ;;; `TUR-E0101`. Accessors take it by `^borrow` so reading leaves ownership
+  ;;; with the caller.
+  (defopaque ^linear FloatArray :int)
+  ;;; __fa-alloc -- calloc a length header plus n float32 slots.
+  (defn __fa-alloc [n : int] : int
+    ```c
+    #include <stdlib.h>
   #include <string.h>
   long long cnt = (long long)n;
   if (cnt < 0) cnt = 0;
@@ -43,28 +45,25 @@
   memcpy(p, &cnt, sizeof(long long));
   return (long long)(intptr_t)p;
   ```)
-
-;;; __fa-free -- release a block from __fa-alloc.
-(defn __fa-free [p : int] : void
-  ```c
-  #include <stdlib.h>
+  ;;; __fa-free -- release a block from __fa-alloc.
+  (defn __fa-free [p : int] : void
+    ```c
+    #include <stdlib.h>
   free((void *)(intptr_t)p);
   ```)
-
-;;; __fa-len -- read the length header.
-(defn __fa-len [p : int] : int
-  ```c
-  #include <string.h>
+  ;;; __fa-len -- read the length header.
+  (defn __fa-len [p : int] : int
+    ```c
+    #include <string.h>
   if (!p) return 0;
   long long n = 0;
   memcpy(&n, (const void *)(intptr_t)p, sizeof(long long));
   return n;
   ```)
-
-;;; __fa-set! -- bounds-checked narrowing store.
-(defn __fa-set! [p : int i : int v : float] : void
-  ```c
-  #include <string.h>
+  ;;; __fa-set! -- bounds-checked narrowing store.
+  (defn __fa-set! [p : int i : int v : float] : void
+    ```c
+    #include <string.h>
   if (!p) return;
   long long n = 0;
   memcpy(&n, (const void *)(intptr_t)p, sizeof(long long));
@@ -72,11 +71,10 @@
   float *d = (float *)((unsigned char *)(intptr_t)p + sizeof(long long));
   d[i] = (float)v;
   ```)
-
-;;; __fa-get -- bounds-checked widening load.
-(defn __fa-get [p : int i : int] : float
-  ```c
-  #include <string.h>
+  ;;; __fa-get -- bounds-checked widening load.
+  (defn __fa-get [p : int i : int] : float
+    ```c
+    #include <string.h>
   if (!p) return 0.0;
   long long n = 0;
   memcpy(&n, (const void *)(intptr_t)p, sizeof(long long));
@@ -85,139 +83,122 @@
       (const float *)((const unsigned char *)(intptr_t)p + sizeof(long long));
   return (double)d[i];
   ```)
-
-;;; __fa-data -- address of the payload, past the length header.
-(defn __fa-data [p : int] : int
-  ```c
-  if (!p) return 0;
+  ;;; __fa-data -- address of the payload, past the length header.
+  (defn __fa-data [p : int] : int
+    ```c
+    if (!p) return 0;
   return (long long)(intptr_t)((unsigned char *)(intptr_t)p + sizeof(long long));
   ```)
-
-;;; make-float-array -- allocate a zeroed array of n packed float32 slots.
-;;;
-;;; Parameters:
-;;;   n -- number of float slots (a negative n is treated as 0)
-;;;
-;;; Returns:
-;;;   A FloatArray that must be consumed exactly once by delete-float-array.
-;;;
-;;; Example:
-;;;   (let [a (make-float-array 9)]
-;;;     (float-array-set! a 0 0.6)
-;;;     (delete-float-array a))
-;;;
-;;; Since: v0.2.0
-(defn make-float-array [n : int] : FloatArray
-  (:: (__fa-alloc n) FloatArray))
-
-;;; delete-float-array -- free an array, consuming the handle.
-;;;
-;;; Parameters:
-;;;   a -- the array to release
-;;;
-;;; Example:
-;;;   (delete-float-array a)
-;;;
-;;; Since: v0.2.0
-(defn delete-float-array [a : FloatArray] : void
-  (__fa-free (:: a :int)))
-
-;;; float-array-set! -- store v at index i, narrowed to float32.
-;;;
-;;; Parameters:
-;;;   a -- the array (borrowed)
-;;;   i -- slot index; out of range is a no-op
-;;;   v -- the value, narrowed from float64 to GLfloat
-;;;
-;;; Example:
-;;;   (float-array-set! a 2 7.1)
-;;;
-;;; Since: v0.2.0
-(defn float-array-set! [^borrow a : FloatArray i : int v : float] : void
-  (__fa-set! (:: a :int) i v))
-
-;;; float-array-get -- read slot i, widened back to float64.
-;;;
-;;; Parameters:
-;;;   a -- the array (borrowed)
-;;;   i -- slot index; out of range answers 0.0
-;;;
-;;; Returns:
-;;;   The stored value. Note it round-trips through float32, so it is the
-;;;   nearest GLfloat to what was written, not the original float64.
-;;;
-;;; Example:
-;;;   (float-array-get a 2)   ; => 7.1
-;;;
-;;; Since: v0.2.0
-(defn float-array-get [^borrow a : FloatArray i : int] : float
-  (__fa-get (:: a :int) i))
-
-;;; float-array-len -- number of float slots.
-;;;
-;;; Parameters:
-;;;   a -- the array (borrowed)
-;;;
-;;; Returns:
-;;;   The slot count passed to make-float-array.
-;;;
-;;; Example:
-;;;   (float-array-len a)   ; => 9
-;;;
-;;; Since: v0.2.0
-(defn float-array-len [^borrow a : FloatArray] : int
-  (__fa-len (:: a :int)))
-
-;;; float-array-bytes -- payload size in bytes, for upload-vertices.
-;;;
-;;; Parameters:
-;;;   a -- the array (borrowed)
-;;;
-;;; Returns:
-;;;   len * 4 -- the byte size GL wants alongside the pointer.
-;;;
-;;; Example:
-;;;   (upload-vertices (float-array-ptr a) (float-array-bytes a) ":static-draw")
-;;;
-;;; Since: v0.2.0
-(defn float-array-bytes [^borrow a : FloatArray] : int
-  (* (__fa-len (:: a :int)) 4))
-
-;;; float-array-ptr -- address of the packed payload.
-;;;
-;;; Parameters:
-;;;   a -- the array (borrowed)
-;;;
-;;; Returns:
-;;;   An :int pointer valid until delete-float-array. Pass it to
-;;;   upload-vertices; do not retain it past the array's lifetime.
-;;;
-;;; Example:
-;;;   (upload-vertices (float-array-ptr a) (float-array-bytes a) ":static-draw")
-;;;
-;;; Since: v0.2.0
-(defn float-array-ptr [^borrow a : FloatArray] : int
-  (__fa-data (:: a :int)))
-
-;;; with-float-array -- allocate an array for the duration of body, then free
-;;; it. The array is exposed to body by name and consumed at the end, so body
-;;; must not delete it itself.
-;;;
-;;; Parameters:
-;;;   a    -- symbol to bind the FloatArray handle
-;;;   n    -- number of float slots
-;;;   body -- one or more expressions executed with a in scope
-;;;
-;;; Example:
-;;;   (with-float-array verts 9
-;;;     (float-array-set! verts 0 0.6)
-;;;     (upload-vertices (float-array-ptr verts)
-;;;                      (float-array-bytes verts) ":static-draw"))
-;;;
-;;; Since: v0.2.0
-(defmacro with-float-array [a n & body]
-  `(let [~a (make-float-array ~n)]
-     ~@body
-     (delete-float-array ~a)))
-
-) ;; end defmodule opengl/arrays
+  ;;; make-float-array -- allocate a zeroed array of n packed float32 slots.
+  ;;;
+  ;;; Parameters:
+  ;;;   n -- number of float slots (a negative n is treated as 0)
+  ;;;
+  ;;; Returns:
+  ;;;   A FloatArray that must be consumed exactly once by delete-float-array.
+  ;;;
+  ;;; Example:
+  ;;;   (let [a (make-float-array 9)]
+  ;;;     (float-array-set! a 0 0.6)
+  ;;;     (delete-float-array a))
+  ;;;
+  ;;; Since: v0.2.0
+  (defn make-float-array [n : int] : FloatArray (:: (__fa-alloc n) FloatArray))
+  ;;; delete-float-array -- free an array, consuming the handle.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the array to release
+  ;;;
+  ;;; Example:
+  ;;;   (delete-float-array a)
+  ;;;
+  ;;; Since: v0.2.0
+  (defn delete-float-array [a : FloatArray] : void (__fa-free (:: a :int)))
+  ;;; float-array-set! -- store v at index i, narrowed to float32.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the array (borrowed)
+  ;;;   i -- slot index; out of range is a no-op
+  ;;;   v -- the value, narrowed from float64 to GLfloat
+  ;;;
+  ;;; Example:
+  ;;;   (float-array-set! a 2 7.1)
+  ;;;
+  ;;; Since: v0.2.0
+  (defn float-array-set! [^borrow a : FloatArray i : int v : float] : void
+    (__fa-set! (:: a :int) i v))
+  ;;; float-array-get -- read slot i, widened back to float64.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the array (borrowed)
+  ;;;   i -- slot index; out of range answers 0.0
+  ;;;
+  ;;; Returns:
+  ;;;   The stored value. Note it round-trips through float32, so it is the
+  ;;;   nearest GLfloat to what was written, not the original float64.
+  ;;;
+  ;;; Example:
+  ;;;   (float-array-get a 2)   ; => 7.1
+  ;;;
+  ;;; Since: v0.2.0
+  (defn float-array-get [^borrow a : FloatArray i : int] : float
+    (__fa-get (:: a :int) i))
+  ;;; float-array-len -- number of float slots.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the array (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The slot count passed to make-float-array.
+  ;;;
+  ;;; Example:
+  ;;;   (float-array-len a)   ; => 9
+  ;;;
+  ;;; Since: v0.2.0
+  (defn float-array-len [^borrow a : FloatArray] : int (__fa-len (:: a :int)))
+  ;;; float-array-bytes -- payload size in bytes, for upload-vertices.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the array (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   len * 4 -- the byte size GL wants alongside the pointer.
+  ;;;
+  ;;; Example:
+  ;;;   (upload-vertices (float-array-ptr a) (float-array-bytes a) ":static-draw")
+  ;;;
+  ;;; Since: v0.2.0
+  (defn float-array-bytes [^borrow a : FloatArray] : int
+    (* (__fa-len (:: a :int)) 4))
+  ;;; float-array-ptr -- address of the packed payload.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the array (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   An :int pointer valid until delete-float-array. Pass it to
+  ;;;   upload-vertices; do not retain it past the array's lifetime.
+  ;;;
+  ;;; Example:
+  ;;;   (upload-vertices (float-array-ptr a) (float-array-bytes a) ":static-draw")
+  ;;;
+  ;;; Since: v0.2.0
+  (defn float-array-ptr [^borrow a : FloatArray] : int (__fa-data (:: a :int)))
+  ;;; with-float-array -- allocate an array for the duration of body, then free
+  ;;; it. The array is exposed to body by name and consumed at the end, so body
+  ;;; must not delete it itself.
+  ;;;
+  ;;; Parameters:
+  ;;;   a    -- symbol to bind the FloatArray handle
+  ;;;   n    -- number of float slots
+  ;;;   body -- one or more expressions executed with a in scope
+  ;;;
+  ;;; Example:
+  ;;;   (with-float-array verts 9
+  ;;;     (float-array-set! verts 0 0.6)
+  ;;;     (upload-vertices (float-array-ptr verts)
+  ;;;                      (float-array-bytes verts) ":static-draw"))
+  ;;;
+  ;;; Since: v0.2.0
+  (defmacro with-float-array [a n & body]
+    `(let [~a (make-float-array ~n)] ~@body (delete-float-array ~a)))) ;; end defmodule opengl/arrays

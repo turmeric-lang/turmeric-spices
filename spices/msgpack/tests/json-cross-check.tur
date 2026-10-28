@@ -10,133 +10,116 @@
 ;; It also pins the two spices' agreement on SHAPE, which is a design promise
 ;; and not an accident: a struct is a map/object keyed by field name in both,
 ;; and a sum is externally tagged as a one-entry `{"Ctor": {...}}` in both.
-
-(defmodule json_cross_check_test (export)
-
-(import msgpack/buf    :refer [Buf buf-free buf->hex])
-(import msgpack/decode :refer [MpTree mp-parse mp-tree-root mp-tree-free])
-(import msgpack/encode :refer [derive-msgpack derive-msgpack-sum])
-(import json/encode    :refer [derive-json derive-json-sum])
-(import json/decode    :refer [json-parse-doc json-doc-free json-doc-root])
-(import test/suite     :refer [describe it])
-(import test/assert    :refer [assert-true assert-eq])
-(import test/runner    :refer [run-all-status])
-
-(defn cstr-eq? [a : cstr b : cstr] : bool
-  ```c
-  #include <string.h>
+(defmodule json_cross_check_test
+  (export)
+  (import msgpack/buf :refer [Buf buf-free buf->hex])
+  (import msgpack/decode :refer [MpTree mp-parse mp-tree-root mp-tree-free])
+  (import msgpack/encode :refer [derive-msgpack derive-msgpack-sum])
+  (import json/encode :refer [derive-json derive-json-sum])
+  (import json/decode :refer [json-parse-doc json-doc-free json-doc-root])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true assert-eq])
+  (import test/runner :refer [run-all-status])
+  (defn cstr-eq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
   return strcmp((const char *)a, (const char *)b) == 0;
   ```)
-
-(defn cstr-free [p : cstr] : nil
-  ```c
-  free((void *)(intptr_t)p);
+  (defn cstr-free [p : cstr] : nil
+    ```c
+    free((void *)(intptr_t)p);
   ```)
-
-(defn hex=? [b : Buf expect : cstr] : bool
-  (let [h (buf->hex b)
-        r (cstr-eq? expect h)]
-    (cstr-free h)
-    (buf-free b)
-    r))
-
-;; One struct, both derives. Neither macro knows the other exists.
-(defstruct User [id : int  name : cstr  active : bool])
-(derive-json    User (id int) (name cstr) (active bool))
-(derive-msgpack User (id int) (name cstr) (active bool))
-
-(defdata ^copy Event [] (Click :int :int) (Scroll :int))
-(derive-json-sum    Event (Click (x int) (y int)) (Scroll (dy int)))
-(derive-msgpack-sum Event (Click (x int) (y int)) (Scroll (dy int)))
-
-(defn __codec-tests [] : void
-  (describe "msgpack + json -- both codecs derived for one struct, in one program"
-
-    (it "the json encoder still produces JSON"
-      (let [s (encode-json (make-struct User 7 "alice" true))
-            r (cstr-eq? "{\"id\":7,\"name\":\"alice\",\"active\":true}" s)]
-        (cstr-free s)
-        (assert-true r)))
-
-    (it "the msgpack encoder still produces MessagePack"
-      (assert-true (hex=? (encode-mp (make-struct User 7 "alice" true))
-                          "83a2696407a46e616d65a5616c696365a6616374697665c3")))
-
-    (it "neither dispatch bled into the other -- the two outputs differ"
-      ;; The failure this guards is the silent one: if both classes had shared
-      ;; a method name, one of these calls would quietly return the other
-      ;; format, and the two assertions above would not both be able to pass.
-      (let [s (encode-json (make-struct User 7 "alice" true))
-            j (cstr-eq? "{\"id\":7,\"name\":\"alice\",\"active\":true}" s)
-            m (hex=? (encode-mp (make-struct User 7 "alice" true))
-                     "83a2696407a46e616d65a5616c696365a6616374697665c3")]
-        (cstr-free s)
-        (assert-true (and j m))))))
-
-(defn __round-trip-tests [] : void
-  (describe "msgpack + json -- the same value round-trips through both"
-
-    (it "msgpack round-trips the struct"
-      (let [b (encode-mp (make-struct User 7 "alice" true))
-            t (ok-val (mp-parse b))
-            u (ok-val (:: (decode-mp t (mp-tree-root t)) (Result User cstr)))
-            r (assert-true (and (= 7 (.id u))
-                                (and (cstr-eq? "alice" (.name u)) (.active u))))]
-        (buf-free b)
-        (mp-tree-free t)
-        r))
-
-    (it "json round-trips the struct"
-      (let [s   (encode-json (make-struct User 7 "alice" true))
-            doc (unsafe (json-parse-doc s))
-            u   (ok-val (:: (decode-json doc (unsafe (json-doc-root doc))) (Result User cstr)))
-            r   (assert-true (and (= 7 (.id u))
-                                  (and (cstr-eq? "alice" (.name u)) (.active u))))]
-        (unsafe (json-doc-free doc))
-        (cstr-free s)
-        r))
-
-    (it "both round trips land on the SAME value, field for field"
-      (let [b   (encode-mp (make-struct User 7 "alice" true))
-            t   (ok-val (mp-parse b))
-            um  (ok-val (:: (decode-mp t (mp-tree-root t)) (Result User cstr)))
-            s   (encode-json (make-struct User 7 "alice" true))
-            doc (unsafe (json-parse-doc s))
-            uj  (ok-val (:: (decode-json doc (unsafe (json-doc-root doc))) (Result User cstr)))
-            r   (assert-true (and (= (.id um) (.id uj))
-                                  (and (cstr-eq? (.name um) (.name uj))
-                                       (= (.active um) (.active uj)))))]
-        (buf-free b)
-        (mp-tree-free t)
-        (unsafe (json-doc-free doc))
-        (cstr-free s)
-        r))))
-
-(defn __sum-shape-tests [] : void
-  (describe "msgpack + json -- a sum is externally tagged in both"
-
-    (it "json tags the constructor"
-      (let [s (encode-json (Click 3 4))
-            r (cstr-eq? "{\"Click\":{\"x\":3,\"y\":4}}" s)]
-        (cstr-free s)
-        (assert-true r)))
-
-    (it "msgpack tags the same constructor the same way"
-      ;; {"Click":{"x":3,"y":4}} as a one-entry map holding a two-entry map
-      (assert-true (hex=? (encode-mp (Click 3 4)) "81a5436c69636b82a17803a17904")))
-
-    (it "the msgpack sum round-trips"
-      (let [b (encode-mp (Scroll 9))
-            t (ok-val (mp-parse b))
-            e (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Event cstr)))
-            r (assert-true (hex=? (encode-mp e) "81a65363726f6c6c81a2647909"))]
-        (buf-free b)
-        (mp-tree-free t)
-        r))))
-
-(defn main [] : int
-  (__codec-tests)
-  (__round-trip-tests)
-  (__sum-shape-tests)
-  (run-all-status))
-)
+  (defn hex=? [b : Buf expect : cstr] : bool
+    (let [h (buf->hex b)
+          r (cstr-eq? expect h)]
+      (cstr-free h)
+      (buf-free b)
+      r))
+  ;; One struct, both derives. Neither macro knows the other exists.
+  (defstruct User [id : int name : cstr active : bool])
+  (derive-json User (id int) (name cstr) (active bool))
+  (derive-msgpack User (id int) (name cstr) (active bool))
+  (defdata ^copy Event [] (Click :int :int) (Scroll :int))
+  (derive-json-sum Event (Click (x int) (y int)) (Scroll (dy int)))
+  (derive-msgpack-sum Event (Click (x int) (y int)) (Scroll (dy int)))
+  (defn __codec-tests [] : void
+    (describe "msgpack + json -- both codecs derived for one struct, in one program"
+      (it "the json encoder still produces JSON"
+        (let [s (encode-json (make-struct User 7 "alice" true))
+              r (cstr-eq? "{\"id\":7,\"name\":\"alice\",\"active\":true}" s)]
+          (cstr-free s)
+          (assert-true r)))
+      (it "the msgpack encoder still produces MessagePack"
+        (assert-true (hex=? (encode-mp (make-struct User 7 "alice" true))
+                       "83a2696407a46e616d65a5616c696365a6616374697665c3")))
+      (it "neither dispatch bled into the other -- the two outputs differ"
+        ;; The failure this guards is the silent one: if both classes had shared
+        ;; a method name, one of these calls would quietly return the other
+        ;; format, and the two assertions above would not both be able to pass.
+        (let [s (encode-json (make-struct User 7 "alice" true))
+              j (cstr-eq? "{\"id\":7,\"name\":\"alice\",\"active\":true}" s)
+              m (hex=? (encode-mp (make-struct User 7 "alice" true))
+                  "83a2696407a46e616d65a5616c696365a6616374697665c3")]
+          (cstr-free s)
+          (assert-true (and j m))))))
+  (defn __round-trip-tests [] : void
+    (describe "msgpack + json -- the same value round-trips through both"
+      (it "msgpack round-trips the struct"
+        (let [b (encode-mp (make-struct User 7 "alice" true))
+              t (ok-val (mp-parse b))
+              u (ok-val (:: (decode-mp t (mp-tree-root t)) (Result User cstr)))
+              r (assert-true (and (= 7 (.id u))
+                               (and (cstr-eq? "alice" (.name u)) (.active u))))]
+          (buf-free b)
+          (mp-tree-free t)
+          r))
+      (it "json round-trips the struct"
+        (let [s   (encode-json (make-struct User 7 "alice" true))
+              doc (unsafe (json-parse-doc s))
+              u   (ok-val (:: (decode-json doc (unsafe (json-doc-root doc)))
+                            (Result User cstr)))
+              r   (assert-true (and (= 7 (.id u))
+                                 (and (cstr-eq? "alice" (.name u)) (.active u))))]
+          (unsafe (json-doc-free doc))
+          (cstr-free s)
+          r))
+      (it "both round trips land on the SAME value, field for field"
+        (let [b   (encode-mp (make-struct User 7 "alice" true))
+              t   (ok-val (mp-parse b))
+              um  (ok-val (:: (decode-mp t (mp-tree-root t)) (Result User cstr)))
+              s   (encode-json (make-struct User 7 "alice" true))
+              doc (unsafe (json-parse-doc s))
+              uj  (ok-val (:: (decode-json doc (unsafe (json-doc-root doc)))
+                            (Result User cstr)))
+              r   (assert-true (and (= (.id um) (.id uj))
+                                 (and (cstr-eq? (.name um) (.name uj))
+                                   (= (.active um) (.active uj)))))]
+          (buf-free b)
+          (mp-tree-free t)
+          (unsafe (json-doc-free doc))
+          (cstr-free s)
+          r))))
+  (defn __sum-shape-tests [] : void
+    (describe "msgpack + json -- a sum is externally tagged in both"
+      (it "json tags the constructor"
+        (let [s (encode-json (Click 3 4))
+              r (cstr-eq? "{\"Click\":{\"x\":3,\"y\":4}}" s)]
+          (cstr-free s)
+          (assert-true r)))
+      (it "msgpack tags the same constructor the same way"
+        ;; {"Click":{"x":3,"y":4}} as a one-entry map holding a two-entry map
+        (assert-true (hex=? (encode-mp (Click 3 4))
+                       "81a5436c69636b82a17803a17904")))
+      (it "the msgpack sum round-trips"
+        (let [b (encode-mp (Scroll 9))
+              t (ok-val (mp-parse b))
+              e (ok-val (:: (decode-mp t (mp-tree-root t)) (Result Event cstr)))
+              r (assert-true (hex=? (encode-mp e) "81a65363726f6c6c81a2647909"))]
+          (buf-free b)
+          (mp-tree-free t)
+          r))))
+  (defn main [] : int
+    (__codec-tests)
+    (__round-trip-tests)
+    (__sum-shape-tests)
+    (run-all-status)))

@@ -13,173 +13,203 @@
 ;; tone (0.35 cycles per sample), which only the sinc read reconstructs.
 ;;
 ;; main returns the failure count for `tur test`.
-
 (defmodule signal/tests/test_buffer
-  (import signal/core   :refer [constant sample])
-  (import signal/osc    :refer [sine sawtooth])
-  (import signal/noise  :refer [white])
-  (import signal/buffer :refer [Buffer buffer-new buffer-render buffer-len
-                                buffer-get buffer-set! buffer-read
-                                buffer-read-nearest buffer-read-cubic
-                                buffer-read-sinc scan scan-nearest scan-cubic
-                                scan-sinc])
-
-(defn near? [a :float b :float] :bool
-  (let [d (- a b)]
-    (if (< d 0.0) (< (- 0.0 d) 0.0001) (< d 0.0001))))
-
-(defn fail-unless [cond :bool label :cstr] :int
-  (if cond 0 (do (println label) 1)))
-
-;;; abs-diff -- |a - b|.
-(defn abs-diff [a :float b :float] :float
-  (if (< a b) (- b a) (- a b)))
-
-;;; maxdiff -- max |a - b| over n samples at 48 kHz, both sampled in order.
-(defn maxdiff [^fat a : (fn [float] float) ^fat b : (fn [float] float) n :int] :float
-  (let [^mut k 0
-        ^mut m 0.0]
-    (while (< k n)
-      (let [t  (/ (as float k) 48000.0)
-            d  (- (sample a t) (sample b t))
-            ad (if (< d 0.0) (- 0.0 d) d)]
-        (if (> ad m) (set! m ad) (set! m m)))
-      (set! k (+ k 1)))
-    m))
-
-;;; diamond -- a 4-sample buffer holding 0, 1, 0, -1.
-(defn diamond [] : Buffer
-  (let [b (buffer-new 4)]
-    (buffer-set! b 1 1.0)
-    (buffer-set! b 3 -1.0)
-    b))
-
-;;; interp-failures -- the nearest / cubic / sinc reads and their scans.
-(defn interp-failures [] : int
-  (let [d     (diamond)
-        z     (constant 0.0)
-        one   (buffer-new 1)
-        flat  (buffer-new 37)
-        ;; one second of 440 Hz and a tenth of a second of 16.8 kHz, both an
-        ;; exact number of cycles, so the loop point is seamless
-        tape  (buffer-render 48000.0 48000 ((sine 440.0 0.0) z))
-        hi    (buffer-render 48000.0 4800 ((sine 16800.0 0.0) z))
-        ;; A position ramp at 0.37 Hz reads `tape` 0.37 samples further on per
-        ;; 48 kHz sample -- off the grid -- and plays its 440 Hz at
-        ;; 0.37 * 440 = 162.8 Hz. The same ramp reads `hi` 0.037 samples on per
-        ;; sample, playing its 16.8 kHz at 621.6 Hz.
-        ramp  ((sawtooth 0.37) z)
-        want  ((sine 162.8 0.0) z)
-        want2 ((sine 621.6 0.0) z)
-        e-near (maxdiff ((scan-nearest tape) ramp) want 48000)
-        e-lin  (maxdiff ((scan tape) ramp) want 48000)
-        e-cub  (maxdiff ((scan-cubic tape) ramp) want 48000)
-        e-sinc (maxdiff ((scan-sinc tape) ramp) want 48000)
-        h-lin  (maxdiff ((scan hi) ramp) want2 4800)
-        h-cub  (maxdiff ((scan-cubic hi) ramp) want2 4800)
-        h-sinc (maxdiff ((scan-sinc hi) ramp) want2 4800)]
-    (buffer-set! one 0 0.3)
-    (let [^mut k 0]
-      (while (< k 37)
-        (buffer-set! flat k -0.6)
-        (set! k (+ k 1))))
-    (+ ;; nearest: 4 samples, so position p reads sample round(4p)
-       (fail-unless (near? (buffer-read-nearest d 0.3) 1.0)    "FAIL: nearest 1.2 -> 1")
-       (fail-unless (near? (buffer-read-nearest d 0.12) 0.0)   "FAIL: nearest 0.48 -> 0")
-       (fail-unless (near? (buffer-read-nearest d 0.125) 1.0)  "FAIL: nearest 0.5 should round up")
-       (fail-unless (near? (buffer-read-nearest d 0.9) 0.0)    "FAIL: nearest 3.6 should round to 4 and wrap to 0")
-       (fail-unless (near? (buffer-read-nearest d -0.2) -1.0)  "FAIL: nearest should wrap below 0")
-       (fail-unless (near? (buffer-read-nearest d (/ 0.0 0.0)) 0.0) "FAIL: nearest NaN should read sample 0")
-       ;; on the grid, every read is the stored sample
-       (fail-unless (and (near? (buffer-read-cubic d 0.25) 1.0)
-                         (near? (buffer-read-sinc d 0.25) 1.0)
-                         (near? (buffer-read-cubic d 0.75) -1.0)
-                         (near? (buffer-read-sinc d 0.75) -1.0)
-                         (near? (buffer-read-sinc d 1.5) 0.0))
-                    "FAIL: cubic/sinc should return the sample on the grid")
-       ;; cubic half way from 0 to 1, neighbours -1 and 0:
-       ;; c1 = 1, c2 = 1, c3 = -1, so ((-0.5 + 1) * 0.5 + 1) * 0.5 = 0.625
-       (fail-unless (near? (buffer-read-cubic d 0.125) 0.625) "FAIL: cubic between samples")
-       (fail-unless (near? (buffer-read-cubic d 0.875) -0.625) "FAIL: cubic should wrap last -> first")
-       ;; the diamond is a sampled sine; sinc puts sin(pi/4) half way
-       (fail-unless (< (abs-diff (buffer-read-sinc d 0.125) 0.70710678) 0.001)
-                    "FAIL: sinc should reconstruct the diamond's sine")
-       ;; a constant reads back exactly, and so does a one-sample buffer
-       (fail-unless (and (near? (buffer-read-sinc flat 0.123456) -0.6)
-                         (near? (buffer-read-cubic flat 0.123456) -0.6)
-                         (near? (buffer-read-nearest flat 0.123456) -0.6))
-                    "FAIL: a constant buffer should read back its constant")
-       (fail-unless (and (near? (buffer-read-sinc one 0.4) 0.3)
-                         (near? (buffer-read-cubic one 0.4) 0.3)
-                         (near? (buffer-read-nearest one 0.4) 0.3))
-                    "FAIL: a one-sample buffer should read its sample")
-       (fail-unless (and (near? (buffer-read-cubic d (/ 0.0 0.0)) 0.0)
-                         (near? (buffer-read-sinc d (/ 1.0 0.0)) 0.0))
-                    "FAIL: cubic/sinc NaN or infinite position should read sample 0")
-       ;; 440 Hz off the grid: each interpolator beats the one before
-       (fail-unless (and (> e-near 0.01) (< e-near 0.06)) "FAIL: nearest error on the 440 Hz tape")
-       (fail-unless (and (> e-lin 0.0001) (< e-lin 0.0005)) "FAIL: linear error on the 440 Hz tape")
-       (fail-unless (< e-cub 0.000005) "FAIL: cubic error on the 440 Hz tape")
-       (fail-unless (< e-sinc 0.000005) "FAIL: sinc error on the 440 Hz tape")
-       ;; 16.8 kHz: only the sinc read is close
-       (fail-unless (> h-lin 0.3) "FAIL: linear should miss a 0.35 cycle/sample tone")
-       (fail-unless (> h-cub 0.2) "FAIL: cubic should miss a 0.35 cycle/sample tone")
-       (fail-unless (< h-sinc 0.00002) "FAIL: sinc should reconstruct a 0.35 cycle/sample tone")
-       ;; scans are stateless, whatever the interpolator
-       (let [s     ((scan-sinc tape) ramp)
-             late  (sample s 0.3)
-             early (sample s 0.1)]
-         (fail-unless (and (< (abs-diff early (sample want 0.1)) 0.00001)
-                           (< (abs-diff late (sample want 0.3)) 0.00001))
-                      "FAIL: scan-sinc depends on sampling order")))))
-
-(defn main [] : int
-  (let [d     (diamond)
-        z     (constant 0.0)
-        table (buffer-render 2048.0 2048 ((sine 1.0 0.0) z))
-        ;; Two renders of one seed are equal; the buffer freezes the stream.
-        n1    (buffer-render 48000.0 64 ((white 9) z))
-        n2    (buffer-render 48000.0 64 ((white 9) z))
-        f (+ (fail-unless (= (buffer-len (buffer-new 64)) 64) "FAIL: buffer-new length")
-             (fail-unless (= (buffer-len (buffer-new 0)) 1) "FAIL: buffer-new 0 should clamp to 1")
-             (fail-unless (near? (buffer-get (buffer-new 8) 5) 0.0) "FAIL: buffer-new is not silent")
-             (fail-unless (near? (buffer-get d 1) 1.0)  "FAIL: buffer-set!/get")
-             (fail-unless (near? (buffer-get d -1) -1.0) "FAIL: buffer-get -1 should wrap to the end")
-             (fail-unless (near? (buffer-get d 5) 1.0)  "FAIL: buffer-get past the end should wrap")
-             ;; positions are in buffer lengths; 4 samples, so 0.125 is index 0.5
-             (fail-unless (near? (buffer-read d 0.0) 0.0)    "FAIL: buffer-read 0")
-             (fail-unless (near? (buffer-read d 0.25) 1.0)   "FAIL: buffer-read on a sample")
-             (fail-unless (near? (buffer-read d 0.125) 0.5)  "FAIL: buffer-read interpolation")
-             (fail-unless (near? (buffer-read d 0.875) -0.5) "FAIL: buffer-read should interpolate last -> first")
-             (fail-unless (near? (buffer-read d 1.25) 1.0)   "FAIL: buffer-read should wrap above 1")
-             (fail-unless (near? (buffer-read d -0.25) -1.0) "FAIL: buffer-read should wrap below 0")
-             (fail-unless (near? (buffer-read d (/ 0.0 0.0)) 0.0) "FAIL: buffer-read NaN should read sample 0")
-             ;; render: sample k is sig(k / sample-rate)
-             (fail-unless (= (buffer-len table) 2048) "FAIL: buffer-render length")
-             (fail-unless (near? (buffer-get table 512) 1.0)   "FAIL: buffer-render quarter cycle")
-             (fail-unless (near? (buffer-get table 1536) -1.0) "FAIL: buffer-render three-quarter cycle")
-             (fail-unless (near? (maxdiff ((scan n1) ((sawtooth 1.0) z)) ((scan n2) ((sawtooth 1.0) z)) 480) 0.0)
-                          "FAIL: buffer-render of one seed differs")
-             ;; scan: a wavetable oscillator
-             (fail-unless (< (maxdiff ((scan table) ((sawtooth 220.0) z)) ((sine 220.0 0.0) z) 48000)
-                             0.00001)
-                          "FAIL: scanning a one-cycle table at 220 Hz is not a 220 Hz sine")
-             ;; scan is stateless: sampled out of order, it still reads the table
-             (let [s  ((scan table) ((sawtooth 3.0) z))
-                   late  (sample s 0.3)
-                   early (sample s 0.1)]
-               (fail-unless (and (near? early (sample ((sine 3.0 0.0) z) 0.1))
-                                 (near? late (sample ((sine 3.0 0.0) z) 0.3)))
-                            "FAIL: scan depends on sampling order"))
-             ;; writes are visible through an existing scan
-             (let [b (buffer-new 2)
-                   s ((scan b) z)]
-               (buffer-set! b 0 0.75)
-               (fail-unless (near? (sample s 0.0) 0.75) "FAIL: scan does not see buffer-set!"))
-             (interp-failures))]
-    (if (= f 0)
-      (println "PASS test_buffer")
-      (println "test_buffer: failures above"))
-    f))
-
-) ;; end defmodule signal/tests/test_buffer
+  (import signal/core :refer [constant sample])
+  (import signal/osc :refer [sine sawtooth])
+  (import signal/noise :refer [white])
+  (import signal/buffer
+    :refer
+    [Buffer
+     buffer-new
+     buffer-render
+     buffer-len
+     buffer-get
+     buffer-set!
+     buffer-read
+     buffer-read-nearest
+     buffer-read-cubic
+     buffer-read-sinc
+     scan
+     scan-nearest
+     scan-cubic
+     scan-sinc])
+  (defn near? [a :float b :float] :bool
+    (let [d (- a b)] (if (< d 0.0) (< (- 0.0 d) 0.0001) (< d 0.0001))))
+  (defn fail-unless [cond :bool label :cstr] :int
+    (if cond 0 (do (println label) 1)))
+  ;;; abs-diff -- |a - b|.
+  (defn abs-diff [a :float b :float] :float (if (< a b) (- b a) (- a b)))
+  ;;; maxdiff -- max |a - b| over n samples at 48 kHz, both sampled in order.
+  (defn maxdiff [^fat a : (fn [float] float) ^fat b : (fn [float] float) n :int] :float
+    (let [^mut k 0
+          ^mut m 0.0]
+      (while (< k n)
+        (let [t  (/ (as float k) 4.8e+04)
+              d  (- (sample a t) (sample b t))
+              ad (if (< d 0.0) (- 0.0 d) d)]
+          (if (> ad m) (set! m ad) (set! m m)))
+        (set! k (+ k 1)))
+      m))
+  ;;; diamond -- a 4-sample buffer holding 0, 1, 0, -1.
+  (defn diamond [] : Buffer
+    (let [b (buffer-new 4)] (buffer-set! b 1 1.0) (buffer-set! b 3 -1.0) b))
+  ;;; interp-failures -- the nearest / cubic / sinc reads and their scans.
+  (defn interp-failures [] : int
+    (let [d      (diamond)
+          z      (constant 0.0)
+          one    (buffer-new 1)
+          flat   (buffer-new 37)
+          ;; one second of 440 Hz and a tenth of a second of 16.8 kHz, both an
+          ;; exact number of cycles, so the loop point is seamless
+          tape   (buffer-render 4.8e+04 48000 ((sine 4.4e+02 0.0) z))
+          hi     (buffer-render 4.8e+04 4800 ((sine 1.68e+04 0.0) z))
+          ;; A position ramp at 0.37 Hz reads `tape` 0.37 samples further on per
+          ;; 48 kHz sample -- off the grid -- and plays its 440 Hz at
+          ;; 0.37 * 440 = 162.8 Hz. The same ramp reads `hi` 0.037 samples on per
+          ;; sample, playing its 16.8 kHz at 621.6 Hz.
+          ramp   ((sawtooth 0.37) z)
+          want   ((sine 162.8 0.0) z)
+          want2  ((sine 621.6 0.0) z)
+          e-near (maxdiff ((scan-nearest tape) ramp) want 48000)
+          e-lin  (maxdiff ((scan tape) ramp) want 48000)
+          e-cub  (maxdiff ((scan-cubic tape) ramp) want 48000)
+          e-sinc (maxdiff ((scan-sinc tape) ramp) want 48000)
+          h-lin  (maxdiff ((scan hi) ramp) want2 4800)
+          h-cub  (maxdiff ((scan-cubic hi) ramp) want2 4800)
+          h-sinc (maxdiff ((scan-sinc hi) ramp) want2 4800)]
+      (buffer-set! one 0 0.3)
+      (let [^mut k 0]
+        (while (< k 37) (buffer-set! flat k -0.6) (set! k (+ k 1))))
+      (+ ;; nearest: 4 samples, so position p reads sample round(4p)
+        (fail-unless (near? (buffer-read-nearest d 0.3) 1.0)
+          "FAIL: nearest 1.2 -> 1")
+        (fail-unless (near? (buffer-read-nearest d 0.12) 0.0)
+          "FAIL: nearest 0.48 -> 0")
+        (fail-unless (near? (buffer-read-nearest d 0.125) 1.0)
+          "FAIL: nearest 0.5 should round up")
+        (fail-unless (near? (buffer-read-nearest d 0.9) 0.0)
+          "FAIL: nearest 3.6 should round to 4 and wrap to 0")
+        (fail-unless (near? (buffer-read-nearest d -0.2) -1.0)
+          "FAIL: nearest should wrap below 0")
+        (fail-unless (near? (buffer-read-nearest d (/ 0.0 0.0)) 0.0)
+          "FAIL: nearest NaN should read sample 0")
+        ;; on the grid, every read is the stored sample
+        (fail-unless (and (near? (buffer-read-cubic d 0.25) 1.0)
+                       (near? (buffer-read-sinc d 0.25) 1.0)
+                       (near? (buffer-read-cubic d 0.75) -1.0)
+                       (near? (buffer-read-sinc d 0.75) -1.0)
+                       (near? (buffer-read-sinc d 1.5) 0.0))
+          "FAIL: cubic/sinc should return the sample on the grid")
+        ;; cubic half way from 0 to 1, neighbours -1 and 0:
+        ;; c1 = 1, c2 = 1, c3 = -1, so ((-0.5 + 1) * 0.5 + 1) * 0.5 = 0.625
+        (fail-unless (near? (buffer-read-cubic d 0.125) 0.625)
+          "FAIL: cubic between samples")
+        (fail-unless (near? (buffer-read-cubic d 0.875) -0.625)
+          "FAIL: cubic should wrap last -> first")
+        ;; the diamond is a sampled sine; sinc puts sin(pi/4) half way
+        (fail-unless (< (abs-diff (buffer-read-sinc d 0.125) 0.70710678) 0.001)
+          "FAIL: sinc should reconstruct the diamond's sine")
+        ;; a constant reads back exactly, and so does a one-sample buffer
+        (fail-unless (and (near? (buffer-read-sinc flat 0.123456) -0.6)
+                       (near? (buffer-read-cubic flat 0.123456) -0.6)
+                       (near? (buffer-read-nearest flat 0.123456) -0.6))
+          "FAIL: a constant buffer should read back its constant")
+        (fail-unless (and (near? (buffer-read-sinc one 0.4) 0.3)
+                       (near? (buffer-read-cubic one 0.4) 0.3)
+                       (near? (buffer-read-nearest one 0.4) 0.3))
+          "FAIL: a one-sample buffer should read its sample")
+        (fail-unless (and (near? (buffer-read-cubic d (/ 0.0 0.0)) 0.0)
+                       (near? (buffer-read-sinc d (/ 1.0 0.0)) 0.0))
+          "FAIL: cubic/sinc NaN or infinite position should read sample 0")
+        ;; 440 Hz off the grid: each interpolator beats the one before
+        (fail-unless (and (> e-near 0.01) (< e-near 0.06))
+          "FAIL: nearest error on the 440 Hz tape")
+        (fail-unless (and (> e-lin 0.0001) (< e-lin 0.0005))
+          "FAIL: linear error on the 440 Hz tape")
+        (fail-unless (< e-cub 5e-06) "FAIL: cubic error on the 440 Hz tape")
+        (fail-unless (< e-sinc 5e-06) "FAIL: sinc error on the 440 Hz tape")
+        ;; 16.8 kHz: only the sinc read is close
+        (fail-unless (> h-lin 0.3)
+          "FAIL: linear should miss a 0.35 cycle/sample tone")
+        (fail-unless (> h-cub 0.2)
+          "FAIL: cubic should miss a 0.35 cycle/sample tone")
+        (fail-unless (< h-sinc 2e-05)
+          "FAIL: sinc should reconstruct a 0.35 cycle/sample tone")
+        ;; scans are stateless, whatever the interpolator
+        (let [s     ((scan-sinc tape) ramp)
+              late  (sample s 0.3)
+              early (sample s 0.1)]
+          (fail-unless (and (< (abs-diff early (sample want 0.1)) 1e-05)
+                         (< (abs-diff late (sample want 0.3)) 1e-05))
+            "FAIL: scan-sinc depends on sampling order")))))
+  (defn main [] : int
+    (let [d     (diamond)
+          z     (constant 0.0)
+          table (buffer-render 2048.0 2048 ((sine 1.0 0.0) z))
+          ;; Two renders of one seed are equal; the buffer freezes the stream.
+          n1    (buffer-render 4.8e+04 64 ((white 9) z))
+          n2    (buffer-render 4.8e+04 64 ((white 9) z))
+          f     (+ (fail-unless (= (buffer-len (buffer-new 64)) 64)
+                     "FAIL: buffer-new length")
+                  (fail-unless (= (buffer-len (buffer-new 0)) 1)
+                    "FAIL: buffer-new 0 should clamp to 1")
+                  (fail-unless (near? (buffer-get (buffer-new 8) 5) 0.0)
+                    "FAIL: buffer-new is not silent")
+                  (fail-unless (near? (buffer-get d 1) 1.0)
+                    "FAIL: buffer-set!/get")
+                  (fail-unless (near? (buffer-get d -1) -1.0)
+                    "FAIL: buffer-get -1 should wrap to the end")
+                  (fail-unless (near? (buffer-get d 5) 1.0)
+                    "FAIL: buffer-get past the end should wrap")
+                  ;; positions are in buffer lengths; 4 samples, so 0.125 is index 0.5
+                  (fail-unless (near? (buffer-read d 0.0) 0.0)
+                    "FAIL: buffer-read 0")
+                  (fail-unless (near? (buffer-read d 0.25) 1.0)
+                    "FAIL: buffer-read on a sample")
+                  (fail-unless (near? (buffer-read d 0.125) 0.5)
+                    "FAIL: buffer-read interpolation")
+                  (fail-unless (near? (buffer-read d 0.875) -0.5)
+                    "FAIL: buffer-read should interpolate last -> first")
+                  (fail-unless (near? (buffer-read d 1.25) 1.0)
+                    "FAIL: buffer-read should wrap above 1")
+                  (fail-unless (near? (buffer-read d -0.25) -1.0)
+                    "FAIL: buffer-read should wrap below 0")
+                  (fail-unless (near? (buffer-read d (/ 0.0 0.0)) 0.0)
+                    "FAIL: buffer-read NaN should read sample 0")
+                  ;; render: sample k is sig(k / sample-rate)
+                  (fail-unless (= (buffer-len table) 2048)
+                    "FAIL: buffer-render length")
+                  (fail-unless (near? (buffer-get table 512) 1.0)
+                    "FAIL: buffer-render quarter cycle")
+                  (fail-unless (near? (buffer-get table 1536) -1.0)
+                    "FAIL: buffer-render three-quarter cycle")
+                  (fail-unless (near? (maxdiff ((scan n1) ((sawtooth 1.0) z))
+                                        ((scan n2) ((sawtooth 1.0) z))
+                                        480)
+                                 0.0)
+                    "FAIL: buffer-render of one seed differs")
+                  ;; scan: a wavetable oscillator
+                  (fail-unless (< (maxdiff ((scan table) ((sawtooth 2.2e+02) z))
+                                    ((sine 2.2e+02 0.0) z)
+                                    48000)
+                                 1e-05)
+                    "FAIL: scanning a one-cycle table at 220 Hz is not a 220 Hz sine")
+                  ;; scan is stateless: sampled out of order, it still reads the table
+                  (let [s     ((scan table) ((sawtooth 3.0) z))
+                        late  (sample s 0.3)
+                        early (sample s 0.1)]
+                    (fail-unless (and (near? early
+                                        (sample ((sine 3.0 0.0) z) 0.1))
+                                   (near? late (sample ((sine 3.0 0.0) z) 0.3)))
+                      "FAIL: scan depends on sampling order"))
+                  ;; writes are visible through an existing scan
+                  (let [b (buffer-new 2)
+                        s ((scan b) z)]
+                    (buffer-set! b 0 0.75)
+                    (fail-unless (near? (sample s 0.0) 0.75)
+                      "FAIL: scan does not see buffer-set!"))
+                  (interp-failures))]
+      (if (= f 0)
+        (println "PASS test_buffer")
+        (println "test_buffer: failures above"))
+      f))) ;; end defmodule signal/tests/test_buffer

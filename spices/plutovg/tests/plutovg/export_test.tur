@@ -4,33 +4,48 @@
 ;; Two shapes had to change for this file to compile and mean something:
 ;; `(assert-eq true ...)` fed a bool to an int-typed assertion, and every
 ;; `it` ended on a destroy call, which is nil where `it` wants a bool.
-
 (defmodule plutovg/tests/export
-  (import test/suite      :refer [describe it])
-  (import test/assert     :refer [assert-eq assert-true])
-  (import test/runner     :refer [run-all-status])
-  (import plutovg/surface :refer [surface-create surface-destroy
-                                  surface-write-png surface-write-jpeg
-                                  surface-width surface-height])
-  (import plutovg/canvas  :refer [canvas-create canvas-destroy
-                                  canvas-set-source-color
-                                  canvas-rect canvas-fill
-                                  canvas-arc canvas-arc-to canvas-round-rect
-                                  canvas-draw-image
-                                  dash-array-create dash-array-add
-                                  dash-array-destroy])
-  (import plutovg/path    :refer [path-create path-destroy
-                                  path-move-to path-line-to path-close
-                                  path-clone-dashed path-length])
-
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-eq assert-true])
+  (import test/runner :refer [run-all-status])
+  (import plutovg/surface
+    :refer
+    [surface-create
+     surface-destroy
+     surface-write-png
+     surface-write-jpeg
+     surface-width
+     surface-height])
+  (import plutovg/canvas
+    :refer
+    [canvas-create
+     canvas-destroy
+     canvas-set-source-color
+     canvas-rect
+     canvas-fill
+     canvas-arc
+     canvas-arc-to
+     canvas-round-rect
+     canvas-draw-image
+     dash-array-create
+     dash-array-add
+     dash-array-destroy])
+  (import plutovg/path
+    :refer
+    [path-create
+     path-destroy
+     path-move-to
+     path-line-to
+     path-close
+     path-clone-dashed
+     path-length])
   (defn surface-byte [s : int n : int] : int
     ```c
     #include <plutovg.h>
     unsigned char *p = plutovg_surface_get_data((plutovg_surface_t *)(intptr_t)s);
     return (int64_t)p[(int)n];
     ```)
-
-;;; any-nonzero? -- is any of the first `n` bytes of the surface non-zero?
+  ;;; any-nonzero? -- is any of the first `n` bytes of the surface non-zero?
   (defn any-nonzero? [s : int n : int] : bool
     ```c
     #include <plutovg.h>
@@ -38,12 +53,8 @@
     for (int i = 0; i < (int)n; i++) if (p[i]) return 1;
     return 0;
     ```)
-
   (load "stdlib/fs.tur")
-
-  (defn file-exists? [path : cstr] : bool
-    (fs/exists? path))
-
+  (defn file-exists? [path : cstr] : bool (fs/exists? path))
   (defn file-size [path : cstr] : int
     ```c
     #include <sys/stat.h>
@@ -51,157 +62,147 @@
     if (stat((const char *)(intptr_t)path, &st) != 0) return -1;
     return (int64_t)st.st_size;
     ```)
-
   (defn unlink-file [path : cstr] : void
     ```c
     #include <unistd.h>
     unlink((const char *)(intptr_t)path);
     ```)
-
-  (defn >i  [a : int b : int] : bool   ```c return (int)a > (int)b; ```)
-  (defn >f  [a : float b : float] : bool ```c return (double)a > (double)b; ```)
-  (defn <=f [a : float b : float] : bool ```c return (double)a <= (double)b; ```)
-
-;;; px-is? -- are the four bytes at `off` the given B, G, R, A?
+  (defn >i [a : int b : int] : bool ```c return (int)a > (int)b; ```)
+  (defn >f [a : float b : float] : bool ```c return (double)a > (double)b; ```)
+  (defn <=f [a : float b : float] : bool
+    ```c return (double)a <= (double)b; ```)
+  ;;; px-is? -- are the four bytes at `off` the given B, G, R, A?
   (defn px-is? [s : int off : int b : int g : int r : int a : int] : bool
     (let [kb (assert-eq b (surface-byte s off))
           kg (assert-eq g (surface-byte s (+ off 1)))
           kr (assert-eq r (surface-byte s (+ off 2)))
           ka (assert-eq a (surface-byte s (+ off 3)))]
       (and kb (and kg (and kr ka)))))
-
   (defn __all-tests [] : void
-   (describe "plutovg/surface PNG export"
-     (it "writes a 4x4 red square to a PNG on disk and the file is non-empty"
-       (let [sr  (surface-create 4 4)
-             out "/tmp/plutovg-pv6-test.png"]
-         (if (not (ok? sr))
-           (assert-true false)
-           (let [s  (ok-val sr)
-                 cr (canvas-create s)
-                 k  (assert-true (ok? cr))]
-             (if (not k)
-               (do (surface-destroy s) false)
-               (let [c (ok-val cr)]
-                 (unlink-file out) ; clean any stale file
-                 (canvas-set-source-color c 1.0 0.0 0.0 1.0)
-                 (canvas-rect c 0.0 0.0 4.0 4.0)
-                 (canvas-fill c)
-                 (canvas-destroy c)
-                 (let [wrote  (assert-true (ok? (surface-write-png s out)))
-                       exists (assert-true (file-exists? out))
-                       ;; PNG header is 8 bytes; a 4x4 RGBA PNG is >50 bytes
-                       sized  (assert-true (>i (file-size out) 50))]
-                   (unlink-file out)
-                   (surface-destroy s)
-                   (and wrote (and exists sized))))))))))
-
-   (describe "plutovg/surface JPEG export"
-     (it "writes a 4x4 surface to a JPEG and the file is non-empty"
-       (let [sr  (surface-create 4 4)
-             out "/tmp/plutovg-pv6-test.jpg"]
-         (if (not (ok? sr))
-           (assert-true false)
-           (let [s (ok-val sr)]
-             (unlink-file out)
-             (let [wrote  (assert-true (ok? (surface-write-jpeg s out 90)))
-                   exists (assert-true (file-exists? out))
-                   ;; A minimal JPEG (SOI + headers + EOI) is several hundred bytes
-                   sized  (assert-true (>i (file-size out) 200))]
-               (unlink-file out)
-               (surface-destroy s)
-               (and wrote (and exists sized))))))))
-
-   (describe "plutovg/canvas arc helpers"
-     ;; This used to call the three helpers and assert nothing at all, under a
-     ;; comment saying it "ensures the inline-C bodies link ... and don't
-     ;; crash".  Linking is what the build step checks; the filled arc leaves
-     ;; pixels behind, so check for those.
-     (it "canvas-arc fills a circle and arc-to / round-rect run over it"
-       (let [sr (surface-create 8 8)]
-         (if (not (ok? sr))
-           (assert-true false)
-           (let [s  (ok-val sr)
-                 cr (canvas-create s)
-                 k  (assert-true (ok? cr))]
-             (if (not k)
-               (do (surface-destroy s) false)
-               (let [c (ok-val cr)]
-                 (canvas-set-source-color c 0.0 1.0 0.0 1.0)
-                 (canvas-arc c 4.0 4.0 3.0 0.0 6.2831)  ; ~ full circle
-                 (canvas-fill c)
-                 (let [;; centre pixel (4,4): stride 32, offset 4*32 + 4*4
-                       centre (px-is? s 144 0 255 0 255)
-                       ;; corner (0,0) is outside a radius-3 circle at (4,4)
-                       corner (px-is? s 0 0 0 0 0)]
-                   (canvas-round-rect c 0.0 0.0 8.0 8.0 2.0 2.0)
-                   (canvas-arc-to c 2.0 2.0 0.0 false true 8.0 8.0)
-                   (canvas-destroy c)
-                   (surface-destroy s)
-                   (and centre corner)))))))))
-
-   (describe "plutovg/canvas draw-image"
-     (it "blits a source surface into a destination surface"
-       ;; Source: 2x2 solid blue square.  Destination: 8x8 surface.
-       ;; After canvas-draw-image c src 0 0 8 8 the top-left of dst should
-       ;; contain blue (texture stretches to the destination rect).
-       (let [src-r (surface-create 2 2)
-             dst-r (surface-create 8 8)]
-         (if (not (and (ok? src-r) (ok? dst-r)))
-           (assert-true false)
-           (let [src    (ok-val src-r)
-                 dst    (ok-val dst-r)
-                 src-cr (canvas-create src)
-                 dst-cr (canvas-create dst)
-                 k      (assert-true (and (ok? src-cr) (ok? dst-cr)))]
-             (if (not k)
-               (do (surface-destroy src) (surface-destroy dst) false)
-               (let [sc (ok-val src-cr)
-                     dc (ok-val dst-cr)]
-                 ;; paint src blue
-                 (canvas-set-source-color sc 0.0 0.0 1.0 1.0)
-                 (canvas-rect sc 0.0 0.0 2.0 2.0)
-                 (canvas-fill sc)
-                 (canvas-destroy sc)
-                 ;; draw src into dst
-                 (canvas-draw-image dc src 0.0 0.0 8.0 8.0)
-                 (canvas-destroy dc)
-                 ;; dst pixel (0, 0) should be blue: 0xFF0000FF -> B G R A
-                 (let [blue (px-is? dst 0 255 0 0 255)]
-                   (surface-destroy src)
-                   (surface-destroy dst)
-                   blue))))))))
-
-   (describe "plutovg/path clone-dashed"
-     (it "produces a non-empty cloned path whose length is positive"
-       (let [pr (path-create)
-             dr (dash-array-create)]
-         (if (not (and (ok? pr) (ok? dr)))
-           (assert-true false)
-           (let [p      (ok-val pr)
-                 dashes (ok-val dr)]
-             ;; original path: a single horizontal line of length 10
-             (path-move-to p 0.0 0.0)
-             (path-line-to p 10.0 0.0)
-             (dash-array-add dashes 2.0)   ; 2 on
-             (dash-array-add dashes 1.0)   ; 1 off
-             (let [r    (path-clone-dashed p 0.0 dashes)
-                   made (assert-true (ok? r))]
-               (if (not made)
-                 (do (dash-array-destroy dashes) (path-destroy p) false)
-                 (let [dashed (ok-val r)
-                       ;; A 10-unit line dashed 2-on/1-off produces multiple
-                       ;; "on" segments totalling roughly 7 units; the dashed
-                       ;; path's length should be positive and < the original.
-                       lc  (path-length p)
-                       ld  (path-length dashed)
-                       pos (assert-true (>f  ld 0.0))
-                       le  (assert-true (<=f ld lc))]
-                   (path-destroy dashed)
-                   (dash-array-destroy dashes)
-                   (path-destroy p)
-                   (and pos le))))))))))
-
-  (defn main [] : int
-    (__all-tests)
-    (run-all-status)))
+    (describe "plutovg/surface PNG export"
+      (it "writes a 4x4 red square to a PNG on disk and the file is non-empty"
+        (let [sr  (surface-create 4 4)
+              out "/tmp/plutovg-pv6-test.png"]
+          (if (not (ok? sr))
+            (assert-true false)
+            (let [s  (ok-val sr)
+                  cr (canvas-create s)
+                  k  (assert-true (ok? cr))]
+              (if (not k)
+                (do (surface-destroy s) false)
+                (let [c (ok-val cr)]
+                  (unlink-file out) ; clean any stale file
+                  (canvas-set-source-color c 1.0 0.0 0.0 1.0)
+                  (canvas-rect c 0.0 0.0 4.0 4.0)
+                  (canvas-fill c)
+                  (canvas-destroy c)
+                  (let [wrote  (assert-true (ok? (surface-write-png s out)))
+                        exists (assert-true (file-exists? out))
+                        ;; PNG header is 8 bytes; a 4x4 RGBA PNG is >50 bytes
+                        sized  (assert-true (>i (file-size out) 50))]
+                    (unlink-file out)
+                    (surface-destroy s)
+                    (and wrote (and exists sized))))))))))
+    (describe "plutovg/surface JPEG export"
+      (it "writes a 4x4 surface to a JPEG and the file is non-empty"
+        (let [sr  (surface-create 4 4)
+              out "/tmp/plutovg-pv6-test.jpg"]
+          (if (not (ok? sr))
+            (assert-true false)
+            (let [s (ok-val sr)]
+              (unlink-file out)
+              (let [wrote  (assert-true (ok? (surface-write-jpeg s out 90)))
+                    exists (assert-true (file-exists? out))
+                    ;; A minimal JPEG (SOI + headers + EOI) is several hundred bytes
+                    sized  (assert-true (>i (file-size out) 200))]
+                (unlink-file out)
+                (surface-destroy s)
+                (and wrote (and exists sized))))))))
+    (describe "plutovg/canvas arc helpers"
+      ;; This used to call the three helpers and assert nothing at all, under a
+      ;; comment saying it "ensures the inline-C bodies link ... and don't
+      ;; crash".  Linking is what the build step checks; the filled arc leaves
+      ;; pixels behind, so check for those.
+      (it "canvas-arc fills a circle and arc-to / round-rect run over it"
+        (let [sr (surface-create 8 8)]
+          (if (not (ok? sr))
+            (assert-true false)
+            (let [s  (ok-val sr)
+                  cr (canvas-create s)
+                  k  (assert-true (ok? cr))]
+              (if (not k)
+                (do (surface-destroy s) false)
+                (let [c (ok-val cr)]
+                  (canvas-set-source-color c 0.0 1.0 0.0 1.0)
+                  (canvas-arc c 4.0 4.0 3.0 0.0 6.2831) ; ~ full circle
+                  (canvas-fill c)
+                  (let [ ;; centre pixel (4,4): stride 32, offset 4*32 + 4*4
+                        centre (px-is? s 144 0 255 0 255)
+                        ;; corner (0,0) is outside a radius-3 circle at (4,4)
+                        corner (px-is? s 0 0 0 0 0)]
+                    (canvas-round-rect c 0.0 0.0 8.0 8.0 2.0 2.0)
+                    (canvas-arc-to c 2.0 2.0 0.0 false true 8.0 8.0)
+                    (canvas-destroy c)
+                    (surface-destroy s)
+                    (and centre corner)))))))))
+    (describe "plutovg/canvas draw-image"
+      (it "blits a source surface into a destination surface"
+        ;; Source: 2x2 solid blue square.  Destination: 8x8 surface.
+        ;; After canvas-draw-image c src 0 0 8 8 the top-left of dst should
+        ;; contain blue (texture stretches to the destination rect).
+        (let [src-r (surface-create 2 2)
+              dst-r (surface-create 8 8)]
+          (if (not (and (ok? src-r) (ok? dst-r)))
+            (assert-true false)
+            (let [src    (ok-val src-r)
+                  dst    (ok-val dst-r)
+                  src-cr (canvas-create src)
+                  dst-cr (canvas-create dst)
+                  k      (assert-true (and (ok? src-cr) (ok? dst-cr)))]
+              (if (not k)
+                (do (surface-destroy src) (surface-destroy dst) false)
+                (let [sc (ok-val src-cr)
+                      dc (ok-val dst-cr)]
+                  ;; paint src blue
+                  (canvas-set-source-color sc 0.0 0.0 1.0 1.0)
+                  (canvas-rect sc 0.0 0.0 2.0 2.0)
+                  (canvas-fill sc)
+                  (canvas-destroy sc)
+                  ;; draw src into dst
+                  (canvas-draw-image dc src 0.0 0.0 8.0 8.0)
+                  (canvas-destroy dc)
+                  ;; dst pixel (0, 0) should be blue: 0xFF0000FF -> B G R A
+                  (let [blue (px-is? dst 0 255 0 0 255)]
+                    (surface-destroy src)
+                    (surface-destroy dst)
+                    blue))))))))
+    (describe "plutovg/path clone-dashed"
+      (it "produces a non-empty cloned path whose length is positive"
+        (let [pr (path-create)
+              dr (dash-array-create)]
+          (if (not (and (ok? pr) (ok? dr)))
+            (assert-true false)
+            (let [p      (ok-val pr)
+                  dashes (ok-val dr)]
+              ;; original path: a single horizontal line of length 10
+              (path-move-to p 0.0 0.0)
+              (path-line-to p 1e+01 0.0)
+              (dash-array-add dashes 2.0) ; 2 on
+              (dash-array-add dashes 1.0) ; 1 off
+              (let [r    (path-clone-dashed p 0.0 dashes)
+                    made (assert-true (ok? r))]
+                (if (not made)
+                  (do (dash-array-destroy dashes) (path-destroy p) false)
+                  (let [dashed (ok-val r)
+                        ;; A 10-unit line dashed 2-on/1-off produces multiple
+                        ;; "on" segments totalling roughly 7 units; the dashed
+                        ;; path's length should be positive and < the original.
+                        lc     (path-length p)
+                        ld     (path-length dashed)
+                        pos    (assert-true (>f ld 0.0))
+                        le     (assert-true (<=f ld lc))]
+                    (path-destroy dashed)
+                    (dash-array-destroy dashes)
+                    (path-destroy p)
+                    (and pos le))))))))))
+  (defn main [] : int (__all-tests) (run-all-status)))
