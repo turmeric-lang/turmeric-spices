@@ -606,7 +606,7 @@ The Pair-consuming mixers (`mix`, `add`, `multiply`) consume the
 ## 5. Envelopes
 
 An ADSR envelope shapes amplitude over the lifetime of a note. Build the
-parameters as a `:copy` struct with `make-struct`, then pass it by value to
+parameters as a `^copy` struct with `make-struct`, then pass it by value to
 `adsr-fixed`:
 
 ```turmeric
@@ -1820,7 +1820,7 @@ restriction.
 - **`effects-chain`** returns the chained signal as a raw pointer. Bind the
   result as a `^fat` signal before sampling it. (`map-signal` returns an
   ordinary signal; sample it directly.)
-- **`ADSRParams`** is a `:copy` struct; build it with `make-struct` and pass
+- **`ADSRParams`** is a `^copy` struct; build it with `make-struct` and pass
   it by value to `adsr-fixed` / `adsr-gen`.
 - **Sample rates come first** in every constructor that takes one, except the
   `hf-osc` oscillators, which take it last: `(hf-sawtooth freq sample-rate)`.

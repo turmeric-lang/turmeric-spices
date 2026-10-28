@@ -94,7 +94,7 @@ fixed-size digests of them.
       0)))
 ```
 
-`Secret` is `defopaque ... :linear`. Every control path through a live
+`Secret` is `defopaque ^linear ...`. Every control path through a live
 `Secret` must end in exactly one `secret-wipe!`; the observing operations
 (`with-secret`, `secret-eq?`, `secret-len`, `secret-locked?`) take it by
 `^borrow` and do not discharge that obligation. Three things are therefore

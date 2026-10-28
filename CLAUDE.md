@@ -165,7 +165,7 @@ Related shapes worth knowing, each found the hard way:
 - A `: nil` self-recursive `defn` makes codegen bind a void call to
   `__auto_type`, which cc rejects ("variable or field declared void").
   Return `int` with an explicit base case.
-- A module-level `(def x (...))` whose initialiser has a `:linear` type (e.g.
+- A module-level `(def x (...))` whose initialiser has a `^linear` type (e.g.
   stdlib's `Mutex`) emits no global at all; the C then fails on an undeclared
   identifier. Hold the carrier instead: `(def m (:: (mutex-new) :int))`, and
   cast back at each borrow.

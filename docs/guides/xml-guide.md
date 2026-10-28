@@ -343,7 +343,7 @@ every entry point without `-opts` -- is the safe configuration:
 | `max-bytes` | `64 MiB` | Longer input fails with kind `Limit`. `0` disables -- do that to stream a huge file through SAX. |
 | `namespaces` | `true` | See [Namespaces](#5-namespaces). |
 
-`ParseOpts` is a `:copy` struct; change one field with `with`:
+`ParseOpts` is a `^copy` struct; change one field with `with`:
 
 ```turmeric no-check
 (sax-parse-file-opts "dump.xml" (with (default-parse-opts) [max-bytes 0]) handler)

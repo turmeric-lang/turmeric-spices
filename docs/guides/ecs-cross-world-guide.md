@@ -91,7 +91,7 @@ elsewhere has the wrong world type. Writing a component a clause did not
 name is likewise a compile error — the `<w>-<C>-write-cap` binding
 simply does not exist.
 
-`XWriteCap` is `:linear` (consumed exactly once, enforced under
+`XWriteCap` is `^linear` (consumed exactly once, enforced under
 `-Xsubstructural`); `XReadCap` is non-linear and re-borrowable across a
 loop.
 
