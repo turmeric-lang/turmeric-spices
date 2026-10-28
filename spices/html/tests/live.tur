@@ -1,0 +1,246 @@
+#use-reader-macros "../src/html/markup.tur"
+;; live.tur -- markup literals as trees (xml-html-followups-plan follow-ups A3
+;; and A4).
+;;
+;; A3: `html->dom` parses a Fragment's markup; for markup the HTML parser
+;; keeps as written, serializing the tree gives `html->string` back, and
+;; `html->nodes` makes the nodes in another document.
+;;
+;; A4: `#html-live{...}` snapshots a literal's holes; `live-mount` builds its
+;; tree; `tpl-update!` patches only the holes whose values changed and says
+;; how many patches it made. Updating with the same values touches nothing,
+;; updating one hole makes one patch, and nodes outside the changed holes
+;; stay the same nodes. After every update the tree serializes to what
+;; `live->string` -- and so `html->string` -- writes for the new values.
+(defmodule html_live_test
+  (export)
+  (import html/markup
+    :refer
+    [html*
+     html->dom
+     html->nodes
+     LiveHtml
+     TemplateInstance
+     html-live*
+     live->string
+     live-free
+     live-mount
+     tpl-update!
+     live-document
+     live-instance-free])
+  (import dom/holes :refer [Fragment html->string fragment-free raw-html])
+  (import dom/ownstr :refer [to-cstr release])
+  (import dom/core
+    :refer
+    [Document
+     Node
+     dom-node
+     dom-free
+     dom-serialize
+     find-first
+     node-attr
+     node-text])
+  (import dom/edit :refer [HtmlFlavor dom-new create-element node-append!])
+  (import html/dom :refer [html-parse-fragment])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; ser -- a document's markup.
+  (defn ser [d : Document] : cstr
+    (let [s (dom-serialize (dom-node d))
+          c (__dup (to-cstr s))]
+      (release s)
+      c))
+  ;;; __dup -- internal.
+  (defn __dup [s : cstr] : cstr
+    ```c
+    size_t n = strlen((const char *)s);
+  char *d = (char *)malloc(n + 1);
+  memcpy(d, s, n + 1);
+  return d;
+  ```)
+  ;;; round-trips? -- does html->dom of f serialize to html->string of f?
+  (defn round-trips? [f : Fragment] : bool
+    (let [d  (html->dom f)
+          ok (__is? (ser d) (html->string f))]
+      (dom-free d)
+      (fragment-free f)
+      ok))
+  ;; ---- A3 ------------------------------------------------------------------------
+  (defn item [name : cstr href : cstr] : Fragment
+    #html{<li class="item"><a href=${href}>${name}</a></li>})
+  ;; ---- A4 ------------------------------------------------------------------------
+  (defn view [title : cstr
+              cls : cstr
+              n : int
+              hidden : bool
+              items : (Cons Fragment)] : LiveHtml
+    #html-live{<section class="box ${cls}" hidden=${hidden}><h1>${title}</h1><p id="static">count: ${n}</p><ul>${items}</ul></section>})
+  ;;; __ptr-eq? -- internal: node identity.
+  (defn __ptr-eq? [a : Node b : Node] : bool
+    ```c
+    return (void *)(intptr_t)a == (void *)(intptr_t)b;
+  ```)
+  ;;; consistent? -- does the instance's tree serialize to what the literal
+  ;;; renders for l?
+  (defn consistent? [inst : TemplateInstance l : LiveHtml] : bool
+    (__is? (ser (live-document inst)) (live->string l)))
+  ;;; __static-p -- internal: the <p id=static> element.
+  (defn __static-p [inst : TemplateInstance] : Node
+    (match (find-first (dom-node (live-document inst)) "p")
+      (Some p)
+      p
+      (None)
+      (panic "no <p>")))
+  (defn __items [a : cstr b : cstr] : (Cons Fragment)
+    (tcons-of (item a "/a") (tcons-of (item b "/b") (tnil))))
+  (defn __all-tests [] : void
+    (describe "html->dom (plan A3)"
+      (it "a fragment round-trips through the tree"
+        (round-trips? #html{<ul>${(item "a & b" "/x?y=1&z=2")}<li>${"<i>"}</li></ul>}))
+      (it "a whole document round-trips"
+        (round-trips? #html{<!DOCTYPE html><html><head><title>t</title></head><body><p>${"x"}</p></body></html>}))
+      (it "table-context literals keep their structure"
+        (round-trips? #html{<tr><td>${"1"}</td><td>${"2"}</td></tr>}))
+      (it "raw-html is parsed in its element, in the tree too"
+        (round-trips? #html{<div>${(raw-html "<b>x</div>y")}</div>}))
+      (it "the parser's normalizations are the only difference"
+        (let [f  #html{<table><tr><td>${"c"}</td></tr></table><input checked=${true}>}
+              d  (html->dom f)
+              ok (__is? (ser d)
+                   "<table><tbody><tr><td>c</td></tr></tbody></table><input checked=\"\">")]
+          (dom-free d)
+          (fragment-free f)
+          ok))
+      (it "html->nodes makes the nodes in another document"
+        (let [d  (dom-new (HtmlFlavor))
+              ul (match (create-element d "ul")
+                   (Ok n)
+                   n
+                   (Err _)
+                   (panic "create-element"))
+              _  (node-append! (dom-node d) ul)
+              ns (html->nodes d #html{<li>${"1"}</li><li>${"2"}</li>})]
+          (__append-all ul ns)
+          (let [ok (__is? (ser d) "<ul><li>1</li><li>2</li></ul>")]
+            (dom-free d)
+            ok))))
+    (describe "live literals (plan A4)"
+      (it "mounting builds the tree the literal renders"
+        (let [l    (view "T" "a" 1 false (__items "x" "y"))
+              inst (live-mount l)
+              ok   (consistent? inst l)]
+          (live-free l)
+          (live-instance-free inst)
+          ok))
+      (it "updating with the same values touches nothing"
+        (let [l    (view "T" "a" 1 false (__items "x" "y"))
+              inst (live-mount l)
+              l2   (view "T" "a" 1 false (__items "x" "y"))
+              n    (tpl-update! inst l2)
+              ok   (and (= n 0) (consistent? inst l2))]
+          (live-free l)
+          (live-free l2)
+          (live-instance-free inst)
+          ok))
+      (it "updating one content hole makes one patch, and other nodes stay put"
+        (let [l    (view "T" "a" 1 false (__items "x" "y"))
+              inst (live-mount l)
+              p    (__static-p inst)
+              l2   (view "T" "a" 2 false (__items "x" "y"))
+              n    (tpl-update! inst l2)
+              same (__ptr-eq? p (__static-p inst))
+              ok   (and (= n 1) (and same (consistent? inst l2)))]
+          (live-free l)
+          (live-free l2)
+          (live-instance-free inst)
+          ok))
+      (it "a list hole grows and shrinks"
+        (let [l    (view "T" "a" 1 false (__items "x" "y"))
+              inst (live-mount l)
+              l2   (view "T" "a" 1 false (tcons-of (item "only" "/o") (tnil)))
+              n2   (tpl-update! inst l2)
+              ok2  (consistent? inst l2)
+              l3   (view "T"
+                     "a"
+                     1
+                     false
+                     (tcons-of (item "1" "/1")
+                       (tcons-of (item "2" "/2")
+                         (tcons-of (item "3" "javascript:x") (tnil)))))
+              n3   (tpl-update! inst l3)
+              ok3  (consistent? inst l3)]
+          (live-free l)
+          (live-free l2)
+          (live-free l3)
+          (live-instance-free inst)
+          (and (= n2 1) (and ok2 (and (= n3 1) ok3)))))
+      (it "an attribute part and a boolean attribute update in place"
+        (let [l    (view "T" "a" 1 false (__items "x" "y"))
+              inst (live-mount l)
+              l2   (view "T" "b\"c" 1 true (__items "x" "y"))
+              n    (tpl-update! inst l2)
+              sec  (find-first (dom-node (live-document inst)) "section")
+              ok   (match sec
+                     (Some s)
+                     (and (match (node-attr s "class")
+                            (Some c)
+                            (__is? c "box b\"c")
+                            (None)
+                            false)
+                       (match (node-attr s "hidden") (Some _) true (None) false))
+                     (None)
+                     false)
+              l3   (view "T" "b\"c" 1 false (__items "x" "y"))
+              n3   (tpl-update! inst l3)
+              gone (match (find-first (dom-node (live-document inst)) "section")
+                     (Some s)
+                     (match (node-attr s "hidden") (Some _) false (None) true)
+                     (None)
+                     false)]
+          (live-free l)
+          (live-free l2)
+          (live-free l3)
+          (live-instance-free inst)
+          (and (= n 2) (and ok (and (= n3 1) gone)))))
+      (it "text in a hole stays text"
+        (let [l    (view "<b>bold</b>" "a" 1 false (__items "x" "y"))
+              inst (live-mount l)
+              ok   (match (find-first (dom-node (live-document inst)) "h1")
+                     (Some h)
+                     (let [t (node-text h)
+                           r (__is? (to-cstr t) "<b>bold</b>")]
+                       (release t)
+                       r)
+                     (None)
+                     false)]
+          (live-free l)
+          (live-instance-free inst)
+          ok))
+      (it "live->string matches #html{} for the same values"
+        (let [l  (html-live* "<p class=\"${\"a\"}\">${\"<&>\"}</p>")
+              f  (html* "<p class=\"${\"a\"}\">${\"<&>\"}</p>")
+              ok (__is? (live->string l) (html->string f))]
+          (live-free l)
+          (fragment-free f)
+          ok))))
+  ;;; __append-all -- internal.
+  (defn __append-all [parent : Node ns : (Cons Node)] : nil
+    (if (tnil? ns)
+      nil
+      (do
+        (match (node-append! parent (thead ns))
+          (Ok _)
+          nil
+          (Err _)
+          (panic "append"))
+        (__append-all parent (ttail ns)))))
+  (defn main [] : int (__all-tests) (run-all-status))) ;; end defmodule html_live_test

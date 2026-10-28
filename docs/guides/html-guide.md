@@ -333,6 +333,38 @@ Two things about the syntax:
 A `Fragment` owns its markup; `fragment-free` releases one, which a server
 rendering a page per request will want.
 
+### Trees and live templates
+
+A `Fragment` is its rendered markup -- the cheap form, for a response body.
+Two ways to get nodes instead:
+
+- `html->dom` parses a fragment into a `Document` (in `template` context, or
+  as a whole document), and `html->nodes d f` makes its top-level nodes in
+  another document, detached and ready to append. Serializing the tree gives
+  the fragment's markup back, except where the parser normalizes it (it adds
+  a `<tbody>` to a table, writes a boolean attribute as `checked=""`).
+- `#html-live{...}` (`html-live*`) is the same literal, checked the same way,
+  for markup that is re-rendered in place. Each evaluation is a `LiveHtml`, a
+  snapshot of the hole values; `live-mount` builds its tree once, as a
+  `TemplateInstance` that remembers where every hole is, and
+  `(tpl-update! inst (view new-values))` patches only the holes whose values
+  changed -- returning how many patches it made, `0` when nothing did. Nodes
+  outside the changed holes stay the same nodes.
+
+```turmeric no-check
+(defn counter [n : int done : bool] : LiveHtml
+  #html-live{<p class=${(if done "done" "open")}>count: ${n}</p>})
+
+(let [inst (live-mount (counter 0 false))]
+  (tpl-update! inst (counter 1 false))   ; => 1: the count
+  (tpl-update! inst (counter 1 false))   ; => 0
+  (dom-serialize (dom-node (live-document inst))))
+```
+
+A `LiveHtml` owns copies of its values (`live-free`); an instance owns its
+`Document` (`live-instance-free`). Only code that asks for a live literal pays
+for the tree.
+
 ---
 
 ## 11. Hiccup: markup as a value

@@ -60,7 +60,10 @@
     template-checked?
     template-check-markup
     template-verify
-    template-parent)
+    template-parent
+    child-markup
+    attr-state
+    attr-raw)
   (import dom/ownstr :refer [String to-cstr adopt-cstr release])
   (import dom/core :refer [Node dom-serialize node-document])
   (import dom/edit :refer [DomFlavor XmlFlavor HtmlFlavor dom-flavor])
@@ -647,4 +650,91 @@
   ;;;
   ;;; Since: 0.3.0
   (defn template-verify [tpl : cstr top : Node] : nil
-    (let [err (__verify-raw tpl top)] (if (__null-cstr? err) nil (panic err))))) ;; end defmodule dom/holes
+    (let [err (__verify-raw tpl top)] (if (__null-cstr? err) nil (panic err))))
+  ;;; __put-child -- internal: append one Child's markup.
+  (defn __put-child [b : ptr<void>
+                     c : Child
+                     html : bool
+                     raw-fix : (fn [cstr cstr] cstr)
+                     ctx : cstr] : nil
+    (match c
+      (ChildText s)
+      (__mb-put-esc b s false html)
+      (ChildHtml s)
+      (if html
+        (__mb-put b s)
+        (panic "an #html{} fragment (or HTML node) cannot go in an #xml{} literal"))
+      (ChildXml s)
+      (if html
+        (panic "an #xml{} fragment (or XML node) cannot go in an #html{} literal")
+        (__mb-put b s))
+      (ChildRaw s)
+      (__mb-put b (raw-fix s ctx))
+      (ChildList xs)
+      (__put-children b xs html raw-fix ctx)
+      (ChildEmpty)
+      nil))
+  ;;; __put-children -- internal.
+  (defn __put-children [b : ptr<void>
+                        xs : (Cons Child)
+                        html : bool
+                        raw-fix : (fn [cstr cstr] cstr)
+                        ctx : cstr] : nil
+    (if (tnil? xs)
+      nil
+      (do
+        (__put-child b (thead xs) html raw-fix ctx)
+        (__put-children b (ttail xs) html raw-fix ctx))))
+  ;;; child-markup -- one content hole's value as markup, as a literal
+  ;;; renders it (malloc'd).
+  ;;;
+  ;;; Internal to the live literals, which keep each hole's rendered markup to
+  ;;; tell a changed hole from an unchanged one.
+  ;;;
+  ;;; Parameters:
+  ;;;   c       -- the hole's value
+  ;;;   html    -- HTML (true) or XML escaping
+  ;;;   raw-fix -- what to do with a raw-html value
+  ;;;   ctx     -- the element the hole sits in
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- malloc'd markup
+  ;;;
+  ;;; Example:
+  ;;;   (child-markup (to-child "a<b") true fix "p")   ; => "a&lt;b"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn child-markup [c : Child
+                      html : bool
+                      raw-fix : (fn [cstr cstr] cstr)
+                      ctx : cstr] : cstr
+    (let [b (__mb-new)] (__put-child b c html raw-fix ctx) (__mb-finish b)))
+  ;;; attr-state -- an attribute value's state: 0 absent, 1 present (a
+  ;;; boolean attribute), 2 a value.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the value
+  ;;;
+  ;;; Returns:
+  ;;;   int
+  ;;;
+  ;;; Example:
+  ;;;   (attr-state (AttrOff))   ; => 0
+  ;;;
+  ;;; Since: 0.3.0
+  (defn attr-state [a : AttrVal] : int
+    (match a (AttrText _) 2 (AttrTrusted _) 2 (AttrOn) 1 (AttrOff) 0))
+  ;;; attr-raw -- an attribute value's text, unescaped ("" for a boolean).
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the value
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- borrowed
+  ;;;
+  ;;; Example:
+  ;;;   (attr-raw (AttrText "a&b"))   ; => "a&b"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn attr-raw [a : AttrVal] : cstr
+    (match a (AttrText s) s (AttrTrusted s) s (AttrOn) "" (AttrOff) ""))) ;; end defmodule dom/holes

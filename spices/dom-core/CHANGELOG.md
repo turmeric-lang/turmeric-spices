@@ -16,7 +16,8 @@
   `TrustedUrl`, `Option` and `(Cons T)` of any of them -- the `raw-html` and `trusted-url`
   opt-outs, the URL scheme allowlist (`url-safe`, `srcset-check`),
   `html->string` / `xml->string` / `fragment-free`, and the renderer and the
-  per-literal parser check both literals share.
+  per-literal parser check both literals share (`child-markup`,
+  `attr-state` and `attr-raw` for tur-html's live literals).
 - `c/dom/turmarkup.c`, a third `:c-source`: escaping, the URL check, the
   template walk and the per-literal check cache.
 

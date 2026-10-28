@@ -23,6 +23,14 @@
   undo (plan D-2). The checking constructors `tag`, `attr-name`, `attr`,
   `attr-on` keep a hand-built tree safe to render. The macro-time half is
   `html/hiccupc`.
+- Markup literals as trees (follow-up A3): `html->dom` parses a `Fragment`
+  into a `Document`; `html->nodes` makes its nodes in another document.
+- Live literals (follow-up A4): `#html-live{...}` / `html-live*` give a
+  `LiveHtml` snapshot of a literal's holes; `live-mount` builds a
+  `TemplateInstance` that remembers where each hole is; `tpl-update!` patches
+  only the holes whose values changed and returns the number of patches;
+  `live->string`, `live-document`, `live-free`, `live-instance-free`. The C
+  half is `c/html/turlive.c`, a second `:c-source`.
 - `html-raw-fix` (html/markup): the raw-html fixer both renderers use.
 - `errors/run.sh`: the compile-error tables for `#html{...}` holes and
   `hiccup` literals.

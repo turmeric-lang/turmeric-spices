@@ -22,7 +22,9 @@ back as the tree a browser builds, and `html-parse` never fails.
 - **Markup literals** (`html/markup`) -- `#html{<li>${name}</li>}`: markup
   with `${...}` holes, escaped by construction, with URL attributes
   scheme-checked and holes in unsafe places (`<script>`, `on*`, names)
-  rejected at compile time. See the
+  rejected at compile time. `html->dom` gives the nodes; `#html-live{...}`
+  builds a tree `tpl-update!` re-renders in place, touching only the holes
+  that changed. See the
   [guide](../../docs/guides/html-guide.md#10-markup-literals).
 - **Hiccup** (`html/hiccup`) -- `(hiccup [:li.item #map{:href u} name])`:
   markup as a typed `Html` value to build, map and `match` on, rendered

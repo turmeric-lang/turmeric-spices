@@ -34,19 +34,63 @@
 ;;; Since: 0.3.0
 ;; HTML literals over dom/holes and lexbor.
 (defmodule html/markup
-  (export html* html-render html-raw-fix)
+  (export mk-hole-child
+    mk-hole-attr
+    mk-srcset-check
+    html*
+    html-render
+    html-raw-fix
+    html->dom
+    html->nodes
+    LiveHtml
+    TemplateInstance
+    html-live*
+    html-live-render
+    live->string
+    live-free
+    live-mount
+    tpl-update!
+    live-document
+    live-instance-free)
   (import dom/ownstr :refer [String to-cstr release])
-  (import dom/core :refer [Document dom-node dom-free dom-serialize])
+  (import dom/core
+    :refer
+    [Document
+     Node
+     dom-node
+     dom-free
+     dom-serialize
+     node-first-child
+     node-next-sibling])
+  (import dom/edit :refer [EditError node-import])
   (import dom/holes
     :refer
     [Fragment
      Hole
+     Child
+     AttrVal
+     hole-child
+     hole-attr
+     srcset-check
+     HoleChild
+     HoleAttr
+     html->string
+     child-markup
+     attr-state
+     attr-raw
+     template-parent
      render-template
      template-checked?
      template-check-markup
      template-verify])
   (import dom/markupc :for-macros)
   (import html/dom :refer [html-parse html-parse-fragment])
+  ;;; mk-hole-child -- internal: a content hole (what the macro emits).
+  (defn mk-hole-child [c : Child] : Hole (hole-child c))
+  ;;; mk-hole-attr -- internal: an attribute hole (what the macro emits).
+  (defn mk-hole-attr [a : AttrVal] : Hole (hole-attr a))
+  ;;; mk-srcset-check -- internal: `srcset-check`, as the macro calls it.
+  (defn mk-srcset-check [a : AttrVal] : AttrVal (srcset-check a))
   ;;; html* -- the macro behind `#html{...}`: a markup literal as a Fragment.
   ;;;
   ;;; Parameters:
@@ -59,7 +103,9 @@
   ;;;   (html->string (html* "<b>${name}</b>"))   ; => "<b>Ada &amp; co</b>"
   ;;;
   ;;; Since: 0.3.0
-  (defmacro* html* [body] (markup-expand body true "html/markup/html-render"))
+  (defmacro* html*
+    [body]
+    (markup-expand body true "html/markup/html-render" "html/markup/"))
   ;;; __free-cstr -- internal.
   (defn __free-cstr [s : cstr] : nil
     ```c
@@ -94,14 +140,8 @@
   ;;; rest of the literal), no comment or raw text that would end early.
   (defn __raw-writable? [d : Document] : bool
     ```c
-    extern void *turdom_doc_node(void *);
-  extern void *turdom_first_child(const void *);
-  extern void *turdom_next_sibling(const void *);
-  extern int turdom_check_subtree(const void *, const void *);
-  void *doc = (void *)(intptr_t)d;
-  for (void *c = turdom_first_child(turdom_doc_node(doc)); c; c = turdom_next_sibling(c))
-    if (turdom_check_subtree(doc, c) != 0) return false;
-  return true;
+    extern int turlive_raw_writable(void *);
+  return turlive_raw_writable((void *)(intptr_t)d) != 0;
   ```)
   ;;; html-raw-fix -- raw-html markup as balanced markup for its context.
   ;;;
@@ -151,5 +191,271 @@
   ;;; Since: 0.3.0
   (defn html-render [tpl : cstr holes : (Cons Hole)] : Fragment
     (if (template-checked? tpl) nil (__check tpl))
-    (:: (__as-fragment (render-template tpl holes true html-raw-fix)) Fragment))) ;; end defmodule html/markup
+    (:: (__as-fragment (render-template tpl holes true html-raw-fix)) Fragment))
+  ;; ---------------------------------------------------------------------------
+  ;; Tree mode (plan A3): a Fragment as nodes
+  ;; ---------------------------------------------------------------------------
+  ;;; __whole-document? -- internal: does markup start with <!doctype or <html?
+  (defn __whole-document? [s : cstr] : bool
+    ```c
+    const char *p = (const char *)s;
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f') p++;
+  return strncasecmp(p, "<!doctype", 9) == 0 ||
+         (strncasecmp(p, "<html", 5) == 0 &&
+          (p[5] == '>' || p[5] == ' ' || p[5] == '\t' || p[5] == '\n' || p[5] == '/'));
+  ```)
+  ;;; html->dom -- a Fragment as a tree.
+  ;;;
+  ;;; Parses the fragment's markup as the content of a `<template>` (or as a
+  ;;; whole document when it starts with `<!doctype` or `<html>`), the context
+  ;;; the literal was checked in. Its top-level nodes are the children of the
+  ;;; returned document's node. Serializing it gives `html->string`'s markup
+  ;;; back for markup the parser keeps as written; the parser does normalize
+  ;;; some (a `<tbody>` inside `<table>`, `checked` as `checked=""`).
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- the fragment
+  ;;;
+  ;;; Returns:
+  ;;;   Document -- owned; release it with `dom-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (let [d (html->dom #html{<ul><li>${x}</li></ul>})] (find-first (dom-node d) "li"))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn html->dom [f : Fragment] : Document
+    (let [m (html->string f)]
+      (if (__whole-document? m)
+        (html-parse m)
+        (html-parse-fragment "template" m))))
+  ;;; __import-all -- internal: import each sibling from x on into d.
+  (defn __import-all [d : Document x : (Option Node)] : (Cons Node)
+    (match x
+      (None)
+      (tnil)
+      (Some n)
+      (match (node-import d n)
+        (Ok m)
+        (tcons-of m (__import-all d (node-next-sibling n)))
+        (Err _)
+        (__import-all d (node-next-sibling n)))))
+  ;;; html->nodes -- a Fragment's nodes, made in another document.
+  ;;;
+  ;;; The fragment's top-level nodes (see `html->dom`), imported into `d`,
+  ;;; detached and in order, ready for dom/edit's `node-append!` and friends.
+  ;;; A node `d` cannot hold (an HTML node in an XML document whose rules it
+  ;;; breaks) is left out.
+  ;;;
+  ;;; Parameters:
+  ;;;   d -- the document the nodes will belong to
+  ;;;   f -- the fragment
+  ;;;
+  ;;; Returns:
+  ;;;   (Cons Node) -- detached nodes owned by `d`
+  ;;;
+  ;;; Example:
+  ;;;   (for-each (fn [n] (node-append! ul n)) (html->nodes d #html{<li>${x}</li>}))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn html->nodes [d : Document f : Fragment] : (Cons Node)
+    (let [src (html->dom f)
+          ns  (__import-all d (node-first-child (dom-node src)))]
+      (dom-free src)
+      ns))
+  ;; ---------------------------------------------------------------------------
+  ;; Live literals (plan A4): a tree whose holes can be updated in place
+  ;; ---------------------------------------------------------------------------
+  ;;; LiveHtml -- one evaluation of an `#html-live{...}` literal: its template
+  ;;; and a snapshot of every hole's value. Owns copies of the values.
+  (defopaque LiveHtml :ptr<void>)
+  ;;; TemplateInstance -- a mounted live literal: a tree, and where each of
+  ;;; its holes is, so `tpl-update!` can rewrite just the ones that changed.
+  (defopaque TemplateInstance :ptr<void>)
+  ;;; html-live* -- the macro behind `#html-live{...}`: a live literal.
+  ;;;
+  ;;; Checked exactly as `#html{...}` is; the result is a LiveHtml instead of
+  ;;; a Fragment.
+  ;;;
+  ;;; Parameters:
+  ;;;   body -- the literal's markup, a string literal, with `${expr}` holes
+  ;;;
+  ;;; Returns:
+  ;;;   LiveHtml
+  ;;;
+  ;;; Example:
+  ;;;   (defn counter [n : int] : LiveHtml (html-live* "<p>count: ${n}</p>"))
+  ;;;
+  ;;; Since: 0.3.0
+  (defmacro* html-live*
+    [body]
+    (markup-expand body true "html/markup/html-live-render" "html/markup/"))
+  ;;; __lv-new -- internal.
+  (defn __lv-new [tpl : cstr] : ptr<void>
+    ```c
+    extern void *turlive_html_new(const char *);
+  return turlive_html_new((const char *)tpl);
+  ```)
+  ;;; __lv-set -- internal: one hole's snapshot.
+  (defn __lv-set [l : ptr<void> i : int state : int s : cstr] : nil
+    ```c
+    extern void turlive_html_set(void *, int64_t, int64_t, const char *);
+  turlive_html_set(l, i, state, (const char *)s);
+  ```)
+  ;;; __lv-fill -- internal: snapshot every hole.
+  (defn __lv-fill [l : ptr<void> tpl : cstr i : int holes : (Cons Hole)] : nil
+    (if (tnil? holes)
+      nil
+      (do
+        (match (thead holes)
+          (HoleChild c)
+          (__lv-set l
+            i
+            2
+            (child-markup c true html-raw-fix (template-parent tpl i)))
+          (HoleAttr a)
+          (__lv-set l i (attr-state a) (attr-raw a)))
+        (__lv-fill l tpl (+ i 1) (ttail holes)))))
+  ;;; html-live-render -- snapshot a checked live literal (what `html-live*`
+  ;;; expands to).
+  ;;;
+  ;;; Parameters:
+  ;;;   tpl   -- the template the macro produced
+  ;;;   holes -- the hole values, in order
+  ;;;
+  ;;; Returns:
+  ;;;   LiveHtml
+  ;;;
+  ;;; Example:
+  ;;;   (html-live-render tpl holes)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn html-live-render [tpl : cstr holes : (Cons Hole)] : LiveHtml
+    (if (template-checked? tpl) nil (__check tpl))
+    (let [l (__lv-new tpl)] (__lv-fill l tpl 0 holes) (:: l LiveHtml)))
+  ;;; live->string -- a live literal's markup, as `html->string` would write it.
+  ;;;
+  ;;; Parameters:
+  ;;;   l -- the evaluation
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- malloc'd markup
+  ;;;
+  ;;; Example:
+  ;;;   (live->string (counter 3))   ; => "<p>count: 3</p>"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn live->string [l : LiveHtml] : cstr
+    ```c
+    extern char *turlive_html_string(const void *);
+  return turlive_html_string((const void *)(intptr_t)l);
+  ```)
+  ;;; live-free -- release a LiveHtml.
+  ;;;
+  ;;; Parameters:
+  ;;;   l -- the evaluation, not used afterwards
+  ;;;
+  ;;; Example:
+  ;;;   (live-free l)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn live-free [l : LiveHtml] : nil
+    ```c
+    extern void turlive_html_free(void *);
+  turlive_html_free((void *)(intptr_t)l);
+  ```)
+  ;;; live-mount -- build the tree for a live literal.
+  ;;;
+  ;;; The instance owns its own Document (`live-document`); each content hole
+  ;;; sits after an empty text node that marks its place, and each attribute
+  ;;; hole is remembered by element and attribute.
+  ;;;
+  ;;; Parameters:
+  ;;;   l -- an evaluation of the literal (not kept: the values are copied)
+  ;;;
+  ;;; Returns:
+  ;;;   TemplateInstance -- free it with `live-instance-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (let [inst (live-mount (counter 0))] ...)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn live-mount [l : LiveHtml] : TemplateInstance
+    (:: (__mount-raw l) TemplateInstance))
+  ;;; __mount-raw -- internal.
+  (defn __mount-raw [l : LiveHtml] : ptr<void>
+    ```c
+    extern void *turlive_mount(const void *);
+  return turlive_mount((const void *)(intptr_t)l);
+  ```)
+  ;;; __update-raw -- internal: patches made, or -1 for another literal.
+  (defn __update-raw [inst : TemplateInstance l : LiveHtml] : int
+    ```c
+    extern int64_t turlive_update(void *, const void *);
+  return turlive_update((void *)(intptr_t)inst, (const void *)(intptr_t)l);
+  ```)
+  ;;; tpl-update! -- re-render a mounted literal in place with new values.
+  ;;;
+  ;;; Compares each hole's new value with the one the tree shows and patches
+  ;;; only what differs: a changed content hole's nodes are replaced, a
+  ;;; changed attribute is set (or removed) again. Nodes outside changed holes
+  ;;; stay the same nodes, so a handle to one stays valid and in place.
+  ;;;
+  ;;; Parameters:
+  ;;;   inst -- the mounted instance
+  ;;;   l    -- a new evaluation of the SAME literal (panics otherwise)
+  ;;;
+  ;;; Returns:
+  ;;;   int -- the number of patches made: 0 when nothing changed, one per
+  ;;;   changed content hole and one per changed attribute
+  ;;;
+  ;;; Example:
+  ;;;   (tpl-update! inst (counter 4))   ; => 1
+  ;;;
+  ;;; Since: 0.3.0
+  (defn tpl-update! [inst : TemplateInstance l : LiveHtml] : int
+    (let [n (__update-raw inst l)]
+      (if (< n 0)
+        (panic "tpl-update!: the new values come from a different #html-live{} literal")
+        n)))
+  ;;; live-document -- the tree a mounted literal maintains.
+  ;;;
+  ;;; Its document node's children are the literal's top-level nodes.
+  ;;; Borrowed from the instance: valid until `live-instance-free`. Read it,
+  ;;; serialize it, or import its nodes elsewhere; editing it by hand around
+  ;;; the holes is fine, removing a hole's place marker is not.
+  ;;;
+  ;;; Parameters:
+  ;;;   inst -- the instance
+  ;;;
+  ;;; Returns:
+  ;;;   Document
+  ;;;
+  ;;; Example:
+  ;;;   (dom-serialize (dom-node (live-document inst)))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn live-document [inst : TemplateInstance] : Document
+    (:: (__doc-raw inst) Document))
+  ;;; __doc-raw -- internal.
+  (defn __doc-raw [inst : TemplateInstance] : ptr<void>
+    ```c
+    extern void *turlive_doc(const void *);
+  return turlive_doc((const void *)(intptr_t)inst);
+  ```)
+  ;;; live-instance-free -- release a mounted literal and its Document.
+  ;;;
+  ;;; Parameters:
+  ;;;   inst -- the instance, not used afterwards
+  ;;;
+  ;;; Example:
+  ;;;   (live-instance-free inst)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn live-instance-free [inst : TemplateInstance] : nil
+    ```c
+    extern void turlive_free(void *);
+  turlive_free((void *)(intptr_t)inst);
+  ```)) ;; end defmodule html/markup
 (reader-macros/define 'html :raw-brace '(html* $body))
+
+(reader-macros/define 'html-live :raw-brace '(html-live* $body))
