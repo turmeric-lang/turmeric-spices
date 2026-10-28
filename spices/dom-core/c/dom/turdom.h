@@ -349,4 +349,72 @@ int            turdom_writer_error(const turdom_writer *w);
  * still needs turdom_writer_free. */
 char          *turdom_writer_finish(turdom_writer *w, size_t *len, int *rc);
 
+/* ---- selectors (c/dom/turdom_select.c) ----------------------------------------
+ *
+ * CSS selectors over the tree: Selectors Level 3 plus :is(), :where(),
+ * :not(<list>), :nth-child(An+B of S), :scope and :has().  A compiled
+ * selector is malloc'd, owns everything it needs (the namespace map it was
+ * compiled with may be freed), and is freed with turdom_selector_free.
+ *
+ * turdom_selector_compile returns NULL only when it cannot allocate the
+ * selector itself; a selector that does not compile carries the error
+ * (turdom_selector_error, a byte offset into the source) and matches nothing.
+ * Every unsupported construct is an error naming it, never a selector that
+ * silently matches nothing: pseudo-elements, the dynamic and UI-state
+ * pseudo-classes, :lang(), :dir(), the column combinator.
+ *
+ * Case: in an HTML document, type selectors and attribute names compare ASCII
+ * case-insensitively on HTML-namespace elements, and so do the values of the
+ * HTML spec's case-insensitive attributes (type, lang, ...) unless the `s`
+ * flag says otherwise.  #id and .class are case-sensitive: every document is
+ * treated as no-quirks.  XML compares everything case-sensitively.
+ *
+ * Namespaces: `p|E` needs `p` in the map; the "" prefix is the default
+ * namespace, which then applies to type selectors and the implied `*` (not
+ * to attribute selectors).  With no default, an unprefixed type selector
+ * matches the local name in any namespace.  A name holding an escaped colon
+ * (`atom\:feed`) is the qualified name as written.
+ *
+ * :has() spends a budget of candidate tests (1e6) between resets; when it
+ * runs out the :has() answers false and turdom_selector_budget_hit says so.
+ * Matching never recurses on the document's depth. */
+
+typedef struct turdom_selector turdom_selector;
+typedef struct turdom_nsmap    turdom_nsmap;
+
+turdom_nsmap    *turdom_nsmap_new(void);
+/* Adding a prefix again replaces its URI. */
+int              turdom_nsmap_add(turdom_nsmap *m, const char *prefix,
+                                  const char *uri);
+void             turdom_nsmap_free(turdom_nsmap *m);
+
+turdom_selector *turdom_selector_compile(const char *src, const turdom_nsmap *ns);
+/* NULL when the selector compiled. */
+const char      *turdom_selector_error(const turdom_selector *s);
+int64_t          turdom_selector_error_offset(const turdom_selector *s);
+void             turdom_selector_free(turdom_selector *s);
+/* Refill the :has() budget and clear budget_hit. */
+void             turdom_selector_reset(turdom_selector *s);
+int              turdom_selector_budget_hit(const turdom_selector *s);
+
+/* Element.matches(): does element n match?  scope is what :scope means (NULL
+ * or the document node: :root). */
+int              turdom_selector_matches(turdom_selector *s, const turdom_node *n,
+                                         const turdom_node *scope);
+/* querySelectorAll as a walk: the next / previous matching element of root's
+ * subtree (root excluded; from == NULL starts) in document order.  :scope is
+ * root.  Combinators may look above root, as the DOM's do. */
+turdom_node     *turdom_select_next(turdom_selector *s, const turdom_node *root,
+                                    const turdom_node *from);
+turdom_node     *turdom_select_prev(turdom_selector *s, const turdom_node *root,
+                                    const turdom_node *from);
+/* Element.closest(): n or its nearest ancestor element that matches. */
+turdom_node     *turdom_closest(turdom_selector *s, const turdom_node *n);
+
+/* A selector that picks exactly element n out of its tree: `tag:nth-child(k)`
+ * steps joined by ` > `, from the top element (`:root`-anchored) or from the
+ * nearest ancestor with an id that is unique in the tree (`#id`).  malloc'd;
+ * NULL for a non-element or on allocation failure. */
+char            *turdom_css_path(const turdom_node *n, size_t *len);
+
 #endif /* TURDOM_H */

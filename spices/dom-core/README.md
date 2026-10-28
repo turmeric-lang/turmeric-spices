@@ -18,6 +18,11 @@ its modules are what you import to read what they produce:
   across documents, and `dom-new` to build one from nothing. Every edit is
   validated, so a serialized tree cannot carry structure the edits did not
   make.
+- `dom/select` -- CSS selectors: `selector-compile`, then `select-all`,
+  `select-first`, `node-matches-selector?` and `node-closest`
+  (`querySelectorAll`, `querySelector`, `matches`, `closest`); `query` and
+  `query-one` for a one-off; `node-css-path` for a selector that picks
+  exactly one element.
 - `dom/event` -- `SaxEvent`, `SaxControl` and `Attr`: the event stream both
   SAX front doors deliver.
 - `dom/ownstr` -- `String`, the owned string type events and `node-text` hand
@@ -145,6 +150,19 @@ defn main [] : int
   0
 ```
 
+## Selectors
+
+`dom/select` runs CSS selectors -- Selectors Level 3 plus `:is()`,
+`:where()`, `:not(<list>)`, `:nth-child(An+B of S)`, `:scope` and `:has()` --
+over a tree from either parser, with the HTML case rules on an HTML document.
+A construct it does not support is a compile error naming it, never a
+selector that silently matches nothing. The engine is
+`c/dom/turdom_select.c`; it is tested against the web-platform-tests
+`querySelectorAll` table (in tur-html and tur-xml) and against a naive
+matcher on random trees (`tests/select_fuzz.tur`). The
+[XML guide](../../docs/guides/xml-guide.md#css-selectors) has the details:
+namespaces, scope, the `:has()` budget and `node-css-path`.
+
 ## Streaming writes
 
 `dom/writer` is the streaming counterpart: a `SaxWriter` turns `SaxEvent`s
@@ -169,6 +187,7 @@ released. `sax-keep` is the identity.
 | `dom/core` | `Document`, `Node`, `NodeKind` (`DocumentNode` `ElementNode` `TextNode` `CommentNode` `CdataNode` `PiNode` `DoctypeNode`), `SourcePos`, `ParseError`, `ParseErrorKind` (`Syntax` `Limit` `Refused` `Io`), `syntax-kind`, `limit-kind`, `refused-kind`, `io-kind`, `dom-root`, `dom-node`, `dom-free`, `dom-serialize`, `dom-equal?`, `dom-node-count`, `dom-live-bytes`, `node-kind`, `node-element?`, `node-name`, `node-local-name`, `node-ns-uri`, `node-value`, `node-text`, `node-attr`, `node-attr-count`, `node-attr-name-at`, `node-attr-value-at`, `node-children`, `node-child-count`, `node-first-child`, `node-last-child`, `node-next-sibling`, `node-prev-sibling`, `node-parent`, `node-document`, `node-pos`, `node-depth`, `node-matches?`, `find-all`, `find-first`, `parse-error-message`, `parse-error-release`, `parse-error-pos` |
 | `dom/edit` | `DomFlavor` (`XmlFlavor` `HtmlFlavor`), `EditError` (`WrongDocument` `WouldCycle` `NotAContainer` `BadPlacement` `Detached` `WrongKind` `BadName` `BadContent` `OutOfMemory`), `edit-error-message`, `dom-new`, `dom-flavor`, `create-element`, `create-element-ns`, `create-text`, `create-comment`, `create-cdata`, `create-pi`, `node-import`, `node-clone`, `node-append!`, `node-prepend!`, `node-insert-before!`, `node-insert-after!`, `node-replace!`, `node-remove!`, `node-unwrap!`, `set-attr!`, `set-attr-ns!`, `remove-attr!`, `set-text!`, `set-value!`, `rename!`, `rename-ns!`, `node-normalize!`, `dom-garbage-bytes`, `dom-compact`, `node-attached?` |
 | `dom/event` | `SaxEvent` (`StartElement` `EndElement` `Chars` `Comment` `Pi` `StartCdata` `EndCdata` `Doctype`), `SaxControl` (`Continue` `Stop`), `Attr`, `attrs-get`, `sax-event-release`, `sax-event-retain`, `sax-dispatch` |
+| `dom/select` | `Selector`, `SelectorError`, `selector-error-message`, `selector-error-release`, `selector-compile`, `selector-compile-ns`, `selector-free`, `selector-gave-up?`, `select-all`, `select-first`, `node-matches-selector?`, `node-closest`, `query`, `query-one`, `node-css-path` |
 | `dom/writer` | `SaxWriter`, `WriteError` (`Rejected` `IoFailed`), `write-error-message`, `TransformError` (`InputError` `OutputError`), `transform-error-message`, `transform-error-release`, `sax-writer-new`, `sax-writer-to-file`, `sax-write!`, `sax-write-all!`, `sax-writer-finish!`, `sax-writer-free`, `sax-transform-handler`, `sax-keep` |
 | `dom/ownstr` | `String`, `from-cstr`, `adopt-cstr`, `to-cstr`, `retain`, `release`, `str-len`, `string=?` |
 

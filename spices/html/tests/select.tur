@@ -1,0 +1,500 @@
+;; select.tur -- dom/select (xml-html-followups-plan follow-up C) over parsed
+;; HTML: the WPT querySelectorAll tables, node-css-path round trips, and the
+;; one-shot query API.
+;;
+;; tests/data/wpt-selectors/ holds WPT's dom/nodes/selectors.js and the
+;; document it runs against (3-clause BSD; LICENSE and the upstream commit are
+;; in the README there). convert.js turns the table into selectors.tsv. As in
+;; WPT's ParentNode-querySelector-All.html, the document gets its special
+;; elements first (the `null` / `undefined` elements, the namespace divs, a
+;; namespaced title attribute -- built here with dom/edit), and every valid
+;; selector runs in three contexts: the document node, a detached clone of
+;; #root, and #root itself with a marked clone of it appended to <body>,
+;; which must never match. WPT's fourth context, a DocumentFragment, has no
+;; counterpart in dom-core.
+;;
+;; A selector the table expects to match but that uses a pseudo-class
+;; dom/select rejects on purpose (:link, :visited, :target, the UI states,
+;; :lang, pseudo-elements; convert.js records which) must be a compile ERROR
+;; here, not an empty result.
+(defmodule html_select_test
+  (export)
+  (import dom/ownstr :refer [String to-cstr release])
+  (import dom/core
+    :refer
+    [Document Node dom-node dom-root dom-free node-attr node-element? find-first])
+  (import dom/edit
+    :refer
+    [EditError create-element create-element-ns node-append! node-clone set-attr! set-attr-ns!])
+  (import dom/select
+    :refer
+    [Selector
+     SelectorError
+     selector-error-message
+     selector-error-release
+     selector-compile
+     selector-free
+     select-all
+     select-first
+     node-matches-selector?
+     node-closest
+     query
+     query-one
+     node-css-path])
+  (import html/dom :refer [html-parse html-parse-fragment])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true assert-eq])
+  (import test/runner :refer [run-all-status])
+  ;; ---- the table ---------------------------------------------------------------
+  ;;; __tsv-load -- read selectors.tsv; the number of rows.
+  (defn __tsv-load [path : cstr] : int
+    ```c
+    /* __tur_include__: #include <stdio.h> */
+  /* __tur_include__: typedef struct { int valid; char *sel; char *want; char *excl; char *skip; } wpt_row; */
+  /* __tur_include__: static wpt_row *g_rows = 0; */
+  /* __tur_include__: static size_t g_nrows = 0; */
+  FILE *f = fopen((const char *)path, "rb");
+  if (!f) return 0;
+  char line[4096];
+  size_t cap = 0;
+  while (fgets(line, sizeof line, f)) {
+    size_t n = strlen(line);
+    while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+    if (n == 0 || line[0] == '#') continue;
+    char *field[5] = {0};
+    char *p = line;
+    for (int k = 0; k < 5; k++) {
+      char *tab = k < 4 ? strchr(p, '\t') : NULL;
+      if (tab) *tab = '\0';
+      /* unescape \t \n \r \\ */
+      char *o = (char *)malloc(strlen(p) + 1), *w = o;
+      for (char *r = p; *r; r++) {
+        if (*r == '\\' && r[1]) {
+          r++;
+          *w++ = *r == 't' ? '\t' : *r == 'n' ? '\n' : *r == 'r' ? '\r' : *r;
+        } else {
+          *w++ = *r;
+        }
+      }
+      *w = '\0';
+      field[k] = o;
+      if (!tab) { for (int j = k + 1; j < 5; j++) field[j] = strdup(""); break; }
+      p = tab + 1;
+    }
+    if (g_nrows == cap) { cap = cap ? cap * 2 : 128; g_rows = (wpt_row *)realloc(g_rows, cap * sizeof(wpt_row)); }
+    wpt_row *r = &g_rows[g_nrows++];
+    r->valid = strcmp(field[0], "valid") == 0;
+    free(field[0]);
+    r->sel = field[1]; r->want = field[2]; r->excl = field[3]; r->skip = field[4];
+  }
+  fclose(f);
+  return (int64_t)g_nrows;
+  ```)
+  ;;; __row-valid? -- internal.
+  (defn __row-valid? [i : int] : bool
+    ```c
+    return g_rows[i].valid != 0;
+  ```)
+  ;;; __row-sel -- internal.
+  (defn __row-sel [i : int] : cstr
+    ```c
+    return g_rows[i].sel;
+  ```)
+  ;;; __row-want -- internal.
+  (defn __row-want [i : int] : cstr
+    ```c
+    return g_rows[i].want;
+  ```)
+  ;;; __row-skip -- internal: why dom/select rejects it, or "".
+  (defn __row-skip [i : int] : cstr
+    ```c
+    return g_rows[i].skip;
+  ```)
+  ;;; __row-runs? -- internal: does row i run in context ctx (and in HTML)?
+  (defn __row-runs? [i : int ctx : cstr] : bool
+    ```c
+    const char *ex = g_rows[i].excl;
+  char buf[256];
+  snprintf(buf, sizeof buf, ",%s,", ex);
+  char want1[64], want2[64];
+  snprintf(want1, sizeof want1, ",%s,", (const char *)ctx);
+  snprintf(want2, sizeof want2, ",html,");
+  return strstr(buf, want1) == NULL && strstr(buf, want2) == NULL;
+  ```)
+  ;;; __empty? -- internal.
+  (defn __empty? [s : cstr] : bool
+    ```c
+    return s[0] == '\0';
+  ```)
+  ;;; __read-file -- internal: a whole file, malloc'd ("" when unreadable).
+  (defn __read-file [path : cstr] : cstr
+    ```c
+    FILE *f = fopen((const char *)path, "rb");
+  if (!f) { char *e = (char *)malloc(1); e[0] = '\0'; return e; }
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  char *buf = (char *)malloc((size_t)sz + 1);
+  size_t got = fread(buf, 1, (size_t)sz, f);
+  fclose(f);
+  buf[got] = '\0';
+  return buf;
+  ```)
+  ;; ---- collecting ids ------------------------------------------------------------
+  ;;; __ids-reset -- internal: start a fresh id list.
+  (defn __ids-reset [] : nil
+    ```c
+    /* __tur_include__: static char g_ids[8192]; */
+  /* __tur_include__: static int g_clone_hit = 0; */
+  g_ids[0] = '\0';
+  g_clone_hit = 0;
+  ```)
+  ;;; __ids-add -- internal: append one id ("-" for none).
+  (defn __ids-add [id : cstr clone : bool] : nil
+    ```c
+    if (g_ids[0]) strncat(g_ids, " ", sizeof g_ids - strlen(g_ids) - 1);
+  strncat(g_ids, (const char *)id, sizeof g_ids - strlen(g_ids) - 1);
+  if (clone) g_clone_hit = 1;
+  ```)
+  ;;; __ids -- internal.
+  (defn __ids [] : cstr
+    ```c
+    return g_ids;
+  ```)
+  ;;; __clone-hit? -- internal: did a marked clone match?
+  (defn __clone-hit? [] : bool
+    ```c
+    return g_clone_hit != 0;
+  ```)
+  ;;; __same? -- internal: equal strings, reporting a mismatch.
+  (defn __same? [what : cstr sel : cstr got : cstr want : cstr] : bool
+    ```c
+    if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# %s %s\n#   want [%s]\n#   got  [%s]\n", (const char *)what,
+          (const char *)sel, (const char *)want, (const char *)got);
+  return false;
+  ```)
+  ;;; __say -- internal: one diagnostic line.
+  (defn __say [what : cstr sel : cstr msg : cstr] : nil
+    ```c
+    fprintf(stderr, "# %s %s: %s\n", (const char *)what, (const char *)sel, (const char *)msg);
+  ```)
+  ;;; __id-of -- the id attribute, or "-".
+  (defn __id-of [n : Node] : cstr
+    (match (node-attr n "id")
+      (Some v) v
+      (None)   "-"))
+  ;;; __clone? -- is this a marked out-of-scope clone?
+  (defn __clone? [n : Node] : bool
+    (match (node-attr n "data-clone")
+      (Some _) true
+      (None)   false))
+  ;;; __collect -- the ids of a node list into the id buffer.
+  (defn __collect [ns : (Cons Node)] : nil
+    (if (tnil? ns)
+      nil
+      (do (__ids-add (__id-of (thead ns)) (__clone? (thead ns)))
+          (__collect (ttail ns)))))
+  ;;; __first-want -- internal: the first id of an expected list ("" if none).
+  (defn __first-want [want : cstr] : cstr
+    ```c
+    /* __tur_include__: static char g_first[256]; */
+  size_t n = strcspn((const char *)want, " ");
+  if (n >= sizeof g_first) n = sizeof g_first - 1;
+  memcpy(g_first, want, n);
+  g_first[n] = '\0';
+  return g_first;
+  ```)
+  ;; ---- running a row ---------------------------------------------------------------
+  ;;; run-valid -- one valid row from `root`; true when it behaved.
+  (defn run-valid [i : int root : Node ctx : cstr] : bool
+    (let [sel  (__row-sel i)
+          want (__row-want i)
+          skip (__row-skip i)]
+      (match (selector-compile sel)
+        (Err e) (let [ok (not (__empty? skip))]
+                  (if (not ok) (__say ctx sel (selector-error-message e)) nil)
+                  (selector-error-release e)
+                  ok)
+        (Ok s)  (if (not (__empty? skip))
+                  (do (__say ctx sel "compiled, but dom/select should reject it")
+                      (selector-free s)
+                      false)
+                  (do (__ids-reset)
+                      (__collect (select-all root s))
+                      (let [all-ok   (__same? ctx sel (__ids) want)
+                            no-clone (not (__clone-hit?))
+                            first    (match (select-first root s)
+                                       (Some n) (__id-of n)
+                                       (None)   "")
+                            first-ok (__same? "select-first" sel first (__first-want want))]
+                        (if (not no-clone) (__say ctx sel "matched an out-of-scope clone") nil)
+                        (selector-free s)
+                        (and all-ok (and no-clone first-ok))))))))
+  ;;; run-context -- every valid row that runs in ctx; the failures.
+  (defn run-context [root : Node ctx : cstr n : int] : int
+    (let [^mut i     0
+          ^mut fails 0]
+      (while (< i n)
+        (if (and (__row-valid? i) (__row-runs? i ctx))
+          (if (run-valid i root ctx) nil (set! fails (+ fails 1)))
+          nil)
+        (set! i (+ i 1)))
+      fails))
+  ;;; run-invalid -- every invalid row must fail to compile; the failures.
+  (defn run-invalid [n : int] : int
+    (let [^mut i     0
+          ^mut fails 0]
+      (while (< i n)
+        (if (__row-valid? i)
+          nil
+          (match (selector-compile (__row-sel i))
+            (Ok s)  (do (__say "invalid" (__row-sel i) "compiled")
+                        (selector-free s)
+                        (set! fails (+ fails 1)))
+            (Err e) (selector-error-release e)))
+        (set! i (+ i 1)))
+      fails))
+  ;;; count-rows -- rows of one kind: valid ones that run in ctx with a
+  ;;; skip reason (skipped = true) or without.
+  (defn count-rows [n : int ctx : cstr skipped : bool] : int
+    (let [^mut i 0
+          ^mut c 0]
+      (while (< i n)
+        (if (and (__row-valid? i)
+                 (and (__row-runs? i ctx) (= skipped (not (__empty? (__row-skip i))))))
+          (set! c (+ c 1))
+          nil)
+        (set! i (+ i 1)))
+      c))
+  ;; ---- the special elements (WPT's setupSpecialElements) ---------------------------
+  ;;; __must -- unwrap an edit result, panicking on an error.
+  (defn __must [r : (Result Node EditError)] : Node
+    (match r
+      (Ok n)  n
+      (Err _) (panic "edit failed")))
+  ;;; __done -- unwrap a nil edit result.
+  (defn __done [r : (Result nil EditError)] : nil
+    (match r
+      (Ok _)  nil
+      (Err _) (panic "edit failed")))
+  ;;; __ns-divs -- a div with id `id` holding the four namespace divs.
+  (defn __ns-divs [d : Document id : cstr] : Node
+    (let [box (__must (create-element d "div"))
+          a   (__must (create-element d "div"))
+          b   (__must (create-element-ns d "http://www.w3.org/1999/xhtml" "div"))
+          c   (__no-ns-div d)
+          e   (__must (create-element-ns d "http://www.example.org/ns" "div"))]
+      (__done (set-attr! box "id" id))
+      (__done (set-attr! a "id" (__cat id "-div1")))
+      (__done (set-attr! b "id" (__cat id "-div2")))
+      (__done (set-attr! c "id" (__cat id "-div3")))
+      (__done (set-attr! e "id" (__cat id "-div4")))
+      (__done (node-append! box a))
+      (__done (node-append! box b))
+      (__done (node-append! box c))
+      (__done (node-append! box e))
+      box))
+;;; __no-ns-div -- internal: a detached `div` in no namespace.
+  ;;;
+  ;;; createElementNS("", "div"). dom/edit puts an element created with no
+  ;;; namespace in an HTML document into the XHTML namespace, as
+  ;;; createElement does, so this goes through the builder entry point.
+  (defn __no-ns-div [d : Document] : Node
+    (:: (__no-ns-div-raw d) Node))
+  ;;; __no-ns-div-raw -- internal.
+  (defn __no-ns-div-raw [d : Document] : ptr<void>
+    ```c
+    extern void *turdom_doc_node(void *);
+  extern void *turdom_append_element(void *, void *, const char *, const char *,
+                                     const char *, int64_t, int64_t);
+  extern void turdom_remove(void *);
+  void *el = turdom_append_element((void *)(intptr_t)d, turdom_doc_node((void *)(intptr_t)d),
+                                   "div", NULL, NULL, 0, 0);
+  turdom_remove(el);
+  return el;
+  ```)
+  ;;; __cat -- internal: concatenation into a fresh (leaked, test-only) cstr.
+  (defn __cat [a : cstr b : cstr] : cstr
+    ```c
+    size_t la = strlen((const char *)a), lb = strlen((const char *)b);
+  char *o = (char *)malloc(la + lb + 1);
+  memcpy(o, a, la); memcpy(o + la, b, lb); o[la + lb] = '\0';
+  return o;
+  ```)
+  ;;; __by-id -- the element with this id, which must exist.
+  (defn __by-id [root : Node id : cstr] : Node
+    (match (query-one root (__cat "#" id))
+      (Ok (Some n)) n
+      (Ok (None))   (panic "no such id")
+      (Err _)       (panic "bad id selector")))
+  ;;; setup-special -- add WPT's special elements under #root.
+  (defn setup-special [d : Document root : Node] : nil
+    (__done (node-append! root (__must (create-element d "null"))))
+    (__done (node-append! root (__must (create-element d "undefined"))))
+    (__done (node-append! root (__ns-divs d "any-namespace")))
+    (__done (node-append! root (__ns-divs d "no-namespace")))
+    (__done (set-attr-ns! (__by-id root "attr-presence-i1") "http://www.example.org/ns" "title" "")))
+  ;;; __mark-clones -- set data-clone on every element under (and at) n.
+  (defn __mark-clones [n : Node] : nil
+    (__done (set-attr! n "data-clone" ""))
+    (match (query n "*")
+      (Ok ns) (__mark-list ns)
+      (Err _) (panic "bad selector")))
+  ;;; __mark-list -- internal.
+  (defn __mark-list [ns : (Cons Node)] : nil
+    (if (tnil? ns)
+      nil
+      (do (__done (set-attr! (thead ns) "data-clone" ""))
+          (__mark-list (ttail ns)))))
+  ;; ---- css paths ------------------------------------------------------------------------
+  ;;; __path-ok? -- does node-css-path pick exactly n?
+  (defn __path-ok? [top : Node n : Node] : bool
+    (let [p  (node-css-path n)
+          ok (match (query top (to-cstr p))
+               (Ok ns) (and (not (tnil? ns))
+                            (and (tnil? (ttail ns)) (__ptr-eq? (thead ns) n)))
+               (Err e) (do (selector-error-release e) false))]
+      (if (not ok) (__say "css-path" (to-cstr p) "does not pick its element") nil)
+      (release p)
+      ok))
+  ;;; __ptr-eq? -- internal: node identity.
+  (defn __ptr-eq? [a : Node b : Node] : bool
+    ```c
+    return (void *)(intptr_t)a == (void *)(intptr_t)b;
+  ```)
+  ;;; path-failures -- elements under top whose path does not round-trip.
+  (defn path-failures [top : Node] : int
+    (match (query top "*")
+      (Ok ns) (__path-loop top ns 0)
+      (Err _) 1))
+  ;;; __path-loop -- internal.
+  (defn __path-loop [top : Node ns : (Cons Node) acc : int] : int
+    (if (tnil? ns)
+      acc
+      (__path-loop top
+                   (ttail ns)
+                   (if (__path-ok? top (thead ns)) acc (+ acc 1)))))
+  ;;; __path-is? -- does n's css path read exactly `want`?
+  (defn __path-is? [n : Node want : cstr] : bool
+    (let [p  (node-css-path n)
+          ok (__same? "css-path" "" (to-cstr p) want)]
+      (release p)
+      ok))
+  ;;; __err-is? -- does compiling src fail with a message containing needle?
+  (defn __err-is? [src : cstr needle : cstr] : bool
+    (match (selector-compile src)
+      (Ok s)  (do (selector-free s) false)
+      (Err e) (let [ok (__contains? (selector-error-message e) needle)]
+                (if (not ok) (__say "error" src (selector-error-message e)) nil)
+                (selector-error-release e)
+                ok)))
+  ;;; __contains? -- internal.
+  (defn __contains? [s : cstr needle : cstr] : bool
+    ```c
+    return strstr((const char *)s, (const char *)needle) != NULL;
+  ```)
+  ;;; __ids-of-query -- the ids `query` finds, space-separated.
+  (defn __ids-of-query [root : Node src : cstr] : cstr
+    (__ids-reset)
+    (match (query root src)
+      (Ok ns) (__collect ns)
+      (Err e) (do (__say "query" src (selector-error-message e))
+                  (selector-error-release e)))
+    (__ids))
+  ;;; __wide-page -- 2000 sibling divs and no span (malloc'd, test only).
+  (defn __wide-page [] : cstr
+    ```c
+    char *b = (char *)malloc(2000 * 11 + 1);
+  b[0] = '\0';
+  for (int i = 0; i < 2000; i++) strcat(b, "<div></div>");
+  return b;
+  ```)
+  ;;; __gave-up? -- does query fail with the :has() budget error?
+  (defn __gave-up? [top : Node src : cstr] : bool
+    (match (query top src)
+      (Ok _)  false
+      (Err e) (let [ok (__contains? (selector-error-message e) "gave up")]
+                (selector-error-release e)
+                ok)))
+  (defn __all-tests [] : void
+    (let [n    (__tsv-load "tests/data/wpt-selectors/selectors.tsv")
+          src  (__read-file "tests/data/wpt-selectors/ParentNode-querySelector-All-content.html")
+          d    (html-parse src)
+          top  (dom-node d)
+          root (__by-id top "root")]
+      (setup-special d root)
+      (describe "WPT selectors.js (tests/data/wpt-selectors)"
+        (it "loads the table" (> n 200))
+        (it "every invalid selector is a compile error" (= 0 (run-invalid n)))
+        (it "runs the document context" (> (count-rows n "document" false) 150))
+        (it "document context" (= 0 (run-context top "document" n)))
+        (it "rejected pseudo-classes are errors, not empty results"
+          (> (count-rows n "document" true) 10))
+        (let [detached (__must (node-clone root))]
+          (it "detached-element context" (= 0 (run-context detached "detached" n))))
+        (let [out (__must (node-clone root))]
+          (__mark-clones out)
+          (__done (node-append! (__by-id top "body") out))
+          (it "in-document element context (a marked clone never matches)"
+            (= 0 (run-context root "element" n)))))
+      (describe "node-css-path"
+        (it "every element of the WPT document round-trips" (= 0 (path-failures top)))
+        (let [f (html-parse "<ul><li>a</li><li>b<b>x</b></li></ul><p id=a></p><p id=a><i></i></p>")
+              t (dom-node f)]
+          (it "round-trips a document with duplicate ids" (= 0 (path-failures t)))
+          (it "stops at a unique id"
+            (match (query-one t "b")
+              (Ok (Some b)) (__path-is? b "html:nth-child(1):root > body:nth-child(2) > ul:nth-child(1) > li:nth-child(2) > b:nth-child(1)")
+              (Ok (None))   false
+              (Err _)       false))
+          (it "uses a unique id when there is one"
+            (let [fd (html-parse-fragment "div" "<p id=x><i>a</i><i>b</i></p>")
+                  ok (match (query-one (dom-node fd) "i + i")
+                       (Ok (Some i)) (__path-is? i "#x > i:nth-child(2)")
+                       (Ok (None))   false
+                       (Err _)       false)]
+              (dom-free fd)
+              ok))
+          (it "skips an id that is not unique"
+            (match (query-one t "i")
+              (Ok (Some i)) (__path-is? i "html:nth-child(1):root > body:nth-child(2) > p:nth-child(3) > i:nth-child(1)")
+              (Ok (None))   false
+              (Err _)       false))
+          (dom-free f)))
+      (describe "matches, closest, query"
+        (it "node-matches-selector?"
+          (match (selector-compile "div#root > p, #root")
+            (Ok s)  (let [r (node-matches-selector? root s)]
+                      (selector-free s)
+                      r)
+            (Err _) false))
+        (it "node-closest finds the nearest matching ancestor"
+          (match (selector-compile "div[id]")
+            (Ok s)  (let [r (match (node-closest (__by-id top "universal-code1") s)
+                              (Some x) (__same? "closest" "div[id]" (__id-of x) "universal")
+                              (None)   false)]
+                      (selector-free s)
+                      r)
+            (Err _) false))
+        (it "query-one on a bad selector is an Err naming the problem"
+          (__err-is? "p:hover" "':hover'"))
+        (it "query reports an undeclared namespace"
+          (__err-is? "svg|rect" "unknown namespace prefix 'svg'"))
+        (it "a :has() past its budget makes query an Err, not a short answer"
+          (let [w  (html-parse (__wide-page))
+                ok (__gave-up? (dom-node w) "div:has(~ span)")]
+            (dom-free w)
+            ok))
+        (it "the same :has() on a small page answers"
+          (let [w  (html-parse "<div></div><div></div><span></span>")
+                ok (__same? "query" "div:has(~ span)"
+                            (__ids-of-query (dom-node w) "div:has(~ span)") "- -")]
+            (dom-free w)
+            ok))
+        (it "query from an element looks above it for combinators"
+          (__same? "query" "html #universal-p1 code"
+                   (__ids-of-query (__by-id top "universal") "html #universal-p1 code")
+                   "universal-code1")))
+      (dom-free d)))
+  (defn main [] : int (__all-tests) (run-all-status))) ;; end defmodule html_select_test

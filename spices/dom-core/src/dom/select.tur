@@ -1,0 +1,436 @@
+;;; dom/select -- CSS selectors over a Document, and a selector for any node.
+;;;
+;;; `selector-compile` turns a selector list into a `Selector`; `select-all`,
+;;; `select-first`, `node-matches-selector?` and `node-closest` run it, with
+;;; `querySelectorAll`, `querySelector`, `matches` and `closest` semantics.
+;;; `query` and `query-one` compile, run and free in one call. The engine is
+;;; c/dom/turdom_select.c, shared by tur-xml and tur-html trees.
+;;;
+;;; Supported: type and universal selectors with namespace prefixes (`ns|E`,
+;;; `*|E`, `|E`), `#id`, `.class`, the seven attribute operators with the
+;;; `i` / `s` flags, the four combinators, `:root`, `:scope`, `:empty`, the
+;;; `-child` / `-of-type` family including `:nth-child(An+B of S)`, `:not()`,
+;;; `:is()`, `:where()` and `:has()`. Selector lists match in document order,
+;;; each element once. Anything else is a compile error naming it -- never a
+;;; selector that silently matches nothing: pseudo-elements, the dynamic and
+;;; UI-state pseudo-classes (`:hover`, `:checked`, ...), `:lang()`, `:dir()`.
+;;;
+;;; Case follows the HTML and CSS specs: in an HTML document, type selectors
+;;; and attribute names ignore ASCII case on HTML elements, as do the values
+;;; of HTML's case-insensitive attributes (`type`, `lang`, ...); `#id` and
+;;; `.class` are case-sensitive (every document is treated as no-quirks). XML
+;;; is case-sensitive throughout.
+;;;
+;;; Namespaces: an unprefixed type selector matches the local name in any
+;;; namespace, unless `selector-compile-ns` declares a default (the "" prefix).
+;;; That differs from `find-all`, which matches the qualified name as written.
+;;; `atom:feed` is not a type selector -- the colon starts a pseudo-class --
+;;; so write `atom|feed` with a prefix map, or `atom\:feed` for the qualified
+;;; name as written.
+;;;
+;;; A compiled Selector owns its memory and is freed with `selector-free`.
+;;; Compile once outside a loop, as with `regex-compile`.
+;;;
+;;; Since: 0.3.0
+;; Selectors over c/dom/turdom_select.c.
+(defmodule dom/select
+  (export Selector
+    SelectorError
+    selector-error-message
+    selector-error-release
+    selector-compile
+    selector-compile-ns
+    selector-free
+    selector-gave-up?
+    select-all
+    select-first
+    node-matches-selector?
+    node-closest
+    query
+    query-one
+    node-css-path)
+  (import dom/ownstr :refer [String from-cstr to-cstr adopt-cstr release])
+  (import dom/core :refer [Node])
+  ;;; Selector -- a compiled selector list. Owns its memory; free it with
+  ;;; `selector-free`.
+  (defopaque Selector :ptr<void>)
+  ;;; SelectorError -- why a selector did not compile, and where.
+  ;;;
+  ;;; `msg` is owned (`selector-error-release` drops it); `offset` is the byte
+  ;;; offset in the selector source where the problem was found.
+  (defstruct ^copy SelectorError [msg : String offset : int])
+  ;;; selector-error-message -- borrow the message of a SelectorError.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the error
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- valid until `selector-error-release`.
+  ;;;
+  ;;; Example:
+  ;;;   (selector-error-message e)   ; => "unknown pseudo-class ':frob'"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn selector-error-message [e : SelectorError] : cstr (to-cstr (.msg e)))
+  ;;; selector-error-release -- release the String a SelectorError owns.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the error, not used afterwards
+  ;;;
+  ;;; Example:
+  ;;;   (selector-error-release e)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn selector-error-release [e : SelectorError] : nil (release (.msg e)))
+  ;; ---------------------------------------------------------------------------
+  ;; Raw helpers. Inline C deals in bare pointers; the opaques are applied here.
+  ;; ---------------------------------------------------------------------------
+  ;;; __sel-null? -- internal: is this a null pointer?
+  (defn __sel-null? [p : ptr<void>] : bool
+    ```c
+    return p == NULL;
+  ```)
+  ;;; __sel-null-cstr? -- internal: is this a null cstr?
+  (defn __sel-null-cstr? [p : cstr] : bool
+    ```c
+    return p == NULL;
+  ```)
+  ;;; __sel-null-ptr -- internal: the null pointer.
+  (defn __sel-null-ptr [] : ptr<void>
+    ```c
+    return NULL;
+  ```)
+  ;;; __sel-opt-node -- internal: a nullable node pointer as an (Option Node).
+  (defn __sel-opt-node [p : ptr<void>] : (Option Node)
+    (if (__sel-null? p) (None) (Some (:: p Node))))
+  ;;; __nsmap-new -- internal: an empty prefix map.
+  (defn __nsmap-new [] : ptr<void>
+    ```c
+    extern void *turdom_nsmap_new(void);
+  return turdom_nsmap_new();
+  ```)
+  ;;; __nsmap-add -- internal: bind a prefix in a prefix map.
+  (defn __nsmap-add [m : ptr<void> prefix : cstr uri : cstr] : nil
+    ```c
+    extern int turdom_nsmap_add(void *, const char *, const char *);
+  turdom_nsmap_add(m, (const char *)prefix, (const char *)uri);
+  ```)
+  ;;; __nsmap-free -- internal.
+  (defn __nsmap-free [m : ptr<void>] : nil
+    ```c
+    extern void turdom_nsmap_free(void *);
+  turdom_nsmap_free(m);
+  ```)
+  ;;; __nsmap-fill -- internal: add every pair of a prefix list.
+  (defn __nsmap-fill [m : ptr<void> ns : (Cons (Pair cstr cstr))] : nil
+    (if (tnil? ns)
+      nil
+      (let [p (thead ns)]
+        (__nsmap-add m (pair-fst p) (pair-snd p))
+        (__nsmap-fill m (ttail ns)))))
+  ;;; __sel-compile-raw -- internal: compile against a prefix map (or NULL).
+  (defn __sel-compile-raw [src : cstr ns : ptr<void>] : ptr<void>
+    ```c
+    extern void *turdom_selector_compile(const char *, const void *);
+  return turdom_selector_compile((const char *)src, ns);
+  ```)
+  ;;; __sel-error-raw -- internal: the compile error, or NULL.
+  (defn __sel-error-raw [s : ptr<void>] : cstr
+    ```c
+    extern const char *turdom_selector_error(const void *);
+  return turdom_selector_error(s);
+  ```)
+  ;;; __sel-error-offset -- internal: the compile error's byte offset.
+  (defn __sel-error-offset [s : ptr<void>] : int
+    ```c
+    extern int64_t turdom_selector_error_offset(const void *);
+  return turdom_selector_error_offset(s);
+  ```)
+  ;;; __sel-free-raw -- internal.
+  (defn __sel-free-raw [s : ptr<void>] : nil
+    ```c
+    extern void turdom_selector_free(void *);
+  turdom_selector_free(s);
+  ```)
+  ;;; __sel-result -- internal: a compiled (or failed) selector as a Result.
+  (defn __sel-result [s : ptr<void>] : (Result Selector SelectorError)
+    (cond (__sel-null? s) (Err (SelectorError (from-cstr "out of memory") 0))
+          (__sel-null-cstr? (__sel-error-raw s)) (Ok (:: s Selector))
+          :else (let [e (SelectorError (from-cstr (__sel-error-raw s))
+                                       (__sel-error-offset s))]
+                  (__sel-free-raw s)
+                  (Err e))))
+  ;;; selector-compile -- compile a CSS selector list.
+  ;;;
+  ;;; Parameters:
+  ;;;   src -- the selector list, e.g. "ul > li.item:not(.done)"
+  ;;;
+  ;;; Returns:
+  ;;;   (Result Selector SelectorError) -- Err for a selector that does not
+  ;;;   parse, uses an undeclared namespace prefix, or uses a construct this
+  ;;;   engine does not support; the message names it.
+  ;;;
+  ;;; Example:
+  ;;;   (match (selector-compile "a[href^=\"https:\"]")
+  ;;;     (Ok s)  (do (println (tlength (select-all (dom-node d) s)))
+  ;;;                 (selector-free s))
+  ;;;     (Err e) (do (println (selector-error-message e))
+  ;;;                 (selector-error-release e)))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn selector-compile [src : cstr] : (Result Selector SelectorError)
+    (__sel-result (__sel-compile-raw src (__sel-null-ptr))))
+  ;;; selector-compile-ns -- compile a selector list with namespace prefixes.
+  ;;;
+  ;;; Each pair binds a prefix to a namespace URI for `prefix|name`; the
+  ;;; prefixes in the document do not matter, only the URIs. The "" prefix
+  ;;; is the default namespace, which unprefixed type selectors (and the
+  ;;; implied `*`) then require.
+  ;;;
+  ;;; Parameters:
+  ;;;   src -- the selector list
+  ;;;   ns  -- (prefix, URI) pairs; the list is not kept
+  ;;;
+  ;;; Returns:
+  ;;;   (Result Selector SelectorError)
+  ;;;
+  ;;; Example:
+  ;;;   (selector-compile-ns "atom|entry > atom|title"
+  ;;;                        (tcons-of (pair "atom" "http://www.w3.org/2005/Atom") (tnil)))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn selector-compile-ns [src : cstr ns : (Cons (Pair cstr cstr))] : (Result
+                                                                          Selector
+                                                                          SelectorError)
+    (let [m (__nsmap-new)]
+      (__nsmap-fill m ns)
+      (let [s (__sel-compile-raw src m)]
+        (__nsmap-free m)
+        (__sel-result s))))
+  ;;; selector-free -- release a compiled selector.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the selector, not used afterwards
+  ;;;
+  ;;; Example:
+  ;;;   (selector-free s)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn selector-free [s : Selector] : nil (__sel-free-raw (:: s ptr<void>)))
+  ;;; __sel-reset -- internal: refill the :has() budget before a query.
+  (defn __sel-reset [s : Selector] : nil
+    ```c
+    extern void turdom_selector_reset(void *);
+  turdom_selector_reset((void *)(intptr_t)s);
+  ```)
+  ;;; selector-gave-up? -- did a `:has()` run out of budget in the last query?
+  ;;;
+  ;;; `:has()` tests candidates under (or beside) each element, which is
+  ;;; quadratic on the wrong input. Each query (`select-all`, `select-first`,
+  ;;; `node-matches-selector?`, `node-closest`) allows it a million candidate
+  ;;; tests; past that, the `:has()` answers false and this reports it, so a
+  ;;; short result can be told apart from a complete one. `query` and
+  ;;; `query-one` turn it into an Err.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the selector
+  ;;;
+  ;;; Returns:
+  ;;;   bool -- true when the last query's results may be incomplete.
+  ;;;
+  ;;; Example:
+  ;;;   (selector-gave-up? s)   ; => false
+  ;;;
+  ;;; Since: 0.3.0
+  (defn selector-gave-up? [s : Selector] : bool
+    ```c
+    extern int turdom_selector_budget_hit(const void *);
+  return turdom_selector_budget_hit((const void *)(intptr_t)s) != 0;
+  ```)
+  ;;; __sel-prev-raw -- internal: the previous match in document order.
+  (defn __sel-prev-raw [s : Selector root : Node from : ptr<void>] : ptr<void>
+    ```c
+    extern void *turdom_select_prev(void *, const void *, const void *);
+  return turdom_select_prev((void *)(intptr_t)s, (const void *)(intptr_t)root, from);
+  ```)
+  ;;; __sel-next-raw -- internal: the next match in document order.
+  (defn __sel-next-raw [s : Selector root : Node from : ptr<void>] : ptr<void>
+    ```c
+    extern void *turdom_select_next(void *, const void *, const void *);
+  return turdom_select_next((void *)(intptr_t)s, (const void *)(intptr_t)root, from);
+  ```)
+  ;;; __select-acc -- internal: collect matches back to front.
+  (defn __select-acc [s : Selector
+                      root : Node
+                      from : ptr<void>
+                      acc : (Cons Node)] : (Cons Node)
+    (let [p (__sel-prev-raw s root from)]
+      (if (__sel-null? p)
+        acc
+        (__select-acc s root p (tcons-of (:: p Node) acc)))))
+  ;;; select-all -- every descendant of `root` that matches, in document order.
+  ;;;
+  ;;; `querySelectorAll` semantics: candidates are `root`'s descendants, but
+  ;;; combinators may look above `root` -- `div p` from a `<p>`'s parent finds
+  ;;; the `<p>` even when the `div` is above it. `:scope` is `root` (`:root`
+  ;;; when `root` is the document node). The result is a snapshot, so
+  ;;; removing each node it holds is safe.
+  ;;;
+  ;;; Parameters:
+  ;;;   root -- where to search (often `(dom-node d)`)
+  ;;;   s    -- the compiled selector
+  ;;;
+  ;;; Returns:
+  ;;;   (Cons Node) -- `(tnil)` when nothing matches.
+  ;;;
+  ;;; Example:
+  ;;;   (tlength (select-all (dom-node d) s))   ; => number of matches
+  ;;;
+  ;;; Since: 0.3.0
+  (defn select-all [root : Node s : Selector] : (Cons Node)
+    (__sel-reset s)
+    (__select-acc s root (__sel-null-ptr) (tnil)))
+  ;;; select-first -- the first descendant of `root` that matches.
+  ;;;
+  ;;; Parameters:
+  ;;;   root -- where to search
+  ;;;   s    -- the compiled selector
+  ;;;
+  ;;; Returns:
+  ;;;   (Option Node) -- the first match in document order, as `select-all` would
+  ;;;   list it; none when nothing matches.
+  ;;;
+  ;;; Example:
+  ;;;   (select-first (dom-node d) s)
+  ;;;
+  ;;; Since: 0.3.0
+  (defn select-first [root : Node s : Selector] : (Option Node)
+    (__sel-reset s)
+    (__sel-opt-node (__sel-next-raw s root (__sel-null-ptr))))
+  ;;; __sel-matches-raw -- internal: Element.matches with a scope.
+  (defn __sel-matches-raw [s : Selector n : Node] : bool
+    ```c
+    extern int turdom_selector_matches(void *, const void *, const void *);
+  return turdom_selector_matches((void *)(intptr_t)s, (const void *)(intptr_t)n,
+                                 (const void *)(intptr_t)n) != 0;
+  ```)
+  ;;; node-matches-selector? -- does element `n` match? (`Element.matches`)
+  ;;;
+  ;;; `:scope` is `n` itself.
+  ;;;
+  ;;; Parameters:
+  ;;;   n -- the node
+  ;;;   s -- the compiled selector
+  ;;;
+  ;;; Returns:
+  ;;;   bool -- false for every non-element.
+  ;;;
+  ;;; Example:
+  ;;;   (node-matches-selector? li s)   ; => true
+  ;;;
+  ;;; Since: 0.3.0
+  (defn node-matches-selector? [n : Node s : Selector] : bool
+    (__sel-reset s)
+    (__sel-matches-raw s n))
+  ;;; __closest-raw -- internal.
+  (defn __closest-raw [s : Selector n : Node] : ptr<void>
+    ```c
+    extern void *turdom_closest(void *, const void *);
+  return turdom_closest((void *)(intptr_t)s, (const void *)(intptr_t)n);
+  ```)
+  ;;; node-closest -- `n` or its nearest ancestor element that matches.
+  ;;; (`Element.closest`)
+  ;;;
+  ;;; Parameters:
+  ;;;   n -- where to start
+  ;;;   s -- the compiled selector; `:scope` is `n`
+  ;;;
+  ;;; Returns:
+  ;;;   (Option Node) -- none when no element on the way up matches, or when
+  ;;;   `n` is not an element.
+  ;;;
+  ;;; Example:
+  ;;;   (node-closest link s)   ; e.g. the enclosing <li class="item">
+  ;;;
+  ;;; Since: 0.3.0
+  (defn node-closest [n : Node s : Selector] : (Option Node)
+    (__sel-reset s)
+    (__sel-opt-node (__closest-raw s n)))
+  ;;; __gave-up-error -- internal: the Err query returns past the budget.
+  (defn __gave-up-error [] : SelectorError
+    (SelectorError (from-cstr "':has()' gave up after 1000000 candidate tests; the result would be incomplete")
+                   0))
+  ;;; query -- compile, `select-all`, free.
+  ;;;
+  ;;; For a one-off query; compile once with `selector-compile` when the same
+  ;;; selector runs many times.
+  ;;;
+  ;;; Parameters:
+  ;;;   root -- where to search
+  ;;;   src  -- the selector list
+  ;;;
+  ;;; Returns:
+  ;;;   (Result (Cons Node) SelectorError) -- Err when the selector does not
+  ;;;   compile, or when a `:has()` ran out of budget (see
+  ;;;   `selector-gave-up?`).
+  ;;;
+  ;;; Example:
+  ;;;   (query (dom-node d) "nav a[href]")   ; => (Ok (a1 a2 ...))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn query [root : Node src : cstr] : (Result (Cons Node) SelectorError)
+    (match (selector-compile src)
+      (Err e) (Err e)
+      (Ok s)  (let [r (select-all root s)
+                    g (selector-gave-up? s)]
+                (selector-free s)
+                (if g (Err (__gave-up-error)) (Ok r)))))
+  ;;; query-one -- compile, `select-first`, free.
+  ;;;
+  ;;; Parameters:
+  ;;;   root -- where to search
+  ;;;   src  -- the selector list
+  ;;;
+  ;;; Returns:
+  ;;;   (Result (Option Node) SelectorError) -- as `query`.
+  ;;;
+  ;;; Example:
+  ;;;   (query-one (dom-node d) "head > title")   ; => (Ok (Some title))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn query-one [root : Node src : cstr] : (Result (Option Node) SelectorError)
+    (match (selector-compile src)
+      (Err e) (Err e)
+      (Ok s)  (let [r (select-first root s)
+                    g (selector-gave-up? s)]
+                (selector-free s)
+                (if g (Err (__gave-up-error)) (Ok r)))))
+  ;;; __css-path-raw -- internal: malloc'd path, or an empty string.
+  (defn __css-path-raw [n : Node] : cstr
+    ```c
+    extern char *turdom_css_path(const void *, size_t *);
+  size_t len = 0;
+  char *s = turdom_css_path((const void *)(intptr_t)n, &len);
+  if (!s) { s = (char *)malloc(1); if (s) s[0] = '\0'; }
+  return s;
+  ```)
+  ;;; node-css-path -- a selector that picks exactly this element.
+  ;;;
+  ;;; Steps of `tag:nth-child(k)` joined by ` > `, from the top element
+  ;;; (anchored with `:root`) or from the nearest ancestor whose `id` is
+  ;;; unique in the document (`#id`, checked, not assumed). So
+  ;;; `(select-first (dom-node d) <compiled path>)` is `n` again -- which is
+  ;;; what makes "which node was that?" answerable in a scraper's log. A path
+  ;;; only means something for the tree it was computed on.
+  ;;;
+  ;;; Parameters:
+  ;;;   n -- an element
+  ;;;
+  ;;; Returns:
+  ;;;   String -- owned; empty when `n` is not an element.
+  ;;;
+  ;;; Example:
+  ;;;   (to-cstr (node-css-path li))   ; => "#menu > li:nth-child(2)"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn node-css-path [n : Node] : String (adopt-cstr (__css-path-raw n)))) ;; end defmodule dom/select
