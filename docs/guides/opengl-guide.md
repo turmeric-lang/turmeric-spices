@@ -49,7 +49,7 @@ the linear-algebra side.
 ## The one idea
 
 Every GPU object -- a vertex array, a buffer, a shader, a program, a
-texture, a window -- is a `:linear` opaque. It is produced once and must be
+texture, a window -- is a `^linear` opaque. It is produced once and must be
 consumed exactly once by its deleting peer:
 
 | Handle | Consumed by |

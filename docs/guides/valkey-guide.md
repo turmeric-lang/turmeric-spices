@@ -44,7 +44,7 @@ Nothing to install on the host.
 
 ## The one idea
 
-`Client` is a `:linear` opaque. A connection extracted with `ok-val` on
+`Client` is a `^linear` opaque. A connection extracted with `ok-val` on
 `client-connect` must be released exactly once with `client-close`
 (`redisFree`). The command, pubsub, and ping operations take it by
 `^borrow`, observing the connection without discharging that obligation.

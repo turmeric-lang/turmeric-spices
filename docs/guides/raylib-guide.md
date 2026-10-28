@@ -133,7 +133,7 @@ named presets: `red`, `green`, `blue`, `white`, `black`, `gray`, `yellow`,
   (unload-font font))
 ```
 
-`Font` is a `:linear` opaque: a handle from `load-font` must be released
+`Font` is a `^linear` opaque: a handle from `load-font` must be released
 exactly once with `unload-font`. Under `-Xsubstructural` this becomes a
 compile-time error; in ordinary builds it is inert.
 
@@ -151,14 +151,14 @@ compile-time error; in ordinary builds it is inert.
   (unload-texture tex))
 ```
 
-`Texture2D` is a `:linear` opaque: a handle from `load-texture` must be
+`Texture2D` is a `^linear` opaque: a handle from `load-texture` must be
 released exactly once with `unload-texture`. The draw operations take it by
 `^borrow` -- they do not consume the handle.
 
 ### Linear resource handles
 
 The handles with an `unload-*` peer -- `Texture2D`, `Font`, `Model`,
-`Sound`, `Music` -- are `:linear` opaques. Under `-Xsubstructural`:
+`Sound`, `Music` -- are `^linear` opaques. Under `-Xsubstructural`:
 
 - Use-after-unload is a compile-time error (`TUR-E0101`)
 - Leaked GPU/audio resources are a compile-time error (`TUR-E0100`)
@@ -234,7 +234,7 @@ streamed audio (longer tracks):
   (unload-music-stream music))
 ```
 
-Both `Sound` and `Music` are `:linear` opaques -- release with
+Both `Sound` and `Music` are `^linear` opaques -- release with
 `unload-sound` / `unload-music-stream` exactly once.
 
 ---
@@ -263,7 +263,7 @@ and projection mode (`0`=perspective, `1`=orthographic). `update-camera`
 applies built-in camera controls (arrow keys to orbit, mouse wheel to
 zoom) when called each frame.
 
-`Model` is a `:linear` opaque -- release with `unload-model`.
+`Model` is a `^linear` opaque -- release with `unload-model`.
 
 ---
 

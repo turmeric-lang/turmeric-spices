@@ -200,7 +200,7 @@ way:
   (import msgpack/buf    :refer [buf->hex buf-free])
   (import msgpack/decode :refer [mp-parse mp-tree-root mp-tree-free])
 
-  (defdata Event :copy [] (Click :int :int) (Scroll :int))
+  (defdata ^copy Event [] (Click :int :int) (Scroll :int))
   (derive-msgpack-sum Event
     (Click (x int) (y int))
     (Scroll (dy int)))
@@ -222,7 +222,7 @@ defmodule demo
   import msgpack/buf    :refer [buf->hex buf-free]
   import msgpack/decode :refer [mp-parse mp-tree-root mp-tree-free]
 
-  defdata Event :copy [] (Click :int :int) (Scroll :int)
+  defdata ^copy Event [] (Click :int :int) (Scroll :int)
   derive-msgpack-sum Event
     (Click (x int) (y int))
     (Scroll (dy int))

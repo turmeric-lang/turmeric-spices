@@ -65,7 +65,7 @@ A socket talks only to a peer speaking the matching half. Sending on a
 receive-only socket is a runtime `err` carrying `NNG_ENOTSUP`, not a
 compile error -- per-protocol socket types are a deliberate non-goal for v0.
 
-`Socket` is `:linear`: a socket extracted with `ok-val` must be consumed
+`Socket` is `^linear`: a socket extracted with `ok-val` must be consumed
 exactly once, by `close`. Every other operation borrows it. Under
 substructural checking, double-close, use-after-close, and a leaked socket
 are compile-time errors (`TUR-E0101` / `TUR-E0100`).
@@ -486,7 +486,7 @@ slots in flight on one thread are the fan-out.
   (aio-free a))
 ```
 
-`Aio` is `:linear`: it must reach `aio-free` exactly once, and every other
+`Aio` is `^linear`: it must reach `aio-free` exactly once, and every other
 call borrows it. Submit with `send-payload-aio`, `send-str-aio` or
 `recv-aio`; then collect in whichever way suits the caller:
 
@@ -568,7 +568,7 @@ request-then-reply (REQ) cycle:
   (ctx-close c))
 ```
 
-`NngCtx` is `:linear`: `ctx-close` consumes it, and every other call borrows
+`NngCtx` is `^linear`: `ctx-close` consumes it, and every other call borrows
 it. Contexts come in two flavours, matching the two ways to be concurrent:
 
 | Flavour | Calls | Concurrency |
