@@ -210,6 +210,22 @@ nothing.
 The stdlib middleware are documented in the turmeric repo's
 [httpd middleware guide](https://turmeric-lang.com/docs/html/guides/httpd-middleware-guide.html).
 
+## Pages built in the source -- `tourist/markup`
+
+`html-response` answers 200 `text/html` with a page built from tur-html's
+markup literals: an `#html{...}` Fragment, a hiccup `Html` tree or a
+`#html-live{...}` evaluation (anything with dom/holes' `RenderHtml`
+instance). Their values are escaped when the literal is built, so a route can
+put request data straight in. Declare `tur-dom-core` and `tur-html` in your
+`:spices` to use it; `render-html` (`tourist/template`) stays for views kept
+in template files.
+
+```turmeric
+(get! "/hi/:name"
+  (fn [ctx : Ctx] : Response
+    (html-response (hiccup [:p.greeting "Hello, " (name-of ctx) "!"]))))
+```
+
 ## Status
 
 Early in development. See
@@ -234,6 +250,8 @@ queued headers on a short-circuit. `tests/wrap_test.tur` runs an app under
 panicking route answered 500 (and logged, and leak-free), a preflight answered
 without reaching tourist, the client address in the log, a 429.
 `tests/opts_test.tur` checks `ServerOpts` without a stack.
+`tests/markup_test.tur` checks `html-response` for each kind of literal,
+reading the Response directly.
 `tests/request_test.tur` covers every request helper and `serve-static!`'s
 ETag / 304 / binary / dotfile behaviour. Run them with `tur test tests`.
 

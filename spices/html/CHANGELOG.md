@@ -40,6 +40,8 @@
   attributes. `Html` gains `HComment`, `HCdata` and `HPi`, with checking
   constructors `comment`, `cdata`, `pi`; `attr-name-of` and `attr-value`
   read an attribute.
+- `RenderHtml` instances for `Html` and `LiveHtml` (the class is
+  dom-core's), so tourist's `html-response` takes either.
 - `node->hiccup` (follow-up D3): a parsed or built node as `Html`, each
   element pinned to its namespace; `hiccup->dom` of it is `dom-equal?` to
   the node across the html5lib corpus.

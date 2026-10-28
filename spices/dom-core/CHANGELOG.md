@@ -4,6 +4,10 @@
 
 ### Added
 
+- `RenderHtml` (dom/holes; xml-html-followups-plan A-3 / D2): a value that
+  is a whole HTML response body, for a web framework to take (tourist's
+  `html-response`). Instances: `Fragment` here, `Html` and `LiveHtml` in
+  tur-html.
 - `dom/holes` and `dom/markupc` (xml-html-followups-plan follow-up A1-A2):
   the shared halves of tur-html's `#html{...}` and tur-xml's `#xml{...}`
   markup literals. `dom/markupc` is the compile-time context tokenizer the
