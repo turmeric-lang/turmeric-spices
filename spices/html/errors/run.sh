@@ -97,7 +97,7 @@ expect_reject '<p>${b}</p>' "ToChild"
 # ---- hiccup (follow-up D1) ------------------------------------------------------
 #
 # expect_hiccup_reject <form> <witness>: `(hiccup <form>)` must not compile.
-# The form is Turmeric source; it may use `x` (a cstr) and `n` (an int).
+# The form is Turmeric source; it may use `x` (a cstr) and `k` (an int).
 expect_hiccup_reject() {
   local form="$1" witness="$2" f out
   n=$((n + 1))
@@ -160,7 +160,20 @@ expect_hiccup_reject '[:tr [:div "x"]]' "<div> directly in <tr>"
 echo "# hiccup: types, through the same classes as #html{}"
 expect_hiccup_reject '[:p #map{:title (hiccup [:b])} "x"]' "ToAttr"
 expect_hiccup_reject '[:a #map{:href true} "x"]' "ToUrlAttr"
-expect_hiccup_reject '[:p true]' "ToChild"
+expect_hiccup_reject '[:p true]' "ToHtml"
+echo "# hiccup: result positions (plan D1b)"
+expect_hiccup_reject '[:ul (let [v [:li x]] v)]' "wrap it in (hiccup ...)"
+expect_hiccup_reject '[:ul (str-concat [:li x])]' "wrap it in (hiccup ...)"
+expect_hiccup_reject '[:ul (when true [:li x] "y")]' "wrap it in (hiccup ...)"
+expect_hiccup_reject '[:ul (if [:b] "a" "b")]' "wrap it in (hiccup ...)"
+expect_hiccup_reject '[:table (if true [:td "x"])]' "<td> directly in <table>"
+expect_hiccup_reject '[:p (cond (> k 1) [:div "x"])]' "<div> inside <p>"
+expect_hiccup_reject '[:a (match (Some k) (Some v) [:a v] (None) "")]' "<a> inside <a>"
+expect_hiccup_reject '[:tr (do "x")]' "text directly in <tr>"
+expect_hiccup_reject '[:ul (if true [x])]' "a computed tag is not allowed"
+# A type error inside a rewritten branch points at the user's line and
+# column (the `(+ x 1)` in the literal), not at the expansion.
+expect_hiccup_reject '[:div (if true [:b (+ x 1)] [:i])]' "tur:5:59: error"
 
 # A raw-html value that cannot be written back panics at render time.
 n=$((n + 1))

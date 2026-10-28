@@ -408,10 +408,14 @@ An element is `[name attrs? child...]`:
   (or `to-url-attr` for `href`, `src` and the other URL attributes), exactly
   as in `#html{...}`: a `bool` is a boolean attribute, `None` drops the
   attribute, a URL is scheme-checked. A map `:class` joins the shorthand
-  classes. `:attrs*` splices a `(Cons Attr)` built at run time.
+  classes. `:attrs*` splices a `(Cons HAttr)` built at run time.
 - **children** -- string and number literals are text; nested vectors are
-  elements; anything else is a hole through `to-child`, which takes what
-  `#html{...}`'s content holes take plus `Html` and lists of `Html`.
+  elements; `if`, `let`, `list-map` and the other forms below have their
+  results rewritten; anything else is a hole through `to-html` (the
+  `ToHtml` class), which takes what `#html{...}`'s content holes take
+  (text, numbers, `Fragment`, `RawHtml`, `Option`, `Cons`), `Html` itself
+  (kept as a tree), parsed `Node`s, and -- through `(to-child x)` -- any
+  type with a `ToChild` instance.
 
 What the literal shows is checked at compile time: every name is a valid
 name; a void element (`br`, `img`, ...) takes no children; a second id; a
@@ -437,3 +441,94 @@ corpus -- and either can hold the other: an `Html` value goes in an
 
 `Html` nodes are heap-allocated and never freed; rendering a tree per
 request belongs in a `with-region` bracket.
+
+The type names carry an `H` (`HTag`, `HAttr`, `HAttrName`, `HRawBody`,
+`HCommentBody`, `HCdataBody`, `HPiBody`) because a type name is global in a
+program: tur-dom-core's SAX `Attr` and a spice's own `Tag` would otherwise
+collide with them.
+
+### Markup inside expressions
+
+A child that is an `if`, `when`, `unless`, `cond`, `do`, `let`, `match` or
+`for`, or a `list-map` over an inline one-parameter `fn`, has the markup in
+its result positions rewritten too, so the branches need no
+`(hiccup ...)` of their own and need not agree on a type:
+
+```turmeric
+(hiccup [:ul
+         (list-map rows
+           (fn [r : Row]
+             (if (.done r) [:li.done (.name r)] [:li (.name r)])))
+         (when (tnil? rows) [:li.empty "nothing yet"])
+         (match (find-user id)
+           (Some u) [:li "for " (.name u)]
+           (None)   "anonymous")])
+```
+
+| Form | Result positions |
+|---|---|
+| `if` | both branches; a missing `else` is empty |
+| `when` / `unless` | the last body form; the other case is empty |
+| `cond` | each result; a missing `:else` is empty |
+| `do`, `let` | the last body form |
+| `match` | each arm's body |
+| `for` | the last body form, over `Option` values: `(for [u (find-user id) :when (.active u)] [:b (.name u)])` is empty when either fails |
+| `list-map` with an inline `fn` | the `fn`'s last body form; the call becomes a `list-foldl` straight into `Html`, so no list of `Html` is built (give the parameter a type, as for any lambda passed to a generic function) |
+
+Everything else -- a condition, a binding's value, a function's argument --
+is left as written. A vector headed by an element name there is a compile
+error that says to wrap it in `(hiccup ...)`, since it is markup the macro
+cannot reach (`(let [li [:li x]] ...)`, `(f [:b x])`). Vectors that are not
+markup (`[:only :encode]`) are left alone. The nesting checks apply through
+the rewritten forms: `[:table (if c [:td "x"])]` is still `<td>` directly in
+`<table>`. A type error inside a branch points at the branch.
+
+### Trees, XML and back
+
+`hiccup->dom` builds the tree's nodes in a new HTML `Document`, the way the
+HTML parser would build `hiccup->string`'s markup: `svg` and `math` start
+SVG and MathML content, `xlink:href` lands in the XLink namespace, adjacent
+text is merged. For any tree a literal may write, the result is
+`dom-equal?` to `(html-parse-fragment "template" (hiccup->string h))`; the
+test suite checks that over hand-written trees and a few hundred random
+ones built from a hostile corpus.
+
+`hiccup->xml-string` writes the same tree as XML -- `<br/>` for an empty
+element, `name="name"` for a boolean attribute, `<script>`'s text escaped --
+and `hiccup->xml-dom` builds it in an XML `Document`, resolving prefixes
+through the `xmlns` attributes in the tree. A `raw-html` child or a spliced
+`#html{...}` value is parsed as HTML in its parent and written back as XML.
+`Html` also has `HComment`, `HCdata` and `HPi` nodes, with checking
+constructors `comment`, `cdata` and `pi`; HTML has no CDATA or processing
+instructions, so `hiccup->string` writes CDATA as text and leaves a PI out.
+
+`node->hiccup` goes the other way: any node of a parsed or built tree (HTML
+or XML) as `Html`, with each element pinned to the namespace it was in. So a
+parsed page can be transformed as data, with ordinary functions and `match`,
+and rendered again. Adding `rel="noopener"` to every external link:
+
+```turmeric
+(defn noopener [h : Html] : Html
+  (match h
+    (HElem t as kids)
+    (let [kids (map-html noopener kids)]
+      (if (and (same? (tag-name t) "a") (external? (href-of as)))
+        (match (attr-name "rel")
+          (Some n) (HElem t (tcons-of (attr n "noopener") as) kids)
+          (None)   (HElem t as kids))
+        (HElem t as kids)))
+    (HList xs) (HList (map-html noopener xs))
+    _ h))
+
+(hiccup->string (noopener (node->hiccup (dom-node (html-parse-fragment "div" src)))))
+```
+
+(`same?`, `external?`, `href-of` -- which reads `attr-name-of` and
+`attr-value` -- and `map-html` are a few lines each; `tests/hiccup_dom.tur`
+in tur-html has them.)
+
+`(hiccup->dom (node->hiccup n))` is `dom-equal?` to `n` for every element of
+the vendored html5lib tree-construction documents, except an element holding
+what dom/edit will not write back (a `<plaintext>`, a `<script>` whose text
+holds `</script`, a comment holding `<!--`); `hiccup->dom` panics on those.
+`hiccup->xml-dom` does the same for XML elements.

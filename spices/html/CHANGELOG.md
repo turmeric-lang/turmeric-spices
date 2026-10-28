@@ -16,13 +16,33 @@
   value. `(hiccup [:li.item #map{:href u} name])` lowers at compile time to
   constructor calls building an `Html` tree (`HElem`, `HRawText`, `HText`,
   `HRaw`, `HList`, `HFragment`); `hiccup->string` renders it, byte for byte
-  as `#html{...}` renders the same markup. Holes go through the same
-  classes, plus `ToChild Html`. The literal checks names, void elements, a
+  as `#html{...}` renders the same markup. Its opaque field types are
+  `HTag`, `HAttrName`, `HAttr` and `HRawBody` (type names are global, and
+  dom/event already has an `Attr`). An `Html` goes in an `#html{...}` hole
+  through `ToChild Html`. The literal checks names, void elements, a
   second id, bare `{...}` attribute maps, dynamic `on*`/`style`/`srcdoc`
   values and `<script>`/`<style>` bodies, and nesting the HTML parser would
   undo (plan D-2). The checking constructors `tag`, `attr-name`, `attr`,
   `attr-on` keep a hand-built tree safe to render. The macro-time half is
   `html/hiccupc`.
+- Hiccup result positions (follow-up D1b): inside a `hiccup` literal, the
+  results of `if`, `when`, `unless`, `cond`, `do`, `let`, `match`, `for`
+  (over `Option`) and an inline `fn` given to `list-map` are rewritten too
+  (a missing branch is empty; `list-map` becomes a `list-foldl` into
+  `Html`); a markup vector anywhere else is a compile error saying to wrap
+  it in `(hiccup ...)`. Holes go through a new `ToHtml` class, which keeps a
+  nested `Html` a tree and takes parsed `Node`s and any `ToChild` type via
+  `(to-child x)`.
+- Hiccup tree mode and XML (follow-up D2): `hiccup->dom` builds a tree's
+  nodes in an HTML `Document` as the parser would build its markup (SVG and
+  MathML namespaces included); `hiccup->xml-string` and `hiccup->xml-dom`
+  give the XML flavour, with prefixes resolved through the tree's `xmlns`
+  attributes. `Html` gains `HComment`, `HCdata` and `HPi`, with checking
+  constructors `comment`, `cdata`, `pi`; `attr-name-of` and `attr-value`
+  read an attribute.
+- `node->hiccup` (follow-up D3): a parsed or built node as `Html`, each
+  element pinned to its namespace; `hiccup->dom` of it is `dom-equal?` to
+  the node across the html5lib corpus.
 - Markup literals as trees (follow-up A3): `html->dom` parses a `Fragment`
   into a `Document`; `html->nodes` makes its nodes in another document.
 - Live literals (follow-up A4): `#html-live{...}` / `html-live*` give a

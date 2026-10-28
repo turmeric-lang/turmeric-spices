@@ -400,54 +400,316 @@
                                        "> is a void element; it takes no children"))
                                    nil)
                                  (while (< j n)
-                                   (let [c (syntax-nth stx j)]
-                                     (cond (__el-vec? c)                          (let [ctag (if (syntax-keyword? (syntax-nth c
-                                                                                                                    0))
-                                                                                               (syntax->str (syntax-nth (__split-shorthand c
-                                                                                                                          (syntax-sym-name (syntax-nth c
-                                                                                                                                             0)))
-                                                                                                              0))
-                                                                                               (syntax->str (syntax-nth c
-                                                                                                              0)))]
-                                                                                    (__check-nesting c
-                                                                                      tag
-                                                                                      sub-anc
-                                                                                      ctag)
-                                                                                    (set! kids
-                                                                                      (tcons-of (__element c
-                                                                                                  sub-anc)
-                                                                                        kids)))
-                                           (syntax-str? c)                        (do
-                                                                                    (if (and (__in? tag
-                                                                                               "table thead tbody tfoot tr")
-                                                                                          (not (__blank? (syntax->str c))))
-                                                                                      (__fail! c
-                                                                                        (str-concat (str-concat "text directly in <"
-                                                                                                      tag)
-                                                                                          "> -- the HTML parser moves it out of the table"))
-                                                                                      nil)
-                                                                                    (set! kids
-                                                                                      (tcons-of (__call1 "html/hiccup/mk-text"
-                                                                                                  c)
-                                                                                        kids)))
-                                           (or (syntax-int? c)
-                                             (syntax-float? c))                   (set! kids
-                                                                                    (tcons-of (__call1 "html/hiccup/mk-text"
-                                                                                                (str->syntax (syntax->string c)))
-                                                                                      kids))
-                                           (syntax-vec? c)                        (__fail! c
-                                                                                    "an element's name must be a keyword or a string literal (a computed tag is not allowed; build one with `tag` and the constructors)")
-                                           :else                                  (set! kids
-                                                                                    (tcons-of (__call1 "html/hiccup/child->html"
-                                                                                                (__call1 "to-child"
-                                                                                                  c))
-                                                                                      kids))))
+                                   (set! kids
+                                     (tcons-of (__result (syntax-nth stx j)
+                                                 tag
+                                                 sub-anc)
+                                       kids))
                                    (set! j (+ j 1)))
                                  (__call3 "html/hiccup/mk-elem"
                                    (__call1 "html/hiccup/unchecked-tag"
                                      (str->syntax tag))
                                    attr-list
                                    (__list kids)))))))
+  ;; ---------------------------------------------------------------------------
+  ;; Result positions (plan D-1, phase D1b). A child expression's value
+  ;; becomes a child, and so do the values of the forms in its result
+  ;; positions: both branches of an `if`, the last body form of `when`,
+  ;; `unless`, `do`, `let` and `for`, each `cond` result and `match` arm, and
+  ;; the body of an inline one-parameter `fn` given to `list-map`. Markup
+  ;; vectors there are rewritten; a missing branch is the empty Html; any
+  ;; other leaf goes through `to-html`. Everything else -- conditions,
+  ;; binding values, arguments -- is left as written, and a vector there
+  ;; headed by an element name is reported, since it would otherwise surface
+  ;; as a puzzling vec-of type error.
+  ;; ---------------------------------------------------------------------------
+  ;;; __known-el? -- internal: an HTML element name (for the wrap-it report).
+  (defn __known-el? [t : cstr] : bool
+    (__in? t
+      "a abbr address area article aside audio b base bdi bdo blockquote body br button canvas caption cite code col colgroup data datalist dd del details dfn dialog div dl dt em embed fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 head header hgroup hr html i iframe img input ins kbd label legend li link main map mark math menu meta meter nav noscript object ol optgroup option output p picture pre progress q rp rt ruby s samp script search section select slot small source span strong style sub summary sup svg table tbody td template textarea tfoot th thead time title tr track u ul var video wbr"))
+  ;;; __kw-tag -- internal: a keyword name up to its first . or #.
+  (defn __kw-tag [name : cstr] : cstr
+    (let [n      (cstr-len name)
+          ^mut e 0]
+      (while (and (< e n)
+               (not (or (= (cstr-nth name e) 46) (= (cstr-nth name e) 35))))
+        (set! e (+ e 1)))
+      (cstr-sub name 0 e)))
+  ;;; __head-is? -- internal: is stx a list headed by the symbol w?
+  (defn __head-is? [stx : Syntax w : cstr] : bool
+    (and (syntax-list? stx)
+      (and (> (syntax-len stx) 0)
+        (and (syntax-sym? (syntax-nth stx 0))
+          (cstr-eq? (syntax-sym-name (syntax-nth stx 0)) w)))))
+  ;;; __scan -- internal: report markup vectors outside a result position.
+  (defn __scan [stx : Syntax] : nil
+    (cond (and (syntax-vec? stx)
+            (and (> (syntax-len stx) 0)
+              (and (syntax-keyword? (syntax-nth stx 0))
+                (__known-el? (__kw-tag (syntax-sym-name (syntax-nth stx 0)))))))                                                                                        (__fail! stx
+                                                                                                                                                                          "markup outside a result position -- the macro does not rewrite it here; wrap it in (hiccup ...)")
+          (__head-is? stx "hiccup")                                                                                                                                     nil
+          (or (syntax-list? stx)
+            (or (syntax-vec? stx) (cstr-eq? (syntax-tag stx) "map-literal")))                                                                                           (let [^mut i 0]
+                                                                                                                                                                          (while (< i
+                                                                                                                                                                                   (syntax-len stx))
+                                                                                                                                                                            (__scan (syntax-nth stx
+                                                                                                                                                                                      i))
+                                                                                                                                                                            (set! i
+                                                                                                                                                                              (+ i
+                                                                                                                                                                                1))))
+          :else                                                                                                                                                         nil))
+  ;;; __scan-from -- internal: __scan the items of a list from index i on.
+  (defn __scan-from [stx : Syntax i : int] : nil
+    (let [^mut k i]
+      (while (< k (syntax-len stx))
+        (__scan (syntax-nth stx k))
+        (set! k (+ k 1)))))
+  ;;; __empty -- internal: the empty Html.
+  (defn __empty [] : Syntax (syntax-list (sym->syntax "html/hiccup/mk-empty")))
+  ;;; __items -- internal: the items i..j-1 of a list, as a list.
+  (defn __items [stx : Syntax i : int j : int] : Syntax
+    (let [^mut acc (syntax-list)
+          ^mut k   i]
+      (while (< k j)
+        (set! acc (syntax-append acc (syntax-list (syntax-nth stx k))))
+        (set! k (+ k 1)))
+      acc))
+  ;;; __with-last -- internal: stx with its last item replaced by v.
+  (defn __with-last [stx : Syntax v : Syntax] : Syntax
+    (syntax-append (__items stx 0 (- (syntax-len stx) 1)) (syntax-list v)))
+  ;;; __body -- internal: a body (items i.. of stx) whose last form is
+  ;;; rewritten, as one expression; an empty body is the empty Html.
+  (defn __body [stx : Syntax i : int parent : cstr anc : cstr] : Syntax
+    (let [n (syntax-len stx)]
+      (cond (>= i n)      (__empty)
+            (= i (- n 1)) (__result (syntax-nth stx i) parent anc)
+            :else         (do
+                            (__scan-from (__items stx i (- n 1)) 0)
+                            (syntax-append (syntax-list (sym->syntax "do"))
+                              (__items stx i (- n 1))
+                              (syntax-list (__result (syntax-nth stx (- n 1))
+                                             parent
+                                             anc)))))))
+  ;;; __child-element -- internal: a literal child element, nesting-checked.
+  (defn __child-element [c : Syntax parent : cstr anc : cstr] : Syntax
+    (let [ctag (if (syntax-keyword? (syntax-nth c 0))
+                 (syntax->str (syntax-nth (__split-shorthand c
+                                            (syntax-sym-name (syntax-nth c 0)))
+                                0))
+                 (syntax->str (syntax-nth c 0)))]
+      (__check-nesting c parent anc ctag)
+      (__element c anc)))
+  ;;; __rw-if -- internal: (if c a b?).
+  (defn __rw-if [stx : Syntax parent : cstr anc : cstr] : Syntax
+    (let [n (syntax-len stx)]
+      (if (or (< n 3) (> n 4))
+        (__fail stx "an if takes a condition and one or two branches")
+        (do
+          (__scan (syntax-nth stx 1))
+          (syntax-list (syntax-nth stx 0)
+            (syntax-nth stx 1)
+            (__result (syntax-nth stx 2) parent anc)
+            (if (= n 4) (__result (syntax-nth stx 3) parent anc) (__empty)))))))
+  ;;; __rw-when -- internal: (when c body...) and (unless c body...).
+  (defn __rw-when [stx : Syntax neg : bool parent : cstr anc : cstr] : Syntax
+    (if (< (syntax-len stx) 2)
+      (__fail stx "when / unless takes a condition")
+      (let [body (__body stx 2 parent anc)]
+        (__scan (syntax-nth stx 1))
+        (syntax-append (syntax-list (sym->syntax "if"))
+          (syntax-list (syntax-nth stx 1))
+          (if neg (syntax-list (__empty) body) (syntax-list body (__empty)))))))
+  ;;; __rw-cond -- internal: (cond t1 r1 ... :else r).
+  (defn __rw-cond [stx : Syntax parent : cstr anc : cstr] : Syntax
+    (let [n          (syntax-len stx)
+          ^mut acc   (syntax-list (syntax-nth stx 0))
+          ^mut else? false
+          ^mut i     1]
+      (if (= (- n (* 2 (/ n 2))) 0)
+        (__fail! stx "a cond with an odd number of forms")
+        nil)
+      (while (< (+ i 1) n)
+        (let [t (syntax-nth stx i)]
+          (if (and (syntax-keyword? t) (cstr-eq? (syntax-sym-name t) "else"))
+            (set! else? true)
+            (__scan t))
+          (set! acc
+            (syntax-append acc
+              (syntax-list t (__result (syntax-nth stx (+ i 1)) parent anc)))))
+        (set! i (+ i 2)))
+      (if else?
+        acc
+        (syntax-append acc (syntax-list (kw->syntax "else") (__empty))))))
+  ;;; __rw-body-form -- internal: (do body...), (let [bindings] body...) and
+  ;;; (for [bindings] body...): the last form is the result; `from` is where
+  ;;; the body starts.
+  (defn __rw-body-form [stx : Syntax from : int parent : cstr anc : cstr] : Syntax
+    (let [n (syntax-len stx)]
+      (if (>= from n)
+        (do (__scan-from stx 1) (syntax-append stx (syntax-list (__empty))))
+        (do
+          (__scan-from (__items stx 1 (- n 1)) 0)
+          (__with-last stx (__result (syntax-nth stx (- n 1)) parent anc))))))
+  ;;; __for-from -- internal: the bindings of a `for` from index i, as nested
+  ;;; matches over Option, then the body.
+  (defn __for-from [stx : Syntax bv : Syntax i : int parent : cstr anc : cstr] : Syntax
+    (cond (>= i (syntax-len bv))                                                                          (__body stx
+                                                                                                            2
+                                                                                                            parent
+                                                                                                            anc)
+          (>= (+ i 1) (syntax-len bv))                                                                    (__fail (syntax-nth bv
+                                                                                                                    i)
+                                                                                                            "a for binding needs a name and a value")
+          (and (syntax-keyword? (syntax-nth bv i))
+            (cstr-eq? (syntax-sym-name (syntax-nth bv i)) "when"))                                        (do
+                                                                                                            (__scan (syntax-nth bv
+                                                                                                                      (+ i
+                                                                                                                        1)))
+                                                                                                            (syntax-list (sym->syntax "if")
+                                                                                                              (syntax-nth bv
+                                                                                                                (+ i
+                                                                                                                  1))
+                                                                                                              (__for-from stx
+                                                                                                                bv
+                                                                                                                (+ i
+                                                                                                                  2)
+                                                                                                                parent
+                                                                                                                anc)
+                                                                                                              (__empty)))
+          :else                                                                                           (do
+                                                                                                            (__scan (syntax-nth bv
+                                                                                                                      (+ i
+                                                                                                                        1)))
+                                                                                                            (syntax-list (sym->syntax "match")
+                                                                                                              (syntax-nth bv
+                                                                                                                (+ i
+                                                                                                                  1))
+                                                                                                              (syntax-list (sym->syntax "Some")
+                                                                                                                (syntax-nth bv
+                                                                                                                  i))
+                                                                                                              (__for-from stx
+                                                                                                                bv
+                                                                                                                (+ i
+                                                                                                                  2)
+                                                                                                                parent
+                                                                                                                anc)
+                                                                                                              (syntax-list (sym->syntax "None"))
+                                                                                                              (__empty)))))
+  ;;; __rw-for -- internal: (for [x opt :when p ...] body...), the Option
+  ;;; comprehension, as nested matches (a missing value is the empty Html).
+  ;;; The `for` macro itself is not used: its `.pure` takes the monad from
+  ;;; the enclosing function's return type alone.
+  (defn __rw-for [stx : Syntax parent : cstr anc : cstr] : Syntax
+    (if (syntax-vec? (syntax-nth stx 1))
+      (__for-from stx (syntax-nth stx 1) 0 parent anc)
+      (__fail stx "a for takes a binding vector")))
+  ;;; __rw-match -- internal: (match e p1 b1 ...).
+  (defn __rw-match [stx : Syntax parent : cstr anc : cstr] : Syntax
+    (let [n        (syntax-len stx)
+          ^mut acc (__items stx 0 2)
+          ^mut i   2]
+      (if (< n 2) (__fail! stx "a match takes a value to match") nil)
+      (__scan (syntax-nth stx 1))
+      (while (< (+ i 1) n)
+        (set! acc
+          (syntax-append acc
+            (syntax-list (syntax-nth stx i)
+              (__result (syntax-nth stx (+ i 1)) parent anc))))
+        (set! i (+ i 2)))
+      acc))
+  ;;; __inline-fn? -- internal: an inline one-parameter (fn [x] body...) or
+  ;;; (fn [x : T] : R body...)?
+  (defn __inline-fn? [f : Syntax] : bool
+    (and (__head-is? f "fn")
+      (and (>= (syntax-len f) 3)
+        (and (syntax-vec? (syntax-nth f 1))
+          (or (= (syntax-len (syntax-nth f 1)) 1)
+            (and (= (syntax-len (syntax-nth f 1)) 2)
+              (cstr-eq? (syntax-tag (syntax-nth (syntax-nth f 1) 1)) "type-ann")))))))
+  ;;; __rw-list-map -- internal: (list-map xs (fn [x] body...)) as a fold
+  ;;; straight into Html.
+  (defn __rw-list-map [stx : Syntax parent : cstr anc : cstr] : Syntax
+    (let [f      (syntax-nth stx 2)
+          ps     (syntax-nth f 1)
+          acc    (syntax-gensym "hiccup_acc")
+          from   (if (and (> (syntax-len f) 3)
+                       (cstr-eq? (syntax-tag (syntax-nth f 2)) "type-ann"))
+                   3
+                   2)
+          params (if (= (syntax-len ps) 1)
+                   (syntax-vec acc (syntax-nth ps 0))
+                   (syntax-vec acc (syntax-nth ps 0) (syntax-nth ps 1)))
+          body   (__body f from parent anc)]
+      (__scan (syntax-nth stx 1))
+      (__call1 "html/hiccup/mk-rev-list"
+        (syntax-list (sym->syntax "list-foldl")
+          (syntax-nth stx 1)
+          (syntax-list (sym->syntax "html/hiccup/mk-nil"))
+          (syntax-list (sym->syntax "fn")
+            params
+            (__call2 "html/hiccup/mk-cons" body acc))))))
+  ;;; __result -- internal: a child expression as an Html expression.
+  (defn __result [c : Syntax parent : cstr anc : cstr] : Syntax
+    (cond (__el-vec? c)                                                                              (__child-element c
+                                                                                                       parent
+                                                                                                       anc)
+          (syntax-str? c)                                                                            (do
+                                                                                                       (if (and (__in? parent
+                                                                                                                  "table thead tbody tfoot tr")
+                                                                                                             (not (__blank? (syntax->str c))))
+                                                                                                         (__fail! c
+                                                                                                           (str-concat (str-concat "text directly in <"
+                                                                                                                         parent)
+                                                                                                             "> -- the HTML parser moves it out of the table"))
+                                                                                                         nil)
+                                                                                                       (__call1 "html/hiccup/mk-text"
+                                                                                                         c))
+          (or (syntax-int? c) (syntax-float? c))                                                     (__call1 "html/hiccup/mk-text"
+                                                                                                       (str->syntax (syntax->string c)))
+          (syntax-vec? c)                                                                            (__fail c
+                                                                                                       "an element's name must be a keyword or a string literal (a computed tag is not allowed; build one with `tag` and the constructors)")
+          (and (__head-is? c "hiccup") (= (syntax-len c) 2))                                         (__result (syntax-nth c
+                                                                                                                 1)
+                                                                                                       parent
+                                                                                                       anc)
+          (__head-is? c "if")                                                                        (__rw-if c
+                                                                                                       parent
+                                                                                                       anc)
+          (__head-is? c "when")                                                                      (__rw-when c
+                                                                                                       false
+                                                                                                       parent
+                                                                                                       anc)
+          (__head-is? c "unless")                                                                    (__rw-when c
+                                                                                                       true
+                                                                                                       parent
+                                                                                                       anc)
+          (__head-is? c "cond")                                                                      (__rw-cond c
+                                                                                                       parent
+                                                                                                       anc)
+          (__head-is? c "do")                                                                        (__rw-body-form c
+                                                                                                       1
+                                                                                                       parent
+                                                                                                       anc)
+          (and (or (__head-is? c "let") (__head-is? c "let*"))
+            (>= (syntax-len c) 2))                                                                   (__rw-body-form c
+                                                                                                       2
+                                                                                                       parent
+                                                                                                       anc)
+          (__head-is? c "match")                                                                     (__rw-match c
+                                                                                                       parent
+                                                                                                       anc)
+          (and (__head-is? c "for") (>= (syntax-len c) 2))                                           (__rw-for c
+                                                                                                       parent
+                                                                                                       anc)
+          (and (__head-is? c "list-map")
+            (and (= (syntax-len c) 3) (__inline-fn? (syntax-nth c 2))))                              (__rw-list-map c
+                                                                                                       parent
+                                                                                                       anc)
+          :else                                                                                      (do
+                                                                                                       (__scan c)
+                                                                                                       (__call1 "to-html"
+                                                                                                         c))))
   ;;; hiccup-expand -- lower a hiccup literal to an Html expression.
   ;;;
   ;;; Parameters:
@@ -461,8 +723,9 @@
   ;;;
   ;;; Since: 0.3.0
   (defn hiccup-expand [form : Syntax] : Syntax
-    (cond (__el-vec? form)   (__element form "")
-          (syntax-vec? form) (__fail form
-                               "an element's name must be a keyword or a string literal (a computed tag is not allowed; build one with `tag` and the constructors)")
-          :else              (__fail form
-                               "expected an element vector, [:tag attrs? child...]")))) ;; end defmodule html/hiccupc
+    (cond (__el-vec? form)    (__element form "")
+          (syntax-list? form) (__result form "" "")
+          (syntax-vec? form)  (__fail form
+                                "an element's name must be a keyword or a string literal (a computed tag is not allowed; build one with `tag` and the constructors)")
+          :else               (__fail form
+                                "expected an element vector, [:tag attrs? child...]")))) ;; end defmodule html/hiccupc

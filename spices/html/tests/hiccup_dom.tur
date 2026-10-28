@@ -1,0 +1,682 @@
+#use-reader-macros "../src/html/markup.tur"
+;; hiccup_dom.tur -- hiccup trees as nodes, as XML, and back
+;; (xml-html-followups-plan follow-ups D2 and D3).
+;;
+;; D2's gate: for parser-stable trees, `hiccup->dom h` is `dom-equal?` to
+;; parsing `hiccup->string h` as a `template` fragment, and `hiccup->xml-dom h`
+;; to parsing `hiccup->xml-string h` with tur-xml (expat). The trees are a
+;; handful written out plus a few hundred random ones over the elements a
+;; literal may nest, with the hostile corpus as text and attribute values.
+;;
+;; D3's gate: `node->hiccup` and back is `dom-equal?` to the node, for every
+;; element of every html5lib tree-construction document (tests/data/html5lib)
+;; and of an XML corpus (namespaces, declarations, comments, CDATA, PIs).
+(defmodule html_hiccup_dom_test
+  (export)
+  (import html/hiccup
+    :refer
+    [Html
+     HElem
+     HList
+     HText
+     HAttr
+     hiccup
+     hiccup->string
+     hiccup->xml-string
+     hiccup->dom
+     hiccup->xml-dom
+     node->hiccup
+     comment
+     cdata
+     pi
+     tag-name
+     attr-name-of
+     attr-value
+     attr
+     attr-name])
+  (import html/markup :refer [html*])
+  (import html/dom :refer [html-parse html-parse-fragment])
+  (import xml/dom :refer [dom-parse-string])
+  (import dom/holes :refer [raw-html])
+  (import dom/core
+    :refer
+    [Document
+     Node
+     NodeKind
+     ElementNode
+     CommentNode
+     dom-node
+     dom-root
+     dom-free
+     dom-equal?
+     dom-serialize
+     node-kind
+     node-value
+     node-local-name
+     node-text
+     node-first-child
+     node-next-sibling
+     parse-error-message])
+  (import dom/ownstr :refer [to-cstr release])
+  (import test/suite :refer [describe it])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; __say -- print a line to stderr.
+  (defn __say [a : cstr b : cstr] : nil
+    ```c
+    #include <stdio.h>
+  fprintf(stderr, "# %s%s\n", (const char *)a, (const char *)b);
+  ```)
+  ;;; __ser -- a node's markup (leaked; for diagnostics).
+  (defn __ser [n : Node] : cstr (to-cstr (dom-serialize n)))
+  ;; ---- D2: string mode and tree mode agree ------------------------------------
+  ;;; html-agrees? -- does the tree build what its markup parses to?
+  (defn html-agrees? [h : Html] : bool
+    (let [s  (hiccup->string h)
+          a  (html-parse-fragment "template" s)
+          b  (hiccup->dom h)
+          ok (dom-equal? (dom-node a) (dom-node b))]
+      (if ok
+        nil
+        (do
+          (__say "markup: " s)
+          (__say "parsed: " (__ser (dom-node a)))
+          (__say "built:  " (__ser (dom-node b)))))
+      (dom-free a)
+      (dom-free b)
+      ok))
+  ;;; xml-agrees? -- the same through expat, for a single-rooted tree.
+  (defn xml-agrees? [h : Html] : bool
+    (let [s (hiccup->xml-string h)
+          b (hiccup->xml-dom h)]
+      (match (dom-parse-string s)
+        (Ok a)
+        (let [ok (dom-equal? (dom-node a) (dom-node b))]
+          (if ok
+            nil
+            (do
+              (__say "markup: " s)
+              (__say "parsed: " (__ser (dom-node a)))
+              (__say "built:  " (__ser (dom-node b)))))
+          (dom-free a)
+          (dom-free b)
+          ok)
+        (Err e)
+        (do
+          (__say "not well-formed: " s)
+          (__say "  " (parse-error-message e))
+          false))))
+  ;;; __rand -- internal: a deterministic generator; n > 0.
+  (defn __rand [n : int] : int
+    ```c
+    /* __tur_include__: #include <stdint.h> */
+  /* __tur_include__: static uint64_t g_hd_seed = 0x9e3779b97f4a7c15ull; */
+  g_hd_seed ^= g_hd_seed << 13; g_hd_seed ^= g_hd_seed >> 7; g_hd_seed ^= g_hd_seed << 17;
+  return (int64_t)(g_hd_seed % (uint64_t)n);
+  ```)
+  ;;; __corpus -- internal: hostile value i (as in hiccup.tur).
+  (defn __corpus [i : int] : cstr
+    ```c
+    static const char *const corpus[] = {
+    "<script>alert(1)</script>", "\"><img src=x onerror=alert(1)>", "'", "</p><p>",
+    "</td></tr></table><b>", "<!--", "-->", "&amp;", "&", "javascript:alert(1)",
+    "JavaScript:x", "java\tscript:x", " data:x", "/rel?a=1&b=2", "https://e/",
+    "\xc2\xa0nbsp", "a\tb\nc\rd", "x", "]]>", "<?x y?>", NULL};
+  int64_t n = 0;
+  while (corpus[n]) n++;
+  return i < n ? corpus[i] : "";
+  ```)
+  (defn __word [] : cstr (__corpus (__rand 20)))
+  ;;; gen-phrasing -- internal: random phrasing content.
+  (defn gen-phrasing [depth : int in-a : bool] : Html
+    (let [k (if (<= depth 0) 0 (__rand 7))]
+      (cond (= k 1)                  (hiccup [:span
+                                              #map{:title (__word)}
+                                              (gen-kids depth in-a false)])
+            (= k 2)                  (hiccup [:b (gen-kids depth in-a false)])
+            (= k 3)                  (hiccup [:em.e (gen-kids depth in-a false)])
+            (and (= k 4) (not in-a)) (hiccup [:a
+                                              #map{:href (__word)}
+                                              (gen-kids depth true false)])
+            (= k 5)                  (hiccup [:br])
+            (= k 6)                  (match (comment "c")
+                                       (Some c)
+                                       (hiccup [:i c])
+                                       (None)
+                                       (hiccup [:i]))
+            :else                    (hiccup [:span (__word)]))))
+  ;;; gen-flow -- internal: random flow content.
+  (defn gen-flow [depth : int in-a : bool] : Html
+    (let [k (if (<= depth 0) 0 (__rand 8))]
+      (cond (= k 1) (hiccup [:div
+                             #map{:class (__word) :data-n k}
+                             (gen-kids depth in-a true)])
+            (= k 2) (hiccup [:p (gen-kids depth in-a false)])
+            (= k 3) (hiccup [:ul
+                             [:li (gen-kids depth in-a true)]
+                             [:li (__word)]])
+            (= k 4) (hiccup [:table
+                             [:tbody
+                              [:tr [:td (gen-kids depth in-a true)] [:th "h"]]]])
+            (= k 5) (hiccup [:section [:h2 (__word)] (gen-kids depth in-a true)])
+            (= k 6) (hiccup [:div
+                             [:svg
+                              #map{:viewBox "0 0 2 2"}
+                              [:circle #map{:r "1"}]]])
+            :else   (gen-phrasing depth in-a))))
+  ;;; gen-kids -- internal: up to three children, text among them.
+  (defn gen-kids [depth : int in-a : bool flow : bool] : (Cons Html)
+    (let [n (__rand 4)] (__gen-n n (- depth 1) in-a flow)))
+  (defn __gen-n [n : int depth : int in-a : bool flow : bool] : (Cons Html)
+    (if (<= n 0)
+      (tnil)
+      (tcons-of (cond (= (__rand 3) 0) (HText (__word))
+                      flow             (gen-flow depth in-a)
+                      :else            (gen-phrasing depth in-a))
+        (__gen-n (- n 1) depth in-a flow))))
+  ;;; random-html-failures -- random trees whose two renderings disagree.
+  (defn random-html-failures [count : int] : int
+    (let [^mut bad 0
+          ^mut i   0]
+      (while (< i count)
+        (if (html-agrees? (hiccup [:div (gen-kids 4 false true)]))
+          nil
+          (set! bad (+ bad 1)))
+        (set! i (+ i 1)))
+      bad))
+  ;;; gen-xml -- internal: random XML content under default namespace urn:d
+  ;;; and prefix a = urn:a.
+  (defn gen-xml [depth : int] : Html
+    (let [k (if (<= depth 0) 0 (__rand 9))]
+      (cond (= k 1) (hiccup [:item
+                             #map{:n (__word) "a:t" (__word)}
+                             (gen-xml-kids depth)])
+            (= k 2) (hiccup ["a:x" (gen-xml-kids depth)])
+            (= k 3) (hiccup [:empty])
+            (= k 4) (match (cdata (__word))
+                      (Some c)
+                      (hiccup [:c c])
+                      (None)
+                      (hiccup [:c "]]>"]))
+            (= k 5) (match (pi "go" (__word))
+                      (Some p)
+                      (hiccup [:p p])
+                      (None)
+                      (hiccup [:p "?>"]))
+            (= k 6) (hiccup ["b:y"
+                             #map{"xmlns:b" "urn:b" "b:z" "1"}
+                             (gen-xml-kids depth)])
+            (= k 7) (hiccup [:script "a < b && c"])
+            (= k 8) (hiccup [:flag #map{:yes true :no false}])
+            :else   (HText (__word)))))
+  (defn gen-xml-kids [depth : int] : (Cons Html)
+    (__xml-n (__rand 4) (- depth 1)))
+  (defn __xml-n [n : int depth : int] : (Cons Html)
+    (if (<= n 0) (tnil) (tcons-of (gen-xml depth) (__xml-n (- n 1) depth))))
+  ;;; random-xml-failures -- random XML trees whose two renderings disagree.
+  (defn random-xml-failures [count : int] : int
+    (let [^mut bad 0
+          ^mut i   0]
+      (while (< i count)
+        (if (xml-agrees? (hiccup [:root
+                                  #map{:xmlns "urn:d" "xmlns:a" "urn:a" :v "1"}
+                                  (gen-xml-kids 4)]))
+          nil
+          (set! bad (+ bad 1)))
+        (set! i (+ i 1)))
+      bad))
+  ;; ---- D3: every element of a corpus, there and back ---------------------------
+  ;;; __each-failures -- elements under n (n included) that do not survive
+  ;;; node->hiccup and the builder.
+  (defn __each-failures [x : (Option Node) xml : bool] : int
+    (match x
+      (None)
+      0
+      (Some n)
+      (+ (match (node-kind n)
+           (ElementNode)
+           (+ (if (__survives? n xml) 0 1)
+             (__each-failures (node-first-child n) xml))
+           _
+           (__each-failures (node-first-child n) xml))
+        (__each-failures (node-next-sibling n) xml))))
+  ;;; __survives? -- is the element rebuilt dom-equal? from its Html? An
+  ;;; element whose subtree dom/edit refuses to rebuild (below) counts as a
+  ;;; refusal instead, and is not rebuilt.
+  (defn __survives? [n : Node xml : bool] : bool
+    (__count-checked)
+    (if (and (not xml) (__refused? (Some n) true))
+      (do (__count-refusal) true)
+      (__rebuilds? n xml)))
+  ;;; __refused? -- internal: does the subtree hold a raw-text element whose
+  ;;; text dom/edit will not put back, because serialized it could end the
+  ;;; element early (`</script` or `<!--` in a <script>, `</style` in a
+  ;;; <style>, ...: the rule `hiccup`'s literals follow too), or a <plaintext>,
+  ;;; which never ends, or a comment holding `<!--` or `-->`? The parser keeps `<script></scriptx>` as text, but
+  ;;; dom/edit stays on the safe side.
+  (defn __refused? [x : (Option Node) top : bool] : bool
+    (match x
+      (None)
+      false
+      (Some n)
+      (or (match (node-kind n)
+            (ElementNode)
+            (or (or (__plaintext? (__name-of n))
+                  (and (__raw-text-name? (__name-of n))
+                    (not (__rawtext-ok? (__name-of n) (__text-of n)))))
+              (__refused? (node-first-child n) false))
+            (CommentNode)
+            (not (__comment-ok? (match (node-value n) (Some v) v (None) "")))
+            _
+            false)
+        (if top false (__refused? (node-next-sibling n) false)))))
+  ;;; __comment-ok? -- internal: c/dom/turdom.c's HTML comment rule.
+  (defn __comment-ok? [s : cstr] : bool
+    ```c
+    const char *p = (const char *)s;
+  size_t n = strlen(p);
+  if (strchr(p, '\r')) return false;
+  if ((n >= 1 && p[0] == '>') || (n >= 2 && p[0] == '-' && p[1] == '>')) return false;
+  if (strstr(p, "<!--") || strstr(p, "-->") || strstr(p, "--!>")) return false;
+  return !(n >= 3 && memcmp(p + n - 3, "<!-", 3) == 0);
+  ```)
+  (defn __plaintext? [t : cstr] : bool
+    ```c
+    return strcmp((const char *)t, "plaintext") == 0;
+  ```)
+  (defn __name-of [n : Node] : cstr
+    (match (node-local-name n) (Some s) s (None) ""))
+  (defn __text-of [n : Node] : cstr (to-cstr (node-text n)))
+  (defn __raw-text-name? [t : cstr] : bool
+    ```c
+    static const char *const raw[] = {"script", "style", "xmp", "iframe", "noembed",
+                                      "noframes", "plaintext", NULL};
+  for (int i = 0; raw[i]; i++) if (strcmp((const char *)t, raw[i]) == 0) return true;
+  return false;
+  ```)
+  ;;; __rawtext-ok? -- internal: c/dom/turdom.c's rawtext_ok.
+  (defn __rawtext-ok? [tag : cstr s : cstr] : bool
+    ```c
+    size_t tlen = strlen((const char *)tag), n = strlen((const char *)s);
+  const char *p = (const char *)s;
+  if (memchr(p, '\r', n)) return false;
+  for (size_t i = 0; i + 1 < n; i++) {
+    if (p[i] != '<') continue;
+    if (p[i + 1] == '/' && i + 2 + tlen <= n && strncasecmp(p + i + 2, (const char *)tag, tlen) == 0)
+      return false;
+    if (strcmp((const char *)tag, "script") == 0 && i + 4 <= n && memcmp(p + i, "<!--", 4) == 0)
+      return false;
+  }
+  return true;
+  ```)
+  ;;; __count-refusal / __refusals -- internal: elements not rebuilt.
+  (defn __count-refusal [] : nil
+    ```c
+    /* __tur_include__: static int64_t g_hd_refused = 0; */
+  g_hd_refused++;
+  ```)
+  (defn __count-checked [] : nil
+    ```c
+    /* __tur_include__: static int64_t g_hd_checked = 0; */
+  g_hd_checked++;
+  ```)
+  (defn __checked [] : int
+    ```c
+    #include <stdio.h>
+  fprintf(stderr, "# elements checked: %lld, refused: %lld\n", (long long)g_hd_checked,
+          (long long)g_hd_refused);
+  return g_hd_checked;
+  ```)
+  (defn __refusals [] : int
+    ```c
+    return g_hd_refused;
+  ```)
+  ;;; __rebuilds? -- internal.
+  (defn __rebuilds? [n : Node xml : bool] : bool
+    (let [d  (if xml
+               (hiccup->xml-dom (node->hiccup n))
+               (hiccup->dom (node->hiccup n)))
+          ok (match (node-first-child (dom-node d))
+               (Some m)
+               (dom-equal? n m)
+               (None)
+               false)]
+      (if ok
+        nil
+        (do
+          (__say "original: " (__ser n))
+          (match (node-first-child (dom-node d))
+            (Some m)
+            (__say "rebuilt:  " (__ser m))
+            (None)
+            (__say "rebuilt:  " "nothing"))))
+      (dom-free d)
+      ok))
+  ;;; __dat-load -- internal: read a .dat file's markup and fragment contexts
+  ;;; (the reader html5lib.tur uses, without the expected trees).
+  (defn __dat-load [path : cstr] : int
+    ```c
+    /* __tur_include__: #include <stdio.h> */
+  /* __tur_include__: typedef struct { char *data; char *ctx; int skip; } hd_test; */
+  /* __tur_include__: static hd_test *g_hd = 0; */
+  /* __tur_include__: static size_t g_hd_len = 0; */
+  for (size_t i = 0; i < g_hd_len; i++) { free(g_hd[i].data); free(g_hd[i].ctx); }
+  free(g_hd); g_hd = 0; g_hd_len = 0;
+  FILE *f = fopen((const char *)path, "rb");
+  if (!f) return 0;
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  char *buf = (char *)malloc((size_t)sz + 2);
+  size_t got = fread(buf, 1, (size_t)sz, f);
+  fclose(f);
+  buf[got] = '\0';
+  size_t cap = 0;
+  char *p = buf, *end = buf + got, *data_start = 0;
+  hd_test *t = 0;
+  int in_data = 0;
+  while (p < end) {
+    char *nl = (char *)memchr(p, '\n', (size_t)(end - p));
+    char *le = nl ? nl : end;
+    size_t ll = (size_t)(le - p);
+    if (ll == 5 && memcmp(p, "#data", 5) == 0) {
+      if (g_hd_len == cap) { cap = cap ? cap * 2 : 64; g_hd = (hd_test *)realloc(g_hd, cap * sizeof(hd_test)); }
+      t = &g_hd[g_hd_len++];
+      memset(t, 0, sizeof *t);
+      in_data = 1; data_start = le + (nl ? 1 : 0);
+    } else if (t && in_data && ((ll == 7 && memcmp(p, "#errors", 7) == 0) ||
+                                (ll == 11 && memcmp(p, "#new-errors", 11) == 0))) {
+      size_t n = (size_t)(p - data_start);
+      if (n > 0 && data_start[n - 1] == '\n') n--;
+      t->data = (char *)malloc(n + 1); memcpy(t->data, data_start, n); t->data[n] = '\0';
+      if (strlen(t->data) != n) t->skip = 1;           /* a NUL in the data */
+      in_data = 0;
+    } else if (t && !in_data && ll >= 18 && memcmp(p, "#document-fragment", 18) == 0) {
+      char *cs = le + 1;
+      char *ce = (char *)memchr(cs, '\n', (size_t)(end - cs));
+      if (!ce) ce = end;
+      t->ctx = (char *)malloc((size_t)(ce - cs) + 1);
+      memcpy(t->ctx, cs, (size_t)(ce - cs)); t->ctx[ce - cs] = '\0';
+      if (strchr(t->ctx, ' ')) t->skip = 1;
+      p = ce < end ? ce + 1 : end;
+      continue;
+    } else if (t && !in_data && ll == 10 && memcmp(p, "#script-on", 10) == 0) {
+      t->skip = 1;
+    }
+    p = nl ? nl + 1 : end;
+  }
+  free(buf);
+  for (size_t i = 0; i < g_hd_len; i++) if (!g_hd[i].data) g_hd[i].skip = 1;
+  return (int64_t)g_hd_len;
+  ```)
+  (defn __dat-skip? [i : int] : bool
+    ```c
+    return g_hd[i].skip != 0;
+  ```)
+  (defn __dat-data [i : int] : cstr
+    ```c
+    return g_hd[i].data;
+  ```)
+  (defn __dat-context [i : int] : cstr
+    ```c
+    return g_hd[i].ctx ? g_hd[i].ctx : "";
+  ```)
+  (defn __strlen [s : cstr] : int
+    ```c
+    return (int64_t)strlen((const char *)s);
+  ```)
+  ;;; __nfiles -- tests/data/html5lib/*.dat, sorted; how many.
+  (defn __nfiles [] : int
+    ```c
+    /* __tur_include__: #include <dirent.h> */
+  /* __tur_include__: static char **g_hd_files = 0; */
+  /* __tur_include__: static size_t g_hd_nfiles = 0; */
+  if (!g_hd_files) {
+    DIR *d = opendir("tests/data/html5lib");
+    struct dirent *de;
+    size_t cap = 0;
+    while (d && (de = readdir(d))) {
+      size_t n = strlen(de->d_name);
+      if (n < 5 || strcmp(de->d_name + n - 4, ".dat")) continue;
+      if (g_hd_nfiles == cap) { cap = cap ? cap * 2 : 64; g_hd_files = (char **)realloc(g_hd_files, cap * sizeof(char *)); }
+      char *p = (char *)malloc(n + 32);
+      snprintf(p, n + 32, "tests/data/html5lib/%s", de->d_name);
+      g_hd_files[g_hd_nfiles++] = p;
+    }
+    if (d) closedir(d);
+    for (size_t i = 1; i < g_hd_nfiles; i++)
+      for (size_t j = i; j > 0 && strcmp(g_hd_files[j-1], g_hd_files[j]) > 0; j--) {
+        char *t = g_hd_files[j]; g_hd_files[j] = g_hd_files[j-1]; g_hd_files[j-1] = t;
+      }
+  }
+  return (int64_t)g_hd_nfiles;
+  ```)
+  (defn __file [i : int] : cstr
+    ```c
+    return g_hd_files[i];
+  ```)
+  ;;; html5lib-failures -- elements of one .dat file's documents that do not
+  ;;; survive the round trip.
+  (defn html5lib-failures [path : cstr] : int
+    (let [n        (__dat-load path)
+          ^mut bad 0
+          ^mut i   0]
+      (while (< i n)
+        (if (__dat-skip? i)
+          nil
+          (let [d (if (= (__strlen (__dat-context i)) 0)
+                    (html-parse (__dat-data i))
+                    (html-parse-fragment (__dat-context i) (__dat-data i)))]
+            (set! bad
+              (+ bad (__each-failures (node-first-child (dom-node d)) false)))
+            (dom-free d)))
+        (set! i (+ i 1)))
+      bad))
+  ;;; __xml-doc -- internal: XML corpus document i ("" past the end).
+  (defn __xml-doc [i : int] : cstr
+    ```c
+    static const char *const docs[] = {
+    "<a/>",
+    "<a x=\"1\" y='2'>t<b>u</b>v<!-- c --><?pi data?><![CDATA[a < b]]></a>",
+    "<feed xmlns=\"http://www.w3.org/2005/Atom\"><entry><title type=\"html\">&lt;b&gt;</title><link href=\"/a?b=1&amp;c=2\"/></entry></feed>",
+    "<r xmlns:a=\"urn:a\" xmlns:b=\"urn:b\"><a:x b:y=\"1\" a:z=\"2\"><b:w xmlns:b=\"urn:c\"/></a:x></r>",
+    "<r xml:lang=\"en\" xmlns=\"urn:d\"><s xmlns=\"\"><t/></s><u xml:space=\"preserve\">  </u></r>",
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" viewBox=\"0 0 1 1\"><use xlink:href=\"#i\"/><text>a&amp;b</text></svg>",
+    "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><script>if (a &lt; b) {}</script></head><body><p>x<br/>y</p></body></html>",
+    "<!DOCTYPE r [<!ENTITY e \"ent\">]><r>&e;&#65;&#x42;<q a=\"&e;\"/></r>",
+    "<r>\n  <i>1</i>\n  <i>2</i>\n</r>",
+    "<r a=\"&#9;&#10;&#13;\">&#13;</r>",
+    NULL};
+  int64_t n = 0;
+  while (docs[n]) n++;
+  return i < n ? docs[i] : "";
+  ```)
+  ;;; xml-corpus-failures -- elements of the XML corpus that do not survive.
+  (defn xml-corpus-failures [] : int
+    (let [^mut bad 0
+          ^mut i   0]
+      (while (> (__strlen (__xml-doc i)) 0)
+        (match (dom-parse-string (__xml-doc i))
+          (Ok d)
+          (do
+            (set! bad
+              (+ bad (__each-failures (node-first-child (dom-node d)) true)))
+            (dom-free d))
+          (Err e)
+          (do
+            (__say "corpus document does not parse: " (__xml-doc i))
+            (set! bad (+ bad 1))))
+        (set! i (+ i 1)))
+      bad))
+  ;; ---- the guide's transform: rel="noopener" on every external <a> -----------
+  ;;; __external? -- internal: an absolute http(s) URL?
+  (defn __external? [u : cstr] : bool
+    ```c
+    return strncmp((const char *)u, "http://", 7) == 0 || strncmp((const char *)u, "https://", 8) == 0;
+  ```)
+  ;;; __href -- internal: an element's href, if it has one.
+  (defn __href [as : (Cons HAttr)] : (Option cstr)
+    (if (tnil? as)
+      (None)
+      (let [a (thead as)]
+        (if (__is-name? (attr-name-of a) "href")
+          (attr-value a)
+          (__href (ttail as))))))
+  (defn __is-name? [a : cstr b : cstr] : bool
+    ```c
+    return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+  ;;; noopener -- the transform: walk the tree, add rel="noopener" to <a>
+  ;;; elements whose href is external.
+  (defn noopener [h : Html] : Html
+    (match h
+      (HElem t as kids)
+      (let [kids2 (noopener-list kids)
+            ext   (and (__is-name? (tag-name t) "a")
+                    (match (__href as) (Some u) (__external? u) (None) false))]
+        (if ext
+          (match (attr-name "rel")
+            (Some n)
+            (HElem t (tcons-of (attr n "noopener") as) kids2)
+            (None)
+            (HElem t as kids2))
+          (HElem t as kids2)))
+      (HList xs)
+      (HList (noopener-list xs))
+      _
+      h))
+  (defn noopener-list [xs : (Cons Html)] : (Cons Html)
+    (if (tnil? xs)
+      (tnil)
+      (tcons-of (noopener (thead xs)) (noopener-list (ttail xs)))))
+  ;;; transformed -- parse, transform, render.
+  (defn transformed [src : cstr] : cstr
+    (let [d (html-parse-fragment "div" src)
+          s (hiccup->string (noopener (node->hiccup (dom-node d))))]
+      (dom-free d)
+      s))
+  (defn __all-tests [] : void
+    (describe "tree mode agrees with string mode (D2)"
+      (it "text, attributes, void and boolean attributes, raw-html"
+        (html-agrees? (hiccup [:ul.a#b
+                               [:li "x < y" "z"]
+                               [:li
+                                #map{:hidden true :title "\"q\""}
+                                [:br]
+                                (raw-html "<b>r</div>")]])))
+      (it "foreign content: svg, xlink, foreignObject, MathML text integration"
+        (html-agrees? (hiccup [:div
+                               [:svg
+                                #map{:viewBox "0 0 1 1"}
+                                [:a #map{"xlink:href" "#x"}]
+                                [:foreignObject [:p "in"]]]
+                               [:math [:mi [:b "m"]] [:mn "1"]]])))
+      (it "raw text, an #html{} fragment, comments, CDATA as text"
+        (html-agrees? (hiccup [:div
+                               [:script "if (a < b) x();"]
+                               [:style "p{}"]
+                               #html{<i>${"f"}</i><b>g</b>}
+                               (match (comment " c ")
+                                 (Some c)
+                                 c
+                                 (None)
+                                 (hiccup [:i]))
+                               (match (cdata "a<b")
+                                 (Some c)
+                                 c
+                                 (None)
+                                 (hiccup [:i]))])))
+      (it "tables"
+        (html-agrees? (hiccup [:table
+                               [:thead [:tr [:th "h"]]]
+                               [:tbody [:tr [:td "1"] [:td [:p "2"]]]]])))
+      (it "300 random parser-stable trees over the hostile corpus"
+        (= 0 (random-html-failures 300)))
+      (it "the XML flavour, through expat"
+        (xml-agrees? (hiccup [:feed
+                              #map{:xmlns "http://www.w3.org/2005/Atom"
+                                   "xmlns:x" "urn:x"}
+                              [:entry
+                               #map{"x:id" "1"}
+                               [:title "a < b"]
+                               [:link #map{:href "/a" :hidden true}]
+                               [:br]
+                               [:script "a < b"]]])))
+      (it "300 random XML trees over the hostile corpus"
+        (= 0 (random-xml-failures 300))))
+    (describe "the XML serialization"
+      (it "empty elements, booleans, escaped raw text, CDATA, PIs, comments"
+        (__is? (hiccup->xml-string (hiccup [:r
+                                            [:br]
+                                            [:i #map{:yes true :no false}]
+                                            [:script "a<b"]
+                                            (match (cdata "x<y")
+                                              (Some c)
+                                              c
+                                              (None)
+                                              (hiccup [:i]))
+                                            (match (pi "go" "now")
+                                              (Some p)
+                                              p
+                                              (None)
+                                              (hiccup [:i]))
+                                            (match (comment "c")
+                                              (Some c)
+                                              c
+                                              (None)
+                                              (hiccup [:i]))]))
+          "<r><br/><i yes=\"yes\"/><script>a&lt;b</script><![CDATA[x<y]]><?go now?><!--c--></r>"))
+      (it "raw-html and #html{} values are written back as XML"
+        (__is? (hiccup->xml-string (hiccup [:r
+                                            (raw-html "<p>a<br>b")
+                                            #html{<img src="x">}]))
+          "<r><p>a<br/>b</p><img src=\"x\"/></r>"))
+      (it "the checking constructors"
+        (and (match (comment "a--b") (Some _) false (None) true)
+          (and (match (comment "a-") (Some _) false (None) true)
+            (and (match (comment ">a") (Some _) false (None) true)
+              (and (match (cdata "a]]>b") (Some _) false (None) true)
+                (and (match (pi "xml" "a") (Some _) false (None) true)
+                  (and (match (pi "a:b" "a") (Some _) false (None) true)
+                    (and (match (pi "go" "a?>b") (Some _) false (None) true)
+                      (match (pi "go" "now") (Some _) true (None) false))))))))))
+    (describe "node->hiccup and back (D3)"
+      (let [n (__nfiles)]
+        (it "finds the vendored .dat files" (= n 54))
+        (let [^mut i 0]
+          (while (< i n)
+            (it (__file i) (= 0 (html5lib-failures (__file i))))
+            (set! i (+ i 1)))))
+      ;; An element counts as left out when anything under it is refused, so
+      ;; each refusal also takes out its ancestors (about 470 of 8300 today:
+      ;; html5lib aims at exactly these edges).
+      (it "the elements left out are under 10%, each holding what dom/edit refuses"
+        (let [r (__refusals)
+              t (__checked)]
+          (and (> r 0) (and (> t 5000) (< (* r 10) t)))))
+      (it "every element of the XML corpus" (= 0 (xml-corpus-failures)))
+      (it "an XML document through the HTML string renderer keeps its text"
+        (match (dom-parse-string "<r><a href=\"/x\">a &amp; b</a></r>")
+          (Ok d)
+          (let [ok (match (dom-root d)
+                     (Some r)
+                     (__is? (hiccup->string (node->hiccup r))
+                       "<r><a href=\"/x\">a &amp; b</a></r>")
+                     (None)
+                     false)]
+            (dom-free d)
+            ok)
+          (Err _)
+          false)))
+    (describe "a transform: rel=\"noopener\" on every external link"
+      (it "adds it to external links only"
+        (__is? (transformed "<p><a href=\"https://e/\">e</a> <a href=\"/in\">i</a></p>")
+          "<p><a rel=\"noopener\" href=\"https://e/\">e</a> <a href=\"/in\">i</a></p>"))))
+  (defn main [] : int (__all-tests) (run-all-status))) ;; end defmodule html_hiccup_dom_test
