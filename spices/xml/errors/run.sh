@@ -108,6 +108,10 @@ expect_panic "a literal that is not well-formed panics on its first render" '(de
     (println (xml->string (xml* "<a><b>${\"x\"}</a>")))
     0))' "literal is not well-formed XML"
 
+echo "# a type error in a hole points at the hole (plan A5)"
+# Line 6 of the generated file is the literal; the hole's ( is column 41.
+expect_reject '<a>${(+ x 1)}</a>' "tur:6:41: error"
+
 echo "1..$n"
 if [ "$fail" -ne 0 ]; then
   echo "# some cases failed"

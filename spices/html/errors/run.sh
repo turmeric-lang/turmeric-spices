@@ -175,6 +175,35 @@ expect_hiccup_reject '[:ul (if true [x])]' "a computed tag is not allowed"
 # column (the `(+ x 1)` in the literal), not at the expansion.
 expect_hiccup_reject '[:div (if true [:b (+ x 1)] [:i])]' "tur:5:59: error"
 
+echo "# a type error in a hole points at the hole (plan A5)"
+# Line 6 of the generated file is the literal; the hole's ( is column 43.
+expect_reject '<p>${(+ x 1)}</p>' "tur:6:43: error"
+# The same in an #html{...} literal spanning lines: a hole on its third
+# line, after an escaped brace.
+n=$((n + 1))
+f="$TMP/pos$n.tur"
+cat > "$f" <<'EOF'
+#use-reader-macros "../../src/html/markup.tur"
+(defmodule poscase
+  (import html/markup :refer [html*])
+  (import dom/holes :refer [html->string])
+  (defn main [] : int
+    (let [x "v"]
+      (println (html->string #html{<ul>
+        <li>${x}</li>
+        <li class="a\}">${(+ x 1)}</li>
+      </ul>})))
+    0))
+EOF
+out="$("$TUR" check "$f" 2>&1)"
+if printf '%s' "$out" | grep -qF "pos$n.tur:9:27: error"; then
+  echo "ok $n - a hole on a literal's third line, after an escaped brace"
+else
+  echo "not ok $n - a hole on a literal's third line, after an escaped brace"
+  printf '%s\n' "$out" | grep -m3 'error' | sed 's/^/      /'
+  fail=1
+fi
+
 # A raw-html value that cannot be written back panics at render time.
 n=$((n + 1))
 f="$TMP/raw$n.tur"

@@ -4,6 +4,10 @@
 
 ### Added
 
+- A type error in a markup literal's `${...}` hole is reported at the hole
+  (xml-html-followups-plan A5): `dom/markupc` reads holes with turmeric's
+  `read-string-at`, which keeps their place in the file. Needs a `tur` with
+  that native.
 - `RenderHtml` (dom/holes; xml-html-followups-plan A-3 / D2): a value that
   is a whole HTML response body, for a web framework to take (tourist's
   `html-response`). Instances: `Fragment` here, `Html` and `LiveHtml` in
