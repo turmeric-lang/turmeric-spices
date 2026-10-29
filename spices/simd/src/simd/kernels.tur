@@ -1,0 +1,297 @@
+;;; simd/kernels -- whole kernels written with explicit SIMD (plan phase S0).
+;;;
+;;; simd-and-vectorization-plan (turmeric repo) phase S0: before the compiler
+;;; knows a vector type, write real kernels on the op set S1 proposes --
+;;; `c/simd/tur_simd.h`, one C function per operation -- to check that set
+;;; against them and measure what crossing a function boundary costs.  A
+;;; vector cannot be a Turmeric value yet (16 or 32 bytes do not fit a carrier
+;;; word), so each kernel is a whole loop over typed numeric arrays
+;;; (`stdlib/numvec.tur`) in one inline-C body.
+;;;
+;;; The kernels are the three the plan names:
+;;;
+;;; - `simd-dot-f64` / `simd-dot-f32`: a dot product on two four-lane
+;;;   accumulators, summed in N1's eight-lane order -- bit-identical to
+;;;   `f64vec-dot` / `f32vec-dot`;
+;;; - `simd-blend-u8!`: an alpha blend of two byte images, widened to 16-bit
+;;;   lanes and narrowed back;
+;;; - `simd-biquad4-f32!`: one biquad section run over four interleaved
+;;;   channels, a channel per lane (a biquad is a recurrence in time, so its
+;;;   lanes can only run across channels).
+;;;
+;;; Each has the plain-C scalar result to the bit; `tests/` holds them to it.
+;;; Built with gcc or clang the operations are vector instructions; under
+;;; `tur jit` (MIR, no vector types) the same names are a loop over a struct
+;;; of lanes (`simd-lowering` says which).
+;;;
+;;; Since: S0
+;; kernels over the N0 arrays
+(load "stdlib/numvec.tur")
+
+(defmodule simd/kernels
+  (export Biquad
+    simd-lowering
+    simd-dot-f64
+    simd-dot-f64x4
+    simd-dot-f32
+    simd-blend-u8!
+    simd-biquad4-f32!)
+  ;;; Biquad -- one biquad section's coefficients, normalized (a0 = 1).
+  ;;;
+  ;;; Direct form II transposed: y = b0 x + z1, z1' = b1 x - a1 y + z2,
+  ;;; z2' = b2 x - a2 y.
+  ;;;
+  ;;; Since: S0
+  (defstruct ^copy Biquad
+    [b0 : float32
+     b1 : float32
+     b2 : float32
+     a1 : float32
+     a2 : float32])
+  ;;; simd-lowering -- which lowering the vector operations got in this build.
+  ;;;
+  ;;; Returns:
+  ;;;   "vector-ext" (GNU vector extensions: gcc, clang) or "lanes" (a
+  ;;;   struct of lanes and a loop per operation: `tur jit`).
+  ;;;
+  ;;; Example:
+  ;;;   (println (simd-lowering))   ; => vector-ext
+  ;;;
+  ;;; Since: S0
+  (defn simd-lowering [] : cstr
+    ```c
+    /* __tur_include__: #include "tur_simd.h" */
+    return TUR_SIMD_VECTOR_EXT ? "vector-ext" : "lanes";
+    ```)
+  ;;; simd-dot-f64 -- the dot product of two F64Vecs, on f64x2 lanes.
+  ;;;
+  ;;; Four f64x2 accumulators hold N1's eight lanes (element i in lane
+  ;;; i mod 8), the tail goes to its lane one element at a time, and the lanes
+  ;;; are added in N1's tree: the same bits as `f64vec-dot`.  Two-wide, not
+  ;;; four: a 16-byte vector is a register on every target, while gcc keeps a
+  ;;; 32-byte one in memory on an SSE2-only build and runs 2.7x slower
+  ;;; (`simd-dot-f64x4`, README).  A length mismatch panics.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the first array (borrowed)
+  ;;;   b -- the second array (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The dot product.
+  ;;;
+  ;;; Example:
+  ;;;   (let [a (f64vec-of 1.5 2.5) b (f64vec-of 2.0 4.0)] (simd-dot-f64 a b))   ; => 13.0
+  ;;;
+  ;;; Since: S0
+  (defn simd-dot-f64 [^borrow a : F64Vec ^borrow b : F64Vec] : float
+    ```c
+    /* __tur_include__: #include "tur_simd.h" */
+    struct { int64_t len; double *data; void *raw; } *y = (void*)(intptr_t)a;
+    struct { int64_t len; double *data; void *raw; } *x = (void*)(intptr_t)b;
+    if (y->len != x->len) {
+      tur_panic("simd-dot-f64: length mismatch");
+      return 0;
+    }
+    int64_t n = y->len;
+    const double *yd = y->data;
+    const double *xd = x->data;
+    f64x2 c0 = simd_f64x2_splat(0.0), c1 = c0, c2 = c0, c3 = c0;
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+      f64x2 m0 = simd_f64x2_mul(simd_f64x2_load(yd + i), simd_f64x2_load(xd + i));
+      f64x2 m1 = simd_f64x2_mul(simd_f64x2_load(yd + i + 2), simd_f64x2_load(xd + i + 2));
+      f64x2 m2 = simd_f64x2_mul(simd_f64x2_load(yd + i + 4), simd_f64x2_load(xd + i + 4));
+      f64x2 m3 = simd_f64x2_mul(simd_f64x2_load(yd + i + 6), simd_f64x2_load(xd + i + 6));
+      c0 = simd_f64x2_add(c0, m0);
+      c1 = simd_f64x2_add(c1, m1);
+      c2 = simd_f64x2_add(c2, m2);
+      c3 = simd_f64x2_add(c3, m3);
+    }
+    double s[8];
+    for (int k = 0; k < 2; k++) {
+      s[k] = simd_f64x2_lane(c0, k);
+      s[2 + k] = simd_f64x2_lane(c1, k);
+      s[4 + k] = simd_f64x2_lane(c2, k);
+      s[6 + k] = simd_f64x2_lane(c3, k);
+    }
+    for (int k = 0; i + k < n; k++) { double m = yd[i + k] * xd[i + k]; s[k] = s[k] + m; }
+    return ((s[0] + s[1]) + (s[2] + s[3])) + ((s[4] + s[5]) + (s[6] + s[7]));
+    ```)
+  ;;; simd-dot-f64x4 -- `simd-dot-f64` on two f64x4 accumulators, for the measurement.
+  ;;;
+  ;;; Two f64x4 accumulators hold lanes 0-3 and 4-7 of N1's eight-lane sum
+  ;;; (element i in lane i mod 8), the tail goes to its lane one element at a
+  ;;; time, and `simd_f64x4_hsum2` adds the lanes in N1's tree: the same bits
+  ;;; as `f64vec-dot`.  Kept to show what a 32-byte vector costs: on gcc
+  ;;; without AVX the two accumulators live on the stack (README).  A length
+  ;;; mismatch panics.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the first array (borrowed)
+  ;;;   b -- the second array (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The dot product.
+  ;;;
+  ;;; Example:
+  ;;;   (let [a (f64vec-of 1.5 2.5) b (f64vec-of 2.0 4.0)] (simd-dot-f64x4 a b))   ; => 13.0
+  ;;;
+  ;;; Since: S0
+  (defn simd-dot-f64x4 [^borrow a : F64Vec ^borrow b : F64Vec] : float
+    ```c
+    /* __tur_include__: #include "tur_simd.h" */
+    struct { int64_t len; double *data; void *raw; } *y = (void*)(intptr_t)a;
+    struct { int64_t len; double *data; void *raw; } *x = (void*)(intptr_t)b;
+    if (y->len != x->len) {
+      tur_panic("simd-dot-f64x4: length mismatch");
+      return 0;
+    }
+    int64_t n = y->len;
+    const double *yd = y->data;
+    const double *xd = x->data;
+    f64x4 lo = simd_f64x4_splat(0.0), hi = simd_f64x4_splat(0.0);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+      f64x4 ml = simd_f64x4_mul(simd_f64x4_load(yd + i), simd_f64x4_load(xd + i));
+      f64x4 mh = simd_f64x4_mul(simd_f64x4_load(yd + i + 4), simd_f64x4_load(xd + i + 4));
+      lo = simd_f64x4_add(lo, ml);
+      hi = simd_f64x4_add(hi, mh);
+    }
+    if (i == n) return simd_f64x4_hsum2(lo, hi);
+    double s[8];
+    for (int k = 0; k < 4; k++) { s[k] = simd_f64x4_lane(lo, k); s[4 + k] = simd_f64x4_lane(hi, k); }
+    for (int k = 0; i + k < n; k++) { double m = yd[i + k] * xd[i + k]; s[k] = s[k] + m; }
+    return ((s[0] + s[1]) + (s[2] + s[3])) + ((s[4] + s[5]) + (s[6] + s[7]));
+    ```)
+  ;;; simd-dot-f32 -- the dot product of two F32Vecs, on f32x4 lanes.
+  ;;;
+  ;;; As `simd-dot-f64`, in float32: the same bits as `f32vec-dot`.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the first array (borrowed)
+  ;;;   b -- the second array (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The dot product, a float32.
+  ;;;
+  ;;; Example:
+  ;;;   (simd-dot-f32 a b)
+  ;;;
+  ;;; Since: S0
+  (defn simd-dot-f32 [^borrow a : F32Vec ^borrow b : F32Vec] : float32
+    ```c
+    /* __tur_include__: #include "tur_simd.h" */
+    struct { int64_t len; float *data; void *raw; } *y = (void*)(intptr_t)a;
+    struct { int64_t len; float *data; void *raw; } *x = (void*)(intptr_t)b;
+    if (y->len != x->len) {
+      tur_panic("simd-dot-f32: length mismatch");
+      return 0;
+    }
+    int64_t n = y->len;
+    const float *yd = y->data;
+    const float *xd = x->data;
+    f32x4 lo = simd_f32x4_splat(0.0f), hi = simd_f32x4_splat(0.0f);
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+      f32x4 ml = simd_f32x4_mul(simd_f32x4_load(yd + i), simd_f32x4_load(xd + i));
+      f32x4 mh = simd_f32x4_mul(simd_f32x4_load(yd + i + 4), simd_f32x4_load(xd + i + 4));
+      lo = simd_f32x4_add(lo, ml);
+      hi = simd_f32x4_add(hi, mh);
+    }
+    if (i == n) return simd_f32x4_hsum2(lo, hi);
+    float s[8];
+    for (int k = 0; k < 4; k++) { s[k] = simd_f32x4_lane(lo, k); s[4 + k] = simd_f32x4_lane(hi, k); }
+    for (int k = 0; i + k < n; k++) { float m = yd[i + k] * xd[i + k]; s[k] = s[k] + m; }
+    return ((s[0] + s[1]) + (s[2] + s[3])) + ((s[4] + s[5]) + (s[6] + s[7]));
+    ```)
+  ;;; simd-blend-u8! -- dst = a * alpha/255 + b * (255 - alpha)/255, per byte.
+  ;;;
+  ;;; Rounded to nearest: with t = a*alpha + b*(255-alpha) + 128, the byte is
+  ;;; (t + (t >> 8)) >> 8, exact for every input.  Sixteen bytes a step,
+  ;;; widened to two u16x8 (a product needs 16 bits) and narrowed back.  All
+  ;;; three arrays have the same length, or a panic; dst may be a or b.
+  ;;;
+  ;;; Parameters:
+  ;;;   dst   -- the array written (borrowed)
+  ;;;   a     -- the image weighted by alpha (borrowed)
+  ;;;   b     -- the image weighted by 255 - alpha (borrowed)
+  ;;;   alpha -- 0 gives b, 255 gives a
+  ;;;
+  ;;; Example:
+  ;;;   (simd-blend-u8! out fg bg (as uint8 128))
+  ;;;
+  ;;; Since: S0
+  (defn simd-blend-u8! [^borrow dst : U8Vec ^borrow a : U8Vec ^borrow b : U8Vec alpha : uint8] : nil
+    ```c
+    /* __tur_include__: #include "tur_simd.h" */
+    struct { int64_t len; uint8_t *data; void *raw; } *o = (void*)(intptr_t)dst;
+    struct { int64_t len; uint8_t *data; void *raw; } *p = (void*)(intptr_t)a;
+    struct { int64_t len; uint8_t *data; void *raw; } *q = (void*)(intptr_t)b;
+    if (o->len != p->len || o->len != q->len) {
+      tur_panic("simd-blend-u8!: length mismatch");
+      return;
+    }
+    int64_t n = o->len;
+    uint8_t *od = o->data;
+    const uint8_t *pd = p->data, *qd = q->data;
+    uint16_t wa = (uint16_t)alpha, wb = (uint16_t)(255 - alpha);
+    u16x8 va = simd_u16x8_splat(wa), vb = simd_u16x8_splat(wb), r = simd_u16x8_splat(128);
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+      u8x16 x = simd_u8x16_load(pd + i), y = simd_u8x16_load(qd + i);
+      u16x8 tl = simd_u16x8_add(simd_u16x8_add(simd_u16x8_mul(simd_u8x16_widen_lo(x), va),
+                                               simd_u16x8_mul(simd_u8x16_widen_lo(y), vb)), r);
+      u16x8 th = simd_u16x8_add(simd_u16x8_add(simd_u16x8_mul(simd_u8x16_widen_hi(x), va),
+                                               simd_u16x8_mul(simd_u8x16_widen_hi(y), vb)), r);
+      tl = simd_u16x8_shr(simd_u16x8_add(tl, simd_u16x8_shr(tl, 8)), 8);
+      th = simd_u16x8_shr(simd_u16x8_add(th, simd_u16x8_shr(th, 8)), 8);
+      simd_u8x16_store(od + i, simd_u16x8_narrow(tl, th));
+    }
+    for (; i < n; i++) {
+      uint32_t t = (uint32_t)pd[i] * wa + (uint32_t)qd[i] * wb + 128;
+      od[i] = (uint8_t)((t + (t >> 8)) >> 8);
+    }
+    ```)
+  ;;; simd-biquad4-f32! -- run one biquad over four interleaved channels, in place.
+  ;;;
+  ;;; buf holds frames of four samples (channel c of frame f at 4f + c), so
+  ;;; its length is a multiple of four, or a panic.  state holds the filter's
+  ;;; memory between calls: z1 for channels 0-3, then z2 -- eight float32,
+  ;;; zeroed to start (`(f32vec-new 8 (as float32 0.0))`).  Each lane is one
+  ;;; channel, its arithmetic in the scalar order, multiplies and adds never
+  ;;; fused: the same bits as four scalar filters.
+  ;;;
+  ;;; Parameters:
+  ;;;   buf   -- the interleaved samples, filtered in place (borrowed)
+  ;;;   state -- the eight state values, updated (borrowed)
+  ;;;   c     -- the coefficients
+  ;;;
+  ;;; Example:
+  ;;;   (simd-biquad4-f32! buf state (Biquad b0 b1 b2 a1 a2))
+  ;;;
+  ;;; Since: S0
+  (defn simd-biquad4-f32! [^borrow buf : F32Vec ^borrow state : F32Vec c : Biquad] : nil
+    ```c
+    /* __tur_include__: #include "tur_simd.h" */
+    struct { int64_t len; float *data; void *raw; } *v = (void*)(intptr_t)buf;
+    struct { int64_t len; float *data; void *raw; } *s = (void*)(intptr_t)state;
+    if (v->len % 4 != 0 || s->len != 8) {
+      tur_panic("simd-biquad4-f32!: buf length must be a multiple of 4, state length 8");
+      return;
+    }
+    float *d = v->data;
+    f32x4 b0 = simd_f32x4_splat(c.b0), b1 = simd_f32x4_splat(c.b1), b2 = simd_f32x4_splat(c.b2);
+    f32x4 a1 = simd_f32x4_splat(c.a1), a2 = simd_f32x4_splat(c.a2);
+    f32x4 z1 = simd_f32x4_load(s->data), z2 = simd_f32x4_load(s->data + 4);
+    for (int64_t i = 0; i < v->len; i += 4) {
+      f32x4 x = simd_f32x4_load(d + i);
+      f32x4 y = simd_f32x4_add(simd_f32x4_mul(b0, x), z1);
+      f32x4 p = simd_f32x4_mul(b1, x), q = simd_f32x4_mul(a1, y);
+      z1 = simd_f32x4_add(simd_f32x4_sub(p, q), z2);
+      f32x4 u = simd_f32x4_mul(b2, x), w = simd_f32x4_mul(a2, y);
+      z2 = simd_f32x4_sub(u, w);
+      simd_f32x4_store(d + i, y);
+    }
+    simd_f32x4_store(s->data, z1);
+    simd_f32x4_store(s->data + 4, z2);
+    ```))
