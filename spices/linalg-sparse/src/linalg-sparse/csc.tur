@@ -1,0 +1,274 @@
+;;; linalg-sparse/csc -- Compressed Sparse Column matrices.
+;;;
+;;; A `cscmat` mirrors `csrmat` along the other axis: `colptr` (cols + 1
+;;; offsets), `rowidx` (nnz row indices, ascending within each column) and
+;;; `vals`. The CSR buffers of A are exactly the CSC buffers of A', so
+;;; `csc-transpose` (here) and `csr-transpose` (linalg-sparse/ops) only copy;
+;;; changing the storage order of the SAME matrix (`csc-from-csr`,
+;;; `csr-from-csc`) is a counting-sort transposition in O(nnz + rows + cols).
+(defmodule linalg-sparse/csc
+  (export cscmat
+    csc-from-coo
+    csc-from-csr
+    csr-from-csc
+    csc-free
+    csc-rows
+    csc-cols
+    csc-nnz
+    csc-get
+    csc-spmv
+    csc-transpose
+    sparse-ivec-copy
+    sparse-fvec-copy)
+  (import linalg/vec :refer [lavec la-vec-new la-vec-len])
+  (import linalg-sparse/csr
+    :refer
+    [coomat csrmat csr-from-coo csr-free sparse-izeros sparse-fzeros])
+  ;;; cscmat -- a rows x cols matrix in Compressed Sparse Column form.
+  (defstruct cscmat
+    [rows : int
+     cols : int
+     nnz : int
+     colptr : (Vec int)
+     rowidx : (Vec int)
+     vals : (Vec float)])
+  ;;; __recompress-kernel -- given compressed buffers of an n-major matrix
+  ;;; (ptr over n majors, idx of minors in 0..nm-1), write the nm-major
+  ;;; compressed buffers of the same matrix. Minor indices come out ascending.
+  (defn __recompress-kernel [optd : (Vec int)
+                             oidxd : (Vec int)
+                             ovd : (Vec float)
+                             ptrd : (Vec int)
+                             idxd : (Vec int)
+                             vd : (Vec float)
+                             n : int
+                             nm : int] : int
+    ```c
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  int64_t *optr = ((struct __V*)(intptr_t)optd)->data;
+  int64_t *oidx = ((struct __V*)(intptr_t)oidxd)->data;
+  double *ov = (double*)(void*)((struct __V*)(intptr_t)ovd)->data;
+  const int64_t *ptr = ((struct __V*)(intptr_t)ptrd)->data;
+  const int64_t *idx = ((struct __V*)(intptr_t)idxd)->data;
+  const double *v = (const double*)(void*)((struct __V*)(intptr_t)vd)->data;
+  for (int64_t j = 0; j <= nm; j++) optr[j] = 0;
+  for (int64_t p = 0; p < ptr[n]; p++) optr[idx[p] + 1]++;
+  for (int64_t j = 0; j < nm; j++) optr[j + 1] += optr[j];
+  int64_t *next = (int64_t*)malloc(sizeof(int64_t) * (size_t)(nm + 1));
+  for (int64_t j = 0; j < nm; j++) next[j] = optr[j];
+  for (int64_t i = 0; i < n; i++)
+    for (int64_t p = ptr[i]; p < ptr[i + 1]; p++) {
+      int64_t q = next[idx[p]]++;
+      oidx[q] = i;
+      ov[q] = v[p];
+    }
+  free(next);
+  return 0;
+  ```)
+  ;;; sparse-ivec-copy / sparse-fvec-copy -- deep copies of index / value buffers.
+  (defn sparse-ivec-copy [^borrow d : (Vec int)] : (Vec int)
+    (let [n      (vec-len d)
+          c      (sparse-izeros n)
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n)
+                   0
+                   (do (vec-set! c i (vec-get d i)) (set! i (+ i 1)) (go))))]
+        (go))
+      c))
+  (defn sparse-fvec-copy [^borrow d : (Vec float)] : (Vec float)
+    (let [n      (vec-len d)
+          c      (sparse-fzeros n)
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n)
+                   0
+                   (do
+                     (vec-set! c i (:: (vec-get d i) :float))
+                     (set! i (+ i 1))
+                     (go))))]
+        (go))
+      c))
+  ;;; csc-from-csr -- the same matrix, re-stored column-major.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- a CSR matrix (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A cscmat holding the same entries.
+  ;;;
+  ;;; Example:
+  ;;;   (csc-get (csc-from-csr m) 2 1)  ; => (csr-get m 2 1)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csc-from-csr [^borrow m : csrmat] : cscmat
+    (let [cp (sparse-izeros (+ (.cols m) 1))
+          ri (sparse-izeros (.nnz m))
+          vs (sparse-fzeros (.nnz m))]
+      (__recompress-kernel cp
+        ri
+        vs
+        (.rowptr m)
+        (.colidx m)
+        (.vals m)
+        (.rows m)
+        (.cols m))
+      (make-struct cscmat (.rows m) (.cols m) (.nnz m) cp ri vs)))
+  ;;; csr-from-csc -- the same matrix, re-stored row-major.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- a CSC matrix (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A csrmat holding the same entries.
+  ;;;
+  ;;; Example:
+  ;;;   (csr-spmv (csr-from-csc m) v)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csr-from-csc [^borrow m : cscmat] : csrmat
+    (let [rp (sparse-izeros (+ (.rows m) 1))
+          ci (sparse-izeros (.nnz m))
+          vs (sparse-fzeros (.nnz m))]
+      (__recompress-kernel rp
+        ci
+        vs
+        (.colptr m)
+        (.rowidx m)
+        (.vals m)
+        (.cols m)
+        (.rows m))
+      (make-struct csrmat (.rows m) (.cols m) (.nnz m) rp ci vs)))
+  ;;; csc-from-coo -- compress a coordinate list into CSC form.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the coordinate list (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A cscmat; repeated coordinates are summed.
+  ;;;
+  ;;; Example:
+  ;;;   (csc-from-coo c)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csc-from-coo [^borrow m : coomat] : cscmat
+    (let [r (csr-from-coo m)
+          c (csc-from-csr r)]
+      (csr-free r)
+      c))
+  ;;; csc-free -- free a CSC matrix.
+  (defn csc-free [m : cscmat] : void
+    (vec-free (.colptr m))
+    (vec-free (.rowidx m))
+    (vec-free (.vals m)))
+  ;;; csc-rows / csc-cols / csc-nnz -- shape and stored-entry count.
+  (defn csc-rows [^borrow m : cscmat] : int (.rows m))
+  (defn csc-cols [^borrow m : cscmat] : int (.cols m))
+  (defn csc-nnz [^borrow m : cscmat] : int (.nnz m))
+  ;;; __csc-get-kernel -- binary search column c for row r; 0.0 when absent.
+  (defn __csc-get-kernel [cpd : (Vec int)
+                          rxd : (Vec int)
+                          vsd : (Vec float)
+                          r : int
+                          c : int] : float
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  const int64_t *colptr = ((struct __V*)(intptr_t)cpd)->data;
+  const int64_t *rowidx = ((struct __V*)(intptr_t)rxd)->data;
+  const double *vals = (const double*)(void*)((struct __V*)(intptr_t)vsd)->data;
+  int64_t lo = colptr[c], hi = colptr[c + 1];
+  while (lo < hi) {
+    int64_t mid = lo + (hi - lo) / 2;
+    if (rowidx[mid] == r) return vals[mid];
+    if (rowidx[mid] < r) lo = mid + 1; else hi = mid;
+  }
+  return 0.0;
+  ```)
+  ;;; csc-get -- element (r, c); 0.0 for an entry that is not stored.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the matrix (borrowed)
+  ;;;   r -- row index
+  ;;;   c -- column index
+  ;;;
+  ;;; Returns:
+  ;;;   The stored value, found by binary search over column c.
+  ;;;
+  ;;; Example:
+  ;;;   (csc-get m 1 0)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csc-get [^borrow m : cscmat r : int c : int] : float
+    (when (or (< r 0) (or (>= r (.rows m)) (or (< c 0) (>= c (.cols m)))))
+      (panic "csc-get: index out of range"))
+    (__csc-get-kernel (.colptr m) (.rowidx m) (.vals m) r c))
+  ;;; __csc-spmv-t-kernel -- y (cols) = A' x by walking each column.
+  (defn __csc-spmv-t-kernel [yd : (Vec float)
+                             cpd : (Vec int)
+                             rxd : (Vec int)
+                             vsd : (Vec float)
+                             xd : (Vec float)
+                             cols : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *y = (double*)(void*)((struct __V*)(intptr_t)yd)->data;
+  const int64_t *colptr = ((struct __V*)(intptr_t)cpd)->data;
+  const int64_t *rowidx = ((struct __V*)(intptr_t)rxd)->data;
+  const double *vals = (const double*)(void*)((struct __V*)(intptr_t)vsd)->data;
+  const double *x = (const double*)(void*)((struct __V*)(intptr_t)xd)->data;
+  for (int64_t c = 0; c < cols; c++) {
+    double s = 0.0;
+    for (int64_t p = colptr[c]; p < colptr[c + 1]; p++) s += vals[p] * x[rowidx[p]];
+    y[c] = s;
+  }
+  return 0;
+  ```)
+  ;;; csc-spmv -- transposed product A' v, by column traversal.
+  ;;;
+  ;;; Column j of A is contiguous in CSC, so (A' v)[j] is one dot product over
+  ;;; it. (For A v, store the matrix as CSR and use `csr-spmv`.)
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- a rows x cols CSC matrix (borrowed)
+  ;;;   v -- a vector of length rows (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A' v, length cols.
+  ;;;
+  ;;; Example:
+  ;;;   (csc-spmv m (la-vec-of 1.0 1.0 1.0))  ; => the column sums of m
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csc-spmv [^borrow m : cscmat ^borrow v : lavec] : lavec
+    (when (not= (la-vec-len v) (.rows m)) (panic "csc-spmv: length mismatch"))
+    (let [y (la-vec-new (.cols m))]
+      (__csc-spmv-t-kernel (.data y)
+        (.colptr m)
+        (.rowidx m)
+        (.vals m)
+        (.data v)
+        (.cols m))
+      y))
+  ;;; csc-transpose -- A' as a CSR matrix (a copy of the same buffers).
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- a rows x cols CSC matrix (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The cols x rows CSR matrix A'.
+  ;;;
+  ;;; Example:
+  ;;;   (csr-get (csc-transpose m) 1 0)  ; => (csc-get m 0 1)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csc-transpose [^borrow m : cscmat] : csrmat
+    (make-struct csrmat
+      (.cols m)
+      (.rows m)
+      (.nnz m)
+      (sparse-ivec-copy (.colptr m))
+      (sparse-ivec-copy (.rowidx m))
+      (sparse-fvec-copy (.vals m))))) ;; end defmodule linalg-sparse/csc

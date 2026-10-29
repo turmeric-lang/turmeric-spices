@@ -1,0 +1,211 @@
+;;; cov_test.tur -- SM0: covariance / correlation matrices and Mahalanobis
+;;; distance. Reference values are numpy's (np.cov, np.corrcoef); the
+;;; covariance is also cross-checked against tur-stats' pairwise `cov` over
+;;; frame columns read from the same numbers.
+(defmodule multivariate/cov-test
+  (import linalg/vec :refer [lavec la-vec-of la-vec-get la-vec-len la-vec-free])
+  (import linalg/mat :refer [mat mat-of mat-get mat-rows mat-cols mat-free])
+  (import linalg/solve :refer [mat-inv])
+  (import multivariate/cov
+    :refer
+    [cov-mat
+     cov-mat-pop
+     cor-mat
+     col-means
+     col-sds
+     mahalanobis
+     mahalanobis-auto
+     mv-pinv])
+  (import frame/csv :refer [read-csv-string])
+  (import frame/frame :refer [frame-column frame-free])
+  (import stats/cov :refer [cov])
+  ;; --- TAP harness (inline-C fail counter) ---
+  (defn check [idx : int name : cstr ok : bool] : void
+    ```c
+    /* __tur_include__: static int g_cv_fails = 0; */
+  if (!ok) g_cv_fails++;
+  printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
+  ```)
+  (defn finish [count : int] : int
+    ```c
+    printf("1..%lld\n", (long long)count);
+  if (g_cv_fails == 0) {
+    fprintf(stderr, "# All %lld cov tests passed.\n", (long long)count);
+    return 0;
+  }
+  fprintf(stderr, "# %d/%lld cov tests failed.\n", g_cv_fails, (long long)count);
+  return 1;
+  ```)
+  (defn fa [x : float] : float ```c return x < 0.0 ? -x : x; ```)
+  (defn approx [a : float b : float] : bool (< (fa (- a b)) 1e-12))
+  ;;; iris15 -- five rows from each of the three iris species (4 columns).
+  (defn iris15 [] : mat
+    (mat-of 15
+      4
+      5.1
+      3.5
+      1.4
+      0.2
+      4.9
+      3.0
+      1.4
+      0.2
+      4.7
+      3.2
+      1.3
+      0.2
+      4.6
+      3.1
+      1.5
+      0.2
+      5.0
+      3.6
+      1.4
+      0.2
+      7.0
+      3.2
+      4.7
+      1.4
+      6.4
+      3.2
+      4.5
+      1.5
+      6.9
+      3.1
+      4.9
+      1.5
+      5.5
+      2.3
+      4.0
+      1.3
+      6.5
+      2.8
+      4.6
+      1.5
+      6.3
+      3.3
+      6.0
+      2.5
+      5.8
+      2.7
+      5.1
+      1.9
+      7.1
+      3.0
+      5.9
+      2.1
+      6.3
+      2.9
+      5.6
+      1.8
+      6.5
+      3.0
+      5.8
+      2.2))
+  (defn near [a : float b : float tol : float] : bool (< (fa (- a b)) tol))
+  (defn csv [] : cstr
+    "a,b,c,d\n5.1,3.5,1.4,0.2\n4.9,3.0,1.4,0.2\n4.7,3.2,1.3,0.2\n4.6,3.1,1.5,0.2\n5.0,3.6,1.4,0.2\n7.0,3.2,4.7,1.4\n6.4,3.2,4.5,1.5\n6.9,3.1,4.9,1.5\n5.5,2.3,4.0,1.3\n6.5,2.8,4.6,1.5\n6.3,3.3,6.0,2.5\n5.8,2.7,5.1,1.9\n7.1,3.0,5.9,2.1\n6.3,2.9,5.6,1.8\n6.5,3.0,5.8,2.2\n")
+  (defn t-cov-numpy [] : bool
+    (let [x (iris15)
+          s (cov-mat x)]
+      (let [ok (and (= (mat-rows s) 4)
+                 (and (near (mat-get s 0 1) -0.04471428571428572 1e-12)
+                   (and (near (mat-get s 2 3) 1.5477619047619047 1e-12)
+                     (near (mat-get s 3 2) (mat-get s 2 3) 1e-15))))]
+        (mat-free s)
+        (mat-free x)
+        ok)))
+  (defn t-cov-vs-stats [] : bool
+    ;; every pair agrees with tur-stats' pairwise cov over frame columns
+    (let [x  (iris15)
+          s  (cov-mat x)
+          df (read-csv-string (csv) 0 0 1 0 "")]
+      (let [ok (and (near (mat-get s 0 2)
+                      (cov (frame-column df "a") (frame-column df "c"))
+                      1e-12)
+                 (and (near (mat-get s 1 3)
+                        (cov (frame-column df "b") (frame-column df "d"))
+                        1e-12)
+                   (near (mat-get s 0 0)
+                     (cov (frame-column df "a") (frame-column df "a"))
+                     1e-12)))]
+        (frame-free df)
+        (mat-free s)
+        (mat-free x)
+        ok)))
+  (defn t-cov-pop [] : bool
+    (let [x (iris15)
+          s (cov-mat x)
+          p (cov-mat-pop x)]
+      (let [ok (near (mat-get p 2 3) (* (mat-get s 2 3) (/ 14.0 15.0)) 1e-12)]
+        (mat-free p)
+        (mat-free s)
+        (mat-free x)
+        ok)))
+  (defn t-cor [] : bool
+    (let [x (iris15)
+          r (cor-mat x)]
+      (let [ok (and (near (mat-get r 1 1) 1.0 1e-15)
+                 (near (mat-get r 0 2) 0.8854496148562916 1e-12))]
+        (mat-free r)
+        (mat-free x)
+        ok)))
+  (defn t-means-sds [] : bool
+    (let [x  (mat-of 3 2 1.0 2.0 2.0 4.0 3.0 9.0)
+          mu (col-means x)
+          sd (col-sds x)]
+      (let [ok (and (near (la-vec-get mu 0) 2.0 1e-15)
+                 (and (near (la-vec-get mu 1) 5.0 1e-15)
+                   (near (la-vec-get sd 0) 1.0 1e-15)))]
+        (la-vec-free sd)
+        (la-vec-free mu)
+        (mat-free x)
+        ok)))
+  (defn t-mahal-center-zero [] : bool
+    ;; the centroid itself is at distance zero
+    (let [x  (iris15)
+          mu (col-means x)
+          s  (cov-mat x)
+          si (mat-inv s)]
+      (let [cm (mat-of 1
+                 4
+                 (la-vec-get mu 0)
+                 (la-vec-get mu 1)
+                 (la-vec-get mu 2)
+                 (la-vec-get mu 3))
+            d  (mahalanobis cm mu si)
+            ok (near (la-vec-get d 0) 0.0 1e-12)]
+        (la-vec-free d)
+        (mat-free cm)
+        (mat-free si)
+        (mat-free s)
+        (la-vec-free mu)
+        (mat-free x)
+        ok)))
+  (defn t-mahal-auto [] : bool
+    (let [x (iris15)
+          d (mahalanobis-auto x)]
+      (let [ok (and (= (la-vec-len d) 15)
+                 (and (near (la-vec-get d 0) 1.6377367395142095 1e-09)
+                   (near (la-vec-get d 7) 1.6478857740842545 1e-09)))]
+        (la-vec-free d)
+        (mat-free x)
+        ok)))
+  (defn t-pinv-singular [] : bool
+    (let [a (mat-of 2 2 2.0 0.0 0.0 0.0)
+          p (mv-pinv a)]
+      (let [ok (and (near (mat-get p 0 0) 0.5 1e-15)
+                 (near (mat-get p 1 1) 0.0 1e-15))]
+        (mat-free p)
+        (mat-free a)
+        ok)))
+  (defn main [] : int
+    (check 1 "cov-mat matches numpy" (t-cov-numpy))
+    (check 2 "cov-mat matches stats/cov pairwise" (t-cov-vs-stats))
+    (check 3 "cov-mat-pop = (m-1)/m cov-mat" (t-cov-pop))
+    (check 4 "cor-mat matches numpy" (t-cor))
+    (check 5 "col-means / col-sds" (t-means-sds))
+    (check 6 "mahalanobis: centroid is at distance 0" (t-mahal-center-zero))
+    (check 7 "mahalanobis-auto matches numpy" (t-mahal-auto))
+    (check 8 "mv-pinv of a singular matrix" (t-pinv-singular))
+    (finish 8))) ;; end defmodule multivariate/cov-test

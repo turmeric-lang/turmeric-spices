@@ -1,0 +1,381 @@
+;;; linalg-sparse/solve -- ILU(0) and the sparse iterative solvers.
+;;;
+;;; `sparse-cg` and `sparse-bicgstab` run the same iterations as linalg/iter's
+;;; `cg` / `bicgstab` but multiply through the CSR buffers, so A is never
+;;; densified: one iteration costs O(nnz). They report through linalg/iter's
+;;; `IterResult`, so callers handle dense and sparse solves alike.
+;;;
+;;; `ilu0` computes the incomplete LU factorization with zero fill-in: L and U
+;;; keep A's sparsity pattern (L unit lower, U upper). For a tridiagonal A
+;;; there is no fill to drop, and it is the exact LU. `ilu-apply` solves
+;;; L U z = r -- the step a preconditioned iteration takes.
+(defmodule linalg-sparse/solve
+  (export ilufac ilu0 ilu-free ilu-apply sparse-cg sparse-bicgstab)
+  (import linalg/vec :refer [lavec la-vec-new la-vec-len])
+  (import linalg/iter :refer [IterOpts IterResult iter-result])
+  (import linalg-sparse/csr
+    :refer
+    [csrmat csr-free sparse-izeros sparse-fzeros])
+  ;;; ilufac -- an ILU(0) factor pair: L unit lower (diagonal stored), U upper.
+  (defstruct ilufac [L : csrmat U : csrmat])
+  ;;; __ilu-factor-kernel -- IKJ ILU(0) over A's pattern (column indices must
+  ;;; ascend within each row). Writes the combined L\U values into w. Returns
+  ;;; -1 when a row has no stored diagonal or a pivot is zero, else the number
+  ;;; of strictly-lower entries.
+  (defn __ilu-factor-kernel [wd : (Vec float)
+                             rpd : (Vec int)
+                             cxd : (Vec int)
+                             vsd : (Vec float)
+                             n : int] : int
+    ```c
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *w = (double*)(void*)((struct __V*)(intptr_t)wd)->data;
+  const int64_t *rp = ((struct __V*)(intptr_t)rpd)->data;
+  const int64_t *cx = ((struct __V*)(intptr_t)cxd)->data;
+  const double *vs = (const double*)(void*)((struct __V*)(intptr_t)vsd)->data;
+  int64_t *iw = (int64_t*)malloc(sizeof(int64_t) * (size_t)(n + 1));
+  int64_t *diag = (int64_t*)malloc(sizeof(int64_t) * (size_t)(n + 1));
+  for (int64_t p = 0; p < rp[n]; p++) w[p] = vs[p];
+  for (int64_t j = 0; j < n; j++) iw[j] = -1;
+  int64_t lower = 0, status = 0;
+  for (int64_t i = 0; i < n && status == 0; i++) {
+    for (int64_t p = rp[i]; p < rp[i + 1]; p++) iw[cx[p]] = p;
+    diag[i] = -1;
+    for (int64_t p = rp[i]; p < rp[i + 1]; p++) {
+      int64_t k = cx[p];
+      if (k >= i) { if (k == i) diag[i] = p; continue; }
+      lower++;
+      w[p] /= w[diag[k]];
+      for (int64_t q = diag[k] + 1; q < rp[k + 1]; q++) {
+        int64_t at = iw[cx[q]];
+        if (at >= 0) w[at] -= w[p] * w[q];
+      }
+    }
+    if (diag[i] < 0 || w[diag[i]] == 0.0) status = -1;
+    for (int64_t p = rp[i]; p < rp[i + 1]; p++) iw[cx[p]] = -1;
+  }
+  free(iw); free(diag);
+  return status < 0 ? -1 : lower;
+  ```)
+  ;;; __ilu-split-kernel -- split the combined L\U values into L (strictly
+  ;;; lower + a stored unit diagonal) and U (diagonal and above).
+  (defn __ilu-split-kernel [lrpd : (Vec int)
+                            lcxd : (Vec int)
+                            lvsd : (Vec float)
+                            urpd : (Vec int)
+                            ucxd : (Vec int)
+                            uvsd : (Vec float)
+                            rpd : (Vec int)
+                            cxd : (Vec int)
+                            wd : (Vec float)
+                            n : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  int64_t *lrp = ((struct __V*)(intptr_t)lrpd)->data;
+  int64_t *lcx = ((struct __V*)(intptr_t)lcxd)->data;
+  double *lvs = (double*)(void*)((struct __V*)(intptr_t)lvsd)->data;
+  int64_t *urp = ((struct __V*)(intptr_t)urpd)->data;
+  int64_t *ucx = ((struct __V*)(intptr_t)ucxd)->data;
+  double *uvs = (double*)(void*)((struct __V*)(intptr_t)uvsd)->data;
+  const int64_t *rp = ((struct __V*)(intptr_t)rpd)->data;
+  const int64_t *cx = ((struct __V*)(intptr_t)cxd)->data;
+  const double *w = (const double*)(void*)((struct __V*)(intptr_t)wd)->data;
+  int64_t lo = 0, uo = 0;
+  lrp[0] = 0; urp[0] = 0;
+  for (int64_t i = 0; i < n; i++) {
+    for (int64_t p = rp[i]; p < rp[i + 1]; p++) {
+      if (cx[p] < i) { lcx[lo] = cx[p]; lvs[lo] = w[p]; lo++; }
+      else           { ucx[uo] = cx[p]; uvs[uo] = w[p]; uo++; }
+    }
+    lcx[lo] = i; lvs[lo] = 1.0; lo++;
+    lrp[i + 1] = lo; urp[i + 1] = uo;
+  }
+  return 0;
+  ```)
+  ;;; ilu0 -- incomplete LU factorization with zero fill-in.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- a square CSR matrix (borrowed) with every diagonal entry stored
+  ;;;
+  ;;; Returns:
+  ;;;   (Result ilufac cstr) -- Ok with L (unit lower) and U (upper), both on
+  ;;;   A's sparsity pattern; Err when A is not square, a diagonal entry is
+  ;;;   missing, or a pivot comes out zero.
+  ;;;
+  ;;; Example:
+  ;;;   (match (ilu0 a)
+  ;;;     (Ok f)  (let [z (ilu-apply f r)] (ilu-free f) z)
+  ;;;     (Err e) (panic e))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn ilu0 [^borrow a : csrmat] : (Result ilufac cstr)
+    (if (not= (.rows a) (.cols a))
+      (Err "ilu0: matrix must be square")
+      (let [n     (.rows a)
+            w     (sparse-fzeros (.nnz a))
+            lower (__ilu-factor-kernel w (.rowptr a) (.colidx a) (.vals a) n)]
+        (if (< lower 0)
+          (do (vec-free w) (Err "ilu0: missing or zero diagonal pivot"))
+          (let [lnnz (+ lower n)
+                unnz (- (.nnz a) lower)
+                lrp  (sparse-izeros (+ n 1))
+                lcx  (sparse-izeros lnnz)
+                lvs  (sparse-fzeros lnnz)
+                urp  (sparse-izeros (+ n 1))
+                ucx  (sparse-izeros unnz)
+                uvs  (sparse-fzeros unnz)]
+            (__ilu-split-kernel lrp
+              lcx
+              lvs
+              urp
+              ucx
+              uvs
+              (.rowptr a)
+              (.colidx a)
+              w
+              n)
+            (vec-free w)
+            (Ok (make-struct ilufac
+                  (make-struct csrmat n n lnnz lrp lcx lvs)
+                  (make-struct csrmat n n unnz urp ucx uvs))))))))
+  ;;; ilu-free -- free an ILU(0) factor pair.
+  (defn ilu-free [f : ilufac] : void (csr-free (.L f)) (csr-free (.U f)))
+  ;;; __ilu-apply-kernel -- z = U^-1 L^-1 r by a forward then a backward sweep.
+  (defn __ilu-apply-kernel [zd : (Vec float)
+                            lrpd : (Vec int)
+                            lcxd : (Vec int)
+                            lvsd : (Vec float)
+                            urpd : (Vec int)
+                            ucxd : (Vec int)
+                            uvsd : (Vec float)
+                            rd : (Vec float)
+                            n : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *z = (double*)(void*)((struct __V*)(intptr_t)zd)->data;
+  const int64_t *lrp = ((struct __V*)(intptr_t)lrpd)->data;
+  const int64_t *lcx = ((struct __V*)(intptr_t)lcxd)->data;
+  const double *lvs = (const double*)(void*)((struct __V*)(intptr_t)lvsd)->data;
+  const int64_t *urp = ((struct __V*)(intptr_t)urpd)->data;
+  const int64_t *ucx = ((struct __V*)(intptr_t)ucxd)->data;
+  const double *uvs = (const double*)(void*)((struct __V*)(intptr_t)uvsd)->data;
+  const double *r = (const double*)(void*)((struct __V*)(intptr_t)rd)->data;
+  for (int64_t i = 0; i < n; i++) {
+    double s = r[i], d = 1.0;
+    for (int64_t p = lrp[i]; p < lrp[i + 1]; p++) {
+      if (lcx[p] == i) d = lvs[p]; else s -= lvs[p] * z[lcx[p]];
+    }
+    z[i] = s / d;
+  }
+  for (int64_t i = n - 1; i >= 0; i--) {
+    double s = z[i], d = 1.0;
+    for (int64_t p = urp[i]; p < urp[i + 1]; p++) {
+      if (ucx[p] == i) d = uvs[p]; else s -= uvs[p] * z[ucx[p]];
+    }
+    z[i] = s / d;
+  }
+  return 0;
+  ```)
+  ;;; ilu-apply -- apply the ILU(0) preconditioner: solve L U z = r.
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- the factor pair from `ilu0` (borrowed)
+  ;;;   r -- a vector of length n (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   z with L U z = r. When ILU(0) is exact (no fill dropped, e.g. a
+  ;;;   tridiagonal A) this solves A z = r.
+  ;;;
+  ;;; Example:
+  ;;;   (ilu-apply f (la-vec-of 1.0 0.0 0.0))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn ilu-apply [^borrow f : ilufac ^borrow r : lavec] : lavec
+    (let [n (.rows (.L f))]
+      (when (not= (la-vec-len r) n) (panic "ilu-apply: length mismatch"))
+      (let [z (la-vec-new n)]
+        (__ilu-apply-kernel (.data z)
+          (.rowptr (.L f))
+          (.colidx (.L f))
+          (.vals (.L f))
+          (.rowptr (.U f))
+          (.colidx (.U f))
+          (.vals (.U f))
+          (.data r)
+          n)
+        z)))
+  ;;; __b2i -- bool to 0/1 for the C kernels.
+  (defn __b2i [b : bool] : int (if b 1 0))
+  ;;; __sparse-iter-kernel -- CG (method 0) or BiCGSTAB (method 1) with the
+  ;;; operator applied through the CSR buffers. Writes x and info =
+  ;;; [iterations, final true residual].
+  (defn __sparse-iter-kernel [xd : (Vec float)
+                              infod : (Vec float)
+                              rpd : (Vec int)
+                              cxd : (Vec int)
+                              vsd : (Vec float)
+                              bd : (Vec float)
+                              n : int
+                              maxit : int
+                              tol : float
+                              verbose : int
+                              method : int] : int
+    ```c
+    #include <math.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *x = (double*)(void*)((struct __V*)(intptr_t)xd)->data;
+  double *info = (double*)(void*)((struct __V*)(intptr_t)infod)->data;
+  const int64_t *rp = ((struct __V*)(intptr_t)rpd)->data;
+  const int64_t *cx = ((struct __V*)(intptr_t)cxd)->data;
+  const double *vs = (const double*)(void*)((struct __V*)(intptr_t)vsd)->data;
+  const double *b = (const double*)(void*)((struct __V*)(intptr_t)bd)->data;
+  size_t sz = sizeof(double) * (size_t)(n + 1);
+  double *r = (double*)malloc(sz), *p = (double*)malloc(sz), *v = (double*)malloc(sz);
+  double *rh = (double*)malloc(sz), *s = (double*)malloc(sz), *t = (double*)malloc(sz);
+  const char *name = method == 0 ? "sparse-cg" : "sparse-bicgstab";
+#define SPMV(dst, src) \
+  for (int64_t i_ = 0; i_ < n; i_++) { \
+    double a_ = 0.0; \
+    for (int64_t q_ = rp[i_]; q_ < rp[i_ + 1]; q_++) a_ += vs[q_] * (src)[cx[q_]]; \
+    (dst)[i_] = a_; \
+  }
+  double rn = 0.0;
+  for (int64_t i = 0; i < n; i++) {
+    x[i] = 0.0; r[i] = b[i]; rh[i] = b[i]; v[i] = 0.0;
+    p[i] = method == 0 ? b[i] : 0.0;
+    rn += b[i] * b[i];
+  }
+  int64_t it = 0;
+  if (method == 0) {
+    double rr = rn;
+    while (it < maxit && sqrt(rr) >= tol) {
+      SPMV(v, p)
+      double pv = 0.0;
+      for (int64_t i = 0; i < n; i++) pv += p[i] * v[i];
+      if (pv == 0.0) break;
+      double alpha = rr / pv, rr2 = 0.0;
+      for (int64_t i = 0; i < n; i++) {
+        x[i] += alpha * p[i]; r[i] -= alpha * v[i]; rr2 += r[i] * r[i];
+      }
+      double beta = rr2 / rr;
+      for (int64_t i = 0; i < n; i++) p[i] = r[i] + beta * p[i];
+      rr = rr2;
+      it++;
+      if (verbose) fprintf(stderr, "%s: iter %lld residual %.6e\n", name, (long long)it, sqrt(rr));
+    }
+  } else {
+    double rho = 1.0, alpha = 1.0, omega = 1.0;
+    rn = sqrt(rn);
+    while (it < maxit && rn >= tol) {
+      double rho1 = 0.0;
+      for (int64_t i = 0; i < n; i++) rho1 += rh[i] * r[i];
+      if (rho1 == 0.0 || omega == 0.0) break;
+      double beta = (rho1 / rho) * (alpha / omega);
+      for (int64_t i = 0; i < n; i++) p[i] = r[i] + beta * (p[i] - omega * v[i]);
+      SPMV(v, p)
+      double rv = 0.0;
+      for (int64_t i = 0; i < n; i++) rv += rh[i] * v[i];
+      if (rv == 0.0) break;
+      alpha = rho1 / rv;
+      double sn = 0.0;
+      for (int64_t i = 0; i < n; i++) { s[i] = r[i] - alpha * v[i]; sn += s[i] * s[i]; }
+      it++;
+      if (sqrt(sn) < tol) {
+        for (int64_t i = 0; i < n; i++) x[i] += alpha * p[i];
+        if (verbose) fprintf(stderr, "%s: iter %lld residual %.6e\n", name, (long long)it, sqrt(sn));
+        break;
+      }
+      SPMV(t, s)
+      double ts = 0.0, tt = 0.0;
+      for (int64_t i = 0; i < n; i++) { ts += t[i] * s[i]; tt += t[i] * t[i]; }
+      omega = tt == 0.0 ? 0.0 : ts / tt;
+      rn = 0.0;
+      for (int64_t i = 0; i < n; i++) {
+        x[i] += alpha * p[i] + omega * s[i];
+        r[i] = s[i] - omega * t[i];
+        rn += r[i] * r[i];
+      }
+      rn = sqrt(rn);
+      rho = rho1;
+      if (verbose) fprintf(stderr, "%s: iter %lld residual %.6e\n", name, (long long)it, rn);
+    }
+  }
+  SPMV(t, x)
+  double res = 0.0;
+  for (int64_t i = 0; i < n; i++) res += (b[i] - t[i]) * (b[i] - t[i]);
+#undef SPMV
+  info[0] = (double)it;
+  info[1] = sqrt(res);
+  free(r); free(p); free(v); free(rh); free(s); free(t);
+  return 0;
+  ```)
+  ;;; __sparse-solve -- shared driver for the two sparse iterations.
+  (defn __sparse-solve [^borrow a : csrmat
+                        ^borrow b : lavec
+                        opts : IterOpts
+                        method : int
+                        who : cstr] : IterResult
+    (when (or (not= (.rows a) (.cols a)) (not= (.rows a) (la-vec-len b)))
+      (panic who))
+    (let [n    (.rows a)
+          x    (la-vec-new n)
+          info (sparse-fzeros 2)]
+      (__sparse-iter-kernel (.data x)
+        info
+        (.rowptr a)
+        (.colidx a)
+        (.vals a)
+        (.data b)
+        n
+        (.max-iters opts)
+        (.tol opts)
+        (__b2i (.verbose opts))
+        method)
+      (let [it  (:: (vec-get info 0) :float)
+            res (:: (vec-get info 1) :float)]
+        (vec-free info)
+        (iter-result x (as int it) res (< res (.tol opts))))))
+  ;;; sparse-cg -- conjugate gradient on a sparse SPD system.
+  ;;;
+  ;;; Parameters:
+  ;;;   a    -- a sparse symmetric positive-definite n x n CSR matrix (borrowed)
+  ;;;   b    -- right-hand side, length n (borrowed)
+  ;;;   opts -- linalg/iter options (iteration limit, tolerance, verbosity)
+  ;;;
+  ;;; Returns:
+  ;;;   A linalg/iter IterResult; free it with `iter-result-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (sparse-cg a b (iter-opts-default))]
+  ;;;     (.converged r))  ; => true
+  ;;;
+  ;;; Since: 0.1.0
+  (defn sparse-cg [^borrow a : csrmat ^borrow b : lavec opts : IterOpts] : IterResult
+    (__sparse-solve a
+      b
+      opts
+      0
+      "sparse-cg: need a square matrix and a matching vector"))
+  ;;; sparse-bicgstab -- BiCGSTAB on a sparse non-singular system.
+  ;;;
+  ;;; Parameters:
+  ;;;   a    -- a square non-singular CSR matrix (borrowed); need not be symmetric
+  ;;;   b    -- right-hand side, length n (borrowed)
+  ;;;   opts -- linalg/iter options
+  ;;;
+  ;;; Returns:
+  ;;;   A linalg/iter IterResult; free it with `iter-result-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (.iters (sparse-bicgstab a b (iter-opts 500 1e-10 false)))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn sparse-bicgstab [^borrow a : csrmat ^borrow b : lavec opts : IterOpts] : IterResult
+    (__sparse-solve a
+      b
+      opts
+      1
+      "sparse-bicgstab: need a square matrix and a matching vector"))) ;; end defmodule linalg-sparse/solve

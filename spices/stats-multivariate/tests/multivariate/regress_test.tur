@@ -1,0 +1,163 @@
+;;; regress_test.tur -- SM3: multivariate OLS on two responses.
+;;;
+;;; Reference coefficients and R^2 are numpy's lstsq on the same data; the
+;;; first response's coefficients are also cross-checked against tur-stats'
+;;; single-response `ols-frame` on a frame holding the same numbers.
+(defmodule multivariate/regress-test
+  (import linalg/vec :refer [lavec la-vec-get la-vec-free])
+  (import linalg/mat :refer [mat mat-of mat-get mat-rows mat-cols mat-free])
+  (import multivariate/regress
+    :refer
+    [MvOlsResult mv-ols mv-ols-free mv-predict mv-r-squared])
+  (import frame/csv :refer [read-csv-string])
+  (import frame/frame :refer [frame-column frame-free])
+  (import frame/column :refer [column-float64-at])
+  (import stats/regress :refer [ols-frame])
+  (import stats/fmt :refer [fit-coefs-frame])
+  ;; --- TAP harness (inline-C fail counter) ---
+  (defn check [idx : int name : cstr ok : bool] : void
+    ```c
+    /* __tur_include__: static int g_rg_fails = 0; */
+  if (!ok) g_rg_fails++;
+  printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
+  ```)
+  (defn finish [count : int] : int
+    ```c
+    printf("1..%lld\n", (long long)count);
+  if (g_rg_fails == 0) {
+    fprintf(stderr, "# All %lld regress tests passed.\n", (long long)count);
+    return 0;
+  }
+  fprintf(stderr, "# %d/%lld regress tests failed.\n", g_rg_fails, (long long)count);
+  return 1;
+  ```)
+  (defn fa [x : float] : float ```c return x < 0.0 ? -x : x; ```)
+  (defn approx [a : float b : float] : bool (< (fa (- a b)) 1e-12))
+  (defn near [a : float b : float tol : float] : bool (< (fa (- a b)) tol))
+  ;; stats results are cons-shaped: (0 . (value . nil)) for ok.
+  (defn result-unwrap [r : int] : int
+    ```c
+    #include <stdint.h>
+    struct __ir_cons { int64_t value; int64_t next; };
+    struct __ir_cons *outer = (struct __ir_cons *)(intptr_t)r;
+    return ((struct __ir_cons *)(intptr_t)outer->next)->value;
+    ```)
+  (defn design [] : mat
+    (mat-of 8 2 1.0 0.0 1.0 1.0 1.0 2.0 1.0 3.0 1.0 4.0 1.0 5.0 1.0 6.0 1.0 7.0))
+  (defn responses [] : mat
+    (mat-of 8
+      2
+      1.1
+      4.7
+      2.8
+      4.6
+      5.05
+      4.2
+      7.3
+      3.4
+      8.9
+      3.0
+      11.0
+      2.65
+      13.2
+      1.8
+      14.75
+      1.6))
+  (defn csv [] : cstr
+    "x,y\n0,1.1\n1,2.8\n2,5.05\n3,7.3\n4,8.9\n5,11.0\n6,13.2\n7,14.75\n")
+  (defn t-coef [] : bool
+    (let [x (design)
+          y (responses)
+          r (mv-ols x y)]
+      (let [c  (.coef r)
+            ok (and (near (mat-get c 0 0) 1.054166666667 1e-11)
+                 (and (near (mat-get c 1 0) 1.988095238095 1e-11)
+                   (and (near (mat-get c 0 1) 4.941666666667 1e-11)
+                     (near (mat-get c 1 1) -0.485119047619 1e-11))))]
+        (mv-ols-free r)
+        (mat-free y)
+        (mat-free x)
+        ok)))
+  (defn t-vs-stats [] : bool
+    (let [x   (design)
+          y   (responses)
+          r   (mv-ols x y)
+          df  (read-csv-string (csv) 0 0 1 0 "")
+          fit (result-unwrap (ols-frame df "y" (cons (:: "x" :int) 0) 1))
+          cf  (fit-coefs-frame fit)
+          est (frame-column cf "estimate")]
+      (let [ok (and (near (mat-get (.coef r) 0 0)
+                      (column-float64-at est 0)
+                      1e-10)
+                 (near (mat-get (.coef r) 1 0) (column-float64-at est 1) 1e-10))]
+        (frame-free cf)
+        (frame-free df)
+        (mv-ols-free r)
+        (mat-free y)
+        (mat-free x)
+        ok)))
+  (defn t-r2 [] : bool
+    (let [x  (design)
+          y  (responses)
+          r  (mv-ols x y)
+          r2 (mv-r-squared r)]
+      (let [ok (and (near (la-vec-get r2 0) 0.998509521626 1e-11)
+                 (near (la-vec-get r2 1) 0.978916217535 1e-11))]
+        (la-vec-free r2)
+        (mv-ols-free r)
+        (mat-free y)
+        (mat-free x)
+        ok)))
+  (defn t-shapes [] : bool
+    (let [x (design)
+          y (responses)
+          r (mv-ols x y)]
+      (let [ok (and (= (.df-resid r) 6)
+                 (and (= (mat-rows (.fitted r)) 8)
+                   (and (= (mat-cols (.residuals r)) 2)
+                     (= (mat-rows (.rss-mat r)) 2))))]
+        (mv-ols-free r)
+        (mat-free y)
+        (mat-free x)
+        ok)))
+  (defn t-rss-diagonal [] : bool
+    ;; RSS_jj = (1 - R^2_j) TSS_j, so check it against R^2 for response 0
+    (let [x  (design)
+          y  (responses)
+          r  (mv-ols x y)
+          r2 (mv-r-squared r)]
+      (let [tss 166.25375
+            ok  (near (mat-get (.rss-mat r) 0 0)
+                  (* (- 1.0 (la-vec-get r2 0)) tss)
+                  1e-08)]
+        (la-vec-free r2)
+        (mv-ols-free r)
+        (mat-free y)
+        (mat-free x)
+        ok)))
+  (defn t-predict [] : bool
+    (let [x  (design)
+          y  (responses)
+          r  (mv-ols x y)
+          xn (mat-of 1 2 1.0 1e+01)
+          p  (mv-predict r xn)]
+      (let [ok (and (near (mat-get p 0 0)
+                      (+ 1.054166666667 (* 1e+01 1.988095238095))
+                      1e-09)
+                 (near (mat-get p 0 1)
+                   (+ 4.941666666667 (* 1e+01 -0.485119047619))
+                   1e-09))]
+        (mat-free p)
+        (mat-free xn)
+        (mv-ols-free r)
+        (mat-free y)
+        (mat-free x)
+        ok)))
+  (defn main [] : int
+    (check 1 "mv-ols: coefficients match numpy" (t-coef))
+    (check 2 "mv-ols: response 0 matches stats/regress ols-frame" (t-vs-stats))
+    (check 3 "mv-r-squared matches numpy" (t-r2))
+    (check 4 "mv-ols: shapes and df" (t-shapes))
+    (check 5 "mv-ols: rss-mat diagonal" (t-rss-diagonal))
+    (check 6 "mv-predict" (t-predict))
+    (finish 6))) ;; end defmodule multivariate/regress-test

@@ -34,7 +34,8 @@
     mat-norm-max
     mat-square?
     mat-approx-eq?
-    la-vec-outer)
+    la-vec-outer
+    linalg-blas?)
   (import linalg/vec
     :refer
     [lavec la-vec-new la-vec-len la-vec-get la-vec-set! sqrt fabs])
@@ -235,76 +236,133 @@
                      (go))))]
         (go))
       c))
+  ;;; linalg-blas? -- whether the BLAS/LAPACK backend is in use.
+  ;;;
+  ;;; The backend is compiled in by building with `-DTUR_LINALG_BLAS` and
+  ;;; linking a BLAS/LAPACK (see the linalg guide); setting the environment
+  ;;; variable TUR_LINALG_NO_BLAS to a non-empty value turns it off at run
+  ;;; time, which is how the tests compare the two paths in one process.
+  ;;;
+  ;;; Returns:
+  ;;;   true when this build carries the backend and it is not switched off.
+  ;;;
+  ;;; Example:
+  ;;;   (println (if (linalg-blas?) "BLAS" "pure"))
+  ;;;
+  ;;; Since: 0.2.0
+  (defn linalg-blas? [] : bool
+    ```c
+    #include <stdlib.h>
+    #if defined(TUR_LINALG_BLAS)
+    const char *e = getenv("TUR_LINALG_NO_BLAS");
+    return !(e && *e);
+    #else
+    return 0;
+    #endif
+    ```)
+  ;;; LB5 -- cache-blocked multiply.
+  ;;; __mat-mul-kernel -- C (m x p) = A (m x n) * B (n x p), all row-major.
+  ;;; Under -DTUR_LINALG_BLAS this is cblas_dgemm (see `linalg-blas?`).
+  ;;; Tiled over i/k/j in TUR_LINALG_BLOCK-sized blocks (default 64; override
+  ;;; with `:build-opts #map{:c-flags ["-DTUR_LINALG_BLOCK=32"]}`) so each
+  ;;; block of B is reused from cache across a block of A's rows. The inner
+  ;;; loop runs along a row of B and of C, which is unit-stride for both.
+  (defn __mat-mul-kernel [Cd : (Vec float)
+                          Ad : (Vec float)
+                          Bd : (Vec float)
+                          m : int
+                          n : int
+                          p : int] : int
+    ```c
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *C = (double*)(void*)((struct __V*)(intptr_t)Cd)->data;
+  const double *A = (const double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  const double *B = (const double*)(void*)((struct __V*)(intptr_t)Bd)->data;
+#if defined(TUR_LINALG_BLAS)
+  if (m > 0 && n > 0 && p > 0 && !(getenv("TUR_LINALG_NO_BLAS") && *getenv("TUR_LINALG_NO_BLAS"))) {
+    extern void cblas_dgemm(int, int, int, int, int, int, double, const double *, int,
+                            const double *, int, double, double *, int);
+    cblas_dgemm(101, 111, 111, (int)m, (int)p, (int)n, 1.0, A, (int)n, B, (int)p, 0.0, C, (int)p);
+    return 0;
+  }
+#endif
+#ifndef TUR_LINALG_BLOCK
+#define TUR_LINALG_BLOCK 64
+#endif
+  const int64_t BS = TUR_LINALG_BLOCK;
+  for (int64_t i = 0; i < m * p; i++) C[i] = 0.0;
+  for (int64_t ii = 0; ii < m; ii += BS) {
+    int64_t ie = ii + BS < m ? ii + BS : m;
+    for (int64_t kk = 0; kk < n; kk += BS) {
+      int64_t ke = kk + BS < n ? kk + BS : n;
+      for (int64_t jj = 0; jj < p; jj += BS) {
+        int64_t je = jj + BS < p ? jj + BS : p;
+        for (int64_t i = ii; i < ie; i++) {
+          double *Ci = C + i * p;
+          const double *Ai = A + i * n;
+          for (int64_t k = kk; k < ke; k++) {
+            double aik = Ai[k];
+            const double *Bk = B + k * p;
+            for (int64_t j = jj; j < je; j++) Ci[j] += aik * Bk[j];
+          }
+        }
+      }
+    }
+  }
+  return 0;
+  ```)
   ;;; mat-mul -- matrix multiplication: (m x n) * (n x p) -> (m x p).
-  ;;; Accumulation is done in place on the result's heap buffer (writes through
-  ;;; the shared buffer escape the loop closures).
+  ;;; Cache-blocked; see `__mat-mul-kernel`.
   (defn mat-mul [^borrow a : mat ^borrow b : mat] : mat
     (when (not= (.cols a) (.rows b)) (panic "mat-mul: incompatible dimensions"))
-    (let [arows  (.rows a)
-          acols  (.cols a)
-          bcols  (.cols b)
-          c      (mat-new-zeroed arows bcols)
-          ^mut i 0]
-      (letrec [goi
-               (fn [] : int
-                 (if (>= i arows)
-                   0
-                   (let [^mut k 0]
-                     (letrec [gok
-                              (fn [] : int
-                                (if (>= k acols)
-                                  0
-                                  (let [aik    (mat-get a i k)
-                                        ^mut j 0]
-                                    (letrec [goj
-                                             (fn [] : int
-                                               (if (>= j bcols)
-                                                 0
-                                                 (let [idx (+ (* i bcols) j)]
-                                                   (vec-set! (.data c)
-                                                     idx
-                                                     (+ (:: (vec-get (.data c)
-                                                              idx)
-                                                          :float)
-                                                       (* aik (mat-get b k j))))
-                                                   (set! j (+ j 1))
-                                                   (goj))))]
-                                      (goj))
-                                    (set! k (+ k 1))
-                                    (gok))))]
-                       (gok))
-                     (set! i (+ i 1))
-                     (goi))))]
-        (goi))
+    (let [c (mat-new-zeroed (.rows a) (.cols b))]
+      (__mat-mul-kernel (.data c)
+        (.data a)
+        (.data b)
+        (.rows a)
+        (.cols a)
+        (.cols b))
       c))
+  ;;; __mat-mul-vec-kernel -- y (m) = A (m x n) x (n); cblas_dgemv under
+  ;;; -DTUR_LINALG_BLAS.
+  (defn __mat-mul-vec-kernel [yd : (Vec float)
+                              Ad : (Vec float)
+                              xd : (Vec float)
+                              m : int
+                              n : int] : int
+    ```c
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *y = (double*)(void*)((struct __V*)(intptr_t)yd)->data;
+  const double *A = (const double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  const double *x = (const double*)(void*)((struct __V*)(intptr_t)xd)->data;
+#if defined(TUR_LINALG_BLAS)
+  if (m > 0 && n > 0 && !(getenv("TUR_LINALG_NO_BLAS") && *getenv("TUR_LINALG_NO_BLAS"))) {
+    extern void cblas_dgemv(int, int, int, int, double, const double *, int, const double *, int,
+                            double, double *, int);
+    cblas_dgemv(101, 111, (int)m, (int)n, 1.0, A, (int)n, x, 1, 0.0, y, 1);
+    return 0;
+  }
+#endif
+  for (int64_t i = 0; i < m; i++) {
+    double s = 0.0;
+    const double *Ai = A + i * n;
+    for (int64_t k = 0; k < n; k++) s += Ai[k] * x[k];
+    y[i] = s;
+  }
+  return 0;
+  ```)
   ;;; mat-mul-vec -- matrix-vector multiplication: (m x n) * n-vec -> m-vec.
   (defn mat-mul-vec [^borrow m : mat ^borrow v : lavec] : lavec
     (when (not= (.cols m) (la-vec-len v))
       (panic "mat-mul-vec: incompatible dimensions"))
-    (let [mrows  (.rows m)
-          mcols  (.cols m)
-          result (la-vec-new mrows)
-          ^mut i 0]
-      (letrec [goi
-               (fn [] : int
-                 (if (>= i mrows)
-                   0
-                   (let [^mut k 0]
-                     (letrec [gok
-                              (fn [] : int
-                                (if (>= k mcols)
-                                  0
-                                  (do
-                                    (la-vec-set! result
-                                      i
-                                      (+ (la-vec-get result i)
-                                        (* (mat-get m i k) (la-vec-get v k))))
-                                    (set! k (+ k 1))
-                                    (gok))))]
-                       (gok))
-                     (set! i (+ i 1))
-                     (goi))))]
-        (goi))
+    (let [result (la-vec-new (.rows m))]
+      (__mat-mul-vec-kernel (.data result)
+        (.data m)
+        (.data v)
+        (.rows m)
+        (.cols m))
       result))
   ;;; mat-transpose -- transpose: (m x n) -> (n x m).
   (defn mat-transpose [^borrow m : mat] : mat

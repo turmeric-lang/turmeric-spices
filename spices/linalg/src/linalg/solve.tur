@@ -12,7 +12,11 @@
     qr-solve
     mat-solve
     mat-inv
-    mat-det)
+    mat-det
+    svd-solve
+    svd-rank
+    svd-condition
+    svd-project)
   (import linalg/mat
     :refer
     [mat
@@ -30,7 +34,7 @@
     [lavec la-vec-new la-vec-len la-vec-get la-vec-set! la-vec-free])
   (import linalg/decomp
     :refer
-    [cholfac lufac qrfac chol chol-free lu lu-free qr qr-free])
+    [cholfac lufac qrfac svdfac chol chol-free lu lu-free qr qr-free])
   ;;; LA3 -- forward / backward substitution
   ;;; __fwd-sub-kernel -- solve L x = b, L lower triangular (n x n).
   (defn __fwd-sub-kernel [xd : (Vec float)
@@ -131,9 +135,14 @@
           n (mat-cols (.R f))
           c (la-vec-new n)]
       (__qt-b-kernel (.data c) (.data (.Q f)) (.data b) m n)
-      ;; R has n columns, so its leading n x n block has row stride n -- back-sub
-      ;; over (.R f) directly solves R1 x = c.
-      (let [x (back-sub (.R f) c)] (la-vec-free c) x)))
+      ;; R is m x n with row stride n, so its leading n x n block R1 is the
+      ;; first n rows read at that stride. Call the kernel with n directly:
+      ;; `back-sub` would take its size from (mat-rows R) = m and walk past R1
+      ;; whenever m > n.
+      (let [x (la-vec-new n)]
+        (__back-sub-kernel (.data x) (.data (.R f)) (.data c) n)
+        (la-vec-free c)
+        x)))
   ;;; mat-solve -- factorize and solve A x = b. spd? = 1 selects Cholesky.
   (defn mat-solve [^borrow a : mat ^borrow b : lavec spd? : int] : lavec
     (when (not (= (mat-square? a) 1))
@@ -207,4 +216,153 @@
           f (lu a)
           d (__lu-det-kernel (.data (.U f)) (.piv f) n)]
       (lu-free f)
-      d))) ;; end defmodule linalg/solve
+      d))
+  ;;; LB1 -- SVD-based least squares, rank, conditioning and projection.
+  ;;; __svd-default-tol -- the numpy/LAPACK rank cutoff max(m, n) * eps * s[0].
+  (defn __svd-default-tol [^borrow f : svdfac] : float
+    (let [m  (mat-rows (.U f))
+          n  (mat-cols (.Vt f))
+          mn (if (> m n) m n)]
+      (if (= (la-vec-len (.s f)) 0)
+        0.0
+        (* (* (as float mn) 2.220446049250313e-16) (la-vec-get (.s f) 0)))))
+  ;;; svd-rank -- numerical rank: the count of singular values above tol.
+  ;;;
+  ;;; Parameters:
+  ;;;   f   -- an SVD factor (borrowed)
+  ;;;   tol -- the cutoff; a value <= 0 selects max(m, n) * eps * s[0]
+  ;;;
+  ;;; Returns:
+  ;;;   The number of singular values strictly greater than the cutoff.
+  ;;;
+  ;;; Example:
+  ;;;   (svd-rank (svd (mat-of 2 2 1.0 2.0 2.0 4.0)) 0.0)  ; => 1
+  ;;;
+  ;;; Since: 0.2.0
+  (defn svd-rank [^borrow f : svdfac tol : float] : int
+    (let [cut (if (> tol 0.0) tol (__svd-default-tol f))
+          k   (la-vec-len (.s f))]
+      (letrec [go
+               (fn [i : int] : int
+                 (if (>= i k)
+                   k
+                   (if (> (la-vec-get (.s f) i) cut) (go (+ i 1)) i)))]
+        (go 0))))
+  ;;; svd-condition -- 2-norm condition number s[0] / s[k-1].
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- an SVD factor (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The ratio of the largest to the smallest singular value; +inf when the
+  ;;;   smallest is exactly zero.
+  ;;;
+  ;;; Example:
+  ;;;   (svd-condition (svd (mat-of 2 2 4.0 0.0 0.0 2.0)))  ; => 2.0
+  ;;;
+  ;;; Since: 0.2.0
+  (defn svd-condition [^borrow f : svdfac] : float
+    (let [k (la-vec-len (.s f))]
+      (if (= k 0)
+        0.0
+        (let [lo (la-vec-get (.s f) (- k 1))
+              hi (la-vec-get (.s f) 0)]
+          (if (= lo 0.0) (/ 1.0 0.0) (/ hi lo))))))
+  ;;; __svd-apply-kernel -- with r leading singular triplets, write
+  ;;;   mode 0: x = sum_j (u_j . b / s_j) v_j   (length n)
+  ;;;   mode 1: x = sum_j (u_j . b) u_j         (length m)
+  (defn __svd-apply-kernel [xd : (Vec float)
+                            Ud : (Vec float)
+                            sd : (Vec float)
+                            Vtd : (Vec float)
+                            bd : (Vec float)
+                            m : int
+                            n : int
+                            r : int
+                            mode : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *x = (double*)(void*)((struct __V*)(intptr_t)xd)->data;
+  double *U = (double*)(void*)((struct __V*)(intptr_t)Ud)->data;
+  double *s = (double*)(void*)((struct __V*)(intptr_t)sd)->data;
+  double *Vt = (double*)(void*)((struct __V*)(intptr_t)Vtd)->data;
+  double *b = (double*)(void*)((struct __V*)(intptr_t)bd)->data;
+  int64_t len = mode == 0 ? n : m;
+  for (int64_t i = 0; i < len; i++) x[i] = 0.0;
+  for (int64_t j = 0; j < r; j++) {
+    double c = 0.0;
+    for (int64_t i = 0; i < m; i++) c += U[i*m + j] * b[i];
+    if (mode == 0) {
+      c /= s[j];
+      for (int64_t i = 0; i < n; i++) x[i] += c * Vt[j*n + i];
+    } else {
+      for (int64_t i = 0; i < m; i++) x[i] += c * U[i*m + j];
+    }
+  }
+  return 0;
+  ```)
+  ;;; svd-solve -- rank-truncated least-squares / minimum-norm solve.
+  ;;;
+  ;;; Minimizes ||A x - b|| and, among the minimizers, ||x||, keeping only the
+  ;;; singular values above the default cutoff (see `svd-rank`). Handles
+  ;;; over-determined, under-determined and rank-deficient systems.
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- the SVD of A (m x n), borrowed
+  ;;;   b -- the right-hand side, length m (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The solution x, length n.
+  ;;;
+  ;;; Example:
+  ;;;   (svd-solve (svd (mat-of 2 2 2.0 0.0 0.0 4.0)) (la-vec-of 2.0 2.0))
+  ;;;   ; => [1.0 0.5]
+  ;;;
+  ;;; Since: 0.2.0
+  (defn svd-solve [^borrow f : svdfac ^borrow b : lavec] : lavec
+    (let [m (mat-rows (.U f))
+          n (mat-cols (.Vt f))]
+      (when (not= (la-vec-len b) m) (panic "svd-solve: length mismatch"))
+      (let [x (la-vec-new n)
+            r (svd-rank f 0.0)]
+        (__svd-apply-kernel (.data x)
+          (.data (.U f))
+          (.data (.s f))
+          (.data (.Vt f))
+          (.data b)
+          m
+          n
+          r
+          0)
+        x)))
+  ;;; svd-project -- orthogonal projection of b onto the column space of A.
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- the SVD of A (m x n), borrowed
+  ;;;   b -- a vector of length m (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   U_r U_r' b, where U_r holds the left singular vectors of the numerical
+  ;;;   rank r.
+  ;;;
+  ;;; Example:
+  ;;;   (svd-project (svd (mat-of 2 1 1.0 0.0)) (la-vec-of 3.0 4.0))
+  ;;;   ; => [3.0 0.0]
+  ;;;
+  ;;; Since: 0.2.0
+  (defn svd-project [^borrow f : svdfac ^borrow b : lavec] : lavec
+    (let [m (mat-rows (.U f))
+          n (mat-cols (.Vt f))]
+      (when (not= (la-vec-len b) m) (panic "svd-project: length mismatch"))
+      (let [x (la-vec-new m)
+            r (svd-rank f 0.0)]
+        (__svd-apply-kernel (.data x)
+          (.data (.U f))
+          (.data (.s f))
+          (.data (.Vt f))
+          (.data b)
+          m
+          n
+          r
+          1)
+        x)))) ;; end defmodule linalg/solve

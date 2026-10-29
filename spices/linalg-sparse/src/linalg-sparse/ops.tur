@@ -1,0 +1,296 @@
+;;; linalg-sparse/ops -- sparse arithmetic and dense conversion.
+;;;
+;;; `csr-scale` and `csr-add` produce new matrices; `csr-transpose` returns
+;;; the CSC form of A' (a copy of the same buffers); the `*-from-dense` /
+;;; `*->dense` pair converts to and from linalg's dense `mat`, dropping exact
+;;; zeros on the way in.
+(defmodule linalg-sparse/ops
+  (export csr-scale
+    csr-add
+    csr-transpose
+    csr-from-dense
+    csc-from-dense
+    csr->dense
+    csc->dense)
+  (import linalg/mat :refer [mat mat-new mat-rows mat-cols])
+  (import linalg-sparse/csr
+    :refer
+    [csrmat csr-free sparse-izeros sparse-fzeros])
+  (import linalg-sparse/csc
+    :refer
+    [cscmat csc-from-csr csr-from-csc sparse-ivec-copy sparse-fvec-copy])
+  ;;; __scale-kernel -- out[i] = v[i] * s.
+  (defn __scale-kernel [od : (Vec float) vd : (Vec float) n : int s : float] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *o = (double*)(void*)((struct __V*)(intptr_t)od)->data;
+  const double *v = (const double*)(void*)((struct __V*)(intptr_t)vd)->data;
+  for (int64_t i = 0; i < n; i++) o[i] = v[i] * s;
+  return 0;
+  ```)
+  ;;; csr-scale -- s A, with A's sparsity pattern.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the matrix (borrowed)
+  ;;;   s -- the scalar
+  ;;;
+  ;;; Returns:
+  ;;;   A new csrmat.
+  ;;;
+  ;;; Example:
+  ;;;   (csr-get (csr-scale m 2.0) 0 0)  ; => 2 * (csr-get m 0 0)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csr-scale [^borrow m : csrmat s : float] : csrmat
+    (let [vs (sparse-fzeros (.nnz m))]
+      (__scale-kernel vs (.vals m) (.nnz m) s)
+      (make-struct csrmat
+        (.rows m)
+        (.cols m)
+        (.nnz m)
+        (sparse-ivec-copy (.rowptr m))
+        (sparse-ivec-copy (.colidx m))
+        vs)))
+  ;;; __add-kernel -- merge two CSR matrices row by row. mode 0 only counts the
+  ;;; union of the patterns and returns it; mode 1 also fills the output.
+  (defn __add-kernel [rpd : (Vec int)
+                      cxd : (Vec int)
+                      vsd : (Vec float)
+                      arpd : (Vec int)
+                      acxd : (Vec int)
+                      avsd : (Vec float)
+                      brpd : (Vec int)
+                      bcxd : (Vec int)
+                      bvsd : (Vec float)
+                      rows : int
+                      mode : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  int64_t *rp = mode ? ((struct __V*)(intptr_t)rpd)->data : 0;
+  int64_t *cx = mode ? ((struct __V*)(intptr_t)cxd)->data : 0;
+  double *vs = mode ? (double*)(void*)((struct __V*)(intptr_t)vsd)->data : 0;
+  const int64_t *arp = ((struct __V*)(intptr_t)arpd)->data;
+  const int64_t *acx = ((struct __V*)(intptr_t)acxd)->data;
+  const double *avs = (const double*)(void*)((struct __V*)(intptr_t)avsd)->data;
+  const int64_t *brp = ((struct __V*)(intptr_t)brpd)->data;
+  const int64_t *bcx = ((struct __V*)(intptr_t)bcxd)->data;
+  const double *bvs = (const double*)(void*)((struct __V*)(intptr_t)bvsd)->data;
+  int64_t o = 0;
+  if (mode) rp[0] = 0;
+  for (int64_t r = 0; r < rows; r++) {
+    int64_t a = arp[r], ae = arp[r + 1], b = brp[r], be = brp[r + 1];
+    while (a < ae || b < be) {
+      int64_t c; double v;
+      if (b >= be || (a < ae && acx[a] < bcx[b])) { c = acx[a]; v = avs[a]; a++; }
+      else if (a >= ae || bcx[b] < acx[a])        { c = bcx[b]; v = bvs[b]; b++; }
+      else                                        { c = acx[a]; v = avs[a] + bvs[b]; a++; b++; }
+      if (mode) { cx[o] = c; vs[o] = v; }
+      o++;
+    }
+    if (mode) rp[r + 1] = o;
+  }
+  return o;
+  ```)
+  ;;; csr-add -- A + B. The patterns need not match: the result stores the
+  ;;; union of both, so a same-pattern sum keeps that pattern.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- a rows x cols CSR matrix (borrowed)
+  ;;;   b -- a CSR matrix of the same shape (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A new csrmat. Panics on a shape mismatch.
+  ;;;
+  ;;; Example:
+  ;;;   (csr-get (csr-add a a) 0 0)  ; => 2 * (csr-get a 0 0)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csr-add [^borrow a : csrmat ^borrow b : csrmat] : csrmat
+    (when (or (not= (.rows a) (.rows b)) (not= (.cols a) (.cols b)))
+      (panic "csr-add: dimension mismatch"))
+    (let [rows (.rows a)
+          nnz  (__add-kernel (.rowptr a)
+                 (.colidx a)
+                 (.vals a)
+                 (.rowptr a)
+                 (.colidx a)
+                 (.vals a)
+                 (.rowptr b)
+                 (.colidx b)
+                 (.vals b)
+                 rows
+                 0)
+          rp   (sparse-izeros (+ rows 1))
+          cx   (sparse-izeros nnz)
+          vs   (sparse-fzeros nnz)]
+      (__add-kernel rp
+        cx
+        vs
+        (.rowptr a)
+        (.colidx a)
+        (.vals a)
+        (.rowptr b)
+        (.colidx b)
+        (.vals b)
+        rows
+        1)
+      (make-struct csrmat rows (.cols a) nnz rp cx vs)))
+  ;;; csr-transpose -- A' in CSC form: the CSR buffers of A are the CSC
+  ;;; buffers of A', so this is a copy, not a re-sort.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- a rows x cols CSR matrix (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The cols x rows CSC matrix A'.
+  ;;;
+  ;;; Example:
+  ;;;   (csc-get (csr-transpose m) 2 0)  ; => (csr-get m 0 2)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csr-transpose [^borrow m : csrmat] : cscmat
+    (make-struct cscmat
+      (.cols m)
+      (.rows m)
+      (.nnz m)
+      (sparse-ivec-copy (.rowptr m))
+      (sparse-ivec-copy (.colidx m))
+      (sparse-fvec-copy (.vals m))))
+  ;;; __from-dense-kernel -- fill CSR buffers with the non-zero entries of A
+  ;;; (rows x cols, row-major); returns how many it wrote.
+  (defn __from-dense-kernel [rpd : (Vec int)
+                             cxd : (Vec int)
+                             vsd : (Vec float)
+                             Ad : (Vec float)
+                             rows : int
+                             cols : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  int64_t *rp = ((struct __V*)(intptr_t)rpd)->data;
+  int64_t *cx = ((struct __V*)(intptr_t)cxd)->data;
+  double *vs = (double*)(void*)((struct __V*)(intptr_t)vsd)->data;
+  const double *A = (const double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  int64_t o = 0;
+  rp[0] = 0;
+  for (int64_t r = 0; r < rows; r++) {
+    for (int64_t c = 0; c < cols; c++) {
+      double v = A[r * cols + c];
+      if (v != 0.0) { cx[o] = c; vs[o] = v; o++; }
+    }
+    rp[r + 1] = o;
+  }
+  return o;
+  ```)
+  ;;; __dense-nnz-kernel -- count the non-zero elements of a dense buffer.
+  (defn __dense-nnz-kernel [Ad : (Vec float) n : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  const double *A = (const double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  int64_t o = 0;
+  for (int64_t i = 0; i < n; i++) if (A[i] != 0.0) o++;
+  return o;
+  ```)
+  ;;; csr-from-dense -- CSR form of a dense matrix, dropping exact zeros.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- a dense linalg `mat` (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A csrmat with one stored entry per non-zero element.
+  ;;;
+  ;;; Example:
+  ;;;   (csr-nnz (csr-from-dense (mat-identity 4)))  ; => 4
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csr-from-dense [^borrow m : mat] : csrmat
+    (let [rows (mat-rows m)
+          cols (mat-cols m)
+          nnz  (__dense-nnz-kernel (.data m) (* rows cols))
+          rp   (sparse-izeros (+ rows 1))
+          cx   (sparse-izeros nnz)
+          vs   (sparse-fzeros nnz)]
+      (__from-dense-kernel rp cx vs (.data m) rows cols)
+      (make-struct csrmat rows cols nnz rp cx vs)))
+  ;;; csc-from-dense -- CSC form of a dense matrix, dropping exact zeros.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- a dense linalg `mat` (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A cscmat with one stored entry per non-zero element.
+  ;;;
+  ;;; Example:
+  ;;;   (csc-nnz (csc-from-dense (mat-identity 4)))  ; => 4
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csc-from-dense [^borrow m : mat] : cscmat
+    (let [r (csr-from-dense m)
+          c (csc-from-csr r)]
+      (csr-free r)
+      c))
+  ;;; __to-dense-kernel -- scatter n-major compressed buffers into a dense
+  ;;; row-major rows x cols matrix. major 0 = rows are the major axis (CSR).
+  (defn __to-dense-kernel [Ad : (Vec float)
+                           ptrd : (Vec int)
+                           idxd : (Vec int)
+                           vd : (Vec float)
+                           n : int
+                           cols : int
+                           major : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  const int64_t *ptr = ((struct __V*)(intptr_t)ptrd)->data;
+  const int64_t *idx = ((struct __V*)(intptr_t)idxd)->data;
+  const double *v = (const double*)(void*)((struct __V*)(intptr_t)vd)->data;
+  for (int64_t i = 0; i < n; i++)
+    for (int64_t p = ptr[i]; p < ptr[i + 1]; p++) {
+      if (major == 0) A[i * cols + idx[p]] += v[p];
+      else            A[idx[p] * cols + i] += v[p];
+    }
+  return 0;
+  ```)
+  ;;; csr->dense -- dense copy of a CSR matrix.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the CSR matrix (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A rows x cols linalg `mat`.
+  ;;;
+  ;;; Example:
+  ;;;   (mat-get (csr->dense m) 0 0)  ; => (csr-get m 0 0)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csr->dense [^borrow m : csrmat] : mat
+    (let [d (mat-new (.rows m) (.cols m))]
+      (__to-dense-kernel (.data d)
+        (.rowptr m)
+        (.colidx m)
+        (.vals m)
+        (.rows m)
+        (.cols m)
+        0)
+      d))
+  ;;; csc->dense -- dense copy of a CSC matrix.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the CSC matrix (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A rows x cols linalg `mat`.
+  ;;;
+  ;;; Example:
+  ;;;   (mat-get (csc->dense m) 0 0)  ; => (csc-get m 0 0)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csc->dense [^borrow m : cscmat] : mat
+    (let [d (mat-new (.rows m) (.cols m))]
+      (__to-dense-kernel (.data d)
+        (.colptr m)
+        (.rowidx m)
+        (.vals m)
+        (.cols m)
+        (.cols m)
+        1)
+      d))) ;; end defmodule linalg-sparse/ops

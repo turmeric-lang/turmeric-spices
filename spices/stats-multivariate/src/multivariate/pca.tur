@@ -1,0 +1,284 @@
+;;; multivariate/pca -- principal component analysis via the SVD.
+;;;
+;;; X (m x n, one observation per row) is centred and optionally scaled, then
+;;; factored Z = U S V' with linalg's `svd`. The loadings are the leading k
+;;; columns of V, the scores are Z V_k, and component j's variance is
+;;; s_j^2 / (m - 1). Each loading column is signed so its largest-magnitude
+;;; entry is positive, which makes results reproducible across platforms.
+(defmodule multivariate/pca
+  (export PCAOpts
+    PcaResult
+    pca-opts
+    pca
+    pca-free
+    pca-project
+    pca-reconstruct
+    pca-var-explained)
+  (import linalg/vec
+    :refer
+    [lavec la-vec-new la-vec-len la-vec-get la-vec-free])
+  (import linalg/mat :refer [mat mat-new mat-rows mat-cols mat-mul mat-free])
+  (import linalg/decomp :refer [svd svd-free])
+  (import multivariate/cov :refer [col-means col-sds])
+  ;;; PCAOpts -- what to do to X before factoring.
+  ;;;   center -- subtract column means (the usual choice)
+  ;;;   scale  -- divide by column standard deviations (PCA on correlations)
+  ;;;   ncomp  -- components to retain; 0 retains min(m, n)
+  (defstruct ^copy PCAOpts [center : bool scale : bool ncomp : int])
+  ;;; PcaResult -- a fitted PCA (owns every buffer).
+  ;;;   loadings -- n x k, columns are the principal directions
+  ;;;   scores   -- m x k, X's rows projected onto them
+  ;;;   sdev     -- length k, standard deviation of each component
+  ;;;   var-prop -- length k, share of the total variance per component
+  ;;;   var-cum  -- length k, running total of var-prop
+  ;;;   center   -- length n, the means subtracted (zeros when not centred)
+  ;;;   scale    -- length n, the divisors used (ones when not scaled)
+  (defstruct PcaResult
+    [loadings : mat
+     scores : mat
+     sdev : lavec
+     var-prop : lavec
+     var-cum : lavec
+     center : lavec
+     scale : lavec])
+  ;;; pca-opts -- build a PCAOpts.
+  ;;;
+  ;;; Parameters:
+  ;;;   center -- subtract column means
+  ;;;   scale  -- divide by column standard deviations
+  ;;;   ncomp  -- components to keep (0 = all)
+  ;;;
+  ;;; Returns:
+  ;;;   The options value.
+  ;;;
+  ;;; Example:
+  ;;;   (pca x (pca-opts true false 2))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn pca-opts [center : bool scale : bool ncomp : int] : PCAOpts
+    (make-struct PCAOpts center scale ncomp))
+  ;;; __fill-kernel -- v[i] = x for every i.
+  (defn __fill-kernel [vd : (Vec float) n : int x : float] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *v = (double*)(void*)((struct __V*)(intptr_t)vd)->data;
+  for (int64_t i = 0; i < n; i++) v[i] = x;
+  return 0;
+  ```)
+  ;;; __standardize-kernel -- Z = (X - center) / scale, column-wise; a zero
+  ;;; scale entry is treated as 1 so a constant column does not divide by 0.
+  (defn __standardize-kernel [Zd : (Vec float)
+                              Xd : (Vec float)
+                              cd : (Vec float)
+                              sd : (Vec float)
+                              m : int
+                              n : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *Z = (double*)(void*)((struct __V*)(intptr_t)Zd)->data;
+  const double *X = (const double*)(void*)((struct __V*)(intptr_t)Xd)->data;
+  const double *c = (const double*)(void*)((struct __V*)(intptr_t)cd)->data;
+  const double *s = (const double*)(void*)((struct __V*)(intptr_t)sd)->data;
+  for (int64_t i = 0; i < m; i++)
+    for (int64_t j = 0; j < n; j++)
+      Z[i*n + j] = (X[i*n + j] - c[j]) / (s[j] == 0.0 ? 1.0 : s[j]);
+  return 0;
+  ```)
+  ;;; __pca-fill-kernel -- from the SVD of Z: loadings L (n x k) = V_k with the
+  ;;; sign fixed, sdev, var-prop, var-cum. sv holds all p = min(m, n) values.
+  (defn __pca-fill-kernel [Ld : (Vec float)
+                           sdevd : (Vec float)
+                           propd : (Vec float)
+                           cumd : (Vec float)
+                           Vtd : (Vec float)
+                           sigd : (Vec float)
+                           m : int
+                           n : int
+                           k : int
+                           p : int] : int
+    ```c
+    #include <math.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *L = (double*)(void*)((struct __V*)(intptr_t)Ld)->data;
+  double *sdev = (double*)(void*)((struct __V*)(intptr_t)sdevd)->data;
+  double *prop = (double*)(void*)((struct __V*)(intptr_t)propd)->data;
+  double *cum = (double*)(void*)((struct __V*)(intptr_t)cumd)->data;
+  const double *Vt = (const double*)(void*)((struct __V*)(intptr_t)Vtd)->data;
+  const double *sv = (const double*)(void*)((struct __V*)(intptr_t)sigd)->data;
+  double total = 0.0;
+  for (int64_t j = 0; j < p; j++) total += sv[j] * sv[j];
+  double run = 0.0;
+  for (int64_t j = 0; j < k; j++) {
+    int64_t big = 0;
+    for (int64_t i = 1; i < n; i++) if (fabs(Vt[j*n + i]) > fabs(Vt[j*n + big])) big = i;
+    double sg = Vt[j*n + big] < 0.0 ? -1.0 : 1.0;
+    for (int64_t i = 0; i < n; i++) L[i*k + j] = sg * Vt[j*n + i];
+    double var = (j < p) ? sv[j] * sv[j] : 0.0;
+    sdev[j] = m > 1 ? sqrt(var / (double)(m - 1)) : 0.0;
+    prop[j] = total > 0.0 ? var / total : 0.0;
+    run += prop[j];
+    cum[j] = run;
+  }
+  return 0;
+  ```)
+  ;;; pca -- principal component analysis of X.
+  ;;;
+  ;;; Parameters:
+  ;;;   x    -- m x n data matrix, one observation per row (borrowed); m >= 2
+  ;;;   opts -- centring, scaling and the number of components
+  ;;;
+  ;;; Returns:
+  ;;;   A PcaResult; free it with `pca-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (pca x (pca-opts true false 0))]
+  ;;;     (la-vec-get (.var-cum r) 1))  ; share explained by two components
+  ;;;
+  ;;; Since: 0.1.0
+  (defn pca [^borrow x : mat opts : PCAOpts] : PcaResult
+    (when (< (mat-rows x) 2) (panic "pca: need at least 2 observations"))
+    (let [m      (mat-rows x)
+          n      (mat-cols x)
+          p      (if (< m n) m n)
+          k      (if (or (<= (.ncomp opts) 0) (> (.ncomp opts) p))
+                   p
+                   (.ncomp opts))
+          center (if (.center opts) (col-means x) (la-vec-new n))
+          scale  (if (.scale opts)
+                   (col-sds x)
+                   (let [v (la-vec-new n)] (__fill-kernel (.data v) n 1.0) v))
+          z      (mat-new m n)]
+      (__standardize-kernel (.data z)
+        (.data x)
+        (.data center)
+        (.data scale)
+        m
+        n)
+      (let [f    (svd z)
+            l    (mat-new n k)
+            sdev (la-vec-new k)
+            prop (la-vec-new k)
+            cum  (la-vec-new k)]
+        (__pca-fill-kernel (.data l)
+          (.data sdev)
+          (.data prop)
+          (.data cum)
+          (.data (.Vt f))
+          (.data (.s f))
+          m
+          n
+          k
+          p)
+        (let [scores (mat-mul z l)]
+          (svd-free f)
+          (mat-free z)
+          (make-struct PcaResult l scores sdev prop cum center scale)))))
+  ;;; pca-free -- free a PcaResult.
+  (defn pca-free [r : PcaResult] : void
+    (mat-free (.loadings r))
+    (mat-free (.scores r))
+    (la-vec-free (.sdev r))
+    (la-vec-free (.var-prop r))
+    (la-vec-free (.var-cum r))
+    (la-vec-free (.center r))
+    (la-vec-free (.scale r)))
+  ;;; pca-project -- scores of new observations in the fitted space.
+  ;;;
+  ;;; Parameters:
+  ;;;   r     -- a fitted PCA (borrowed)
+  ;;;   x-new -- m' x n data with the original columns (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The m' x k score matrix, centred and scaled as the fit was.
+  ;;;
+  ;;; Example:
+  ;;;   (pca-project r x)  ; reproduces (.scores r) for the training data
+  ;;;
+  ;;; Since: 0.1.0
+  (defn pca-project [^borrow r : PcaResult ^borrow x-new : mat] : mat
+    (let [n (mat-rows (.loadings r))]
+      (when (not= (mat-cols x-new) n)
+        (panic "pca-project: column count mismatch"))
+      (let [z (mat-new (mat-rows x-new) n)]
+        (__standardize-kernel (.data z)
+          (.data x-new)
+          (.data (.center r))
+          (.data (.scale r))
+          (mat-rows x-new)
+          n)
+        (let [s (mat-mul z (.loadings r))] (mat-free z) s))))
+  ;;; __reconstruct-kernel -- X~ = (S_k L_k') * scale + center over the first
+  ;;; kk of the k retained components.
+  (defn __reconstruct-kernel [Xd : (Vec float)
+                              Sd : (Vec float)
+                              Ld : (Vec float)
+                              cd : (Vec float)
+                              sd : (Vec float)
+                              m : int
+                              n : int
+                              k : int
+                              kk : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *X = (double*)(void*)((struct __V*)(intptr_t)Xd)->data;
+  const double *S = (const double*)(void*)((struct __V*)(intptr_t)Sd)->data;
+  const double *L = (const double*)(void*)((struct __V*)(intptr_t)Ld)->data;
+  const double *c = (const double*)(void*)((struct __V*)(intptr_t)cd)->data;
+  const double *s = (const double*)(void*)((struct __V*)(intptr_t)sd)->data;
+  for (int64_t i = 0; i < m; i++)
+    for (int64_t j = 0; j < n; j++) {
+      double acc = 0.0;
+      for (int64_t t = 0; t < kk; t++) acc += S[i*k + t] * L[j*k + t];
+      X[i*n + j] = acc * (s[j] == 0.0 ? 1.0 : s[j]) + c[j];
+    }
+  return 0;
+  ```)
+  ;;; pca-reconstruct -- approximate X from its first kk components.
+  ;;;
+  ;;; Parameters:
+  ;;;   r  -- a fitted PCA (borrowed)
+  ;;;   kk -- components to use, 1 <= kk <= k retained
+  ;;;
+  ;;; Returns:
+  ;;;   The m x n reconstruction; with every component of a full-rank fit it
+  ;;;   recovers X up to rounding.
+  ;;;
+  ;;; Example:
+  ;;;   (pca-reconstruct r 1)  ; the best rank-1 approximation of X
+  ;;;
+  ;;; Since: 0.1.0
+  (defn pca-reconstruct [^borrow r : PcaResult kk : int] : mat
+    (let [m (mat-rows (.scores r))
+          n (mat-rows (.loadings r))
+          k (mat-cols (.loadings r))]
+      (when (or (< kk 1) (> kk k))
+        (panic "pca-reconstruct: component count out of range"))
+      (let [x (mat-new m n)]
+        (__reconstruct-kernel (.data x)
+          (.data (.scores r))
+          (.data (.loadings r))
+          (.data (.center r))
+          (.data (.scale r))
+          m
+          n
+          k
+          kk)
+        x)))
+  ;;; pca-var-explained -- share of the total variance in the first kk
+  ;;; components.
+  ;;;
+  ;;; Parameters:
+  ;;;   r  -- a fitted PCA (borrowed)
+  ;;;   kk -- components, 1 <= kk <= k retained
+  ;;;
+  ;;; Returns:
+  ;;;   A float in [0, 1].
+  ;;;
+  ;;; Example:
+  ;;;   (pca-var-explained r 2)  ; => 0.958...
+  ;;;
+  ;;; Since: 0.1.0
+  (defn pca-var-explained [^borrow r : PcaResult kk : int] : float
+    (when (or (< kk 1) (> kk (la-vec-len (.var-cum r))))
+      (panic "pca-var-explained: component count out of range"))
+    (la-vec-get (.var-cum r) (- kk 1)))) ;; end defmodule multivariate/pca

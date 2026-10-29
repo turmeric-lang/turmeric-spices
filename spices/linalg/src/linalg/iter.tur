@@ -1,0 +1,333 @@
+;;; linalg/iter -- iterative solvers for large dense systems: conjugate
+;;; gradient (SPD) and BiCGSTAB (general non-singular), plus the diagonal
+;;; (Jacobi) preconditioner vector.
+;;;
+;;; Like linalg/decomp, the numeric loops run in inline C over the backing
+;;; `(Vec float)` buffers; the Turmeric layer owns allocation and the result
+;;; struct. Both solvers start from x0 = 0 and stop once the residual
+;;; ||b - A x||_2 drops below `tol` or `max-iters` iterations have run.
+;;; `IterResult` carries the best iterate either way, so a caller can inspect
+;;; a non-converged run.
+;;;
+;;; linalg-sparse reuses `IterOpts` / `IterResult` for its sparse-cg and
+;;; sparse-bicgstab, so the two spices report the same shape.
+(defmodule linalg/iter
+  (export IterOpts
+    IterResult
+    iter-opts
+    iter-opts-default
+    iter-result
+    iter-result-free
+    cg
+    cg-free
+    bicgstab
+    bicgstab-free
+    jacobi-precond)
+  (import linalg/vec :refer [lavec la-vec-new la-vec-len la-vec-free])
+  (import linalg/mat :refer [mat mat-rows mat-cols mat-square?])
+  ;;; IterOpts -- convergence and limit controls shared by the iterative solvers.
+  ;;;   max-iters -- iterations allowed before giving up
+  ;;;   tol       -- stop when ||b - A x||_2 < tol
+  ;;;   verbose   -- true prints the residual of each iteration to stderr
+  (defstruct ^copy IterOpts [max-iters : int tol : float verbose : bool])
+  ;;; IterResult -- outcome of an iterative solve (owns `x`).
+  ;;;   x         -- the solution, or the last iterate on non-convergence
+  ;;;   iters     -- iterations taken
+  ;;;   residual  -- ||b - A x||_2 of the returned x
+  ;;;   converged -- true when residual < tol
+  (defstruct IterResult
+    [x : lavec iters : int residual : float converged : bool])
+  ;;; iter-opts -- build an IterOpts.
+  ;;;
+  ;;; Parameters:
+  ;;;   max-iters -- iteration limit
+  ;;;   tol       -- residual tolerance
+  ;;;   verbose   -- print per-iteration residuals to stderr
+  ;;;
+  ;;; Returns:
+  ;;;   The options value.
+  ;;;
+  ;;; Example:
+  ;;;   (cg a b (iter-opts 500 1e-10 false))
+  ;;;
+  ;;; Since: 0.2.0
+  (defn iter-opts [max-iters : int tol : float verbose : bool] : IterOpts
+    (make-struct IterOpts max-iters tol verbose))
+  ;;; iter-opts-default -- 1000 iterations, tolerance 1e-10, quiet.
+  ;;;
+  ;;; Returns:
+  ;;;   The default IterOpts.
+  ;;;
+  ;;; Example:
+  ;;;   (bicgstab a b (iter-opts-default))
+  ;;;
+  ;;; Since: 0.2.0
+  (defn iter-opts-default [] : IterOpts (make-struct IterOpts 1000 1e-10 false))
+  ;;; iter-result -- build an IterResult (for solvers outside this module).
+  ;;;
+  ;;; Parameters:
+  ;;;   x         -- the solution vector (ownership moves into the result)
+  ;;;   iters     -- iterations taken
+  ;;;   residual  -- final ||b - A x||_2
+  ;;;   converged -- whether residual < tol
+  ;;;
+  ;;; Returns:
+  ;;;   The result struct.
+  ;;;
+  ;;; Example:
+  ;;;   (iter-result x 12 3e-11 true)
+  ;;;
+  ;;; Since: 0.2.0
+  (defn iter-result [x : lavec iters : int residual : float converged : bool] : IterResult
+    (make-struct IterResult x iters residual converged))
+  ;;; iter-result-free -- free an IterResult and its solution vector.
+  (defn iter-result-free [r : IterResult] : void (la-vec-free (.x r)))
+  ;;; cg-free -- free the result of `cg`.
+  (defn cg-free [r : IterResult] : void (la-vec-free (.x r)))
+  ;;; bicgstab-free -- free the result of `bicgstab`.
+  (defn bicgstab-free [r : IterResult] : void (la-vec-free (.x r)))
+  ;;; __b2i -- bool to 0/1 for the C kernels.
+  (defn __b2i [b : bool] : int (if b 1 0))
+  ;;; __cg-kernel -- conjugate gradient on dense A (n x n). Writes x and
+  ;;; info = [iterations, final true residual]. Returns 0.
+  (defn __cg-kernel [xd : (Vec float)
+                     infod : (Vec float)
+                     Ad : (Vec float)
+                     bd : (Vec float)
+                     n : int
+                     maxit : int
+                     tol : float
+                     verbose : int] : int
+    ```c
+    #include <math.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *x = (double*)(void*)((struct __V*)(intptr_t)xd)->data;
+  double *info = (double*)(void*)((struct __V*)(intptr_t)infod)->data;
+  double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  double *b = (double*)(void*)((struct __V*)(intptr_t)bd)->data;
+  double *r = (double*)malloc(sizeof(double) * (size_t)(n + 1));
+  double *p = (double*)malloc(sizeof(double) * (size_t)(n + 1));
+  double *q = (double*)malloc(sizeof(double) * (size_t)(n + 1));
+  double rr = 0.0;
+  for (int64_t i = 0; i < n; i++) { x[i] = 0.0; r[i] = b[i]; p[i] = b[i]; rr += b[i] * b[i]; }
+  int64_t it = 0;
+  while (it < maxit && sqrt(rr) >= tol) {
+    double pq = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+      double s = 0.0;
+      const double *Ai = A + i * n;
+      for (int64_t j = 0; j < n; j++) s += Ai[j] * p[j];
+      q[i] = s; pq += p[i] * s;
+    }
+    if (pq == 0.0) break;
+    double alpha = rr / pq, rr2 = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+      x[i] += alpha * p[i];
+      r[i] -= alpha * q[i];
+      rr2 += r[i] * r[i];
+    }
+    double beta = rr2 / rr;
+    for (int64_t i = 0; i < n; i++) p[i] = r[i] + beta * p[i];
+    rr = rr2;
+    it++;
+    if (verbose) fprintf(stderr, "cg: iter %lld residual %.6e\n", (long long)it, sqrt(rr));
+  }
+  double res = 0.0;
+  for (int64_t i = 0; i < n; i++) {
+    double s = b[i];
+    for (int64_t j = 0; j < n; j++) s -= A[i*n + j] * x[j];
+    res += s * s;
+  }
+  info[0] = (double)it;
+  info[1] = sqrt(res);
+  free(r); free(p); free(q);
+  return 0;
+  ```)
+  ;;; __bicgstab-kernel -- BiCGSTAB (van der Vorst) on dense A (n x n). Writes
+  ;;; x and info = [iterations, final true residual]. Returns 0.
+  (defn __bicgstab-kernel [xd : (Vec float)
+                           infod : (Vec float)
+                           Ad : (Vec float)
+                           bd : (Vec float)
+                           n : int
+                           maxit : int
+                           tol : float
+                           verbose : int] : int
+    ```c
+    #include <math.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *x = (double*)(void*)((struct __V*)(intptr_t)xd)->data;
+  double *info = (double*)(void*)((struct __V*)(intptr_t)infod)->data;
+  double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  double *b = (double*)(void*)((struct __V*)(intptr_t)bd)->data;
+  size_t sz = sizeof(double) * (size_t)(n + 1);
+  double *r = (double*)malloc(sz), *rh = (double*)malloc(sz), *p = (double*)malloc(sz);
+  double *v = (double*)malloc(sz), *s = (double*)malloc(sz), *t = (double*)malloc(sz);
+  double rn = 0.0;
+  for (int64_t i = 0; i < n; i++) {
+    x[i] = 0.0; r[i] = b[i]; rh[i] = b[i]; p[i] = 0.0; v[i] = 0.0; rn += b[i] * b[i];
+  }
+  rn = sqrt(rn);
+  double rho = 1.0, alpha = 1.0, omega = 1.0;
+  int64_t it = 0;
+  while (it < maxit && rn >= tol) {
+    double rho1 = 0.0;
+    for (int64_t i = 0; i < n; i++) rho1 += rh[i] * r[i];
+    if (rho1 == 0.0 || omega == 0.0) break;           /* breakdown */
+    double beta = (rho1 / rho) * (alpha / omega);
+    for (int64_t i = 0; i < n; i++) p[i] = r[i] + beta * (p[i] - omega * v[i]);
+    double rv = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+      double acc = 0.0;
+      for (int64_t j = 0; j < n; j++) acc += A[i*n + j] * p[j];
+      v[i] = acc; rv += rh[i] * acc;
+    }
+    if (rv == 0.0) break;
+    alpha = rho1 / rv;
+    double sn = 0.0;
+    for (int64_t i = 0; i < n; i++) { s[i] = r[i] - alpha * v[i]; sn += s[i] * s[i]; }
+    it++;
+    if (sqrt(sn) < tol) {
+      for (int64_t i = 0; i < n; i++) x[i] += alpha * p[i];
+      rn = sqrt(sn);
+      if (verbose) fprintf(stderr, "bicgstab: iter %lld residual %.6e\n", (long long)it, rn);
+      break;
+    }
+    double ts = 0.0, tt = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+      double acc = 0.0;
+      for (int64_t j = 0; j < n; j++) acc += A[i*n + j] * s[j];
+      t[i] = acc; ts += acc * s[i]; tt += acc * acc;
+    }
+    omega = (tt == 0.0) ? 0.0 : ts / tt;
+    rn = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+      x[i] += alpha * p[i] + omega * s[i];
+      r[i] = s[i] - omega * t[i];
+      rn += r[i] * r[i];
+    }
+    rn = sqrt(rn);
+    rho = rho1;
+    if (verbose) fprintf(stderr, "bicgstab: iter %lld residual %.6e\n", (long long)it, rn);
+  }
+  double res = 0.0;
+  for (int64_t i = 0; i < n; i++) {
+    double acc = b[i];
+    for (int64_t j = 0; j < n; j++) acc -= A[i*n + j] * x[j];
+    res += acc * acc;
+  }
+  info[0] = (double)it;
+  info[1] = sqrt(res);
+  free(r); free(rh); free(p); free(v); free(s); free(t);
+  return 0;
+  ```)
+  ;;; __check-system -- panic unless A is square and b matches; returns n.
+  (defn __check-system [^borrow a : mat ^borrow b : lavec who : cstr] : int
+    (when (not (= (mat-square? a) 1)) (panic who))
+    (when (not= (mat-rows a) (la-vec-len b)) (panic who))
+    (mat-rows a))
+  (defn __info-new [] : (Vec float) (:: (vec-of 0.0 0.0) (Vec float)))
+  ;;; cg -- conjugate gradient solve of A x = b.
+  ;;;
+  ;;; Parameters:
+  ;;;   a    -- symmetric positive-definite n x n matrix (borrowed)
+  ;;;   b    -- right-hand side, length n (borrowed)
+  ;;;   opts -- iteration limit, tolerance, verbosity
+  ;;;
+  ;;; Returns:
+  ;;;   An IterResult (free with `cg-free`). For a non-SPD `a` the iteration is
+  ;;;   not guaranteed to converge; `converged` then reads false.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (cg a b (iter-opts-default))]
+  ;;;     (.converged r))  ; => true
+  ;;;
+  ;;; Since: 0.2.0
+  (defn cg [^borrow a : mat ^borrow b : lavec opts : IterOpts] : IterResult
+    (let [n    (__check-system a
+                 b
+                 "cg: need a square matrix and a matching vector")
+          x    (la-vec-new n)
+          info (__info-new)]
+      (__cg-kernel (.data x)
+        info
+        (.data a)
+        (.data b)
+        n
+        (.max-iters opts)
+        (.tol opts)
+        (__b2i (.verbose opts)))
+      (let [it  (:: (vec-get info 0) :float)
+            res (:: (vec-get info 1) :float)]
+        (vec-free info)
+        (make-struct IterResult x (as int it) res (< res (.tol opts))))))
+  ;;; bicgstab -- BiCGSTAB solve of A x = b for a general non-singular A.
+  ;;;
+  ;;; Parameters:
+  ;;;   a    -- square non-singular n x n matrix (borrowed); need not be symmetric
+  ;;;   b    -- right-hand side, length n (borrowed)
+  ;;;   opts -- iteration limit, tolerance, verbosity
+  ;;;
+  ;;; Returns:
+  ;;;   An IterResult (free with `bicgstab-free`).
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (bicgstab a b (iter-opts 200 1e-12 false))]
+  ;;;     (.iters r))  ; => iterations used
+  ;;;
+  ;;; Since: 0.2.0
+  (defn bicgstab [^borrow a : mat ^borrow b : lavec opts : IterOpts] : IterResult
+    (let [n    (__check-system a
+                 b
+                 "bicgstab: need a square matrix and a matching vector")
+          x    (la-vec-new n)
+          info (__info-new)]
+      (__bicgstab-kernel (.data x)
+        info
+        (.data a)
+        (.data b)
+        n
+        (.max-iters opts)
+        (.tol opts)
+        (__b2i (.verbose opts)))
+      (let [it  (:: (vec-get info 0) :float)
+            res (:: (vec-get info 1) :float)]
+        (vec-free info)
+        (make-struct IterResult x (as int it) res (< res (.tol opts))))))
+  ;;; __jacobi-kernel -- d[i] = 1 / A[i][i]; returns -1 on a zero diagonal.
+  (defn __jacobi-kernel [dd : (Vec float) Ad : (Vec float) n : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *d = (double*)(void*)((struct __V*)(intptr_t)dd)->data;
+  double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  for (int64_t i = 0; i < n; i++) {
+    if (A[i*n + i] == 0.0) return -1;
+    d[i] = 1.0 / A[i*n + i];
+  }
+  return 0;
+  ```)
+  ;;; jacobi-precond -- diagonal (Jacobi) preconditioner: the reciprocals of
+  ;;; A's diagonal.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- square matrix (borrowed) with a non-zero diagonal
+  ;;;
+  ;;; Returns:
+  ;;;   A lavec d with d[i] = 1 / A[i][i]. Panics on a zero diagonal entry.
+  ;;;
+  ;;; Example:
+  ;;;   (jacobi-precond (mat-of 2 2 4.0 1.0 1.0 2.0))  ; => [0.25 0.5]
+  ;;;
+  ;;; Since: 0.2.0
+  (defn jacobi-precond [^borrow a : mat] : lavec
+    (when (not (= (mat-square? a) 1))
+      (panic "jacobi-precond: matrix must be square"))
+    (let [n (mat-rows a)
+          d (la-vec-new n)]
+      (when (< (__jacobi-kernel (.data d) (.data a) n) 0)
+        (do (la-vec-free d) (panic "jacobi-precond: zero on the diagonal")))
+      d))) ;; end defmodule linalg/iter

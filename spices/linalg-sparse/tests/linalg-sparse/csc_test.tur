@@ -1,0 +1,140 @@
+;;; csc_test.tur -- LS1: CSC assembly, access, the transposed product and
+;;; the CSR <-> CSC conversions.
+;;;
+;;; The subject is a non-symmetric 4x5 matrix, so a transposition mistake
+;;; changes the answer: `csc-spmv` (A' v) is checked against `csr-spmv` of the
+;;; CSR transpose that `csc-transpose` returns.
+(defmodule linalg-sparse/csc-test
+  (import linalg/vec
+    :refer
+    [lavec la-vec-of la-vec-get la-vec-len la-vec-approx-eq? la-vec-free])
+  (import linalg-sparse/csr
+    :refer
+    [coomat
+     csrmat
+     coo-new
+     coo-push!
+     coo-free
+     csr-from-coo
+     csr-free
+     csr-rows
+     csr-cols
+     csr-get
+     csr-spmv])
+  (import linalg-sparse/csc
+    :refer
+    [cscmat
+     csc-from-coo
+     csc-from-csr
+     csr-from-csc
+     csc-free
+     csc-rows
+     csc-cols
+     csc-nnz
+     csc-get
+     csc-spmv
+     csc-transpose])
+  ;; --- TAP harness (inline-C fail counter) ---
+  (defn check [idx : int name : cstr ok : bool] : void
+    ```c
+    /* __tur_include__: static int g_csc_fails = 0; */
+  if (!ok) g_csc_fails++;
+  printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
+  ```)
+  (defn finish [count : int] : int
+    ```c
+    printf("1..%lld\n", (long long)count);
+  if (g_csc_fails == 0) {
+    fprintf(stderr, "# All %lld csc tests passed.\n", (long long)count);
+    return 0;
+  }
+  fprintf(stderr, "# %d/%lld csc tests failed.\n", g_csc_fails, (long long)count);
+  return 1;
+  ```)
+  (defn fa [x : float] : float ```c return x < 0.0 ? -x : x; ```)
+  (defn approx [a : float b : float] : bool (< (fa (- a b)) 1e-12))
+  ;;; sample -- a 4x5 non-symmetric pattern:
+  ;;;   [ 1  0  2  0  0 ]
+  ;;;   [ 0  3  0  0  4 ]
+  ;;;   [ 5  0  0  6  0 ]
+  ;;;   [ 0  7  0  0  8 ]
+  (defn sample [] : coomat
+    (let [c (coo-new 4 5)]
+      (coo-push! c 3 4 8.0)
+      (coo-push! c 0 0 1.0)
+      (coo-push! c 2 3 6.0)
+      (coo-push! c 1 1 3.0)
+      (coo-push! c 0 2 2.0)
+      (coo-push! c 3 1 7.0)
+      (coo-push! c 2 0 5.0)
+      (coo-push! c 1 4 4.0)
+      c))
+  (defn t-shape [] : bool
+    (let [c (sample)
+          m (csc-from-coo c)]
+      (let [ok (and (= (csc-rows m) 4)
+                 (and (= (csc-cols m) 5) (= (csc-nnz m) 8)))]
+        (csc-free m)
+        (coo-free c)
+        ok)))
+  (defn t-get [] : bool
+    (let [c (sample)
+          m (csc-from-coo c)]
+      (let [ok (and (approx (csc-get m 2 0) 5.0)
+                 (and (approx (csc-get m 3 4) 8.0)
+                   (and (approx (csc-get m 0 1) 0.0)
+                     (approx (csc-get m 1 4) 4.0))))]
+        (csc-free m)
+        (coo-free c)
+        ok)))
+  (defn t-spmv-vs-transpose [] : bool
+    ;; csc-spmv(A, v) = A' v = csr-spmv(csc-transpose(A), v)
+    (let [c  (sample)
+          m  (csc-from-coo c)
+          t  (csc-transpose m)
+          v  (la-vec-of 1.0 -2.0 0.5 3.0)
+          y1 (csc-spmv m v)
+          y2 (csr-spmv t v)]
+      (let [ok (and (= (la-vec-len y1) 5)
+                 (and (= (la-vec-approx-eq? y1 y2 1e-12) 1)
+                   ;; column 0 of A is (1 0 5 0): 1*1 + 5*0.5 = 3.5
+                   (approx (la-vec-get y1 0) 3.5)))]
+        (la-vec-free y1)
+        (la-vec-free y2)
+        (la-vec-free v)
+        (csr-free t)
+        (csc-free m)
+        (coo-free c)
+        ok)))
+  (defn t-transpose-shape [] : bool
+    (let [c (sample)
+          m (csc-from-coo c)
+          t (csc-transpose m)]
+      (let [ok (and (= (csr-rows t) 5)
+                 (and (= (csr-cols t) 4) (approx (csr-get t 4 1) 4.0)))]
+        (csr-free t)
+        (csc-free m)
+        (coo-free c)
+        ok)))
+  (defn t-roundtrip [] : bool
+    ;; CSR -> CSC -> CSR keeps every entry
+    (let [c  (sample)
+          r  (csr-from-coo c)
+          m  (csc-from-csr r)
+          r2 (csr-from-csc m)]
+      (let [ok (and (approx (csr-get r2 0 2) 2.0)
+                 (and (approx (csr-get r2 3 1) 7.0)
+                   (and (approx (csr-get r2 2 3) 6.0)
+                     (approx (csc-get m 0 2) 2.0))))]
+        (csr-free r2)
+        (csc-free m)
+        (csr-free r)
+        (coo-free c)
+        ok)))
+  (defn main [] : int
+    (check 1 "csc-from-coo: shape and nnz" (t-shape))
+    (check 2 "csc-get: stored and absent entries" (t-get))
+    (check 3 "csc-spmv = csr-spmv on the transpose" (t-spmv-vs-transpose))
+    (check 4 "csc-transpose: shape and entries" (t-transpose-shape))
+    (check 5 "csr -> csc -> csr round trip" (t-roundtrip))
+    (finish 5))) ;; end defmodule linalg-sparse/csc-test
