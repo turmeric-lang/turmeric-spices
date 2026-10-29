@@ -1,0 +1,368 @@
+;; tests/formula/terms_test.tur -- formula/terms: model frames, R's
+;; model.matrix coding, row dropping, errors, and fits through tur-stats'
+;; ols-frame checked against R's lm() on mtcars and iris.
+;;
+;; The two data sets are R's own (datasets::mtcars, datasets::iris), as CSV.
+;; Each column-name list is colnames(model.matrix(f)) for the same formula.
+;; The coefficients are the least-squares solution on R's model matrix
+;; (computed independently, with numpy), and agree with what R's lm() prints
+;; for these well-known fits -- e.g. mpg ~ wt * hp: 49.80842, -8.21662,
+;; -0.12010, 0.02785.
+(defmodule stats_formula_terms_test
+  (export main)
+  (import frame/csv :refer [read-csv-string])
+  (import frame/typed :refer [Frame frame-typed])
+  (import stats/regress :refer [ols-frame])
+  (import formula/terms
+    :refer
+    [FormulaTerms
+     formula-parse-terms
+     formula-terms-response
+     formula-terms-predictors
+     formula-terms-intercept?
+     formula-terms-terms
+     formula-terms-data
+     formula-terms-dropped
+     formula-terms-free
+     formula-predictors
+     formula-response
+     formula-intercept?
+     formula-term-labels])
+  (import formula/model-frame
+    :refer
+    [ModelFrame
+     model-frame-handle
+     model-frame-names
+     model-frame-nrows
+     model-frame-value])
+  (import formula/ast
+    :refer
+    [FormulaError
+     FormulaErrorKind
+     SyntaxError
+     UnknownColumn
+     NotNumeric
+     DomainError
+     NameCollision
+     NoResponse
+     TooFewLevels
+     formula-error-kind
+     formula-error-message])
+  (import test/assert :refer [assert-true])
+  (import test/suite :refer [describe it])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; __near? -- |a - b| <= tol * max(1, |b|), printing both when not.
+  (defn __near? [a : float b : float tol : float] : bool
+    ```c
+    #include <math.h>
+  #include <stdio.h>
+  double s = fabs(b) > 1.0 ? fabs(b) : 1.0;
+  if (fabs(a - b) <= tol * s) return true;
+  fprintf(stderr, "# want: %.12g\n# got:  %.12g\n", b, a);
+  return false;
+  ```)
+  ;;; __join -- strings separated by spaces.
+  (defn __join [xs : (Cons cstr)] : cstr
+    (cond (tnil? xs)         ""
+          (tnil? (ttail xs)) (thead xs)
+          :else              (str-concat (thead xs)
+                               (str-concat " " (__join (ttail xs))))))
+  ;; y: 1 2 null 4 5 6 7;  x: 0.5 1.5 2.5 null 4.5 5.5 6.5;
+  ;; g: a b c a b null c;  h: p q p q p q p;  one: z z z z z z z
+  (defn __small-raw [] : int
+    (read-csv-string "y,x,g,h,one,gb\n1,0.5,a,p,z,1\n2,1.5,b,q,z,2\n,2.5,c,p,z,3\n4,,a,q,z,4\n5,4.5,b,p,z,5\n6,5.5,,q,z,6\n7,6.5,c,p,z,7\n"
+      44
+      34
+      1
+      100
+      ""))
+  (defn __small [^&cols] [] : (Frame cols) (frame-typed (__small-raw)))
+  (defn __mtcars [^&cols] [] : (Frame cols)
+    (frame-typed (read-csv-string "mpg,cyl,disp,hp,drat,wt,qsec,vs,am,gear,carb\n21,6,160,110,3.9,2.62,16.46,0,1,4,4\n21,6,160,110,3.9,2.875,17.02,0,1,4,4\n22.8,4,108,93,3.85,2.32,18.61,1,1,4,1\n21.4,6,258,110,3.08,3.215,19.44,1,0,3,1\n18.7,8,360,175,3.15,3.44,17.02,0,0,3,2\n18.1,6,225,105,2.76,3.46,20.22,1,0,3,1\n14.3,8,360,245,3.21,3.57,15.84,0,0,3,4\n24.4,4,146.7,62,3.69,3.19,20,1,0,4,2\n22.8,4,140.8,95,3.92,3.15,22.9,1,0,4,2\n19.2,6,167.6,123,3.92,3.44,18.3,1,0,4,4\n17.8,6,167.6,123,3.92,3.44,18.9,1,0,4,4\n16.4,8,275.8,180,3.07,4.07,17.4,0,0,3,3\n17.3,8,275.8,180,3.07,3.73,17.6,0,0,3,3\n15.2,8,275.8,180,3.07,3.78,18,0,0,3,3\n10.4,8,472,205,2.93,5.25,17.98,0,0,3,4\n10.4,8,460,215,3,5.424,17.82,0,0,3,4\n14.7,8,440,230,3.23,5.345,17.42,0,0,3,4\n32.4,4,78.7,66,4.08,2.2,19.47,1,1,4,1\n30.4,4,75.7,52,4.93,1.615,18.52,1,1,4,2\n33.9,4,71.1,65,4.22,1.835,19.9,1,1,4,1\n21.5,4,120.1,97,3.7,2.465,20.01,1,0,3,1\n15.5,8,318,150,2.76,3.52,16.87,0,0,3,2\n15.2,8,304,150,3.15,3.435,17.3,0,0,3,2\n13.3,8,350,245,3.73,3.84,15.41,0,0,3,4\n19.2,8,400,175,3.08,3.845,17.05,0,0,3,2\n27.3,4,79,66,4.08,1.935,18.9,1,1,4,1\n26,4,120.3,91,4.43,2.14,16.7,0,1,5,2\n30.4,4,95.1,113,3.77,1.513,16.9,1,1,5,2\n15.8,8,351,264,4.22,3.17,14.5,0,1,5,4\n19.7,6,145,175,3.62,2.77,15.5,0,1,5,6\n15,8,301,335,3.54,3.57,14.6,0,1,5,8\n21.4,4,121,109,4.11,2.78,18.6,1,1,4,2\n"
+                   44
+                   34
+                   1
+                   100
+                   "")))
+  (defn __iris [^&cols] [] : (Frame cols)
+    (frame-typed (read-csv-string "Sepal.Length,Sepal.Width,Petal.Length,Petal.Width,Species\n5.1,3.5,1.4,0.2,setosa\n4.9,3,1.4,0.2,setosa\n4.7,3.2,1.3,0.2,setosa\n4.6,3.1,1.5,0.2,setosa\n5,3.6,1.4,0.2,setosa\n5.4,3.9,1.7,0.4,setosa\n4.6,3.4,1.4,0.3,setosa\n5,3.4,1.5,0.2,setosa\n4.4,2.9,1.4,0.2,setosa\n4.9,3.1,1.5,0.1,setosa\n5.4,3.7,1.5,0.2,setosa\n4.8,3.4,1.6,0.2,setosa\n4.8,3,1.4,0.1,setosa\n4.3,3,1.1,0.1,setosa\n5.8,4,1.2,0.2,setosa\n5.7,4.4,1.5,0.4,setosa\n5.4,3.9,1.3,0.4,setosa\n5.1,3.5,1.4,0.3,setosa\n5.7,3.8,1.7,0.3,setosa\n5.1,3.8,1.5,0.3,setosa\n5.4,3.4,1.7,0.2,setosa\n5.1,3.7,1.5,0.4,setosa\n4.6,3.6,1,0.2,setosa\n5.1,3.3,1.7,0.5,setosa\n4.8,3.4,1.9,0.2,setosa\n5,3,1.6,0.2,setosa\n5,3.4,1.6,0.4,setosa\n5.2,3.5,1.5,0.2,setosa\n5.2,3.4,1.4,0.2,setosa\n4.7,3.2,1.6,0.2,setosa\n4.8,3.1,1.6,0.2,setosa\n5.4,3.4,1.5,0.4,setosa\n5.2,4.1,1.5,0.1,setosa\n5.5,4.2,1.4,0.2,setosa\n4.9,3.1,1.5,0.2,setosa\n5,3.2,1.2,0.2,setosa\n5.5,3.5,1.3,0.2,setosa\n4.9,3.6,1.4,0.1,setosa\n4.4,3,1.3,0.2,setosa\n5.1,3.4,1.5,0.2,setosa\n5,3.5,1.3,0.3,setosa\n4.5,2.3,1.3,0.3,setosa\n4.4,3.2,1.3,0.2,setosa\n5,3.5,1.6,0.6,setosa\n5.1,3.8,1.9,0.4,setosa\n4.8,3,1.4,0.3,setosa\n5.1,3.8,1.6,0.2,setosa\n4.6,3.2,1.4,0.2,setosa\n5.3,3.7,1.5,0.2,setosa\n5,3.3,1.4,0.2,setosa\n7,3.2,4.7,1.4,versicolor\n6.4,3.2,4.5,1.5,versicolor\n6.9,3.1,4.9,1.5,versicolor\n5.5,2.3,4,1.3,versicolor\n6.5,2.8,4.6,1.5,versicolor\n5.7,2.8,4.5,1.3,versicolor\n6.3,3.3,4.7,1.6,versicolor\n4.9,2.4,3.3,1,versicolor\n6.6,2.9,4.6,1.3,versicolor\n5.2,2.7,3.9,1.4,versicolor\n5,2,3.5,1,versicolor\n5.9,3,4.2,1.5,versicolor\n6,2.2,4,1,versicolor\n6.1,2.9,4.7,1.4,versicolor\n5.6,2.9,3.6,1.3,versicolor\n6.7,3.1,4.4,1.4,versicolor\n5.6,3,4.5,1.5,versicolor\n5.8,2.7,4.1,1,versicolor\n6.2,2.2,4.5,1.5,versicolor\n5.6,2.5,3.9,1.1,versicolor\n5.9,3.2,4.8,1.8,versicolor\n6.1,2.8,4,1.3,versicolor\n6.3,2.5,4.9,1.5,versicolor\n6.1,2.8,4.7,1.2,versicolor\n6.4,2.9,4.3,1.3,versicolor\n6.6,3,4.4,1.4,versicolor\n6.8,2.8,4.8,1.4,versicolor\n6.7,3,5,1.7,versicolor\n6,2.9,4.5,1.5,versicolor\n5.7,2.6,3.5,1,versicolor\n5.5,2.4,3.8,1.1,versicolor\n5.5,2.4,3.7,1,versicolor\n5.8,2.7,3.9,1.2,versicolor\n6,2.7,5.1,1.6,versicolor\n5.4,3,4.5,1.5,versicolor\n6,3.4,4.5,1.6,versicolor\n6.7,3.1,4.7,1.5,versicolor\n6.3,2.3,4.4,1.3,versicolor\n5.6,3,4.1,1.3,versicolor\n5.5,2.5,4,1.3,versicolor\n5.5,2.6,4.4,1.2,versicolor\n6.1,3,4.6,1.4,versicolor\n5.8,2.6,4,1.2,versicolor\n5,2.3,3.3,1,versicolor\n5.6,2.7,4.2,1.3,versicolor\n5.7,3,4.2,1.2,versicolor\n5.7,2.9,4.2,1.3,versicolor\n6.2,2.9,4.3,1.3,versicolor\n5.1,2.5,3,1.1,versicolor\n5.7,2.8,4.1,1.3,versicolor\n6.3,3.3,6,2.5,virginica\n5.8,2.7,5.1,1.9,virginica\n7.1,3,5.9,2.1,virginica\n6.3,2.9,5.6,1.8,virginica\n6.5,3,5.8,2.2,virginica\n7.6,3,6.6,2.1,virginica\n4.9,2.5,4.5,1.7,virginica\n7.3,2.9,6.3,1.8,virginica\n6.7,2.5,5.8,1.8,virginica\n7.2,3.6,6.1,2.5,virginica\n6.5,3.2,5.1,2,virginica\n6.4,2.7,5.3,1.9,virginica\n6.8,3,5.5,2.1,virginica\n5.7,2.5,5,2,virginica\n5.8,2.8,5.1,2.4,virginica\n6.4,3.2,5.3,2.3,virginica\n6.5,3,5.5,1.8,virginica\n7.7,3.8,6.7,2.2,virginica\n7.7,2.6,6.9,2.3,virginica\n6,2.2,5,1.5,virginica\n6.9,3.2,5.7,2.3,virginica\n5.6,2.8,4.9,2,virginica\n7.7,2.8,6.7,2,virginica\n6.3,2.7,4.9,1.8,virginica\n6.7,3.3,5.7,2.1,virginica\n7.2,3.2,6,1.8,virginica\n6.2,2.8,4.8,1.8,virginica\n6.1,3,4.9,1.8,virginica\n6.4,2.8,5.6,2.1,virginica\n7.2,3,5.8,1.6,virginica\n7.4,2.8,6.1,1.9,virginica\n7.9,3.8,6.4,2,virginica\n6.4,2.8,5.6,2.2,virginica\n6.3,2.8,5.1,1.5,virginica\n6.1,2.6,5.6,1.4,virginica\n7.7,3,6.1,2.3,virginica\n6.3,3.4,5.6,2.4,virginica\n6.4,3.1,5.5,1.8,virginica\n6,3,4.8,1.8,virginica\n6.9,3.1,5.4,2.1,virginica\n6.7,3.1,5.6,2.4,virginica\n6.9,3.1,5.1,2.3,virginica\n5.8,2.7,5.1,1.9,virginica\n6.8,3.2,5.9,2.3,virginica\n6.7,3.3,5.7,2.5,virginica\n6.7,3,5.2,2.3,virginica\n6.3,2.5,5,1.9,virginica\n6.5,3,5.2,2,virginica\n6.2,3.4,5.4,2.3,virginica\n5.9,3,5.1,1.8,virginica\n"
+                   44
+                   34
+                   1
+                   200
+                   "")))
+  ;;; __cols -- the predictor names of src over the small frame, or the
+  ;;; error message.
+  (defn __cols [src : cstr] : cstr
+    (match (formula-predictors (__small) src)
+      (Ok ns)
+      (__join ns)
+      (Err e)
+      (str-concat "error: " (formula-error-message e))))
+  ;;; __kind -- the error kind of fitting src to the small frame.
+  (defn __kind [src : cstr] : cstr
+    (match (formula-parse-terms (__small) src)
+      (Ok t)
+      (do (formula-terms-free t) "ok")
+      (Err e)
+      (match (formula-error-kind e)
+        (SyntaxError)
+        "syntax"
+        (UnknownColumn)
+        "unknown-column"
+        (NotNumeric)
+        "not-numeric"
+        (DomainError)
+        "domain"
+        (NameCollision)
+        "name-collision"
+        (NoResponse)
+        "no-response"
+        (TooFewLevels)
+        "too-few-levels"
+        _
+        "other")))
+  ;; ---------------------------------------------------------------------------
+  ;; Reading an lm-fit (tur-stats' layout; see stats/tests/regress_test).
+  ;; ---------------------------------------------------------------------------
+  ;;; __fit -- the fit inside ols-frame's result, or 0 for an error.
+  (defn __fit [r : int] : int
+    ```c
+    struct __cons { int64_t value; int64_t next; };
+  struct __cons *outer = (struct __cons *)(intptr_t)r;
+  if (!outer || outer->value != 0) return 0;
+  return ((struct __cons *)(intptr_t)outer->next)->value;
+  ```)
+  ;;; __coef -- coefficient i of a fit.
+  (defn __coef [fit : int i : int] : float
+    ```c
+    typedef struct {
+    int64_t coefs; int64_t se; int64_t t_values; int64_t p_values;
+    int64_t fitted; int64_t residuals;
+    double r_squared; double adj_r_squared; double sigma;
+    int64_t df_residual; int64_t df_model; int64_t n_obs;
+    int64_t names;
+  } __lm_fit_t;
+  struct __fcol { int64_t type_tag; int64_t length; int64_t null_count; int64_t refcount;
+                  void *validity; void *values; void *offsets; };
+  __lm_fit_t *f = (__lm_fit_t *)(intptr_t)fit;
+  return ((double *)((struct __fcol *)(intptr_t)f->coefs)->values)[i];
+  ```)
+  ;;; __ols -- fit src to frame f with ols-frame, and the fit (0 on error).
+  (defn __ols [^&cols] [f : (Frame cols) src : cstr] : int
+    (match (formula-parse-terms f src)
+      (Ok t)
+      (__fit (ols-frame (model-frame-handle (formula-terms-data t))
+               (formula-terms-response t)
+               (formula-terms-predictors t)
+               (if (formula-terms-intercept? t) 1 0)))
+      (Err e)
+      (do (println (formula-error-message e)) 0)))
+  ;;; __coefs? -- a fit's first k coefficients are wants, to 1e-6 relative.
+  (defn __coefs? [fit : int wants : (Cons float) i : int] : bool
+    (cond (= fit 0)     false
+          (tnil? wants) true
+          :else         (and (__near? (__coef fit i) (thead wants) 1e-06)
+                          (__coefs? fit (ttail wants) (+ i 1)))))
+  (defn __all-tests [] : void
+    (describe "formula/terms coding (vs R colnames(model.matrix()))"
+      (it "y ~ x" (assert-true (__is? (__cols "y ~ x") "x")))
+      (it "y ~ g: treatment contrasts"
+        (assert-true (__is? (__cols "y ~ g") "gb gc")))
+      (it "y ~ g - 1: no intercept, every level"
+        (assert-true (__is? (__cols "y ~ g - 1") "ga gb gc")))
+      (it "y ~ 0 + x + g: the first factor gets every level"
+        (assert-true (__is? (__cols "y ~ 0 + x + g") "x ga gb gc")))
+      (it "y ~ g + h - 1: only the first factor"
+        (assert-true (__is? (__cols "y ~ g + h - 1") "ga gb gc hq")))
+      (it "y ~ g * h"
+        (assert-true (__is? (__cols "y ~ g * h") "gb gc hq gb:hq gc:hq")))
+      (it "y ~ g:x: no g main effect, so every level"
+        (assert-true (__is? (__cols "y ~ g:x") "ga:x gb:x gc:x")))
+      (it "y ~ x + g:x: x is in the model, so contrasts"
+        (assert-true (__is? (__cols "y ~ x + g:x") "x x:gb x:gc")))
+      (it "y ~ g * x"
+        (assert-true (__is? (__cols "y ~ g * x") "gb gc x gb:x gc:x")))
+      (it "y ~ g / x"
+        (assert-true (__is? (__cols "y ~ g / x") "gb gc ga:x gb:x gc:x")))
+      (it "y ~ g:h: neither main effect, so every pair"
+        (assert-true (__is? (__cols "y ~ g:h")
+                       "ga:hp gb:hp gc:hp ga:hq gb:hq gc:hq")))
+      (it "y ~ h + g:h"
+        (assert-true (__is? (__cols "y ~ h + g:h") "hq hp:gb hq:gb hp:gc hq:gc")))
+      (it "y ~ I(x^2) + log(x)"
+        (assert-true (__is? (__cols "y ~ I(x^2) + log(x)") "I(x^2) log(x)")))
+      (it "y ~ 1: nothing but the intercept"
+        (assert-true (__is? (__cols "y ~ 1") ""))))
+    (describe "formula/terms model frame"
+      (it "response first, then the predictors"
+        (assert-true (match (formula-parse-terms (__small) "y ~ g * x")
+                       (Ok t)
+                       (let [ok (__is? (__join (model-frame-names (formula-terms-data t)))
+                                  "y gb gc x gb:x gc:x")]
+                         (formula-terms-free t)
+                         ok)
+                       (Err e)
+                       false)))
+      (it "rows with a null in any variable used are dropped"
+        (assert-true (match (formula-parse-terms (__small) "y ~ g + x")
+                       (Ok t)
+                       (let [ok (and (= (formula-terms-dropped t) 3)
+                                  (= (model-frame-nrows (formula-terms-data t))
+                                    4))]
+                         (formula-terms-free t)
+                         ok)
+                       (Err e)
+                       false)))
+      (it "only the variables the formula uses decide"
+        (assert-true (match (formula-parse-terms (__small) "y ~ h")
+                       (Ok t)
+                       (let [ok (= (formula-terms-dropped t) 1)]
+                         (formula-terms-free t)
+                         ok)
+                       (Err e)
+                       false)))
+      (it "the kept rows' values, in order"
+        (assert-true (match (formula-parse-terms (__small) "y ~ g:x")
+                       (Ok t)
+                       (let [m  (formula-terms-data t)
+                             ok (and (match (model-frame-value m "y" 3)
+                                       (Some v)
+                                       (= v 7.0)
+                                       (None)
+                                       false)
+                                  (match (model-frame-value m "gc:x" 3)
+                                    (Some v)
+                                    (= v 6.5)
+                                    (None)
+                                    false)
+                                  (match (model-frame-value m "gb:x" 1)
+                                    (Some v)
+                                    (= v 1.5)
+                                    (None)
+                                    false))]
+                         (formula-terms-free t)
+                         ok)
+                       (Err e)
+                       false)))
+      (it "a computed response"
+        (assert-true (match (formula-parse-terms (__small) "log(y) ~ x")
+                       (Ok t)
+                       (let [ok (__is? (formula-terms-response t) "log(y)")]
+                         (formula-terms-free t)
+                         ok)
+                       (Err e)
+                       false)))
+      (it "the terms are kept"
+        (assert-true (match (formula-parse-terms (__small) "y ~ g * x")
+                       (Ok t)
+                       (let [ok (= (tlength (formula-terms-terms t)) 3)]
+                         (formula-terms-free t)
+                         ok)
+                       (Err e)
+                       false))))
+    (describe "formula/terms without a frame"
+      (it "formula-response"
+        (assert-true (match (formula-response "log(y) ~ x")
+                       (Ok r)
+                       (__is? r "log(y)")
+                       (Err e)
+                       false)))
+      (it "formula-intercept?"
+        (assert-true (and (match (formula-intercept? "y ~ x - 1")
+                            (Ok b)
+                            (not b)
+                            (Err e)
+                            false)
+                       (match (formula-intercept? "y ~ x")
+                         (Ok b)
+                         b
+                         (Err e)
+                         false))))
+      (it "formula-term-labels"
+        (assert-true (match (formula-term-labels "y ~ a * b")
+                       (Ok ls)
+                       (__is? (__join ls) "a b a:b")
+                       (Err e)
+                       false))))
+    (describe "formula/terms errors"
+      (it "no response" (assert-true (__is? (__kind "~ x") "no-response")))
+      (it "an unknown column"
+        (assert-true (__is? (__kind "y ~ x + nope") "unknown-column")))
+      (it "a categorical response"
+        (assert-true (__is? (__kind "g ~ x") "not-numeric")))
+      (it "a factor with one level in the data"
+        (assert-true (__is? (__kind "y ~ one") "too-few-levels")))
+      (it "two model columns with one name"
+        (assert-true (and (__is? (__kind "y ~ g + gb") "name-collision")
+                       (__is? (__cols "y ~ g + gb")
+                         "error: two model columns would both be named 'gb'"))))
+      (it "a domain error in a computed variable"
+        (assert-true (__is? (__kind "y ~ log(I(x - 1))") "domain")))
+      (it "a syntax error" (assert-true (__is? (__kind "y ~ x +") "syntax"))))
+    (describe "formula/terms through ols-frame (vs R lm())"
+      (it "mpg ~ wt * hp"
+        (assert-true (__coefs? (__ols (__mtcars) "mpg ~ wt * hp")
+                       (tcons-of 49.8084234
+                         (tcons-of -8.2166243
+                           (tcons-of -0.120102091
+                             (tcons-of 0.0278481483 (tnil)))))
+                       0)))
+      (it "mpg ~ wt + I(wt^2)"
+        (assert-true (__coefs? (__ols (__mtcars) "mpg ~ wt + I(wt^2)")
+                       (tcons-of 49.93081095
+                         (tcons-of -13.38033708 (tcons-of 1.17108689 (tnil))))
+                       0)))
+      (it "log(mpg) ~ log(hp) + am"
+        (assert-true (__coefs? (__ols (__mtcars) "log(mpg) ~ log(hp) + am")
+                       (tcons-of 5.11957434
+                         (tcons-of -0.45913393 (tcons-of 0.19543454 (tnil))))
+                       0)))
+      (it "mpg ~ (wt + hp + qsec)^2"
+        (assert-true (__coefs? (__ols (__mtcars) "mpg ~ (wt + hp + qsec)^2")
+                       (tcons-of 36.1827233
+                         (tcons-of -8.91432509
+                           (tcons-of -0.0331489865
+                             (tcons-of 0.732862842
+                               (tcons-of 0.0279486109
+                                 (tcons-of 0.0529085716
+                                   (tcons-of -0.00514555763 (tnil))))))))
+                       0)))
+      (it "Sepal.Length ~ Petal.Length + Species"
+        (assert-true (__coefs? (__ols (__iris)
+                                 "Sepal.Length ~ Petal.Length + Species")
+                       (tcons-of 3.68352657
+                         (tcons-of 0.90456459
+                           (tcons-of -1.60097172 (tcons-of -2.11766917 (tnil)))))
+                       0)))
+      (it "Sepal.Length ~ Species - 1 gives the group means"
+        (assert-true (__coefs? (__ols (__iris) "Sepal.Length ~ Species - 1")
+                       (tcons-of 5.006 (tcons-of 5.936 (tcons-of 6.588 (tnil))))
+                       0)))
+      (it "Sepal.Length ~ Species * Petal.Length"
+        (assert-true (__coefs? (__ols (__iris)
+                                 "Sepal.Length ~ Species * Petal.Length")
+                       (tcons-of 4.21316822
+                         (tcons-of -1.80564512
+                           (tcons-of -3.15350913
+                             (tcons-of 0.5422926
+                               (tcons-of 0.28598836
+                                 (tcons-of 0.45344604 (tnil)))))))
+                       0)))
+      (it "the predictor names for that fit"
+        (assert-true (match (formula-predictors (__iris)
+                              "Sepal.Length ~ Species * Petal.Length")
+                       (Ok ns)
+                       (__is? (__join ns)
+                         "Speciesversicolor Speciesvirginica Petal.Length Speciesversicolor:Petal.Length Speciesvirginica:Petal.Length")
+                       (Err e)
+                       false)))))
+  (defn main [] : int (__all-tests) (run-all-status)))

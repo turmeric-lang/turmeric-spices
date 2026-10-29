@@ -1,0 +1,80 @@
+;; tests/formula/lexer_test.tur -- formula/lexer: token kinds, text,
+;; positions, and the errors.
+(defmodule stats_formula_lexer_test
+  (export main)
+  (import formula/lexer
+    :refer
+    [TokKind Token token-kind token-text token-pos tok-kind-name formula-lex])
+  (import formula/ast :refer [FormulaError formula-error->string])
+  (import test/assert :refer [assert-true])
+  (import test/suite :refer [describe it])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; __render -- each token as kind[text]@pos, space-separated.
+  (defn __render [ts : (Cons Token)] : cstr
+    (if (tnil? ts)
+      ""
+      (let [t (thead ts)
+            s (str-concat (tok-kind-name (token-kind t))
+                (str-concat "["
+                  (str-concat (token-text t)
+                    (str-concat "]@" (int->str (token-pos t))))))]
+        (if (tnil? (ttail ts))
+          s
+          (str-concat s (str-concat " " (__render (ttail ts))))))))
+  ;;; __lex -- the rendered tokens, or the rendered error.
+  (defn __lex [s : cstr] : cstr
+    (match (formula-lex s)
+      (Ok ts)
+      (__render ts)
+      (Err e)
+      (str-concat "error: " (formula-error->string e))))
+  (defn __all-tests [] : void
+    (describe "formula/lexer tokens"
+      (it "operators and names, with positions"
+        (assert-true (__is? (__lex "y~x1*x2")
+                       "name[y]@0 '~'[~]@1 name[x1]@2 '*'[*]@4 name[x2]@5 end of formula[]@7")))
+      (it "every operator"
+        (assert-true (__is? (__lex "+-*/^:(),")
+                       "'+'[+]@0 '-'[-]@1 '*'[*]@2 '/'[/]@3 '^'[^]@4 ':'[:]@5 '('[(]@6 ')'[)]@7 ','[,]@8 end of formula[]@9")))
+      (it "whitespace is skipped but positions count it"
+        (assert-true (__is? (__lex "  y \t~\n x")
+                       "name[y]@2 '~'[~]@5 name[x]@8 end of formula[]@9")))
+      (it "R names: dots, underscores, digits after the first byte"
+        (assert-true (__is? (__lex "Sepal.Length log_wt .hidden x2.b")
+                       "name[Sepal.Length]@0 name[log_wt]@13 name[.hidden]@20 name[x2.b]@28 end of formula[]@32")))
+      (it "numbers: integer, decimal, leading dot, exponent"
+        (assert-true (__is? (__lex "1 2.5 .5 1e-3 2E+2 3.")
+                       "number[1]@0 number[2.5]@2 number[.5]@6 number[1e-3]@9 number[2E+2]@14 number[3.]@19 end of formula[]@21")))
+      (it "an e with no digits after it is not an exponent"
+        (assert-true (__is? (__lex "2e")
+                       "number[2]@0 name[e]@1 end of formula[]@2")))
+      (it "a lone dot is TDot"
+        (assert-true (__is? (__lex "y ~ .")
+                       "name[y]@0 '~'[~]@2 '.'[.]@4 end of formula[]@5")))
+      (it "a backticked name keeps its spaces and loses its backticks"
+        (assert-true (__is? (__lex "`fuel economy` ~ x")
+                       "name[fuel economy]@0 '~'[~]@15 name[x]@17 end of formula[]@18")))
+      (it "UTF-8 bytes lex as name bytes"
+        (assert-true (__is? (__lex "y ~ caf\xc3\xa9")
+                       "name[y]@0 '~'[~]@2 name[caf\xc3\xa9]@4 end of formula[]@9")))
+      (it "the empty formula is just the end"
+        (assert-true (__is? (__lex "") "end of formula[]@0"))))
+    (describe "formula/lexer errors"
+      (it "an unexpected character, at its position"
+        (assert-true (__is? (__lex "y ~ x $ z")
+                       "error: unexpected character '$' at position 6")))
+      (it "an unterminated backtick name"
+        (assert-true (__is? (__lex "y ~ `abc")
+                       "error: unterminated backtick name at position 4")))
+      (it "an empty backtick name"
+        (assert-true (__is? (__lex "y ~ ``")
+                       "error: empty backtick name at position 4")))))
+  (defn main [] : int (__all-tests) (run-all-status)))

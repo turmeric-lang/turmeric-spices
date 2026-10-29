@@ -1,0 +1,447 @@
+;;; formula/parser -- a Pratt parser from formula text to a ParsedFormula.
+;;;
+;;; Grammar (tightest first):
+;;;
+;;;   ^        power, `a ^ 2`; the exponent is a positive integer literal
+;;;   :        interaction
+;;;   * /      crossing, nesting (left-associative)
+;;;   - (unary) as in `-1 + x`
+;;;   + -      sum, removal (left-associative)
+;;;
+;;; A term is a column name, `0` / `1` (intercept off / on), a parenthesised
+;;; right-hand side, or a call of one of the supported functions -- `I` and
+;;; the math functions `log`, `exp`, `sqrt`, `abs` -- whose argument is
+;;; ordinary arithmetic (`+ - * / ^`, unary minus, numbers, columns, nested
+;;; calls). `log(x)` is a variable labelled `log(x)`, just as in R; `I(...)`
+;;; is needed only to stop an operator being read as formula syntax, as in
+;;; `I(x^2)` or `I(a + b)`.
+;;;
+;;; The left of `~` is one variable (`y`, `log(y)`, `I(y / 2)`), or nothing
+;;; for a one-sided formula `~ x`.
+;;;
+;;; Since: 0.1.0
+;; Formula parser.
+(load "stdlib/str-build.tur")
+
+(defmodule formula/parser
+  (export formula-parse
+    formula-parse-tokens
+    formula-parse-expr
+    formula-function?)
+  (import formula/text :refer [text-len text-byte text-sub text-eq?])
+  (import formula/ast
+    :refer
+    [Op
+     OpAdd
+     OpSub
+     OpMul
+     OpDiv
+     OpPow
+     Expr
+     ENum
+     ECol
+     ENeg
+     EBin
+     ECall
+     Formula
+     FVar
+     FIntercept
+     FSum
+     FDiff
+     FNeg
+     FCross
+     FInteract
+     FNest
+     FPower
+     Lhs
+     OneSided
+     Response
+     ParsedFormula
+     FormulaError
+     SyntaxError
+     formula-error-at])
+  (import formula/lexer
+    :refer
+    [TokKind
+     TName
+     TNum
+     TTilde
+     TPlus
+     TMinus
+     TStar
+     TSlash
+     TCaret
+     TColon
+     TLParen
+     TRParen
+     TComma
+     TDot
+     TEof
+     Token
+     token-kind
+     token-text
+     token-pos
+     tok-kind-name
+     formula-lex])
+  ;; A parse step's result: the node and the tokens after it.
+  (defstruct ^copy PForm [node : Formula rest : (Cons Token)])
+  (defstruct ^copy PExpr [node : Expr rest : (Cons Token)])
+  ;;; __peek -- internal: the next token (the lexer always ends with TEof, and
+  ;;; nothing consumes it).
+  (defn __peek [ts : (Cons Token)] : Token (thead ts))
+  ;;; __kind-is? -- internal: does token t have the kind of k?
+  (defn __kind-is? [t : Token k : TokKind] : bool
+    (= (__kind-code (token-kind t)) (__kind-code k)))
+  ;;; __kind-code -- internal: a TokKind as a small integer, for comparison.
+  (defn __kind-code [k : TokKind] : int
+    (match k
+      (TName)
+      0
+      (TNum)
+      1
+      (TTilde)
+      2
+      (TPlus)
+      3
+      (TMinus)
+      4
+      (TStar)
+      5
+      (TSlash)
+      6
+      (TCaret)
+      7
+      (TColon)
+      8
+      (TLParen)
+      9
+      (TRParen)
+      10
+      (TComma)
+      11
+      (TDot)
+      12
+      (TEof)
+      13))
+  ;;; __describe -- internal: a token as it reads in an error message.
+  (defn __describe [t : Token] : cstr
+    (match (token-kind t)
+      (TName)
+      (str-concat "name '" (str-concat (token-text t) "'"))
+      (TNum)
+      (str-concat "number " (token-text t))
+      (TEof)
+      "end of formula"
+      _
+      (str-concat "token " (tok-kind-name (token-kind t)))))
+  ;;; __unexpected -- internal: "expected X, found Y" at Y's position.
+  (defn __unexpected [A] [what : cstr t : Token] : (Result A FormulaError)
+    (Err (formula-error-at (SyntaxError)
+           (str-concat "expected "
+             (str-concat what (str-concat ", found " (__describe t))))
+           (token-pos t))))
+  ;;; __expect -- internal: consume a token of kind k, or fail.
+  (defn __expect [ts : (Cons Token) k : TokKind] : (Result (Cons Token)
+                                                     FormulaError)
+    (if (__kind-is? (__peek ts) k)
+      (Ok (ttail ts))
+      (__unexpected (tok-kind-name k) (__peek ts))))
+  ;;; formula-function? -- is `name` a function a formula may call?
+  ;;;
+  ;;; Parameters:
+  ;;;   name -- a function name
+  ;;;
+  ;;; Returns:
+  ;;;   bool -- true for I, log, exp, sqrt and abs
+  ;;;
+  ;;; Example:
+  ;;;   (formula-function? "log")    ; => true
+  ;;;   (formula-function? "poly")   ; => false
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-function? [name : cstr] : bool
+    (or (text-eq? name "I")
+      (text-eq? name "log")
+      (text-eq? name "exp")
+      (text-eq? name "sqrt")
+      (text-eq? name "abs")))
+  ;;; __parse-float -- internal: strtod.
+  (defn __parse-float [s : cstr] : float
+    ```c
+    return strtod((const char *)s, NULL);
+  ```)
+  ;;; __positive-int -- internal: a literal that is all digits and at least 1.
+  (defn __positive-int [s : cstr] : (Option int)
+    (if (__all-digits? s 0 (text-len s))
+      (let [v (__digits-value s 0 (text-len s) 0)]
+        (if (>= v 1) (Some v) (None)))
+      (None)))
+  ;;; __all-digits? -- internal.
+  (defn __all-digits? [s : cstr i : int n : int] : bool
+    (cond (>= i n)                                              (> n 0)
+          (and (>= (text-byte s i) 48) (<= (text-byte s i) 57)) (__all-digits? s
+                                                                  (+ i 1)
+                                                                  n)
+          :else                                                 false))
+  ;;; __digits-value -- internal (saturates well above any sensible exponent).
+  (defn __digits-value [s : cstr i : int n : int acc : int] : int
+    (if (or (>= i n) (> acc 1000000))
+      acc
+      (__digits-value s (+ i 1) n (+ (* acc 10) (- (text-byte s i) 48)))))
+  ;; ---------------------------------------------------------------------------
+  ;; Arithmetic expressions: inside I(...), function arguments, and the
+  ;; response.
+  ;; ---------------------------------------------------------------------------
+  ;;; __expr-lbp -- internal: the left binding power of an infix arithmetic
+  ;;; token (0 for one that ends the expression).
+  (defn __expr-lbp [t : Token] : int
+    (match (token-kind t)
+      (TPlus)
+      10
+      (TMinus)
+      10
+      (TStar)
+      20
+      (TSlash)
+      20
+      (TCaret)
+      30
+      _
+      0))
+  ;;; __expr-op -- internal: the Op of an infix arithmetic token.
+  (defn __expr-op [t : Token] : Op
+    (match (token-kind t)
+      (TPlus)
+      (OpAdd)
+      (TMinus)
+      (OpSub)
+      (TStar)
+      (OpMul)
+      (TSlash)
+      (OpDiv)
+      _
+      (OpPow)))
+  ;;; __call-rest -- internal: after `name (`, the argument and the `)`.
+  (defn __call-rest [name : Token ts : (Cons Token)] : (Result PExpr
+                                                         FormulaError)
+    (if (formula-function? (token-text name))
+      (let [arg (? (__parse-expr ts 0))
+            nx  (__peek (.rest arg))]
+        (if (__kind-is? nx (TComma))
+          (Err (formula-error-at (SyntaxError)
+                 (str-concat "function '"
+                   (str-concat (token-text name) "' takes one argument"))
+                 (token-pos nx)))
+          (let [rest (? (__expect (.rest arg) (TRParen)))]
+            (Ok (PExpr (ECall (token-text name) (.node arg)) rest)))))
+      (Err (formula-error-at (SyntaxError)
+             (str-concat "function '"
+               (str-concat (token-text name)
+                 "' is not supported (I, log, exp, sqrt, abs are)"))
+             (token-pos name)))))
+  ;;; __expr-nud -- internal: an arithmetic primary.
+  (defn __expr-nud [ts : (Cons Token)] : (Result PExpr FormulaError)
+    (let [t    (__peek ts)
+          rest (ttail ts)]
+      (match (token-kind t)
+        (TNum)
+        (Ok (PExpr (ENum (__parse-float (token-text t))) rest))
+        (TName)
+        (if (__kind-is? (__peek rest) (TLParen))
+          (__call-rest t (ttail rest))
+          (Ok (PExpr (ECol (token-text t)) rest)))
+        (TLParen)
+        (let [inner (? (__parse-expr rest 0))
+              after (? (__expect (.rest inner) (TRParen)))]
+          (Ok (PExpr (.node inner) after)))
+        (TMinus)
+        (let [x (? (__parse-expr rest 25))]
+          (Ok (PExpr (ENeg (.node x)) (.rest x))))
+        (TPlus)
+        (__parse-expr rest 25)
+        _
+        (__unexpected "a number, a column or '('" t))))
+  ;;; __expr-loop -- internal: the Pratt loop for arithmetic.
+  (defn __expr-loop [left : PExpr rbp : int] : (Result PExpr FormulaError)
+    (let [t   (__peek (.rest left))
+          lbp (__expr-lbp t)]
+      (if (> lbp rbp)
+        ;; ^ is right-associative: its right side binds at lbp - 1
+        (let [right (? (__parse-expr (ttail (.rest left))
+                         (if (= lbp 30) 29 lbp)))]
+          (__expr-loop (PExpr (EBin (__expr-op t) (.node left) (.node right))
+                         (.rest right))
+            rbp))
+        (Ok left))))
+  ;;; __parse-expr -- internal.
+  (defn __parse-expr [ts : (Cons Token) rbp : int] : (Result PExpr FormulaError)
+    (let [left (? (__expr-nud ts))] (__expr-loop left rbp)))
+  ;; ---------------------------------------------------------------------------
+  ;; Formula right-hand sides.
+  ;; ---------------------------------------------------------------------------
+  ;;; __rhs-lbp -- internal: left binding power of an infix formula token.
+  (defn __rhs-lbp [t : Token] : int
+    (match (token-kind t)
+      (TPlus)
+      10
+      (TMinus)
+      10
+      (TStar)
+      20
+      (TSlash)
+      20
+      (TColon)
+      30
+      (TCaret)
+      40
+      _
+      0))
+  ;;; __rhs-nud -- internal: a formula primary.
+  (defn __rhs-nud [ts : (Cons Token)] : (Result PForm FormulaError)
+    (let [t    (__peek ts)
+          rest (ttail ts)]
+      (match (token-kind t)
+        (TName)
+        (if (__kind-is? (__peek rest) (TLParen))
+          (let [call (? (__call-rest t (ttail rest)))]
+            (Ok (PForm (FVar (.node call)) (.rest call))))
+          (Ok (PForm (FVar (ECol (token-text t))) rest)))
+        (TNum)
+        (cond (text-eq? (token-text t) "0") (Ok (PForm (FIntercept false) rest))
+              (text-eq? (token-text t) "1") (Ok (PForm (FIntercept true) rest))
+              :else                         (Err (formula-error-at (SyntaxError)
+                                                   (str-concat "number "
+                                                     (str-concat (token-text t)
+                                                       " is not a term (only 0 and 1 are; wrap arithmetic in I(...))"))
+                                                   (token-pos t))))
+        (TLParen)
+        (let [inner (? (__parse-rhs rest 0))
+              after (? (__expect (.rest inner) (TRParen)))]
+          (Ok (PForm (.node inner) after)))
+        (TMinus)
+        (let [x (? (__parse-rhs rest 15))]
+          (Ok (PForm (FNeg (.node x)) (.rest x))))
+        (TPlus)
+        (__parse-rhs rest 15)
+        (TDot)
+        (Err (formula-error-at (SyntaxError)
+               "'.' (all other columns) is not supported yet; list the columns"
+               (token-pos t)))
+        _
+        (__unexpected "a term" t))))
+  ;;; __power-rest -- internal: after `^`, the exponent.
+  (defn __power-rest [left : Formula ts : (Cons Token)] : (Result PForm
+                                                            FormulaError)
+    (let [t (__peek ts)]
+      (match (token-kind t)
+        (TNum)
+        (match (__positive-int (token-text t))
+          (Some n)
+          (Ok (PForm (FPower left n) (ttail ts)))
+          (None)
+          (Err (formula-error-at (SyntaxError)
+                 (str-concat "exponent "
+                   (str-concat (token-text t)
+                     " must be a positive integer (for a numeric power use I(x^2))"))
+                 (token-pos t))))
+        _
+        (__unexpected "a positive integer exponent" t))))
+  ;;; __rhs-led -- internal: apply infix token t to left.
+  (defn __rhs-led [left : Formula t : Token ts : (Cons Token)] : (Result PForm
+                                                                   FormulaError)
+    (match (token-kind t)
+      (TCaret)
+      (__power-rest left ts)
+      _
+      (let [right (? (__parse-rhs ts (__rhs-lbp t)))
+            r     (.node right)
+            node  (match (token-kind t)
+                    (TPlus)
+                    (FSum left r)
+                    (TMinus)
+                    (FDiff left r)
+                    (TStar)
+                    (FCross left r)
+                    (TSlash)
+                    (FNest left r)
+                    _
+                    (FInteract left r))]
+        (Ok (PForm node (.rest right))))))
+  ;;; __rhs-loop -- internal: the Pratt loop for formulas.
+  (defn __rhs-loop [left : PForm rbp : int] : (Result PForm FormulaError)
+    (let [t   (__peek (.rest left))
+          lbp (__rhs-lbp t)]
+      (if (> lbp rbp)
+        (let [next (? (__rhs-led (.node left) t (ttail (.rest left))))]
+          (__rhs-loop next rbp))
+        (Ok left))))
+  ;;; __parse-rhs -- internal.
+  (defn __parse-rhs [ts : (Cons Token) rbp : int] : (Result PForm FormulaError)
+    (let [left (? (__rhs-nud ts))] (__rhs-loop left rbp)))
+  ;;; __finish -- internal: the right-hand side, then the end of input.
+  (defn __finish [lhs : Lhs ts : (Cons Token)] : (Result ParsedFormula
+                                                   FormulaError)
+    (let [rhs (? (__parse-rhs ts 0))
+          nx  (__peek (.rest rhs))]
+      (if (__kind-is? nx (TEof))
+        (Ok (ParsedFormula lhs (.node rhs)))
+        (__unexpected "an operator or end of formula" nx))))
+  ;;; formula-parse-tokens -- parse a token list (from formula-lex).
+  ;;;
+  ;;; Parameters:
+  ;;;   ts -- the tokens, ending with TEof
+  ;;;
+  ;;; Returns:
+  ;;;   (Result ParsedFormula FormulaError)
+  ;;;
+  ;;; Example:
+  ;;;   (match (formula-lex "y ~ a * b")
+  ;;;     (Ok ts) (formula-parse-tokens ts)
+  ;;;     (Err e) (Err e))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-parse-tokens [ts : (Cons Token)] : (Result ParsedFormula
+                                                     FormulaError)
+    (if (__kind-is? (__peek ts) (TTilde))
+      (__finish (OneSided) (ttail ts))
+      (let [lhs   (? (__parse-expr ts 0))
+            after (? (__expect (.rest lhs) (TTilde)))]
+        (__finish (Response (.node lhs)) after))))
+  ;;; formula-parse -- parse formula text.
+  ;;;
+  ;;; Parameters:
+  ;;;   input -- e.g. "y ~ x1 * x2 + I(x3^2)" or the one-sided "~ a + b"
+  ;;;
+  ;;; Returns:
+  ;;;   (Result ParsedFormula FormulaError) -- a SyntaxError carries the byte
+  ;;;   position of the offending token.
+  ;;;
+  ;;; Example:
+  ;;;   (match (formula-parse "y ~ x1 + x2")
+  ;;;     (Ok pf) (parsed-formula->string pf)   ; => "y ~ x1 + x2"
+  ;;;     (Err e) (formula-error->string e))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-parse [input : cstr] : (Result ParsedFormula FormulaError)
+    (let [ts (? (formula-lex input))] (formula-parse-tokens ts)))
+  ;;; formula-parse-expr -- parse arithmetic text, as written inside I(...).
+  ;;;
+  ;;; Parameters:
+  ;;;   input -- e.g. "x^2" or "log(a + b)"
+  ;;;
+  ;;; Returns:
+  ;;;   (Result Expr FormulaError)
+  ;;;
+  ;;; Example:
+  ;;;   (match (formula-parse-expr "wt^2")
+  ;;;     (Ok e) (expr->string e)   ; => "wt^2"
+  ;;;     (Err e) "")
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-parse-expr [input : cstr] : (Result Expr FormulaError)
+    (let [ts (? (formula-lex input))
+          e  (? (__parse-expr ts 0))
+          nx (__peek (.rest e))]
+      (if (__kind-is? nx (TEof))
+        (Ok (.node e))
+        (__unexpected "an operator or end of input" nx)))))

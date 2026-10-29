@@ -1,0 +1,232 @@
+;;; formula/model-frame -- the frames this spice builds, and its plumbing
+;;; over tur-frame columns.
+;;;
+;;; A `ModelFrame` is a tur-frame frame that the formula layer allocated: a
+;;; model frame from `formula-parse-terms`, the indicator columns of
+;;; `formula-dummy-code`, the one computed column of `formula-eval-identity`.
+;;; Every column in one is float64. The caller owns it and frees it with
+;;; `model-frame-free`; `model-frame-handle` is the raw tur-frame handle the
+;;; untyped frame/* and stats/* APIs take (`ols-frame`, `print-frame`, ...).
+;;;
+;;; Since: 0.1.0
+;; ModelFrame and column helpers.
+(load "stdlib/math.tur")
+
+(defmodule formula/model-frame
+  (export ModelFrame
+    model-frame-handle
+    model-frame-free
+    model-frame-nrows
+    model-frame-ncols
+    model-frame-names
+    model-frame-value
+    model-frame-valid?
+    __model-frame-of
+    __num-at
+    __categorical?
+    __f64-column
+    __f64-column-where
+    __assemble
+    __cmp)
+  (import formula/seq
+    :refer
+    [seq-reverse seq-map seq-foldl seq-length seq-append seq->carrier])
+  (import frame/frame
+    :refer
+    [frame
+     frame-free
+     frame-nrows
+     frame-ncols
+     frame-schema
+     frame-column
+     frame-column-at])
+  (import frame/schema :refer [field schema schema-field-at field-name])
+  (import frame/type :refer [type-float64 type-utf8])
+  (import frame/column
+    :refer
+    [column-type
+     column-valid?
+     column-int32-at
+     column-int64-at
+     column-float32-at
+     column-float64-at
+     column-bool-at
+     column-builder
+     builder-append-float64
+     builder-append-null
+     builder-finish])
+  ;;; ModelFrame -- a frame built by this spice; the caller owns it.
+  ;;; Since: 0.1.0
+  (defopaque ModelFrame :int)
+  ;;; __model-frame-of -- internal: adopt a raw frame handle.
+  (defn __model-frame-of [h : int] : ModelFrame (:: h ModelFrame))
+  ;;; model-frame-handle -- the raw tur-frame handle, for frame/* and stats/*.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the model frame
+  ;;;
+  ;;; Returns:
+  ;;;   int -- a tur-frame frame handle, still owned by `m`
+  ;;;
+  ;;; Example:
+  ;;;   (print-frame (model-frame-handle m))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn model-frame-handle [m : ModelFrame] : int (:: m :int))
+  ;;; model-frame-free -- free a model frame and its columns.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the model frame
+  ;;;
+  ;;; Returns:
+  ;;;   void
+  ;;;
+  ;;; Example:
+  ;;;   (model-frame-free m)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn model-frame-free [m : ModelFrame] : void (frame-free (:: m :int)))
+  ;;; model-frame-nrows -- number of rows.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the model frame
+  ;;;
+  ;;; Returns:
+  ;;;   int
+  ;;;
+  ;;; Example:
+  ;;;   (model-frame-nrows m)   ; => 32
+  ;;;
+  ;;; Since: 0.1.0
+  (defn model-frame-nrows [m : ModelFrame] : int (frame-nrows (:: m :int)))
+  ;;; model-frame-ncols -- number of columns.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the model frame
+  ;;;
+  ;;; Returns:
+  ;;;   int
+  ;;;
+  ;;; Example:
+  ;;;   (model-frame-ncols m)   ; => 4
+  ;;;
+  ;;; Since: 0.1.0
+  (defn model-frame-ncols [m : ModelFrame] : int (frame-ncols (:: m :int)))
+  ;;; __names-from -- internal.
+  (defn __names-from [s : int i : int n : int] : (Cons cstr)
+    (if (>= i n)
+      (tnil)
+      (tcons-of (field-name (schema-field-at s i)) (__names-from s (+ i 1) n))))
+  ;;; model-frame-names -- the column names, in order.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the model frame
+  ;;;
+  ;;; Returns:
+  ;;;   (Cons cstr) -- borrowed from the frame
+  ;;;
+  ;;; Example:
+  ;;;   (model-frame-names m)   ; => ("mpg" "wt" "hp" "wt:hp")
+  ;;;
+  ;;; Since: 0.1.0
+  (defn model-frame-names [m : ModelFrame] : (Cons cstr)
+    (__names-from (frame-schema (:: m :int)) 0 (frame-ncols (:: m :int))))
+  ;;; model-frame-value -- the value of a named column at a row.
+  ;;;
+  ;;; Parameters:
+  ;;;   m    -- the model frame
+  ;;;   name -- a column name
+  ;;;   row  -- 0-based row
+  ;;;
+  ;;; Returns:
+  ;;;   (Option float) -- None when there is no such column or row, or the
+  ;;;   cell is null
+  ;;;
+  ;;; Example:
+  ;;;   (model-frame-value m "wt:hp" 0)   ; => (Some 288.2)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn model-frame-value [m : ModelFrame name : cstr row : int] : (Option float)
+    (let [c (frame-column (:: m :int) name)]
+      (if (or (= c 0)
+            (< row 0)
+            (>= row (frame-nrows (:: m :int)))
+            (not (column-valid? c row)))
+        (None)
+        (Some (column-float64-at c row)))))
+  ;;; model-frame-valid? -- is a named column's cell at a row non-null?
+  ;;;
+  ;;; Parameters:
+  ;;;   m    -- the model frame
+  ;;;   name -- a column name
+  ;;;   row  -- 0-based row
+  ;;;
+  ;;; Returns:
+  ;;;   bool -- false also when there is no such column or row
+  ;;;
+  ;;; Example:
+  ;;;   (model-frame-valid? m "I(x^2)" 3)   ; => true
+  ;;;
+  ;;; Since: 0.1.0
+  (defn model-frame-valid? [m : ModelFrame name : cstr row : int] : bool
+    (match (model-frame-value m name row) (Some v) true (None) false))
+  ;;; __categorical? -- internal: is a tur-frame column categorical (utf8)?
+  (defn __categorical? [col : int] : bool (= (column-type col) (type-utf8)))
+  ;;; __num-at -- internal: a numeric cell as a float, whatever the column's
+  ;;; numeric type (bool reads as 0 / 1, dates as their day / tick count).
+  (defn __num-at [col : int i : int] : float
+    (let [t (column-type col)]
+      (cond (or (= t 1) (= t 7)) (int->float (column-int32-at col i))
+            (or (= t 2) (= t 8)) (int->float (column-int64-at col i))
+            (= t 3)              (column-float32-at col i)
+            (= t 4)              (column-float64-at col i)
+            (= t 5)              (int->float (column-bool-at col i))
+            :else                0.0)))
+  ;;; __f64-fill -- internal: append f(i) for i in [i, n); None appends a null.
+  (defn __f64-fill [b : int i : int n : int f : (fn [int] (Option float))] : int
+    (if (>= i n)
+      (builder-finish b)
+      (do
+        (match (f i)
+          (Some v)
+          (builder-append-float64 b v)
+          (None)
+          (builder-append-null b))
+        (__f64-fill b (+ i 1) n f))))
+  ;;; __f64-column -- internal: a float64 column of n cells, f(i) each.
+  (defn __f64-column [n : int f : (fn [int] (Option float))] : int
+    (__f64-fill (column-builder (type-float64) n) 0 n f))
+  ;;; __f64-fill-where -- internal: append f(i) for the rows keep accepts.
+  (defn __f64-fill-where [b : int
+                          i : int
+                          n : int
+                          keep : (fn [int] bool)
+                          f : (fn [int] (Option float))] : int
+    (if (>= i n)
+      (builder-finish b)
+      (do
+        (when (keep i)
+          (match (f i)
+            (Some v)
+            (builder-append-float64 b v)
+            (None)
+            (builder-append-null b)))
+        (__f64-fill-where b (+ i 1) n keep f))))
+  ;;; __f64-column-where -- internal: a float64 column of f(i) for each row
+  ;;; i in [0, n) that keep accepts, in order.
+  (defn __f64-column-where [n : int
+                            keep : (fn [int] bool)
+                            f : (fn [int] (Option float))] : int
+    (__f64-fill-where (column-builder (type-float64) n) 0 n keep f))
+  ;;; __assemble -- internal: a frame from parallel lists of names and float64
+  ;;; column handles (which it takes ownership of).
+  (defn __assemble [names : (Cons cstr) cols : (Cons int)] : int
+    (let [fields (seq-map names
+                   (fn [n : cstr] : int (field n (type-float64) 1)))]
+      (frame (schema (seq->carrier fields)) (seq->carrier cols))))
+  ;;; __cmp -- internal: strcmp.
+  (defn __cmp [a : cstr b : cstr] : int
+    ```c
+    int r = strcmp((const char *)a, (const char *)b);
+  return r < 0 ? -1 : (r > 0 ? 1 : 0);
+  ```))

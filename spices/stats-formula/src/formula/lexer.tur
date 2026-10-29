@@ -1,0 +1,345 @@
+;;; formula/lexer -- split formula text into tokens.
+;;;
+;;; Names follow R: letters, digits, `_` and `.`, not starting with a digit
+;;; (`x1`, `log.wt`, `.hidden`); bytes >= 0x80 count as letters, so UTF-8
+;;; column names lex as names. A name that is not syntactic goes in
+;;; backticks: `` `fuel economy` ``. Numbers are decimal: `2`, `0.5`, `.5`,
+;;; `1e-3`. Every token remembers its 0-based byte position, which error
+;;; messages report.
+;;;
+;;; Since: 0.1.0
+;; Formula lexer.
+(load "stdlib/str-build.tur")
+
+(defmodule formula/lexer
+  (export TokKind
+    TName
+    TNum
+    TTilde
+    TPlus
+    TMinus
+    TStar
+    TSlash
+    TCaret
+    TColon
+    TLParen
+    TRParen
+    TComma
+    TDot
+    TEof
+    Token
+    token-kind
+    token-text
+    token-pos
+    tok-kind-name
+    formula-lex)
+  (import formula/text :refer [text-len text-byte text-sub text-eq?])
+  (import formula/ast :refer [FormulaError SyntaxError formula-error-at])
+  ;;; TokKind -- the kinds of token in a formula.
+  ;;;
+  ;;;   TName   -- a name (column or function)
+  ;;;   TNum    -- a numeric literal
+  ;;;   TTilde TPlus TMinus TStar TSlash TCaret TColon -- ~ + - * / ^ :
+  ;;;   TLParen TRParen TComma -- ( ) ,
+  ;;;   TDot    -- a lone `.` (R's "all other columns"; not supported yet)
+  ;;;   TEof    -- end of input
+  ;;;
+  ;;; Since: 0.1.0
+  (defdata ^copy TokKind
+    (TName)
+    (TNum)
+    (TTilde)
+    (TPlus)
+    (TMinus)
+    (TStar)
+    (TSlash)
+    (TCaret)
+    (TColon)
+    (TLParen)
+    (TRParen)
+    (TComma)
+    (TDot)
+    (TEof))
+  ;;; Token -- one token: its kind, its text (a name without backticks), and
+  ;;; its 0-based byte position.
+  ;;; Since: 0.1.0
+  (defdata ^heap ^copy Token (Token TokKind cstr int))
+  ;;; token-kind -- a token's kind.
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the token
+  ;;;
+  ;;; Returns:
+  ;;;   TokKind
+  ;;;
+  ;;; Example:
+  ;;;   (token-kind t)   ; => (TName)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn token-kind [t : Token] : TokKind (match t (Token k _ _) k))
+  ;;; token-text -- a token's text.
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the token
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- for a backticked name, the name without its backticks
+  ;;;
+  ;;; Example:
+  ;;;   (token-text t)   ; => "x1"
+  ;;;
+  ;;; Since: 0.1.0
+  (defn token-text [t : Token] : cstr (match t (Token _ s _) s))
+  ;;; token-pos -- a token's 0-based byte position in the formula text.
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the token
+  ;;;
+  ;;; Returns:
+  ;;;   int
+  ;;;
+  ;;; Example:
+  ;;;   (token-pos t)   ; => 4
+  ;;;
+  ;;; Since: 0.1.0
+  (defn token-pos [t : Token] : int (match t (Token _ _ p) p))
+  ;;; tok-kind-name -- a token kind as it reads in an error message.
+  ;;;
+  ;;; Parameters:
+  ;;;   k -- the kind
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- e.g. "name", "'~'", "end of formula"
+  ;;;
+  ;;; Example:
+  ;;;   (tok-kind-name (TTilde))   ; => "'~'"
+  ;;;
+  ;;; Since: 0.1.0
+  (defn tok-kind-name [k : TokKind] : cstr
+    (match k
+      (TName)
+      "name"
+      (TNum)
+      "number"
+      (TTilde)
+      "'~'"
+      (TPlus)
+      "'+'"
+      (TMinus)
+      "'-'"
+      (TStar)
+      "'*'"
+      (TSlash)
+      "'/'"
+      (TCaret)
+      "'^'"
+      (TColon)
+      "':'"
+      (TLParen)
+      "'('"
+      (TRParen)
+      "')'"
+      (TComma)
+      "','"
+      (TDot)
+      "'.'"
+      (TEof)
+      "end of formula"))
+  ;;; __alpha? -- internal: may byte c start a name?
+  (defn __alpha? [c : int] : bool
+    (or (and (>= c 97) (<= c 122))
+      (and (>= c 65) (<= c 90))
+      (= c 95)
+      (>= c 128)))
+  ;;; __digit? -- internal.
+  (defn __digit? [c : int] : bool (and (>= c 48) (<= c 57)))
+  ;;; __name-char? -- internal: may byte c continue a name?
+  (defn __name-char? [c : int] : bool (or (__alpha? c) (__digit? c) (= c 46)))
+  ;;; __space? -- internal.
+  (defn __space? [c : int] : bool (or (= c 32) (= c 9) (= c 10) (= c 13)))
+  ;;; __at -- internal: the byte at i, or 0 past the end.
+  (defn __at [s : cstr n : int i : int] : int (if (< i n) (text-byte s i) 0))
+  ;;; __skip-name -- internal: the end of a name starting at i.
+  (defn __skip-name [s : cstr n : int i : int] : int
+    (if (and (< i n) (__name-char? (text-byte s i)))
+      (__skip-name s n (+ i 1))
+      i))
+  ;;; __skip-digits -- internal.
+  (defn __skip-digits [s : cstr n : int i : int] : int
+    (if (and (< i n) (__digit? (text-byte s i))) (__skip-digits s n (+ i 1)) i))
+  ;;; __skip-number -- internal: the end of a number starting at i (digits,
+  ;;; an optional fraction, an optional exponent).
+  (defn __skip-number [s : cstr n : int i : int] : int
+    (let [a (__skip-digits s n i)
+          b (if (= (__at s n a) 46) (__skip-digits s n (+ a 1)) a)
+          e (__at s n b)]
+      (if (or (= e 101) (= e 69))
+        (let [c  (+ b 1)
+              sg (__at s n c)
+              d  (if (or (= sg 43) (= sg 45)) (+ c 1) c)]
+          (if (__digit? (__at s n d)) (__skip-digits s n d) b))
+        b)))
+  ;;; __find-byte -- internal: the index of byte c at or after i, if any.
+  (defn __find-byte [s : cstr n : int i : int c : int] : (Option int)
+    (cond (>= i n)              (None)
+          (= (text-byte s i) c) (Some i)
+          :else                 (__find-byte s n (+ i 1) c)))
+  ;;; __punct -- internal: the token kind of a one-byte operator, if c is one.
+  (defn __punct [c : int] : (Option TokKind)
+    (cond (= c 126) (Some (TTilde))
+          (= c 43)  (Some (TPlus))
+          (= c 45)  (Some (TMinus))
+          (= c 42)  (Some (TStar))
+          (= c 47)  (Some (TSlash))
+          (= c 94)  (Some (TCaret))
+          (= c 58)  (Some (TColon))
+          (= c 40)  (Some (TLParen))
+          (= c 41)  (Some (TRParen))
+          (= c 44)  (Some (TComma))
+          :else     (None)))
+  ;;; __push -- internal.
+  (defn __push [k : TokKind
+                s : cstr
+                from : int
+                to : int
+                text-from : int
+                text-to : int
+                acc : (Cons Token)] : (Cons Token)
+    (tcons-of (Token k (text-sub s text-from text-to) from) acc))
+  ;;; __lex -- internal: lex from i, accumulating tokens in reverse.
+  (defn __lex [s : cstr n : int i : int acc : (Cons Token)] : (Result (Cons Token)
+                                                                FormulaError)
+    (if (>= i n)
+      (Ok (treverse-tok (tcons-of (Token (TEof) "" n) acc) (tnil)))
+      (let [c (text-byte s i)]
+        (cond (__space? c)                                                   (__lex s
+                                                                               n
+                                                                               (+ i
+                                                                                 1)
+                                                                               acc)
+              (or (__digit? c) (and (= c 46) (__digit? (__at s n (+ i 1))))) (let [j (__skip-number s
+                                                                                       n
+                                                                                       i)]
+                                                                               (__lex s
+                                                                                 n
+                                                                                 j
+                                                                                 (__push (TNum)
+                                                                                   s
+                                                                                   i
+                                                                                   j
+                                                                                   i
+                                                                                   j
+                                                                                   acc)))
+              (__alpha? c)                                                   (let [j (__skip-name s
+                                                                                       n
+                                                                                       i)]
+                                                                               (__lex s
+                                                                                 n
+                                                                                 j
+                                                                                 (__push (TName)
+                                                                                   s
+                                                                                   i
+                                                                                   j
+                                                                                   i
+                                                                                   j
+                                                                                   acc)))
+              (= c 46)                                                       (let [j (__skip-name s
+                                                                                       n
+                                                                                       i)]
+                                                                               (if (= j
+                                                                                     (+ i
+                                                                                       1))
+                                                                                 (__lex s
+                                                                                   n
+                                                                                   j
+                                                                                   (__push (TDot)
+                                                                                     s
+                                                                                     i
+                                                                                     j
+                                                                                     i
+                                                                                     j
+                                                                                     acc))
+                                                                                 (__lex s
+                                                                                   n
+                                                                                   j
+                                                                                   (__push (TName)
+                                                                                     s
+                                                                                     i
+                                                                                     j
+                                                                                     i
+                                                                                     j
+                                                                                     acc))))
+              (= c 96)                                                       (match (__find-byte s
+                                                                                      n
+                                                                                      (+ i
+                                                                                        1)
+                                                                                      96)
+                                                                               (Some j)
+                                                                               (if (= j
+                                                                                     (+ i
+                                                                                       1))
+                                                                                 (Err (formula-error-at (SyntaxError)
+                                                                                        "empty backtick name"
+                                                                                        i))
+                                                                                 (__lex s
+                                                                                   n
+                                                                                   (+ j
+                                                                                     1)
+                                                                                   (__push (TName)
+                                                                                     s
+                                                                                     i
+                                                                                     (+ j
+                                                                                       1)
+                                                                                     (+ i
+                                                                                       1)
+                                                                                     j
+                                                                                     acc)))
+                                                                               (None)
+                                                                               (Err (formula-error-at (SyntaxError)
+                                                                                      "unterminated backtick name"
+                                                                                      i)))
+              :else                                                          (match (__punct c)
+                                                                               (Some k)
+                                                                               (__lex s
+                                                                                 n
+                                                                                 (+ i
+                                                                                   1)
+                                                                                 (__push k
+                                                                                   s
+                                                                                   i
+                                                                                   (+ i
+                                                                                     1)
+                                                                                   i
+                                                                                   (+ i
+                                                                                     1)
+                                                                                   acc))
+                                                                               (None)
+                                                                               (Err (formula-error-at (SyntaxError)
+                                                                                      (str-concat "unexpected character '"
+                                                                                        (str-concat (text-sub s
+                                                                                                      i
+                                                                                                      (+ i
+                                                                                                        1))
+                                                                                          "'"))
+                                                                                      i)))))))
+  ;;; treverse-tok -- internal: reverse a token list onto acc.
+  (defn treverse-tok [xs : (Cons Token) acc : (Cons Token)] : (Cons Token)
+    (if (tnil? xs) acc (treverse-tok (ttail xs) (tcons-of (thead xs) acc))))
+  ;;; formula-lex -- tokenize a formula string.
+  ;;;
+  ;;; Parameters:
+  ;;;   input -- the formula text, e.g. "y ~ x1 * x2 + I(x3^2)"
+  ;;;
+  ;;; Returns:
+  ;;;   (Result (Cons Token) FormulaError) -- the tokens in order, ending with
+  ;;;   a TEof token; or a SyntaxError naming the first byte that is not part
+  ;;;   of any token.
+  ;;;
+  ;;; Example:
+  ;;;   (match (formula-lex "y ~ x")
+  ;;;     (Ok ts) (tlength ts)   ; => 4  (y, ~, x, end)
+  ;;;     (Err e) 0)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-lex [input : cstr] : (Result (Cons Token) FormulaError)
+    (__lex input (text-len input) 0 (tnil))))

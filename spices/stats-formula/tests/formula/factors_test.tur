@@ -1,0 +1,182 @@
+;; tests/formula/factors_test.tur -- formula/factors: detection, levels,
+;; treatment contrasts, interaction columns.
+(defmodule stats_formula_factors_test
+  (export main)
+  (import frame/csv :refer [read-csv-string])
+  (import frame/typed :refer [Frame frame-typed])
+  (import formula/factors
+    :refer
+    [formula-is-factor
+     formula-factor-levels
+     formula-dummy-code
+     formula-dummy-code-interaction])
+  (import formula/model-frame
+    :refer
+    [ModelFrame
+     model-frame-names
+     model-frame-nrows
+     model-frame-value
+     model-frame-valid?
+     model-frame-free])
+  (import formula/ast
+    :refer
+    [FormulaError
+     FormulaErrorKind
+     UnknownColumn
+     NotCategorical
+     UnknownLevel
+     formula-error-kind])
+  (import test/assert :refer [assert-true])
+  (import test/suite :refer [describe it])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; __join -- strings separated by spaces.
+  (defn __join [xs : (Cons cstr)] : cstr
+    (cond (tnil? xs)         ""
+          (tnil? (ttail xs)) (thead xs)
+          :else              (str-concat (thead xs)
+                               (str-concat " " (__join (ttail xs))))))
+  ;;; __cell -- a cell as text: its value, or NA.
+  (defn __cell [m : ModelFrame name : cstr row : int] : cstr
+    (match (model-frame-value m name row) (Some v) (__fmt v) (None) "NA"))
+  ;;; __fmt -- %g.
+  (defn __fmt [x : float] : cstr
+    ```c
+    char *b = (char *)malloc(32);
+  snprintf(b, 32, "%g", x);
+  return b;
+  ```)
+  ;;; __col -- a column's cells, space-separated.
+  (defn __col [m : ModelFrame name : cstr] : cstr
+    (__col-from m name 0 (model-frame-nrows m)))
+  ;;; __col-from -- internal.
+  (defn __col-from [m : ModelFrame name : cstr i : int n : int] : cstr
+    (cond (>= i n)      ""
+          (= i (- n 1)) (__cell m name i)
+          :else         (str-concat (__cell m name i)
+                          (str-concat " " (__col-from m name (+ i 1) n)))))
+  ;; g: b, null, a, c, b;  h: x y y x y;  x: 1.5 2.5 -3.25 4 0.5
+  (defn __data [^&cols] [] : (Frame cols)
+    (frame-typed (read-csv-string "x,g,h\n1.5,b,x\n2.5,,y\n-3.25,a,y\n4,c,x\n0.5,b,y\n"
+                   44
+                   34
+                   1
+                   100
+                   "")))
+  ;;; __names-and -- the names of a result, then one column's cells.
+  (defn __names-and [r : (Result ModelFrame FormulaError) col : cstr] : cstr
+    (match r
+      (Ok m)
+      (let [s (str-concat (__join (model-frame-names m))
+                (str-concat " | " (__col m col)))]
+        (model-frame-free m)
+        s)
+      (Err e)
+      "error"))
+  ;;; __kind -- an error's kind as a word.
+  (defn __kind [r : (Result ModelFrame FormulaError)] : cstr
+    (match r
+      (Ok m)
+      (do (model-frame-free m) "ok")
+      (Err e)
+      (match (formula-error-kind e)
+        (UnknownColumn)
+        "unknown-column"
+        (NotCategorical)
+        "not-categorical"
+        (UnknownLevel)
+        "unknown-level"
+        _
+        "other")))
+  (defn __all-tests [] : void
+    (describe "formula/factors detection and levels"
+      (it "a utf8 column is a factor"
+        (assert-true (formula-is-factor (__data) "g")))
+      (it "a numeric column is not"
+        (assert-true (not (formula-is-factor (__data) "x"))))
+      (it "a missing column is not"
+        (assert-true (not (formula-is-factor (__data) "nope"))))
+      (it "levels are distinct, sorted, nulls left out"
+        (assert-true (match (formula-factor-levels (__data) "g")
+                       (Ok ls)
+                       (__is? (__join ls) "a b c")
+                       (Err e)
+                       false)))
+      (it "levels of a numeric column are an error"
+        (assert-true (match (formula-factor-levels (__data) "x")
+                       (Ok ls)
+                       false
+                       (Err e)
+                       (match (formula-error-kind e)
+                         (NotCategorical)
+                         true
+                         _
+                         false)))))
+    (describe "formula/factors dummy coding"
+      (it "treatment contrasts leave out the first level"
+        (assert-true (__is? (__names-and (formula-dummy-code (__data)
+                                           "g"
+                                           (None))
+                              "gb")
+                       "gb gc | 1 NA 0 0 1")))
+      (it "a null factor value is null in every indicator"
+        (assert-true (__is? (__names-and (formula-dummy-code (__data)
+                                           "g"
+                                           (None))
+                              "gc")
+                       "gb gc | 0 NA 0 1 0")))
+      (it "an explicit base level"
+        (assert-true (__is? (__names-and (formula-dummy-code (__data)
+                                           "g"
+                                           (Some "c"))
+                              "ga")
+                       "ga gb | 0 NA 1 0 0")))
+      (it "a base that is not a level"
+        (assert-true (__is? (__kind (formula-dummy-code (__data)
+                                      "g"
+                                      (Some "zz")))
+                       "unknown-level")))
+      (it "dummy coding a numeric column"
+        (assert-true (__is? (__kind (formula-dummy-code (__data) "x" (None)))
+                       "not-categorical")))
+      (it "dummy coding a missing column"
+        (assert-true (__is? (__kind (formula-dummy-code (__data) "zz" (None)))
+                       "unknown-column"))))
+    (describe "formula/factors interactions"
+      (it "factor by numeric: one column per level, times x"
+        (assert-true (__is? (__names-and (formula-dummy-code-interaction (__data)
+                                           "g"
+                                           "x")
+                              "ga:x")
+                       "ga:x gb:x gc:x | 0 NA -3.25 0 0")))
+      (it "0 times a negative number is 0, not -0"
+        (assert-true (__is? (__names-and (formula-dummy-code-interaction (__data)
+                                           "g"
+                                           "x")
+                              "gb:x")
+                       "ga:x gb:x gc:x | 1.5 NA 0 0 0.5")))
+      (it "factor by factor: every pair, the first varying fastest"
+        (assert-true (__is? (__names-and (formula-dummy-code-interaction (__data)
+                                           "g"
+                                           "h")
+                              "gb:hy")
+                       "ga:hx gb:hx gc:hx ga:hy gb:hy gc:hy | 0 NA 0 0 1")))
+      (it "numeric by numeric: the product"
+        (assert-true (__is? (__names-and (formula-dummy-code-interaction (__data)
+                                           "x"
+                                           "x")
+                              "x:x")
+                       "x:x | 2.25 6.25 10.5625 16 0.25")))
+      (it "a missing column"
+        (assert-true (__is? (__kind (formula-dummy-code-interaction (__data)
+                                      "g"
+                                      "zz"))
+                       "unknown-column")))))
+  (defn main [] : int (__all-tests) (run-all-status)))
