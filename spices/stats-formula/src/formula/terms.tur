@@ -1,0 +1,542 @@
+;;; formula/terms -- formula text and a frame in, a model frame out.
+;;;
+;;; `formula-parse-terms` lexes, parses and expands a formula, binds its
+;;; variables to the frame's columns, and builds the model frame: the
+;;; response, then one float64 column per model-matrix column, over the rows
+;;; where every variable the formula uses is present (R's default
+;;; `na.action = na.omit`). Its predictor names go straight to tur-stats:
+;;;
+;;; ```turmeric
+;;; (match (formula-parse-terms f "mpg ~ wt * hp + I(wt^2)")
+;;;   (Ok t) (ols-frame (model-frame-handle (formula-terms-data t))
+;;;                     (formula-terms-response t)
+;;;                     (formula-terms-predictors t)
+;;;                     (if (formula-terms-intercept? t) 1 0))
+;;;   (Err e) ...)
+;;; ```
+;;;
+;;; Factors are coded as R's model.matrix codes them. A factor in a term is
+;;; coded by contrasts when the term without it is empty or is contained in
+;;; an earlier term, and by dummy variables otherwise; with no intercept, the
+;;; first factor of the first term that has one is coded by dummy variables.
+;;; So `y ~ g` gives `gb`, `gc`; `y ~ g - 1` gives `ga`, `gb`, `gc`; `y ~ g:x`
+;;; gives `ga:x`, `gb:x`, `gc:x`; but `y ~ x + g:x` gives `x`, `x:gb`, `x:gc`,
+;;; since `x` is already in the model.
+;;;
+;;; Since: 0.1.0
+;; Top-level formula interface.
+(load "stdlib/str-build.tur")
+
+(defmodule formula/terms
+  (export FormulaTerms
+    formula-parse-terms
+    formula-terms-response
+    formula-terms-predictors
+    formula-terms-intercept?
+    formula-terms-terms
+    formula-terms-data
+    formula-terms-dropped
+    formula-terms-free
+    formula-predictors
+    formula-response
+    formula-intercept?
+    formula-term-labels)
+  (import formula/text :refer [text-len text-byte text-sub text-eq?])
+  (import formula/seq
+    :refer
+    [seq-reverse seq-map seq-foldl seq-length seq-append seq->carrier])
+  (import formula/ast
+    :refer
+    [Expr
+     ECol
+     FormulaError
+     NoResponse
+     NotNumeric
+     NameCollision
+     TooFewLevels
+     formula-error
+     expr->string])
+  (import formula/parser :refer [formula-parse])
+  (import formula/expand
+    :refer
+    [Term
+     term-label
+     term-variables
+     Expansion
+     formula-expand
+     expansion-response
+     expansion-variables
+     expansion-terms
+     expansion-labels
+     expansion-intercept?])
+  (import formula/identity :refer [__variable-column])
+  (import formula/factors
+    :refer
+    [VarData
+     VNum
+     VFac
+     Coding
+     Contrast
+     Dummy
+     MCol
+     __var-label
+     __var-free
+     __levels-where
+     __var-mcols
+     __cross
+     __mcol-name
+     __mcol-value])
+  (import formula/model-frame
+    :refer
+    [ModelFrame
+     model-frame-free
+     __model-frame-of
+     __categorical?
+     __f64-column-where
+     __assemble])
+  (import frame/frame :refer [frame-nrows frame-column])
+  (import frame/typed :refer [Frame frame-handle])
+  (import frame/column :refer [column-valid? column-float64-at column-free])
+  ;;; FormulaTerms -- a formula fitted to a frame: the response's column name,
+  ;;; the predictor column names (model-matrix columns, in order), whether the
+  ;;; model has an intercept, the expanded terms, the model frame holding
+  ;;; those columns, and how many incomplete rows were dropped.
+  ;;; Since: 0.1.0
+  (defstruct ^copy FormulaTerms
+    [response : cstr
+     predictors : (Cons cstr)
+     intercept : bool
+     terms : (Cons Term)
+     data : ModelFrame
+     dropped : int])
+  ;;; formula-terms-response -- the response's column name in the model frame:
+  ;;; its label, `mpg` or `log(mpg)`.
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the formula terms
+  ;;;
+  ;;; Returns:
+  ;;;   cstr
+  ;;;
+  ;;; Example:
+  ;;;   (formula-terms-response t)   ; => "mpg"
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-terms-response [t : FormulaTerms] : cstr (.response t))
+  ;;; formula-terms-predictors -- the predictor column names, in model-matrix
+  ;;; order (no intercept column).
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the formula terms
+  ;;;
+  ;;; Returns:
+  ;;;   (Cons cstr) -- the predictor-names list ols-frame takes
+  ;;;
+  ;;; Example:
+  ;;;   (formula-terms-predictors t)   ; => ("wt" "hp" "wt:hp")
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-terms-predictors [t : FormulaTerms] : (Cons cstr)
+    (.predictors t))
+  ;;; formula-terms-intercept? -- does the model have an intercept?
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the formula terms
+  ;;;
+  ;;; Returns:
+  ;;;   bool
+  ;;;
+  ;;; Example:
+  ;;;   (formula-terms-intercept? t)   ; => true
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-terms-intercept? [t : FormulaTerms] : bool (.intercept t))
+  ;;; formula-terms-terms -- the expanded terms (`wt`, `hp`, `wt:hp`), each of
+  ;;; which may own several predictor columns.
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the formula terms
+  ;;;
+  ;;; Returns:
+  ;;;   (Cons Term)
+  ;;;
+  ;;; Example:
+  ;;;   (tlength (formula-terms-terms t))   ; => 3
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-terms-terms [t : FormulaTerms] : (Cons Term) (.terms t))
+  ;;; formula-terms-data -- the model frame: the response column, then the
+  ;;; predictor columns, all float64, complete rows only.
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the formula terms
+  ;;;
+  ;;; Returns:
+  ;;;   ModelFrame -- owned by `t`; freed by formula-terms-free
+  ;;;
+  ;;; Example:
+  ;;;   (model-frame-handle (formula-terms-data t))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-terms-data [t : FormulaTerms] : ModelFrame (.data t))
+  ;;; formula-terms-dropped -- how many rows of the input frame were left out
+  ;;; because a variable the formula uses was null there.
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the formula terms
+  ;;;
+  ;;; Returns:
+  ;;;   int
+  ;;;
+  ;;; Example:
+  ;;;   (formula-terms-dropped t)   ; => 0
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-terms-dropped [t : FormulaTerms] : int (.dropped t))
+  ;;; formula-terms-free -- free the model frame.
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the formula terms
+  ;;;
+  ;;; Returns:
+  ;;;   void
+  ;;;
+  ;;; Example:
+  ;;;   (formula-terms-free t)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-terms-free [t : FormulaTerms] : void
+    (model-frame-free (.data t)))
+  ;; ---------------------------------------------------------------------------
+  ;; Binding variables.
+  ;; ---------------------------------------------------------------------------
+  ;;; __response -- internal: the response, checked to be numeric.
+  (defn __response [f : int ex : Expansion] : (Result Expr FormulaError)
+    (match (expansion-response ex)
+      (None)
+      (Err (formula-error (NoResponse)
+             "the formula has no response (nothing left of '~')"))
+      (Some e)
+      (match e
+        (ECol name)
+        (let [c (frame-column f name)]
+          (if (and (not= c 0) (__categorical? c))
+            (Err (formula-error (NotNumeric)
+                   (str-concat "response '"
+                     (str-concat name "' is categorical"))))
+            (Ok e)))
+        _
+        (Ok e))))
+  ;;; __free-all -- internal.
+  (defn __free-all [vs : (Cons VarData)] : void
+    (when (not (tnil? vs)) (__var-free (thead vs)) (__free-all (ttail vs))))
+  ;;; __bind -- internal: bind each variable (factor levels left empty for now),
+  ;;; freeing what was bound if one fails.
+  (defn __bind [f : int vs : (Cons Expr) acc : (Cons VarData)] : (Result (Cons VarData)
+                                                                   FormulaError)
+    (if (tnil? vs)
+      (Ok (seq-reverse acc))
+      (let [e (thead vs)
+            c (match e (ECol name) (frame-column f name) _ 0)]
+        (if (and (not= c 0) (__categorical? c))
+          (__bind f (ttail vs) (tcons-of (VFac (expr->string e) c (tnil)) acc))
+          (match (__variable-column f e)
+            (Ok col)
+            (__bind f (ttail vs) (tcons-of (VNum (expr->string e) col) acc))
+            (Err err)
+            (do (__free-all acc) (Err err)))))))
+  ;;; __source-cols -- internal: the columns whose nulls drop a row.
+  (defn __source-cols [vs : (Cons VarData)] : (Cons int)
+    (if (tnil? vs)
+      (tnil)
+      (tcons-of (match (thead vs) (VNum l c) c (VFac l c ls) c)
+        (__source-cols (ttail vs)))))
+  ;;; __all-valid? -- internal.
+  (defn __all-valid? [cols : (Cons int) row : int] : bool
+    (cond (tnil? cols)                     true
+          (column-valid? (thead cols) row) (__all-valid? (ttail cols) row)
+          :else                            false))
+  ;;; __with-levels -- internal: fill in the factors' levels over the kept rows.
+  (defn __with-levels [vs : (Cons VarData) n : int keep : (fn [int] bool)] : (Cons VarData)
+    (if (tnil? vs)
+      (tnil)
+      (tcons-of (match (thead vs)
+                  (VNum l c)
+                  (VNum l c)
+                  (VFac l c ls)
+                  (VFac l c (__levels-where c n keep)))
+        (__with-levels (ttail vs) n keep))))
+  ;;; __too-few -- internal: the first factor with fewer than two levels.
+  (defn __too-few [vs : (Cons VarData)] : (Option cstr)
+    (cond (tnil? vs) (None)
+          :else      (match (thead vs)
+                       (VFac l c ls)
+                       (if (< (tlength ls) 2) (Some l) (__too-few (ttail vs)))
+                       _
+                       (__too-few (ttail vs)))))
+  ;;; __find -- internal: the bound variable with a label.
+  (defn __find [vs : (Cons VarData) label : cstr] : VarData
+    (if (or (tnil? (ttail vs)) (text-eq? (__var-label (thead vs)) label))
+      (thead vs)
+      (__find (ttail vs) label)))
+  ;;; __factor? -- internal.
+  (defn __factor? [vs : (Cons VarData) label : cstr] : bool
+    (match (__find vs label) (VFac l c ls) true _ false))
+  ;; ---------------------------------------------------------------------------
+  ;; Coding (R's TermCode, and model.matrix's no-intercept rule).
+  ;; ---------------------------------------------------------------------------
+  ;; With no intercept: the term and the factor that get dummy coding.
+  (defdata ^heap ^copy Forced (NoForce) (Force cstr cstr))
+  ;;; __has? -- internal.
+  (defn __has? [xs : (Cons cstr) s : cstr] : bool
+    (cond (tnil? xs)              false
+          (text-eq? (thead xs) s) true
+          :else                   (__has? (ttail xs) s)))
+  ;;; __drop -- internal.
+  (defn __drop [xs : (Cons cstr) s : cstr] : (Cons cstr)
+    (cond (tnil? xs)              (tnil)
+          (text-eq? (thead xs) s) (__drop (ttail xs) s)
+          :else                   (tcons-of (thead xs) (__drop (ttail xs) s))))
+  ;;; __subset? -- internal.
+  (defn __subset? [a : (Cons cstr) b : (Cons cstr)] : bool
+    (cond (tnil? a)            true
+          (__has? b (thead a)) (__subset? (ttail a) b)
+          :else                false))
+  ;;; __in-some? -- internal: is set s contained in some term of ts?
+  (defn __in-some? [ts : (Cons Term) s : (Cons cstr)] : bool
+    (cond (tnil? ts)                                false
+          (__subset? s (term-variables (thead ts))) true
+          :else                                     (__in-some? (ttail ts) s)))
+  ;;; __first-factor -- internal: the first factor among a term's variables.
+  (defn __first-factor [bound : (Cons VarData) vars : (Cons cstr)] : (Option cstr)
+    (cond (tnil? vars)                   (None)
+          (__factor? bound (thead vars)) (Some (thead vars))
+          :else                          (__first-factor bound (ttail vars))))
+  ;;; __forced -- internal: with no intercept, the first term that has a
+  ;;; factor, and that factor.
+  (defn __forced [bound : (Cons VarData) ts : (Cons Term)] : Forced
+    (if (tnil? ts)
+      (NoForce)
+      (match (__first-factor bound (term-variables (thead ts)))
+        (Some v)
+        (Force (term-label (thead ts)) v)
+        (None)
+        (__forced bound (ttail ts)))))
+  ;;; __coding -- internal: how factor v enters term t, given the terms before
+  ;;; it.
+  (defn __coding [forced : Forced prev : (Cons Term) t : Term v : cstr] : Coding
+    (let [rest (__drop (term-variables t) v)
+          pin  (match forced
+                 (Force tl fv)
+                 (and (text-eq? tl (term-label t)) (text-eq? fv v))
+                 (NoForce)
+                 false)]
+      (cond pin                    (Dummy)
+            (tnil? rest)           (Contrast)
+            (__in-some? prev rest) (Contrast)
+            :else                  (Dummy))))
+  ;;; __term-mcols-loop -- internal.
+  (defn __term-mcols-loop [bound : (Cons VarData)
+                           forced : Forced
+                           prev : (Cons Term)
+                           t : Term
+                           vars : (Cons cstr)
+                           acc : (Cons MCol)] : (Cons MCol)
+    (if (tnil? vars)
+      acc
+      (let [v    (thead vars)
+            cols (__var-mcols (__find bound v) (__coding forced prev t v))]
+        (__term-mcols-loop bound
+          forced
+          prev
+          t
+          (ttail vars)
+          (if (tnil? acc) cols (__cross acc cols))))))
+  ;;; __term-mcols -- internal: the model columns of one term.
+  (defn __term-mcols [bound : (Cons VarData)
+                      forced : Forced
+                      prev : (Cons Term)
+                      t : Term] : (Cons MCol)
+    (__term-mcols-loop bound forced prev t (term-variables t) (tnil)))
+  ;;; __all-mcols -- internal: the model columns of every term, in order.
+  (defn __all-mcols [bound : (Cons VarData)
+                     forced : Forced
+                     prev : (Cons Term)
+                     ts : (Cons Term)] : (Cons MCol)
+    (if (tnil? ts)
+      (tnil)
+      (seq-append (__term-mcols bound forced prev (thead ts))
+        (__all-mcols bound
+          forced
+          (seq-append prev (tcons-of (thead ts) (tnil)))
+          (ttail ts)))))
+  ;; ---------------------------------------------------------------------------
+  ;; Building the model frame.
+  ;; ---------------------------------------------------------------------------
+  ;;; __mcol-names -- internal.
+  (defn __mcol-names [ms : (Cons MCol)] : (Cons cstr)
+    (if (tnil? ms)
+      (tnil)
+      (tcons-of (__mcol-name (thead ms)) (__mcol-names (ttail ms)))))
+  ;;; __duplicate -- internal: the first name that occurs twice.
+  (defn __duplicate [names : (Cons cstr)] : (Option cstr)
+    (cond (tnil? names)                        (None)
+          (__has? (ttail names) (thead names)) (Some (thead names))
+          :else                                (__duplicate (ttail names))))
+  ;;; __mcol-columns -- internal: each model column over the kept rows.
+  (defn __mcol-columns [ms : (Cons MCol) n : int keep : (fn [int] bool)] : (Cons int)
+    (if (tnil? ms)
+      (tnil)
+      (let [m (thead ms)]
+        (tcons-of (__f64-column-where n
+                    keep
+                    (fn [i : int] : (Option float) (Some (__mcol-value m i))))
+          (__mcol-columns (ttail ms) n keep)))))
+  ;;; __count -- internal: rows in [i, n) that keep accepts.
+  (defn __count [keep : (fn [int] bool) i : int n : int acc : int] : int
+    (if (>= i n) acc (__count keep (+ i 1) n (if (keep i) (+ acc 1) acc))))
+  ;;; __finish -- internal: the model frame from bound variables.
+  (defn __finish [f : int
+                  ex : Expansion
+                  resp-label : cstr
+                  resp : int
+                  bound0 : (Cons VarData)] : (Result FormulaTerms FormulaError)
+    (let [n      (frame-nrows f)
+          srcs   (tcons-of resp (__source-cols bound0))
+          keep   (fn [i : int] : bool (__all-valid? srcs i))
+          bound  (__with-levels bound0 n keep)
+          terms  (expansion-terms ex)
+          forced (if (expansion-intercept? ex) (NoForce) (__forced bound terms))
+          mcols  (__all-mcols bound forced (tnil) terms)
+          names  (__mcol-names mcols)]
+      (match (__too-few bound)
+        (Some v)
+        (Err (formula-error (TooFewLevels)
+               (str-concat "factor '"
+                 (str-concat v
+                   "' has fewer than two levels in the complete rows"))))
+        (None)
+        (match (__duplicate (tcons-of resp-label names))
+          (Some d)
+          (Err (formula-error (NameCollision)
+                 (str-concat "two model columns would both be named '"
+                   (str-concat d "'"))))
+          (None)
+          (let [rcol (__f64-column-where n
+                       keep
+                       (fn [i : int] : (Option float)
+                         (Some (column-float64-at resp i))))
+                cols (__mcol-columns mcols n keep)
+                mf   (__assemble (tcons-of resp-label names)
+                       (tcons-of rcol cols))]
+            (Ok (FormulaTerms resp-label
+                  names
+                  (expansion-intercept? ex)
+                  terms
+                  (__model-frame-of mf)
+                  (- n (__count keep 0 n 0)))))))))
+  ;;; __build -- internal: bind, build, and free the temporaries.
+  (defn __build [f : int ex : Expansion] : (Result FormulaTerms FormulaError)
+    (let [re   (? (__response f ex))
+          resp (? (__variable-column f re))]
+      (match (__bind f (expansion-variables ex) (tnil))
+        (Err e)
+        (do (column-free resp) (Err e))
+        (Ok bound)
+        (let [r (__finish f ex (expr->string re) resp bound)]
+          (column-free resp)
+          (__free-all bound)
+          r))))
+  ;;; formula-parse-terms -- fit a formula to a frame.
+  ;;;
+  ;;; Parameters:
+  ;;;   f   -- the frame
+  ;;;   src -- the formula, e.g. "mpg ~ wt * hp + I(wt^2)"
+  ;;;
+  ;;; Returns:
+  ;;;   (Result FormulaTerms FormulaError) -- the response and predictor
+  ;;;   column names, the intercept flag, the terms, and a new model frame
+  ;;;   holding those columns over the complete rows. The caller frees the
+  ;;;   model frame with formula-terms-free. Errors: SyntaxError (with a
+  ;;;   position), NoResponse, UnknownColumn, NotNumeric, DomainError,
+  ;;;   TooFewLevels, NameCollision.
+  ;;;
+  ;;; Example:
+  ;;;   (match (formula-parse-terms f "mpg ~ wt + hp")
+  ;;;     (Ok t) (formula-terms-predictors t)   ; => ("wt" "hp")
+  ;;;     (Err e) (tnil))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-parse-terms [^&cols] [f : (Frame cols) src : cstr] : (Result FormulaTerms
+                                                                       FormulaError)
+    (let [pf (? (formula-parse src))]
+      (__build (frame-handle f) (formula-expand pf))))
+  ;;; formula-predictors -- the predictor column names a formula gives over a
+  ;;; frame (factors expanded to their indicator columns).
+  ;;;
+  ;;; Parameters:
+  ;;;   f   -- the frame
+  ;;;   src -- the formula
+  ;;;
+  ;;; Returns:
+  ;;;   (Result (Cons cstr) FormulaError)
+  ;;;
+  ;;; Example:
+  ;;;   (formula-predictors f "y ~ g * x")   ; => (Ok ("gb" "gc" "x" "gb:x" "gc:x"))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-predictors [^&cols] [f : (Frame cols) src : cstr] : (Result (Cons cstr)
+                                                                      FormulaError)
+    (let [t (? (formula-parse-terms f src))]
+      (formula-terms-free t)
+      (Ok (.predictors t))))
+  ;;; formula-response -- the response's label; no frame needed.
+  ;;;
+  ;;; Parameters:
+  ;;;   src -- the formula
+  ;;;
+  ;;; Returns:
+  ;;;   (Result cstr FormulaError) -- NoResponse for a one-sided formula
+  ;;;
+  ;;; Example:
+  ;;;   (formula-response "log(y) ~ x")   ; => (Ok "log(y)")
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-response [src : cstr] : (Result cstr FormulaError)
+    (let [pf (? (formula-parse src))]
+      (match (expansion-response (formula-expand pf))
+        (Some e)
+        (Ok (expr->string e))
+        (None)
+        (Err (formula-error (NoResponse)
+               "the formula has no response (nothing left of '~')")))))
+  ;;; formula-intercept? -- does a formula's model have an intercept?
+  ;;;
+  ;;; Parameters:
+  ;;;   src -- the formula
+  ;;;
+  ;;; Returns:
+  ;;;   (Result bool FormulaError) -- true unless it says `- 1` or `+ 0`
+  ;;;
+  ;;; Example:
+  ;;;   (formula-intercept? "y ~ x - 1")   ; => (Ok false)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-intercept? [src : cstr] : (Result bool FormulaError)
+    (let [pf (? (formula-parse src))]
+      (Ok (expansion-intercept? (formula-expand pf)))))
+  ;;; formula-term-labels -- a formula's expanded term labels; no frame needed.
+  ;;;
+  ;;; Parameters:
+  ;;;   src -- the formula
+  ;;;
+  ;;; Returns:
+  ;;;   (Result (Cons cstr) FormulaError)
+  ;;;
+  ;;; Example:
+  ;;;   (formula-term-labels "y ~ a * b")   ; => (Ok ("a" "b" "a:b"))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-term-labels [src : cstr] : (Result (Cons cstr) FormulaError)
+    (let [pf (? (formula-parse src))]
+      (Ok (expansion-labels (formula-expand pf))))))

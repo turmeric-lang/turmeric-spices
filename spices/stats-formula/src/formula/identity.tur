@@ -1,0 +1,209 @@
+;;; formula/identity -- evaluate a formula variable over a frame's rows.
+;;;
+;;; `I(x^2)`, `log(z)`, `I(a * b / 2)`: arithmetic over numeric columns,
+;;; computed row by row into a new float64 column. The operators are
+;;; `+ - * / ^` and unary minus; the functions are `I` (identity), `log`
+;;; (natural), `exp`, `sqrt` and `abs`, from stdlib/math.tur. A row where
+;;; any column the expression reads is null is null. A row where every input
+;;; is present but the result is NaN or infinite -- `log(0)`, `sqrt(-1)`,
+;;; `1/0` -- is an error naming the row: R would carry a NaN and drop the
+;;; row in `na.omit`, which hides a data problem the caller almost always
+;;; wants to see.
+;;;
+;;; Columns of any numeric type are read as float (bool as 0 / 1). A
+;;; categorical (utf8) column inside arithmetic is a NotNumeric error.
+;;;
+;;; Since: 0.1.0
+;; I() evaluation.
+(load "stdlib/str-build.tur")
+
+(load "stdlib/math.tur")
+
+(defmodule formula/identity
+  (export formula-eval-identity __variable-column)
+  (import formula/text :refer [text-len text-byte text-sub text-eq?])
+  (import formula/ast
+    :refer
+    [Op
+     OpAdd
+     OpSub
+     OpMul
+     OpDiv
+     OpPow
+     Expr
+     ENum
+     ECol
+     ENeg
+     EBin
+     ECall
+     FormulaError
+     UnknownColumn
+     NotNumeric
+     DomainError
+     formula-error
+     expr->string])
+  (import formula/parser :refer [formula-parse-expr])
+  (import formula/model-frame
+    :refer
+    [ModelFrame
+     __model-frame-of
+     __num-at
+     __categorical?
+     __f64-column
+     __assemble])
+  (import frame/frame :refer [frame-nrows frame-column])
+  (import frame/typed :refer [Frame frame-handle])
+  (import frame/column :refer [column-valid?])
+  ;; A one-argument function, resolved.
+  (defdata ^copy MathFn (FnId) (FnLog) (FnExp) (FnSqrt) (FnAbs))
+  ;; An Expr with its columns looked up: RCol holds a tur-frame column handle
+  ;; borrowed from the frame being evaluated.
+  (defdata ^heap ^copy RExpr
+    (RNum float)
+    (RCol int)
+    (RNeg RExpr)
+    (RBin Op RExpr RExpr)
+    (RFn MathFn RExpr))
+  ;;; __math-fn -- internal (the parser only lets the five names through).
+  (defn __math-fn [name : cstr] : MathFn
+    (cond (text-eq? name "log")  (FnLog)
+          (text-eq? name "exp")  (FnExp)
+          (text-eq? name "sqrt") (FnSqrt)
+          (text-eq? name "abs")  (FnAbs)
+          :else                  (FnId)))
+  ;;; __resolve -- internal: look up e's columns in frame f.
+  (defn __resolve [f : int e : Expr] : (Result RExpr FormulaError)
+    (match e
+      (ENum x)
+      (Ok (RNum x))
+      (ECol name)
+      (let [c (frame-column f name)]
+        (cond (= c 0)            (Err (formula-error (UnknownColumn)
+                                        (str-concat "column '"
+                                          (str-concat name
+                                            "' not found in frame"))))
+              (__categorical? c) (Err (formula-error (NotNumeric)
+                                        (str-concat "column '"
+                                          (str-concat name
+                                            "' is categorical; it cannot be used in arithmetic"))))
+              :else              (Ok (RCol c))))
+      (ENeg x)
+      (let [rx (? (__resolve f x))] (Ok (RNeg rx)))
+      (EBin op a b)
+      (let [ra (? (__resolve f a))
+            rb (? (__resolve f b))]
+        (Ok (RBin op ra rb)))
+      (ECall name x)
+      (let [rx (? (__resolve f x))] (Ok (RFn (__math-fn name) rx)))))
+  ;;; __cols -- internal: the columns r reads, onto acc.
+  (defn __cols [r : RExpr acc : (Cons int)] : (Cons int)
+    (match r
+      (RNum x)
+      acc
+      (RCol c)
+      (tcons-of c acc)
+      (RNeg x)
+      (__cols x acc)
+      (RBin op a b)
+      (__cols b (__cols a acc))
+      (RFn g x)
+      (__cols x acc)))
+  ;;; __all-valid? -- internal.
+  (defn __all-valid? [cols : (Cons int) row : int] : bool
+    (cond (tnil? cols)                     true
+          (column-valid? (thead cols) row) (__all-valid? (ttail cols) row)
+          :else                            false))
+  ;;; __eval -- internal: r at a row whose inputs are all present.
+  (defn __eval [r : RExpr row : int] : float
+    (match r
+      (RNum x)
+      x
+      (RCol c)
+      (__num-at c row)
+      (RNeg x)
+      (- 0.0 (__eval x row))
+      (RBin op a b)
+      (let [x (__eval a row)
+            y (__eval b row)]
+        (match op
+          (OpAdd)
+          (+ x y)
+          (OpSub)
+          (- x y)
+          (OpMul)
+          (* x y)
+          (OpDiv)
+          (/ x y)
+          (OpPow)
+          (pow x y)))
+      (RFn g x)
+      (let [v (__eval x row)]
+        (match g
+          (FnId)
+          v
+          (FnLog)
+          (log v)
+          (FnExp)
+          (exp v)
+          (FnSqrt)
+          (sqrt v)
+          (FnAbs)
+          (fabs v)))))
+  ;;; __finite? -- internal.
+  (defn __finite? [x : float] : bool
+    ```c
+    #include <math.h>
+  return isfinite(x);
+  ```)
+  ;;; __first-bad-row -- internal: the first row with all inputs present and a
+  ;;; result that is not finite.
+  (defn __first-bad-row [r : RExpr cols : (Cons int) row : int n : int] : (Option int)
+    (cond (>= row n)                                                     (None)
+          (and (__all-valid? cols row) (not (__finite? (__eval r row)))) (Some row)
+          :else                                                          (__first-bad-row r
+                                                                           cols
+                                                                           (+ row
+                                                                             1)
+                                                                           n)))
+  ;;; __variable-column -- internal: variable e evaluated over every row of
+  ;;; raw frame f, as a new float64 column (null where an input is null).
+  (defn __variable-column [f : int e : Expr] : (Result int FormulaError)
+    (let [r    (? (__resolve f e))
+          cols (__cols r (tnil))
+          n    (frame-nrows f)]
+      (match (__first-bad-row r cols 0 n)
+        (Some row)
+        (Err (formula-error (DomainError)
+               (str-concat "'"
+                 (str-concat (expr->string e)
+                   (str-concat "' is not finite at row " (int->str row))))))
+        (None)
+        (Ok (__f64-column n
+              (fn [i : int] : (Option float)
+                (if (__all-valid? cols i) (Some (__eval r i)) (None))))))))
+  ;;; formula-eval-identity -- evaluate an arithmetic expression over a frame.
+  ;;;
+  ;;; Parameters:
+  ;;;   f   -- the frame
+  ;;;   src -- the expression, with or without its I(...): "x^2", "I(x^2)",
+  ;;;          "log(a + b)"
+  ;;;
+  ;;; Returns:
+  ;;;   (Result ModelFrame FormulaError) -- a one-column frame, the column
+  ;;;   named by the expression's label (`x^2`, `I(x^2)`) and as long as `f`,
+  ;;;   null where an input is null. The caller frees it with
+  ;;;   model-frame-free. Errors: SyntaxError, UnknownColumn, NotNumeric,
+  ;;;   DomainError.
+  ;;;
+  ;;; Example:
+  ;;;   (match (formula-eval-identity f "I(wt^2)")
+  ;;;     (Ok m) (model-frame-value m "I(wt^2)" 0)   ; => (Some 6.8644)
+  ;;;     (Err e) (None))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-eval-identity [^&cols] [f : (Frame cols) src : cstr] : (Result ModelFrame
+                                                                         FormulaError)
+    (let [e   (? (formula-parse-expr src))
+          col (? (__variable-column (frame-handle f) e))]
+      (Ok (__model-frame-of (__assemble (tcons-of (expr->string e) (tnil))
+                              (tcons-of col (tnil))))))))

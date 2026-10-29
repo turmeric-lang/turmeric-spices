@@ -1,0 +1,143 @@
+;; tests/formula/parser_test.tur -- formula/parser: structure (rendered
+;; back with the minimum parentheses), precedence, and errors with their
+;; positions.
+(defmodule stats_formula_parser_test
+  (export main)
+  (import formula/parser
+    :refer
+    [formula-parse formula-parse-expr formula-function?])
+  (import formula/ast
+    :refer
+    [FormulaError
+     FormulaErrorKind
+     SyntaxError
+     ParsedFormula
+     parsed-formula-response
+     parsed-formula->string
+     expr->string
+     formula-error->string
+     formula-error-kind
+     formula-error-pos])
+  (import test/assert :refer [assert-true])
+  (import test/suite :refer [describe it])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; __p -- the formula parsed and rendered back, or the rendered error.
+  (defn __p [s : cstr] : cstr
+    (match (formula-parse s)
+      (Ok pf)
+      (parsed-formula->string pf)
+      (Err e)
+      (str-concat "error: " (formula-error->string e))))
+  ;;; __e -- an I() expression parsed and rendered back.
+  (defn __e [s : cstr] : cstr
+    (match (formula-parse-expr s)
+      (Ok e)
+      (expr->string e)
+      (Err e)
+      (str-concat "error: " (formula-error->string e))))
+  ;;; __syntax-at? -- does s fail to parse with a SyntaxError at pos?
+  (defn __syntax-at? [s : cstr pos : int] : bool
+    (match (formula-parse s)
+      (Ok pf)
+      false
+      (Err e)
+      (and (match (formula-error-kind e) (SyntaxError) true _ false)
+        (match (formula-error-pos e) (Some p) (= p pos) (None) false))))
+  (defn __all-tests [] : void
+    (describe "formula/parser round trips"
+      (it "y ~ x1 * x2 + I(x3^2)"
+        (assert-true (__is? (__p "y~x1*x2+I(x3^2)") "y ~ x1 * x2 + I(x3^2)")))
+      (it "a response that is a function call"
+        (assert-true (__is? (__p "log(y) ~ x") "log(y) ~ x")))
+      (it "a one-sided formula" (assert-true (__is? (__p "~ a + b") "~ a + b")))
+      (it "intercept terms 0 and 1"
+        (assert-true (__is? (__p "y ~ 0 + x + 1") "y ~ 0 + x + 1")))
+      (it "unary minus" (assert-true (__is? (__p "y ~ -1 + x") "y ~ -1 + x")))
+      (it "unary plus disappears" (assert-true (__is? (__p "y ~ +x") "y ~ x")))
+      (it "power with a parenthesised base"
+        (assert-true (__is? (__p "y ~ (a + b + c)^2 - a:b")
+                       "y ~ (a + b + c)^2 - a:b")))
+      (it "nesting"
+        (assert-true (__is? (__p "y ~ (a + b) / c") "y ~ (a + b) / c")))
+      (it "a backticked name renders with its backticks"
+        (assert-true (__is? (__p "`fuel economy` ~ `my col`")
+                       "`fuel economy` ~ `my col`")))
+      (it "the supported functions"
+        (assert-true (__is? (__p "y ~ log(a) + exp(b) + sqrt(c) + abs(d)")
+                       "y ~ log(a) + exp(b) + sqrt(c) + abs(d)")))
+      (it "nested calls and arithmetic inside I()"
+        (assert-true (__is? (__p "y ~ I(-x^2 / (z - 1)) + exp(2.5 * log(w))")
+                       "y ~ I(-x^2/(z - 1)) + exp(2.5 * log(w))"))))
+    (describe "formula/parser precedence"
+      (it ": binds tighter than *"
+        (assert-true (__is? (__p "y ~ (a * b):c") "y ~ (a * b):c")))
+      (it "* binds tighter than +"
+        (assert-true (__is? (__p "y ~ (a + b) * c") "y ~ (a + b) * c")))
+      (it "^ binds tighter than :"
+        (assert-true (__is? (__p "y ~ (a:b)^2") "y ~ (a:b)^2")))
+      (it "+ and - are left-associative"
+        (assert-true (__is? (__p "y ~ a - (b + c)") "y ~ a - (b + c)")))
+      (it "I(): ^ is right-associative"
+        (assert-true (__is? (__e "2^3^2") "2^3^2")))
+      (it "I(): (2^3)^2 keeps its parentheses"
+        (assert-true (__is? (__e "(2^3)^2") "(2^3)^2")))
+      (it "I(): - is left-associative"
+        (assert-true (__is? (__e "(a - b) - c") "a - b - c")))
+      (it "I(): a - (b - c) keeps its parentheses"
+        (assert-true (__is? (__e "a - (b - c)") "a - (b - c)")))
+      (it "I(): unary minus binds looser than ^"
+        (assert-true (__is? (__e "-x^2") "-x^2")))
+      (it "I(): (-x)^2 keeps its parentheses"
+        (assert-true (__is? (__e "(-x)^2") "(-x)^2")))
+      (it "I(): numbers render as R deparses them"
+        (assert-true (__is? (__e "x * 2.50 + 1e-04") "x * 2.5 + 0.0001"))))
+    (describe "formula/parser errors"
+      (it "a dangling operator, at the end"
+        (assert-true (__is? (__p "y ~ x +")
+                       "error: expected a term, found end of formula at position 7")))
+      (it "an unsupported function, at its name"
+        (assert-true (__is? (__p "y ~ poly(x)")
+                       "error: function 'poly' is not supported (I, log, exp, sqrt, abs are) at position 4")))
+      (it "a fractional exponent" (assert-true (__syntax-at? "y ~ x^2.5" 6)))
+      (it "a zero exponent" (assert-true (__syntax-at? "y ~ x^0" 6)))
+      (it "a number other than 0 / 1 as a term"
+        (assert-true (__syntax-at? "y ~ 2 + x" 4)))
+      (it "'.' is not supported yet" (assert-true (__syntax-at? "y ~ ." 4)))
+      (it "two arguments"
+        (assert-true (__is? (__p "y ~ log(x, 2)")
+                       "error: function 'log' takes one argument at position 9")))
+      (it "a missing ~"
+        (assert-true (__is? (__p "y x")
+                       "error: expected '~', found name 'x' at position 2")))
+      (it "an unclosed parenthesis"
+        (assert-true (__syntax-at? "y ~ (a + b" 10)))
+      (it "an unmatched )"
+        (assert-true (__is? (__p "y ~ a)")
+                       "error: expected an operator or end of formula, found token ')' at position 5")))
+      (it "a second ~" (assert-true (__syntax-at? "y ~ a ~ b" 6)))
+      (it "a lexer error comes through"
+        (assert-true (__syntax-at? "y ~ a $" 6))))
+    (describe "formula/parser API"
+      (it "formula-function? knows the five names"
+        (assert-true (and (formula-function? "I")
+                       (formula-function? "sqrt")
+                       (not (formula-function? "poly")))))
+      (it "parsed-formula-response is None for ~ x"
+        (assert-true (match (formula-parse "~ x")
+                       (Ok pf)
+                       (match (parsed-formula-response pf)
+                         (Some e)
+                         false
+                         (None)
+                         true)
+                       (Err e)
+                       false)))))
+  (defn main [] : int (__all-tests) (run-all-status)))

@@ -1,0 +1,368 @@
+;;; formula/factors -- categorical variables: levels, dummy coding, and the
+;;; columns a model term expands to.
+;;;
+;;; A column is a factor when its tur-frame type is utf8. Every other type is
+;;; numeric -- int, float, date and bool (read as 0 / 1). A numeric column
+;;; that holds category codes (`cyl` = 4, 6, 8) stays numeric, as it does in
+;;; R without `factor(cyl)`; cast it with tur-frame's `column-cast` to utf8 to
+;;; treat it as a factor.
+;;;
+;;; A factor's levels are its distinct non-null values in byte order (R sorts
+;;; in the locale's collation; for ASCII labels the two agree except that
+;;; byte order puts every capital letter before every lower-case one).
+;;;
+;;; Coding is R's treatment contrasts. A factor coded by contrasts gets one
+;;; indicator column per level but the first (`g` with levels a, b, c gives
+;;; `gb`, `gc`); a factor coded by dummy variables gets one per level (`ga`,
+;;; `gb`, `gc`). In a model, which one a factor gets follows R's
+;;; model.matrix (formula/terms decides); here, `formula-dummy-code` uses
+;;; contrasts and `formula-dummy-code-interaction` dummy variables.
+;;;
+;;; The columns of an interaction are the products of its variables'
+;;; columns, named by joining their names with `:`, the first variable
+;;; varying fastest: `g:x` gives `gb:x`, `gc:x`; `g:h` gives `gb:hy`,
+;;; `gc:hy`, ...
+;;;
+;;; Since: 0.1.0
+;; Factors and model-term columns.
+(load "stdlib/str-build.tur")
+
+(defmodule formula/factors
+  (export formula-is-factor
+    formula-factor-levels
+    formula-dummy-code
+    formula-dummy-code-interaction
+    VarData
+    VNum
+    VFac
+    Coding
+    Contrast
+    Dummy
+    MCol
+    __var-data
+    __var-label
+    __var-free
+    __levels-where
+    __var-mcols
+    __cross
+    __mcol-name
+    __mcol-value
+    __mcol-valid?)
+  (import formula/text :refer [text-len text-byte text-sub text-eq?])
+  (import formula/seq
+    :refer
+    [seq-reverse seq-map seq-foldl seq-length seq-append seq->carrier])
+  (import formula/ast
+    :refer
+    [Expr
+     ECol
+     FormulaError
+     UnknownColumn
+     NotCategorical
+     UnknownLevel
+     formula-error
+     expr->string])
+  (import formula/identity :refer [__variable-column])
+  (import formula/model-frame
+    :refer
+    [ModelFrame
+     __model-frame-of
+     __num-at
+     __categorical?
+     __f64-column
+     __assemble
+     __cmp])
+  (import frame/frame :refer [frame-nrows frame-column])
+  (import frame/typed :refer [Frame frame-handle])
+  (import frame/column
+    :refer
+    [column-valid? column-utf8-at column-float64-at column-free])
+  ;;; VarData -- internal: a formula variable bound to the data.
+  ;;;
+  ;;;   VNum -- label, a float64 column of its values over every row (owned)
+  ;;;   VFac -- label, its utf8 source column (borrowed), its levels
+  ;;;
+  ;;; Since: 0.1.0
+  (defdata ^heap ^copy VarData (VNum cstr int) (VFac cstr int (Cons cstr)))
+  ;;; Coding -- internal: how a factor enters one term.
+  ;;; Since: 0.1.0
+  (defdata ^copy Coding (Contrast) (Dummy))
+  ;; One factor of a model column: a numeric column's value, or the
+  ;; indicator "the utf8 column at this row equals this level".
+  (defdata ^heap ^copy Comp (CNum int) (CInd int cstr))
+  ;;; MCol -- internal: one model-matrix column: its name and the factors
+  ;;; whose product it is.
+  ;;; Since: 0.1.0
+  (defdata ^heap ^copy MCol (MCol cstr (Cons Comp)))
+  ;;; __var-label -- internal.
+  (defn __var-label [v : VarData] : cstr (match v (VNum l c) l (VFac l c ls) l))
+  ;;; __var-free -- internal: free what a VarData owns.
+  (defn __var-free [v : VarData] : void
+    (match v (VNum l c) (column-free c) (VFac l c ls) nil))
+  ;;; __insert -- internal: s into the sorted, duplicate-free list xs.
+  (defn __insert [xs : (Cons cstr) s : cstr] : (Cons cstr)
+    (if (tnil? xs)
+      (tcons-of s (tnil))
+      (let [c (__cmp s (thead xs))]
+        (cond (= c 0) xs
+              (< c 0) (tcons-of s xs)
+              :else   (tcons-of (thead xs) (__insert (ttail xs) s))))))
+  ;;; __levels-loop -- internal.
+  (defn __levels-loop [col : int
+                       keep : (fn [int] bool)
+                       i : int
+                       n : int
+                       acc : (Cons cstr)] : (Cons cstr)
+    (if (>= i n)
+      acc
+      (__levels-loop col
+        keep
+        (+ i 1)
+        n
+        (if (and (column-valid? col i) (keep i))
+          (__insert acc (column-utf8-at col i))
+          acc))))
+  ;;; __levels-where -- internal: a utf8 column's distinct values, sorted,
+  ;;; over the non-null rows keep accepts.
+  (defn __levels-where [col : int n : int keep : (fn [int] bool)] : (Cons cstr)
+    (__levels-loop col keep 0 n (tnil)))
+  ;;; __var-data -- internal: bind variable e to raw frame f, levels taken
+  ;;; over the rows keep accepts.
+  (defn __var-data [f : int e : Expr keep : (fn [int] bool)] : (Result VarData
+                                                                 FormulaError)
+    (match e
+      (ECol name)
+      (let [c (frame-column f name)]
+        (if (and (not= c 0) (__categorical? c))
+          (Ok (VFac (expr->string e) c (__levels-where c (frame-nrows f) keep)))
+          (let [col (? (__variable-column f e))]
+            (Ok (VNum (expr->string e) col)))))
+      _
+      (let [col (? (__variable-column f e))] (Ok (VNum (expr->string e) col)))))
+  ;;; __mcol-name -- internal.
+  (defn __mcol-name [m : MCol] : cstr (match m (MCol n cs) n))
+  ;;; __comps -- internal.
+  (defn __comps [m : MCol] : (Cons Comp) (match m (MCol n cs) cs))
+  ;; The helpers below recurse by hand rather than through seq-map /
+  ;; seq-foldl: a lambda whose parameter is a ^heap defdata does not unify
+  ;; with a generic function-typed parameter (see the spice README).
+  ;;; __level-mcols -- internal: one indicator column per level.
+  (defn __level-mcols [label : cstr col : int levels : (Cons cstr)] : (Cons MCol)
+    (if (tnil? levels)
+      (tnil)
+      (tcons-of (MCol (str-concat label (thead levels))
+                  (tcons-of (CInd col (thead levels)) (tnil)))
+        (__level-mcols label col (ttail levels)))))
+  ;;; __var-mcols -- internal: the columns one variable contributes to a term.
+  (defn __var-mcols [v : VarData coding : Coding] : (Cons MCol)
+    (match v
+      (VNum label col)
+      (tcons-of (MCol label (tcons-of (CNum col) (tnil))) (tnil))
+      (VFac label col levels)
+      (__level-mcols label
+        col
+        (match coding (Contrast) (ttail levels) (Dummy) levels))))
+  ;;; __mcol-times -- internal: column a times column n.
+  (defn __mcol-times [a : MCol n : MCol] : MCol
+    (MCol (str-concat (__mcol-name a) (str-concat ":" (__mcol-name n)))
+      (seq-append (__comps a) (__comps n))))
+  ;;; __times-each -- internal: every column of acc times n, onto rest.
+  (defn __times-each [acc : (Cons MCol) n : MCol rest : (Cons MCol)] : (Cons MCol)
+    (if (tnil? acc)
+      rest
+      (tcons-of (__mcol-times (thead acc) n) (__times-each (ttail acc) n rest))))
+  ;;; __cross -- internal: every product of a column of acc with a column of
+  ;;; next, acc's varying fastest.
+  (defn __cross [acc : (Cons MCol) next : (Cons MCol)] : (Cons MCol)
+    (if (tnil? next)
+      (tnil)
+      (__times-each acc (thead next) (__cross acc (ttail next)))))
+  ;;; __comp-valid? -- internal.
+  (defn __comp-valid? [c : Comp row : int] : bool
+    (match c
+      (CNum col)
+      (column-valid? col row)
+      (CInd col lvl)
+      (column-valid? col row)))
+  ;;; __comps-valid? -- internal.
+  (defn __comps-valid? [cs : (Cons Comp) row : int] : bool
+    (cond (tnil? cs)                     true
+          (__comp-valid? (thead cs) row) (__comps-valid? (ttail cs) row)
+          :else                          false))
+  ;;; __mcol-valid? -- internal: are all of a column's inputs present at row?
+  (defn __mcol-valid? [m : MCol row : int] : bool
+    (__comps-valid? (__comps m) row))
+  ;;; __comp-value -- internal.
+  (defn __comp-value [c : Comp row : int] : float
+    (match c
+      (CNum col)
+      (column-float64-at col row)
+      (CInd col lvl)
+      (if (text-eq? (column-utf8-at col row) lvl) 1.0 0.0)))
+  ;;; __comps-value -- internal.
+  (defn __comps-value [cs : (Cons Comp) row : int acc : float] : float
+    (if (tnil? cs)
+      acc
+      (__comps-value (ttail cs) row (* acc (__comp-value (thead cs) row)))))
+  ;;; __mcol-value -- internal: a column's value at a row whose inputs are
+  ;;; all present (+ 0.0 turns the -0 of `0 * -x` into 0).
+  (defn __mcol-value [m : MCol row : int] : float
+    (+ (__comps-value (__comps m) row 1.0) 0.0))
+  ;;; __mcol-names -- internal.
+  (defn __mcol-names [ms : (Cons MCol)] : (Cons cstr)
+    (if (tnil? ms)
+      (tnil)
+      (tcons-of (__mcol-name (thead ms)) (__mcol-names (ttail ms)))))
+  ;;; __mcol-column -- internal: column m over every row, null where an input
+  ;;; is null.
+  (defn __mcol-column [m : MCol n : int] : int
+    (__f64-column n
+      (fn [i : int] : (Option float)
+        (if (__mcol-valid? m i) (Some (__mcol-value m i)) (None)))))
+  ;;; __mcol-columns -- internal.
+  (defn __mcol-columns [ms : (Cons MCol) n : int] : (Cons int)
+    (if (tnil? ms)
+      (tnil)
+      (tcons-of (__mcol-column (thead ms) n) (__mcol-columns (ttail ms) n))))
+  ;;; __mcol-frame -- internal: a frame of model columns over every row, null
+  ;;; where an input is null.
+  (defn __mcol-frame [mcols : (Cons MCol) n : int] : ModelFrame
+    (__model-frame-of (__assemble (__mcol-names mcols) (__mcol-columns mcols n))))
+  ;;; __factor-column -- internal: the utf8 column `name` of raw frame f.
+  (defn __factor-column [f : int name : cstr] : (Result int FormulaError)
+    (let [c (frame-column f name)]
+      (cond (= c 0)            (Err (formula-error (UnknownColumn)
+                                      (str-concat "column '"
+                                        (str-concat name "' not found in frame"))))
+            (__categorical? c) (Ok c)
+            :else              (Err (formula-error (NotCategorical)
+                                      (str-concat "column '"
+                                        (str-concat name
+                                          "' is numeric, not categorical")))))))
+  ;;; __all-rows -- internal.
+  (defn __all-rows [i : int] : bool true)
+  ;;; formula-is-factor -- is a column categorical?
+  ;;;
+  ;;; Parameters:
+  ;;;   f    -- the frame
+  ;;;   name -- a column name
+  ;;;
+  ;;; Returns:
+  ;;;   bool -- true when the column exists and is utf8
+  ;;;
+  ;;; Example:
+  ;;;   (formula-is-factor f "species")   ; => true
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-is-factor [^&cols] [f : (Frame cols) name : cstr] : bool
+    (let [c (frame-column (frame-handle f) name)]
+      (and (not= c 0) (__categorical? c))))
+  ;;; formula-factor-levels -- a factor's levels: its distinct non-null values,
+  ;;; sorted by byte order.
+  ;;;
+  ;;; Parameters:
+  ;;;   f    -- the frame
+  ;;;   name -- a utf8 column's name
+  ;;;
+  ;;; Returns:
+  ;;;   (Result (Cons cstr) FormulaError) -- the levels (borrowed from the
+  ;;;   frame); UnknownColumn, or NotCategorical for a numeric column.
+  ;;;
+  ;;; Example:
+  ;;;   (formula-factor-levels f "g")   ; => (Ok ("a" "b" "c"))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-factor-levels [^&cols] [f : (Frame cols) name : cstr] : (Result (Cons cstr)
+                                                                          FormulaError)
+    (let [raw (frame-handle f)
+          c   (? (__factor-column raw name))]
+      (Ok (__levels-where c (frame-nrows raw) __all-rows))))
+  ;;; __base-first -- internal: xs with s moved to the front (s is a member).
+  (defn __base-first [xs : (Cons cstr) s : cstr] : (Cons cstr)
+    (tcons-of s (__drop xs s)))
+  ;;; __drop -- internal: xs without s.
+  (defn __drop [xs : (Cons cstr) s : cstr] : (Cons cstr)
+    (cond (tnil? xs)              (tnil)
+          (text-eq? (thead xs) s) (__drop (ttail xs) s)
+          :else                   (tcons-of (thead xs) (__drop (ttail xs) s))))
+  ;;; __member? -- internal.
+  (defn __member? [xs : (Cons cstr) s : cstr] : bool
+    (seq-foldl xs
+      false
+      (fn [found : bool x : cstr] : bool (or found (text-eq? x s)))))
+  ;;; __pick-base -- internal: the levels with the base first.
+  (defn __pick-base [name : cstr levels : (Cons cstr) base : (Option cstr)] : (Result (Cons cstr)
+                                                                                FormulaError)
+    (match base
+      (None)
+      (Ok levels)
+      (Some b)
+      (if (__member? levels b)
+        (Ok (__base-first levels b))
+        (Err (formula-error (UnknownLevel)
+               (str-concat "'"
+                 (str-concat b
+                   (str-concat "' is not a level of '" (str-concat name "'")))))))))
+  ;;; formula-dummy-code -- treatment-contrast indicator columns for a factor.
+  ;;;
+  ;;; Parameters:
+  ;;;   f    -- the frame
+  ;;;   name -- a utf8 column's name
+  ;;;   base -- the level to leave out; None for the first level
+  ;;;
+  ;;; Returns:
+  ;;;   (Result ModelFrame FormulaError) -- one float64 column per other level,
+  ;;;   named name + level (`gb`, `gc`), 1.0 where the row has that level and
+  ;;;   0.0 elsewhere, null where the factor is null; as many rows as `f`.
+  ;;;   UnknownColumn, NotCategorical, or UnknownLevel for a base that is not
+  ;;;   a level.
+  ;;;
+  ;;; Example:
+  ;;;   (match (formula-dummy-code f "g" (None))
+  ;;;     (Ok m) (model-frame-names m)   ; => ("gb" "gc")
+  ;;;     (Err e) (tnil))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-dummy-code [^&cols] [f : (Frame cols)
+                                     name : cstr
+                                     base : (Option cstr)] : (Result ModelFrame
+                                                               FormulaError)
+    (let [raw (frame-handle f)
+          c   (? (__factor-column raw name))
+          n   (frame-nrows raw)
+          lv  (? (__pick-base name (__levels-where c n __all-rows) base))]
+      (Ok (__mcol-frame (__var-mcols (VFac name c lv) (Contrast)) n))))
+  ;;; formula-dummy-code-interaction -- the columns of the interaction a:b, each
+  ;;; factor coded by dummy variables (one indicator per level).
+  ;;;
+  ;;; Parameters:
+  ;;;   f      -- the frame
+  ;;;   a-name -- a column name (factor or numeric)
+  ;;;   b-name -- a column name (factor or numeric)
+  ;;;
+  ;;; Returns:
+  ;;;   (Result ModelFrame FormulaError) -- for two factors, one column per
+  ;;;   pair of levels (`ga:hx`, `gb:hx`, `ga:hy`, ...); for a factor and a
+  ;;;   number, one per level (`ga:x`, `gb:x`); for two numbers, their
+  ;;;   product (`x:z`). As many rows as `f`, null where an input is null.
+  ;;;   UnknownColumn.
+  ;;;
+  ;;; Example:
+  ;;;   (match (formula-dummy-code-interaction f "g" "x")
+  ;;;     (Ok m) (model-frame-names m)   ; => ("ga:x" "gb:x" "gc:x")
+  ;;;     (Err e) (tnil))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-dummy-code-interaction [^&cols] [f : (Frame cols)
+                                                 a-name : cstr
+                                                 b-name : cstr] : (Result ModelFrame
+                                                                    FormulaError)
+    (let [raw (frame-handle f)
+          va  (? (__var-data raw (ECol a-name) __all-rows))
+          vb  (? (__var-data raw (ECol b-name) __all-rows))
+          m   (__mcol-frame (__cross (__var-mcols va (Dummy))
+                              (__var-mcols vb (Dummy)))
+                (frame-nrows raw))]
+      (__var-free va)
+      (__var-free vb)
+      (Ok m))))

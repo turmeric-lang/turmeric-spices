@@ -1,0 +1,430 @@
+;;; formula/ast -- the parsed shape of a Wilkinson-Rogers model formula.
+;;;
+;;; A formula `y ~ x1 * x2 + I(x3^2)` parses to a `ParsedFormula`: an
+;;; optional response (the left of `~`) and a right-hand side `Formula`
+;;; tree. Every variable in either side is an `Expr`: a plain column
+;;; (`ECol "x1"`) or a computed one (`ECall "I" ...`, `ECall "log" ...`).
+;;; `expr->string` gives a variable its label, which is the name its column
+;;; gets in the model frame -- `x1`, `I(x3^2)`, `log(z)` -- spelled the way R
+;;; deparses it.
+;;;
+;;; All three trees are `^heap`: each constructor call allocates a node that
+;;; nothing frees. Parsing a formula allocates a few dozen; a program that
+;;; parses formulas in a loop wraps the loop body in `with-region`.
+;;;
+;;; Since: 0.1.0
+;; AST types shared by the lexer, parser, expander and model builder.
+(load "stdlib/str-build.tur")
+
+(defmodule formula/ast
+  (export Op
+    OpAdd
+    OpSub
+    OpMul
+    OpDiv
+    OpPow
+    Expr
+    ENum
+    ECol
+    ENeg
+    EBin
+    ECall
+    Formula
+    FVar
+    FIntercept
+    FSum
+    FDiff
+    FNeg
+    FCross
+    FInteract
+    FNest
+    FPower
+    Lhs
+    OneSided
+    Response
+    ParsedFormula
+    parsed-formula-response
+    parsed-formula-rhs
+    FormulaErrorKind
+    SyntaxError
+    UnknownColumn
+    NotNumeric
+    DomainError
+    NameCollision
+    NoResponse
+    NotCategorical
+    UnknownLevel
+    TooFewLevels
+    FormulaError
+    formula-error
+    formula-error-at
+    formula-error-message
+    formula-error-kind
+    formula-error-pos
+    formula-error->string
+    expr->string
+    formula->string
+    parsed-formula->string
+    float->label)
+  ;;; Op -- an arithmetic operator inside I(...) or a function argument.
+  ;;; Since: 0.1.0
+  (defdata ^copy Op (OpAdd) (OpSub) (OpMul) (OpDiv) (OpPow))
+  ;;; Expr -- a variable: a column, or arithmetic over columns.
+  ;;;
+  ;;;   ENum  -- a numeric literal (only inside I(...) / a function call)
+  ;;;   ECol  -- a column of the data frame, by name
+  ;;;   ENeg  -- unary minus
+  ;;;   EBin  -- a binary arithmetic operation
+  ;;;   ECall -- a one-argument function: I (identity), log, exp, sqrt, abs
+  ;;;
+  ;;; Since: 0.1.0
+  (defdata ^heap ^copy Expr
+    (ENum float)
+    (ECol cstr)
+    (ENeg Expr)
+    (EBin Op Expr Expr)
+    (ECall cstr Expr))
+  ;;; Formula -- the right-hand side of `~`, before expansion.
+  ;;;
+  ;;;   FVar       -- one variable (an Expr)
+  ;;;   FIntercept -- `1` (true) or `0` (false)
+  ;;;   FSum       -- a + b
+  ;;;   FDiff      -- a - b   (removes b's terms; `- 1` drops the intercept)
+  ;;;   FNeg       -- -b      (as in `-1 + x`)
+  ;;;   FCross     -- a * b   (a + b + a:b)
+  ;;;   FInteract  -- a : b
+  ;;;   FNest      -- a / b   (a + a:b)
+  ;;;   FPower     -- a ^ n   (a * a * ... n times, interactions up to order n)
+  ;;;
+  ;;; Since: 0.1.0
+  (defdata ^heap ^copy Formula
+    (FVar Expr)
+    (FIntercept bool)
+    (FSum Formula Formula)
+    (FDiff Formula Formula)
+    (FNeg Formula)
+    (FCross Formula Formula)
+    (FInteract Formula Formula)
+    (FNest Formula Formula)
+    (FPower Formula int))
+  ;;; Lhs -- the left of `~`: a response variable, or nothing (`~ x`).
+  ;;; Since: 0.1.0
+  (defdata ^heap ^copy Lhs (OneSided) (Response Expr))
+  ;;; ParsedFormula -- a whole formula: its left-hand side and its right-hand
+  ;;; side.
+  ;;; Since: 0.1.0
+  (defstruct ^copy ParsedFormula [lhs : Lhs rhs : Formula])
+  ;;; parsed-formula-response -- the response variable, if the formula has one.
+  ;;;
+  ;;; Parameters:
+  ;;;   pf -- the parsed formula
+  ;;;
+  ;;; Returns:
+  ;;;   (Option Expr) -- None for a one-sided formula
+  ;;;
+  ;;; Example:
+  ;;;   (parsed-formula-response pf)   ; => (Some (ECol "y"))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn parsed-formula-response [pf : ParsedFormula] : (Option Expr)
+    (match (.lhs pf) (Response e) (Some e) (OneSided) (None)))
+  ;;; parsed-formula-rhs -- the right-hand side.
+  ;;;
+  ;;; Parameters:
+  ;;;   pf -- the parsed formula
+  ;;;
+  ;;; Returns:
+  ;;;   Formula
+  ;;;
+  ;;; Example:
+  ;;;   (formula->string (parsed-formula-rhs pf))   ; => "x1 * x2"
+  ;;;
+  ;;; Since: 0.1.0
+  (defn parsed-formula-rhs [pf : ParsedFormula] : Formula (.rhs pf))
+  ;;; FormulaErrorKind -- what went wrong, for a caller that wants to match.
+  ;;;
+  ;;;   SyntaxError   -- the formula text does not parse
+  ;;;   UnknownColumn -- a variable names a column the frame does not have
+  ;;;   NotNumeric    -- a categorical column where a number is needed
+  ;;;   DomainError   -- a computed variable is NaN or infinite on some row
+  ;;;   NameCollision -- two model-frame columns would get the same name
+  ;;;   NoResponse    -- the formula has nothing left of `~`
+  ;;;   NotCategorical -- a numeric column where a factor is needed
+  ;;;   UnknownLevel  -- a base level that the factor does not have
+  ;;;   TooFewLevels  -- a factor with fewer than two levels in the data
+  ;;;
+  ;;; Since: 0.1.0
+  (defdata ^copy FormulaErrorKind
+    (SyntaxError)
+    (UnknownColumn)
+    (NotNumeric)
+    (DomainError)
+    (NameCollision)
+    (NoResponse)
+    (NotCategorical)
+    (UnknownLevel)
+    (TooFewLevels))
+  ;;; ErrPos -- internal: where an error is, if anywhere.
+  ;;
+  ;; Held as an ErrPos, not an (Option int): a struct field of an Option
+  ;; type anywhere in a program makes the emitted C define `Cons T` before T
+  ;; for a user ADT T (see the spice README). Nothing in this spice stores an
+  ;; Option in a struct for that reason; accessors such as formula-error-pos
+  ;; convert.
+  (defdata ^copy ErrPos (NoPos) (AtPos int))
+  ;;; FormulaError -- an error from any formula stage: its kind, a message,
+  ;;; and the 0-based byte position in the formula text when there is one.
+  ;;; Since: 0.1.0
+  (defstruct ^copy FormulaError
+    [kind : FormulaErrorKind message : cstr pos : ErrPos])
+  ;;; formula-error -- an error with no position.
+  ;;;
+  ;;; Parameters:
+  ;;;   kind -- the FormulaErrorKind
+  ;;;   msg  -- the message
+  ;;;
+  ;;; Returns:
+  ;;;   FormulaError
+  ;;;
+  ;;; Example:
+  ;;;   (formula-error (UnknownColumn) "column 'z' not found in frame")
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-error [kind : FormulaErrorKind msg : cstr] : FormulaError
+    (FormulaError kind msg (NoPos)))
+  ;;; formula-error-at -- an error at a position in the formula text.
+  ;;;
+  ;;; Parameters:
+  ;;;   kind -- the FormulaErrorKind
+  ;;;   msg  -- the message (the position is appended when rendered)
+  ;;;   pos  -- 0-based byte offset
+  ;;;
+  ;;; Returns:
+  ;;;   FormulaError
+  ;;;
+  ;;; Example:
+  ;;;   (formula-error-at (SyntaxError) "unexpected token ')'" 12)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-error-at [kind : FormulaErrorKind msg : cstr pos : int] : FormulaError
+    (FormulaError kind msg (AtPos pos)))
+  ;;; formula-error-message -- an error's message, without the position.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the error
+  ;;;
+  ;;; Returns:
+  ;;;   cstr
+  ;;;
+  ;;; Example:
+  ;;;   (formula-error-message e)   ; => "unexpected token ')'"
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-error-message [e : FormulaError] : cstr (.message e))
+  ;;; formula-error-kind -- an error's kind.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the error
+  ;;;
+  ;;; Returns:
+  ;;;   FormulaErrorKind
+  ;;;
+  ;;; Example:
+  ;;;   (match (formula-error-kind e) (UnknownColumn) ... _ ...)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-error-kind [e : FormulaError] : FormulaErrorKind (.kind e))
+  ;;; formula-error-pos -- where in the formula text the error is, if known.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the error
+  ;;;
+  ;;; Returns:
+  ;;;   (Option int) -- the 0-based byte offset
+  ;;;
+  ;;; Example:
+  ;;;   (formula-error-pos e)   ; => (Some 12)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-error-pos [e : FormulaError] : (Option int)
+    (match (.pos e) (AtPos p) (Some p) (NoPos) (None)))
+  ;;; formula-error->string -- the message, with " at position N" when the
+  ;;; error has a position.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the error
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- freshly allocated
+  ;;;
+  ;;; Example:
+  ;;;   (formula-error->string e)   ; => "unexpected token ')' at position 12"
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-error->string [e : FormulaError] : cstr
+    (match (.pos e)
+      (AtPos p)
+      (str-concat (.message e) (str-concat " at position " (int->str p)))
+      (NoPos)
+      (str-concat (.message e) "")))
+  ;;; float->label -- a numeric literal as R deparses it: `2`, `0.5`, `1e-04`.
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- the number
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- freshly allocated
+  ;;;
+  ;;; Example:
+  ;;;   (float->label 2.5)   ; => "2.5"
+  ;;;
+  ;;; Since: 0.1.0
+  (defn float->label [x : float] : cstr
+    ```c
+    char *buf = (char *)malloc(32);
+  if (!buf) abort();
+  snprintf(buf, 32, "%.15g", x);
+  return (const char *)buf;
+  ```)
+  ;;; __syntactic? -- internal: would formula/lexer read `s` as one name
+  ;;; (so it needs no backticks)?
+  (defn __syntactic? [s : cstr] : bool
+    ```c
+    const unsigned char *p = (const unsigned char *)s;
+  #define SF_A(c) (((c) >= 'a' && (c) <= 'z') || ((c) >= 'A' && (c) <= 'Z') || (c) == '_' || (c) >= 0x80)
+  #define SF_D(c) ((c) >= '0' && (c) <= '9')
+  if (!p[0]) return false;
+  if (!(SF_A(p[0]) || (p[0] == '.' && !SF_D(p[1]) && p[1] != '\0'))) return false;
+  for (size_t i = 1; p[i]; i++) if (!(SF_A(p[i]) || SF_D(p[i]) || p[i] == '.')) return false;
+  return true;
+  #undef SF_A
+  #undef SF_D
+  ```)
+  ;;; __op-prec -- internal: binding strength of an operator (higher binds
+  ;;; tighter).
+  (defn __op-prec [op : Op] : int
+    (match op (OpAdd) 1 (OpSub) 1 (OpMul) 2 (OpDiv) 2 (OpPow) 4))
+  ;;; __op-text -- internal: the operator as R deparses it (spaces around
+  ;;; + - *, none around / ^).
+  (defn __op-text [op : Op] : cstr
+    (match op (OpAdd) " + " (OpSub) " - " (OpMul) " * " (OpDiv) "/" (OpPow) "^"))
+  ;;; __expr-prec -- internal: the binding strength of an expression's top.
+  (defn __expr-prec [e : Expr] : int
+    (match e (EBin op a b) (__op-prec op) (ENeg x) 3 _ 9))
+  ;;; __paren -- internal.
+  (defn __paren [s : cstr] : cstr (str-concat "(" (str-concat s ")")))
+  ;;; __expr-at -- internal: render e, parenthesised when it binds looser
+  ;;; than `need`.
+  (defn __expr-at [e : Expr need : int] : cstr
+    (if (< (__expr-prec e) need) (__paren (expr->string e)) (expr->string e)))
+  ;;; expr->string -- a variable's label, as R deparses it.
+  ;;;
+  ;;; Parameters:
+  ;;;   e -- the expression
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- freshly allocated; the name the variable's column gets in a
+  ;;;   model frame
+  ;;;
+  ;;; Example:
+  ;;;   (expr->string (ECall "I" (EBin (OpPow) (ECol "x") (ENum 2.0))))
+  ;;;   ; => "I(x^2)"
+  ;;;
+  ;;; Since: 0.1.0
+  (defn expr->string [e : Expr] : cstr
+    (match e
+      (ENum x)
+      (float->label x)
+      (ECol name)
+      (if (__syntactic? name) name (str-concat "`" (str-concat name "`")))
+      (ENeg x)
+      (str-concat "-" (__expr-at x 3))
+      (EBin op a b)
+      (let [p  (__op-prec op)
+            ;; ^ is right-associative, the rest left
+            lp (if (= p 4) (+ p 1) p)
+            rp (if (= p 4) p (+ p 1))]
+        (str-concat (__expr-at a lp)
+          (str-concat (__op-text op) (__expr-at b rp))))
+      (ECall f x)
+      (str-concat f (__paren (expr->string x)))))
+  ;;; __formula-prec -- internal.
+  (defn __formula-prec [f : Formula] : int
+    (match f
+      (FSum a b)
+      1
+      (FDiff a b)
+      1
+      (FNeg x)
+      2
+      (FCross a b)
+      3
+      (FNest a b)
+      3
+      (FInteract a b)
+      4
+      (FPower a n)
+      5
+      _
+      9))
+  ;;; __formula-at -- internal.
+  (defn __formula-at [f : Formula need : int] : cstr
+    (if (< (__formula-prec f) need)
+      (__paren (formula->string f))
+      (formula->string f)))
+  ;;; __formula-bin -- internal: a left-associative binary operator.
+  (defn __formula-bin [a : Formula op : cstr b : Formula p : int] : cstr
+    (str-concat (__formula-at a p) (str-concat op (__formula-at b (+ p 1)))))
+  ;;; formula->string -- render a right-hand side back to formula text.
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- the formula
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- freshly allocated, with the minimum parentheses
+  ;;;
+  ;;; Example:
+  ;;;   (formula->string (FCross (FVar (ECol "a")) (FVar (ECol "b"))))
+  ;;;   ; => "a * b"
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula->string [f : Formula] : cstr
+    (match f
+      (FVar e)
+      (expr->string e)
+      (FIntercept on)
+      (if on "1" "0")
+      (FSum a b)
+      (__formula-bin a " + " b 1)
+      (FDiff a b)
+      (__formula-bin a " - " b 1)
+      (FNeg x)
+      (str-concat "-" (__formula-at x 3))
+      (FCross a b)
+      (__formula-bin a " * " b 3)
+      (FNest a b)
+      (__formula-bin a " / " b 3)
+      (FInteract a b)
+      (__formula-bin a ":" b 4)
+      (FPower a n)
+      (str-concat (__formula-at a 6) (str-concat "^" (int->str n)))))
+  ;;; parsed-formula->string -- render a whole formula: `y ~ rhs`, or `~ rhs`
+  ;;; with no response.
+  ;;;
+  ;;; Parameters:
+  ;;;   pf -- the parsed formula
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- freshly allocated
+  ;;;
+  ;;; Example:
+  ;;;   (parsed-formula->string pf)   ; => "y ~ x1 * x2 + I(x3^2)"
+  ;;;
+  ;;; Since: 0.1.0
+  (defn parsed-formula->string [pf : ParsedFormula] : cstr
+    (let [rhs (formula->string (.rhs pf))]
+      (match (.lhs pf)
+        (Response e)
+        (str-concat (expr->string e) (str-concat " ~ " rhs))
+        (OneSided)
+        (str-concat "~ " rhs)))))
