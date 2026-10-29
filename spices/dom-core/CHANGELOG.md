@@ -4,6 +4,13 @@
 
 ### Added
 
+- Holes in code (xml-html-followups-plan A6): `dom/markupc` reads the
+  JavaScript, JSON or CSS around a hole in an `on*` / `style` attribute or a
+  `<script>` / `<style>` body and picks the escaper from its position;
+  `dom/holes` gains `ToJs`, `ToCodeText`, `ToCss`, `ToSrcdoc`, `TrustedJs`
+  (`trusted-js`), `TrustedCss` (`trusted-css`), the escapers
+  `js-string-escape`, `css-string-escape`, `css-url-escape`, and the hole
+  kind `HoleCode`. Positions it cannot follow are compile errors.
 - A type error in a markup literal's `${...}` hole is reported at the hole
   (xml-html-followups-plan A5): `dom/markupc` reads holes with turmeric's
   `read-string-at`, which keeps their place in the file. Needs a `tur` with

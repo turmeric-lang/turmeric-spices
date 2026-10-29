@@ -298,11 +298,68 @@ A value of the wrong kind for its place -- a `Fragment` in an attribute, a
 
 A hole anywhere a value could change the document's structure is a
 **compile error naming the place**: in a tag or attribute name, right after
-a `<`, in a comment or doctype, inside `<script>`, `<style>`, `<textarea>`,
-`<title>` and the other raw-text elements, sharing an unquoted attribute
-value with other text, and in the value of an `on*`, `style` or `srcdoc`
-attribute -- the browser hands those values to a JavaScript, CSS or HTML
-parser, which HTML escaping does not protect.
+a `<`, in a comment or doctype, inside `<textarea>`, `<title>` and the other
+raw-text elements, and sharing an unquoted attribute value with other text.
+`<script>`, `<style>` and the `on*`, `style` and `srcdoc` attributes take
+holes only where the next section allows them.
+
+### Holes in JavaScript, CSS and srcdoc
+
+The browser hands an `on*` attribute's value and a `<script>` body to its
+JavaScript parser, and a `style` attribute and a `<style>` body to its CSS
+parser, so HTML escaping alone does not protect a value there. The macro
+reads the code around each such hole -- an attribute's text after decoding
+its character references, as the browser does -- and escapes in two layers:
+first for the inner language, by where the hole sits, then for the
+attribute (a `<script>` / `<style>` body needs no second layer: the first
+already keeps `</script` and `</style` out).
+
+```turmeric
+(defn row [id : int name : cstr colour : cstr] : Fragment
+  #html{<li style="color: ${colour}">
+          <button onclick="pick(${id}, '${name}')">${name}</button>
+        </li>})
+
+(defn boot [user : cstr items : int] : Fragment
+  #html{<script>start(${user}, {count: ${items}});</script>
+        <script type="application/json" id="cfg">{"user": ${user}}</script>})
+```
+
+| Where the hole is | Class | It becomes |
+|---|---|---|
+| JavaScript or JSON, where a value goes | `ToJs`: `int`, `bool`, `cstr`, `String`, `(Option T)` | a literal (`null` for `None`), a space on each side |
+| | `TrustedJs` (`trusted-js`) | the code itself |
+| inside a quoted JavaScript or JSON string | `ToCodeText`: `cstr`, `String`, `int` | text with `\ ' " ` < > & =`, controls and U+2028/9 as `\uXXXX` |
+| a CSS property value | `ToCss`: `int`, `cstr`, `String` | kept if it is only letters, digits and `# . - _ % ,` and space, else `tur-unsafe` (which the browser drops) |
+| | `TrustedCss` (`trusted-css`) | as written |
+| inside a quoted CSS string | `ToCodeText` | text with everything but letters and digits as `\HEX ` |
+| inside CSS `url(...)` | `ToUrlAttr` | scheme-checked, then percent-encoded |
+| `srcdoc="${x}"`, the whole value | `ToSrcdoc`: `Fragment`, `RawHtml` | its markup, live in the iframe |
+| | `cstr`, `String` | text in the iframe |
+
+Everywhere else in code, a hole is a compile error, and the macro refuses
+rather than guesses: a hole inside a template literal (backticks), a
+comment or a regex; after a `/` it cannot tell apart from a division or
+after `)`, `}`, `++`; where an operator goes (`a ${x}`) or after a `.`; in a
+`<script>` holding `<!--` or of any type but JavaScript and JSON
+(`application/json`, `application/ld+json`); a JSON object key; a CSS
+selector, at-rule or property name, or a declaration that turns out to be
+a nested rule. Only quoted values take code holes (`onclick=${x}` is still
+an error), a character reference the macro does not decode (`&quot;`,
+`&#39;`, `&amp;`, `&lt;`, `&gt;` and numeric ASCII ones it does) is an
+error in a code attribute with holes, and `srcdoc` takes one hole, its
+whole quoted value.
+
+`trusted-js` and `trusted-css` are the opt-outs for code, greppable like
+`raw-html`; a trusted value that would end its `<script>` or `<style>`
+still panics when the literal renders. Holes in code exist in HTML only:
+`#xml{...}` keeps them compile errors. Live literals take them too.
+
+The test suite checks this three ways: an escaping table per context, a
+hostile corpus that may not change any literal's parsed structure, and
+`fixtures/browser.sh`, which loads a page per hostile value in headless
+Chromium, clicks every handler, and checks that no value ran code and every
+string hole read back as itself.
 
 URLs are checked with an allowlist: a relative URL or one with scheme
 `http`, `https`, `mailto` or `tel` passes, anything else (`javascript:`,

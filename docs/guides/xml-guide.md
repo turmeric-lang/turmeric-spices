@@ -482,8 +482,10 @@ What is different from HTML:
 
 - Names are case-sensitive and there is no raw text; CDATA sections and
   processing instructions take no holes. Holes in `on*`, `style` and
-  `srcdoc` values are compile errors here too, since browsers run them in
-  SVG and in XHTML served as XML.
+  `srcdoc` values stay compile errors here (browsers run them in SVG and in
+  XHTML served as XML): the code-aware holes of `#html{...}` -- see the
+  tur-html guide -- read HTML's rules for script and style text, which XML
+  does not share.
 - Attribute values escape tab, LF and CR as character references, which
   attribute-value normalization would otherwise fold; a `true` boolean
   attribute renders as `name="name"`.

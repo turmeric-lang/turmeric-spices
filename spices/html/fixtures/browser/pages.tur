@@ -1,0 +1,73 @@
+#use-reader-macros "../../src/html/markup.tur"
+;; pages.tur -- the pages fixtures/browser.sh loads in a real browser
+;; (xml-html-followups-plan A6's browser check).
+;;
+;; One page per hostile value, the value in every code context the macro
+;; allows: an onclick expression and both string quotes, a <script>
+;; expression and both string quotes, a JSON body, a style attribute string
+;; and value, a <style> string, value and url(), and an iframe's srcdoc.
+;; The values try to call __pwn(), which sets a sentinel; check.js loads each
+;; page, clicks the handlers, and checks the sentinel stayed false and every
+;; string hole reads back as the value written beside the page.
+;;
+;; Writes $TUR_BROWSER_OUT/pN.html and pN.txt (the value), N from 0.
+(defmodule html_browser_pages
+  (import html/markup :refer [html*])
+  (import dom/holes :refer [Fragment html->string fragment-free])
+  ;;; __value -- internal: hostile value i ("" past the end).
+  (defn __value [i : int] : cstr
+    ```c
+    static const char *const v[] = {
+    "');__pwn();('", "\");__pwn();(\"", "`+__pwn()+`", "\\');__pwn();//",
+    "</script><script>__pwn()</script>", "</SCRIPT ><script>__pwn()</script>",
+    "<!--<script>__pwn()</script>", "-->__pwn()", "*/__pwn()/*", "\xe2\x80\xa8__pwn()",
+    "\"><img src=x onerror=__pwn()>", "'><img src=x onerror=__pwn()>",
+    "red;}</style><img src=x onerror=__pwn()>", "expression(__pwn())",
+    "javascript:__pwn()", "${__pwn()}", "<svg onload=__pwn()>", "&quot;);__pwn();(&quot;",
+    "\\x27);__pwn();//", "\\u0027);__pwn();//", "a\tb\nc\rd e\\f\"g'h<i>j&k",
+    "caf\xc3\xa9 \xe2\x9c\x93 \xf0\x9f\x98\x80", "x", NULL};
+  int64_t n = 0;
+  while (v[n]) n++;
+  return i < n ? v[i] : "";
+  ```)
+  ;;; __count -- internal: how many values.
+  (defn __count [] : int 23)
+  ;;; page -- one page with v in every code context.
+  (defn page [v : cstr] : Fragment
+    #html{<!doctype html><html><head><meta charset="utf-8"><script>window.__pwned = false; function __pwn() { window.__pwned = true; }</script></head><body>
+<button id="b1" onclick="window.__r1 = ${v}">a</button>
+<button id="b2" onclick="window.__r2 = '${v}'">b</button>
+<button id="b3" onclick="window.__r3 = &quot;${v}&quot;">c</button>
+<script>window.__r4 = ${v}; window.__r5 = "${v}"; window.__r6 = '${v}';</script>
+<script type="application/json" id="j">{"a": ${v}, "b": "${v}"}</script>
+<p id="s1" style="font-family: '${v}'; color: ${v}">x</p>
+<style>#s2::after { content: "${v}" } #s3 { color: ${v}; background: url('${v}') }</style>
+<p id="s2">y</p><p id="s3">z</p>
+<iframe id="f" srcdoc="${v}"></iframe>
+</body></html>})
+  ;;; __write -- internal: write s to $TUR_BROWSER_OUT/pI.EXT; false on error.
+  (defn __write [i : int ext : cstr s : cstr] : bool
+    ```c
+    #include <stdio.h>
+  #include <stdlib.h>
+  const char *dir = getenv("TUR_BROWSER_OUT");
+  if (!dir) return false;
+  char path[4096];
+  snprintf(path, sizeof path, "%s/p%lld.%s", dir, (long long)i, (const char *)ext);
+  FILE *f = fopen(path, "wb");
+  if (!f) return false;
+  fputs((const char *)s, f);
+  return fclose(f) == 0;
+  ```)
+  (defn main [] : int
+    (let [^mut i  0
+          ^mut ok true]
+      (while (< i (__count))
+        (let [f (page (__value i))]
+          (if (and (__write i "html" (html->string f))
+                (__write i "txt" (__value i)))
+            nil
+            (set! ok false))
+          (fragment-free f))
+        (set! i (+ i 1)))
+      (if ok 0 1))))

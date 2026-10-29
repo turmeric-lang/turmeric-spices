@@ -70,18 +70,45 @@ expect_reject '<!-- ${x} -->' "a hole inside a comment"
 expect_reject '<!doctype ${x}>' "a hole inside a doctype"
 expect_reject '<? ${x} >' "a hole inside a doctype or markup declaration"
 echo "# raw text"
-expect_reject '<script>var a = ${x};</script>' "a hole inside <script>"
-expect_reject '<style>p { color: ${x} }</style>' "a hole inside <style>"
 expect_reject '<textarea>${x}</textarea>' "a hole inside <textarea>"
 expect_reject '<title>${x}</title>' "a hole inside <title>"
-expect_reject '<SCRIPT>${x}</SCRIPT>' "a hole inside <SCRIPT>"
-echo "# attributes whose value is code or markup (plan A-4)"
-expect_reject '<a onclick=\"go(${x})\">' "event-handler attribute 'onclick'"
-expect_reject '<a ONMOUSEOVER=${x}>' "event-handler attribute 'ONMOUSEOVER'"
-expect_reject '<svg onload=\"${x}\"></svg>' "event-handler attribute 'onload'"
-expect_reject '<p style=\"color: ${x}\">' "a hole in the 'style' attribute"
-expect_reject '<p STYLE=${x}>' "a hole in the 'STYLE' attribute"
-expect_reject '<iframe srcdoc=\"${x}\"></iframe>' "a hole in the 'srcdoc' attribute"
+echo "# holes in JavaScript the macro refuses (plan A6a)"
+expect_reject '<script>var s = `${x}`;</script>' "inside a JavaScript template literal"
+expect_reject '<script>/* ${x} */</script>' "inside a JavaScript comment"
+expect_reject '<script>var r = /a${x}/;</script>' "inside a JavaScript regular expression"
+expect_reject '<script>if (a) /b/.test(${x});</script>' "cannot follow"
+expect_reject '<script>a ${x}</script>' "where JavaScript expects an operator"
+expect_reject '<script>a.${x}</script>' "after a '.'"
+expect_reject '<script>a(); <!-- ${x}</script>' "holding <!--"
+expect_reject '<script>var s = \"\\${x}\";</script>' "right after a backslash"
+expect_reject '<script type=\"text/template\">${x}</script>' "of type 'text/template'"
+expect_reject '<script type=\"${x}\">f(${x})</script>' "whose type is itself a hole"
+expect_reject '<SCRIPT>a ${x}</SCRIPT>' "in <SCRIPT>: a hole where JavaScript expects an operator"
+expect_reject '<script type=\"application/json\">{${x}: 1}</script>' "where a JSON object key goes"
+expect_reject '<script type=\"application/json\">[1 ${x}]</script>' "where JSON expects a ','"
+expect_reject '<a onclick=\"go(${x}, a ${x})\">' "in 'onclick': a hole where JavaScript expects an operator"
+expect_reject '<a onclick=\"go(&unknown; ${x})\">' "a character reference in 'onclick'"
+expect_reject '<a onclick=\"go(&quot ${x})\">' "a character reference in 'onclick'"
+echo "# holes in CSS the macro refuses (plan A6b)"
+expect_reject '<style>${x} { color: red }</style>' "a hole in a CSS selector"
+expect_reject '<style>@media ${x} { p { color: red } }</style>' "a hole in a CSS selector or at-rule"
+expect_reject '<style>p { ${x}: red }</style>' "a hole in a CSS property name"
+expect_reject '<style>p { color: red /* ${x} */ }</style>' "inside a CSS comment"
+expect_reject '<style>p { color: ${x} &:hover { color: blue } }</style>' "turns out to be a nested rule"
+expect_reject '<p style=\"${x}: red\">' "in 'style': a hole in a CSS property name"
+expect_reject '<p style=\"content: \x27\\${x}\x27\">' "right after a backslash in a CSS string"
+echo "# srcdoc (plan A6c)"
+expect_reject '<iframe srcdoc=\"<p>${x}</p>\"></iframe>' "only a hole that is the whole value"
+expect_reject '<iframe srcdoc=${x}></iframe>' "srcdoc hole is written srcdoc"
+echo "# attributes whose value is code: quoted values only (plan A-4)"
+expect_reject '<a ONMOUSEOVER=${x}>' "event-handler attribute 'ONMOUSEOVER' must be inside its quoted value"
+expect_reject '<p STYLE=${x}>' "a hole in a style attribute must be inside its quoted value"
+echo "# code holes take their own classes (plan A6)"
+expect_reject '<a onclick=\"f(${(html* \"<b></b>\")})\">' "ToJs"
+expect_reject '<a onclick=\"f(\x27${b}\x27)\">' "ToCodeText"
+expect_reject '<p style=\"color: ${b}\">' "ToCss"
+expect_reject '<p style=\"background: url(${b})\">' "ToUrlAttr"
+expect_reject '<iframe srcdoc=\"${b}\"></iframe>' "ToSrcdoc"
 echo "# documents and fragments (plan A-2)"
 expect_reject '<head><title>t</title></head>' "a top-level <head> or <body>"
 expect_reject '<body>${x}</body>' "a top-level <head> or <body>"
@@ -220,6 +247,27 @@ if printf '%s' "$out" | grep -qF "cannot be written back as parsed"; then
   echo "ok $n - a <plaintext> raw-html value panics instead of unbalancing the literal"
 else
   echo "not ok $n - a <plaintext> raw-html value panics instead of unbalancing the literal"
+  printf '%s\n' "$out" | tail -5 | sed 's/^/      /'
+  fail=1
+fi
+
+# A TrustedJs value that would end its <script> panics at render time
+# (plan A6): the escapers never write </script, a trusted value can.
+n=$((n + 1))
+f="$TMP/trusted$n.tur"
+cat > "$f" <<'EOF'
+(defmodule trustedcase
+  (import html/markup :refer [html*])
+  (import dom/holes :refer [html->string trusted-js])
+  (defn main [] : int
+    (println (html->string (html* "<script>f(${(trusted-js \"1)</script><script>alert(2)\")})</script>")))
+    0))
+EOF
+out="$("$TUR" run "$f" 2>&1)"
+if printf '%s' "$out" | grep -qF "would end the element early"; then
+  echo "ok $n - a TrustedJs value holding </script> panics instead of ending the <script>"
+else
+  echo "not ok $n - a TrustedJs value holding </script> panics instead of ending the <script>"
   printf '%s\n' "$out" | tail -5 | sed 's/^/      /'
   fail=1
 fi

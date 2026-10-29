@@ -12,6 +12,12 @@
  *   \x01a\x02        a hole inside a quoted attribute value
  *   \x01wNAME\x02    a hole that is an attribute's whole value; the static
  *                    text no longer holds ` NAME="..."`, the renderer writes it
+ *   \x01kNAME\x02    a code hole (plan A6) inside the quoted value of the
+ *                    attribute NAME (`on*`, `style`): its value is already
+ *                    escaped for JavaScript or CSS and is attribute-escaped
+ *   \x01rTAG\x02     a code hole in the raw text of <TAG> (`script`, `style`):
+ *                    its value is already escaped and is written as it is,
+ *                    once checked that it cannot end the element
  *
  * Holes appear in the template in the order their values are passed. */
 
@@ -175,6 +181,154 @@ char *turdom_srcset_safe(const char *s) {
     return turdom_mbuf_finish(b);
 }
 
+/* ---- code holes: the inner escapers (plan A6) ------------------------------------------ */
+
+static const char *nth_marker(const char *tpl, int64_t i);
+
+/* The code point of the UTF-8 sequence at s (n bytes left), and its length;
+ * an invalid byte is U+FFFD, length 1. */
+static uint32_t utf8_at(const unsigned char *s, size_t n, size_t *len) {
+    unsigned c = s[0];
+    if (c < 0x80) { *len = 1; return c; }
+    size_t k = c >= 0xF0 && c < 0xF5 ? 4 : c >= 0xE0 ? 3 : c >= 0xC2 && c < 0xE0 ? 2 : 0;
+    if (k == 0 || k > n) { *len = 1; return 0xFFFD; }
+    uint32_t v = c & (k == 2 ? 0x1F : k == 3 ? 0x0F : 0x07);
+    for (size_t i = 1; i < k; i++) {
+        if ((s[i] & 0xC0) != 0x80) { *len = 1; return 0xFFFD; }
+        v = (v << 6) | (s[i] & 0x3F);
+    }
+    *len = k;
+    return v;
+}
+
+/* Text for the inside of a JavaScript (or JSON) string literal, either
+ * quote: backslash, both quotes, backtick, < > & =, every C0 control, DEL and
+ * the line terminators U+2028 / U+2029 become \uXXXX.  Escaping < is what
+ * keeps </script and <!-- out of a <script> body.  malloc'd. */
+char *turdom_js_string_escape(const char *s) {
+    turdom_mbuf *b = turdom_mbuf_new();
+    const unsigned char *p = (const unsigned char *)(s ? s : "");
+    size_t n = strlen((const char *)p), i = 0;
+    char tmp[8];
+    while (i < n) {
+        size_t len;
+        uint32_t c = utf8_at(p + i, n - i, &len);
+        if (c < 0x20 || c == 0x7F || c == '\\' || c == '"' || c == '\'' || c == '`' ||
+            c == '<' || c == '>' || c == '&' || c == '=' || c == 0x2028 || c == 0x2029) {
+            snprintf(tmp, sizeof tmp, "\\u%04x", (unsigned)c);
+            turdom_mbuf_put(b, tmp);
+        } else if (c == 0xFFFD && len == 1) {
+            turdom_mbuf_put(b, "\\ufffd");
+        } else {
+            mb_put(b, (const char *)p + i, len);
+        }
+        i += len;
+    }
+    return turdom_mbuf_finish(b);
+}
+
+/* A double-quoted JavaScript (and JSON) string literal.  malloc'd. */
+char *turdom_js_quote(const char *s) {
+    char *e = turdom_js_string_escape(s);
+    turdom_mbuf *b = turdom_mbuf_new();
+    turdom_mbuf_put(b, "\"");
+    turdom_mbuf_put(b, e);
+    turdom_mbuf_put(b, "\"");
+    free(e);
+    return turdom_mbuf_finish(b);
+}
+
+/* A JavaScript value in expression position, padded with a space on each
+ * side, so `a-${x}` with x = -1 cannot form `--`.  malloc'd. */
+char *turdom_js_pad(const char *s) {
+    turdom_mbuf *b = turdom_mbuf_new();
+    turdom_mbuf_put(b, " ");
+    turdom_mbuf_put(b, s ? s : "");
+    turdom_mbuf_put(b, " ");
+    return turdom_mbuf_finish(b);
+}
+
+#define TUR_UNSAFE_CSS "tur-unsafe"
+
+/* A CSS property value from text: kept when every byte is an ASCII letter or
+ * digit or one of # . - _ % , and space; otherwise the invalid value
+ * tur-unsafe, which the browser drops (parens, quotes, \, /, ;, {, }, < --
+ * so expression(, url( and comments -- never get through). */
+const char *turdom_css_value(const char *s) {
+    if (!s) return "";
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        unsigned c = *p;
+        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                 c == '#' || c == '.' || c == '-' || c == '_' || c == '%' || c == ',' || c == ' ';
+        if (!ok) return TUR_UNSAFE_CSS;
+    }
+    return s;
+}
+
+/* Text for the inside of a quoted CSS string: everything but an ASCII letter
+ * or digit becomes a \HEX escape followed by a space (< gives \3c ).
+ * malloc'd. */
+char *turdom_css_string_escape(const char *s) {
+    turdom_mbuf *b = turdom_mbuf_new();
+    const unsigned char *p = (const unsigned char *)(s ? s : "");
+    size_t n = strlen((const char *)p), i = 0;
+    char tmp[16];
+    while (i < n) {
+        size_t len;
+        uint32_t c = utf8_at(p + i, n - i, &len);
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+            mb_put(b, (const char *)p + i, 1);
+        } else {
+            snprintf(tmp, sizeof tmp, "\\%x ", (unsigned)(c == 0 ? 0xFFFD : c));
+            turdom_mbuf_put(b, tmp);
+        }
+        i += len;
+    }
+    return turdom_mbuf_finish(b);
+}
+
+/* A URL for the inside of url(...), quoted or not, already through the
+ * scheme check: parens, both quotes, whitespace, \ and < > percent-encoded.
+ * malloc'd. */
+char *turdom_css_url_escape(const char *s) {
+    turdom_mbuf *b = turdom_mbuf_new();
+    char tmp[4];
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        unsigned c = *p;
+        if (c == '(' || c == ')' || c == '\'' || c == '"' || c == '\\' || c == '<' ||
+            c == '>' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' ||
+            c < 0x20 || c == 0x7F) {
+            snprintf(tmp, sizeof tmp, "%%%02X", c);
+            turdom_mbuf_put(b, tmp);
+        } else {
+            mb_put(b, (const char *)p, 1);
+        }
+    }
+    return turdom_mbuf_finish(b);
+}
+
+/* May value s go in code hole i of tpl as it is?  Only an 'r' hole has
+ * anything to check: s must not hold its element's end tag `</TAG` (any
+ * case), nor -- in a <script> -- `<!--`, which moves the HTML tokenizer into
+ * its escaped script states.  The escapers never produce either; a
+ * TrustedJs / TrustedCss value can. */
+int turdom_code_ok(const char *tpl, int64_t i, const char *s) {
+    const char *m = nth_marker(tpl, i);
+    if (!m || m[1] != 'r' || !s) return 1;
+    const char *t = m + 2, *e = strchr(t, '\x02');
+    size_t tn = e ? (size_t)(e - t) : strlen(t);
+    for (const char *p = s; *p; p++) {
+        if (p[0] != '<') continue;
+        if (p[1] == '/') {
+            size_t j = 0;
+            while (j < tn && p[2 + j] && lower((unsigned char)p[2 + j]) == lower((unsigned char)t[j])) j++;
+            if (j == tn) return 0;
+        }
+        if (tn == 6 && strncmp(p, "<!--", 4) == 0) return 0;
+    }
+    return 1;
+}
+
 /* ---- walking a template ----------------------------------------------------------- */
 
 /* Append the static text of tpl from pos up to the next marker; return the
@@ -244,7 +398,7 @@ char *turdom_tpl_check_markup(const char *tpl) {
         if (kind == 'c') {
             snprintf(tmp, sizeof tmp, "<!--" HOLE_PREFIX "%lld__-->", (long long)k);
             turdom_mbuf_put(b, tmp);
-        } else if (kind == 'a') {
+        } else if (kind == 'a' || kind == 'k' || kind == 'r') {
             snprintf(tmp, sizeof tmp, HOLE_PREFIX "%lld__", (long long)k);
             turdom_mbuf_put(b, tmp);
         } else {
@@ -258,8 +412,8 @@ char *turdom_tpl_check_markup(const char *tpl) {
     return turdom_mbuf_finish(b);
 }
 
-/* The hole kinds of a template, in order ('c', 'a' or 'w'), and the name of
- * a whole hole's attribute. */
+/* The hole kinds of a template, in order ('c', 'a', 'w', 'k' or 'r'), and
+ * the name a 'w' or 'k' hole's attribute, or an 'r' hole's element, has. */
 int64_t turdom_tpl_hole_count(const char *tpl) {
     int64_t k = 0;
     for (const char *p = tpl; (p = strchr(p, '\x01')); p++) k++;
@@ -281,11 +435,12 @@ int turdom_tpl_hole_kind(const char *tpl, int64_t i) {
     return m ? (unsigned char)m[1] : 0;
 }
 
-/* Does whole hole i belong to the attribute `name`?  ASCII case-insensitive
- * in HTML, where the parser lower-cases attribute names. */
+/* Does hole i (a 'w' or 'k' hole: an attribute; an 'r' hole: an element)
+ * name `name`?  ASCII case-insensitive in HTML, where the parser lower-cases
+ * names. */
 int turdom_tpl_hole_attr_is(const char *tpl, int64_t i, const char *name) {
     const char *m = nth_marker(tpl, i);
-    if (!m || m[1] != 'w' || !name) return 0;
+    if (!m || (m[1] != 'w' && m[1] != 'k' && m[1] != 'r') || !name) return 0;
     const char *a = m + 2, *e = strchr(a, '\x02');
     size_t n = e ? (size_t)(e - a) : strlen(a);
     if (strlen(name) != n) return 0;
@@ -458,11 +613,30 @@ char *turdom_tpl_verify(const char *tpl, const turdom_node *top) {
                     if (k >= n) { add_err(e, "unknown hole marker in an attribute", -1); continue; }
                     int hk = turdom_tpl_hole_kind(tpl, k);
                     if (hk == 'c') add_err(e, "is a content hole but parsed inside an attribute", k);
+                    else if (hk == 'r') add_err(e, "is a <script>/<style> hole but parsed inside an attribute", k);
                     else if (hk == 'w' && !(turdom_tpl_is_hole_ref(av, k) &&
                                             turdom_tpl_hole_attr_is(tpl, k, an)))
                         add_err(e, "is a whole attribute value but parsed differently", k);
+                    else if (hk == 'k' && !turdom_tpl_hole_attr_is(tpl, k, an))
+                        add_err(e, "is a code hole of another attribute than the one it parsed in", k);
                     seen[k]++;
                 }
+            }
+        } else if (kind == TURDOM_TEXT && has_ref(turdom_value(x))) {
+            /* Only a code hole in a <script> or <style> body may be text, and
+             * only in the element the macro read it in, as HTML. */
+            const turdom_node *p = turdom_parent(x);
+            const char *pn = (p && turdom_kind(p) == TURDOM_ELEMENT) ? turdom_local_name(p) : NULL;
+            const char *pu = p ? turdom_ns_uri(p) : NULL;
+            int html_el = !pu || strcmp(pu, "http://www.w3.org/1999/xhtml") == 0;
+            const char *v = turdom_value(x);
+            int64_t at = 0, k;
+            while ((k = turdom_tpl_next_hole_ref(v, &at)) >= 0) {
+                if (k >= n) { add_err(e, "unknown hole marker in text", -1); continue; }
+                if (turdom_tpl_hole_kind(tpl, k) != 'r' || !pn || !html_el ||
+                    !turdom_tpl_hole_attr_is(tpl, k, pn))
+                    add_err(e, "turned up as text (raw text, or markup the tokenizer misread)", k);
+                seen[k]++;
             }
         } else if (has_ref(turdom_value(x)) || has_ref(turdom_name(x)) ||
                    has_ref(turdom_public_id(x)) || has_ref(turdom_system_id(x))) {

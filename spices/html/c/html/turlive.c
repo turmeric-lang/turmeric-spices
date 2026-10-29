@@ -56,6 +56,7 @@ extern void         turdom_remove(turdom_node *);
 extern int          turdom_edit_set_attr(turdom_node *, const char *, const char *,
                                          const char *, size_t);
 extern int          turdom_remove_attr(turdom_node *, const char *);
+extern int          turdom_set_value(turdom_node *, const char *, size_t);
 extern int          turdom_check_subtree(const turdom_doc *, const turdom_node *);
 
 extern char        *turdom_tpl_check_markup(const char *);
@@ -144,8 +145,12 @@ char *turlive_html_string(const turlive_html *h) {
         int kind = turdom_tpl_hole_kind(h->tpl, i);
         if (kind == 'c') {
             turdom_mbuf_put(b, h->str[i]);
-        } else if (kind == 'a') {
+        } else if (kind == 'a' || kind == 'k') {
             turdom_mbuf_put_escaped(b, h->str[i], 1, 1);
+        } else if (kind == 'r') {
+            /* a code hole in a <script>/<style> body: escaped for its
+             * language, and checked, when the snapshot was taken */
+            turdom_mbuf_put(b, h->str[i]);
         } else {
             turdom_tpl_whole_attr(b, h->tpl, pos, h->state[i], h->str[i], 1);
         }
@@ -162,6 +167,7 @@ typedef struct group {
     char *name;     /* the attribute's name as parsed */
     char *tpl;      /* its value with __tur_hole_N__ markers */
     int whole;      /* one whole-value hole */
+    int text;       /* el is the text of a <script>/<style> with code holes */
     int dirty;
 } group;
 
@@ -253,7 +259,8 @@ static void apply_group(turlive_inst *t, int64_t g) {
         if (k < 0) break;
     }
     v[n] = '\0';
-    turdom_edit_set_attr(gr->el, gr->name, NULL, v, n);
+    if (gr->text) turdom_set_value(gr->el, v, n);
+    else turdom_edit_set_attr(gr->el, gr->name, NULL, v, n);
     free(v);
 }
 
@@ -311,6 +318,19 @@ turlive_inst *turlive_mount(const turlive_html *h) {
                                      : "template";
                 t->ctx[k] = xdup(pn);
             }
+        } else if (kind == TEXT_KIND) {
+            /* code holes in a <script> or <style> body (plan A6): the text
+             * is one group, rebuilt from its holes like an attribute's value */
+            const char *v = turdom_value(x);
+            if (!v || !strstr(v, "__tur_hole_")) continue;
+            int64_t g = t->ngroups++;
+            group *gr = &t->groups[g];
+            gr->el = x;
+            gr->text = 1;
+            gr->tpl = xdup(v);
+            int64_t at = 0, k;
+            while ((k = turdom_tpl_next_hole_ref(v, &at)) >= 0)
+                if (k < t->n) t->grp[k] = g;
         } else if (kind == ELEMENT_KIND) {
             int64_t na = turdom_attr_count(x);
             for (int64_t a = 0; a < na; a++) {

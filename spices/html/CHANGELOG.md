@@ -4,6 +4,11 @@
 
 ### Added
 
+- `#html{...}` holes in code (follow-up A6): in `onclick="..."` and the
+  other `on*` attributes, `<script>` (JavaScript and JSON) bodies, `style`
+  attributes, `<style>` bodies and a whole `srcdoc` value, each escaped for
+  its language first. Live literals take them too. `fixtures/browser.sh`
+  checks them in headless Chromium where node and playwright are installed.
 - `html/markup` (xml-html-followups-plan follow-up A1-A2): `#html{...}`
   markup literals with `${...}` holes, escaped by construction, rendering
   to a `Fragment` with no tree built. A hole's position picks what it may

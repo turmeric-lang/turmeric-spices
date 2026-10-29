@@ -15,10 +15,33 @@
 ;;;   ToUrlAttr  cstr, String -- scheme-checked, then escaped; TrustedUrl --
 ;;;              escaped, not checked, see `trusted-url`; (Option T)
 ;;;
+;;; Holes in code (plan A6; HTML only): in an `on*` attribute or a `<script>`
+;;; body the macro reads the JavaScript around the hole --
+;;;
+;;;   ToJs       expression position: int, bool, cstr, String, (Option T)
+;;;              (None is `null`) as a JavaScript literal; TrustedJs as code
+;;;   ToCodeText inside a quoted JavaScript string: cstr, String, int, each
+;;;              character JS-escaped (< too, so no </script)
+;;;
+;;; -- and in a `style` attribute or a `<style>` body, the CSS:
+;;;
+;;;   ToCss      a property value: int; cstr / String kept only when every
+;;;              character is a letter, a digit or one of `# . - _ % ,` and
+;;;              space (else `tur-unsafe`, which the browser drops);
+;;;              TrustedCss as written
+;;;   ToCodeText inside a quoted CSS string: escaped to \HEX
+;;;   ToUrlAttr  inside url(...): scheme-checked, then percent-encoded
+;;;
+;;; and `srcdoc="${x}"` takes ToSrcdoc: a Fragment's markup, a cstr / String
+;;; as text, or a RawHtml's markup live in the iframe. Every other position
+;;; in code (a template literal, a comment, a regex, after an ambiguous `/`, a
+;;; selector, a property name) is a compile error.
+;;;
 ;;; A Node or a Fragment in attribute position has no instance, so it is a
 ;;; type error at the hole. Escaping is by construction: the only ways to put
 ;;; unescaped markup in are `raw-html` and nested literals, and the only way
-;;; around the URL check is `trusted-url` -- both greppable.
+;;; around the URL check is `trusted-url` -- both greppable, as are
+;;; `trusted-js` and `trusted-css` for code.
 ;;;
 ;;; Memory: a Fragment owns its markup (malloc'd). Splicing it into another
 ;;; literal copies it; `fragment-free` releases one that is done with.
@@ -45,6 +68,17 @@
     Hole
     HoleChild
     HoleAttr
+    HoleCode
+    TrustedJs
+    TrustedCss
+    trusted-js
+    trusted-css
+    hole-code
+    js-string-escape
+    js-pad
+    css-string-escape
+    css-url-escape
+    template-code-ok?
     raw-html
     raw-html-markup
     trusted-url
@@ -76,6 +110,10 @@
   (defopaque RawHtml :ptr<void>)
   ;;; TrustedUrl -- a URL a caller vouches for; see `trusted-url`.
   (defopaque TrustedUrl :ptr<void>)
+  ;;; TrustedJs -- JavaScript a caller vouches for; see `trusted-js`.
+  (defopaque TrustedJs :ptr<void>)
+  ;;; TrustedCss -- CSS a caller vouches for; see `trusted-css`.
+  (defopaque TrustedCss :ptr<void>)
   ;;; Child -- what a content hole renders: text to escape, markup of either
   ;;; flavour, raw markup to parse in the hole's context, several of those in
   ;;; order, or nothing.
@@ -91,12 +129,15 @@
   ;;; (`AttrOff`). Absent drops the whole attribute when the hole is its whole
   ;;; value; inside a larger value, on renders `true` and off nothing.
   (defdata ^copy AttrVal (AttrText cstr) (AttrTrusted cstr) (AttrOn) (AttrOff))
-  ;;; Hole -- one hole's value, as the renderer receives it.
-  (defdata ^copy Hole (HoleChild Child) (HoleAttr AttrVal))
+  ;;; Hole -- one hole's value, as the renderer receives it. `HoleCode` is a
+  ;;; code hole's value, already escaped for JavaScript or CSS (plan A6).
+  (defdata ^copy Hole (HoleChild Child) (HoleAttr AttrVal) (HoleCode cstr))
   ;;; hole-child -- internal: a content hole (what the macro emits).
   (defn hole-child [c : Child] : Hole (HoleChild c))
   ;;; hole-attr -- internal: an attribute hole (what the macro emits).
   (defn hole-attr [a : AttrVal] : Hole (HoleAttr a))
+  ;;; hole-code -- internal: a code hole, its value escaped for its language.
+  (defn hole-code [s : cstr] : Hole (HoleCode s))
   ;; ---------------------------------------------------------------------------
   ;; Raw helpers
   ;; ---------------------------------------------------------------------------
@@ -427,6 +468,229 @@
   (definstance ToUrlAttr [(Option A)]
     [(ToUrlAttr A)]
     (to-url-attr [x] (match x (Some v) (to-url-attr v) (None) (AttrOff))))
+  ;; ---------------------------------------------------------------------------
+  ;; Code holes (plan A6)
+  ;; ---------------------------------------------------------------------------
+  ;;; trusted-js -- JavaScript code the caller vouches for.
+  ;;;
+  ;;; UNSAFE for anything built from untrusted input: in a code hole it is
+  ;;; written as code, after only the attribute escaping (and, in a `<script>`
+  ;;; body, a check that it cannot end the element).
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the code (copied)
+  ;;;
+  ;;; Returns:
+  ;;;   TrustedJs
+  ;;;
+  ;;; Example:
+  ;;;   #html{<button onclick="${(trusted-js "history.back()")}">back</button>}
+  ;;;
+  ;;; Since: 0.3.0
+  (defn trusted-js [s : cstr] : TrustedJs (:: (__as-ptr (__dup s)) TrustedJs))
+  ;;; trusted-css -- CSS the caller vouches for.
+  ;;;
+  ;;; UNSAFE for anything built from untrusted input: in a CSS value hole it is
+  ;;; written as it is, after only the attribute escaping (and, in a `<style>`
+  ;;; body, a check that it cannot end the element).
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the CSS (copied)
+  ;;;
+  ;;; Returns:
+  ;;;   TrustedCss
+  ;;;
+  ;;; Example:
+  ;;;   #html{<p style="background: ${(trusted-css "linear-gradient(red, blue)")}">x</p>}
+  ;;;
+  ;;; Since: 0.3.0
+  (defn trusted-css [s : cstr] : TrustedCss
+    (:: (__as-ptr (__dup s)) TrustedCss))
+  ;;; js-string-escape -- text for the inside of a JavaScript string literal.
+  ;;;
+  ;;; Backslash, both quotes, backtick, `< > & =`, C0 controls, DEL and U+2028
+  ;;; / U+2029 become `\uXXXX`.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the text
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- malloc'd
+  ;;;
+  ;;; Example:
+  ;;;   (js-string-escape "a'b")   ; => "a\u0027b"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn js-string-escape [s : cstr] : cstr
+    ```c
+    extern char *turdom_js_string_escape(const char *);
+  return turdom_js_string_escape((const char *)s);
+  ```)
+  ;;; __js-quote -- internal: a double-quoted JavaScript string literal.
+  (defn __js-quote [s : cstr] : cstr
+    ```c
+    extern char *turdom_js_quote(const char *);
+  return turdom_js_quote((const char *)s);
+  ```)
+  ;;; js-pad -- internal: a JavaScript value with a space on each side.
+  (defn js-pad [s : cstr] : cstr
+    ```c
+    extern char *turdom_js_pad(const char *);
+  return turdom_js_pad((const char *)s);
+  ```)
+  ;;; __css-value -- internal: text as a CSS value, or tur-unsafe.
+  (defn __css-value [s : cstr] : cstr
+    ```c
+    extern const char *turdom_css_value(const char *);
+  return turdom_css_value((const char *)s);
+  ```)
+  ;;; css-string-escape -- text for the inside of a quoted CSS string.
+  ;;;
+  ;;; Every character but an ASCII letter or digit becomes `\HEX ` .
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the text
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- malloc'd
+  ;;;
+  ;;; Example:
+  ;;;   (css-string-escape "a<b")   ; => "a\3c b"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn css-string-escape [s : cstr] : cstr
+    ```c
+    extern char *turdom_css_string_escape(const char *);
+  return turdom_css_string_escape((const char *)s);
+  ```)
+  ;;; __css-url-raw -- internal.
+  (defn __css-url-raw [s : cstr] : cstr
+    ```c
+    extern char *turdom_css_url_escape(const char *);
+  return turdom_css_url_escape((const char *)s);
+  ```)
+  ;;; css-url-escape -- a checked URL for the inside of CSS `url(...)`.
+  ;;;
+  ;;; Takes what `to-url-attr` gives (so the scheme is checked unless the URL
+  ;;; is a TrustedUrl) and percent-encodes parens, quotes, whitespace, `\`
+  ;;; and `< >`.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the URL, through `to-url-attr`
+  ;;;
+  ;;; Returns:
+  ;;;   cstr -- malloc'd
+  ;;;
+  ;;; Example:
+  ;;;   (css-url-escape (to-url-attr "/a b.png"))   ; => "/a%20b.png"
+  ;;;
+  ;;; Since: 0.3.0
+  (defn css-url-escape [a : AttrVal] : cstr
+    (match a
+      (AttrText s)
+      (__css-url-raw s)
+      (AttrTrusted s)
+      (__css-url-raw s)
+      (AttrOn)
+      ""
+      (AttrOff)
+      ""))
+  ;;; __html-text -- internal: text escaped as HTML content, malloc'd.
+  (defn __html-text [s : cstr] : cstr
+    (let [b (__mb-new)] (__mb-put-esc b s false true) (__mb-finish b)))
+  ;;; ToJs -- a value that can fill a JavaScript hole in expression position.
+  ;;;
+  ;;; Parameters:
+  ;;;   T -- the value's type
+  ;;;
+  ;;; Methods:
+  ;;;   to-js -- the value as a JavaScript literal (TrustedJs: as code)
+  ;;;
+  ;;; Example:
+  ;;;   #html{<button onclick="pick(${id}, ${name})">x</button>}
+  ;;;
+  ;;; Since: 0.3.0
+  (defclass ToJs [T] (to-js [x : T] : cstr))
+  ;;; ToJs [int] -- a decimal number.
+  (definstance ToJs [int] (to-js [x] (__itoa x)))
+  ;;; ToJs [bool] -- true or false.
+  (definstance ToJs [bool] (to-js [x] (if x "true" "false")))
+  ;;; ToJs [cstr] -- a double-quoted string, every risky character escaped.
+  (definstance ToJs [cstr] (to-js [x] (__js-quote x)))
+  ;;; ToJs [String] -- a double-quoted string.
+  (definstance ToJs [String] (to-js [x] (__js-quote (to-cstr x))))
+  ;;; ToJs [TrustedJs] -- the code itself.
+  (definstance ToJs [TrustedJs] (to-js [x] (__as-cstr (:: x ptr<void>))))
+  ;;; ToJs [(Option A)] -- null, or the value.
+  (definstance ToJs [(Option A)]
+    [(ToJs A)]
+    (to-js [x] (match x (Some v) (to-js v) (None) "null")))
+  ;;; ToCodeText -- a value that can fill a hole inside a quoted JavaScript or
+  ;;; CSS string.
+  ;;;
+  ;;; Parameters:
+  ;;;   T -- the value's type
+  ;;;
+  ;;; Methods:
+  ;;;   to-code-text -- the value as text (escaped by the hole's language)
+  ;;;
+  ;;; Example:
+  ;;;   #html{<button onclick="say('hi, ${name}')">x</button>}
+  ;;;
+  ;;; Since: 0.3.0
+  (defclass ToCodeText [T] (to-code-text [x : T] : cstr))
+  ;;; ToCodeText [cstr] -- as it is.
+  (definstance ToCodeText [cstr] (to-code-text [x] x))
+  ;;; ToCodeText [String] -- its text.
+  (definstance ToCodeText [String] (to-code-text [x] (to-cstr x)))
+  ;;; ToCodeText [int] -- decimal text.
+  (definstance ToCodeText [int] (to-code-text [x] (__itoa x)))
+  ;;; ToCss -- a value that can fill a CSS property-value hole.
+  ;;;
+  ;;; Parameters:
+  ;;;   T -- the value's type
+  ;;;
+  ;;; Methods:
+  ;;;   to-css -- the value as CSS (text filtered; TrustedCss as written)
+  ;;;
+  ;;; Example:
+  ;;;   #html{<p style="color: ${c}; width: ${w}px">x</p>}
+  ;;;
+  ;;; Since: 0.3.0
+  (defclass ToCss [T] (to-css [x : T] : cstr))
+  ;;; ToCss [int] -- a decimal number.
+  (definstance ToCss [int] (to-css [x] (__itoa x)))
+  ;;; ToCss [cstr] -- kept when it is only letters, digits and `# . - _ % ,`
+  ;;; and space; otherwise `tur-unsafe`.
+  (definstance ToCss [cstr] (to-css [x] (__css-value x)))
+  ;;; ToCss [String] -- as cstr.
+  (definstance ToCss [String] (to-css [x] (__css-value (to-cstr x))))
+  ;;; ToCss [TrustedCss] -- as written.
+  (definstance ToCss [TrustedCss] (to-css [x] (__as-cstr (:: x ptr<void>))))
+  ;;; ToSrcdoc -- a value that can be an iframe's whole `srcdoc`.
+  ;;;
+  ;;; Parameters:
+  ;;;   T -- the value's type
+  ;;;
+  ;;; Methods:
+  ;;;   to-srcdoc -- the document's markup (attribute-escaped when written)
+  ;;;
+  ;;; Example:
+  ;;;   #html{<iframe srcdoc="${#html{<p>${x}</p>}}"></iframe>}
+  ;;;
+  ;;; Since: 0.3.0
+  (defclass ToSrcdoc [T] (to-srcdoc [x : T] : AttrVal))
+  ;;; ToSrcdoc [Fragment] -- the fragment's markup.
+  (definstance ToSrcdoc [Fragment]
+    (to-srcdoc [x] (AttrTrusted (html->string x))))
+  ;;; ToSrcdoc [cstr] -- text in the iframe, never markup.
+  (definstance ToSrcdoc [cstr] (to-srcdoc [x] (AttrTrusted (__html-text x))))
+  ;;; ToSrcdoc [String] -- text in the iframe.
+  (definstance ToSrcdoc [String]
+    (to-srcdoc [x] (AttrTrusted (__html-text (to-cstr x)))))
+  ;;; ToSrcdoc [RawHtml] -- markup live in the iframe, as raw-html asks.
+  (definstance ToSrcdoc [RawHtml]
+    (to-srcdoc [x] (AttrTrusted (raw-html-markup x))))
   ;;; RenderHtml -- a value that is a whole HTML response body.
   ;;;
   ;;; What a web framework takes to answer with HTML (tourist's
@@ -559,6 +823,42 @@
         (__mb-put b "true")
         (AttrOff)
         nil)))
+  ;;; template-code-ok? -- may s fill code hole i of tpl as it is?
+  ;;;
+  ;;; Internal to the markup literals: a hole in a `<script>` or `<style>`
+  ;;; body must not hold that element's end tag (nor, in a script, `<!--`).
+  ;;; The escapers never produce one; a TrustedJs / TrustedCss value can.
+  ;;;
+  ;;; Parameters:
+  ;;;   tpl -- the template
+  ;;;   i   -- the hole's index
+  ;;;   s   -- the hole's escaped value
+  ;;;
+  ;;; Returns:
+  ;;;   bool
+  ;;;
+  ;;; Example:
+  ;;;   (template-code-ok? tpl 0 "</script>")   ; => false
+  ;;;
+  ;;; Since: 0.3.0
+  (defn template-code-ok? [tpl : cstr i : int s : cstr] : bool
+    ```c
+    extern int turdom_code_ok(const char *, int64_t, const char *);
+  return turdom_code_ok((const char *)tpl, i, (const char *)s) != 0;
+  ```)
+  ;;; __render-code -- internal: a code hole's value, in its marker's layer.
+  (defn __render-code [b : ptr<void>
+                       tpl : cstr
+                       pos : int
+                       i : int
+                       s : cstr
+                       html : bool] : nil
+    (let [k (__tpl-kind tpl pos)]
+      (cond (= k 107) (__mb-put-esc b s true html)
+            (= k 114) (if (template-code-ok? tpl i s)
+                        (__mb-put b s)
+                        (panic "a TrustedJs or TrustedCss value holds its element's end tag (or, in a <script>, <!--); it would end the element early"))
+            :else     (panic "markup literal: a code value in a hole that is not a code hole"))))
   ;;; __render-loop -- internal: static text and holes, in order.
   (defn __render-loop [b : ptr<void>
                        tpl : cstr
@@ -577,7 +877,9 @@
               (HoleChild c)
               (__render-child b tpl i c html raw-fix)
               (HoleAttr a)
-              (__render-attr b tpl m a html))
+              (__render-attr b tpl m a html)
+              (HoleCode s)
+              (__render-code b tpl m i s html))
             (__render-loop b
               tpl
               (__tpl-after tpl m)
