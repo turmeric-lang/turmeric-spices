@@ -16,7 +16,12 @@
 (defmodule simd/bench
   (import simd/kernels
     :refer
-    [Biquad simd-lowering simd-dot-f64 simd-dot-f64x4 simd-blend-u8! simd-biquad4-f32!])
+    [Biquad
+     simd-lowering
+     simd-dot-f64
+     simd-dot-f64x4
+     simd-blend-u8!
+     simd-biquad4-f32!])
   (defn now-ns [] : int
     ```c
     #include <time.h>
@@ -44,40 +49,53 @@
           ^mut i 0
           ^mut s 0.0]
       (while (< i n)
-        (set! s {s + {(unsafe (f64vec-ref-unchecked a i)) * (unsafe (f64vec-ref-unchecked b i))}})
-        (set! i {i + 1}))
+        (set! s
+          (+ s
+            (* (unsafe (f64vec-ref-unchecked a i))
+              (unsafe (f64vec-ref-unchecked b i)))))
+        (set! i (+ i 1)))
       s))
   (defn time-dot [which : int] : float
     (let [n         4096
           reps      20000
-          a         (f64vec-build n [i] {(as float (mod i 97)) * 0.0371})
-          b         (f64vec-build n [i] {(as float (mod i 89)) * 0.0119})
-          ^mut best 1e18
+          a         (f64vec-build n [i] (* (as float (mod i 97)) 0.0371))
+          b         (f64vec-build n [i] (* (as float (mod i 89)) 0.0119))
+          ^mut best 1e+18
           ^mut t    0]
       (while (< t 5)
         (let [t0     (now-ns)
               ^mut r 0
               ^mut s 0.0]
           (while (< r reps)
-            (set! s {s + (if (= which 0)
-                           (simd-dot-f64 a b)
-                           (if (= which 1)
-                             (f64vec-dot a b)
-                             (if (= which 2) (dot-scalar a b) (simd-dot-f64x4 a b))))})
-            (set! r {r + 1}))
+            (set! s
+              (+ s
+                (if (= which 0)
+                  (simd-dot-f64 a b)
+                  (if (= which 1)
+                    (f64vec-dot a b)
+                    (if (= which 2) (dot-scalar a b) (simd-dot-f64x4 a b))))))
+            (set! r (+ r 1)))
           (sink s)
-          (let [dt (as float {(now-ns) - t0})]
+          (let [dt (as float (- (now-ns) t0))]
             (when (< dt best) (set! best dt))))
-        (set! t {t + 1}))
-      {best / (as float {n * reps})}))
+        (set! t (+ t 1)))
+      (/ best (as float (* n reps)))))
   ;; --- blend: 65536 bytes, 2000 passes ---
-  (defn blend-scalar! [^borrow out : U8Vec ^borrow a : U8Vec ^borrow b : U8Vec alpha : int] : nil
+  (defn blend-scalar! [^borrow out : U8Vec
+                       ^borrow a : U8Vec
+                       ^borrow b : U8Vec
+                       alpha : int] : nil
     (u8vec-for-index [i x a]
       (let [y (as int (unsafe (u8vec-ref-unchecked b i)))
-            t {{{(as int x) * alpha} + {y * {255 - alpha}}} + 128}]
-        (unsafe (u8vec-set-unchecked! out i (as uint8 (bit-shr {t + (bit-shr t 8)} 8)))))))
-;; the same blend as plain scalar C, for gcc/clang's own auto-vectorizer
-  (defn blend-c! [^borrow out : U8Vec ^borrow a : U8Vec ^borrow b : U8Vec alpha : int] : nil
+            t (+ (+ (* (as int x) alpha) (* y (- 255 alpha))) 128)]
+        (unsafe (u8vec-set-unchecked! out
+                  i
+                  (as uint8 (bit-shr (+ t (bit-shr t 8)) 8)))))))
+  ;; the same blend as plain scalar C, for gcc/clang's own auto-vectorizer
+  (defn blend-c! [^borrow out : U8Vec
+                  ^borrow a : U8Vec
+                  ^borrow b : U8Vec
+                  alpha : int] : nil
     ```c
     struct { int64_t len; uint8_t *data; void *raw; } *o = (void*)(intptr_t)out;
   struct { int64_t len; uint8_t *data; void *raw; } *p = (void*)(intptr_t)a;
@@ -96,37 +114,40 @@
           a         (u8vec-build n [i] (as uint8 (mod (* i 89) 256)))
           b         (u8vec-build n [i] (as uint8 (mod (* i 53) 256)))
           out       (u8vec-new n (as uint8 0))
-          ^mut best 1e18
+          ^mut best 1e+18
           ^mut t    0]
       (while (< t 5)
         (let [t0     (now-ns)
               ^mut r 0]
           (while (< r reps)
             (if (= which 0)
-              (simd-blend-u8! out a b (as uint8 {(mod r 200) + 20}))
+              (simd-blend-u8! out a b (as uint8 (+ (mod r 200) 20)))
               (if (= which 1)
-                (blend-scalar! out a b {(mod r 200) + 20})
-                (blend-c! out a b {(mod r 200) + 20})))
-            (set! r {r + 1}))
+                (blend-scalar! out a b (+ (mod r 200) 20))
+                (blend-c! out a b (+ (mod r 200) 20))))
+            (set! r (+ r 1)))
           (sink (as float (u8vec-ref out 7)))
-          (let [dt (as float {(now-ns) - t0})]
+          (let [dt (as float (- (now-ns) t0))]
             (when (< dt best) (set! best dt))))
-        (set! t {t + 1}))
-      {best / (as float {n * reps})}))
+        (set! t (+ t 1)))
+      (/ best (as float (* n reps)))))
   ;; --- biquad: 4 channels x 16384 frames, 400 passes ---
-  (defn biquad-scalar! [^borrow buf : F32Vec ^borrow z : F32Vec ch : int c : Biquad] : nil
+  (defn biquad-scalar! [^borrow buf : F32Vec
+                        ^borrow z : F32Vec
+                        ch : int
+                        c : Biquad] : nil
     (let [n      (f32vec-len buf)
           ^mut i ch]
       (while (< i n)
         (let [x  (f32vec-ref buf i)
-              z1 (f32vec-ref z {2 * ch})
-              z2 (f32vec-ref z {{2 * ch} + 1})
-              y  {{(.b0 c) * x} + z1}]
-          (f32vec-set! z {2 * ch} {{{(.b1 c) * x} - {(.a1 c) * y}} + z2})
-          (f32vec-set! z {{2 * ch} + 1} {{(.b2 c) * x} - {(.a2 c) * y}})
+              z1 (f32vec-ref z (* 2 ch))
+              z2 (f32vec-ref z (+ (* 2 ch) 1))
+              y  (+ (* (.b0 c) x) z1)]
+          (f32vec-set! z (* 2 ch) (+ (- (* (.b1 c) x) (* (.a1 c) y)) z2))
+          (f32vec-set! z (+ (* 2 ch) 1) (- (* (.b2 c) x) (* (.a2 c) y)))
           (f32vec-set! buf i y))
-        (set! i {i + 4}))))
-;; the four channels written out side by side in scalar C, for the
+        (set! i (+ i 4)))))
+  ;; the four channels written out side by side in scalar C, for the
   ;; auto-vectorizer (SLP) to find the lanes itself
   (defn biquad-c! [^borrow buf : F32Vec ^borrow state : F32Vec c : Biquad] : nil
     ```c
@@ -151,13 +172,19 @@
   ```)
   (defn time-biquad [which : int] : float
     (let [frames    16384
-          n         {frames * 4}
+          n         (* frames 4)
           reps      400
-          c         (Biquad (as float32 0.0675) (as float32 0.135) (as float32 0.0675)
-                            (as float32 -1.1429) (as float32 0.4128))
-          v         (f32vec-build n [i] (as float32 {{(as float (mod (* i 37) 101)) * 0.0371} - 1.25}))
+          c         (Biquad (as float32 0.0675)
+                      (as float32 0.135)
+                      (as float32 0.0675)
+                      (as float32 -1.1429)
+                      (as float32 0.4128))
+          v         (f32vec-build n
+                      [i]
+                      (as float32
+                        (- (* (as float (mod (* i 37) 101)) 0.0371) 1.25)))
           st        (f32vec-new 8 (as float32 0.0))
-          ^mut best 1e18
+          ^mut best 1e+18
           ^mut t    0]
       (while (< t 5)
         (let [t0     (now-ns)
@@ -168,15 +195,13 @@
               (if (= which 2)
                 (biquad-c! v st c)
                 (let [^mut ch 0]
-                (while (< ch 4)
-                  (biquad-scalar! v st ch c)
-                  (set! ch {ch + 1})))))
-            (set! r {r + 1}))
+                  (while (< ch 4) (biquad-scalar! v st ch c) (set! ch (+ ch 1))))))
+            (set! r (+ r 1)))
           (sink (as float (f32vec-ref v 5)))
-          (let [dt (as float {(now-ns) - t0})]
+          (let [dt (as float (- (now-ns) t0))]
             (when (< dt best) (set! best dt))))
-        (set! t {t + 1}))
-      {best / (as float {n * reps})}))
+        (set! t (+ t 1)))
+      (/ best (as float (* n reps)))))
   (defn main [] : int
     (note (simd-lowering))
     (row "dot f64: simd-dot-f64 (f64x2)" (time-dot 0))

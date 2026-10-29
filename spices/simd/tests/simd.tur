@@ -5,12 +5,19 @@
 ;;; failed), as linalg's.  Floats are compared as bit patterns, never with a
 ;;; tolerance: the kernels promise the scalar arithmetic in the scalar order.
 (load "stdlib/numvec.tur")
+
 (load "stdlib/bits.tur")
 
 (defmodule simd/kernels-test
   (import simd/kernels
     :refer
-    [Biquad simd-lowering simd-dot-f64 simd-dot-f64x4 simd-dot-f32 simd-blend-u8! simd-biquad4-f32!])
+    [Biquad
+     simd-lowering
+     simd-dot-f64
+     simd-dot-f64x4
+     simd-dot-f32
+     simd-blend-u8!
+     simd-biquad4-f32!])
   ;; --- TAP harness (inline-C fail counter) ---
   (defn check [idx : int name : cstr ok : bool] : void
     ```c
@@ -34,27 +41,31 @@
   ```)
   ;; two arrays of n elements with fractional, mixed-sign values
   (defn f64-a [n : int] : F64Vec
-    (f64vec-build n [i] {{(as float (mod (* i 37) 101)) * 0.0371} - 1.25}))
+    (f64vec-build n [i] (- (* (as float (mod (* i 37) 101)) 0.0371) 1.25)))
   (defn f64-b [n : int] : F64Vec
-    (f64vec-build n [i] {{(as float (mod (* i 13) 29)) * 0.1171} - 0.5}))
+    (f64vec-build n [i] (- (* (as float (mod (* i 13) 29)) 0.1171) 0.5)))
   (defn f32-a [n : int] : F32Vec
-    (f32vec-build n [i] (as float32 {{(as float (mod (* i 37) 101)) * 0.0371} - 1.25})))
+    (f32vec-build n
+      [i]
+      (as float32 (- (* (as float (mod (* i 37) 101)) 0.0371) 1.25))))
   (defn f32-b [n : int] : F32Vec
-    (f32vec-build n [i] (as float32 {{(as float (mod (* i 13) 29)) * 0.1171} - 0.5})))
+    (f32vec-build n
+      [i]
+      (as float32 (- (* (as float (mod (* i 13) 29)) 0.1171) 0.5))))
   (defn dot-f64-same? [n : int] : bool
     (let [a (f64-a n)
           b (f64-b n)]
       (and (= (float->bits (simd-dot-f64 a b)) (float->bits (f64vec-dot a b)))
-           (= (float->bits (simd-dot-f64x4 a b)) (float->bits (f64vec-dot a b))))))
+        (= (float->bits (simd-dot-f64x4 a b)) (float->bits (f64vec-dot a b))))))
   (defn dot-f32-same? [n : int] : bool
     (let [a (f32-a n)
           b (f32-b n)]
       (= (float->bits (as float (simd-dot-f32 a b)))
-         (float->bits (as float (f32vec-dot a b))))))
+        (float->bits (as float (f32vec-dot a b))))))
   ;; the blend's scalar result, the formula the kernel documents
   (defn blend-byte [x : int y : int alpha : int] : int
-    (let [t {{(* x alpha) + (* y {255 - alpha})} + 128}]
-      (bit-shr {t + (bit-shr t 8)} 8)))
+    (let [t (+ (+ (* x alpha) (* y (- 255 alpha))) 128)]
+      (bit-shr (+ t (bit-shr t 8)) 8)))
   (defn blend-same? [n : int alpha : int] : bool
     (let [a   (u8vec-build n [i] (as uint8 (mod (* i 89) 256)))
           b   (u8vec-build n [i] (as uint8 (mod (* i 53) 256)))
@@ -64,37 +75,45 @@
             ^mut i  0]
         (while (< i n)
           (when (not (= (as int (u8vec-ref out i))
-                        (blend-byte (as int (u8vec-ref a i)) (as int (u8vec-ref b i)) alpha)))
+                       (blend-byte (as int (u8vec-ref a i))
+                         (as int (u8vec-ref b i))
+                         alpha)))
             (set! ok false))
-          (set! i {i + 1}))
+          (set! i (+ i 1)))
         ok)))
   ;; one scalar biquad over channel ch of an interleaved buffer, DF2T, each
   ;; product its own value, state in z (z1 then z2 at 2*ch, 2*ch + 1)
-  (defn biquad-scalar! [^borrow buf : F32Vec ^borrow z : F32Vec ch : int c : Biquad] : nil
+  (defn biquad-scalar! [^borrow buf : F32Vec
+                        ^borrow z : F32Vec
+                        ch : int
+                        c : Biquad] : nil
     (let [n      (f32vec-len buf)
           ^mut i ch]
       (while (< i n)
         (let [x  (f32vec-ref buf i)
-              z1 (f32vec-ref z {2 * ch})
-              z2 (f32vec-ref z {{2 * ch} + 1})
-              m  {(.b0 c) * x}
-              y  {m + z1}
-              p  {(.b1 c) * x}
-              q  {(.a1 c) * y}
-              u  {(.b2 c) * x}
-              w  {(.a2 c) * y}]
-          (f32vec-set! z {2 * ch} {{p - q} + z2})
-          (f32vec-set! z {{2 * ch} + 1} {u - w})
+              z1 (f32vec-ref z (* 2 ch))
+              z2 (f32vec-ref z (+ (* 2 ch) 1))
+              m  (* (.b0 c) x)
+              y  (+ m z1)
+              p  (* (.b1 c) x)
+              q  (* (.a1 c) y)
+              u  (* (.b2 c) x)
+              w  (* (.a2 c) y)]
+          (f32vec-set! z (* 2 ch) (+ (- p q) z2))
+          (f32vec-set! z (+ (* 2 ch) 1) (- u w))
           (f32vec-set! buf i y))
-        (set! i {i + 4}))))
+        (set! i (+ i 4)))))
   (defn biquad-same? [frames : int] : bool
-    (let [n     {frames * 4}
-          c     (Biquad (as float32 0.0675) (as float32 0.135) (as float32 0.0675)
-                        (as float32 -1.1429) (as float32 0.4128))
-          v     (f32-a n)
-          s     (f32-a n)
-          st    (f32vec-new 8 (as float32 0.0))
-          zs    (f32vec-new 8 (as float32 0.0))]
+    (let [n  (* frames 4)
+          c  (Biquad (as float32 0.0675)
+               (as float32 0.135)
+               (as float32 0.0675)
+               (as float32 -1.1429)
+               (as float32 0.4128))
+          v  (f32-a n)
+          s  (f32-a n)
+          st (f32vec-new 8 (as float32 0.0))
+          zs (f32vec-new 8 (as float32 0.0))]
       ;; twice, so the state carried between calls is checked too
       (simd-biquad4-f32! v st c)
       (simd-biquad4-f32! v st c)
@@ -102,29 +121,36 @@
         (while (< ch 4)
           (biquad-scalar! s zs ch c)
           (biquad-scalar! s zs ch c)
-          (set! ch {ch + 1})))
+          (set! ch (+ ch 1))))
       (let [^mut ok true
             ^mut i  0]
         (while (< i n)
           (when (not (= (float->bits (as float (f32vec-ref v i)))
-                        (float->bits (as float (f32vec-ref s i)))))
+                       (float->bits (as float (f32vec-ref s i)))))
             (set! ok false))
-          (set! i {i + 1}))
+          (set! i (+ i 1)))
         ok)))
   (defn __all-tests [] : int
     (note-lowering (simd-lowering))
     (check 1 "dot-f64, dot-f64x4 == f64vec-dot, n = 0" (dot-f64-same? 0))
-    (check 2 "dot-f64, dot-f64x4 == f64vec-dot, n = 7 (tail only)" (dot-f64-same? 7))
+    (check 2
+      "dot-f64, dot-f64x4 == f64vec-dot, n = 7 (tail only)"
+      (dot-f64-same? 7))
     (check 3 "dot-f64, dot-f64x4 == f64vec-dot, n = 64" (dot-f64-same? 64))
-    (check 4 "dot-f64, dot-f64x4 == f64vec-dot, n = 1003 (main + tail)" (dot-f64-same? 1003))
+    (check 4
+      "dot-f64, dot-f64x4 == f64vec-dot, n = 1003 (main + tail)"
+      (dot-f64-same? 1003))
     (check 5 "dot-f32 == f32vec-dot, n = 5" (dot-f32-same? 5))
     (check 6 "dot-f32 == f32vec-dot, n = 1003" (dot-f32-same? 1003))
     (check 7 "blend alpha 0 == scalar" (blend-same? 77 0))
     (check 8 "blend alpha 255 == scalar" (blend-same? 77 255))
     (check 9 "blend alpha 128 == scalar, n = 1001" (blend-same? 1001 128))
-    (check 10 "blend alpha 37 == scalar, n = 15 (tail only)" (blend-same? 15 37))
+    (check 10
+      "blend alpha 37 == scalar, n = 15 (tail only)"
+      (blend-same? 15 37))
     (check 11 "biquad4 == four scalar biquads, 1 frame" (biquad-same? 1))
-    (check 12 "biquad4 == four scalar biquads, 257 frames, two calls" (biquad-same? 257))
+    (check 12
+      "biquad4 == four scalar biquads, 257 frames, two calls"
+      (biquad-same? 257))
     (finish 12))
-  (defn main [] : int
-    (__all-tests)))
+  (defn main [] : int (__all-tests)))
