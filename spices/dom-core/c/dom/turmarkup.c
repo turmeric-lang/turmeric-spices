@@ -1,7 +1,7 @@
 /* c/dom/turmarkup.c -- the runtime half of markup literals (`#html{...}`,
  * `#xml{...}`): escaping, the URL scheme check, the template renderer's
  * pieces and the per-literal check cache.  See src/dom/holes.tur and
- * turmeric docs/upcoming/spices/xml-html-followups-plan.md, follow-up A.
+ * turmeric docs/archive/xml-html-followups-plan.md, follow-up A.
  *
  * A template is the string the macro (src/dom/markupc.tur) produces: one mode
  * byte ('F' an HTML fragment, 'D' a whole HTML document, 'X' XML), then the
