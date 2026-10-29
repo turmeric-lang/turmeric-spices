@@ -1,0 +1,154 @@
+;;; iter.tur -- tests for linalg/iter (LB4): conjugate gradient on a 50x50
+;;; SPD system, BiCGSTAB on a 20x20 non-symmetric diagonally-dominant system,
+;;; and the Jacobi preconditioner vector.
+;;;
+;;; Mirrors linalg.tur's TAP harness (inline-C fail counter).
+(defmodule linalg/iter-test
+  (import linalg/vec
+    :refer
+    [lavec la-vec-new la-vec-get la-vec-set! la-vec-len la-vec-approx-eq? la-vec-free])
+  (import linalg/mat :refer [mat mat-of mat-new mat-set! mat-mul-vec mat-free])
+  (import linalg/iter
+    :refer
+    [IterOpts
+     IterResult
+     iter-opts
+     iter-opts-default
+     cg
+     cg-free
+     bicgstab
+     bicgstab-free
+     jacobi-precond])
+  ;; --- TAP harness (inline-C fail counter) ---
+  (defn check [idx : int name : cstr ok : bool] : void
+    ```c
+    /* __tur_include__: static int g_it_fails = 0; */
+  if (!ok) g_it_fails++;
+  printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
+  ```)
+  (defn finish [count : int] : int
+    ```c
+    printf("1..%lld\n", (long long)count);
+  if (g_it_fails == 0) {
+    fprintf(stderr, "# All %lld iter tests passed.\n", (long long)count);
+    return 0;
+  }
+  fprintf(stderr, "# %d/%lld iter tests failed.\n", g_it_fails, (long long)count);
+  return 1;
+  ```)
+  (defn fa [x : float] : float ```c return x < 0.0 ? -x : x; ```)
+  (defn i2f [n : int] : float ```c return (double)n; ```)
+  ;;; spd50 -- tridiag(-1, 4, -1) plus a 0.5 band at distance 3: symmetric,
+  ;;; strictly diagonally dominant with a positive diagonal, hence SPD.
+  (defn spd50 [] : mat
+    (let [n      50
+          a      (mat-new n n)
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n)
+                   0
+                   (do
+                     (mat-set! a i i 4.0)
+                     (when (> i 0) (mat-set! a i (- i 1) -1.0))
+                     (when (< i (- n 1)) (mat-set! a i (+ i 1) -1.0))
+                     (when (>= i 3) (mat-set! a i (- i 3) 0.5))
+                     (when (< i (- n 3)) (mat-set! a i (+ i 3) 0.5))
+                     (set! i (+ i 1))
+                     (go))))]
+        (go))
+      a))
+  ;;; nonsym20 -- 10 on the diagonal, 2 above, -1 below, 0.5 at (i, i+5 mod 20).
+  (defn nonsym20 [] : mat
+    (let [n      20
+          a      (mat-new n n)
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n)
+                   0
+                   (do
+                     (mat-set! a i i 1e+01)
+                     (when (> i 0) (mat-set! a i (- i 1) -1.0))
+                     (when (< i (- n 1)) (mat-set! a i (+ i 1) 2.0))
+                     (mat-set! a i (- (+ i 5) (* 20 (if (>= (+ i 5) 20) 1 0))) 0.5)
+                     (set! i (+ i 1))
+                     (go))))]
+        (go))
+      a))
+  ;;; truth -- x_true[i] = 1 + i / 10.
+  (defn truth [n : int] : lavec
+    (let [v      (la-vec-new n)
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n)
+                   0
+                   (do (la-vec-set! v i (+ 1.0 (/ (i2f i) 1e+01))) (set! i (+ i 1)) (go))))]
+        (go))
+      v))
+  (defn t-cg [] : bool
+    (let [a  (spd50)
+          xt (truth 50)
+          b  (mat-mul-vec a xt)
+          r  (cg a b (iter-opts 50 1e-10 false))]
+      (let [ok (and (.converged r)
+                 (and (<= (.iters r) 50)
+                   (and (< (.residual r) 1e-10)
+                     (= (la-vec-approx-eq? (.x r) xt 1e-09) 1))))]
+        (cg-free r)
+        (la-vec-free b)
+        (la-vec-free xt)
+        (mat-free a)
+        ok)))
+  (defn t-cg-limit [] : bool
+    ;; two iterations cannot solve the 50x50 system: converged must read false
+    (let [a  (spd50)
+          xt (truth 50)
+          b  (mat-mul-vec a xt)
+          r  (cg a b (iter-opts 2 1e-10 false))]
+      (let [ok (and (not (.converged r)) (= (.iters r) 2))]
+        (cg-free r)
+        (la-vec-free b)
+        (la-vec-free xt)
+        (mat-free a)
+        ok)))
+  (defn t-bicgstab [] : bool
+    (let [a  (nonsym20)
+          xt (truth 20)
+          b  (mat-mul-vec a xt)
+          r  (bicgstab a b (iter-opts 100 1e-10 false))]
+      (let [ok (and (.converged r)
+                 (and (<= (.iters r) 100)
+                   (= (la-vec-approx-eq? (.x r) xt 1e-09) 1)))]
+        (bicgstab-free r)
+        (la-vec-free b)
+        (la-vec-free xt)
+        (mat-free a)
+        ok)))
+  (defn t-bicgstab-default [] : bool
+    (let [a  (nonsym20)
+          xt (truth 20)
+          b  (mat-mul-vec a xt)
+          r  (bicgstab a b (iter-opts-default))]
+      (let [ok (.converged r)]
+        (bicgstab-free r)
+        (la-vec-free b)
+        (la-vec-free xt)
+        (mat-free a)
+        ok)))
+  (defn t-jacobi [] : bool
+    (let [a (mat-of 2 2 4.0 1.0 1.0 2.0)
+          d (jacobi-precond a)]
+      (let [ok (and (< (fa (- (la-vec-get d 0) 0.25)) 1e-15)
+                 (< (fa (- (la-vec-get d 1) 0.5)) 1e-15))]
+        (la-vec-free d)
+        (mat-free a)
+        ok)))
+  (defn main [] : int
+    (check 1 "cg: 50x50 SPD converges to the true solution" (t-cg))
+    (check 2 "cg: iteration limit reports non-convergence" (t-cg-limit))
+    (check 3 "bicgstab: 20x20 non-symmetric converges" (t-bicgstab))
+    (check 4 "bicgstab: default options converge" (t-bicgstab-default))
+    (check 5 "jacobi-precond: reciprocal diagonal" (t-jacobi))
+    (finish 5))) ;; end defmodule linalg/iter-test

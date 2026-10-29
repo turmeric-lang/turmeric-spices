@@ -1,0 +1,143 @@
+;;; mul.tur -- LB5: the cache-blocked mat-mul.
+;;;
+;;; Checks the tiled kernel against a naive triple loop on shapes that are not
+;;; multiples of the block size, then times a 512x512 multiply and prints the
+;;; wall time as a TAP comment (`# mat-mul 512x512: N ms`) for CI to record.
+;;; The timing is reported, not asserted -- runner speed varies too much.
+(defmodule linalg/mul-test
+  (import linalg/vec :refer [lavec la-vec-get la-vec-free])
+  (import linalg/mat
+    :refer
+    [mat mat-new mat-get mat-set! mat-rows mat-cols mat-mul mat-mul-vec mat-row mat-free])
+  ;; --- TAP harness (inline-C fail counter) ---
+  (defn check [idx : int name : cstr ok : bool] : void
+    ```c
+    /* __tur_include__: static int g_mm_fails = 0; */
+  if (!ok) g_mm_fails++;
+  printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
+  ```)
+  (defn finish [count : int] : int
+    ```c
+    printf("1..%lld\n", (long long)count);
+  if (g_mm_fails == 0) {
+    fprintf(stderr, "# All %lld mat-mul tests passed.\n", (long long)count);
+    return 0;
+  }
+  fprintf(stderr, "# %d/%lld mat-mul tests failed.\n", g_mm_fails, (long long)count);
+  return 1;
+  ```)
+  (defn fa [x : float] : float ```c return x < 0.0 ? -x : x; ```)
+  (defn i2f [n : int] : float ```c return (double)n; ```)
+  (defn now-ms [] : float
+    ```c
+    #include <time.h>
+    struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+  ```)
+  (defn report [ms : float] : void
+    ```c
+    printf("# mat-mul 512x512: %.1f ms\n", ms);
+  ```)
+  ;;; filled -- r x c matrix with a deterministic, non-trivial pattern.
+  (defn filled [r : int c : int seed : int] : mat
+    (let [m      (mat-new r c)
+          ^mut i 0]
+      (letrec [gor
+               (fn [] : int
+                 (if (>= i r)
+                   0
+                   (let [^mut j 0]
+                     (letrec [goc
+                              (fn [] : int
+                                (if (>= j c)
+                                  0
+                                  (do
+                                    (mat-set! m i j (- (i2f (mod (+ (* i 7) (* j 13) seed) 17)) 8.25))
+                                    (set! j (+ j 1))
+                                    (goc))))]
+                       (goc))
+                     (set! i (+ i 1))
+                     (gor))))]
+        (gor))
+      m))
+  ;;; naive-entry -- sum_k A[i][k] B[k][j].
+  (defn naive-entry [^borrow a : mat ^borrow b : mat i : int j : int] : float
+    (let [n (mat-cols a)]
+      (letrec [go
+               (fn [k : int acc : float] : float
+                 (if (>= k n) acc (go (+ k 1) (+ acc (* (mat-get a i k) (mat-get b k j))))))]
+        (go 0 0.0))))
+  ;;; max-dev -- max |C - A B| over every entry, against the naive sum.
+  (defn max-dev [^borrow a : mat ^borrow b : mat ^borrow c : mat] : float
+    (let [rows (mat-rows c)
+          cols (mat-cols c)]
+      (letrec [go
+               (fn [idx : int acc : float] : float
+                 (if (>= idx (* rows cols))
+                   acc
+                   (let [i (/ idx cols)
+                         j (mod idx cols)
+                         d (fa (- (mat-get c i j) (naive-entry a b i j)))]
+                     (go (+ idx 1) (if (> d acc) d acc)))))]
+        (go 0 0.0))))
+  (defn t-ragged [] : bool
+    (let [a (filled 70 130 1)
+          b (filled 130 65 5)
+          c (mat-mul a b)]
+      (let [ok (and (= (mat-rows c) 70)
+                 (and (= (mat-cols c) 65) (< (max-dev a b c) 1e-09)))]
+        (mat-free a)
+        (mat-free b)
+        (mat-free c)
+        ok)))
+  (defn t-small [] : bool
+    (let [a (filled 3 5 2)
+          b (filled 5 1 3)
+          c (mat-mul a b)]
+      (let [ok (< (max-dev a b c) 1e-12)] (mat-free a) (mat-free b) (mat-free c) ok)))
+  (defn t-mul-vec [] : bool
+    ;; A v, with v the first row of B', equals the first column of A B
+    (let [a  (filled 70 130 1)
+          b  (filled 1 130 5)
+          v  (mat-row b 0)
+          y  (mat-mul-vec a v)]
+      (let [ok (letrec [go
+                        (fn [i : int] : bool
+                          (if (>= i 70)
+                            true
+                            (let [want (letrec [s
+                                                (fn [k : int acc : float] : float
+                                                  (if (>= k 130)
+                                                    acc
+                                                    (s (+ k 1)
+                                                      (+ acc (* (mat-get a i k) (mat-get b 0 k))))))]
+                                         (s 0 0.0))]
+                              (if (> (fa (- (la-vec-get y i) want)) 1e-09) false (go (+ i 1))))))]
+                 (go 0))]
+        (la-vec-free y)
+        (la-vec-free v)
+        (mat-free a)
+        (mat-free b)
+        ok)))
+  (defn t-timed-512 [] : bool
+    (let [a  (filled 512 512 1)
+          b  (filled 512 512 9)
+          t0 (now-ms)
+          c  (mat-mul a b)
+          t1 (now-ms)]
+      (report (- t1 t0))
+      ;; spot-check a corner and the middle against the naive sum
+      (let [ok (and (< (fa (- (mat-get c 0 0) (naive-entry a b 0 0))) 1e-08)
+                 (and (< (fa (- (mat-get c 511 511) (naive-entry a b 511 511))) 1e-08)
+                   (< (fa (- (mat-get c 257 130) (naive-entry a b 257 130))) 1e-08)))]
+        (mat-free a)
+        (mat-free b)
+        (mat-free c)
+        ok)))
+  (defn main [] : int
+    (check 1 "mat-mul: 70x130 * 130x65 matches the naive product" (t-ragged))
+    (check 2 "mat-mul: 3x5 * 5x1 matches the naive product" (t-small))
+    (check 3 "mat-mul-vec: matches the naive product" (t-mul-vec))
+    (check 4 "mat-mul: 512x512 (timed)" (t-timed-512))
+    (finish 4))) ;; end defmodule linalg/mul-test
