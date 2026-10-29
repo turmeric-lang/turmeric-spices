@@ -1,0 +1,169 @@
+;; hiccup_rewrite.tur -- markup in result positions (xml-html-followups-plan
+;; follow-up D1b).
+;;
+;; Inside a hiccup literal, a child expression's result positions are
+;; rewritten too: both branches of an `if`, the last body form of `when`,
+;; `unless`, `do`, `let` and `for`, each `cond` result and `match` arm, and
+;; an inline `fn` given to `list-map`. One case per form, with markup in
+;; every branch and a missing branch where the form allows one. The
+;; compile-error half (markup outside a result position, nesting checks
+;; through the rewritten forms, a type error's position) is errors/run.sh.
+(defmodule html_hiccup_rewrite_test
+  (export)
+  (import html/hiccup :refer [Html HElem HFragment hiccup hiccup->string])
+  (import dom/holes :refer [Child])
+  (import test/suite :refer [describe it])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; __eq? -- byte equality.
+  (defn __eq? [a : cstr b : cstr] : bool
+    ```c
+    return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+  ;;; renders? -- does the tree render exactly `want`?
+  (defn renders? [h : Html want : cstr] : bool (__is? (hiccup->string h) want))
+  ;; `list-map` and `list-foldl` with stdlib/list-typed's signatures, over
+  ;; `(Cons A)`. tur-html cannot load list-typed itself today: its `String`
+  ;; and dom/ownstr's collide (docs/reported in turmeric). The rewrite only
+  ;; needs the names, and calls `list-foldl`.
+  (defn list-foldl [A B] [xs : (Cons A) init : B f : (fn [B A] B)] : B
+    (if (tnil? xs) init (list-foldl (ttail xs) (f init (thead xs)) f)))
+  (defn half [n : int] : (Option int)
+    (if (= n (* 2 (/ n 2))) (Some (/ n 2)) (None)))
+  (defn item [s : cstr] : Html (hiccup [:li.it s]))
+  ;;; first-kid-is-elem? -- is a tree's first child still a tree (not a
+  ;;; fragment of markup)?
+  (defn first-kid-is-elem? [h : Html] : bool
+    (match h
+      (HElem t as kids)
+      (if (tnil? kids)
+        false
+        (match (thead kids) (HElem _ _ _) true (HFragment _) false _ false))
+      _
+      false))
+  (defn __all-tests [] : void
+    (describe "if"
+      (it "markup in both branches"
+        (and (renders? (let [b true]
+                         (hiccup [:ul (if b [:li "y"] [:li.n "n"])]))
+               "<ul><li>y</li></ul>")
+          (renders? (let [b false] (hiccup [:ul (if b [:li "y"] [:li.n "n"])]))
+            "<ul><li class=\"n\">n</li></ul>")))
+      (it "a missing else is empty"
+        (and (renders? (let [b true] (hiccup [:div (if b [:b "x"])]))
+               "<div><b>x</b></div>")
+          (renders? (let [b false] (hiccup [:div (if b [:b "x"])]))
+            "<div></div>")))
+      (it "branches of different types need not agree"
+        (renders? (let [k 7] (hiccup [:p (if (> k 5) [:b k] "small")]))
+          "<p><b>7</b></p>")))
+    (describe "when and unless"
+      (it "when: the last body form, after statements"
+        (and (renders? (let [b true]
+                         (hiccup [:div
+                                  (when b (println "# side effect") [:i "w"])]))
+               "<div><i>w</i></div>")
+          (renders? (let [b false] (hiccup [:div (when b [:i "w"])]))
+            "<div></div>")))
+      (it "unless"
+        (and (renders? (let [b false] (hiccup [:div (unless b [:i "u"])]))
+               "<div><i>u</i></div>")
+          (renders? (let [b true] (hiccup [:div (unless b [:i "u"])]))
+            "<div></div>"))))
+    (describe "cond"
+      (it "each result, with :else"
+        (renders? (let [k 3]
+                    (hiccup [:p
+                             (cond (> k 5) [:b "big"]
+                                   (> k 1) [:i "mid"]
+                                   :else   "small")]))
+          "<p><i>mid</i></p>"))
+      (it "a missing :else is empty"
+        (renders? (let [k 0]
+                    (hiccup [:p (cond (> k 5) [:b "big"] (> k 1) [:i "mid"])]))
+          "<p></p>")))
+    (describe "do and let"
+      (it "do"
+        (renders? (hiccup [:p (do (println "# step") [:em "d"])])
+          "<p><em>d</em></p>"))
+      (it "let"
+        (renders? (hiccup [:p (let [s "l<"] [:em s])]) "<p><em>l&lt;</em></p>"))
+      (it "let, nested in an if"
+        (renders? (let [b true]
+                    (hiccup [:p
+                             (if b
+                               (let [s "a"
+                                     t s]
+                                 [:em t])
+                               [:i])]))
+          "<p><em>a</em></p>")))
+    (describe "match"
+      (it "each arm"
+        (and (renders? (hiccup [:p
+                                (match (half 8)
+                                  (Some n)
+                                  [:b n]
+                                  (None)
+                                  [:i "odd"])])
+               "<p><b>4</b></p>")
+          (renders? (hiccup [:p
+                             (match (half 7) (Some n) [:b n] (None) [:i "odd"])])
+            "<p><i>odd</i></p>"))))
+    (describe "for (the Option comprehension)"
+      (it "bindings in turn"
+        (renders? (hiccup [:p (for [a (half 8) b (half a)] [:b (+ a b)])])
+          "<p><b>6</b></p>"))
+      (it "a None is empty"
+        (renders? (hiccup [:p (for [a (half 7)] [:b a])]) "<p></p>"))
+      (it ":when"
+        (and (renders? (hiccup [:p (for [a (half 8) :when (> a 1)] [:b a])])
+               "<p><b>4</b></p>")
+          (renders? (hiccup [:p (for [a (half 8) :when (> a 9)] [:b a])])
+            "<p></p>"))))
+    (describe "list-map with an inline fn"
+      (it "becomes a fold straight into Html"
+        (let [xs (tcons-of "a" (tcons-of "b<" (tcons-of "c" (tnil))))]
+          (renders? (hiccup [:ul (list-map xs (fn [r : cstr] [:li r]))])
+            "<ul><li>a</li><li>b&lt;</li><li>c</li></ul>")))
+      (it "its body's result positions are rewritten too"
+        (let [xs (tcons-of "a" (tcons-of "c" (tnil)))]
+          (renders? (hiccup [:ul
+                             (list-map xs
+                               (fn [r : cstr]
+                                 (if (__eq? r "c") [:li.c r] [:li r])))])
+            "<ul><li>a</li><li class=\"c\">c</li></ul>")))
+      (it "a return annotation and statements before the result"
+        (let [xs (tcons-of "a" (tnil))]
+          (renders? (hiccup [:ul
+                             (list-map xs
+                               (fn [r : cstr] : int (println "# item") [:li r]))])
+            "<ul><li>a</li></ul>"))))
+    (describe "leaves"
+      (it "the literal itself may be a result-position form"
+        (renders? (let [b false] (hiccup (if b [:p "x"] [:div "y"])))
+          "<div>y</div>"))
+      (it "a nested (hiccup ...) splices in place"
+        (renders? (hiccup [:ul (hiccup [:li "n"])]) "<ul><li>n</li></ul>"))
+      (it "an Html value stays a tree"
+        (first-kid-is-elem? (hiccup [:ul (item "x")])))
+      (it "an Html value renders as its markup"
+        (renders? (hiccup [:ul (item "x<")])
+          "<ul><li class=\"it\">x&lt;</li></ul>"))
+      (it "a Child goes in through to-child"
+        (renders? (hiccup [:p (to-child 42)]) "<p>42</p>"))
+      (it "Option and Cons leaves"
+        (renders? (hiccup [:p
+                           (half 6)
+                           (half 5)
+                           (tcons-of "a" (tcons-of "b" (tnil)))])
+          "<p>3ab</p>"))
+      (it "vectors that are not markup are left alone"
+        (renders? (hiccup [:p (let [opts [:only :encode]] "k")]) "<p>k</p>"))))
+  (defn main [] : int (__all-tests) (run-all-status))) ;; end defmodule html_hiccup_rewrite_test

@@ -1,0 +1,281 @@
+#use-reader-macros "../src/html/markup.tur"
+(defmodule html_markup_test
+  (export)
+  (import html/markup :refer [html*])
+  (import dom/holes
+    :refer
+    [Fragment html->string fragment-free raw-html trusted-url url-safe])
+  (import dom/core :refer [Node Document dom-node dom-free find-first])
+  (import html/dom :refer [html-parse html-parse-fragment])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; renders? -- does the fragment render exactly `want`?
+  (defn renders? [f : Fragment want : cstr] : bool
+    (let [ok (__is? (html->string f) want)] (fragment-free f) ok))
+  ;; ---- templates, one per context ---------------------------------------------
+  (defn t-child [v : cstr] : Fragment #html{<p>${v}</p>})
+  (defn t-part [v : cstr] : Fragment #html{<p title="a ${v} b">x</p>})
+  (defn t-part-sq [v : cstr] : Fragment #html{<p title='${v} b'>x</p>})
+  (defn t-whole [v : cstr] : Fragment #html{<p title="${v}">x</p>})
+  (defn t-unq [v : cstr] : Fragment #html{<p title=${v}>x</p>})
+  (defn t-href [v : cstr] : Fragment #html{<a href=${v}>x</a>})
+  (defn t-srcset [v : cstr] : Fragment #html{<img srcset="${v}">})
+  (defn t-table [v : cstr] : Fragment
+    #html{<table><tr><td>${v}</td></tr></table>})
+  (defn t-select [v : cstr] : Fragment
+    #html{<select><option>${v}</option></select>})
+  (defn t-two [v : cstr] : Fragment
+    #html{<ul><li class=${v}>${v}</li><li>${v}</li></ul>})
+  (defn t-svg [v : cstr] : Fragment #html{<svg><text x="1">${v}</text></svg>})
+  (defn t-raw [v : cstr] : Fragment
+    #html{<div id="a"><div id="b">${(raw-html v)}</div><p>after</p></div>})
+  ;;; render-with -- one template by number.
+  (defn render-with [k : int v : cstr] : Fragment
+    (cond (= k 0)  (t-child v)
+          (= k 1)  (t-part v)
+          (= k 2)  (t-part-sq v)
+          (= k 3)  (t-whole v)
+          (= k 4)  (t-unq v)
+          (= k 5)  (t-href v)
+          (= k 6)  (t-srcset v)
+          (= k 7)  (t-table v)
+          (= k 8)  (t-select v)
+          (= k 9)  (t-two v)
+          (= k 10) (t-svg v)
+          :else    (t-raw v)))
+  ;; ---- shape --------------------------------------------------------------------
+  ;;; __shape -- internal: the structure of a parsed fragment: node kinds,
+  ;;; element names and namespaces, attribute names; no text, no values.
+  (defn __shape [d : Document maxd : int] : cstr
+    ```c
+    extern void *turdom_doc_node(void *);
+  extern void *turdom_next_in(const void *, const void *);
+  extern int turdom_kind(const void *);
+  extern const char *turdom_name(const void *);
+  extern const char *turdom_ns_uri(const void *);
+  extern int64_t turdom_depth(const void *);
+  extern int64_t turdom_attr_count(const void *);
+  extern const char *turdom_attr_name_at(const void *, int64_t);
+  size_t cap = 4096, n = 0;
+  char *o = (char *)malloc(cap);
+  o[0] = '\0';
+  void *top = turdom_doc_node((void *)(intptr_t)d);
+  for (void *x = turdom_next_in(top, NULL); x; x = turdom_next_in(top, x)) {
+    char line[512];
+    if (turdom_depth(x) > maxd) continue;
+    int k = turdom_kind(x);
+    int m = snprintf(line, sizeof line, "%lld:%d:%s:%s", (long long)turdom_depth(x), k,
+                     k == 1 ? turdom_name(x) : "", k == 1 && turdom_ns_uri(x) ? turdom_ns_uri(x) : "");
+    for (int64_t i = 0; k == 1 && i < turdom_attr_count(x) && m < 400; i++)
+      m += snprintf(line + m, sizeof line - (size_t)m, " @%s", turdom_attr_name_at(x, i));
+    if (n + (size_t)m + 2 >= cap) { cap = cap * 2 + (size_t)m; o = (char *)realloc(o, cap); }
+    memcpy(o + n, line, (size_t)m);
+    n += (size_t)m;
+    o[n++] = '\n';
+    o[n] = '\0';
+  }
+  return o;
+  ```)
+  ;;; shape-of -- the shape of a rendered fragment, parsed as a template's
+  ;;; content, down to depth maxd.
+  (defn shape-of [f : Fragment maxd : int] : cstr
+    (let [d (html-parse-fragment "template" (html->string f))
+          s (__shape d maxd)]
+      (dom-free d)
+      (fragment-free f)
+      s))
+  ;;; __corpus -- internal: hostile value i ("" past the end).
+  (defn __corpus [i : int] : cstr
+    ```c
+    static const char *const corpus[] = {
+    "<script>alert(1)</script>", "\"><img src=x onerror=alert(1)>",
+    "'><img src=x onerror=alert(1)>", "</p><p>", "</td></tr></table><b>",
+    "</option></select><b>", "<!--", "-->", "--!>", "<![CDATA[x]]>", "]]>",
+    "&amp;", "&", "&lt;script&gt;", "javascript:alert(1)", "\xc2\xa0nbsp",
+    "${x}", "__tur_hole_0__", "</textarea>", "</title>", "<!doctype html>",
+    "<svg><script>alert(1)</script></svg>", "<math><mi>x</mi></math>",
+    " onload=alert(1) ", "\" onload=\"alert(1)", "' onload='alert(1)",
+    "a\tb\nc\rd", "`backtick`", "</svg><p>", "<template>", "</div></div></div>",
+    "<xmp>", "<noscript>", "<style>", "\\", "x", NULL};
+  int64_t n = 0;
+  while (corpus[n]) n++;
+  return i < n ? corpus[i] : "";
+  ```)
+  ;;; __corpus-n -- internal: the corpus's size.
+  (defn __corpus-n [] : int 36)
+  ;;; __say -- internal.
+  (defn __say [k : int v : cstr a : cstr b : cstr] : nil
+    ```c
+    #include <stdio.h>
+  fprintf(stderr, "# template %lld, value [%s]: the structure changed\n#   with x:  %s\n#   with it: %s\n",
+          (long long)k, (const char *)v, (const char *)a, (const char *)b);
+  ```)
+  ;;; structure-failures -- (template, value) pairs whose structure differs
+  ;;; from the template rendered with "x". The raw-html template (11) changes
+  ;;; structure by design -- raw-html is the opt-out -- so for it only the
+  ;;; literal's own elements (depth 2 and up) are compared: raw markup can add
+  ;;; nodes inside its hole, never close or move the literal's.
+  (defn structure-failures [] : int
+    (let [^mut bad 0
+          ^mut k   0]
+      (while (<= k 11)
+        (let [maxd   (if (= k 11) 2 1000)
+              base   (shape-of (render-with k "x") maxd)
+              ^mut i 0]
+          (while (< i (__corpus-n))
+            (let [v (__corpus i)
+                  s (shape-of (render-with k v) maxd)]
+              (if (__streq? s base)
+                nil
+                (do (__say k v base s) (set! bad (+ bad 1)))))
+            (set! i (+ i 1))))
+        (set! k (+ k 1)))
+      bad))
+  ;;; __streq? -- internal.
+  (defn __streq? [a : cstr b : cstr] : bool
+    ```c
+    return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+  ;;; probe? -- does a literal parse as a template's content to a first
+  ;;; element named `want`, and render unchanged?
+  (defn probe? [f : Fragment src : cstr want : cstr] : bool
+    (let [d  (html-parse-fragment "template" (html->string f))
+          ok (match (find-first (dom-node d) want)
+               (Some _)
+               (__is? (html->string f) src)
+               (None)
+               false)]
+      (dom-free d)
+      (fragment-free f)
+      ok))
+  (defn __all-tests [] : void
+    (describe "escaping"
+      (it "content: < & > escaped, quotes kept"
+        (renders? (t-child "a<b & \"c\" 'd' </script>")
+          "<p>a&lt;b &amp; \"c\" 'd' &lt;/script&gt;</p>"))
+      (it "part of a double-quoted value"
+        (renders? (t-part "<\"&'")
+          "<p title=\"a &lt;&quot;&amp;&#39; b\">x</p>"))
+      (it "part of a single-quoted value"
+        (renders? (t-part-sq "it's \"x\"")
+          "<p title='it&#39;s &quot;x&quot; b'>x</p>"))
+      (it "a whole quoted value is written double-quoted"
+        (renders? (t-whole "</script>") "<p title=\"&lt;/script&gt;\">x</p>"))
+      (it "a whole unquoted value is quoted"
+        (renders? (t-unq "a b=c>") "<p title=\"a b=c&gt;\">x</p>"))
+      (it "U+00A0 as &nbsp;" (renders? (t-child "a b") "<p>a&nbsp;b</p>"))
+      (it "an int"
+        (renders? #html{<i data-n=${42}>${7}</i>} "<i data-n=\"42\">7</i>")))
+    (describe "structure"
+      (it "a hostile value never changes the parsed structure (12 templates x 36 values)"
+        (= 0 (structure-failures))))
+    (describe "URLs (plan A-1)"
+      (it "javascript:"
+        (__is? (url-safe "javascript:alert(1)") "about:invalid#tur-unsafe"))
+      (it "JavaScript:"
+        (__is? (url-safe "JavaScript:alert(1)") "about:invalid#tur-unsafe"))
+      (it "java<tab>script:"
+        (__is? (url-safe "java\tscript:alert(1)") "about:invalid#tur-unsafe"))
+      (it "java<LF>script:"
+        (__is? (url-safe "java\nscript:alert(1)") "about:invalid#tur-unsafe"))
+      (it "a leading space and control characters"
+        (__is? (url-safe " \x01\x1fjavascript:x") "about:invalid#tur-unsafe"))
+      (it "data:"
+        (__is? (url-safe "data:text/html,<script>") "about:invalid#tur-unsafe"))
+      (it "vbscript:"
+        (__is? (url-safe "VBScript:x") "about:invalid#tur-unsafe"))
+      (it "relative" (__is? (url-safe "/a/b?c=d#e") "/a/b?c=d#e"))
+      (it "relative with a colon after the path starts"
+        (__is? (url-safe "a/b:c") "a/b:c"))
+      (it "http and https"
+        (and (__is? (url-safe "http://e/") "http://e/")
+          (__is? (url-safe "HTTPS://e/") "HTTPS://e/")))
+      (it "mailto and tel"
+        (and (__is? (url-safe "mailto:a@b") "mailto:a@b")
+          (__is? (url-safe "tel:+1") "tel:+1")))
+      (it "through an href hole"
+        (renders? (t-href "javascript:alert(1)")
+          "<a href=\"about:invalid#tur-unsafe\">x</a>"))
+      (it "an href is still escaped"
+        (renders? (t-href "/?a=1&b=\"") "<a href=\"/?a=1&amp;b=&quot;\">x</a>"))
+      (it "srcset: each candidate checked"
+        (renders? (t-srcset "a.png 1x, javascript:x 2x,b.png")
+          "<img srcset=\"a.png 1x, about:invalid#tur-unsafe 2x,b.png\">"))
+      (it "trusted-url skips the check, not the escaping"
+        (renders? #html{<a href=${(trusted-url "javascript:f('x')")}>x</a>}
+          "<a href=\"javascript:f(&#39;x&#39;)\">x</a>"))
+      (it "the URL attributes: src action formaction poster cite"
+        (renders? #html{<img src=${"javascript:1"}><form action=${"javascript:2"}><button formaction=${"javascript:3"}></button></form><video poster=${"javascript:4"}></video><q cite=${"javascript:5"}></q>}
+          "<img src=\"about:invalid#tur-unsafe\"><form action=\"about:invalid#tur-unsafe\"><button formaction=\"about:invalid#tur-unsafe\"></button></form><video poster=\"about:invalid#tur-unsafe\"></video><q cite=\"about:invalid#tur-unsafe\"></q>")))
+    (describe "template context (plan A-2)"
+      (it "<tr>"
+        (probe? #html{<tr><td>${"a"}</td></tr>} "<tr><td>a</td></tr>" "tr"))
+      (it "<td>" (probe? #html{<td>${"a"}</td>} "<td>a</td>" "td"))
+      (it "<col>" (probe? #html{<col span=${2}>} "<col span=\"2\">" "col"))
+      (it "<option>"
+        (probe? #html{<option value=${"v"}>${"t"}</option>}
+          "<option value=\"v\">t</option>"
+          "option"))
+      (it "<caption>"
+        (probe? #html{<caption>${"c"}</caption>}
+          "<caption>c</caption>"
+          "caption"))
+      (it "a whole document"
+        (renders? #html{<!doctype html><html><head><title>t</title></head><body>${"b&"}</body></html>}
+          "<!doctype html><html><head><title>t</title></head><body>b&amp;</body></html>")))
+    (describe "values"
+      (it "bool: present or absent"
+        (and (renders? #html{<input checked=${true}>} "<input checked>")
+          (renders? #html{<input type="checkbox" checked=${false}>}
+            "<input type=\"checkbox\">")))
+      (it "Option: None drops the attribute and renders no content"
+        (renders? #html{<p title=${(:: (None) (Option cstr))} id=${(Some "i")}>${(:: (None) (Option int))}${(Some "s")}</p>}
+          "<p id=\"i\">s</p>"))
+      (it "inside a larger value, true and false"
+        (renders? #html{<p class="a ${true} ${false} b">x</p>}
+          "<p class=\"a true  b\">x</p>"))
+      (it "a nested literal is spliced, not escaped"
+        (renders? #html{<div>${(t-child "<x>")}</div>}
+          "<div><p>&lt;x&gt;</p></div>"))
+      (it "a list of literals"
+        (renders? #html{<ul>${(tcons-of (t-child "1") (tcons-of (t-child "2") (tnil)))}</ul>}
+          "<ul><p>1</p><p>2</p></ul>"))
+      (it "a Node is serialized in"
+        (let [d  (html-parse "<b class=c>bold &amp; <i>it</i></b>")
+              ok (match (find-first (dom-node d) "b")
+                   (Some b)
+                   (renders? #html{<p>${b}</p>}
+                     "<p><b class=\"c\">bold &amp; <i>it</i></b></p>")
+                   (None)
+                   false)]
+          (dom-free d)
+          ok))
+      (it "raw-html is parsed in its context, so it cannot unbalance the literal"
+        (renders? (t-raw "<b>x</div></div><i>y")
+          "<div id=\"a\"><div id=\"b\"><b>x<i>y</i></b></div><p>after</p></div>"))
+      (it "raw-html is not sanitized"
+        (renders? (t-raw "<img src=x onerror=f()>")
+          "<div id=\"a\"><div id=\"b\"><img src=\"x\" onerror=\"f()\"></div><p>after</p></div>"))
+      (it "the same literal renders many times (checked once)"
+        (and (renders? (t-child "1") "<p>1</p>")
+          (renders? (t-child "2") "<p>2</p>"))))
+    (describe "the literal's own syntax"
+      (it "\\} and \\\\ in the body"
+        (renders? #html{<p>\} \\ ${"\}"}</p>} "<p>} \\ }</p>"))
+      (it "balanced braces need no escape"
+        (renders? #html{<p>{a}</p>} "<p>{a}</p>"))
+      (it "a curly-infix expression in a hole"
+        (let [n 2] (renders? #html{<p>${ {n * 21} }</p>} "<p>42</p>")))
+      (it "html* called directly"
+        (renders? (html* "<b>${\"<\"}</b>") "<b>&lt;</b>"))
+      (it "no holes" (renders? #html{<br>} "<br>"))))
+  (defn main [] : int (__all-tests) (run-all-status))) ;; end defmodule html_markup_test

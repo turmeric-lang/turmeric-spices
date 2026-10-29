@@ -4,6 +4,37 @@
 
 ### Added
 
+- Holes in code (xml-html-followups-plan A6): `dom/markupc` reads the
+  JavaScript, JSON or CSS around a hole in an `on*` / `style` attribute or a
+  `<script>` / `<style>` body and picks the escaper from its position;
+  `dom/holes` gains `ToJs`, `ToCodeText`, `ToCss`, `ToSrcdoc`, `TrustedJs`
+  (`trusted-js`), `TrustedCss` (`trusted-css`), the escapers
+  `js-string-escape`, `css-string-escape`, `css-url-escape`, and the hole
+  kind `HoleCode`. Positions it cannot follow are compile errors.
+- A type error in a markup literal's `${...}` hole is reported at the hole
+  (xml-html-followups-plan A5): `dom/markupc` reads holes with turmeric's
+  `read-string-at`, which keeps their place in the file. Needs a `tur` with
+  that native.
+- `RenderHtml` (dom/holes; xml-html-followups-plan A-3 / D2): a value that
+  is a whole HTML response body, for a web framework to take (tourist's
+  `html-response`). Instances: `Fragment` here, `Html` and `LiveHtml` in
+  tur-html.
+- `dom/holes` and `dom/markupc` (xml-html-followups-plan follow-up A1-A2):
+  the shared halves of tur-html's `#html{...}` and tur-xml's `#xml{...}`
+  markup literals. `dom/markupc` is the compile-time context tokenizer the
+  literal macros import `:for-macros`: it finds the `${...}` holes, makes a
+  hole in a tag or attribute name, a comment, raw text, a doctype, or an
+  `on*` / `style` / `srcdoc` value a compile error naming the place, and
+  picks the class each hole goes through. `dom/holes` has the classes --
+  `ToChild`, `ToAttr`, `ToUrlAttr`, with instances for `cstr`, `String`,
+  `int`, `bool`, `Fragment`, `XmlFragment`, `Node`, `RawHtml`,
+  `TrustedUrl`, `Option` and `(Cons T)` of any of them -- the `raw-html` and `trusted-url`
+  opt-outs, the URL scheme allowlist (`url-safe`, `srcset-check`),
+  `html->string` / `xml->string` / `fragment-free`, and the renderer and the
+  per-literal parser check both literals share (`child-markup`,
+  `attr-state` and `attr-raw` for tur-html's live literals).
+- `c/dom/turmarkup.c`, a third `:c-source`: escaping, the URL check, the
+  template walk and the per-literal check cache.
 - `dom/select` (xml-html-followups-plan follow-up C): CSS selectors over
   any tree. `selector-compile` / `selector-compile-ns` (namespace prefixes,
   and a default namespace under the `""` prefix) give a `Selector` or a

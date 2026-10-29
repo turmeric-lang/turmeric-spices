@@ -19,6 +19,18 @@ back as the tree a browser builds, and `html-parse` never fails.
   `node-text` and `dom-serialize` are the same as for XML.
 - **Tokenizer events** (`html/sax`) -- tags as written, in the same `SaxEvent`
   vocabulary as [`tur-xml`](../xml/README.md)'s SAX. One-shot or push.
+- **Markup literals** (`html/markup`) -- `#html{<li>${name}</li>}`: markup
+  with `${...}` holes, escaped by construction, with URL attributes
+  scheme-checked and holes in unsafe places (`<script>`, `on*`, names)
+  rejected at compile time. `html->dom` gives the nodes; `#html-live{...}`
+  builds a tree `tpl-update!` re-renders in place, touching only the holes
+  that changed. See the
+  [guide](../../docs/guides/html-guide.md#10-markup-literals).
+- **Hiccup** (`html/hiccup`) -- `(hiccup [:li.item #map{:href u} name])`:
+  markup as a typed `Html` value to build, map and `match` on, rendered
+  with `hiccup->string` or `hiccup->xml-string`, built as nodes with
+  `hiccup->dom`, and read back from a parsed tree with `node->hiccup`. See the
+  [guide](../../docs/guides/html-guide.md#11-hiccup-markup-as-a-value).
 - **innerHTML** (`html/edit`) -- `set-inner-html!` parses markup in an
   element's own context and puts it in place of the element's children,
   through dom-core's validated `dom/edit`; `node-inner-html` and
@@ -88,6 +100,8 @@ defn main [] : int
 | `html/edit` | `set-inner-html!`, `node-inner-html`, `node-outer-html` |
 | `html/sax` | `HtmlSaxParser`, `html-sax-parse-string`, `html-sax-parse-string-opts`, `html-sax-parser-new`, `html-sax-parser-new-opts`, `html-sax-feed!`, `html-sax-finish!`, `html-sax-parser-free` |
 | `html/transform` | `html-sax-transform`, `html-sax-transform-opts` |
+| `html/hiccup` | `Html` (`HElem` `HRawText` `HText` `HRaw` `HList` `HFragment` `HComment` `HCdata` `HPi`), `HTag`, `HAttrName`, `HAttr`, `HRawBody`, `HCommentBody`, `HCdataBody`, `HPiBody`, `hiccup`, `hiccup->string`, `hiccup->xml-string`, `hiccup->dom`, `hiccup->xml-dom`, `node->hiccup`, `tag`, `tag-name`, `attr-name`, `attr`, `attr-on`, `attr-name-of`, `attr-value`, `comment`, `cdata`, `pi` and their readers (and the internals the macro expands to) |
+| `html/markup` | `html*` (the macro behind `#html{...}`), `html-render`, `html-raw-fix`; the literal's types and opt-outs are dom-core's `dom/holes` |
 
 The [HTML guide](../../docs/guides/html-guide.md) covers both, the tree's
 shape (namespaces, templates, the depth cap), how the tokenizer stream

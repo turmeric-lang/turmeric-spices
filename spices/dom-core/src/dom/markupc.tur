@@ -1,0 +1,1713 @@
+;;; dom/markupc -- the compile-time half of markup literals: a context
+;;; tokenizer that finds the `${...}` holes in an `#html{...}` / `#xml{...}`
+;;; body and decides, from where each one sits, what it may hold.
+;;;
+;;; Imported `:for-macros` by tur-html's `html/markup` and tur-xml's
+;;; `xml/markup`; nothing here runs in a compiled program. `markup-expand`
+;;; walks the body as the HTML (or XML) tokenizer would -- data, tag name,
+;;; attribute name, attribute value (quoted or not), comment, doctype,
+;;; processing instruction, raw text (`script`, `style`, `textarea`,
+;;; `title`, ...), CDATA -- and at each hole:
+;;;
+;;;   - in content: a content hole, filled through `to-child`;
+;;;   - in an attribute value: filled through `to-attr`, or `to-url-attr`
+;;;     for a URL-bearing attribute, plus `srcset-check` for `srcset`;
+;;;   - anywhere else -- a tag or attribute name, a comment, raw text, a
+;;;     doctype, an unquoted value it shares with other text -- a compile
+;;;     error naming the place, because a value there could change the
+;;;     document's structure and no escaping makes that safe;
+;;;   - in code (plan A6, HTML only): inside the quoted value of an `on*` or
+;;;     `style` attribute, or a JavaScript / JSON `<script>` or a `<style>`
+;;;     body, the macro reads the JavaScript, JSON or CSS around the hole --
+;;;     an attribute's after decoding its character references -- and picks
+;;;     the escaper from where the hole sits (a literal in expression or
+;;;     value position, text inside a string, a URL inside CSS url()); any
+;;;     other place there (a template literal, a comment, a regex, after a
+;;;     `/` it cannot classify, a selector, a property name) is a compile
+;;;     error. `srcdoc` takes one hole, its whole quoted value.
+;;;
+;;; It emits one template string (see c/dom/turmarkup.c for the encoding) and
+;;; the hole expressions, each wrapped for its context. A literal whose first
+;;; tag is `<!doctype` or `<html>` is a whole document; otherwise a
+;;; top-level `<head>` or `<body>` is a compile error, since a fragment parse
+;;; drops it.
+;;;
+;;; Since: 0.3.0
+;; tur-check: macro-time
+;; Context tokenizer for markup literals; macro time only.
+(defmodule dom/markupc
+  (export markup-expand)
+  ;;; __b -- internal: the byte at i, or -1 past the end.
+  (defn __b [s : cstr i : int n : int] : int (if (< i n) (cstr-nth s i) -1))
+  ;;; __ws? -- internal: HTML whitespace.
+  (defn __ws? [c : int] : bool
+    (or (= c 32) (or (= c 9) (or (= c 10) (or (= c 13) (= c 12))))))
+  ;;; __lc -- internal: ASCII lower case.
+  (defn __lc [c : int] : int (if (and (>= c 65) (<= c 90)) (+ c 32) c))
+  ;;; __letter? -- internal: may a tag name start with c?
+  (defn __letter? [c : int html : bool] : bool
+    (or (and (>= c 97) (<= c 122))
+      (or (and (>= c 65) (<= c 90))
+        (or (and (not html) (or (= c 95) (= c 58))) (and (not html) (>= c 128))))))
+  ;;; __span-is? -- internal: is s[a, b) the word w (ASCII case-insensitively
+  ;;; when fold)?
+  (defn __span-is? [s : cstr a : int b : int w : cstr fold : bool] : bool
+    (let [wn      (cstr-len w)
+          ^mut k  0
+          ^mut ok (= (- b a) wn)]
+      (while (and ok (< k wn))
+        (let [x (cstr-nth s (+ a k))
+              y (cstr-nth w k)]
+          (if (= (if fold (__lc x) x) y) nil (set! ok false)))
+        (set! k (+ k 1)))
+      ok))
+  ;;; __span-in? -- internal: is s[a, b) one of the space-separated words?
+  (defn __span-in? [s : cstr a : int b : int words : cstr fold : bool] : bool
+    (let [wn       (cstr-len words)
+          ^mut k   0
+          ^mut hit false]
+      (while (and (not hit) (< k wn))
+        (let [^mut e k]
+          (while (and (< e wn) (not (= (cstr-nth words e) 32)))
+            (set! e (+ e 1)))
+          (if (__span-is? s a b (cstr-sub words k e) fold) (set! hit true) nil)
+          (set! k (+ e 1))))
+      hit))
+  ;;; __starts-ci? -- internal: does s continue at i with w (case-insensitive)?
+  (defn __starts-ci? [s : cstr i : int n : int w : cstr] : bool
+    (let [wn (cstr-len w)]
+      (if (> (+ i wn) n) false (__span-is? s i (+ i wn) w true))))
+  ;;; __starts? -- internal: does s continue at i with w exactly?
+  (defn __starts? [s : cstr i : int n : int w : cstr] : bool
+    (let [wn (cstr-len w)]
+      (if (> (+ i wn) n) false (__span-is? s i (+ i wn) w false))))
+  ;;; __hole-at? -- internal: does a `${` start at i?
+  (defn __hole-at? [s : cstr i : int n : int] : bool
+    (and (= (__b s i n) 36) (= (__b s (+ i 1) n) 123)))
+  ;;; __hole-end -- internal: the index of the `}` closing the hole at i, or
+  ;;; -1. Braces nest; braces inside a string literal do not count.
+  (defn __hole-end [s : cstr i : int n : int] : int
+    (let [^mut j     (+ i 2)
+          ^mut depth 1
+          ^mut res   -1]
+      (while (and (< j n) (< res 0))
+        (let [c (cstr-nth s j)]
+          (cond (= c 34)  (do
+                            (set! j (+ j 1))
+                            (while (and (< j n) (not (= (cstr-nth s j) 34)))
+                              (set! j
+                                (if (= (cstr-nth s j) 92) (+ j 2) (+ j 1)))))
+                (= c 123) (set! depth (+ depth 1))
+                (= c 125) (do
+                            (set! depth (- depth 1))
+                            (if (= depth 0) (set! res j) nil))
+                :else     nil))
+        (set! j (+ j 1)))
+      res))
+  ;;; __ws-before -- internal: where the whitespace run ending before i starts.
+  (defn __ws-before [s : cstr i : int] : int
+    (let [^mut k i]
+      (while (and (> k 0) (__ws? (cstr-nth s (- k 1)))) (set! k (- k 1)))
+      k))
+  ;;; __fail -- internal: a compile error at the literal.
+  (defn __fail [body : Syntax html : bool msg : cstr] : Syntax
+    (syntax-error (str-concat (if html "#html{...}: " "#xml{...}: ") msg) body))
+  ;;; __fail! -- internal: a compile error, in statement position.
+  (defn __fail! [body : Syntax html : bool msg : cstr] : nil
+    (__fail body html msg)
+    nil)
+  ;;; __hole-form -- internal: the hole's expression, read from its text with
+  ;;; the position it has in the user's file (read-string-at), so a type
+  ;;; error in a hole points at the hole.
+  (defn __hole-form [body : Syntax html : bool s : cstr i : int j : int] : Syntax
+    (let [text       (cstr-sub s (+ i 2) j)
+          ^mut k     0
+          ^mut blank true]
+      (while (< k (cstr-len text))
+        (if (__ws? (cstr-nth text k)) nil (set! blank false))
+        (set! k (+ k 1)))
+      (if blank
+        (__fail body html "an empty hole ${}")
+        (read-string-at text body (+ i 2)))))
+  ;;; __call1 -- internal: (f x) as Syntax.
+  (defn __call1 [f : cstr x : Syntax] : Syntax (syntax-list (sym->syntax f) x))
+  ;;; __attr-hole -- internal: an attribute hole's wrapped expression, or a
+  ;;; compile error for an attribute that holds code or markup.
+  (defn __attr-hole [ns : cstr
+                     body : Syntax
+                     html : bool
+                     s : cstr
+                     a : int
+                     b : int
+                     e : Syntax] : Syntax
+    (cond (and (>= (- b a) 2) (__span-is? s a (+ a 2) "on" true))                     (__fail body
+                                                                                        html
+                                                                                        (if html
+                                                                                          (str-concat (str-concat (str-concat (str-concat "a hole in the event-handler attribute '"
+                                                                                                                                (cstr-sub s
+                                                                                                                                  a
+                                                                                                                                  b))
+                                                                                                                    "' must be inside its quoted value, where the macro reads the JavaScript around it: ")
+                                                                                                        (cstr-sub s
+                                                                                                          a
+                                                                                                          b))
+                                                                                            "=\"f(${...})\"")
+                                                                                          (str-concat (str-concat "a hole in the event-handler attribute '"
+                                                                                                        (cstr-sub s
+                                                                                                          a
+                                                                                                          b))
+                                                                                            "' -- its value is JavaScript, and #xml{...} takes no holes in code")))
+          (__span-is? s a b "style" true)                                             (__fail body
+                                                                                        html
+                                                                                        (if html
+                                                                                          "a hole in a style attribute must be inside its quoted value, where the macro reads the CSS around it: style=\"color: ${...}\""
+                                                                                          "a hole in the 'style' attribute -- its value is CSS, and #xml{...} takes no holes in code"))
+          (__span-is? s a b "srcdoc" true)                                            (__fail body
+                                                                                        html
+                                                                                        (if html
+                                                                                          "a srcdoc hole is written srcdoc=\"${...}\": quoted, and the whole value"
+                                                                                          "a hole in the 'srcdoc' attribute -- its value is HTML, and #xml{...} takes no holes in code"))
+          (__span-is? s a b "srcset" true)                                            (__call1 (str-concat ns
+                                                                                                 "mk-hole-attr")
+                                                                                        (__call1 (str-concat ns
+                                                                                                   "mk-srcset-check")
+                                                                                          (__call1 "to-url-attr"
+                                                                                            e)))
+          (__span-in? s
+            a
+            b
+            "href src action formaction xlink:href poster cite"
+            true)                                                                     (__call1 (str-concat ns
+                                                                                                 "mk-hole-attr")
+                                                                                        (__call1 "to-url-attr"
+                                                                                          e))
+          :else                                                                       (__call1 (str-concat ns
+                                                                                                 "mk-hole-attr")
+                                                                                        (__call1 "to-attr"
+                                                                                          e))))
+  ;;; __void? -- internal: an HTML void element (no end tag, no content).
+  (defn __void? [s : cstr a : int b : int] : bool
+    (__span-in? s
+      a
+      b
+      "area base basefont bgsound br col embed frame hr img input keygen link meta param source track wbr"
+      true))
+  ;;; __rawtext? -- internal: an HTML element whose content is raw text.
+  (defn __rawtext? [s : cstr a : int b : int] : bool
+    (__span-in? s
+      a
+      b
+      "script style textarea title xmp iframe noembed noframes noscript plaintext"
+      true))
+  ;; ---------------------------------------------------------------------------
+  ;; Holes in code (plan A6). Inside an `on*` or `style` attribute's quoted
+  ;; value, or a `<script>` / `<style>` body, the text around a hole is read
+  ;; as the browser's JavaScript, JSON or CSS parser will read it -- for an
+  ;; attribute, after decoding its character references -- and the hole's
+  ;; position there picks its escaper. Each classifier reads the region's
+  ;; text up to the hole, earlier holes standing in as placeholders: \x03 a
+  ;; value, \x04 (or x in JavaScript) text inside a string. Anything they
+  ;; cannot follow is a compile error, never a guess.
+  ;; ---------------------------------------------------------------------------
+  ;;; __digit? -- internal.
+  (defn __digit? [c : int] : bool (and (>= c 48) (<= c 57)))
+  ;;; __alnum? -- internal: an ASCII letter or digit.
+  (defn __alnum? [c : int] : bool
+    (or (__digit? c) (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)))))
+  ;;; __ascii -- internal: the one-byte string for code c (tab, LF, CR or
+  ;;; printable ASCII), or "".
+  (defn __ascii [c : int] : cstr
+    (let [t "\t\n\r !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"]
+      (cond (= c 9)                    (cstr-sub t 0 1)
+            (= c 10)                   (cstr-sub t 1 2)
+            (= c 13)                   (cstr-sub t 2 3)
+            (and (>= c 32) (<= c 126)) (cstr-sub t (- c 29) (- c 28))
+            :else                      "")))
+  ;;; __entity -- internal: the text the character reference s[a, b) (the
+  ;;; part between & and ;) stands for, or "" for one this decoder does not
+  ;;; read: &quot; &apos; &amp; &lt; &gt; and numeric references to ASCII.
+  (defn __entity [s : cstr a : int b : int] : cstr
+    (cond (__span-is? s a b "quot" false)           "\""
+          (__span-is? s a b "apos" false)           "'"
+          (__span-is? s a b "amp" false)            "&"
+          (__span-is? s a b "lt" false)             "<"
+          (__span-is? s a b "gt" false)             ">"
+          (and (< (+ a 1) b) (= (cstr-nth s a) 35)) (let [hex     (or (= (cstr-nth s
+                                                                           (+ a
+                                                                             1))
+                                                                        120)
+                                                                    (= (cstr-nth s
+                                                                         (+ a 1))
+                                                                      88))
+                                                          ^mut k  (if hex
+                                                                    (+ a 2)
+                                                                    (+ a 1))
+                                                          ^mut v  0
+                                                          ^mut ok (< k b)]
+                                                      (while (and ok (< k b))
+                                                        (let [c (cstr-nth s k)
+                                                              d (cond (__digit? c)                         (- c
+                                                                                                             48)
+                                                                      (and hex
+                                                                        (and (>= c
+                                                                               97)
+                                                                          (<= c
+                                                                            102)))                         (- c
+                                                                                                             87)
+                                                                      (and hex
+                                                                        (and (>= c
+                                                                               65)
+                                                                          (<= c
+                                                                            70)))                          (- c
+                                                                                                             55)
+                                                                      :else                                -1)]
+                                                          (if (or (< d 0)
+                                                                (> v 1000))
+                                                            (set! ok false)
+                                                            (set! v
+                                                              (+ (* v
+                                                                   (if hex
+                                                                     16
+                                                                     10))
+                                                                d))))
+                                                        (set! k (+ k 1)))
+                                                      (if ok (__ascii v) ""))
+          :else                                     ""))
+  ;;; __decode -- internal: attribute text s[a, b) as the browser hands it to
+  ;;; the attribute's own parser, its character references decoded; "\x05"
+  ;;; when it holds a reference this decoder does not read (in doubt,
+  ;;; refuse). An & not followed by a letter, digit or # is itself.
+  (defn __decode [s : cstr a : int b : int] : cstr
+    (let [^mut out ""
+          ^mut i   a
+          ^mut run a
+          ^mut bad false]
+      (while (and (not bad) (< i b))
+        (if (and (= (cstr-nth s i) 38)
+              (or (__alnum? (__b s (+ i 1) b)) (= (__b s (+ i 1) b) 35)))
+          (let [^mut e (+ i 1)]
+            (while (and (< e b)
+                     (and (< e (+ i 12)) (not (= (cstr-nth s e) 59))))
+              (set! e (+ e 1)))
+            (let [d (if (and (< e b) (= (cstr-nth s e) 59))
+                      (__entity s (+ i 1) e)
+                      "")]
+              (if (= (cstr-len d) 0)
+                (set! bad true)
+                (do
+                  (set! out (str-concat (str-concat out (cstr-sub s run i)) d))
+                  (set! i (+ e 1))
+                  (set! run i)))))
+          (set! i (+ i 1))))
+      (if bad "\x05" (str-concat out (cstr-sub s run b)))))
+  ;;; __id-start? -- internal: may a JavaScript identifier start with c?
+  (defn __id-start? [c : int] : bool
+    (or (and (>= c 97) (<= c 122))
+      (or (and (>= c 65) (<= c 90)) (or (= c 95) (or (= c 36) (>= c 128))))))
+  ;;; __id-char? -- internal: may a JavaScript identifier continue with c?
+  (defn __id-char? [c : int] : bool (or (__id-start? c) (__digit? c)))
+  ;;; __js-ctx -- internal: where the end of JavaScript source src is, for a
+  ;;; hole there. 1 expression position (a literal through ToJs), 2 inside a
+  ;;; quoted string (text through ToCodeText); otherwise an error code (see
+  ;;; __code-error): 10 operator position, 11 template literal, 12 comment,
+  ;;; 13 regex, 14 a token it cannot read past, 15 right after a backslash in
+  ;;; a string, 16 after a `.`, 17 `<!--` in the source.
+  (defn __js-ctx [src : cstr] : int
+    (let [n         (cstr-len src)
+          ^mut i    0
+          ^mut mode 0
+          ^mut expr 1
+          ^mut lost false
+          ^mut tail false]
+      ;; mode: 0 code, 1 '...', 2 "...", 3 `...`, 4 // comment, 5 /* comment,
+      ;; 6 regex, 7 regex class. expr: 1 a value may start here, 0 an
+      ;; operator must, 2 unknown (after ) } ++ --), 3 after a `.`.
+      (while (and (< i n) (not lost))
+        (let [c (cstr-nth src i)
+              d (__b src (+ i 1) n)]
+          (cond (= mode 0)                 (cond (__ws? c)                                                          (set! i
+                                                                                                                      (+ i
+                                                                                                                        1))
+                                                 (= c 3)                                                            (do
+                                                                                                                      (set! expr
+                                                                                                                        0)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          1)))
+                                                 (= c 39)                                                           (do
+                                                                                                                      (set! mode
+                                                                                                                        1)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          1)))
+                                                 (= c 34)                                                           (do
+                                                                                                                      (set! mode
+                                                                                                                        2)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          1)))
+                                                 (= c 96)                                                           (do
+                                                                                                                      (set! mode
+                                                                                                                        3)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          1)))
+                                                 (and (= c 47) (= d 47))                                            (do
+                                                                                                                      (set! mode
+                                                                                                                        4)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          2)))
+                                                 (and (= c 47) (= d 42))                                            (do
+                                                                                                                      (set! mode
+                                                                                                                        5)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          2)))
+                                                 (and (= c 47) (= expr 1))                                          (do
+                                                                                                                      (set! mode
+                                                                                                                        6)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          1)))
+                                                 (and (= c 47) (= expr 0))                                          (do
+                                                                                                                      (set! expr
+                                                                                                                        1)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          1)))
+                                                 (= c 47)                                                           (set! lost
+                                                                                                                      true)
+                                                 (__id-start? c)                                                    (let [^mut e (+ i
+                                                                                                                                   1)]
+                                                                                                                      (while (and (< e
+                                                                                                                                    n)
+                                                                                                                               (__id-char? (cstr-nth src
+                                                                                                                                             e)))
+                                                                                                                        (set! e
+                                                                                                                          (+ e
+                                                                                                                            1)))
+                                                                                                                      (set! expr
+                                                                                                                        (if (__span-in? src
+                                                                                                                              i
+                                                                                                                              e
+                                                                                                                              "return typeof instanceof in of new delete void throw case do else yield await"
+                                                                                                                              false)
+                                                                                                                          1
+                                                                                                                          0))
+                                                                                                                      (set! i
+                                                                                                                        e))
+                                                 (or (__digit? c)
+                                                   (and (= c 46) (__digit? d)))                                     (let [^mut e (+ i
+                                                                                                                                   1)]
+                                                                                                                      (while (and (< e
+                                                                                                                                    n)
+                                                                                                                               (or (__id-char? (cstr-nth src
+                                                                                                                                                 e))
+                                                                                                                                 (= (cstr-nth src
+                                                                                                                                      e)
+                                                                                                                                   46)))
+                                                                                                                        (set! e
+                                                                                                                          (+ e
+                                                                                                                            1)))
+                                                                                                                      (set! expr
+                                                                                                                        0)
+                                                                                                                      (set! i
+                                                                                                                        e))
+                                                 (= c 46)                                                           (do
+                                                                                                                      (set! expr
+                                                                                                                        3)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          1)))
+                                                 (and (= c 63)
+                                                   (and (= d 46)
+                                                     (not (__digit? (__b src
+                                                                      (+ i 2)
+                                                                      n)))))                                        (do
+                                                                                                                      (set! expr
+                                                                                                                        3)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          2)))
+                                                 (or (= c 41) (= c 125))                                            (do
+                                                                                                                      (set! expr
+                                                                                                                        2)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          1)))
+                                                 (= c 93)                                                           (do
+                                                                                                                      (set! expr
+                                                                                                                        0)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          1)))
+                                                 (and (or (= c 43) (= c 45))
+                                                   (= d c))                                                         (do
+                                                                                                                      (set! expr
+                                                                                                                        2)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          2)))
+                                                 (= c 92)                                                           (set! lost
+                                                                                                                      true)
+                                                 :else                                                              (do
+                                                                                                                      (set! expr
+                                                                                                                        1)
+                                                                                                                      (set! i
+                                                                                                                        (+ i
+                                                                                                                          1))))
+                (or (= mode 1) (= mode 2)) (cond (= c 92)                    (if (< (+ i
+                                                                                      1)
+                                                                                   n)
+                                                                               (set! i
+                                                                                 (+ i
+                                                                                   2))
+                                                                               (do
+                                                                                 (set! tail
+                                                                                   true)
+                                                                                 (set! i
+                                                                                   n)))
+                                                 (or (= c 10) (= c 13))      (set! lost
+                                                                               true)
+                                                 (= c (if (= mode 1) 39 34)) (do
+                                                                               (set! mode
+                                                                                 0)
+                                                                               (set! expr
+                                                                                 0)
+                                                                               (set! i
+                                                                                 (+ i
+                                                                                   1)))
+                                                 :else                       (set! i
+                                                                               (+ i
+                                                                                 1)))
+                (= mode 3)                 (cond (= c 92) (set! i (+ i 2))
+                                                 (= c 96) (do
+                                                            (set! mode 0)
+                                                            (set! expr 0)
+                                                            (set! i (+ i 1)))
+                                                 :else    (set! i (+ i 1)))
+                (= mode 4)                 (do
+                                             (if (or (= c 10) (= c 13))
+                                               (set! mode 0)
+                                               nil)
+                                             (set! i (+ i 1)))
+                (= mode 5)                 (if (and (= c 42) (= d 47))
+                                             (do (set! mode 0) (set! i (+ i 2)))
+                                             (set! i (+ i 1)))
+                (= mode 6)                 (cond (= c 92)               (set! i
+                                                                          (+ i
+                                                                            2))
+                                                 (= c 91)               (do
+                                                                          (set! mode
+                                                                            7)
+                                                                          (set! i
+                                                                            (+ i
+                                                                              1)))
+                                                 (or (= c 10) (= c 13)) (set! lost
+                                                                          true)
+                                                 (= c 47)               (let [^mut e (+ i
+                                                                                       1)]
+                                                                          (while (and (< e
+                                                                                        n)
+                                                                                   (__id-char? (cstr-nth src
+                                                                                                 e)))
+                                                                            (set! e
+                                                                              (+ e
+                                                                                1)))
+                                                                          (set! mode
+                                                                            0)
+                                                                          (set! expr
+                                                                            0)
+                                                                          (set! i
+                                                                            e))
+                                                 :else                  (set! i
+                                                                          (+ i
+                                                                            1)))
+                :else                      (cond (= c 92) (set! i (+ i 2))
+                                                 (= c 93) (do
+                                                            (set! mode 6)
+                                                            (set! i (+ i 1)))
+                                                 :else    (set! i (+ i 1))))))
+      (cond (match (cstr-index-of src "<!--") (Some _) true (None) false) 17
+            lost                                                          14
+            (= mode 0)                                                    (cond (= expr
+                                                                                  1)       1
+                                                                                (= expr
+                                                                                  0)       10
+                                                                                (= expr
+                                                                                  3)       16
+                                                                                :else      14)
+            (or (= mode 1) (= mode 2))                                    (if tail
+                                                                            15
+                                                                            2)
+            (= mode 3)                                                    11
+            (or (= mode 4) (= mode 5))                                    12
+            :else                                                         13)))
+  ;;; __json-ctx -- internal: where the end of JSON source src is. 1 a value
+  ;;; goes here, 2 inside a string; errors 20 an object key goes here, 21
+  ;;; anywhere else, 15 right after a backslash, 17 `<!--`.
+  (defn __json-ctx [src : cstr] : int
+    (let [n          (cstr-len src)
+          ^mut i     0
+          ^mut st    "v"
+          ^mut ex    0
+          ^mut instr false
+          ^mut key   false
+          ^mut lost  false
+          ^mut tail  false]
+      ;; ex: 0 a value, 1 a key or }, 2 a key, 3 a colon, 4 a comma or a
+      ;; closing bracket. st: the open containers, innermost last.
+      (while (and (< i n) (not lost))
+        (let [c (cstr-nth src i)]
+          (cond instr                                    (cond (= c 92) (if (< (+ i
+                                                                                 1)
+                                                                              n)
+                                                                          (set! i
+                                                                            (+ i
+                                                                              2))
+                                                                          (do
+                                                                            (set! tail
+                                                                              true)
+                                                                            (set! i
+                                                                              n)))
+                                                               (= c 34) (do
+                                                                          (set! instr
+                                                                            false)
+                                                                          (set! ex
+                                                                            (if key
+                                                                              3
+                                                                              4))
+                                                                          (set! i
+                                                                            (+ i
+                                                                              1)))
+                                                               :else    (set! i
+                                                                          (+ i
+                                                                            1)))
+                (__ws? c)                                (set! i (+ i 1))
+                (= c 3)                                  (do
+                                                           (set! ex 4)
+                                                           (set! i (+ i 1)))
+                (= c 34)                                 (do
+                                                           (set! instr true)
+                                                           (set! key
+                                                             (or (= ex 1)
+                                                               (= ex 2)))
+                                                           (set! i (+ i 1)))
+                (= c 123)                                (do
+                                                           (set! st
+                                                             (str-concat st "o"))
+                                                           (set! ex 1)
+                                                           (set! i (+ i 1)))
+                (= c 91)                                 (do
+                                                           (set! st
+                                                             (str-concat st "a"))
+                                                           (set! ex 0)
+                                                           (set! i (+ i 1)))
+                (or (= c 125) (= c 93))                  (do
+                                                           (if (> (cstr-len st)
+                                                                 1)
+                                                             (set! st
+                                                               (cstr-sub st
+                                                                 0
+                                                                 (- (cstr-len st)
+                                                                   1)))
+                                                             (set! lost true))
+                                                           (set! ex 4)
+                                                           (set! i (+ i 1)))
+                (= c 58)                                 (do
+                                                           (set! ex 0)
+                                                           (set! i (+ i 1)))
+                (= c 44)                                 (do
+                                                           (set! ex
+                                                             (if (= (cstr-nth st
+                                                                      (- (cstr-len st)
+                                                                        1))
+                                                                   111)
+                                                               2
+                                                               0))
+                                                           (set! i (+ i 1)))
+                (or (__alnum? c) (or (= c 45) (= c 46))) (do
+                                                           (while (and (< i n)
+                                                                    (or (__alnum? (cstr-nth src
+                                                                                    i))
+                                                                      (or (= (cstr-nth src
+                                                                               i)
+                                                                            45)
+                                                                        (or (= (cstr-nth src
+                                                                                 i)
+                                                                              46)
+                                                                          (= (cstr-nth src
+                                                                               i)
+                                                                            43)))))
+                                                             (set! i (+ i 1)))
+                                                           (set! ex 4))
+                :else                                    (set! lost true))))
+      (cond (match (cstr-index-of src "<!--") (Some _) true (None) false) 17
+            lost                                                          21
+            instr                                                         (if tail
+                                                                            15
+                                                                            2)
+            (= ex 0)                                                      1
+            (or (= ex 1) (= ex 2))                                        20
+            :else                                                         21)))
+  ;;; __at-rule-block? -- internal: does the at-rule whose prelude starts at
+  ;;; s[a] hold rules (not declarations)?
+  (defn __at-rule-block? [s : cstr a : int b : int] : bool
+    (let [^mut e (+ a 1)]
+      (while (and (< e b) (or (__alnum? (cstr-nth s e)) (= (cstr-nth s e) 45)))
+        (set! e (+ e 1)))
+      (__span-in? s
+        (+ a 1)
+        e
+        "media supports layer container document scope starting-style keyframes -webkit-keyframes -moz-document"
+        true)))
+  ;;; __css-scan -- internal: read CSS source src -- a `style` attribute's
+  ;;; declarations (attr) or a style sheet. Without final: where its end is,
+  ;;; for a hole there: 30 a property value (ToCss), 31 inside a quoted
+  ;;; string (ToCodeText, CSS-escaped), 32 inside url(...) (ToUrlAttr,
+  ;;; percent-encoded); errors 40 a selector or at-rule, 41 a property name,
+  ;;; 42 a comment, 43 something it cannot follow, 44 right after a
+  ;;; backslash. With final, over the whole region: 0, or 45 when a
+  ;;; declaration holding a hole turns out to be a nested rule's selector.
+  (defn __css-scan [src : cstr attr : bool final : bool] : int
+    (let [n          (cstr-len src)
+          ^mut i     0
+          ^mut stack (if attr "D" "r")
+          ^mut pos   0
+          ^mut pa    0
+          ^mut mode  0
+          ^mut url   false
+          ^mut ph    false
+          ^mut lost  false
+          ^mut tail  false
+          ^mut res   0]
+      ;; mode: 0 normal, 1 '...', 2 "...", 3 comment, 4 unquoted url(...).
+      ;; stack: D an attribute's declarations, r a block of rules, d a block
+      ;; of declarations. pos: 0 a property name, 1 its value. ph: the
+      ;; current declaration or prelude holds a hole.
+      (while (and (< i n) (and (not lost) (= res 0)))
+        (let [c   (cstr-nth src i)
+              d   (__b src (+ i 1) n)
+              top (cstr-nth stack (- (cstr-len stack) 1))]
+          (cond (= mode 3)                       (if (and (= c 42) (= d 47))
+                                                   (do
+                                                     (set! mode 0)
+                                                     (set! i (+ i 2)))
+                                                   (set! i (+ i 1)))
+                (or (= mode 1) (= mode 2))       (cond (= c 92)                    (if (< (+ i
+                                                                                            1)
+                                                                                         n)
+                                                                                     (set! i
+                                                                                       (+ i
+                                                                                         2))
+                                                                                     (do
+                                                                                       (set! tail
+                                                                                         true)
+                                                                                       (set! i
+                                                                                         n)))
+                                                       (or (= c 3) (= c 4))        (do
+                                                                                     (set! ph
+                                                                                       true)
+                                                                                     (set! i
+                                                                                       (+ i
+                                                                                         1)))
+                                                       (or (= c 10) (= c 13))      (set! lost
+                                                                                     true)
+                                                       (= c
+                                                         (if (= mode 1) 39 34))    (do
+                                                                                     (set! mode
+                                                                                       0)
+                                                                                     (set! i
+                                                                                       (+ i
+                                                                                         1)))
+                                                       :else                       (set! i
+                                                                                     (+ i
+                                                                                       1)))
+                (= mode 4)                       (cond (= c 92)             (if (< (+ i
+                                                                                     1)
+                                                                                  n)
+                                                                              (set! i
+                                                                                (+ i
+                                                                                  2))
+                                                                              (do
+                                                                                (set! tail
+                                                                                  true)
+                                                                                (set! i
+                                                                                  n)))
+                                                       (or (= c 3) (= c 4)) (do
+                                                                              (set! ph
+                                                                                true)
+                                                                              (set! i
+                                                                                (+ i
+                                                                                  1)))
+                                                       (= c 41)             (do
+                                                                              (set! mode
+                                                                                0)
+                                                                              (set! url
+                                                                                false)
+                                                                              (set! i
+                                                                                (+ i
+                                                                                  1)))
+                                                       :else                (set! i
+                                                                              (+ i
+                                                                                1)))
+                (and (= c 47) (= d 42))          (do
+                                                   (set! mode 3)
+                                                   (set! i (+ i 2)))
+                (= c 39)                         (do
+                                                   (set! mode 1)
+                                                   (set! i (+ i 1)))
+                (= c 34)                         (do
+                                                   (set! mode 2)
+                                                   (set! i (+ i 1)))
+                (or (= c 3) (= c 4))             (do
+                                                   (set! ph true)
+                                                   (set! i (+ i 1)))
+                (and (= c 41) url)               (do
+                                                   (set! url false)
+                                                   (set! i (+ i 1)))
+                (__starts-ci? src i n "url(")    (let [^mut e (+ i 4)]
+                                                   (while (and (< e n)
+                                                            (__ws? (cstr-nth src
+                                                                     e)))
+                                                     (set! e (+ e 1)))
+                                                   (set! url true)
+                                                   (cond (= (__b src e n) 39) (do
+                                                                                (set! mode
+                                                                                  1)
+                                                                                (set! i
+                                                                                  (+ e
+                                                                                    1)))
+                                                         (= (__b src e n) 34) (do
+                                                                                (set! mode
+                                                                                  2)
+                                                                                (set! i
+                                                                                  (+ e
+                                                                                    1)))
+                                                         :else                (do
+                                                                                (set! mode
+                                                                                  4)
+                                                                                (set! i
+                                                                                  e))))
+                (= c 92)                         (set! i (+ i 2))
+                (= c 123)                        (do
+                                                   (cond (= top 68)  (set! lost
+                                                                       true)
+                                                         (= top 100) (if (and final
+                                                                           ph)
+                                                                       (set! res
+                                                                         45)
+                                                                       (set! stack
+                                                                         (str-concat stack
+                                                                           "d")))
+                                                         :else       (let [^mut a pa]
+                                                                       (while (and (< a
+                                                                                     i)
+                                                                                (__ws? (cstr-nth src
+                                                                                         a)))
+                                                                         (set! a
+                                                                           (+ a
+                                                                             1)))
+                                                                       (set! stack
+                                                                         (str-concat stack
+                                                                           (if (and (< a
+                                                                                      i)
+                                                                                 (and (= (cstr-nth src
+                                                                                           a)
+                                                                                        64)
+                                                                                   (__at-rule-block? src
+                                                                                     a
+                                                                                     i)))
+                                                                             "r"
+                                                                             "d")))))
+                                                   (set! pos 0)
+                                                   (set! ph false)
+                                                   (set! pa (+ i 1))
+                                                   (set! i (+ i 1)))
+                (= c 125)                        (do
+                                                   (if (> (cstr-len stack) 1)
+                                                     (set! stack
+                                                       (cstr-sub stack
+                                                         0
+                                                         (- (cstr-len stack) 1)))
+                                                     (set! lost true))
+                                                   (set! pos 0)
+                                                   (set! ph false)
+                                                   (set! pa (+ i 1))
+                                                   (set! i (+ i 1)))
+                (= c 59)                         (do
+                                                   (set! pos 0)
+                                                   (set! ph false)
+                                                   (set! pa (+ i 1))
+                                                   (set! i (+ i 1)))
+                (and (= c 58) (not (= top 114))) (do
+                                                   (set! pos 1)
+                                                   (set! i (+ i 1)))
+                :else                            (set! i (+ i 1)))))
+      (let [top (cstr-nth stack (- (cstr-len stack) 1))]
+        (cond final                      (if lost 43 res)
+              lost                       43
+              (= mode 3)                 42
+              (or (= mode 1) (= mode 2)) (cond tail 44 url 32 :else 31)
+              (= mode 4)                 (if tail 44 32)
+              (= top 114)                40
+              (= pos 0)                  41
+              :else                      30))))
+  ;;; __code-error -- internal: the message for a classifier's error code, or
+  ;;; "" for a position that takes a hole.
+  (defn __code-error [k : int] : cstr
+    (cond (= k 10) "a hole where JavaScript expects an operator; a hole stands for a value"
+          (= k 11) "a hole inside a JavaScript template literal (backticks)"
+          (= k 12) "a hole inside a JavaScript comment"
+          (= k 13) "a hole inside a JavaScript regular expression"
+          (= k 14) "a hole after JavaScript the macro cannot follow (a / that may start a regex or divide, or a value after ) } ++ --); in doubt it refuses"
+          (= k 15) "a hole right after a backslash in a string"
+          (= k 16) "a hole after a '.'; a property name cannot be a hole"
+          (= k 17) "a hole in a <script> holding <!--, which changes how the HTML parser ends it"
+          (= k 20) "a hole where a JSON object key goes"
+          (= k 21) "a hole where JSON expects a ',' or a closing bracket"
+          (= k 40) "a hole in a CSS selector or at-rule; holes go in property values"
+          (= k 41) "a hole in a CSS property name; holes go in property values"
+          (= k 42) "a hole inside a CSS comment"
+          (= k 43) "a hole after CSS the macro cannot follow; in doubt it refuses"
+          (= k 44) "a hole right after a backslash in a CSS string"
+          (= k 45) "a hole in a CSS declaration that turns out to be a nested rule's selector"
+          :else    ""))
+  ;;; __code-wrap -- internal: a code hole's expression for classifier result
+  ;;; k (js: JavaScript or JSON, else CSS), as a `mk-hole-code` call.
+  (defn __code-wrap [ns : cstr js : bool k : int e : Syntax] : Syntax
+    (__call1 (str-concat ns "mk-hole-code")
+      (cond (and js (= k 1)) (__call1 (str-concat ns "mk-js-pad")
+                               (__call1 "to-js" e))
+            js               (__call1 (str-concat ns "mk-js-escape")
+                               (__call1 "to-code-text" e))
+            (= k 30)         (__call1 "to-css" e)
+            (= k 31)         (__call1 (str-concat ns "mk-css-escape")
+                               (__call1 "to-code-text" e))
+            :else            (__call1 (str-concat ns "mk-css-url")
+                               (__call1 "to-url-attr" e)))))
+  ;;; __code-ph -- internal: the placeholder a hole leaves in its region.
+  (defn __code-ph [js : bool k : int] : cstr
+    (cond (and js (= k 1)) "\x03" js "x" (= k 30) "\x03" :else "\x04"))
+  ;;; __script-kind -- internal: a <script>'s body, by its type attribute
+  ;;; (static text): 4 JavaScript, 5 JSON, 7 anything else.
+  (defn __script-kind [t : cstr] : int
+    (let [n      (cstr-len t)
+          ^mut a 0
+          ^mut b n]
+      (while (and (< a n) (__ws? (cstr-nth t a))) (set! a (+ a 1)))
+      (while (and (> b a) (__ws? (cstr-nth t (- b 1)))) (set! b (- b 1)))
+      (cond (= a b)                                                                                                                                                                                                                                                                                                                                             4
+            (__span-in? t
+              a
+              b
+              "module text/javascript application/javascript text/ecmascript application/ecmascript application/x-javascript application/x-ecmascript text/x-javascript text/x-ecmascript text/jscript text/livescript text/javascript1.0 text/javascript1.1 text/javascript1.2 text/javascript1.3 text/javascript1.4 text/javascript1.5"
+              true)                                                                                                                                                                                                                                                                                                                                             4
+            (__span-in? t a b "application/json application/ld+json" true)                                                                                                                                                                                                                                                                                      5
+            :else                                                                                                                                                                                                                                                                                                                                               7)))
+  ;;; __attr-code -- internal: what an attribute's value is, for holes in it:
+  ;;; 1 JavaScript (on*), 2 CSS (style), 3 an HTML document (srcdoc), 0 a
+  ;;; plain value. Code attributes exist in HTML only.
+  (defn __attr-code [s : cstr a : int b : int html : bool] : int
+    (cond (not html)                                              0
+          (and (>= (- b a) 2) (__span-is? s a (+ a 2) "on" true)) 1
+          (__span-is? s a b "style" true)                         2
+          (__span-is? s a b "srcdoc" true)                        3
+          :else                                                   0))
+  ;;; markup-expand -- expand a markup literal body into a render call.
+  ;;;
+  ;;; Parameters:
+  ;;;   body   -- the literal's body (a string literal Syntax)
+  ;;;   html   -- HTML (true) or XML rules
+  ;;;   render -- the name of the function to call with the template and holes
+  ;;;   ns     -- the module prefix ("html/markup/") of the `mk-hole-child`,
+  ;;;             `mk-hole-attr`, `mk-srcset-check` and (HTML) `mk-hole-code`
+  ;;;             family the expansion calls: the macro's own module, which
+  ;;;             every file using the macro has imported (a qualified name
+  ;;;             resolves only for a module the file imports itself)
+  ;;;
+  ;;; Returns:
+  ;;;   Syntax -- `(render "template" (tcons-of hole ... (tnil)))`
+  ;;;
+  ;;; Example:
+  ;;;   (defmacro* html* [body] (markup-expand body true "html/markup/html-render" "html/markup/"))
+  ;;;
+  ;;; Since: 0.3.0
+  (defn markup-expand [body : Syntax html : bool render : cstr ns : cstr] : Syntax
+    (let [s              (syntax->str body)
+          n              (cstr-len s)
+          ^mut i         0
+          ^mut st        0
+          ^mut out       ""
+          ^mut seg       0
+          ^mut holes     (:: (tnil) (Cons Syntax))
+          ^mut tag-a     0
+          ^mut tag-b     0
+          ^mut raw-a     0
+          ^mut raw-b     0
+          ^mut attr-a    0
+          ^mut attr-b    0
+          ^mut val-a     0
+          ^mut q         0
+          ^mut depth     0
+          ^mut seen      false
+          ^mut doc       false
+          ^mut close     false
+          ;; plan A6: the code region a hole is in (0 none, 1 an on*
+          ;; attribute, 2 a style attribute, 3 srcdoc, 4 a JavaScript
+          ;; <script>, 5 a JSON <script>, 6 <style>, 7 a <script> of another
+          ;; type, 8 a <script> whose type is a hole), its text so far
+          ;; (decoded, holes as placeholders), where its unread static text
+          ;; starts, and whether it has holes; the <script>'s type
+          ^mut code      0
+          ^mut region    ""
+          ^mut rfrom     0
+          ^mut rholes    false
+          ^mut stype     ""
+          ^mut stype-dyn false]
+      (let [^mut k 0]
+        (while (< k n)
+          (let [c (cstr-nth s k)]
+            (if (and (>= c 1) (<= c 4))
+              (__fail! body
+                html
+                "control characters U+0001 to U+0004 are reserved")
+              nil))
+          (set! k (+ k 1))))
+      (match (cstr-index-of s "__tur_hole_")
+        (Some _)
+        (__fail! body html "'__tur_hole_' is reserved for hole markers")
+        (None)
+        nil)
+      (while (< i n)
+        (let [c (cstr-nth s i)]
+          (cond
+                ;; ---- data
+                (= st 0)  (cond (__hole-at? s i n) (let [j (__hole-end s i n)]
+                                                     (if (< j 0)
+                                                       (__fail! body
+                                                         html
+                                                         "unterminated ${")
+                                                       nil)
+                                                     ;; `<${x}`: the tokenizer saw a `<` that does not open a tag,
+                                                     ;; but the static `<` and the value would print one.
+                                                     (if (and (> i 0)
+                                                           (= (cstr-nth s
+                                                                (- i 1))
+                                                             60))
+                                                       (__fail! body
+                                                         html
+                                                         "a hole cannot be a tag name")
+                                                       nil)
+                                                     (set! out
+                                                       (str-concat (str-concat out
+                                                                     (cstr-sub s
+                                                                       seg
+                                                                       i))
+                                                         "\x01c\x02"))
+                                                     (set! holes
+                                                       (tcons-of (__call1 (str-concat ns
+                                                                            "mk-hole-child")
+                                                                   (__call1 "to-child"
+                                                                     (__hole-form body
+                                                                       html
+                                                                       s
+                                                                       i
+                                                                       j)))
+                                                         holes))
+                                                     (set! i (+ j 1))
+                                                     (set! seg i))
+                                (= c 60)           (cond (__starts? s
+                                                           i
+                                                           n
+                                                           "<!--")                                      (do
+                                                                                                          (set! st
+                                                                                                            8)
+                                                                                                          (set! i
+                                                                                                            (+ i
+                                                                                                              4)))
+                                                         (and (not html)
+                                                           (__starts? s
+                                                             i
+                                                             n
+                                                             "<![CDATA["))                              (do
+                                                                                                          (set! st
+                                                                                                            13)
+                                                                                                          (set! i
+                                                                                                            (+ i
+                                                                                                              9)))
+                                                         (= (__b s (+ i 1) n)
+                                                           33)                                          (do
+                                                                                                          (if (and html
+                                                                                                                (and (not seen)
+                                                                                                                  (__starts-ci? s
+                                                                                                                    i
+                                                                                                                    n
+                                                                                                                    "<!doctype")))
+                                                                                                            (set! doc
+                                                                                                              true)
+                                                                                                            nil)
+                                                                                                          (set! seen
+                                                                                                            true)
+                                                                                                          (set! st
+                                                                                                            9)
+                                                                                                          (set! i
+                                                                                                            (+ i
+                                                                                                              2)))
+                                                         (= (__b s (+ i 1) n)
+                                                           63)                                          (do
+                                                                                                          (set! st
+                                                                                                            (if html
+                                                                                                              9
+                                                                                                              10))
+                                                                                                          (set! i
+                                                                                                            (+ i
+                                                                                                              2)))
+                                                         (= (__b s (+ i 1) n)
+                                                           47)                                          (do
+                                                                                                          (set! st
+                                                                                                            11)
+                                                                                                          (set! i
+                                                                                                            (+ i
+                                                                                                              2)))
+                                                         (__letter? (__b s
+                                                                      (+ i 1)
+                                                                      n)
+                                                           html)                                        (do
+                                                                                                          (set! st
+                                                                                                            1)
+                                                                                                          (set! close
+                                                                                                            false)
+                                                                                                          (set! stype
+                                                                                                            "")
+                                                                                                          (set! stype-dyn
+                                                                                                            false)
+                                                                                                          (set! tag-a
+                                                                                                            (+ i
+                                                                                                              1))
+                                                                                                          (set! i
+                                                                                                            (+ i
+                                                                                                              1)))
+                                                         :else                                          (set! i
+                                                                                                          (+ i
+                                                                                                            1)))
+                                :else              (set! i (+ i 1)))
+                ;; ---- tag name
+                (= st 1)  (cond (__hole-at? s i n)                    (__fail! body
+                                                                        html
+                                                                        "a hole cannot be part of a tag name")
+                                (or (__ws? c) (or (= c 47) (= c 62))) (do
+                                                                        (set! tag-b
+                                                                          i)
+                                                                        (if (and html
+                                                                              (and (not seen)
+                                                                                (__span-is? s
+                                                                                  tag-a
+                                                                                  tag-b
+                                                                                  "html"
+                                                                                  true)))
+                                                                          (set! doc
+                                                                            true)
+                                                                          nil)
+                                                                        (set! seen
+                                                                          true)
+                                                                        (if (and html
+                                                                              (and (not doc)
+                                                                                (and (= depth
+                                                                                       0)
+                                                                                  (__span-in? s
+                                                                                    tag-a
+                                                                                    tag-b
+                                                                                    "head body"
+                                                                                    true))))
+                                                                          (__fail! body
+                                                                            html
+                                                                            "a top-level <head> or <body> is dropped by a fragment parse; start the literal with <!doctype html> or <html> for a whole document")
+                                                                          nil)
+                                                                        (set! st
+                                                                          2))
+                                :else                                 (set! i
+                                                                        (+ i 1)))
+                ;; ---- between attributes
+                (= st 2)  (cond (__ws? c)          (set! i (+ i 1))
+                                (= c 62)           (do
+                                                     (if (and html
+                                                           (__rawtext? s
+                                                             tag-a
+                                                             tag-b))
+                                                       (do
+                                                         (set! st 12)
+                                                         (set! raw-a tag-a)
+                                                         (set! raw-b tag-b)
+                                                         (set! code
+                                                           (cond (__span-is? s
+                                                                   tag-a
+                                                                   tag-b
+                                                                   "script"
+                                                                   true)                                  (if stype-dyn
+                                                                                                            8
+                                                                                                            (__script-kind stype))
+                                                                 (__span-is? s
+                                                                   tag-a
+                                                                   tag-b
+                                                                   "style"
+                                                                   true)                                  6
+                                                                 :else                                    0))
+                                                         (set! region "")
+                                                         (set! rfrom (+ i 1))
+                                                         (set! rholes false))
+                                                       (set! st 0))
+                                                     (if (or close
+                                                           (and html
+                                                             (__void? s
+                                                               tag-a
+                                                               tag-b)))
+                                                       nil
+                                                       (set! depth (+ depth 1)))
+                                                     (set! i (+ i 1)))
+                                (= c 47)           (do
+                                                     (if (= (__b s (+ i 1) n)
+                                                           62)
+                                                       (set! close true)
+                                                       nil)
+                                                     (set! i (+ i 1)))
+                                (__hole-at? s i n) (__fail! body
+                                                     html
+                                                     "a hole cannot be an attribute name; write name=${...} (a boolean attribute takes a bool)")
+                                :else              (do
+                                                     (set! attr-a i)
+                                                     (set! st 3)))
+                ;; ---- attribute name
+                (= st 3)  (cond (__hole-at? s i n)                                  (__fail! body
+                                                                                      html
+                                                                                      "a hole cannot be part of an attribute name")
+                                (or (__ws? c)
+                                  (or (= c 61) (or (= c 62) (= c 47))))             (do
+                                                                                      (set! attr-b
+                                                                                        i)
+                                                                                      (set! st
+                                                                                        4))
+                                :else                                               (set! i
+                                                                                      (+ i
+                                                                                        1)))
+                ;; ---- after an attribute name
+                (= st 4)  (cond (__ws? c) (set! i (+ i 1))
+                                (= c 61)  (do (set! st 5) (set! i (+ i 1)))
+                                :else     (set! st 2))
+                ;; ---- before an attribute value
+                (= st 5)  (cond (__ws? c)              (set! i (+ i 1))
+                                (or (= c 34) (= c 39)) (do
+                                                         (set! q c)
+                                                         (set! val-a (+ i 1))
+                                                         (set! code
+                                                           (__attr-code s
+                                                             attr-a
+                                                             attr-b
+                                                             html))
+                                                         (set! region "")
+                                                         (set! rfrom (+ i 1))
+                                                         (set! rholes false)
+                                                         (set! st 6)
+                                                         (set! i (+ i 1)))
+                                (__hole-at? s i n)     (let [j     (__hole-end s
+                                                                     i
+                                                                     n)
+                                                             after (+ j 1)
+                                                             nc    (__b s
+                                                                     after
+                                                                     n)]
+                                                         (if (< j 0)
+                                                           (__fail! body
+                                                             html
+                                                             "unterminated ${")
+                                                           nil)
+                                                         (if (or (< nc 0)
+                                                               (or (__ws? nc)
+                                                                 (or (= nc 62)
+                                                                   (= nc 47))))
+                                                           nil
+                                                           (__fail! body
+                                                             html
+                                                             "a hole shares an unquoted attribute value with other text; quote the value"))
+                                                         (if (__span-is? s
+                                                               attr-a
+                                                               attr-b
+                                                               "type"
+                                                               true)
+                                                           (set! stype-dyn true)
+                                                           nil)
+                                                         (set! holes
+                                                           (tcons-of (__attr-hole ns
+                                                                       body
+                                                                       html
+                                                                       s
+                                                                       attr-a
+                                                                       attr-b
+                                                                       (__hole-form body
+                                                                         html
+                                                                         s
+                                                                         i
+                                                                         j))
+                                                             holes))
+                                                         (set! out
+                                                           (str-concat (str-concat (str-concat (str-concat out
+                                                                                                 (cstr-sub s
+                                                                                                   seg
+                                                                                                   (__ws-before s
+                                                                                                     attr-a)))
+                                                                                     "\x01w")
+                                                                         (cstr-sub s
+                                                                           attr-a
+                                                                           attr-b))
+                                                             "\x02"))
+                                                         (set! i after)
+                                                         (set! seg after)
+                                                         (set! st 2))
+                                (= c 62)               (set! st 2)
+                                :else                  (do
+                                                         (set! val-a i)
+                                                         (set! st 7)))
+                ;; ---- quoted attribute value
+                (= st 6)  (cond (= c q)                                             (do
+                                                                                      (if (and (= code
+                                                                                                 2)
+                                                                                            rholes)
+                                                                                        (let [rest (__decode s
+                                                                                                     rfrom
+                                                                                                     i)]
+                                                                                          (if (and (> (cstr-len rest)
+                                                                                                     0)
+                                                                                                (= (cstr-nth rest
+                                                                                                     0)
+                                                                                                  5))
+                                                                                            (__fail! body
+                                                                                              html
+                                                                                              (str-concat (str-concat "a character reference in '"
+                                                                                                            (cstr-sub s
+                                                                                                              attr-a
+                                                                                                              attr-b))
+                                                                                                "' the macro cannot read; write the character, or &quot; &#39; &amp; &lt; &gt; or an ASCII numeric reference"))
+                                                                                            nil)
+                                                                                          (let [k (__css-scan (str-concat region
+                                                                                                                rest)
+                                                                                                    true
+                                                                                                    true)]
+                                                                                            (if (= k
+                                                                                                  0)
+                                                                                              nil
+                                                                                              (__fail! body
+                                                                                                html
+                                                                                                (__code-error k)))))
+                                                                                        nil)
+                                                                                      (if (__span-is? s
+                                                                                            attr-a
+                                                                                            attr-b
+                                                                                            "type"
+                                                                                            true)
+                                                                                        (set! stype
+                                                                                          (cstr-sub s
+                                                                                            val-a
+                                                                                            i))
+                                                                                        nil)
+                                                                                      (set! code
+                                                                                        0)
+                                                                                      (set! st
+                                                                                        2)
+                                                                                      (set! i
+                                                                                        (+ i
+                                                                                          1)))
+                                ;; a hole in JavaScript or CSS (plan A6)
+                                (and (__hole-at? s i n)
+                                  (or (= code 1) (= code 2)))                       (let [j   (__hole-end s
+                                                                                                i
+                                                                                                n)
+                                                                                          dec (__decode s
+                                                                                                rfrom
+                                                                                                i)
+                                                                                          js  (= code
+                                                                                                1)]
+                                                                                      (if (< j
+                                                                                            0)
+                                                                                        (__fail! body
+                                                                                          html
+                                                                                          "unterminated ${")
+                                                                                        nil)
+                                                                                      (if (and (> (cstr-len dec)
+                                                                                                 0)
+                                                                                            (= (cstr-nth dec
+                                                                                                 0)
+                                                                                              5))
+                                                                                        (__fail! body
+                                                                                          html
+                                                                                          (str-concat (str-concat "a character reference in '"
+                                                                                                        (cstr-sub s
+                                                                                                          attr-a
+                                                                                                          attr-b))
+                                                                                            "' the macro cannot read; write the character, or &quot; &#39; &amp; &lt; &gt; or an ASCII numeric reference"))
+                                                                                        nil)
+                                                                                      (set! region
+                                                                                        (str-concat region
+                                                                                          dec))
+                                                                                      (let [k   (if js
+                                                                                                  (__js-ctx region)
+                                                                                                  (__css-scan region
+                                                                                                    true
+                                                                                                    false))
+                                                                                            msg (__code-error k)]
+                                                                                        (if (> (cstr-len msg)
+                                                                                              0)
+                                                                                          (__fail! body
+                                                                                            html
+                                                                                            (str-concat (str-concat (str-concat "in '"
+                                                                                                                      (cstr-sub s
+                                                                                                                        attr-a
+                                                                                                                        attr-b))
+                                                                                                          "': ")
+                                                                                              msg))
+                                                                                          nil)
+                                                                                        (set! holes
+                                                                                          (tcons-of (__code-wrap ns
+                                                                                                      js
+                                                                                                      k
+                                                                                                      (__hole-form body
+                                                                                                        html
+                                                                                                        s
+                                                                                                        i
+                                                                                                        j))
+                                                                                            holes))
+                                                                                        (set! region
+                                                                                          (str-concat region
+                                                                                            (__code-ph js
+                                                                                              k))))
+                                                                                      (set! out
+                                                                                        (str-concat (str-concat (str-concat (str-concat out
+                                                                                                                              (cstr-sub s
+                                                                                                                                seg
+                                                                                                                                i))
+                                                                                                                  "\x01k")
+                                                                                                      (cstr-sub s
+                                                                                                        attr-a
+                                                                                                        attr-b))
+                                                                                          "\x02"))
+                                                                                      (set! rholes
+                                                                                        true)
+                                                                                      (set! i
+                                                                                        (+ j
+                                                                                          1))
+                                                                                      (set! seg
+                                                                                        i)
+                                                                                      (set! rfrom
+                                                                                        i))
+                                ;; srcdoc takes one hole, its whole value (plan A6)
+                                (and (__hole-at? s i n) (= code 3))                 (let [j (__hole-end s
+                                                                                              i
+                                                                                              n)]
+                                                                                      (if (< j
+                                                                                            0)
+                                                                                        (__fail! body
+                                                                                          html
+                                                                                          "unterminated ${")
+                                                                                        nil)
+                                                                                      (if (and (= i
+                                                                                                 val-a)
+                                                                                            (= (__b s
+                                                                                                 (+ j
+                                                                                                   1)
+                                                                                                 n)
+                                                                                              q))
+                                                                                        nil
+                                                                                        (__fail! body
+                                                                                          html
+                                                                                          "a hole inside a srcdoc value: only a hole that is the whole value, srcdoc=\"${...}\", is allowed"))
+                                                                                      (set! holes
+                                                                                        (tcons-of (__call1 (str-concat ns
+                                                                                                             "mk-hole-attr")
+                                                                                                    (__call1 "to-srcdoc"
+                                                                                                      (__hole-form body
+                                                                                                        html
+                                                                                                        s
+                                                                                                        i
+                                                                                                        j)))
+                                                                                          holes))
+                                                                                      (set! out
+                                                                                        (str-concat (str-concat (str-concat (str-concat out
+                                                                                                                              (cstr-sub s
+                                                                                                                                seg
+                                                                                                                                (__ws-before s
+                                                                                                                                  attr-a)))
+                                                                                                                  "\x01w")
+                                                                                                      (cstr-sub s
+                                                                                                        attr-a
+                                                                                                        attr-b))
+                                                                                          "\x02"))
+                                                                                      (set! code
+                                                                                        0)
+                                                                                      (set! i
+                                                                                        (+ j
+                                                                                          2))
+                                                                                      (set! seg
+                                                                                        i)
+                                                                                      (set! st
+                                                                                        2))
+                                (__hole-at? s i n)                                  (let [j (__hole-end s
+                                                                                              i
+                                                                                              n)]
+                                                                                      (if (< j
+                                                                                            0)
+                                                                                        (__fail! body
+                                                                                          html
+                                                                                          "unterminated ${")
+                                                                                        nil)
+                                                                                      (if (__span-is? s
+                                                                                            attr-a
+                                                                                            attr-b
+                                                                                            "type"
+                                                                                            true)
+                                                                                        (set! stype-dyn
+                                                                                          true)
+                                                                                        nil)
+                                                                                      (set! holes
+                                                                                        (tcons-of (__attr-hole ns
+                                                                                                    body
+                                                                                                    html
+                                                                                                    s
+                                                                                                    attr-a
+                                                                                                    attr-b
+                                                                                                    (__hole-form body
+                                                                                                      html
+                                                                                                      s
+                                                                                                      i
+                                                                                                      j))
+                                                                                          holes))
+                                                                                      (if (and (= i
+                                                                                                 val-a)
+                                                                                            (= (__b s
+                                                                                                 (+ j
+                                                                                                   1)
+                                                                                                 n)
+                                                                                              q))
+                                                                                        (do
+                                                                                          (set! out
+                                                                                            (str-concat (str-concat (str-concat (str-concat out
+                                                                                                                                  (cstr-sub s
+                                                                                                                                    seg
+                                                                                                                                    (__ws-before s
+                                                                                                                                      attr-a)))
+                                                                                                                      "\x01w")
+                                                                                                          (cstr-sub s
+                                                                                                            attr-a
+                                                                                                            attr-b))
+                                                                                              "\x02"))
+                                                                                          (set! i
+                                                                                            (+ j
+                                                                                              2))
+                                                                                          (set! seg
+                                                                                            i)
+                                                                                          (set! st
+                                                                                            2))
+                                                                                        (do
+                                                                                          (set! out
+                                                                                            (str-concat (str-concat out
+                                                                                                          (cstr-sub s
+                                                                                                            seg
+                                                                                                            i))
+                                                                                              "\x01a\x02"))
+                                                                                          (set! i
+                                                                                            (+ j
+                                                                                              1))
+                                                                                          (set! seg
+                                                                                            i))))
+                                :else                                               (set! i
+                                                                                      (+ i
+                                                                                        1)))
+                ;; ---- unquoted attribute value
+                (= st 7)  (cond (__hole-at? s i n)      (__fail! body
+                                                          html
+                                                          "a hole shares an unquoted attribute value with other text; quote the value")
+                                (or (__ws? c) (= c 62)) (do
+                                                          (if (__span-is? s
+                                                                attr-a
+                                                                attr-b
+                                                                "type"
+                                                                true)
+                                                            (set! stype
+                                                              (cstr-sub s
+                                                                val-a
+                                                                i))
+                                                            nil)
+                                                          (set! st 2))
+                                :else                   (set! i (+ i 1)))
+                ;; ---- comment
+                (= st 8)  (cond (__hole-at? s i n)      (__fail! body
+                                                          html
+                                                          "a hole inside a comment")
+                                (__starts? s i n "-->") (do
+                                                          (set! st 0)
+                                                          (set! i (+ i 3)))
+                                :else                   (set! i (+ i 1)))
+                ;; ---- doctype, markup declaration, HTML bogus comment
+                (= st 9)  (cond (__hole-at? s i n) (__fail! body
+                                                     html
+                                                     "a hole inside a doctype or markup declaration")
+                                (= c 62)           (do
+                                                     (set! st 0)
+                                                     (set! i (+ i 1)))
+                                :else              (set! i (+ i 1)))
+                ;; ---- XML processing instruction
+                (= st 10) (cond (__hole-at? s i n)     (__fail! body
+                                                         html
+                                                         "a hole inside a processing instruction")
+                                (__starts? s i n "?>") (do
+                                                         (set! st 0)
+                                                         (set! i (+ i 2)))
+                                :else                  (set! i (+ i 1)))
+                ;; ---- end tag
+                (= st 11) (cond (__hole-at? s i n) (__fail! body
+                                                     html
+                                                     "a hole cannot be part of an end tag")
+                                (= c 62)           (do
+                                                     (set! depth
+                                                       (if (> depth 0)
+                                                         (- depth 1)
+                                                         0))
+                                                     (set! st 0)
+                                                     (set! i (+ i 1)))
+                                :else              (set! i (+ i 1)))
+                ;; ---- raw text (script, style, ...)
+                (= st 12) (cond (and (__hole-at? s i n)
+                                  (and (>= code 4) (<= code 6)))                                                                                                                                                                                               (let [j  (__hole-end s
+                                                                                                                                                                                                                                                                          i
+                                                                                                                                                                                                                                                                          n)
+                                                                                                                                                                                                                                                                     js (not (= code
+                                                                                                                                                                                                                                                                               6))]
+                                                                                                                                                                                                                                                                 (if (< j
+                                                                                                                                                                                                                                                                       0)
+                                                                                                                                                                                                                                                                   (__fail! body
+                                                                                                                                                                                                                                                                     html
+                                                                                                                                                                                                                                                                     "unterminated ${")
+                                                                                                                                                                                                                                                                   nil)
+                                                                                                                                                                                                                                                                 (set! region
+                                                                                                                                                                                                                                                                   (str-concat region
+                                                                                                                                                                                                                                                                     (cstr-sub s
+                                                                                                                                                                                                                                                                       rfrom
+                                                                                                                                                                                                                                                                       i)))
+                                                                                                                                                                                                                                                                 (let [k   (cond (= code
+                                                                                                                                                                                                                                                                                   4)       (__js-ctx region)
+                                                                                                                                                                                                                                                                                 (= code
+                                                                                                                                                                                                                                                                                   5)       (__json-ctx region)
+                                                                                                                                                                                                                                                                                 :else      (__css-scan region
+                                                                                                                                                                                                                                                                                              false
+                                                                                                                                                                                                                                                                                              false))
+                                                                                                                                                                                                                                                                       msg (__code-error k)]
+                                                                                                                                                                                                                                                                   (if (> (cstr-len msg)
+                                                                                                                                                                                                                                                                         0)
+                                                                                                                                                                                                                                                                     (__fail! body
+                                                                                                                                                                                                                                                                       html
+                                                                                                                                                                                                                                                                       (str-concat (str-concat (str-concat "in <"
+                                                                                                                                                                                                                                                                                                 (cstr-sub s
+                                                                                                                                                                                                                                                                                                   raw-a
+                                                                                                                                                                                                                                                                                                   raw-b))
+                                                                                                                                                                                                                                                                                     ">: ")
+                                                                                                                                                                                                                                                                         msg))
+                                                                                                                                                                                                                                                                     nil)
+                                                                                                                                                                                                                                                                   (set! holes
+                                                                                                                                                                                                                                                                     (tcons-of (__code-wrap ns
+                                                                                                                                                                                                                                                                                 js
+                                                                                                                                                                                                                                                                                 k
+                                                                                                                                                                                                                                                                                 (__hole-form body
+                                                                                                                                                                                                                                                                                   html
+                                                                                                                                                                                                                                                                                   s
+                                                                                                                                                                                                                                                                                   i
+                                                                                                                                                                                                                                                                                   j))
+                                                                                                                                                                                                                                                                       holes))
+                                                                                                                                                                                                                                                                   (set! region
+                                                                                                                                                                                                                                                                     (str-concat region
+                                                                                                                                                                                                                                                                       (__code-ph js
+                                                                                                                                                                                                                                                                         k))))
+                                                                                                                                                                                                                                                                 (set! out
+                                                                                                                                                                                                                                                                   (str-concat (str-concat (str-concat (str-concat out
+                                                                                                                                                                                                                                                                                                         (cstr-sub s
+                                                                                                                                                                                                                                                                                                           seg
+                                                                                                                                                                                                                                                                                                           i))
+                                                                                                                                                                                                                                                                                             "\x01r")
+                                                                                                                                                                                                                                                                                 (cstr-sub s
+                                                                                                                                                                                                                                                                                   raw-a
+                                                                                                                                                                                                                                                                                   raw-b))
+                                                                                                                                                                                                                                                                     "\x02"))
+                                                                                                                                                                                                                                                                 (set! rholes
+                                                                                                                                                                                                                                                                   true)
+                                                                                                                                                                                                                                                                 (set! i
+                                                                                                                                                                                                                                                                   (+ j
+                                                                                                                                                                                                                                                                     1))
+                                                                                                                                                                                                                                                                 (set! seg
+                                                                                                                                                                                                                                                                   i)
+                                                                                                                                                                                                                                                                 (set! rfrom
+                                                                                                                                                                                                                                                                   i))
+                                (__hole-at? s i n)                                                                                                                                                                                                             (__fail! body
+                                                                                                                                                                                                                                                                 html
+                                                                                                                                                                                                                                                                 (cond (= code
+                                                                                                                                                                                                                                                                         7)       (str-concat (str-concat "a hole in a <script> of type '"
+                                                                                                                                                                                                                                                                                                stype)
+                                                                                                                                                                                                                                                                                    "' -- only JavaScript and JSON (application/json, application/ld+json) bodies take holes")
+                                                                                                                                                                                                                                                                       (= code
+                                                                                                                                                                                                                                                                         8)       "a hole in a <script> whose type is itself a hole"
+                                                                                                                                                                                                                                                                       :else      (str-concat (str-concat "a hole inside <"
+                                                                                                                                                                                                                                                                                                (cstr-sub s
+                                                                                                                                                                                                                                                                                                  raw-a
+                                                                                                                                                                                                                                                                                                  raw-b))
+                                                                                                                                                                                                                                                                                    "> -- its content is raw text, which HTML escaping does not make safe")))
+                                (and (= c 60)
+                                  (and (= (__b s (+ i 1) n) 47)
+                                    (and (__starts-ci? s
+                                           (+ i 2)
+                                           n
+                                           (cstr-sub s raw-a raw-b))
+                                      (let [after (__b s
+                                                    (+ (+ i 2) (- raw-b raw-a))
+                                                    n)]
+                                        (or (< after 0)
+                                          (or (__ws? after)
+                                            (or (= after 47) (= after 62))))))))                                                                                                                                                                               (do
+                                                                                                                                                                                                                                                                 (if (and (= code
+                                                                                                                                                                                                                                                                            6)
+                                                                                                                                                                                                                                                                       rholes)
+                                                                                                                                                                                                                                                                   (let [k (__css-scan (str-concat region
+                                                                                                                                                                                                                                                                                         (cstr-sub s
+                                                                                                                                                                                                                                                                                           rfrom
+                                                                                                                                                                                                                                                                                           i))
+                                                                                                                                                                                                                                                                             false
+                                                                                                                                                                                                                                                                             true)]
+                                                                                                                                                                                                                                                                     (if (= k
+                                                                                                                                                                                                                                                                           0)
+                                                                                                                                                                                                                                                                       nil
+                                                                                                                                                                                                                                                                       (__fail! body
+                                                                                                                                                                                                                                                                         html
+                                                                                                                                                                                                                                                                         (__code-error k))))
+                                                                                                                                                                                                                                                                   nil)
+                                                                                                                                                                                                                                                                 (set! code
+                                                                                                                                                                                                                                                                   0)
+                                                                                                                                                                                                                                                                 (set! st
+                                                                                                                                                                                                                                                                   11)
+                                                                                                                                                                                                                                                                 (set! i
+                                                                                                                                                                                                                                                                   (+ i
+                                                                                                                                                                                                                                                                     2)))
+                                :else                                                                                                                                                                                                                          (set! i
+                                                                                                                                                                                                                                                                 (+ i
+                                                                                                                                                                                                                                                                   1)))
+                ;; ---- CDATA section (XML)
+                :else     (cond (__hole-at? s i n)      (__fail! body
+                                                          html
+                                                          "a hole inside a CDATA section")
+                                (__starts? s i n "]]>") (do
+                                                          (set! st 0)
+                                                          (set! i (+ i 3)))
+                                :else                   (set! i (+ i 1))))))
+      (let [tpl      (str-concat (str-concat (if html (if doc "D" "F") "X") out)
+                       (cstr-sub s seg n))
+            ^mut acc (syntax-list (sym->syntax "tnil"))
+            ^mut hs  holes]
+        (while (not (tnil? hs))
+          (set! acc (syntax-list (sym->syntax "tcons-of") (thead hs) acc))
+          (set! hs (ttail hs)))
+        (syntax-list (sym->syntax render) (str->syntax tpl) acc))))) ;; end defmodule dom/markupc

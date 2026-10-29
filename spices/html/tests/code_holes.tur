@@ -1,0 +1,322 @@
+#use-reader-macros "../src/html/markup.tur"
+;; code_holes.tur -- holes in JavaScript, JSON, CSS and srcdoc
+;; (xml-html-followups-plan follow-up A6).
+;;
+;; The compile-error half (positions the macro refuses) is errors/run.sh, and
+;; the check in a real browser is fixtures/browser.sh. Here: the escaping
+;; table per context; the structure gate -- every hostile corpus value, in
+;; every code context, parses to the same HTML structure as "x" does; and
+;; code holes in a live literal.
+(defmodule html_code_holes_test
+  (export)
+  (import html/markup
+    :refer
+    [html*
+     html-live*
+     live->string
+     live-free
+     live-mount
+     tpl-update!
+     live-document
+     live-instance-free])
+  (import html/dom :refer [html-parse-fragment])
+  (import dom/core :refer [Document dom-node dom-free dom-serialize])
+  (import dom/ownstr :refer [to-cstr release])
+  (import dom/holes
+    :refer
+    [Fragment
+     html->string
+     fragment-free
+     trusted-js
+     trusted-css
+     trusted-url
+     raw-html])
+  (import test/suite :refer [describe it])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; renders? -- does the literal render exactly `want`? Frees it.
+  (defn renders? [f : Fragment want : cstr] : bool
+    (let [ok (__is? (html->string f) want)] (fragment-free f) ok))
+  ;; ---- one template per code context ---------------------------------------------
+  (defn t-js-expr [v : cstr] : Fragment
+    #html{<button onclick="f(${v})">b</button>})
+  (defn t-js-sq [v : cstr] : Fragment
+    #html{<button onclick="f('${v}')">b</button>})
+  (defn t-js-dq [v : cstr] : Fragment
+    #html{<button onclick="f(&quot;${v}&quot;)">b</button>})
+  (defn t-script-expr [v : cstr] : Fragment
+    #html{<script>var a = ${v};</script><p>after</p>})
+  (defn t-script-dq [v : cstr] : Fragment
+    #html{<script>var a = "${v}";</script><p>after</p>})
+  (defn t-script-sq [v : cstr] : Fragment
+    #html{<script>var a = '${v}';</script><p>after</p>})
+  (defn t-json [v : cstr] : Fragment
+    #html{<script type="application/json">{"a": ${v}, "b": ["${v}"]}</script><p>after</p>})
+  (defn t-css-value [v : cstr] : Fragment #html{<p style="color: ${v}">x</p>})
+  (defn t-css-string [v : cstr] : Fragment
+    #html{<p style="font-family: '${v}'">x</p>})
+  (defn t-css-url [v : cstr] : Fragment
+    #html{<p style="background: url(${v})">x</p>})
+  (defn t-style-value [v : cstr] : Fragment
+    #html{<style>p { color: ${v} }</style><p>after</p>})
+  (defn t-style-string [v : cstr] : Fragment
+    #html{<style>p::after { content: "${v}" }</style><p>after</p>})
+  (defn t-style-url [v : cstr] : Fragment
+    #html{<style>p { background: url('${v}') }</style><p>after</p>})
+  (defn t-srcdoc [v : cstr] : Fragment
+    #html{<iframe srcdoc="${v}"></iframe><p>after</p>})
+  ;;; render-with -- one template by number.
+  (defn render-with [k : int v : cstr] : Fragment
+    (cond (= k 0)  (t-js-expr v)
+          (= k 1)  (t-js-sq v)
+          (= k 2)  (t-js-dq v)
+          (= k 3)  (t-script-expr v)
+          (= k 4)  (t-script-dq v)
+          (= k 5)  (t-script-sq v)
+          (= k 6)  (t-json v)
+          (= k 7)  (t-css-value v)
+          (= k 8)  (t-css-string v)
+          (= k 9)  (t-css-url v)
+          (= k 10) (t-style-value v)
+          (= k 11) (t-style-string v)
+          (= k 12) (t-style-url v)
+          :else    (t-srcdoc v)))
+  ;; ---- shape --------------------------------------------------------------------
+  ;;; __shape -- internal: the structure of a parsed fragment: node kinds,
+  ;;; element names and namespaces, attribute names; no text, no values.
+  (defn __shape [d : Document] : cstr
+    ```c
+    extern void *turdom_doc_node(void *);
+  extern void *turdom_next_in(const void *, const void *);
+  extern int turdom_kind(const void *);
+  extern const char *turdom_name(const void *);
+  extern const char *turdom_ns_uri(const void *);
+  extern int64_t turdom_depth(const void *);
+  extern int64_t turdom_attr_count(const void *);
+  extern const char *turdom_attr_name_at(const void *, int64_t);
+  size_t cap = 4096, n = 0;
+  char *o = (char *)malloc(cap);
+  o[0] = '\0';
+  void *top = turdom_doc_node((void *)(intptr_t)d);
+  for (void *x = turdom_next_in(top, NULL); x; x = turdom_next_in(top, x)) {
+    char line[512];
+    int k = turdom_kind(x);
+    int m = snprintf(line, sizeof line, "%lld:%d:%s:%s", (long long)turdom_depth(x), k,
+                     k == 1 ? turdom_name(x) : "", k == 1 && turdom_ns_uri(x) ? turdom_ns_uri(x) : "");
+    for (int64_t i = 0; k == 1 && i < turdom_attr_count(x) && m < 400; i++)
+      m += snprintf(line + m, sizeof line - (size_t)m, " @%s", turdom_attr_name_at(x, i));
+    if (n + (size_t)m + 2 >= cap) { cap = cap * 2 + (size_t)m; o = (char *)realloc(o, cap); }
+    memcpy(o + n, line, (size_t)m);
+    n += (size_t)m;
+    o[n++] = '\n';
+    o[n] = '\0';
+  }
+  return o;
+  ```)
+  ;;; shape-of -- the shape of a rendered fragment, parsed as a template's
+  ;;; content. Frees the fragment.
+  (defn shape-of [f : Fragment] : cstr
+    (let [d (html-parse-fragment "template" (html->string f))
+          s (__shape d)]
+      (dom-free d)
+      (fragment-free f)
+      s))
+  ;;; __corpus -- internal: hostile value i ("" past the end): A2's HTML
+  ;;; breakouts and the plan's code ones -- both quotes, backtick, backslash,
+  ;;; </script>, </style>, <!--, */, U+2028, -->, expression(, javascript:.
+  (defn __corpus [i : int] : cstr
+    ```c
+    static const char *const corpus[] = {
+    "'", "\"", "`", "\\", "\\'", "</script>", "</SCRIPT >", "</style>", "<!--", "-->",
+    "<!-- <script>", "*/", "/*", "//", "\xe2\x80\xa8", "\xe2\x80\xa9",
+    "expression(alert(1))", "javascript:alert(1)", "');alert(1);('", "\");alert(1);(\"",
+    "${x}", "}{", "red;}body{background:red", "red; background: url(x)",
+    "\"><img src=x onerror=alert(1)>", "'><img src=x onerror=alert(1)>",
+    "</p><p>", "&quot;", "&#39;", "&lt;/script&gt;", "a\tb\nc\rd",
+    "url(javascript:alert(1))", ") ; } </style><b>", "\\3c /style\\3e ",
+    "\" onload=\"alert(1)", "<svg onload=alert(1)>", "x", NULL};
+  int64_t n = 0;
+  while (corpus[n]) n++;
+  return i < n ? corpus[i] : "";
+  ```)
+  ;;; __corpus-n -- internal: the corpus's size.
+  (defn __corpus-n [] : int 37)
+  ;;; __say -- internal.
+  (defn __say [k : int v : cstr a : cstr b : cstr] : nil
+    ```c
+    #include <stdio.h>
+  fprintf(stderr, "# template %lld, value [%s]: the structure changed\n#   with x:  %s\n#   with it: %s\n",
+          (long long)k, (const char *)v, (const char *)a, (const char *)b);
+  ```)
+  ;;; __streq? -- internal.
+  (defn __streq? [a : cstr b : cstr] : bool
+    ```c
+    return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+  ;;; structure-failures -- (template, value) pairs whose HTML structure
+  ;;; differs from the template rendered with "x".
+  (defn structure-failures [] : int
+    (let [^mut bad 0
+          ^mut k   0]
+      (while (<= k 13)
+        (let [base   (shape-of (render-with k "x"))
+              ^mut i 0]
+          (while (< i (__corpus-n))
+            (let [v (__corpus i)
+                  s (shape-of (render-with k v))]
+              (if (__streq? s base)
+                nil
+                (do (__say k v base s) (set! bad (+ bad 1)))))
+            (set! i (+ i 1))))
+        (set! k (+ k 1)))
+      bad))
+  ;;; __contains? -- internal.
+  (defn __contains? [s : cstr w : cstr] : bool
+    ```c
+    return strstr((const char *)s, (const char *)w) != NULL;
+  ```)
+  ;;; __ci-contains? -- internal: ASCII case-insensitive.
+  (defn __ci-contains? [s : cstr w : cstr] : bool
+    ```c
+    return strcasestr((const char *)s, (const char *)w) != NULL;
+  ```)
+  ;;; body-failures -- rendered <script> / <style> bodies (templates 3-6,
+  ;;; 10-12) that hold their end tag or `<!--` after the static text's own.
+  (defn body-failures [] : int
+    (let [^mut bad 0
+          ^mut k   3]
+      (while (<= k 12)
+        (if (or (<= k 6) (>= k 10))
+          (let [^mut i 0]
+            (while (< i (__corpus-n))
+              (let [f (render-with k (__corpus i))
+                    m (html->string f)]
+                (if (or (__ci-contains? m "</script><script")
+                      (or (__contains? m "<!--")
+                        (__ci-contains? m "</style><style")))
+                  (do (__say k (__corpus i) "" m) (set! bad (+ bad 1)))
+                  nil)
+                (fragment-free f))
+              (set! i (+ i 1))))
+          nil)
+        (set! k (+ k 1)))
+      bad))
+  (defn __all-tests [] : void
+    (describe "JavaScript holes (A6a)"
+      (it "expression position: a literal, padded"
+        (let [n 42
+              b true
+              s "it's"]
+          (renders? #html{<button onclick="f(${n}, ${b}, ${s})">b</button>}
+            "<button onclick=\"f( 42 ,  true ,  &quot;it\\u0027s&quot; )\">b</button>")))
+      (it "None is null, Some its value"
+        (let [a (Some 3)
+              b (:: (None) (Option int))]
+          (renders? #html{<script>f(${a}, ${b});</script>}
+            "<script>f( 3 ,  null );</script>")))
+      (it "inside a quoted string: escaped text, either quote"
+        (let [v "a'b\"c\\d</script>"]
+          (renders? #html{<script>var a = '${v}', b = "${v}";</script>}
+            "<script>var a = 'a\\u0027b\\u0022c\\u005cd\\u003c/script\\u003e', b = \"a\\u0027b\\u0022c\\u005cd\\u003c/script\\u003e\";</script>")))
+      (it "the line terminators U+2028 and U+2029"
+        (let [v "\xe2\x80\xa8\xe2\x80\xa9"]
+          (renders? #html{<script>var a = "${v}";</script>}
+            "<script>var a = \"\\u2028\\u2029\";</script>")))
+      (it "an attribute's character references are read first: &quot; opens a string"
+        (renders? #html{<button onclick="f(&quot;${"<x>"}&quot;)">b</button>}
+          "<button onclick=\"f(&quot;\\u003cx\\u003e&quot;)\">b</button>"))
+      (it "after keywords and operators, a value"
+        (let [n 1]
+          (renders? #html{<script>if (a) { return ${n}; } x = !${n} + -${n};</script>}
+            "<script>if (a) { return  1 ; } x = ! 1  + - 1 ;</script>")))
+      (it "past a regex, a division, a comment and a string"
+        (let [n 2]
+          (renders? #html{<script>var r = /a\\/b[/]/g; var d = a / b; /* c */ var s = "/"; f(${n});</script>}
+            "<script>var r = /a\\/b[/]/g; var d = a / b; /* c */ var s = \"/\"; f( 2 );</script>")))
+      (it "JSON bodies: values and strings"
+        (let [n 7
+              s "q\"</script>"]
+          (renders? #html{<script type="application/json">{"n": ${n}, "s": ${s}, "t": "${s}"}</script>}
+            "<script type=\"application/json\">{\"n\":  7 , \"s\":  \"q\\u0022\\u003c/script\\u003e\" , \"t\": \"q\\u0022\\u003c/script\\u003e\"}</script>")))
+      (it "type=module is JavaScript"
+        (let [n 1]
+          (renders? #html{<script type=module>f(${n});</script>}
+            "<script type=module>f( 1 );</script>")))
+      (it "TrustedJs is code"
+        (renders? #html{<button onclick="${(trusted-js "go()")}">b</button>}
+          "<button onclick=\" go() \">b</button>")))
+    (describe "CSS holes (A6b)"
+      (it "a property value: kept when plain"
+        (let [c "#0a0"
+              w 12]
+          (renders? #html{<p style="color: ${c}; width: ${w}px">x</p>}
+            "<p style=\"color: #0a0; width: 12px\">x</p>")))
+      (it "a property value: tur-unsafe otherwise"
+        (renders? #html{<p style="color: ${"red;}body{x:y"}">x</p>}
+          "<p style=\"color: tur-unsafe\">x</p>"))
+      (it "expression( and url( in a value are tur-unsafe"
+        (renders? #html{<style>p { width: ${"expression(alert(1))"}; background: ${"url(x)"} }</style>}
+          "<style>p { width: tur-unsafe; background: tur-unsafe }</style>"))
+      (it "inside a quoted string: \\HEX escapes"
+        (let [v "a\"</style>"]
+          (renders? #html{<style>p::after { content: "${v}" }</style>}
+            "<style>p::after { content: \"a\\22 \\3c \\2f style\\3e \" }</style>")))
+      (it "inside url(...): the scheme check, then percent-encoding"
+        (let [u "/a b(c).png"]
+          (renders? #html{<p style="background: url(${u}); border-image: url('${"javascript:x"}')">x</p>}
+            "<p style=\"background: url(/a%20b%28c%29.png); border-image: url('about:invalid#tur-unsafe')\">x</p>")))
+      (it "a trusted URL skips the scheme check, not the encoding"
+        (renders? #html{<style>p { background: url(${(trusted-url "data:image/png;base64,AA==")}) }</style>}
+          "<style>p { background: url(data:image/png;base64,AA==) }</style>"))
+      (it "inside @media and nested rules, values only"
+        (let [c "red"]
+          (renders? #html{<style>@media screen { p { color: ${c} } } a { color: blue; &:hover { color: ${c} } }</style>}
+            "<style>@media screen { p { color: red } } a { color: blue; &:hover { color: red } }</style>")))
+      (it "TrustedCss as written"
+        (renders? #html{<p style="background: ${(trusted-css "linear-gradient(red, blue)")}">x</p>}
+          "<p style=\"background: linear-gradient(red, blue)\">x</p>")))
+    (describe "srcdoc (A6c)"
+      (it "text is text in the iframe"
+        (renders? #html{<iframe srcdoc="${"<script>x</script>"}"></iframe>}
+          "<iframe srcdoc=\"&amp;lt;script&amp;gt;x&amp;lt;/script&amp;gt;\"></iframe>"))
+      (it "a Fragment is markup in the iframe, still attribute-escaped"
+        (let [inner #html{<b title="q">${"<"}</b>}
+              ok    (renders? #html{<iframe srcdoc="${inner}"></iframe>}
+                      "<iframe srcdoc=\"&lt;b title=&quot;q&quot;&gt;&amp;lt;&lt;/b&gt;\"></iframe>")]
+          (fragment-free inner)
+          ok))
+      (it "raw-html is live in the iframe"
+        (renders? #html{<iframe srcdoc="${(raw-html "<i>x</i>")}"></iframe>}
+          "<iframe srcdoc=\"&lt;i&gt;x&lt;/i&gt;\"></iframe>")))
+    (describe "hostile values never change the structure"
+      (it "37 values x 14 code contexts parse like \"x\""
+        (= 0 (structure-failures)))
+      (it "and never put an end tag or <!-- in a script or style body"
+        (= 0 (body-failures))))
+    (describe "code holes in a live literal"
+      (it "render, mount and update"
+        (let [l1   (html-live* "<button onclick=\"f(${1})\">b</button><script>var a = \"${\"x\"}\";</script>")
+              inst (live-mount l1)
+              l2   (html-live* "<button onclick=\"f(${2})\">b</button><script>var a = \"${\"x\"}\";</script>")
+              l3   (html-live* "<button onclick=\"f(${2})\">b</button><script>var a = \"${\"y<\"}\";</script>")
+              ok1  (__is? (live->string l1)
+                     "<button onclick=\"f( 1 )\">b</button><script>var a = \"x\";</script>")
+              n2   (tpl-update! inst l2)
+              n3   (tpl-update! inst l3)
+              s    (dom-serialize (dom-node (live-document inst)))
+              ok2  (__is? (to-cstr s)
+                     "<button onclick=\"f( 2 )\">b</button><script>var a = \"y\\u003c\";</script>")]
+          (release s)
+          (live-instance-free inst)
+          (live-free l1)
+          (live-free l2)
+          (live-free l3)
+          (and ok1 (and ok2 (and (= n2 1) (= n3 1))))))))
+  (defn main [] : int (__all-tests) (run-all-status))) ;; end defmodule html_code_holes_test

@@ -128,6 +128,7 @@ defn main [] : int
 | `xml/sax` | `ParseOpts`, `default-parse-opts`, `sax-parse-string`, `sax-parse-string-opts`, `sax-parse-file`, `sax-parse-file-opts`, `SaxParser`, `sax-parser-new`, `sax-parser-new-opts`, `sax-feed!`, `sax-finish!`, `sax-parser-free`, `xml-backend-version` |
 | `xml/dom` | `dom-parse-string`, `dom-parse-string-opts`, `dom-parse-file`, `dom-parse-file-opts` |
 | `xml/transform` | `sax-transform`, `sax-transform-opts`, `sax-transform-file` |
+| `xml/markup` | `xml*` (the macro behind `#xml{...}`), `xml-render`; the literal's types and opt-outs are dom-core's `dom/holes` |
 
 Events (`SaxEvent`, `SaxControl`, `Attr`) and the tree (`Document`, `Node`,
 navigation, queries, serialization) come from

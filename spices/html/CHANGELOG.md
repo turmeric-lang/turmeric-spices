@@ -4,6 +4,63 @@
 
 ### Added
 
+- `#html{...}` holes in code (follow-up A6): in `onclick="..."` and the
+  other `on*` attributes, `<script>` (JavaScript and JSON) bodies, `style`
+  attributes, `<style>` bodies and a whole `srcdoc` value, each escaped for
+  its language first. Live literals take them too. `fixtures/browser.sh`
+  checks them in headless Chromium where node and playwright are installed.
+- `html/markup` (xml-html-followups-plan follow-up A1-A2): `#html{...}`
+  markup literals with `${...}` holes, escaped by construction, rendering
+  to a `Fragment` with no tree built. A hole's position picks what it may
+  hold (a hole in a name, comment, `<script>`/`<style>` text or an
+  `on*`/`style`/`srcdoc` value is a compile error), its type picks how it
+  renders, and URL attributes are scheme-checked. Each literal is parsed
+  once with lexbor, in `template` context, on its first render to check
+  the holes landed where the macro said. `html*` is the macro behind it.
+- `html/hiccup` (xml-html-followups-plan follow-up D1): markup as a typed
+  value. `(hiccup [:li.item #map{:href u} name])` lowers at compile time to
+  constructor calls building an `Html` tree (`HElem`, `HRawText`, `HText`,
+  `HRaw`, `HList`, `HFragment`); `hiccup->string` renders it, byte for byte
+  as `#html{...}` renders the same markup. Its opaque field types are
+  `HTag`, `HAttrName`, `HAttr` and `HRawBody` (type names are global, and
+  dom/event already has an `Attr`). An `Html` goes in an `#html{...}` hole
+  through `ToChild Html`. The literal checks names, void elements, a
+  second id, bare `{...}` attribute maps, dynamic `on*`/`style`/`srcdoc`
+  values and `<script>`/`<style>` bodies, and nesting the HTML parser would
+  undo (plan D-2). The checking constructors `tag`, `attr-name`, `attr`,
+  `attr-on` keep a hand-built tree safe to render. The macro-time half is
+  `html/hiccupc`.
+- Hiccup result positions (follow-up D1b): inside a `hiccup` literal, the
+  results of `if`, `when`, `unless`, `cond`, `do`, `let`, `match`, `for`
+  (over `Option`) and an inline `fn` given to `list-map` are rewritten too
+  (a missing branch is empty; `list-map` becomes a `list-foldl` into
+  `Html`); a markup vector anywhere else is a compile error saying to wrap
+  it in `(hiccup ...)`. Holes go through a new `ToHtml` class, which keeps a
+  nested `Html` a tree and takes parsed `Node`s and any `ToChild` type via
+  `(to-child x)`.
+- Hiccup tree mode and XML (follow-up D2): `hiccup->dom` builds a tree's
+  nodes in an HTML `Document` as the parser would build its markup (SVG and
+  MathML namespaces included); `hiccup->xml-string` and `hiccup->xml-dom`
+  give the XML flavour, with prefixes resolved through the tree's `xmlns`
+  attributes. `Html` gains `HComment`, `HCdata` and `HPi`, with checking
+  constructors `comment`, `cdata`, `pi`; `attr-name-of` and `attr-value`
+  read an attribute.
+- `RenderHtml` instances for `Html` and `LiveHtml` (the class is
+  dom-core's), so tourist's `html-response` takes either.
+- `node->hiccup` (follow-up D3): a parsed or built node as `Html`, each
+  element pinned to its namespace; `hiccup->dom` of it is `dom-equal?` to
+  the node across the html5lib corpus.
+- Markup literals as trees (follow-up A3): `html->dom` parses a `Fragment`
+  into a `Document`; `html->nodes` makes its nodes in another document.
+- Live literals (follow-up A4): `#html-live{...}` / `html-live*` give a
+  `LiveHtml` snapshot of a literal's holes; `live-mount` builds a
+  `TemplateInstance` that remembers where each hole is; `tpl-update!` patches
+  only the holes whose values changed and returns the number of patches;
+  `live->string`, `live-document`, `live-free`, `live-instance-free`. The C
+  half is `c/html/turlive.c`, a second `:c-source`.
+- `html-raw-fix` (html/markup): the raw-html fixer both renderers use.
+- `errors/run.sh`: the compile-error tables for `#html{...}` holes and
+  `hiccup` literals.
 - Tests for dom-core's `dom/select` over parsed HTML (`tests/select.tur`):
   the web-platform-tests `querySelectorAll` table (`tests/data/wpt-selectors/`,
   vendored with its licence and commit) in the document, detached-element and

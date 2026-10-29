@@ -1,0 +1,69 @@
+#use-reader-macros "../../html/src/html/markup.tur"
+;; tests/markup_test.tur -- html-response (xml-html-followups-plan A-3, D2).
+;;
+;; An #html{...} Fragment, a hiccup Html tree and a #html-live{...}
+;; evaluation each become a 200 text/html Response whose body is their
+;; markup, through dom/holes' RenderHtml class; a hostile value arrives
+;; escaped. The Response is read directly rather than over a socket: tourist's
+;; HTTP test client loads json/ownstr, whose String collides with
+;; dom/ownstr's (turmeric docs/reported/module-type-names-collide-across-modules).
+(defmodule tourist/tests/markup
+  (import tourist/markup :refer [html-response])
+  (import html/markup :refer [html* html-live* live-free])
+  (import html/hiccup :refer [hiccup])
+  (import dom/holes :refer [fragment-free])
+  (import httpd/types :refer [Response])
+  (import httpd/response :refer [resp-header free-response])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true])
+  (import test/runner :refer [run-all-status])
+  ;;; __status / __body -- internal: read httpd's struct __httpd_resp.
+  (defn __status [r : Response] : int
+    ```c
+    struct tur_mk_resp { int status; char *body; };
+  return ((struct tur_mk_resp *)(intptr_t)r)->status;
+  ```)
+  (defn __body [r : Response] : cstr
+    ```c
+    struct tur_mk_resp { int status; char *body; };
+  return ((struct tur_mk_resp *)(intptr_t)r)->body;
+  ```)
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; answers? -- is r a 200 text/html Response with body `want`? Frees r.
+  (defn answers? [r : Response want : cstr] : bool
+    (let [ok (and (= (__status r) 200)
+               (and (match (resp-header r "Content-Type")
+                      (Some t)
+                      (__is? t "text/html")
+                      (None)
+                      false)
+                 (__is? (__body r) want)))]
+      (free-response r)
+      ok))
+  (defn __all-tests [] : void
+    (let [name "<script>x</script>"]
+      (describe "html-response"
+        (it "an #html{...} Fragment"
+          (let [f  #html{<p class="hi">Hello, ${name}!</p>}
+                ok (answers? (html-response f)
+                     "<p class=\"hi\">Hello, &lt;script&gt;x&lt;/script&gt;!</p>")]
+            (fragment-free f)
+            ok))
+        (it "a hiccup tree"
+          (answers? (html-response (hiccup [:ul#names
+                                            [:li name]
+                                            [:li "and you"]]))
+            "<ul id=\"names\"><li>&lt;script&gt;x&lt;/script&gt;</li><li>and you</li></ul>"))
+        (it "a #html-live{...} evaluation"
+          (let [l  #html-live{<b>${name}</b>}
+                ok (answers? (html-response l)
+                     "<b>&lt;script&gt;x&lt;/script&gt;</b>")]
+            (live-free l)
+            ok)))))
+  (defn main [] : int (__all-tests) (run-all-status)))

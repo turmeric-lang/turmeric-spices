@@ -24,6 +24,8 @@ what is particular to HTML.
 7. [Options, files and encodings](#7-options-files-and-encodings)
 8. [Editing and token-level transforms](#8-editing-and-token-level-transforms)
 9. [CSS selectors](#9-css-selectors)
+10. [Markup literals](#10-markup-literals)
+11. [Hiccup: markup as a value](#11-hiccup-markup-as-a-value)
 
 ---
 
@@ -303,3 +305,355 @@ The engine is checked against the
 browsers' `querySelectorAll` is tested with (`tests/select.tur` here; the
 XHTML run is tur-xml's), and against a naive reference matcher on random
 trees (dom-core's `tests/select_fuzz.tur`).
+
+---
+
+## 10. Markup literals
+
+`html/markup` adds `#html{...}`: markup written as markup, with `${...}`
+holes for values, escaped by construction. The result is a `Fragment`
+(`dom/holes`), and `html->string` gives its markup.
+
+```turmeric no-check
+(import html/markup :refer [html*])
+(import dom/holes   :refer [Fragment html->string])
+
+(defn item [name : cstr href : cstr done : bool] : Fragment
+  #html{<li class="item" data-done=${done}>
+          <a href=${href}>${name}</a>
+        </li>})
+
+(defn page [items : (Cons Fragment)] : Fragment
+  #html{<ul>${items}</ul>})
+```
+
+```sweet-exp
+#lang sweet-exp
+import html/markup :refer [html*]
+import dom/holes   :refer [Fragment html->string]
+
+defn item [name : cstr href : cstr done : bool] : Fragment
+  #html{<li class="item" data-done=${done}>
+          <a href=${href}>${name}</a>
+        </li>}
+
+defn page [items : (Cons Fragment)] : Fragment
+  #html{<ul>${items}</ul>}
+```
+
+`(item "Q&A" "javascript:alert(1)" true)` renders the literal as written,
+line breaks included, with the holes filled: `data-done` present (a
+boolean attribute), `href="about:invalid#tur-unsafe"` (the scheme check) and
+`Q&amp;A` (escaped text).
+
+**Where a hole sits decides what it may hold; the value's type decides how
+it renders.** The macro reads the literal the way the HTML tokenizer does:
+
+| Hole | Accepts (through) | Renders |
+|---|---|---|
+| content | `cstr`, `String`, `int` (`to-child`) | escaped text |
+| | `Fragment`, `(Cons Fragment)`, `Node` | spliced markup |
+| | `RawHtml` (`raw-html`) | unescaped, parsed in the hole's element |
+| | `(Option T)` | nothing for `None` |
+| attribute value | `cstr`, `String`, `int` (`to-attr`) | escaped value |
+| | `bool` | present or absent (an HTML boolean attribute) |
+| | `(Option T)` | `None` drops the whole attribute |
+| `href` `src` `action` `formaction` `xlink:href` `poster` `cite` `srcset` | `cstr`, `String` (`to-url-attr`) | scheme-checked, then escaped |
+| | `TrustedUrl` (`trusted-url`) | escaped, not checked |
+
+A value of the wrong kind for its place -- a `Fragment` in an attribute, a
+`bool` in content -- has no instance, so it is a type error at the hole.
+
+A hole anywhere a value could change the document's structure is a
+**compile error naming the place**: in a tag or attribute name, right after
+a `<`, in a comment or doctype, inside `<textarea>`, `<title>` and the other
+raw-text elements, and sharing an unquoted attribute value with other text.
+`<script>`, `<style>` and the `on*`, `style` and `srcdoc` attributes take
+holes only where the next section allows them.
+
+### Holes in JavaScript, CSS and srcdoc
+
+The browser hands an `on*` attribute's value and a `<script>` body to its
+JavaScript parser, and a `style` attribute and a `<style>` body to its CSS
+parser, so HTML escaping alone does not protect a value there. The macro
+reads the code around each such hole -- an attribute's text after decoding
+its character references, as the browser does -- and escapes in two layers:
+first for the inner language, by where the hole sits, then for the
+attribute (a `<script>` / `<style>` body needs no second layer: the first
+already keeps `</script` and `</style` out).
+
+```turmeric
+(defn row [id : int name : cstr colour : cstr] : Fragment
+  #html{<li style="color: ${colour}">
+          <button onclick="pick(${id}, '${name}')">${name}</button>
+        </li>})
+
+(defn boot [user : cstr items : int] : Fragment
+  #html{<script>start(${user}, {count: ${items}});</script>
+        <script type="application/json" id="cfg">{"user": ${user}}</script>})
+```
+
+| Where the hole is | Class | It becomes |
+|---|---|---|
+| JavaScript or JSON, where a value goes | `ToJs`: `int`, `bool`, `cstr`, `String`, `(Option T)` | a literal (`null` for `None`), a space on each side |
+| | `TrustedJs` (`trusted-js`) | the code itself |
+| inside a quoted JavaScript or JSON string | `ToCodeText`: `cstr`, `String`, `int` | text with `\ ' " ` < > & =`, controls and U+2028/9 as `\uXXXX` |
+| a CSS property value | `ToCss`: `int`, `cstr`, `String` | kept if it is only letters, digits and `# . - _ % ,` and space, else `tur-unsafe` (which the browser drops) |
+| | `TrustedCss` (`trusted-css`) | as written |
+| inside a quoted CSS string | `ToCodeText` | text with everything but letters and digits as `\HEX ` |
+| inside CSS `url(...)` | `ToUrlAttr` | scheme-checked, then percent-encoded |
+| `srcdoc="${x}"`, the whole value | `ToSrcdoc`: `Fragment`, `RawHtml` | its markup, live in the iframe |
+| | `cstr`, `String` | text in the iframe |
+
+Everywhere else in code, a hole is a compile error, and the macro refuses
+rather than guesses: a hole inside a template literal (backticks), a
+comment or a regex; after a `/` it cannot tell apart from a division or
+after `)`, `}`, `++`; where an operator goes (`a ${x}`) or after a `.`; in a
+`<script>` holding `<!--` or of any type but JavaScript and JSON
+(`application/json`, `application/ld+json`); a JSON object key; a CSS
+selector, at-rule or property name, or a declaration that turns out to be
+a nested rule. Only quoted values take code holes (`onclick=${x}` is still
+an error), a character reference the macro does not decode (`&quot;`,
+`&#39;`, `&amp;`, `&lt;`, `&gt;` and numeric ASCII ones it does) is an
+error in a code attribute with holes, and `srcdoc` takes one hole, its
+whole quoted value.
+
+`trusted-js` and `trusted-css` are the opt-outs for code, greppable like
+`raw-html`; a trusted value that would end its `<script>` or `<style>`
+still panics when the literal renders. Holes in code exist in HTML only:
+`#xml{...}` keeps them compile errors. Live literals take them too.
+
+The test suite checks this three ways: an escaping table per context, a
+hostile corpus that may not change any literal's parsed structure, and
+`fixtures/browser.sh`, which loads a page per hostile value in headless
+Chromium, clicks every handler, and checks that no value ran code and every
+string hole read back as itself.
+
+URLs are checked with an allowlist: a relative URL or one with scheme
+`http`, `https`, `mailto` or `tel` passes, anything else (`javascript:`,
+`data:`, ...) becomes `about:invalid#tur-unsafe`. `trusted-url` and
+`raw-html` are the two opt-outs, both greppable; `raw-html` markup is still
+parsed in the hole's own element, so it cannot close anything outside it,
+but it is **not sanitized** -- never give it markup an untrusted party wrote.
+
+A literal is parsed as the content of a `<template>`, so one that starts
+with `<tr>`, `<td>`, `<option>` or `<col>` keeps that structure. A literal
+that starts with `<!doctype html>` or `<html>` is a whole document; a
+fragment with a top-level `<head>` or `<body>` is a compile error, because
+a fragment parse drops them. The first time a literal renders it is parsed
+once with lexbor and every hole is checked to land where the macro said
+(a disagreement panics with the literal); rendering itself is string
+concatenation, with no tree built.
+
+Two things about the syntax:
+
+- `#html{...}` exists in a file read *after* `html/markup` is loaded. Import
+  it from the entry module, before the modules that use the literal; or put
+  `#use-reader-macros "<path to html/markup.tur>"` at the top of the file; or
+  call the macro directly, `(html* "<p>${name}</p>")`.
+- The body is read raw up to the matching `}`, counting braces but not
+  quotes: a `}` that closes nothing is written `\}` (also inside a string in
+  a hole), a backslash `\\`. `${` always opens a hole.
+
+A `Fragment` owns its markup; `fragment-free` releases one, which a server
+rendering a page per request will want.
+
+### Trees and live templates
+
+A `Fragment` is its rendered markup -- the cheap form, for a response body.
+Two ways to get nodes instead:
+
+- `html->dom` parses a fragment into a `Document` (in `template` context, or
+  as a whole document), and `html->nodes d f` makes its top-level nodes in
+  another document, detached and ready to append. Serializing the tree gives
+  the fragment's markup back, except where the parser normalizes it (it adds
+  a `<tbody>` to a table, writes a boolean attribute as `checked=""`).
+- `#html-live{...}` (`html-live*`) is the same literal, checked the same way,
+  for markup that is re-rendered in place. Each evaluation is a `LiveHtml`, a
+  snapshot of the hole values; `live-mount` builds its tree once, as a
+  `TemplateInstance` that remembers where every hole is, and
+  `(tpl-update! inst (view new-values))` patches only the holes whose values
+  changed -- returning how many patches it made, `0` when nothing did. Nodes
+  outside the changed holes stay the same nodes.
+
+```turmeric no-check
+(defn counter [n : int done : bool] : LiveHtml
+  #html-live{<p class=${(if done "done" "open")}>count: ${n}</p>})
+
+(let [inst (live-mount (counter 0 false))]
+  (tpl-update! inst (counter 1 false))   ; => 1: the count
+  (tpl-update! inst (counter 1 false))   ; => 0
+  (dom-serialize (dom-node (live-document inst))))
+```
+
+A `LiveHtml` owns copies of its values (`live-free`); an instance owns its
+`Document` (`live-instance-free`). Only code that asks for a live literal pays
+for the tree.
+
+---
+
+## 11. Hiccup: markup as a value
+
+`html/hiccup` builds markup as a Turmeric value, Clojure-hiccup style:
+`(hiccup [...])` lowers a literal to constructor calls building an `Html`
+tree, which ordinary functions build, map, filter and `match` on before
+`hiccup->string` renders it.
+
+```turmeric
+(import html/hiccup :refer [Html hiccup hiccup->string])
+
+(defn item [name : cstr href : cstr done : bool] : Html
+  (hiccup [:li.item #map{:data-done done}
+            [:a #map{:href href} name]]))
+
+(defn page [items : (Cons Html)] : cstr
+  (hiccup->string (hiccup [:ul#menu items])))
+```
+
+```sweet-exp
+#lang sweet-exp
+import html/hiccup :refer [Html hiccup hiccup->string]
+
+defn item [name : cstr href : cstr done : bool] : Html
+  hiccup [:li.item #map{:data-done done} [:a #map{:href href} name]]
+
+defn page [items : (Cons Html)] : cstr
+  hiccup->string $ hiccup [:ul#menu items]
+```
+
+An element is `[name attrs? child...]`:
+
+- **name** -- a keyword, with CSS-style shorthand for the id and classes
+  (`:li.item#main`), or a string literal for a name with a colon
+  (`["svg:rect" ...]`; a keyword splits at the colon). A computed name is a
+  compile error: build that element with `tag` and the constructors.
+- **attrs** -- a `#map{...}` with keyword or string keys. A bare `{...}` is
+  curly-infix, not a map, and is a compile error pointing here. A literal
+  value is written as given; any other value is a hole through `to-attr`
+  (or `to-url-attr` for `href`, `src` and the other URL attributes), exactly
+  as in `#html{...}`: a `bool` is a boolean attribute, `None` drops the
+  attribute, a URL is scheme-checked. A map `:class` joins the shorthand
+  classes. `:attrs*` splices a `(Cons HAttr)` built at run time.
+- **children** -- string and number literals are text; nested vectors are
+  elements; `if`, `let`, `list-map` and the other forms below have their
+  results rewritten; anything else is a hole through `to-html` (the
+  `ToHtml` class), which takes what `#html{...}`'s content holes take
+  (text, numbers, `Fragment`, `RawHtml`, `Option`, `Cons`), `Html` itself
+  (kept as a tree), parsed `Node`s, and -- through `(to-child x)` -- any
+  type with a `ToChild` instance.
+
+What the literal shows is checked at compile time: every name is a valid
+name; a void element (`br`, `img`, ...) takes no children; a second id; a
+dynamic value under `on*`, `style` or `srcdoc`; a `<script>` or `<style>`
+body that is not one string literal, or that would end the element early;
+and nesting the HTML parser would undo -- block content in a `<p>`, `<a>`
+in `<a>`, `<form>` in `<form>`, interactive content in `<a>` or `<button>`,
+anything but the table-structure elements (or text) directly in a
+`<table>`, `<tbody>` or `<tr>`. A tree assembled at run time is not
+checked for nesting.
+
+`Html`'s constructors are public, so a tree can be built and taken apart by
+hand; every field that could carry unsafe bytes is an opaque type with a
+checking constructor, so any `Html` value renders safely: `tag` and
+`attr-name` return `None` for a name that is not a name, `tag` refuses the
+raw-text elements, `attr-name` refuses `on*`, `style` and `srcdoc`, and
+`attr` scheme-checks a URL-bearing attribute's value.
+
+`hiccup->string` writes what `#html{...}` would for the same markup -- the
+test suite checks the two give byte-identical output across a hostile
+corpus -- and either can hold the other: an `Html` value goes in an
+`#html{...}` hole, a `Fragment` in a hiccup child.
+
+`Html` nodes are heap-allocated and never freed; rendering a tree per
+request belongs in a `with-region` bracket.
+
+The type names carry an `H` (`HTag`, `HAttr`, `HAttrName`, `HRawBody`,
+`HCommentBody`, `HCdataBody`, `HPiBody`) because a type name is global in a
+program: tur-dom-core's SAX `Attr` and a spice's own `Tag` would otherwise
+collide with them.
+
+### Markup inside expressions
+
+A child that is an `if`, `when`, `unless`, `cond`, `do`, `let`, `match` or
+`for`, or a `list-map` over an inline one-parameter `fn`, has the markup in
+its result positions rewritten too, so the branches need no
+`(hiccup ...)` of their own and need not agree on a type:
+
+```turmeric
+(hiccup [:ul
+         (list-map rows
+           (fn [r : Row]
+             (if (.done r) [:li.done (.name r)] [:li (.name r)])))
+         (when (tnil? rows) [:li.empty "nothing yet"])
+         (match (find-user id)
+           (Some u) [:li "for " (.name u)]
+           (None)   "anonymous")])
+```
+
+| Form | Result positions |
+|---|---|
+| `if` | both branches; a missing `else` is empty |
+| `when` / `unless` | the last body form; the other case is empty |
+| `cond` | each result; a missing `:else` is empty |
+| `do`, `let` | the last body form |
+| `match` | each arm's body |
+| `for` | the last body form, over `Option` values: `(for [u (find-user id) :when (.active u)] [:b (.name u)])` is empty when either fails |
+| `list-map` with an inline `fn` | the `fn`'s last body form; the call becomes a `list-foldl` straight into `Html`, so no list of `Html` is built (give the parameter a type, as for any lambda passed to a generic function) |
+
+Everything else -- a condition, a binding's value, a function's argument --
+is left as written. A vector headed by an element name there is a compile
+error that says to wrap it in `(hiccup ...)`, since it is markup the macro
+cannot reach (`(let [li [:li x]] ...)`, `(f [:b x])`). Vectors that are not
+markup (`[:only :encode]`) are left alone. The nesting checks apply through
+the rewritten forms: `[:table (if c [:td "x"])]` is still `<td>` directly in
+`<table>`. A type error inside a branch points at the branch.
+
+### Trees, XML and back
+
+`hiccup->dom` builds the tree's nodes in a new HTML `Document`, the way the
+HTML parser would build `hiccup->string`'s markup: `svg` and `math` start
+SVG and MathML content, `xlink:href` lands in the XLink namespace, adjacent
+text is merged. For any tree a literal may write, the result is
+`dom-equal?` to `(html-parse-fragment "template" (hiccup->string h))`; the
+test suite checks that over hand-written trees and a few hundred random
+ones built from a hostile corpus.
+
+`hiccup->xml-string` writes the same tree as XML -- `<br/>` for an empty
+element, `name="name"` for a boolean attribute, `<script>`'s text escaped --
+and `hiccup->xml-dom` builds it in an XML `Document`, resolving prefixes
+through the `xmlns` attributes in the tree. A `raw-html` child or a spliced
+`#html{...}` value is parsed as HTML in its parent and written back as XML.
+`Html` also has `HComment`, `HCdata` and `HPi` nodes, with checking
+constructors `comment`, `cdata` and `pi`; HTML has no CDATA or processing
+instructions, so `hiccup->string` writes CDATA as text and leaves a PI out.
+
+`node->hiccup` goes the other way: any node of a parsed or built tree (HTML
+or XML) as `Html`, with each element pinned to the namespace it was in. So a
+parsed page can be transformed as data, with ordinary functions and `match`,
+and rendered again. Adding `rel="noopener"` to every external link:
+
+```turmeric
+(defn noopener [h : Html] : Html
+  (match h
+    (HElem t as kids)
+    (let [kids (map-html noopener kids)]
+      (if (and (same? (tag-name t) "a") (external? (href-of as)))
+        (match (attr-name "rel")
+          (Some n) (HElem t (tcons-of (attr n "noopener") as) kids)
+          (None)   (HElem t as kids))
+        (HElem t as kids)))
+    (HList xs) (HList (map-html noopener xs))
+    _ h))
+
+(hiccup->string (noopener (node->hiccup (dom-node (html-parse-fragment "div" src)))))
+```
+
+(`same?`, `external?`, `href-of` -- which reads `attr-name-of` and
+`attr-value` -- and `map-html` are a few lines each; `tests/hiccup_dom.tur`
+in tur-html has them.)
+
+`(hiccup->dom (node->hiccup n))` is `dom-equal?` to `n` for every element of
+the vendored html5lib tree-construction documents, except an element holding
+what dom/edit will not write back (a `<plaintext>`, a `<script>` whose text
+holds `</script`, a comment holding `<!--`); `hiccup->dom` panics on those.
+`hiccup->xml-dom` does the same for XML elements.

@@ -24,6 +24,7 @@ events carries over to HTML.
 8. [Encodings](#8-encodings)
 9. [Editing and streaming transforms](#9-editing-and-streaming-transforms)
 10. [Limitations](#10-limitations)
+11. [Markup literals](#11-markup-literals)
 
 ---
 
@@ -539,3 +540,39 @@ The test suite runs James Clark's `xmltest` from the W3C XML Conformance Test
 Suite (every `valid/sa` document's events must reproduce its canonical XML,
 every `not-wf/sa` document must be rejected) and a mutation fuzz pass; see
 `spices/xml/fixtures/`.
+
+---
+
+## 11. Markup literals
+
+`xml/markup` adds `#xml{...}`, the XML counterpart of tur-html's
+`#html{...}` (see the [HTML guide](html-guide.md#10-markup-literals) for the
+full rules): markup with `${...}` holes, escaped by construction, giving an
+`XmlFragment` that `xml->string` reads.
+
+```turmeric no-check
+(import xml/markup :refer [xml*])
+(import dom/holes  :refer [XmlFragment xml->string])
+
+(defn entry [title : cstr href : cstr] : XmlFragment
+  #xml{<entry><title>${title}</title><link href=${href}/></entry>})
+```
+
+What is different from HTML:
+
+- Names are case-sensitive and there is no raw text; CDATA sections and
+  processing instructions take no holes. Holes in `on*`, `style` and
+  `srcdoc` values stay compile errors here (browsers run them in SVG and in
+  XHTML served as XML): the code-aware holes of `#html{...}` -- see the
+  tur-html guide -- read HTML's rules for script and style text, which XML
+  does not share.
+- Attribute values escape tab, LF and CR as character references, which
+  attribute-value normalization would otherwise fold; a `true` boolean
+  attribute renders as `name="name"`.
+- The first render parses the literal with expat, wrapped in a root
+  element, so namespace prefixes must be declared inside the literal; a
+  literal that is not well-formed panics then, with expat's message.
+- A `raw-html` value must be well-formed XML content on its own, and is
+  parsed and re-serialized before it is written. An `#html{...}` fragment
+  (or an HTML `Node`) in an `#xml{...}` literal, or the other way round,
+  panics.

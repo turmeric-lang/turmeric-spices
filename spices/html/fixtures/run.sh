@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# fixtures/run.sh -- tur-html's end-to-end fixtures: the mutation fuzz pass
-# and the dom/edit fuzz pass.
+# fixtures/run.sh -- tur-html's end-to-end fixtures: the mutation fuzz pass,
+# the dom/edit fuzz pass, and the browser check of code holes.
 #
 # A whole program with its own `main`, so it lives outside tests/ (`tur test`
 # recurses and would count it as a suite).  scripts/run-shard.sh runs this
@@ -25,6 +25,11 @@ fi
 echo "== edit fuzz (random dom/edit sequences, refusals and round trips)"
 if ! "$TUR_BIN" run fixtures/edit-fuzz.tur; then
   echo "# edit fuzz failed."
+  exit 1
+fi
+echo "== browser (code holes in headless Chromium)"
+if ! bash fixtures/browser.sh "$TUR_BIN"; then
+  echo "# browser check failed."
   exit 1
 fi
 echo "# All fixture groups passed."

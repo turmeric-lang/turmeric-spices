@@ -1,0 +1,150 @@
+#use-reader-macros "../src/xml/markup.tur"
+(defmodule xml_markup_test
+  (export)
+  (import xml/markup :refer [xml*])
+  (import dom/holes :refer [XmlFragment xml->string xml-fragment-free raw-html])
+  (import dom/core :refer [Document dom-node dom-free find-first dom-equal?])
+  (import xml/dom :refer [dom-parse-string])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; renders? -- does the fragment render exactly `want`?
+  (defn renders? [f : XmlFragment want : cstr] : bool
+    (let [ok (__is? (xml->string f) want)] (xml-fragment-free f) ok))
+  (defn t-child [v : cstr] : XmlFragment #xml{<r><e>${v}</e></r>})
+  (defn t-part [v : cstr] : XmlFragment #xml{<r a="x ${v} y"/>})
+  (defn t-whole [v : cstr] : XmlFragment #xml{<r a=${v}/>})
+  (defn t-ns [v : cstr] : XmlFragment
+    #xml{<a:r xmlns:a="urn:a"><a:e a:k="${v}">${v}</a:e></a:r>})
+  (defn t-href [v : cstr] : XmlFragment
+    #xml{<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><a xlink:href=${v}/></svg>})
+  ;;; render-with -- one template by number.
+  (defn render-with [k : int v : cstr] : XmlFragment
+    (cond (= k 0) (t-child v)
+          (= k 1) (t-part v)
+          (= k 2) (t-whole v)
+          (= k 3) (t-ns v)
+          :else   (t-href v)))
+  ;;; __corpus -- internal: hostile value i.
+  (defn __corpus [i : int] : cstr
+    ```c
+    static const char *const corpus[] = {
+    "</e><x>", "\"/><x a=\"", "'/><x a='", "<![CDATA[x]]>", "]]>", "<!--", "-->",
+    "<?pi x?>", "&amp;", "&", "&#0;", "&undefined;", "<!DOCTYPE r [<!ENTITY e 'x'>]>",
+    "a\tb\nc\rd", "xmlns:a='urn:evil'", "${x}", "__tur_hole_0__", "x", NULL};
+  int64_t n = 0;
+  while (corpus[n]) n++;
+  return i < n ? corpus[i] : "";
+  ```)
+  ;;; __parse -- parse well-formed XML.
+  (defn __parse [s : cstr] : Document
+    (match (dom-parse-string s)
+      (Ok d)
+      d
+      (Err _)
+      (panic "rendered XML is not well-formed")))
+  ;;; same-shape? -- does template k render well-formed XML with as many
+  ;;; elements and attributes for v as for "x"? (A value that broke out of
+  ;;; its slot would add or remove one, or make the output unparseable.)
+  (defn same-shape? [k : int v : cstr] : bool
+    (let [a  (render-with k "x")
+          b  (render-with k v)
+          da (__parse (xml->string a))
+          db (__parse (xml->string b))
+          ok (= (__count da) (__count db))]
+      (if ok nil (__say k v (xml->string b)))
+      (dom-free da)
+      (dom-free db)
+      (xml-fragment-free a)
+      (xml-fragment-free b)
+      ok))
+  ;;; __count -- internal: elements and attributes in a document.
+  (defn __count [d : Document] : int
+    ```c
+    extern void *turdom_doc_node(void *);
+  extern void *turdom_next_in(const void *, const void *);
+  extern int turdom_kind(const void *);
+  extern int64_t turdom_attr_count(const void *);
+  int64_t c = 0;
+  void *top = turdom_doc_node((void *)(intptr_t)d);
+  for (void *x = turdom_next_in(top, NULL); x; x = turdom_next_in(top, x))
+    if (turdom_kind(x) == 1) c += 1000 + turdom_attr_count(x);
+  return c;
+  ```)
+  ;;; __say -- internal.
+  (defn __say [k : int v : cstr out : cstr] : nil
+    ```c
+    #include <stdio.h>
+  fprintf(stderr, "# template %lld, value [%s]: structure changed: %s\n", (long long)k,
+          (const char *)v, (const char *)out);
+  ```)
+  ;;; structure-failures -- every template with every corpus value.
+  (defn structure-failures [] : int
+    (let [^mut bad 0
+          ^mut k   0]
+      (while (<= k 4)
+        (let [^mut i 0]
+          (while (< i 18)
+            (if (same-shape? k (__corpus i)) nil (set! bad (+ bad 1)))
+            (set! i (+ i 1))))
+        (set! k (+ k 1)))
+      bad))
+  (defn __all-tests [] : void
+    (describe "escaping"
+      (it "content"
+        (renders? (t-child "a<b & \"c\" ]]>")
+          "<r><e>a&lt;b &amp; \"c\" ]]&gt;</e></r>"))
+      (it "part of an attribute value"
+        (renders? (t-part "<\"&'") "<r a=\"x &lt;&quot;&amp;&#39; y\"/>"))
+      (it "tab, LF and CR in an attribute are character references"
+        (renders? (t-whole "a\tb\nc\rd") "<r a=\"a&#9;b&#10;c&#13;d\"/>"))
+      (it "no &nbsp; in XML" (renders? (t-child "a b") "<r><e>a b</e></r>"))
+      (it "a boolean attribute is name=\"name\""
+        (and (renders? #xml{<o hidden=${true}/>} "<o hidden=\"hidden\"/>")
+          (renders? #xml{<o hidden=${false}/>} "<o/>"))))
+    (describe "structure"
+      (it "a hostile value never changes the parsed structure (5 templates x 18 values)"
+        (= 0 (structure-failures))))
+    (describe "URLs"
+      (it "xlink:href is checked"
+        (renders? (t-href "javascript:alert(1)")
+          "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"><a xlink:href=\"about:invalid#tur-unsafe\"/></svg>"))
+      (it "a relative href passes"
+        (renders? #xml{<a href=${"/x?a=1&b=2"}/>}
+          "<a href=\"/x?a=1&amp;b=2\"/>")))
+    (describe "values"
+      (it "namespaces declared in the literal"
+        (renders? (t-ns "v")
+          "<a:r xmlns:a=\"urn:a\"><a:e a:k=\"v\">v</a:e></a:r>"))
+      (it "a nested literal and a list"
+        (renders? #xml{<feed>${(tcons-of (t-child "1") (tcons-of (t-child "2") (tnil)))}</feed>}
+          "<feed><r><e>1</e></r><r><e>2</e></r></feed>"))
+      (it "raw XML content is checked and re-serialized"
+        (renders? #xml{<r>${(raw-html "<a x='1'>t<b/></a>tail")}</r>}
+          "<r><a x=\"1\">t<b/></a>tail</r>"))
+      (it "a Node is serialized in"
+        (let [d  (__parse "<x a=\"1\"><y>&lt;</y></x>")
+              ok (match (find-first (dom-node d) "y")
+                   (Some y)
+                   (renders? #xml{<r>${y}</r>} "<r><y>&lt;</y></r>")
+                   (None)
+                   false)]
+          (dom-free d)
+          ok))
+      (it "CDATA and processing instructions pass through as written"
+        (renders? #xml{<r><![CDATA[a<b]]><?pi data?>${"&"}</r>}
+          "<r><![CDATA[a<b]]><?pi data?>&amp;</r>"))
+      (it "Option"
+        (renders? #xml{<r a=${(:: (None) (Option cstr))}>${(Some 5)}</r>}
+          "<r>5</r>"))
+      (it "xml* called directly"
+        (renders? (xml* "<t>${\"<\"}</t>") "<t>&lt;</t>"))))
+  (defn main [] : int (__all-tests) (run-all-status))) ;; end defmodule xml_markup_test
