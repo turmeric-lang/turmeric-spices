@@ -7,6 +7,12 @@
 ;;; keeps the heavy math in one place. The Turmeric layer owns allocation and
 ;;; the factor structs.
 ;;;
+;;; BLAS/LAPACK backend (v0.2): built with `-DTUR_LINALG_BLAS`, the Cholesky,
+;;; LU, QR, SVD and symmetric-eigen kernels call LAPACK's dpotrf, dgetrf,
+;;; dgeqrf + dorgqr, dgesdd and dsyev instead (the Fortran entry points,
+;;; declared inline, so no header has to be found). The public API and the
+;;; factor layouts do not change. See `linalg-blas?` in linalg/mat.
+;;;
 ;;; Factor type names are hyphen-free (`cholfac`/`lufac`/`qrfac`) because a
 ;;; hyphen in a struct type name does not survive C codegen.
 (defmodule linalg/decomp
@@ -62,9 +68,26 @@
   ;;; row-major). Returns 0 on success, -1 if A is not positive definite.
   (defn __chol-kernel [Ld : (Vec float) Ad : (Vec float) n : int] : int
     ```c
+    #include <stdlib.h>
     struct __V { int64_t *data; int64_t len; int64_t cap; };
   double *L = (double*)(void*)((struct __V*)(intptr_t)Ld)->data;
   double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+#if defined(TUR_LINALG_BLAS)
+  if (n > 0 && !(getenv("TUR_LINALG_NO_BLAS") && *getenv("TUR_LINALG_NO_BLAS"))) {
+    /* LAPACK is column-major: the row-major A is its own transpose, and the
+       'U' factor of that column-major matrix, read row-major, is L. */
+    extern void dpotrf_(const char *, const int *, double *, const int *, int *);
+    double *M = (double*)malloc(sizeof(double) * (size_t)(n * n));
+    int nn = (int)n, info = 0;
+    for (int64_t i = 0; i < n * n; i++) M[i] = A[i];
+    dpotrf_("U", &nn, M, &nn, &info);
+    if (info == 0)
+      for (int64_t i = 0; i < n; i++)
+        for (int64_t j = 0; j < n; j++) L[i*n + j] = (j <= i) ? M[i*n + j] : 0.0;
+    free(M);
+    return info == 0 ? 0 : -1;
+  }
+#endif
   for (int64_t i = 0; i < n; i++) {
     for (int64_t j = 0; j <= i; j++) {
       double sum = A[i*n + j];
@@ -102,12 +125,42 @@
                      Ad : (Vec float)
                      n : int] : int
     ```c
+    #include <math.h>
+    #include <stdlib.h>
     struct __V { int64_t *data; int64_t len; int64_t cap; };
   double *L = (double*)(void*)((struct __V*)(intptr_t)Ld)->data;
   double *U = (double*)(void*)((struct __V*)(intptr_t)Ud)->data;
   int64_t *piv = (int64_t*)(void*)((struct __V*)(intptr_t)pivd)->data;
   double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
   double *M = (double*)malloc(sizeof(double) * (size_t)n * (size_t)n);
+#if defined(TUR_LINALG_BLAS)
+  if (n > 0 && !(getenv("TUR_LINALG_NO_BLAS") && *getenv("TUR_LINALG_NO_BLAS"))) {
+    extern void dgetrf_(const int *, const int *, double *, const int *, int *, int *);
+    int nn = (int)n, info = 0;
+    int *ip = (int*)malloc(sizeof(int) * (size_t)n);
+    for (int64_t r = 0; r < n; r++)
+      for (int64_t c = 0; c < n; c++) M[r + c*n] = A[r*n + c];   /* column-major copy */
+    dgetrf_(&nn, &nn, M, &nn, ip, &info);
+    int bad = info > 0;
+    for (int64_t i = 0; i < n && !bad; i++) if (fabs(M[i + i*n]) < 1e-12) bad = 1;
+    if (!bad) {
+      /* ipiv is a sequence of row swaps; replay them on the identity to get
+         piv[i] = the original row now at position i */
+      for (int64_t i = 0; i < n; i++) piv[i] = i;
+      for (int64_t i = 0; i < n; i++) {
+        int64_t j = (int64_t)ip[i] - 1, t = piv[i]; piv[i] = piv[j]; piv[j] = t;
+      }
+      for (int64_t r = 0; r < n; r++)
+        for (int64_t c = 0; c < n; c++) {
+          double v = M[r + c*n];
+          L[r*n + c] = (c < r) ? v : (c == r ? 1.0 : 0.0);
+          U[r*n + c] = (c >= r) ? v : 0.0;
+        }
+    }
+    free(ip); free(M);
+    return bad ? -1 : 0;
+  }
+#endif
   for (int64_t i = 0; i < n*n; i++) M[i] = A[i];
   for (int64_t i = 0; i < n; i++) piv[i] = i;
   for (int64_t k = 0; k < n; k++) {
@@ -163,10 +216,44 @@
   ;;; of A (m x n), overwrite them in place with the Householder QR.
   (defn __qr-kernel [Qd : (Vec float) Rd : (Vec float) m : int n : int] : int
     ```c
+    #include <stdlib.h>
     struct __V { int64_t *data; int64_t len; int64_t cap; };
   double *Q = (double*)(void*)((struct __V*)(intptr_t)Qd)->data;
   double *R = (double*)(void*)((struct __V*)(intptr_t)Rd)->data;
   int64_t lim = (m < n) ? m : n;
+#if defined(TUR_LINALG_BLAS)
+  if (m > 0 && n > 0 && m >= n && !(getenv("TUR_LINALG_NO_BLAS") && *getenv("TUR_LINALG_NO_BLAS"))) {
+    extern void dgeqrf_(const int *, const int *, double *, const int *, double *, double *,
+                        const int *, int *);
+    extern void dorgqr_(const int *, const int *, const int *, double *, const int *,
+                        const double *, double *, const int *, int *);
+    int mm = (int)m, nn = (int)n, kk = (int)lim, info = 0, lw = -1;
+    double *Qc = (double*)calloc((size_t)(m * m), sizeof(double));
+    double *tau = (double*)malloc(sizeof(double) * (size_t)lim);
+    double wq = 0.0, wq2 = 0.0;
+    for (int64_t r = 0; r < m; r++)
+      for (int64_t c = 0; c < n; c++) Qc[r + c*m] = R[r*n + c];   /* A, column-major */
+    dgeqrf_(&mm, &nn, Qc, &mm, tau, &wq, &lw, &info);
+    dorgqr_(&mm, &mm, &kk, Qc, &mm, tau, &wq2, &lw, &info);
+    lw = (int)(wq > wq2 ? wq : wq2);
+    if (lw < 1) lw = 1;
+    double *work = (double*)malloc(sizeof(double) * (size_t)lw);
+    double *Rt = (double*)malloc(sizeof(double) * (size_t)(m * n));
+    dgeqrf_(&mm, &nn, Qc, &mm, tau, work, &lw, &info);
+    if (info == 0) {
+      for (int64_t r = 0; r < m; r++)
+        for (int64_t c = 0; c < n; c++) Rt[r*n + c] = (r <= c) ? Qc[r + c*m] : 0.0;
+      dorgqr_(&mm, &mm, &kk, Qc, &mm, tau, work, &lw, &info);
+    }
+    if (info == 0) {   /* write R and Q only once both calls succeeded */
+      for (int64_t i = 0; i < m * n; i++) R[i] = Rt[i];
+      for (int64_t r = 0; r < m; r++)
+        for (int64_t c = 0; c < m; c++) Q[r*m + c] = Qc[r + c*m];
+    }
+    free(Rt); free(work); free(tau); free(Qc);
+    if (info == 0) return 0;
+  }
+#endif
   double *v = (double*)malloc(sizeof(double) * (size_t)m);
   for (int64_t k = 0; k < lim; k++) {
     double norm = 0.0;
@@ -227,6 +314,34 @@
   double *Vto = (double*)(void*)((struct __V*)(intptr_t)Vtd)->data;
   double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
   int tr = (m < n);
+#if defined(TUR_LINALG_BLAS)
+  if (m > 0 && n > 0 && !(getenv("TUR_LINALG_NO_BLAS") && *getenv("TUR_LINALG_NO_BLAS"))) {
+    extern void dgesdd_(const char *, const int *, const int *, double *, const int *, double *,
+                        double *, const int *, double *, const int *, double *, const int *,
+                        int *, int *);
+    int mm = (int)m, nn = (int)n, info = 0, lw = -1;
+    int64_t k = m < n ? m : n;
+    double *Ac = (double*)malloc(sizeof(double) * (size_t)(m * n));
+    double *Uc = (double*)malloc(sizeof(double) * (size_t)(m * m));
+    double *Vc = (double*)malloc(sizeof(double) * (size_t)(n * n));
+    int *iw = (int*)malloc(sizeof(int) * (size_t)(8 * k));
+    double wq = 0.0;
+    for (int64_t r = 0; r < m; r++)
+      for (int64_t c = 0; c < n; c++) Ac[r + c*m] = A[r*n + c];
+    dgesdd_("A", &mm, &nn, Ac, &mm, so, Uc, &mm, Vc, &nn, &wq, &lw, iw, &info);
+    lw = (int)wq; if (lw < 1) lw = 1;
+    double *work = (double*)malloc(sizeof(double) * (size_t)lw);
+    dgesdd_("A", &mm, &nn, Ac, &mm, so, Uc, &mm, Vc, &nn, work, &lw, iw, &info);
+    if (info == 0) {
+      for (int64_t r = 0; r < m; r++)
+        for (int64_t c = 0; c < m; c++) Uo[r*m + c] = Uc[r + c*m];
+      for (int64_t r = 0; r < n; r++)
+        for (int64_t c = 0; c < n; c++) Vto[r*n + c] = Vc[r + c*n];
+    }
+    free(work); free(iw); free(Vc); free(Uc); free(Ac);
+    if (info == 0) return 0;     /* otherwise fall through to Jacobi */
+  }
+#endif
   int64_t R = tr ? n : m;          /* rows of the tall working matrix */
   int64_t C = tr ? m : n;          /* its columns (= min(m, n)) */
   double *W = (double*)malloc(sizeof(double) * (size_t)(R * C + 1));
@@ -394,6 +509,31 @@
   double *vals = (double*)(void*)((struct __V*)(intptr_t)valsd)->data;
   double *Q = (double*)(void*)((struct __V*)(intptr_t)Qd)->data;
   double *A0 = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+#if defined(TUR_LINALG_BLAS)
+  if (n > 0 && !(getenv("TUR_LINALG_NO_BLAS") && *getenv("TUR_LINALG_NO_BLAS"))) {
+    extern void dsyev_(const char *, const char *, const int *, double *, const int *, double *,
+                       double *, const int *, int *);
+    int nn = (int)n, info = 0, lw = -1;
+    double *Mc = (double*)malloc(sizeof(double) * (size_t)(n * n));
+    double wq = 0.0;
+    for (int64_t i = 0; i < n; i++)
+      for (int64_t j = 0; j < n; j++) Mc[i + j*n] = (j >= i) ? A0[i*n + j] : A0[j*n + i];
+    dsyev_("V", "U", &nn, Mc, &nn, vals, &wq, &lw, &info);
+    lw = (int)wq; if (lw < 1) lw = 1;
+    double *work = (double*)malloc(sizeof(double) * (size_t)lw);
+    dsyev_("V", "U", &nn, Mc, &nn, vals, work, &lw, &info);
+    if (info == 0)
+      for (int64_t j = 0; j < n; j++) {
+        /* same sign rule as the Jacobi path: largest component positive */
+        int64_t big = 0;
+        for (int64_t i = 1; i < n; i++) if (fabs(Mc[i + j*n]) > fabs(Mc[big + j*n])) big = i;
+        double sg = Mc[big + j*n] < 0.0 ? -1.0 : 1.0;
+        for (int64_t i = 0; i < n; i++) Q[i*n + j] = sg * Mc[i + j*n];
+      }
+    free(work); free(Mc);
+    if (info == 0) return 0;     /* otherwise fall through to Jacobi */
+  }
+#endif
   double *M = (double*)malloc(sizeof(double) * (size_t)(n * n + 1));
   double *V = (double*)malloc(sizeof(double) * (size_t)(n * n + 1));
   for (int64_t i = 0; i < n; i++)
@@ -473,16 +613,19 @@
   ;;;
   ;;; Since: 0.2.0
   (defn eigen-sym [^borrow a : mat] : (Result eigenfac cstr)
-    (cond (not (= (mat-square? a) 1))                     (Err "eigen-sym: matrix must be square")
+    (cond (not (= (mat-square? a) 1))                       (Err "eigen-sym: matrix must be square")
           (= (__sym-check-kernel (.data a) (mat-rows a)) 0) (Err "eigen-sym: matrix must be symmetric")
-          :else                                           (let [n    (mat-rows a)
-                                                                vals (la-vec-new n)
-                                                                q    (mat-new-zeroed n n)]
-                                                            (__eigen-kernel (.data vals)
-                                                              (.data q)
-                                                              (.data a)
-                                                              n)
-                                                            (Ok (make-struct eigenfac vals q)))))
+          :else                                             (let [n    (mat-rows a)
+                                                                  vals (la-vec-new n)
+                                                                  q    (mat-new-zeroed n
+                                                                         n)]
+                                                              (__eigen-kernel (.data vals)
+                                                                (.data q)
+                                                                (.data a)
+                                                                n)
+                                                              (Ok (make-struct eigenfac
+                                                                    vals
+                                                                    q)))))
   ;;; eigen-free -- free an eigendecomposition.
   (defn eigen-free [f : eigenfac] : void
     (la-vec-free (.vals f))

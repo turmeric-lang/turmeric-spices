@@ -11,14 +11,11 @@
 ;;; v0.1 extracts unrotated factors only; varimax and maximum likelihood are
 ;;; later work. Each factor is signed so its loadings sum to a positive value.
 (defmodule multivariate/factor
-  (export FAOpts
-    FaResult
-    fa-opts
-    factor-analysis
-    fa-free
-    fa-scores)
+  (export FAOpts FaResult fa-opts factor-analysis fa-free fa-scores)
   (import linalg/vec :refer [lavec la-vec-new la-vec-free])
-  (import linalg/mat :refer [mat mat-new mat-copy mat-rows mat-cols mat-mul mat-free])
+  (import linalg/mat
+    :refer
+    [mat mat-new mat-copy mat-rows mat-cols mat-mul mat-free])
   (import linalg/decomp :refer [eigenfac eigen-sym eigen-free])
   (import multivariate/cov :refer [cor-mat col-means col-sds mv-pinv])
   ;;; FAOpts -- factor analysis controls.
@@ -28,11 +25,7 @@
   ;;;   max-iters -- communality iterations allowed
   ;;;   tol       -- stop when no communality moves by more than this
   (defstruct ^copy FAOpts
-    [nfactors : int
-     method : cstr
-     rotate : cstr
-     max-iters : int
-     tol : float])
+    [nfactors : int method : cstr rotate : cstr max-iters : int tol : float])
   ;;; FaResult -- a fitted factor model (owns its buffers).
   ;;;   loadings    -- n x k factor loadings
   ;;;   communality -- length n, row sums of loadings^2
@@ -59,7 +52,8 @@
   ;;;   (factor-analysis r (fa-opts 2))
   ;;;
   ;;; Since: 0.1.0
-  (defn fa-opts [nfactors : int] : FAOpts (make-struct FAOpts nfactors "paf" "none" 500 1e-09))
+  (defn fa-opts [nfactors : int] : FAOpts
+    (make-struct FAOpts nfactors "paf" "none" 500 1e-09))
   (defn __streq [a : cstr b : cstr] : bool
     ```c
     #include <string.h>
@@ -95,7 +89,10 @@
   return 0;
   ```)
   ;;; __set-diag-kernel -- A = R with its diagonal replaced by h.
-  (defn __set-diag-kernel [Ad : (Vec float) Rd : (Vec float) hd : (Vec float) n : int] : int
+  (defn __set-diag-kernel [Ad : (Vec float)
+                           Rd : (Vec float)
+                           hd : (Vec float)
+                           n : int] : int
     ```c
     struct __V { int64_t *data; int64_t len; int64_t cap; };
   double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
@@ -149,7 +146,8 @@
   for (int64_t i = 0; i < n; i++) u[i] = 1.0 - h[i];
   return 0;
   ```)
-  (defn __info0 [^borrow info : (Vec float)] : float (:: (vec-get info 0) :float))
+  (defn __info0 [^borrow info : (Vec float)] : float
+    (:: (vec-get info 0) :float))
   ;;; __paf -- run the PAF iteration on a validated R; returns the result.
   (defn __paf [^borrow r : mat opts : FAOpts] : FaResult
     (let [n    (mat-rows r)
@@ -159,27 +157,39 @@
           rh   (mat-new n n)
           info (:: (vec-of 1.0) (Vec float))]
       (match (eigen-sym r)
-        (Ok f) (do
-                 (__smc-kernel (.data h) (.data (.vecs f)) (.data (.vals f)) (.data r) n)
-                 (eigen-free f))
-        (Err e) (panic e))
+        (Ok f)
+        (do
+          (__smc-kernel (.data h)
+            (.data (.vecs f))
+            (.data (.vals f))
+            (.data r)
+            n)
+          (eigen-free f))
+        (Err e)
+        (panic e))
       (let [iters (letrec [go
                            (fn [it : int] : int
-                             (if (or (>= it (.max-iters opts)) (< (__info0 info) (.tol opts)))
+                             (if (or (>= it (.max-iters opts))
+                                   (< (__info0 info) (.tol opts)))
                                it
                                (do
-                                 (__set-diag-kernel (.data rh) (.data r) (.data h) n)
+                                 (__set-diag-kernel (.data rh)
+                                   (.data r)
+                                   (.data h)
+                                   n)
                                  (match (eigen-sym rh)
-                                   (Ok f) (do
-                                            (__paf-step-kernel (.data l)
-                                              (.data h)
-                                              info
-                                              (.data (.vecs f))
-                                              (.data (.vals f))
-                                              n
-                                              k)
-                                            (eigen-free f))
-                                   (Err e) (panic e))
+                                   (Ok f)
+                                   (do
+                                     (__paf-step-kernel (.data l)
+                                       (.data h)
+                                       info
+                                       (.data (.vecs f))
+                                       (.data (.vals f))
+                                       n
+                                       k)
+                                     (eigen-free f))
+                                   (Err e)
+                                   (panic e))
                                  (go (+ it 1)))))]
                     (go 0))
             conv  (< (__info0 info) (.tol opts))
@@ -219,12 +229,13 @@
   ;;;
   ;;; Since: 0.1.0
   (defn factor-analysis [^borrow r : mat opts : FAOpts] : (Result FaResult cstr)
-    (cond (not= (mat-rows r) (mat-cols r))                     (Err "factor-analysis: R must be square")
-          (= (__corr-like-kernel (.data r) (mat-rows r)) 0)    (Err "factor-analysis: R must be a correlation matrix")
+    (cond (not= (mat-rows r) (mat-cols r))                               (Err "factor-analysis: R must be square")
+          (= (__corr-like-kernel (.data r) (mat-rows r)) 0)              (Err "factor-analysis: R must be a correlation matrix")
           (or (< (.nfactors opts) 1) (>= (.nfactors opts) (mat-rows r))) (Err "factor-analysis: need 1 <= nfactors < n")
-          (not (__streq (.method opts) "paf"))                 (Err "factor-analysis: only method \"paf\" is available in v0.1")
-          (not (__streq (.rotate opts) "none"))                (Err "factor-analysis: only rotate \"none\" is available in v0.1")
-          :else                                                (Ok (__paf r opts))))
+          (not (__streq (.method opts) "paf"))                           (Err "factor-analysis: only method \"paf\" is available in v0.1")
+          (not (__streq (.rotate opts) "none"))                          (Err "factor-analysis: only rotate \"none\" is available in v0.1")
+          :else                                                          (Ok (__paf r
+                                                                               opts))))
   ;;; fa-free -- free a FaResult.
   (defn fa-free [r : FaResult] : void
     (mat-free (.loadings r))
@@ -268,7 +279,12 @@
       (let [mu (col-means x)
             sd (col-sds x)
             z  (mat-new (mat-rows x) n)]
-        (__zscore-kernel (.data z) (.data x) (.data mu) (.data sd) (mat-rows x) n)
+        (__zscore-kernel (.data z)
+          (.data x)
+          (.data mu)
+          (.data sd)
+          (mat-rows x)
+          n)
         (let [r  (cor-mat x)
               ri (mv-pinv r)
               w  (mat-mul ri (.loadings f))

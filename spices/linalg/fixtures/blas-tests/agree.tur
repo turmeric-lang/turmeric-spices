@@ -1,0 +1,345 @@
+;;; agree.tur -- LX1-LX3: the BLAS/LAPACK backend agrees with the pure path.
+;;;
+;;; Built only by fixtures/run.sh, with -DTUR_LINALG_BLAS. Every check runs an
+;;; operation twice in this one process -- once through BLAS/LAPACK, once
+;;; with TUR_LINALG_NO_BLAS set so the pure kernels run -- and requires the
+;;; two to agree to 12 significant figures (relative to the largest entry).
+;;; Singular vectors are compared up to sign, the one freedom the SVD has.
+(defmodule linalg/blas-agree
+  (import linalg/vec
+    :refer
+    [lavec la-vec-new la-vec-get la-vec-set! la-vec-len la-vec-free])
+  (import linalg/mat
+    :refer
+    [mat
+     mat-new
+     mat-get
+     mat-set!
+     mat-rows
+     mat-cols
+     mat-mul
+     mat-mul-vec
+     mat-transpose
+     mat-add
+     mat-identity
+     mat-free
+     linalg-blas?])
+  (import linalg/decomp
+    :refer
+    [chol chol-free lu lu-free qr qr-free svd svd-free eigen-sym eigen-free])
+  (import linalg/solve :refer [chol-solve lu-solve qr-solve])
+  ;; --- TAP harness (inline-C fail counter) ---
+  (defn check [idx : int name : cstr ok : bool] : void
+    ```c
+    /* __tur_include__: static int g_bl_fails = 0; */
+  if (!ok) g_bl_fails++;
+  printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
+  ```)
+  (defn finish [count : int] : int
+    ```c
+    printf("1..%lld\n", (long long)count);
+  if (g_bl_fails == 0) {
+    fprintf(stderr, "# All %lld BLAS agreement tests passed.\n", (long long)count);
+    return 0;
+  }
+  fprintf(stderr, "# %d/%lld BLAS agreement tests failed.\n", g_bl_fails, (long long)count);
+  return 1;
+  ```)
+  (defn fa [x : float] : float ```c return x < 0.0 ? -x : x; ```)
+  (defn approx [a : float b : float] : bool (< (fa (- a b)) 1e-12))
+  (defn blas-off! [] : void
+    ```c
+    extern int setenv(const char *, const char *, int);
+    setenv("TUR_LINALG_NO_BLAS", "1", 1);
+    ```)
+  (defn blas-on! [] : void
+    ```c
+    extern int unsetenv(const char *);
+    unsetenv("TUR_LINALG_NO_BLAS");
+    ```)
+  (defn i2f [n : int] : float (as float n))
+  ;;; filled -- r x c with a deterministic, non-trivial pattern.
+  (defn filled [r : int c : int seed : int] : mat
+    (let [m (mat-new r c)]
+      (letrec [go
+               (fn [idx : int] : int
+                 (if (>= idx (* r c))
+                   0
+                   (do
+                     (mat-set! m
+                       (/ idx c)
+                       (mod idx c)
+                       (- (i2f (mod (+ (* (* idx idx) 7) (+ (* idx 13) seed))
+                                 29))
+                         14.3))
+                     (go (+ idx 1)))))]
+        (go 0))
+      m))
+  ;;; spd -- B' B + n I, symmetric positive definite.
+  (defn spd [n : int] : mat
+    (let [b  (filled n n 3)
+          bt (mat-transpose b)
+          p  (mat-mul bt b)
+          i  (mat-identity n)
+          ni (mat-new n n)]
+      (letrec [go
+               (fn [k : int] : int
+                 (if (>= k n) 0 (do (mat-set! ni k k (i2f n)) (go (+ k 1)))))]
+        (go 0))
+      (let [a (mat-add p ni)]
+        (mat-free ni)
+        (mat-free i)
+        (mat-free p)
+        (mat-free bt)
+        (mat-free b)
+        a)))
+  ;;; max-abs / same12? -- agreement to 12 significant figures.
+  (defn max-abs [^borrow a : mat] : float
+    (letrec [go
+             (fn [idx : int acc : float] : float
+               (if (>= idx (* (mat-rows a) (mat-cols a)))
+                 acc
+                 (let [v (fa (mat-get a
+                               (/ idx (mat-cols a))
+                               (mod idx (mat-cols a))))]
+                   (go (+ idx 1) (if (> v acc) v acc)))))]
+      (go 0 0.0)))
+  (defn same12? [^borrow a : mat ^borrow b : mat] : bool
+    (and (= (mat-rows a) (mat-rows b))
+      (and (= (mat-cols a) (mat-cols b))
+        (let [tol (* 1e-12 (max-abs a))]
+          (letrec [go
+                   (fn [idx : int] : bool
+                     (if (>= idx (* (mat-rows a) (mat-cols a)))
+                       true
+                       (let [i (/ idx (mat-cols a))
+                             j (mod idx (mat-cols a))]
+                         (if (> (fa (- (mat-get a i j) (mat-get b i j))) tol)
+                           false
+                           (go (+ idx 1))))))]
+            (go 0))))))
+  (defn vsame12? [^borrow a : lavec ^borrow b : lavec] : bool
+    (let [n   (la-vec-len a)
+          big (letrec [g
+                       (fn [i : int acc : float] : float
+                         (if (>= i n)
+                           acc
+                           (g (+ i 1)
+                             (if (> (fa (la-vec-get a i)) acc)
+                               (fa (la-vec-get a i))
+                               acc))))]
+                (g 0 0.0))]
+      (letrec [go
+               (fn [i : int] : bool
+                 (if (>= i n)
+                   true
+                   (if (> (fa (- (la-vec-get a i) (la-vec-get b i)))
+                         (* 1e-12 big))
+                     false
+                     (go (+ i 1)))))]
+        (go 0))))
+  ;;; cols-same12-up-to-sign? -- each of the first k columns agrees, or agrees negated.
+  (defn cols-same12-up-to-sign? [^borrow a : mat ^borrow b : mat k : int] : bool
+    (letrec [go
+             (fn [j : int] : bool
+               (if (>= j k)
+                 true
+                 (let [sg (if (< (* (mat-get a 0 j) (mat-get b 0 j)) 0.0)
+                            -1.0
+                            1.0)
+                       ok (letrec [r
+                                   (fn [i : int] : bool
+                                     (if (>= i (mat-rows a))
+                                       true
+                                       (if (> (fa (- (mat-get a i j)
+                                                    (* sg (mat-get b i j))))
+                                             1e-12)
+                                         false
+                                         (r (+ i 1)))))]
+                            (r 0))]
+                   (if ok (go (+ j 1)) false))))]
+      (go 0)))
+  (defn t-active [] : bool
+    (let [on (linalg-blas?)]
+      (blas-off!)
+      (let [off (linalg-blas?)] (blas-on!) (and on (not off)))))
+  (defn t-mat-mul [] : bool
+    (let [a (filled 70 130 1)
+          b (filled 130 65 5)
+          x (mat-mul a b)]
+      (blas-off!)
+      (let [y (mat-mul a b)]
+        (blas-on!)
+        (let [ok (same12? x y)]
+          (mat-free y)
+          (mat-free x)
+          (mat-free b)
+          (mat-free a)
+          ok))))
+  (defn t-mat-mul-vec [] : bool
+    (let [a (filled 70 130 1)
+          v (la-vec-new 130)]
+      (letrec [go
+               (fn [i : int] : int
+                 (if (>= i 130)
+                   0
+                   (do (la-vec-set! v i (- (i2f (mod i 9)) 4.1)) (go (+ i 1)))))]
+        (go 0))
+      (let [x (mat-mul-vec a v)]
+        (blas-off!)
+        (let [y (mat-mul-vec a v)]
+          (blas-on!)
+          (let [ok (vsame12? x y)]
+            (la-vec-free y)
+            (la-vec-free x)
+            (la-vec-free v)
+            (mat-free a)
+            ok)))))
+  (defn t-chol [] : bool
+    (let [a (spd 6)
+          f (chol a)]
+      (blas-off!)
+      (let [g (chol a)]
+        (blas-on!)
+        (let [ok (same12? (.L f) (.L g))]
+          (chol-free g)
+          (chol-free f)
+          (mat-free a)
+          ok))))
+  (defn t-lu [] : bool
+    (let [a (filled 7 7 2)
+          f (lu a)]
+      (blas-off!)
+      (let [g (lu a)]
+        (blas-on!)
+        (let [ok (and (same12? (.L f) (.L g))
+                   (and (same12? (.U f) (.U g))
+                     (letrec [go
+                              (fn [i : int] : bool
+                                (if (>= i 7)
+                                  true
+                                  (if (= (vec-get (.piv f) i)
+                                        (vec-get (.piv g) i))
+                                    (go (+ i 1))
+                                    false)))]
+                       (go 0))))]
+          (lu-free g)
+          (lu-free f)
+          (mat-free a)
+          ok))))
+  (defn t-qr [] : bool
+    (let [a (filled 9 5 4)
+          f (qr a)]
+      (blas-off!)
+      (let [g (qr a)]
+        (blas-on!)
+        (let [ok (and (same12? (.R f) (.R g)) (same12? (.Q f) (.Q g)))]
+          (qr-free g)
+          (qr-free f)
+          (mat-free a)
+          ok))))
+  (defn t-solves [] : bool
+    ;; chol-solve, lu-solve and qr-solve agree through both factorizations
+    (let [s (spd 6)
+          a (filled 6 6 2)
+          t (filled 9 5 4)
+          b (la-vec-new 6)
+          c (la-vec-new 9)]
+      (letrec [go
+               (fn [i : int] : int
+                 (if (>= i 9)
+                   0
+                   (do
+                     (when (< i 6) (la-vec-set! b i (+ 1.5 (i2f i))))
+                     (la-vec-set! c i (- 2.25 (i2f i)))
+                     (go (+ i 1)))))]
+        (go 0))
+      (let [f1 (chol s)
+            f2 (lu a)
+            f3 (qr t)
+            x1 (chol-solve f1 b)
+            x2 (lu-solve f2 b)
+            x3 (qr-solve f3 c)]
+        (blas-off!)
+        (let [g1 (chol s)
+              g2 (lu a)
+              g3 (qr t)
+              y1 (chol-solve g1 b)
+              y2 (lu-solve g2 b)
+              y3 (qr-solve g3 c)]
+          (blas-on!)
+          (let [ok (and (vsame12? x1 y1)
+                     (and (vsame12? x2 y2) (vsame12? x3 y3)))]
+            (la-vec-free y3)
+            (la-vec-free y2)
+            (la-vec-free y1)
+            (qr-free g3)
+            (lu-free g2)
+            (chol-free g1)
+            (la-vec-free x3)
+            (la-vec-free x2)
+            (la-vec-free x1)
+            (qr-free f3)
+            (lu-free f2)
+            (chol-free f1)
+            (la-vec-free c)
+            (la-vec-free b)
+            (mat-free t)
+            (mat-free a)
+            (mat-free s)
+            ok)))))
+  (defn t-svd [] : bool
+    ;; the LB0 4x3 matrix and a wide one: singular values to 12 figures,
+    ;; singular vectors up to sign
+    (let [a (filled 6 4 8)
+          w (filled 4 6 9)
+          f (svd a)
+          h (svd w)]
+      (blas-off!)
+      (let [g (svd a)
+            k (svd w)]
+        (blas-on!)
+        (let [ok (and (vsame12? (.s f) (.s g))
+                   (and (vsame12? (.s h) (.s k))
+                     (and (cols-same12-up-to-sign? (.U f) (.U g) 4)
+                       (cols-same12-up-to-sign? (.U h) (.U k) 4))))]
+          (svd-free k)
+          (svd-free g)
+          (svd-free h)
+          (svd-free f)
+          (mat-free w)
+          (mat-free a)
+          ok))))
+  (defn t-eigen [] : bool
+    (let [a (spd 6)]
+      (match (eigen-sym a)
+        (Ok f)
+        (do
+          (blas-off!)
+          (match (eigen-sym a)
+            (Ok g)
+            (do
+              (blas-on!)
+              (let [ok (and (vsame12? (.vals f) (.vals g))
+                         (same12? (.vecs f) (.vecs g)))]
+                (eigen-free g)
+                (eigen-free f)
+                (mat-free a)
+                ok))
+            (Err e)
+            (do (blas-on!) (eigen-free f) (mat-free a) false)))
+        (Err e)
+        (do (mat-free a) false))))
+  (defn main [] : int
+    (check 1
+      "linalg-blas? reports the backend, and TUR_LINALG_NO_BLAS turns it off"
+      (t-active))
+    (check 2 "mat-mul: cblas_dgemm = pure, 12 figures" (t-mat-mul))
+    (check 3 "mat-mul-vec: cblas_dgemv = pure, 12 figures" (t-mat-mul-vec))
+    (check 4 "chol: dpotrf = pure, 12 figures" (t-chol))
+    (check 5 "lu: dgetrf = pure (L, U, pivots), 12 figures" (t-lu))
+    (check 6 "qr: dgeqrf + dorgqr = pure (Q, R), 12 figures" (t-qr))
+    (check 7 "chol-solve / lu-solve / qr-solve agree" (t-solves))
+    (check 8 "svd: dgesdd = Jacobi, 12 figures" (t-svd))
+    (check 9 "eigen-sym: dsyev = Jacobi, 12 figures" (t-eigen))
+    (finish 9))) ;; end defmodule linalg/blas-agree
