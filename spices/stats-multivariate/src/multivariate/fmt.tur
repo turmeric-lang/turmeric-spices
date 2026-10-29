@@ -1,0 +1,282 @@
+;;; multivariate/fmt -- printing for the multivariate result types.
+;;;
+;;; Each `*->str` returns a malloc'd cstr that the caller frees with
+;;; `mv-str-free`; each `*-print` prints and frees. Tables are fixed-width,
+;;; four decimals, with rows and columns labelled by index (V1.. for
+;;; variables, PC1.. / F1.. / LD1.. for components, factors and axes).
+(defmodule multivariate/fmt
+  (export pca->str
+    pca-print
+    pca-print-loadings
+    fa->str
+    fa-print
+    mv-regress->str
+    mv-regress-print
+    hotelling->str
+    hotelling-print
+    manova->str
+    manova-print
+    lda->str
+    lda-print
+    mv-str-free)
+  (import linalg/vec :refer [lavec la-vec-len])
+  (import linalg/mat :refer [mat mat-rows mat-cols])
+  (import multivariate/pca :refer [PcaResult])
+  (import multivariate/factor :refer [FaResult])
+  (import multivariate/regress :refer [MvOlsResult])
+  (import multivariate/test :refer [HotellingResult ManovaResult])
+  (import multivariate/lda :refer [LdaResult])
+  ;;; mv-str-free -- free a cstr returned by the *->str helpers.
+  (defn mv-str-free [s : cstr] : void ```c free((void*)(intptr_t)s); ```)
+  ;;; __fmt-matrix -- "title\n" then a table of data (rows x cols, row-major,
+  ;;; the first `ncols` columns only) with labels rowp<i+1> and colp<j+1>.
+  (defn __fmt-matrix [title : cstr
+                      rowp : cstr
+                      colp : cstr
+                      d : (Vec float)
+                      rows : int
+                      cols : int
+                      ncols : int] : cstr
+    ```c
+    #include <stdio.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  const double *a = (const double*)(void*)((struct __V*)(intptr_t)d)->data;
+  int64_t nc = ncols < cols ? ncols : cols;
+  size_t cap = 256 + (size_t)(rows + 1) * (size_t)(nc + 1) * 16;
+  char *buf = (char*)malloc(cap);
+  size_t off = (size_t)snprintf(buf, cap, "%s\n%-8s", (const char*)title, "");
+  for (int64_t j = 0; j < nc; j++) {
+    char lab[32]; snprintf(lab, sizeof lab, "%s%lld", (const char*)colp, (long long)(j + 1));
+    off += (size_t)snprintf(buf + off, cap - off, " %10s", lab);
+  }
+  for (int64_t i = 0; i < rows; i++) {
+    char lab[32]; snprintf(lab, sizeof lab, "%s%lld", (const char*)rowp, (long long)(i + 1));
+    off += (size_t)snprintf(buf + off, cap - off, "\n%-8s", lab);
+    for (int64_t j = 0; j < nc; j++)
+      off += (size_t)snprintf(buf + off, cap - off, " %10.4f", a[i*cols + j]);
+  }
+  return (const char *)buf;
+  ```)
+  ;;; __cat -- a ++ "\n" ++ b; frees both inputs.
+  (defn __cat [a : cstr b : cstr] : cstr
+    ```c
+    #include <stdlib.h>
+    #include <string.h>
+    size_t la = strlen((const char*)a), lb = strlen((const char*)b);
+    char *o = (char*)malloc(la + lb + 2);
+    memcpy(o, (const char*)a, la); o[la] = '\n'; memcpy(o + la + 1, (const char*)b, lb + 1);
+    free((void*)(intptr_t)a); free((void*)(intptr_t)b);
+    return (const char *)o;
+    ```)
+  ;;; __pca-table -- the importance table, one row per component.
+  (defn __pca-table [sd : (Vec float) pd : (Vec float) cd : (Vec float) k : int] : cstr
+    ```c
+    #include <stdio.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  const double *s = (const double*)(void*)((struct __V*)(intptr_t)sd)->data;
+  const double *p = (const double*)(void*)((struct __V*)(intptr_t)pd)->data;
+  const double *c = (const double*)(void*)((struct __V*)(intptr_t)cd)->data;
+  size_t cap = 128 + (size_t)k * 64;
+  char *buf = (char*)malloc(cap);
+  size_t off = (size_t)snprintf(buf, cap, "Importance of components:\n%-8s %10s %10s %10s",
+                                "", "sdev", "prop", "cumulative");
+  for (int64_t j = 0; j < k; j++)
+    off += (size_t)snprintf(buf + off, cap - off, "\nPC%-6lld %10.4f %10.4f %10.4f",
+                            (long long)(j + 1), s[j], p[j], c[j]);
+  return (const char *)buf;
+  ```)
+  ;;; pca->str -- importance table and the loadings of the first two components.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- a fitted PCA (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A malloc'd cstr; free it with `mv-str-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (let [s (pca->str r)] (println s) (mv-str-free s))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn pca->str [^borrow r : PcaResult] : cstr
+    (let [k (la-vec-len (.sdev r))]
+      (__cat (__pca-table (.data (.sdev r)) (.data (.var-prop r)) (.data (.var-cum r)) k)
+        (__fmt-matrix "Loadings:"
+          "V"
+          "PC"
+          (.data (.loadings r))
+          (mat-rows (.loadings r))
+          (mat-cols (.loadings r))
+          2))))
+  ;;; pca-print -- print `pca->str`.
+  (defn pca-print [^borrow r : PcaResult] : void
+    (let [s (pca->str r)] (println s) (mv-str-free s)))
+  ;;; pca-print-loadings -- print the loadings of the first k components.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- a fitted PCA (borrowed)
+  ;;;   k -- how many component columns to show
+  ;;;
+  ;;; Example:
+  ;;;   (pca-print-loadings r 3)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn pca-print-loadings [^borrow r : PcaResult k : int] : void
+    (let [s (__fmt-matrix "Loadings:"
+              "V"
+              "PC"
+              (.data (.loadings r))
+              (mat-rows (.loadings r))
+              (mat-cols (.loadings r))
+              k)]
+      (println s)
+      (mv-str-free s)))
+  ;;; __fa-tail -- communality / uniqueness table and the convergence line.
+  (defn __fa-tail [hd : (Vec float) ud : (Vec float) n : int iters : int conv : bool] : cstr
+    ```c
+    #include <stdio.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  const double *h = (const double*)(void*)((struct __V*)(intptr_t)hd)->data;
+  const double *u = (const double*)(void*)((struct __V*)(intptr_t)ud)->data;
+  size_t cap = 160 + (size_t)n * 48;
+  char *buf = (char*)malloc(cap);
+  size_t off = (size_t)snprintf(buf, cap, "%-8s %10s %10s", "", "h2", "u2");
+  for (int64_t i = 0; i < n; i++)
+    off += (size_t)snprintf(buf + off, cap - off, "\nV%-7lld %10.4f %10.4f", (long long)(i + 1), h[i], u[i]);
+  snprintf(buf + off, cap - off, "\n%s after %lld iterations", conv ? "converged" : "NOT converged",
+           (long long)iters);
+  return (const char *)buf;
+  ```)
+  ;;; fa->str -- loading matrix, communalities and uniquenesses.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- a fitted factor model (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A malloc'd cstr; free it with `mv-str-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (let [s (fa->str f)] (println s) (mv-str-free s))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn fa->str [^borrow r : FaResult] : cstr
+    (let [l (.loadings r)]
+      (__cat (__fmt-matrix "Factor loadings (PAF, unrotated):"
+               "V"
+               "F"
+               (.data l)
+               (mat-rows l)
+               (mat-cols l)
+               (mat-cols l))
+        (__fa-tail (.data (.communality r)) (.data (.uniqueness r)) (mat-rows l) (.iters r) (.converged r)))))
+  ;;; fa-print -- print `fa->str`.
+  (defn fa-print [^borrow r : FaResult] : void
+    (let [s (fa->str r)] (println s) (mv-str-free s)))
+  ;;; mv-regress->str -- the p x q coefficient table and residual df.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- a fitted multivariate OLS (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A malloc'd cstr; free it with `mv-str-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (let [s (mv-regress->str r)] (println s) (mv-str-free s))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn mv-regress->str [^borrow r : MvOlsResult] : cstr
+    (let [c (.coef r)]
+      (__cat (__fmt-matrix "Coefficients (rows: predictors, columns: responses):"
+               "X"
+               "Y"
+               (.data c)
+               (mat-rows c)
+               (mat-cols c)
+               (mat-cols c))
+        (__df-line (.df-resid r)))))
+  (defn __df-line [df : int] : cstr
+    ```c
+    #include <stdio.h>
+    #include <stdlib.h>
+    char *buf = (char*)malloc(64);
+    snprintf(buf, 64, "Residual df: %lld", (long long)df);
+    return (const char *)buf;
+    ```)
+  ;;; mv-regress-print -- print `mv-regress->str`.
+  (defn mv-regress-print [^borrow r : MvOlsResult] : void
+    (let [s (mv-regress->str r)] (println s) (mv-str-free s)))
+  (defn __hotelling-fmt [t2 : float f : float df1 : int df2 : int p : float] : cstr
+    ```c
+    #include <stdio.h>
+    #include <stdlib.h>
+    char *buf = (char*)malloc(160);
+    snprintf(buf, 160, "Hotelling's T^2 = %.4f\nF = %.4f on %lld and %lld df, p-value = %.4g",
+             t2, f, (long long)df1, (long long)df2, p);
+    return (const char *)buf;
+    ```)
+  ;;; hotelling->str -- T^2, F, degrees of freedom and p-value.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- a Hotelling result
+  ;;;
+  ;;; Returns:
+  ;;;   A malloc'd cstr; free it with `mv-str-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (hotelling-print (hotelling-1samp x mu0))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn hotelling->str [r : HotellingResult] : cstr
+    (__hotelling-fmt (.t2 r) (.f-stat r) (.df1 r) (.df2 r) (.p-value r)))
+  ;;; hotelling-print -- print `hotelling->str`.
+  (defn hotelling-print [r : HotellingResult] : void
+    (let [s (hotelling->str r)] (println s) (mv-str-free s)))
+  (defn __manova-fmt [w : float pi : float f : float df1 : float df2 : float p : float] : cstr
+    ```c
+    #include <stdio.h>
+    #include <stdlib.h>
+    char *buf = (char*)malloc(200);
+    snprintf(buf, 200, "Wilks' lambda = %.4f\nPillai's trace = %.4f\n"
+             "approx F = %.4f on %.4g and %.4g df, p-value = %.4g", w, pi, f, df1, df2, p);
+    return (const char *)buf;
+    ```)
+  ;;; manova->str -- Wilks' lambda, Pillai's trace, Rao's F and p-value.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- a MANOVA result
+  ;;;
+  ;;; Returns:
+  ;;;   A malloc'd cstr; free it with `mv-str-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (match (manova-1way x g) (Ok r) (manova-print r) (Err e) (println e))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn manova->str [r : ManovaResult] : cstr
+    (__manova-fmt (.wilks r) (.pillai r) (.f-approx r) (.df1 r) (.df2 r) (.p-value r)))
+  ;;; manova-print -- print `manova->str`.
+  (defn manova-print [r : ManovaResult] : void
+    (let [s (manova->str r)] (println s) (mv-str-free s)))
+  ;;; lda->str -- priors, class means and discriminant axes.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- a fitted LDA (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A malloc'd cstr; free it with `mv-str-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (let [s (lda->str r)] (println s) (mv-str-free s))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn lda->str [^borrow r : LdaResult] : cstr
+    (let [k (mat-rows (.means r))
+          a (.scalings r)]
+      (__cat (__fmt-matrix "Prior probabilities:" "" "C" (.data (.prior r)) 1 k k)
+        (__cat (__fmt-matrix "Class means:" "C" "V" (.data (.means r)) k (mat-cols (.means r)) (mat-cols (.means r)))
+          (__fmt-matrix "Discriminant axes:" "V" "LD" (.data a) (mat-rows a) (mat-cols a) (mat-cols a))))))
+  ;;; lda-print -- print `lda->str`.
+  (defn lda-print [^borrow r : LdaResult] : void
+    (let [s (lda->str r)] (println s) (mv-str-free s)))) ;; end defmodule multivariate/fmt

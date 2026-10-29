@@ -1,0 +1,106 @@
+;;; fmt_test.tur -- SM6: the print helpers produce their tables on minimal
+;;; inputs without crashing, and the PCA variance column sums to 1.
+(defmodule multivariate/fmt-test
+  (import linalg/vec :refer [lavec la-vec-of la-vec-get la-vec-len la-vec-free])
+  (import linalg/mat :refer [mat mat-of mat-submat mat-free])
+  (import multivariate/pca :refer [pca pca-opts pca-free])
+  (import multivariate/factor :refer [factor-analysis fa-opts fa-free])
+  (import multivariate/regress :refer [mv-ols mv-ols-free])
+  (import multivariate/test :refer [hotelling-1samp manova-1way])
+  (import multivariate/lda :refer [lda-fit lda-free lda-opts-default lda-opts-free])
+  (import multivariate/fmt
+    :refer
+    [pca->str pca-print pca-print-loadings fa->str fa-print mv-regress->str hotelling->str
+     manova->str lda->str lda-print mv-str-free])
+  ;; --- TAP harness (inline-C fail counter) ---
+  (defn check [idx : int name : cstr ok : bool] : void
+    ```c
+    /* __tur_include__: static int g_fm_fails = 0; */
+  if (!ok) g_fm_fails++;
+  printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
+  ```)
+  (defn finish [count : int] : int
+    ```c
+    printf("1..%lld\n", (long long)count);
+  if (g_fm_fails == 0) {
+    fprintf(stderr, "# All %lld multivariate fmt tests passed.\n", (long long)count);
+    return 0;
+  }
+  fprintf(stderr, "# %d/%lld multivariate fmt tests failed.\n", g_fm_fails, (long long)count);
+  return 1;
+  ```)
+  (defn fa [x : float] : float ```c return x < 0.0 ? -x : x; ```)
+  (defn approx [a : float b : float] : bool (< (fa (- a b)) 1e-12))
+  ;;; iris15 -- five rows from each of the three iris species (4 columns).
+  (defn iris15 [] : mat
+    (mat-of 15 4
+      5.1 3.5 1.4 0.2  4.9 3.0 1.4 0.2  4.7 3.2 1.3 0.2  4.6 3.1 1.5 0.2  5.0 3.6 1.4 0.2
+      7.0 3.2 4.7 1.4  6.4 3.2 4.5 1.5  6.9 3.1 4.9 1.5  5.5 2.3 4.0 1.3  6.5 2.8 4.6 1.5
+      6.3 3.3 6.0 2.5  5.8 2.7 5.1 1.9  7.1 3.0 5.9 2.1  6.3 2.9 5.6 1.8  6.5 3.0 5.8 2.2))
+  (defn has? [s : cstr needle : cstr] : bool
+    ```c
+    #include <string.h>
+    return strstr((const char *)s, (const char *)needle) != NULL;
+    ```)
+  ;;; check-str -- s contains needle; frees s.
+  (defn check-str [s : cstr needle : cstr] : bool
+    (let [ok (has? s needle)] (mv-str-free s) ok))
+  (defn groups15 [] : (Vec int) (:: (vec-of 0 0 0 0 0 1 1 1 1 1 2 2 2 2 2) (Vec int)))
+  (defn t-pca [] : bool
+    (let [x (mat-of 3 2 1.0 2.0 2.0 3.5 3.0 5.5)
+          r (pca x (pca-opts true false 0))]
+      (pca-print r)
+      (pca-print-loadings r 1)
+      (let [ok (and (check-str (pca->str r) "Importance of components")
+                 (near (+ (la-vec-get (.var-prop r) 0) (la-vec-get (.var-prop r) 1)) 1.0 1e-12))]
+        (pca-free r)
+        (mat-free x)
+        ok)))
+  (defn near [a : float b : float tol : float] : bool (< (fa (- a b)) tol))
+  (defn t-fa [] : bool
+    (let [r (mat-of 3 3 1.0 0.6 0.5 0.6 1.0 0.4 0.5 0.4 1.0)]
+      (match (factor-analysis r (fa-opts 1))
+        (Ok f) (do
+                 (fa-print f)
+                 (let [ok (check-str (fa->str f) "h2")] (fa-free f) (mat-free r) ok))
+        (Err e) (do (mat-free r) false))))
+  (defn t-regress [] : bool
+    (let [x (mat-of 3 2 1.0 0.0 1.0 1.0 1.0 2.0)
+          y (mat-of 3 1 1.0 2.5 5.0)
+          r (mv-ols x y)]
+      (let [ok (check-str (mv-regress->str r) "Residual df: 1")] (mv-ols-free r) (mat-free y) (mat-free x) ok)))
+  (defn t-hotelling [] : bool
+    (let [x  (mat-of 4 2 1.0 2.0 2.0 1.0 3.0 5.0 4.0 4.0)
+          mu (la-vec-of 0.0 0.0)
+          r  (hotelling-1samp x mu)]
+      (let [ok (check-str (hotelling->str r) "on 2 and 2 df")] (la-vec-free mu) (mat-free x) ok)))
+  (defn t-manova [] : bool
+    (let [x (iris15)
+          z (mat-submat x 0 0 15 2)
+          g (groups15)]
+      (let [ok (match (manova-1way z g)
+                 (Ok r) (check-str (manova->str r) "Wilks' lambda")
+                 (Err e) false)]
+        (vec-free g)
+        (mat-free z)
+        (mat-free x)
+        ok)))
+  (defn t-lda [] : bool
+    (let [x (iris15)
+          g (groups15)
+          o (lda-opts-default)]
+      (let [ok (match (lda-fit x g o)
+                 (Ok r) (do (lda-print r) (let [ok (check-str (lda->str r) "LD2")] (lda-free r) ok))
+                 (Err e) false)]
+        (lda-opts-free o)
+        (vec-free g)
+        (mat-free x)
+        ok)))
+  (defn main [] : int
+    (check 1 "pca->str / pca-print; variance column sums to 1" (t-pca))
+    (check 2 "fa->str / fa-print" (t-fa))
+    (check 3 "mv-regress->str" (t-regress))
+    (check 4 "hotelling->str" (t-hotelling))
+    (check 5 "manova->str" (t-manova))
+    (check 6 "lda->str / lda-print" (t-lda))
+    (finish 6))) ;; end defmodule multivariate/fmt-test

@@ -1,0 +1,270 @@
+;;; multivariate/cov -- covariance / correlation matrices and Mahalanobis
+;;; distance over linalg `mat` data.
+;;;
+;;; A data matrix X is m x n: one observation per row, one variable per
+;;; column. These complement `stats/cov`, which works pairwise on frame
+;;; columns, by producing the whole n x n matrix at once.
+;;;
+;;; The numeric loops run in inline C over the backing `(Vec float)` buffers,
+;;; as in linalg; the Turmeric layer allocates and composes.
+(defmodule multivariate/cov
+  (export cov-mat
+    cov-mat-pop
+    cor-mat
+    col-means
+    col-sds
+    mahalanobis
+    mahalanobis-auto
+    mv-pinv)
+  (import linalg/vec :refer [lavec la-vec-new la-vec-len la-vec-free])
+  (import linalg/mat :refer [mat mat-new mat-rows mat-cols mat-free])
+  (import linalg/decomp :refer [svd svd-free])
+  (import linalg/solve :refer [svd-rank])
+  ;;; __cov-kernel -- S (n x n) from X (m x n). mode 0: sample covariance
+  ;;; (m - 1 denominator); 1: population (m); 2: Pearson correlation.
+  (defn __cov-kernel [Sd : (Vec float) Xd : (Vec float) m : int n : int mode : int] : int
+    ```c
+    #include <math.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *S = (double*)(void*)((struct __V*)(intptr_t)Sd)->data;
+  const double *X = (const double*)(void*)((struct __V*)(intptr_t)Xd)->data;
+  double *mu = (double*)calloc((size_t)(n + 1), sizeof(double));
+  for (int64_t i = 0; i < m; i++)
+    for (int64_t j = 0; j < n; j++) mu[j] += X[i*n + j];
+  for (int64_t j = 0; j < n; j++) mu[j] /= (double)m;
+  double den = (mode == 1) ? (double)m : (double)(m - 1);
+  for (int64_t a = 0; a < n; a++)
+    for (int64_t b = a; b < n; b++) {
+      double s = 0.0;
+      for (int64_t i = 0; i < m; i++) s += (X[i*n + a] - mu[a]) * (X[i*n + b] - mu[b]);
+      S[a*n + b] = S[b*n + a] = s / den;
+    }
+  if (mode == 2) {
+    double *sd = (double*)malloc(sizeof(double) * (size_t)(n + 1));
+    for (int64_t j = 0; j < n; j++) sd[j] = sqrt(S[j*n + j]);
+    for (int64_t a = 0; a < n; a++)
+      for (int64_t b = 0; b < n; b++)
+        S[a*n + b] = (a == b) ? 1.0 : S[a*n + b] / (sd[a] * sd[b]);
+    free(sd);
+  }
+  free(mu);
+  return 0;
+  ```)
+  (defn __cov-with [^borrow x : mat mode : int who : cstr] : mat
+    (when (< (mat-rows x) 2) (panic who))
+    (let [n (mat-cols x)
+          s (mat-new n n)]
+      (__cov-kernel (.data s) (.data x) (mat-rows x) n mode)
+      s))
+  ;;; cov-mat -- sample covariance matrix (unbiased, m - 1 denominator).
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- m x n data matrix, one observation per row (borrowed); m >= 2
+  ;;;
+  ;;; Returns:
+  ;;;   The n x n covariance matrix.
+  ;;;
+  ;;; Example:
+  ;;;   (cov-mat (mat-of 3 2 1.0 2.0 2.0 4.0 3.0 7.0))  ; S[0][1] = 2.5
+  ;;;
+  ;;; Since: 0.1.0
+  (defn cov-mat [^borrow x : mat] : mat
+    (__cov-with x 0 "cov-mat: need at least 2 observations"))
+  ;;; cov-mat-pop -- population covariance matrix (m denominator).
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- m x n data matrix (borrowed); m >= 2
+  ;;;
+  ;;; Returns:
+  ;;;   The n x n biased covariance matrix.
+  ;;;
+  ;;; Example:
+  ;;;   (cov-mat-pop x)  ; = (m - 1) / m * (cov-mat x)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn cov-mat-pop [^borrow x : mat] : mat
+    (__cov-with x 1 "cov-mat-pop: need at least 2 observations"))
+  ;;; cor-mat -- Pearson correlation matrix.
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- m x n data matrix (borrowed); m >= 2, no constant column
+  ;;;
+  ;;; Returns:
+  ;;;   The n x n correlation matrix (unit diagonal).
+  ;;;
+  ;;; Example:
+  ;;;   (mat-get (cor-mat x) 0 0)  ; => 1.0
+  ;;;
+  ;;; Since: 0.1.0
+  (defn cor-mat [^borrow x : mat] : mat
+    (__cov-with x 2 "cor-mat: need at least 2 observations"))
+  ;;; __colstat-kernel -- mode 0: column means; mode 1: column sample sds.
+  (defn __colstat-kernel [od : (Vec float) Xd : (Vec float) m : int n : int mode : int] : int
+    ```c
+    #include <math.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *o = (double*)(void*)((struct __V*)(intptr_t)od)->data;
+  const double *X = (const double*)(void*)((struct __V*)(intptr_t)Xd)->data;
+  for (int64_t j = 0; j < n; j++) {
+    double mu = 0.0;
+    for (int64_t i = 0; i < m; i++) mu += X[i*n + j];
+    mu /= (double)m;
+    if (mode == 0) { o[j] = mu; continue; }
+    double s = 0.0;
+    for (int64_t i = 0; i < m; i++) s += (X[i*n + j] - mu) * (X[i*n + j] - mu);
+    o[j] = m > 1 ? sqrt(s / (double)(m - 1)) : 0.0;
+  }
+  return 0;
+  ```)
+  ;;; col-means -- the mean of each column.
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- m x n data matrix (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A length-n lavec.
+  ;;;
+  ;;; Example:
+  ;;;   (col-means (mat-of 2 2 1.0 2.0 3.0 4.0))  ; => [2.0 3.0]
+  ;;;
+  ;;; Since: 0.1.0
+  (defn col-means [^borrow x : mat] : lavec
+    (let [v (la-vec-new (mat-cols x))]
+      (__colstat-kernel (.data v) (.data x) (mat-rows x) (mat-cols x) 0)
+      v))
+  ;;; col-sds -- the sample standard deviation of each column.
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- m x n data matrix (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A length-n lavec (m - 1 denominator).
+  ;;;
+  ;;; Example:
+  ;;;   (col-sds (mat-of 2 1 1.0 3.0))  ; => [1.4142...]
+  ;;;
+  ;;; Since: 0.1.0
+  (defn col-sds [^borrow x : mat] : lavec
+    (let [v (la-vec-new (mat-cols x))]
+      (__colstat-kernel (.data v) (.data x) (mat-rows x) (mat-cols x) 1)
+      v))
+  ;;; __mahal-kernel -- d[i] = sqrt((x_i - mu)' Sinv (x_i - mu)).
+  (defn __mahal-kernel [dd : (Vec float)
+                        Xd : (Vec float)
+                        mud : (Vec float)
+                        Sd : (Vec float)
+                        m : int
+                        n : int] : int
+    ```c
+    #include <math.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *d = (double*)(void*)((struct __V*)(intptr_t)dd)->data;
+  const double *X = (const double*)(void*)((struct __V*)(intptr_t)Xd)->data;
+  const double *mu = (const double*)(void*)((struct __V*)(intptr_t)mud)->data;
+  const double *S = (const double*)(void*)((struct __V*)(intptr_t)Sd)->data;
+  double *z = (double*)malloc(sizeof(double) * (size_t)(n + 1));
+  for (int64_t i = 0; i < m; i++) {
+    for (int64_t j = 0; j < n; j++) z[j] = X[i*n + j] - mu[j];
+    double q = 0.0;
+    for (int64_t a = 0; a < n; a++) {
+      double r = 0.0;
+      for (int64_t b = 0; b < n; b++) r += S[a*n + b] * z[b];
+      q += z[a] * r;
+    }
+    d[i] = sqrt(q > 0.0 ? q : 0.0);
+  }
+  free(z);
+  return 0;
+  ```)
+  ;;; mahalanobis -- Mahalanobis distance of each row of X from mu.
+  ;;;
+  ;;; Parameters:
+  ;;;   x     -- m x n data matrix (borrowed)
+  ;;;   mu    -- the centre, length n (borrowed)
+  ;;;   s-inv -- the inverse covariance matrix, n x n (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A length-m lavec of distances sqrt((x - mu)' S^-1 (x - mu)) -- the
+  ;;;   distance itself, not its square (R's `mahalanobis` returns the square).
+  ;;;
+  ;;; Example:
+  ;;;   (mahalanobis x (col-means x) (mat-inv (cov-mat x)))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn mahalanobis [^borrow x : mat ^borrow mu : lavec ^borrow s-inv : mat] : lavec
+    (let [n (mat-cols x)]
+      (when (or (not= (la-vec-len mu) n) (or (not= (mat-rows s-inv) n) (not= (mat-cols s-inv) n)))
+        (panic "mahalanobis: dimension mismatch"))
+      (let [d (la-vec-new (mat-rows x))]
+        (__mahal-kernel (.data d) (.data x) (.data mu) (.data s-inv) (mat-rows x) n)
+        d)))
+  ;;; __pinv-kernel -- P = V diag(1/s) U' over the r leading triplets.
+  (defn __pinv-kernel [Pd : (Vec float)
+                       Ud : (Vec float)
+                       sd : (Vec float)
+                       Vtd : (Vec float)
+                       n : int
+                       r : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *P = (double*)(void*)((struct __V*)(intptr_t)Pd)->data;
+  const double *U = (const double*)(void*)((struct __V*)(intptr_t)Ud)->data;
+  const double *s = (const double*)(void*)((struct __V*)(intptr_t)sd)->data;
+  const double *Vt = (const double*)(void*)((struct __V*)(intptr_t)Vtd)->data;
+  for (int64_t a = 0; a < n; a++)
+    for (int64_t b = 0; b < n; b++) {
+      double acc = 0.0;
+      for (int64_t k = 0; k < r; k++) acc += Vt[k*n + a] * U[b*n + k] / s[k];
+      P[a*n + b] = acc;
+    }
+  return 0;
+  ```)
+  ;;; mv-pinv -- Moore-Penrose pseudo-inverse of a square matrix via the SVD,
+  ;;; truncated at linalg's default rank cutoff.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- an n x n matrix (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A+ (n x n); equal to the inverse when a is non-singular.
+  ;;;
+  ;;; Example:
+  ;;;   (mv-pinv (mat-of 2 2 2.0 0.0 0.0 0.0))  ; => [[0.5 0] [0 0]]
+  ;;;
+  ;;; Since: 0.1.0
+  (defn mv-pinv [^borrow a : mat] : mat
+    (when (not= (mat-rows a) (mat-cols a)) (panic "mv-pinv: matrix must be square"))
+    (let [n (mat-rows a)
+          f (svd a)
+          p (mat-new n n)]
+      (__pinv-kernel (.data p) (.data (.U f)) (.data (.s f)) (.data (.Vt f)) n (svd-rank f 0.0))
+      (svd-free f)
+      p))
+  ;;; mahalanobis-auto -- distances from the column means under the sample
+  ;;; covariance of X itself.
+  ;;;
+  ;;; S^-1 is the SVD pseudo-inverse, so a singular covariance (a constant or
+  ;;; collinear column) still yields distances in the remaining directions
+  ;;; rather than failing.
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- m x n data matrix (borrowed); m >= 2
+  ;;;
+  ;;; Returns:
+  ;;;   A length-m lavec of distances.
+  ;;;
+  ;;; Example:
+  ;;;   (mahalanobis-auto x)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn mahalanobis-auto [^borrow x : mat] : lavec
+    (let [s  (cov-mat x)
+          mu (col-means x)
+          p  (mv-pinv s)
+          d  (mahalanobis x mu p)]
+      (mat-free p)
+      (la-vec-free mu)
+      (mat-free s)
+      d))) ;; end defmodule multivariate/cov

@@ -1,0 +1,149 @@
+;;; factor_test.tur -- SM2: principal axis factoring.
+;;;
+;;; R is built from a known two-factor structure, R = L L' with a unit
+;;; diagonal, so the true communalities are the row sums of L^2 and PAF's
+;;; fixed point reproduces every off-diagonal correlation exactly.
+(defmodule multivariate/factor-test
+  (import linalg/vec :refer [lavec la-vec-get la-vec-len la-vec-free])
+  (import linalg/mat
+    :refer
+    [mat mat-of mat-get mat-set! mat-rows mat-cols mat-mul mat-transpose mat-free])
+  (import multivariate/factor
+    :refer
+    [FAOpts FaResult fa-opts factor-analysis fa-free fa-scores])
+  ;; --- TAP harness (inline-C fail counter) ---
+  (defn check [idx : int name : cstr ok : bool] : void
+    ```c
+    /* __tur_include__: static int g_fc_fails = 0; */
+  if (!ok) g_fc_fails++;
+  printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
+  ```)
+  (defn finish [count : int] : int
+    ```c
+    printf("1..%lld\n", (long long)count);
+  if (g_fc_fails == 0) {
+    fprintf(stderr, "# All %lld factor tests passed.\n", (long long)count);
+    return 0;
+  }
+  fprintf(stderr, "# %d/%lld factor tests failed.\n", g_fc_fails, (long long)count);
+  return 1;
+  ```)
+  (defn fa [x : float] : float ```c return x < 0.0 ? -x : x; ```)
+  (defn approx [a : float b : float] : bool (< (fa (- a b)) 1e-12))
+  (defn near [a : float b : float tol : float] : bool (< (fa (- a b)) tol))
+  (defn lambda6 [] : mat
+    (mat-of 6 2 0.8 0.1 0.7 0.2 0.6 0.0 0.1 0.75 0.0 0.65 0.2 0.55))
+  ;;; corr6 -- L L' with the diagonal set to 1.
+  (defn corr6 [] : mat
+    (let [l  (lambda6)
+          lt (mat-transpose l)
+          r  (mat-mul l lt)]
+      (letrec [go (fn [i : int] : int (if (>= i 6) 0 (do (mat-set! r i i 1.0) (go (+ i 1)))))]
+        (go 0))
+      (mat-free lt)
+      (mat-free l)
+      r))
+  (defn tight [] : FAOpts (make-struct FAOpts 2 "paf" "none" 20000 1e-13))
+  ;;; true-h2 -- row i of L squared and summed.
+  (defn true-h2 [i : int] : float
+    (let [l (lambda6)
+          a (mat-get l i 0)
+          b (mat-get l i 1)]
+      (mat-free l)
+      (+ (* a a) (* b b))))
+  (defn t-converges [] : bool
+    (let [r (corr6)]
+      (match (factor-analysis r (tight))
+        (Ok f) (let [ok (and (.converged f) (= (mat-cols (.loadings f)) 2))] (fa-free f) (mat-free r) ok)
+        (Err e) (do (mat-free r) false))))
+  (defn t-h2-plus-u2 [] : bool
+    (let [r (corr6)]
+      (match (factor-analysis r (tight))
+        (Ok f) (let [ok (letrec [go
+                                 (fn [i : int] : bool
+                                   (if (>= i 6)
+                                     true
+                                     (if (near (+ (la-vec-get (.communality f) i) (la-vec-get (.uniqueness f) i)) 1.0 1e-12)
+                                       (go (+ i 1))
+                                       false)))]
+                          (go 0))]
+                 (fa-free f)
+                 (mat-free r)
+                 ok)
+        (Err e) (do (mat-free r) false))))
+  (defn t-true-communalities [] : bool
+    (let [r (corr6)]
+      (match (factor-analysis r (tight))
+        (Ok f) (let [ok (letrec [go
+                                 (fn [i : int] : bool
+                                   (if (>= i 6)
+                                     true
+                                     (if (near (la-vec-get (.communality f) i) (true-h2 i) 1e-06)
+                                       (go (+ i 1))
+                                       false)))]
+                          (go 0))]
+                 (fa-free f)
+                 (mat-free r)
+                 ok)
+        (Err e) (do (mat-free r) false))))
+  (defn t-reproduces-r [] : bool
+    ;; L L' matches R off the diagonal
+    (let [r (corr6)]
+      (match (factor-analysis r (tight))
+        (Ok f) (let [lt (mat-transpose (.loadings f))
+                     rr (mat-mul (.loadings f) lt)
+                     ok (letrec [go
+                                 (fn [idx : int] : bool
+                                   (if (>= idx 36)
+                                     true
+                                     (let [i (/ idx 6)
+                                           j (mod idx 6)]
+                                       (if (or (= i j) (near (mat-get rr i j) (mat-get r i j) 1e-06))
+                                         (go (+ idx 1))
+                                         false))))]
+                          (go 0))]
+                 (mat-free rr)
+                 (mat-free lt)
+                 (fa-free f)
+                 (mat-free r)
+                 ok)
+        (Err e) (do (mat-free r) false))))
+  (defn t-defaults-run [] : bool
+    (let [r (corr6)]
+      (match (factor-analysis r (fa-opts 1))
+        (Ok f) (let [ok (and (= (mat-cols (.loadings f)) 1) (> (.iters f) 0))] (fa-free f) (mat-free r) ok)
+        (Err e) (do (mat-free r) false))))
+  (defn rejects? [^borrow r : mat o : FAOpts] : bool
+    (match (factor-analysis r o) (Ok f) (do (fa-free f) false) (Err e) true))
+  (defn t-errors [] : bool
+    (let [r  (corr6)
+          nc (mat-of 2 2 2.0 0.5 0.5 1.0)
+          ok (and (rejects? r (fa-opts 0))
+               (and (rejects? r (fa-opts 6))
+                 (and (rejects? r (make-struct FAOpts 2 "ml" "none" 10 1e-06))
+                   (and (rejects? r (make-struct FAOpts 2 "paf" "varimax" 10 1e-06))
+                     (rejects? nc (fa-opts 1))))))]
+      (mat-free nc)
+      (mat-free r)
+      ok))
+  (defn t-scores-shape [] : bool
+    (let [x (mat-of 6 3 1.0 2.0 0.5 2.0 3.5 1.0 3.0 3.0 2.5 4.0 5.5 2.0 5.0 6.0 4.5 6.0 6.5 4.0)
+          r (mat-of 3 3 1.0 0.6 0.5 0.6 1.0 0.4 0.5 0.4 1.0)]
+      (match (factor-analysis r (fa-opts 1))
+        (Ok f) (let [s  (fa-scores f x)
+                     ok (and (= (mat-rows s) 6) (= (mat-cols s) 1))]
+                 (mat-free s)
+                 (fa-free f)
+                 (mat-free r)
+                 (mat-free x)
+                 ok)
+        (Err e) (do (mat-free r) (mat-free x) false))))
+  (defn main [] : int
+    (check 1 "factor-analysis: PAF converges on a 2-factor R" (t-converges))
+    (check 2 "factor-analysis: communality + uniqueness = 1" (t-h2-plus-u2))
+    (check 3 "factor-analysis: recovers the true communalities" (t-true-communalities))
+    (check 4 "factor-analysis: L L' reproduces R" (t-reproduces-r))
+    (check 5 "factor-analysis: default options run" (t-defaults-run))
+    (check 6 "factor-analysis: Err on bad input / v0.1 limits" (t-errors))
+    (check 7 "fa-scores: m x k" (t-scores-shape))
+    (finish 7))) ;; end defmodule multivariate/factor-test

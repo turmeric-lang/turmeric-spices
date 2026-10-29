@@ -1,0 +1,139 @@
+;;; multivariate/regress -- multivariate ordinary least squares.
+;;;
+;;; Fits Y = X B + E for q responses at once (Y m x q, X m x p) by one
+;;; Householder QR of X -- linalg's `qr` -- reused for every response
+;;; column. Include a column of ones in X for an intercept.
+(defmodule multivariate/regress
+  (export MvOlsResult
+    mv-ols
+    mv-ols-free
+    mv-predict
+    mv-r-squared)
+  (import linalg/vec :refer [lavec la-vec-new la-vec-get la-vec-free])
+  (import linalg/mat
+    :refer
+    [mat mat-new mat-rows mat-cols mat-col mat-set! mat-mul mat-sub mat-transpose mat-free])
+  (import linalg/decomp :refer [qrfac qr qr-free])
+  (import linalg/solve :refer [qr-solve])
+  ;;; MvOlsResult -- a fitted multivariate OLS (owns its matrices).
+  ;;;   coef      -- p x q coefficients, column j for response j
+  ;;;   fitted    -- m x q fitted values X B
+  ;;;   residuals -- m x q, Y - X B
+  ;;;   rss-mat   -- q x q residual sums of squares and cross-products E'E
+  ;;;   df-resid  -- residual degrees of freedom m - p
+  (defstruct MvOlsResult
+    [coef : mat
+     fitted : mat
+     residuals : mat
+     rss-mat : mat
+     df-resid : int])
+  ;;; mv-ols -- fit Y = X B + E by least squares.
+  ;;;
+  ;;; Parameters:
+  ;;;   x -- m x p design matrix, m >= p, full column rank (borrowed)
+  ;;;   y -- m x q responses (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   An MvOlsResult; free it with `mv-ols-free`. Panics when the row counts
+  ;;;   differ or m < p.
+  ;;;
+  ;;; Example:
+  ;;;   (let [r (mv-ols x y)]
+  ;;;     (mat-get (.coef r) 1 0))  ; slope of response 0 on predictor 1
+  ;;;
+  ;;; Since: 0.1.0
+  (defn mv-ols [^borrow x : mat ^borrow y : mat] : MvOlsResult
+    (when (not= (mat-rows x) (mat-rows y)) (panic "mv-ols: X and Y need the same number of rows"))
+    (when (< (mat-rows x) (mat-cols x)) (panic "mv-ols: need at least as many rows as predictors"))
+    (let [p      (mat-cols x)
+          q      (mat-cols y)
+          f      (qr x)
+          b      (mat-new p q)
+          ^mut j 0]
+      (letrec [goj
+               (fn [] : int
+                 (if (>= j q)
+                   0
+                   (let [yj (mat-col y j)
+                         bj (qr-solve f yj)]
+                     (letrec [goi
+                              (fn [i : int] : int
+                                (if (>= i p) 0 (do (mat-set! b i j (la-vec-get bj i)) (goi (+ i 1)))))]
+                       (goi 0))
+                     (la-vec-free bj)
+                     (la-vec-free yj)
+                     (set! j (+ j 1))
+                     (goj))))]
+        (goj))
+      (qr-free f)
+      (let [fit (mat-mul x b)
+            res (mat-sub y fit)
+            rt  (mat-transpose res)
+            rss (mat-mul rt res)]
+        (mat-free rt)
+        (make-struct MvOlsResult b fit res rss (- (mat-rows x) p)))))
+  ;;; mv-ols-free -- free an MvOlsResult.
+  (defn mv-ols-free [r : MvOlsResult] : void
+    (mat-free (.coef r))
+    (mat-free (.fitted r))
+    (mat-free (.residuals r))
+    (mat-free (.rss-mat r)))
+  ;;; mv-predict -- responses for new observations, X-new B.
+  ;;;
+  ;;; Parameters:
+  ;;;   r     -- a fitted model (borrowed)
+  ;;;   x-new -- m' x p design matrix laid out like the fit's X (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The m' x q predictions.
+  ;;;
+  ;;; Example:
+  ;;;   (mv-predict r (mat-of 1 2 1.0 10.0))  ; responses at x = 10
+  ;;;
+  ;;; Since: 0.1.0
+  (defn mv-predict [^borrow r : MvOlsResult ^borrow x-new : mat] : mat
+    (when (not= (mat-cols x-new) (mat-rows (.coef r)))
+      (panic "mv-predict: predictor count mismatch"))
+    (mat-mul x-new (.coef r)))
+  ;;; __r2-kernel -- R^2_j = 1 - RSS_j / TSS_j with Y = fitted + residuals and
+  ;;; TSS about the column mean.
+  (defn __r2-kernel [od : (Vec float) Fd : (Vec float) Ed : (Vec float) m : int q : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *o = (double*)(void*)((struct __V*)(intptr_t)od)->data;
+  const double *F = (const double*)(void*)((struct __V*)(intptr_t)Fd)->data;
+  const double *E = (const double*)(void*)((struct __V*)(intptr_t)Ed)->data;
+  for (int64_t j = 0; j < q; j++) {
+    double mu = 0.0;
+    for (int64_t i = 0; i < m; i++) mu += F[i*q + j] + E[i*q + j];
+    mu /= (double)m;
+    double tss = 0.0, rss = 0.0;
+    for (int64_t i = 0; i < m; i++) {
+      double y = F[i*q + j] + E[i*q + j];
+      tss += (y - mu) * (y - mu);
+      rss += E[i*q + j] * E[i*q + j];
+    }
+    o[j] = tss > 0.0 ? 1.0 - rss / tss : 0.0;
+  }
+  return 0;
+  ```)
+  ;;; mv-r-squared -- coefficient of determination of each response.
+  ;;;
+  ;;; TSS is taken about each response's mean, which is the usual R^2 for a
+  ;;; model with an intercept column.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- a fitted model (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A length-q lavec.
+  ;;;
+  ;;; Example:
+  ;;;   (la-vec-get (mv-r-squared r) 0)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn mv-r-squared [^borrow r : MvOlsResult] : lavec
+    (let [q (mat-cols (.fitted r))
+          o (la-vec-new q)]
+      (__r2-kernel (.data o) (.data (.fitted r)) (.data (.residuals r)) (mat-rows (.fitted r)) q)
+      o))) ;; end defmodule multivariate/regress

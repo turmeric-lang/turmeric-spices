@@ -1,0 +1,475 @@
+;;; multivariate/lda -- linear discriminant analysis.
+;;;
+;;; Fits Fisher's LDA from a data matrix X (m x p) and a class label per row
+;;; (0 .. k-1). The pooled within-class covariance S_w gives both the
+;;; Gaussian classifier (shared covariance, class priors) and the
+;;; discriminant axes: with S_w = Q D Q' and W = Q D^-1/2 Q', the axes are
+;;; W v for the leading eigenvectors v of W S_b W, S_b being the
+;;; prior-weighted between-class scatter. That solves the generalized problem
+;;; S_w^-1 S_b a = lambda a through `eigen-sym` alone, and leaves the axes
+;;; S_w-orthonormal (a_i' S_w a_j = delta_ij), as R's MASS::lda scales them.
+;;;
+;;; When S_w is near-singular (smallest eigenvalue below tol times the
+;;; largest), a ridge of tol * trace(S_w) / p is added to its diagonal before
+;;; anything is inverted, and `regularized` reads true.
+(defmodule multivariate/lda
+  (export LDAOpts
+    LdaResult
+    lda-opts
+    lda-opts-default
+    lda-opts-free
+    lda-fit
+    lda-free
+    lda-predict
+    lda-posterior
+    lda-transform)
+  (import linalg/vec :refer [lavec la-vec-new la-vec-len la-vec-free])
+  (import linalg/mat :refer [mat mat-new mat-rows mat-cols mat-free])
+  (import linalg/decomp :refer [eigenfac eigen-sym eigen-free])
+  ;;; LDAOpts -- fit options (owns `prior`).
+  ;;;   prior -- class prior probabilities, length k; empty = class frequencies
+  ;;;   tol   -- near-singularity threshold that triggers the ridge
+  (defstruct LDAOpts [prior : lavec tol : float])
+  ;;; LdaResult -- a fitted LDA (owns its buffers).
+  ;;;   means       -- k x p class means
+  ;;;   pooled-cov  -- p x p pooled within-class covariance (after any ridge)
+  ;;;   pooled-inv  -- its inverse
+  ;;;   scalings    -- p x d discriminant axes, d = min(k - 1, p)
+  ;;;   prior       -- length k class priors
+  ;;;   center      -- length p prior-weighted mean of the class means
+  ;;;   regularized -- whether the ridge was applied
+  (defstruct LdaResult
+    [means : mat
+     pooled-cov : mat
+     pooled-inv : mat
+     scalings : mat
+     prior : lavec
+     center : lavec
+     regularized : bool])
+  ;;; lda-opts -- options with explicit priors.
+  ;;;
+  ;;; Parameters:
+  ;;;   prior -- length-k priors summing to 1 (ownership moves in)
+  ;;;   tol   -- ridge threshold, e.g. 1e-8
+  ;;;
+  ;;; Returns:
+  ;;;   An LDAOpts; free it with `lda-opts-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (lda-opts (la-vec-of 0.5 0.5) 1e-08)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn lda-opts [prior : lavec tol : float] : LDAOpts (make-struct LDAOpts prior tol))
+  ;;; lda-opts-default -- class-frequency priors, tol 1e-8.
+  ;;;
+  ;;; Returns:
+  ;;;   An LDAOpts; free it with `lda-opts-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (let [o (lda-opts-default)] (lda-fit x y o))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn lda-opts-default [] : LDAOpts (make-struct LDAOpts (la-vec-new 0) 1e-08))
+  ;;; lda-opts-free -- free an LDAOpts.
+  (defn lda-opts-free [o : LDAOpts] : void (la-vec-free (.prior o)))
+  ;;; __classes-kernel -- k from labels 0 .. k-1 (each used, k >= 2), or -1.
+  (defn __classes-kernel [gd : (Vec int) m : int] : int
+    ```c
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  const int64_t *g = ((struct __V*)(intptr_t)gd)->data;
+  int64_t k = 0;
+  for (int64_t i = 0; i < m; i++) { if (g[i] < 0) return -1; if (g[i] + 1 > k) k = g[i] + 1; }
+  if (k < 2) return -1;
+  int64_t *cnt = (int64_t*)calloc((size_t)k, sizeof(int64_t));
+  for (int64_t i = 0; i < m; i++) cnt[g[i]]++;
+  int ok = 1;
+  for (int64_t c = 0; c < k; c++) if (cnt[c] == 0) ok = 0;
+  free(cnt);
+  return ok ? k : -1;
+  ```)
+  ;;; __lda-stats-kernel -- class means (k x p), pooled S_w (p x p), priors
+  ;;; (given when np == k, else class frequencies).
+  (defn __lda-stats-kernel [Md : (Vec float)
+                            Sd : (Vec float)
+                            Pd : (Vec float)
+                            Xd : (Vec float)
+                            gd : (Vec int)
+                            pind : (Vec float)
+                            np : int
+                            m : int
+                            p : int
+                            k : int] : int
+    ```c
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *M = (double*)(void*)((struct __V*)(intptr_t)Md)->data;
+  double *S = (double*)(void*)((struct __V*)(intptr_t)Sd)->data;
+  double *P = (double*)(void*)((struct __V*)(intptr_t)Pd)->data;
+  const double *X = (const double*)(void*)((struct __V*)(intptr_t)Xd)->data;
+  const int64_t *g = ((struct __V*)(intptr_t)gd)->data;
+  const double *pin = (const double*)(void*)((struct __V*)(intptr_t)pind)->data;
+  int64_t *cnt = (int64_t*)calloc((size_t)k, sizeof(int64_t));
+  for (int64_t a = 0; a < k * p; a++) M[a] = 0.0;
+  for (int64_t i = 0; i < m; i++) {
+    cnt[g[i]]++;
+    for (int64_t j = 0; j < p; j++) M[g[i]*p + j] += X[i*p + j];
+  }
+  for (int64_t c = 0; c < k; c++) for (int64_t j = 0; j < p; j++) M[c*p + j] /= (double)cnt[c];
+  for (int64_t a = 0; a < p * p; a++) S[a] = 0.0;
+  for (int64_t i = 0; i < m; i++)
+    for (int64_t a = 0; a < p; a++)
+      for (int64_t b = 0; b < p; b++)
+        S[a*p + b] += (X[i*p + a] - M[g[i]*p + a]) * (X[i*p + b] - M[g[i]*p + b]);
+  for (int64_t a = 0; a < p * p; a++) S[a] /= (double)(m - k);
+  for (int64_t c = 0; c < k; c++) P[c] = (np == k) ? pin[c] : (double)cnt[c] / (double)m;
+  free(cnt);
+  return 0;
+  ```)
+  ;;; __ridge-kernel -- add tol * trace / p to S's diagonal when the smallest
+  ;;; eigenvalue (vals ascending) is below tol times the largest. 1 if added.
+  (defn __ridge-kernel [Sd : (Vec float) vd : (Vec float) p : int tol : float] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *S = (double*)(void*)((struct __V*)(intptr_t)Sd)->data;
+  const double *v = (const double*)(void*)((struct __V*)(intptr_t)vd)->data;
+  if (v[0] >= tol * (v[p - 1] > 0.0 ? v[p - 1] : 1.0) && v[0] > 0.0) return 0;
+  double tr = 0.0;
+  for (int64_t i = 0; i < p; i++) tr += S[i*p + i];
+  double r = tol * (tr > 0.0 ? tr / (double)p : 1.0);
+  for (int64_t i = 0; i < p; i++) S[i*p + i] += r;
+  return 1;
+  ```)
+  ;;; __lda-prep-kernel -- from S_w = Q D Q': Sinv, W = Q D^-1/2 Q', the
+  ;;; prior-weighted centre, and Mb = W S_b W (symmetrized).
+  (defn __lda-prep-kernel [Sid : (Vec float)
+                           Wd : (Vec float)
+                           cd : (Vec float)
+                           Mbd : (Vec float)
+                           Qd : (Vec float)
+                           dd : (Vec float)
+                           Md : (Vec float)
+                           Pd : (Vec float)
+                           p : int
+                           k : int] : int
+    ```c
+    #include <math.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *Si = (double*)(void*)((struct __V*)(intptr_t)Sid)->data;
+  double *W = (double*)(void*)((struct __V*)(intptr_t)Wd)->data;
+  double *cen = (double*)(void*)((struct __V*)(intptr_t)cd)->data;
+  double *Mb = (double*)(void*)((struct __V*)(intptr_t)Mbd)->data;
+  const double *Q = (const double*)(void*)((struct __V*)(intptr_t)Qd)->data;
+  const double *d = (const double*)(void*)((struct __V*)(intptr_t)dd)->data;
+  const double *M = (const double*)(void*)((struct __V*)(intptr_t)Md)->data;
+  const double *P = (const double*)(void*)((struct __V*)(intptr_t)Pd)->data;
+  for (int64_t a = 0; a < p; a++)
+    for (int64_t b = 0; b < p; b++) {
+      double si = 0.0, w = 0.0;
+      for (int64_t t = 0; t < p; t++) {
+        si += Q[a*p + t] * Q[b*p + t] / d[t];
+        w += Q[a*p + t] * Q[b*p + t] / sqrt(d[t]);
+      }
+      Si[a*p + b] = si; W[a*p + b] = w;
+    }
+  for (int64_t j = 0; j < p; j++) {
+    double s = 0.0;
+    for (int64_t c = 0; c < k; c++) s += P[c] * M[c*p + j];
+    cen[j] = s;
+  }
+  double *Sb = (double*)calloc((size_t)(p * p), sizeof(double));
+  double *T = (double*)malloc(sizeof(double) * (size_t)(p * p));
+  for (int64_t c = 0; c < k; c++)
+    for (int64_t a = 0; a < p; a++)
+      for (int64_t b = 0; b < p; b++)
+        Sb[a*p + b] += P[c] * (M[c*p + a] - cen[a]) * (M[c*p + b] - cen[b]);
+  for (int64_t a = 0; a < p; a++)
+    for (int64_t b = 0; b < p; b++) {
+      double s = 0.0;
+      for (int64_t t = 0; t < p; t++) s += Sb[a*p + t] * W[t*p + b];
+      T[a*p + b] = s;
+    }
+  for (int64_t a = 0; a < p; a++)
+    for (int64_t b = 0; b < p; b++) {
+      double s = 0.0;
+      for (int64_t t = 0; t < p; t++) s += W[a*p + t] * T[t*p + b];
+      Mb[a*p + b] = s;
+    }
+  for (int64_t a = 0; a < p; a++)
+    for (int64_t b = a + 1; b < p; b++) { double v = 0.5 * (Mb[a*p + b] + Mb[b*p + a]); Mb[a*p + b] = Mb[b*p + a] = v; }
+  free(Sb); free(T);
+  return 0;
+  ```)
+  ;;; __lda-axes-kernel -- scalings (p x dd) = W V for the dd leading
+  ;;; eigenvectors (V's eigenvalues ascending), each signed so its
+  ;;; largest-magnitude entry is positive.
+  (defn __lda-axes-kernel [Ad : (Vec float) Wd : (Vec float) Vd : (Vec float) p : int dd : int] : int
+    ```c
+    #include <math.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  const double *W = (const double*)(void*)((struct __V*)(intptr_t)Wd)->data;
+  const double *V = (const double*)(void*)((struct __V*)(intptr_t)Vd)->data;
+  for (int64_t t = 0; t < dd; t++) {
+    int64_t src = p - 1 - t;
+    for (int64_t a = 0; a < p; a++) {
+      double s = 0.0;
+      for (int64_t b = 0; b < p; b++) s += W[a*p + b] * V[b*p + src];
+      A[a*dd + t] = s;
+    }
+    int64_t big = 0;
+    for (int64_t a = 1; a < p; a++) if (fabs(A[a*dd + t]) > fabs(A[big*dd + t])) big = a;
+    if (A[big*dd + t] < 0.0) for (int64_t a = 0; a < p; a++) A[a*dd + t] = -A[a*dd + t];
+  }
+  return 0;
+  ```)
+  ;;; __prior-ok-kernel -- 1 when every prior is >= 0 and they sum to 1.
+  (defn __prior-ok-kernel [pd : (Vec float) k : int] : int
+    ```c
+    #include <math.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  const double *P = (const double*)(void*)((struct __V*)(intptr_t)pd)->data;
+  double s = 0.0;
+  for (int64_t c = 0; c < k; c++) { if (P[c] < 0.0) return 0; s += P[c]; }
+  return fabs(s - 1.0) < 1e-9;
+  ```)
+  ;;; __fit -- the fit on validated input.
+  (defn __fit [^borrow x : mat ^borrow y : (Vec int) ^borrow opts : LDAOpts k : int] : LdaResult
+    (let [m      (mat-rows x)
+          p      (mat-cols x)
+          dd     (if (< (- k 1) p) (- k 1) p)
+          means  (mat-new k p)
+          sw     (mat-new p p)
+          prior  (la-vec-new k)]
+      (__lda-stats-kernel (.data means)
+        (.data sw)
+        (.data prior)
+        (.data x)
+        y
+        (.data (.prior opts))
+        (la-vec-len (.prior opts))
+        m
+        p
+        k)
+      (let [reg (match (eigen-sym sw)
+                  (Ok f) (let [r (__ridge-kernel (.data sw) (.data (.vals f)) p (.tol opts))]
+                           (eigen-free f)
+                           r)
+                  (Err e) (panic e))
+            si  (mat-new p p)
+            w   (mat-new p p)
+            cen (la-vec-new p)
+            mb  (mat-new p p)]
+        (match (eigen-sym sw)
+          (Ok f) (do
+                   (__lda-prep-kernel (.data si)
+                     (.data w)
+                     (.data cen)
+                     (.data mb)
+                     (.data (.vecs f))
+                     (.data (.vals f))
+                     (.data means)
+                     (.data prior)
+                     p
+                     k)
+                   (eigen-free f))
+          (Err e) (panic e))
+        (let [ax (mat-new p dd)]
+          (match (eigen-sym mb)
+            (Ok f) (do (__lda-axes-kernel (.data ax) (.data w) (.data (.vecs f)) p dd) (eigen-free f))
+            (Err e) (panic e))
+          (mat-free mb)
+          (mat-free w)
+          (make-struct LdaResult means sw si ax prior cen (= reg 1))))))
+  ;;; lda-fit -- fit a linear discriminant analysis.
+  ;;;
+  ;;; Parameters:
+  ;;;   x    -- m x p training data (borrowed)
+  ;;;   y    -- length-m class labels 0 .. k-1, every class present (borrowed)
+  ;;;   opts -- priors and ridge tolerance (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   (Result LdaResult cstr) -- Err when the labels are malformed, there are
+  ;;;   no more observations than classes, or the given priors are not k
+  ;;;   non-negative numbers summing to 1.
+  ;;;
+  ;;; Example:
+  ;;;   (let [o (lda-opts-default)]
+  ;;;     (match (lda-fit x y o)
+  ;;;       (Ok r)  (lda-predict r x-new)
+  ;;;       (Err e) (panic e)))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn lda-fit [^borrow x : mat ^borrow y : (Vec int) ^borrow opts : LDAOpts] : (Result LdaResult cstr)
+    (let [m  (mat-rows x)
+          k  (if (= (vec-len y) m) (__classes-kernel y m) -1)
+          np (la-vec-len (.prior opts))]
+      (cond (< k 0)                                                (Err "lda-fit: need one label 0..k-1 per row, k >= 2, every class present")
+            (<= m k)                                               (Err "lda-fit: need more observations than classes")
+            (and (> np 0) (not= np k))                             (Err "lda-fit: prior length must equal the number of classes")
+            (and (> np 0) (= (__prior-ok-kernel (.data (.prior opts)) k) 0)) (Err "lda-fit: priors must be non-negative and sum to 1")
+            :else                                                  (Ok (__fit x y opts k)))))
+  ;;; lda-free -- free an LdaResult.
+  (defn lda-free [r : LdaResult] : void
+    (mat-free (.means r))
+    (mat-free (.pooled-cov r))
+    (mat-free (.pooled-inv r))
+    (mat-free (.scalings r))
+    (la-vec-free (.prior r))
+    (la-vec-free (.center r)))
+  ;;; __posterior-kernel -- Post (m x k) by softmax of
+  ;;; delta_c(x) = x' Si mu_c - mu_c' Si mu_c / 2 + log prior_c; when lab is
+  ;;; non-null also the argmax class per row.
+  (defn __posterior-kernel [Pod : (Vec float)
+                            labd : (Vec int)
+                            Xd : (Vec float)
+                            Md : (Vec float)
+                            Sid : (Vec float)
+                            prd : (Vec float)
+                            m : int
+                            p : int
+                            k : int] : int
+    ```c
+    #include <math.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *Po = (double*)(void*)((struct __V*)(intptr_t)Pod)->data;
+  int64_t *lab = ((struct __V*)(intptr_t)labd)->data;
+  const double *X = (const double*)(void*)((struct __V*)(intptr_t)Xd)->data;
+  const double *M = (const double*)(void*)((struct __V*)(intptr_t)Md)->data;
+  const double *Si = (const double*)(void*)((struct __V*)(intptr_t)Sid)->data;
+  const double *pr = (const double*)(void*)((struct __V*)(intptr_t)prd)->data;
+  double *SM = (double*)malloc(sizeof(double) * (size_t)(k * p));   /* Si mu_c */
+  double *cst = (double*)malloc(sizeof(double) * (size_t)k);
+  for (int64_t c = 0; c < k; c++) {
+    double q = 0.0;
+    for (int64_t a = 0; a < p; a++) {
+      double s = 0.0;
+      for (int64_t b = 0; b < p; b++) s += Si[a*p + b] * M[c*p + b];
+      SM[c*p + a] = s;
+      q += M[c*p + a] * s;
+    }
+    cst[c] = -0.5 * q + (pr[c] > 0.0 ? log(pr[c]) : -INFINITY);
+  }
+  for (int64_t i = 0; i < m; i++) {
+    double best = -INFINITY; int64_t arg = 0;
+    for (int64_t c = 0; c < k; c++) {
+      double s = cst[c];
+      for (int64_t a = 0; a < p; a++) s += X[i*p + a] * SM[c*p + a];
+      Po[i*k + c] = s;
+      if (s > best) { best = s; arg = c; }
+    }
+    double z = 0.0;
+    for (int64_t c = 0; c < k; c++) { Po[i*k + c] = exp(Po[i*k + c] - best); z += Po[i*k + c]; }
+    for (int64_t c = 0; c < k; c++) Po[i*k + c] /= z;
+    lab[i] = arg;
+  }
+  free(SM); free(cst);
+  return 0;
+  ```)
+  (defn __izeros [n : int] : (Vec int)
+    (let [d      (:: (vec-new) (Vec int))
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n) 0 (do (vec-push! d 0) (set! i (+ i 1)) (go))))]
+        (go))
+      d))
+  (defn __check-cols [^borrow r : LdaResult ^borrow x : mat who : cstr] : void
+    (when (not= (mat-cols x) (mat-cols (.means r))) (panic who)))
+  ;;; lda-posterior -- class posterior probabilities.
+  ;;;
+  ;;; Parameters:
+  ;;;   r     -- a fitted LDA (borrowed)
+  ;;;   x-new -- m' x p observations (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The m' x k matrix of posteriors; each row sums to 1.
+  ;;;
+  ;;; Example:
+  ;;;   (mat-get (lda-posterior r x) 0 1)  ; P(class 1 | row 0)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn lda-posterior [^borrow r : LdaResult ^borrow x-new : mat] : mat
+    (__check-cols r x-new "lda-posterior: column count mismatch")
+    (let [m   (mat-rows x-new)
+          k   (mat-rows (.means r))
+          po  (mat-new m k)
+          lab (__izeros m)]
+      (__posterior-kernel (.data po)
+        lab
+        (.data x-new)
+        (.data (.means r))
+        (.data (.pooled-inv r))
+        (.data (.prior r))
+        m
+        (mat-cols x-new)
+        k)
+      (vec-free lab)
+      po))
+  ;;; lda-predict -- the most probable class of each observation.
+  ;;;
+  ;;; Parameters:
+  ;;;   r     -- a fitted LDA (borrowed)
+  ;;;   x-new -- m' x p observations (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A length-m' (Vec int) of class labels; free it with `vec-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (vec-get (lda-predict r x) 0)  ; => predicted class of row 0
+  ;;;
+  ;;; Since: 0.1.0
+  (defn lda-predict [^borrow r : LdaResult ^borrow x-new : mat] : (Vec int)
+    (__check-cols r x-new "lda-predict: column count mismatch")
+    (let [m   (mat-rows x-new)
+          k   (mat-rows (.means r))
+          po  (mat-new m k)
+          lab (__izeros m)]
+      (__posterior-kernel (.data po)
+        lab
+        (.data x-new)
+        (.data (.means r))
+        (.data (.pooled-inv r))
+        (.data (.prior r))
+        m
+        (mat-cols x-new)
+        k)
+      (mat-free po)
+      lab))
+  ;;; __transform-kernel -- T (m x d) = (X - center) A.
+  (defn __transform-kernel [Td : (Vec float) Xd : (Vec float) cd : (Vec float) Ad : (Vec float) m : int p : int d : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *T = (double*)(void*)((struct __V*)(intptr_t)Td)->data;
+  const double *X = (const double*)(void*)((struct __V*)(intptr_t)Xd)->data;
+  const double *c = (const double*)(void*)((struct __V*)(intptr_t)cd)->data;
+  const double *A = (const double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  for (int64_t i = 0; i < m; i++)
+    for (int64_t t = 0; t < d; t++) {
+      double s = 0.0;
+      for (int64_t a = 0; a < p; a++) s += (X[i*p + a] - c[a]) * A[a*d + t];
+      T[i*d + t] = s;
+    }
+  return 0;
+  ```)
+  ;;; lda-transform -- project observations onto the discriminant axes.
+  ;;;
+  ;;; Parameters:
+  ;;;   r -- a fitted LDA (borrowed)
+  ;;;   x -- m' x p observations (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The m' x d scores (X - center) scalings.
+  ;;;
+  ;;; Example:
+  ;;;   (lda-transform r x)  ; the coordinates an LDA biplot draws
+  ;;;
+  ;;; Since: 0.1.0
+  (defn lda-transform [^borrow r : LdaResult ^borrow x : mat] : mat
+    (__check-cols r x "lda-transform: column count mismatch")
+    (let [d (mat-cols (.scalings r))
+          t (mat-new (mat-rows x) d)]
+      (__transform-kernel (.data t) (.data x) (.data (.center r)) (.data (.scalings r)) (mat-rows x) (mat-cols x) d)
+      t))) ;; end defmodule multivariate/lda

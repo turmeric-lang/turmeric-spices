@@ -1,0 +1,315 @@
+;;; multivariate/test -- Hotelling's T^2 and one-way MANOVA.
+;;;
+;;; Both compare mean vectors. The F and p-values come from `stats/dist`'s F
+;;; CDF (`pf-dist`); covariance inverses use the SVD pseudo-inverse, so a
+;;; singular covariance degrades to a test in the directions that remain
+;;; rather than a crash.
+;;;
+;;; One-way MANOVA takes the data as one matrix plus a group label per row
+;;; (0 .. k-1), the layout R's `manova(Y ~ g)` reads, and reports Wilks'
+;;; lambda (with Rao's F approximation) and Pillai's trace.
+;;;
+;;; Both result types are plain `^copy` values that own nothing, so unlike the
+;;; other modules there is no -free to call.
+(defmodule multivariate/test
+  (export HotellingResult
+    ManovaResult
+    hotelling-1samp
+    hotelling-2samp
+    manova-1way)
+  (import linalg/vec :refer [lavec la-vec-new la-vec-len la-vec-sub la-vec-dot la-vec-free])
+  (import linalg/mat :refer [mat mat-new mat-rows mat-cols mat-mul-vec mat-free])
+  (import linalg/decomp :refer [eigenfac eigen-sym eigen-free])
+  (import stats/dist :refer [pf-dist])
+  (import multivariate/cov :refer [cov-mat col-means mv-pinv])
+  ;;; HotellingResult -- outcome of a Hotelling T^2 test.
+  ;;;   t2      -- the T^2 statistic
+  ;;;   f-stat  -- its exact F transform
+  ;;;   df1     -- numerator degrees of freedom (p)
+  ;;;   df2     -- denominator degrees of freedom
+  ;;;   p-value -- upper-tail probability of f-stat under F(df1, df2)
+  (defstruct ^copy HotellingResult
+    [t2 : float
+     f-stat : float
+     df1 : int
+     df2 : int
+     p-value : float])
+  ;;; ManovaResult -- outcome of a one-way MANOVA.
+  ;;;   wilks    -- Wilks' lambda, det(E) / det(E + H)
+  ;;;   pillai   -- Pillai's trace, tr(H (H + E)^-1)
+  ;;;   f-approx -- Rao's F approximation for Wilks' lambda
+  ;;;   df1, df2 -- its degrees of freedom (df2 need not be an integer)
+  ;;;   p-value  -- upper-tail probability of f-approx
+  (defstruct ^copy ManovaResult
+    [wilks : float
+     pillai : float
+     f-approx : float
+     df1 : float
+     df2 : float
+     p-value : float])
+  ;;; __quad -- d' A d.
+  (defn __quad [^borrow a : mat ^borrow d : lavec] : float
+    (let [ad (mat-mul-vec a d)
+          q  (la-vec-dot d ad)]
+      (la-vec-free ad)
+      q))
+  ;;; __upper -- 1 - F CDF, clamped into [0, 1].
+  (defn __upper [f : float df1 : float df2 : float] : float
+    (let [p (- 1.0 (pf-dist f df1 df2))] (if (< p 0.0) 0.0 (if (> p 1.0) 1.0 p))))
+  ;;; hotelling-1samp -- one-sample T^2: does the mean of X equal mu0?
+  ;;;
+  ;;; T^2 = m (xbar - mu0)' S^-1 (xbar - mu0), F = (m - p) / (p (m - 1)) T^2
+  ;;; on (p, m - p) degrees of freedom.
+  ;;;
+  ;;; Parameters:
+  ;;;   x   -- m x p data matrix (borrowed); m > p
+  ;;;   mu0 -- hypothesised mean, length p (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A HotellingResult.
+  ;;;
+  ;;; Example:
+  ;;;   (.p-value (hotelling-1samp x (la-vec-of 0.0 0.0)))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn hotelling-1samp [^borrow x : mat ^borrow mu0 : lavec] : HotellingResult
+    (let [m (mat-rows x)
+          p (mat-cols x)]
+      (when (not= (la-vec-len mu0) p) (panic "hotelling-1samp: mu0 length mismatch"))
+      (when (<= m p) (panic "hotelling-1samp: need more observations than variables"))
+      (let [s    (cov-mat x)
+            si   (mv-pinv s)
+            xbar (col-means x)
+            d    (la-vec-sub xbar mu0)
+            t2   (* (as float m) (__quad si d))
+            df1  p
+            df2  (- m p)
+            f    (* (/ (as float df2) (* (as float p) (as float (- m 1)))) t2)]
+        (la-vec-free d)
+        (la-vec-free xbar)
+        (mat-free si)
+        (mat-free s)
+        (make-struct HotellingResult t2 f df1 df2 (__upper f (as float df1) (as float df2))))))
+  ;;; __pool-kernel -- Sp = ((n1 - 1) S1 + (n2 - 1) S2) / (n1 + n2 - 2).
+  (defn __pool-kernel [Pd : (Vec float) Ad : (Vec float) Bd : (Vec float) n1 : int n2 : int len : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *P = (double*)(void*)((struct __V*)(intptr_t)Pd)->data;
+  const double *A = (const double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  const double *B = (const double*)(void*)((struct __V*)(intptr_t)Bd)->data;
+  double den = (double)(n1 + n2 - 2);
+  for (int64_t i = 0; i < len; i++) P[i] = ((double)(n1 - 1) * A[i] + (double)(n2 - 1) * B[i]) / den;
+  return 0;
+  ```)
+  ;;; hotelling-2samp -- two-sample T^2: are the means of X1 and X2 equal?
+  ;;;
+  ;;; Uses the pooled covariance; T^2 = n1 n2 / (n1 + n2) d' Sp^-1 d and
+  ;;; F = (n1 + n2 - p - 1) / (p (n1 + n2 - 2)) T^2 on (p, n1 + n2 - p - 1)
+  ;;; degrees of freedom.
+  ;;;
+  ;;; Parameters:
+  ;;;   x1 -- n1 x p sample (borrowed)
+  ;;;   x2 -- n2 x p sample with the same columns (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A HotellingResult.
+  ;;;
+  ;;; Example:
+  ;;;   (< (.p-value (hotelling-2samp a b)) 0.05)  ; means differ at 5%
+  ;;;
+  ;;; Since: 0.1.0
+  (defn hotelling-2samp [^borrow x1 : mat ^borrow x2 : mat] : HotellingResult
+    (let [n1 (mat-rows x1)
+          n2 (mat-rows x2)
+          p  (mat-cols x1)]
+      (when (not= (mat-cols x2) p) (panic "hotelling-2samp: column count mismatch"))
+      (when (or (< n1 2) (or (< n2 2) (<= (+ n1 n2) (+ p 1))))
+        (panic "hotelling-2samp: too few observations"))
+      (let [s1 (cov-mat x1)
+            s2 (cov-mat x2)
+            sp (mat-new p p)]
+        (__pool-kernel (.data sp) (.data s1) (.data s2) n1 n2 (* p p))
+        (let [si  (mv-pinv sp)
+              m1  (col-means x1)
+              m2  (col-means x2)
+              d   (la-vec-sub m1 m2)
+              t2  (* (/ (as float (* n1 n2)) (as float (+ n1 n2))) (__quad si d))
+              df2 (- (+ n1 n2) (+ p 1))
+              f   (* (/ (as float df2) (* (as float p) (as float (- (+ n1 n2) 2)))) t2)]
+          (la-vec-free d)
+          (la-vec-free m2)
+          (la-vec-free m1)
+          (mat-free si)
+          (mat-free sp)
+          (mat-free s2)
+          (mat-free s1)
+          (make-struct HotellingResult t2 f p df2 (__upper f (as float p) (as float df2)))))))
+  ;;; __groups-kernel -- validate labels (0 .. k-1, each used at least twice
+  ;;; overall, k >= 2) and return k, or -1.
+  (defn __groups-kernel [gd : (Vec int) m : int] : int
+    ```c
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  const int64_t *g = ((struct __V*)(intptr_t)gd)->data;
+  int64_t k = 0;
+  for (int64_t i = 0; i < m; i++) { if (g[i] < 0) return -1; if (g[i] + 1 > k) k = g[i] + 1; }
+  if (k < 2) return -1;
+  int64_t *cnt = (int64_t*)calloc((size_t)k, sizeof(int64_t));
+  for (int64_t i = 0; i < m; i++) cnt[g[i]]++;
+  int ok = 1;
+  for (int64_t c = 0; c < k; c++) if (cnt[c] == 0) ok = 0;
+  free(cnt);
+  return ok ? k : -1;
+  ```)
+  ;;; __sscp-kernel -- within-groups E and between-groups H (p x p) SSCP.
+  (defn __sscp-kernel [Ed : (Vec float)
+                       Hd : (Vec float)
+                       Xd : (Vec float)
+                       gd : (Vec int)
+                       m : int
+                       p : int
+                       k : int] : int
+    ```c
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *E = (double*)(void*)((struct __V*)(intptr_t)Ed)->data;
+  double *H = (double*)(void*)((struct __V*)(intptr_t)Hd)->data;
+  const double *X = (const double*)(void*)((struct __V*)(intptr_t)Xd)->data;
+  const int64_t *g = ((struct __V*)(intptr_t)gd)->data;
+  double *mu = (double*)calloc((size_t)(k * p), sizeof(double));
+  double *gm = (double*)calloc((size_t)p, sizeof(double));
+  int64_t *cnt = (int64_t*)calloc((size_t)k, sizeof(int64_t));
+  for (int64_t i = 0; i < m; i++) {
+    cnt[g[i]]++;
+    for (int64_t j = 0; j < p; j++) { mu[g[i]*p + j] += X[i*p + j]; gm[j] += X[i*p + j]; }
+  }
+  for (int64_t c = 0; c < k; c++) for (int64_t j = 0; j < p; j++) mu[c*p + j] /= (double)cnt[c];
+  for (int64_t j = 0; j < p; j++) gm[j] /= (double)m;
+  for (int64_t a = 0; a < p * p; a++) { E[a] = 0.0; H[a] = 0.0; }
+  for (int64_t i = 0; i < m; i++)
+    for (int64_t a = 0; a < p; a++)
+      for (int64_t b = 0; b < p; b++)
+        E[a*p + b] += (X[i*p + a] - mu[g[i]*p + a]) * (X[i*p + b] - mu[g[i]*p + b]);
+  for (int64_t c = 0; c < k; c++)
+    for (int64_t a = 0; a < p; a++)
+      for (int64_t b = 0; b < p; b++)
+        H[a*p + b] += (double)cnt[c] * (mu[c*p + a] - gm[a]) * (mu[c*p + b] - gm[b]);
+  free(mu); free(gm); free(cnt);
+  return 0;
+  ```)
+  ;;; __whiten-kernel -- M = W H W with W = Q diag(d^-1/2) Q' from E = Q D Q'.
+  ;;; Returns -1 when E is numerically singular.
+  (defn __whiten-kernel [Md : (Vec float) Qd : (Vec float) dd : (Vec float) Hd : (Vec float) p : int] : int
+    ```c
+    #include <math.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *M = (double*)(void*)((struct __V*)(intptr_t)Md)->data;
+  const double *Q = (const double*)(void*)((struct __V*)(intptr_t)Qd)->data;
+  const double *d = (const double*)(void*)((struct __V*)(intptr_t)dd)->data;
+  const double *H = (const double*)(void*)((struct __V*)(intptr_t)Hd)->data;
+  if (!(d[0] > 1e-12 * (d[p - 1] > 0.0 ? d[p - 1] : 1.0))) return -1;
+  double *W = (double*)malloc(sizeof(double) * (size_t)(p * p));
+  double *T = (double*)malloc(sizeof(double) * (size_t)(p * p));
+  for (int64_t a = 0; a < p; a++)
+    for (int64_t b = 0; b < p; b++) {
+      double s = 0.0;
+      for (int64_t t = 0; t < p; t++) s += Q[a*p + t] * Q[b*p + t] / sqrt(d[t]);
+      W[a*p + b] = s;
+    }
+  for (int64_t a = 0; a < p; a++)
+    for (int64_t b = 0; b < p; b++) {
+      double s = 0.0;
+      for (int64_t t = 0; t < p; t++) s += H[a*p + t] * W[t*p + b];
+      T[a*p + b] = s;
+    }
+  for (int64_t a = 0; a < p; a++)
+    for (int64_t b = 0; b < p; b++) {
+      double s = 0.0;
+      for (int64_t t = 0; t < p; t++) s += W[a*p + t] * T[t*p + b];
+      M[a*p + b] = s;
+    }
+  /* symmetrize away rounding so eigen-sym accepts it */
+  for (int64_t a = 0; a < p; a++)
+    for (int64_t b = a + 1; b < p; b++) { double v = 0.5 * (M[a*p + b] + M[b*p + a]); M[a*p + b] = M[b*p + a] = v; }
+  free(W); free(T);
+  return 0;
+  ```)
+  ;;; __manova-stats-kernel -- from the eigenvalues of W H W: out = [wilks,
+  ;;; pillai, F, df1, df2] for p variables, k groups, m observations.
+  (defn __manova-stats-kernel [od : (Vec float) ld : (Vec float) p : int k : int m : int] : int
+    ```c
+    #include <math.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *o = (double*)(void*)((struct __V*)(intptr_t)od)->data;
+  const double *lam = (const double*)(void*)((struct __V*)(intptr_t)ld)->data;
+  double wilks = 1.0, pillai = 0.0;
+  for (int64_t i = 0; i < p; i++) {
+    double l = lam[i] > 0.0 ? lam[i] : 0.0;
+    wilks *= 1.0 / (1.0 + l);
+    pillai += l / (1.0 + l);
+  }
+  double pp = (double)p, q = (double)(k - 1), dfe = (double)(m - k);
+  double t = (pp * pp + q * q - 5.0 > 0.0) ? sqrt((pp * pp * q * q - 4.0) / (pp * pp + q * q - 5.0)) : 1.0;
+  double df1 = pp * q;
+  double w = dfe + q - (pp + q + 1.0) / 2.0;
+  double df2 = w * t - (pp * q - 2.0) / 2.0;
+  double l1t = pow(wilks, 1.0 / t);
+  double F = (1.0 - l1t) / l1t * (df2 / df1);
+  o[0] = wilks; o[1] = pillai; o[2] = F; o[3] = df1; o[4] = df2;
+  return 0;
+  ```)
+  (defn __at [^borrow v : (Vec float) i : int] : float (:: (vec-get v i) :float))
+  ;;; manova-1way -- one-way MANOVA: are the k group mean vectors equal?
+  ;;;
+  ;;; Parameters:
+  ;;;   x      -- m x p data, one observation per row (borrowed)
+  ;;;   groups -- length-m group labels 0 .. k-1, every label used (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   (Result ManovaResult cstr) -- Err when the labels are malformed (fewer
+  ;;;   than two groups, a negative or unused label, wrong length) or the
+  ;;;   within-groups SSCP matrix is singular.
+  ;;;
+  ;;; Example:
+  ;;;   (match (manova-1way x g)
+  ;;;     (Ok r)  (.p-value r)
+  ;;;     (Err e) 1.0)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn manova-1way [^borrow x : mat ^borrow groups : (Vec int)] : (Result ManovaResult cstr)
+    (let [m (mat-rows x)
+          p (mat-cols x)
+          k (if (= (vec-len groups) m) (__groups-kernel groups m) -1)]
+      (if (< k 0)
+        (Err "manova-1way: need one label 0..k-1 per row, k >= 2, every group non-empty")
+        (if (<= m (+ k p))
+          (Err "manova-1way: too few observations for the number of groups and variables")
+          (let [e  (mat-new p p)
+                h  (mat-new p p)
+                mm (mat-new p p)]
+            (__sscp-kernel (.data e) (.data h) (.data x) groups m p k)
+            (let [st (match (eigen-sym e)
+                       (Ok f) (let [s (__whiten-kernel (.data mm) (.data (.vecs f)) (.data (.vals f)) (.data h) p)]
+                                (eigen-free f)
+                                s)
+                       (Err err) -1)]
+              (if (< st 0)
+                (do (mat-free mm) (mat-free h) (mat-free e) (Err "manova-1way: within-groups SSCP is singular"))
+                (match (eigen-sym mm)
+                  (Ok f) (let [o (:: (vec-of 0.0 0.0 0.0 0.0 0.0) (Vec float))]
+                           (__manova-stats-kernel o (.data (.vals f)) p k m)
+                           (eigen-free f)
+                           (mat-free mm)
+                           (mat-free h)
+                           (mat-free e)
+                           (let [r (make-struct ManovaResult
+                                     (__at o 0)
+                                     (__at o 1)
+                                     (__at o 2)
+                                     (__at o 3)
+                                     (__at o 4)
+                                     (__upper (__at o 2) (__at o 3) (__at o 4)))]
+                             (vec-free o)
+                             (Ok r)))
+                  (Err err) (do (mat-free mm) (mat-free h) (mat-free e) (Err err))))))))))) ;; end defmodule multivariate/test

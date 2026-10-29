@@ -1,0 +1,282 @@
+;;; multivariate/factor -- exploratory factor analysis by principal axis
+;;; factoring (PAF).
+;;;
+;;; PAF fits R ~ L L' + Psi for a correlation matrix R: replace R's diagonal
+;;; with the current communality estimates h2, take the k leading eigenpairs
+;;; of that reduced matrix as L = Q_k sqrt(Lambda_k), update h2 to the row
+;;; sums of L^2, and repeat until h2 settles. The start is the squared
+;;; multiple correlation 1 - 1 / diag(R^-1) (the largest absolute
+;;; off-diagonal correlation of each row when R is singular).
+;;;
+;;; v0.1 extracts unrotated factors only; varimax and maximum likelihood are
+;;; later work. Each factor is signed so its loadings sum to a positive value.
+(defmodule multivariate/factor
+  (export FAOpts
+    FaResult
+    fa-opts
+    factor-analysis
+    fa-free
+    fa-scores)
+  (import linalg/vec :refer [lavec la-vec-new la-vec-free])
+  (import linalg/mat :refer [mat mat-new mat-copy mat-rows mat-cols mat-mul mat-free])
+  (import linalg/decomp :refer [eigenfac eigen-sym eigen-free])
+  (import multivariate/cov :refer [cor-mat col-means col-sds mv-pinv])
+  ;;; FAOpts -- factor analysis controls.
+  ;;;   nfactors  -- factors to extract, 1 <= nfactors < n
+  ;;;   method    -- "paf" (the only method in v0.1)
+  ;;;   rotate    -- "none" (the only rotation in v0.1)
+  ;;;   max-iters -- communality iterations allowed
+  ;;;   tol       -- stop when no communality moves by more than this
+  (defstruct ^copy FAOpts
+    [nfactors : int
+     method : cstr
+     rotate : cstr
+     max-iters : int
+     tol : float])
+  ;;; FaResult -- a fitted factor model (owns its buffers).
+  ;;;   loadings    -- n x k factor loadings
+  ;;;   communality -- length n, row sums of loadings^2
+  ;;;   uniqueness  -- length n, 1 - communality
+  ;;;   iters       -- communality iterations run
+  ;;;   converged   -- whether the communalities settled within tol
+  ;;;   method      -- "paf"
+  (defstruct FaResult
+    [loadings : mat
+     communality : lavec
+     uniqueness : lavec
+     iters : int
+     converged : bool
+     method : cstr])
+  ;;; fa-opts -- PAF, unrotated, 500 iterations, tolerance 1e-9.
+  ;;;
+  ;;; Parameters:
+  ;;;   nfactors -- factors to extract
+  ;;;
+  ;;; Returns:
+  ;;;   An FAOpts with the defaults filled in.
+  ;;;
+  ;;; Example:
+  ;;;   (factor-analysis r (fa-opts 2))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn fa-opts [nfactors : int] : FAOpts (make-struct FAOpts nfactors "paf" "none" 500 1e-09))
+  (defn __streq [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
+    return strcmp((const char *)a, (const char *)b) == 0;
+    ```)
+  ;;; __smc-kernel -- h2[i] = 1 - 1 / (R^-1)[i][i] from R = Q diag(vals) Q',
+  ;;; or the largest |r_ij| (j != i) when R is numerically singular.
+  (defn __smc-kernel [hd : (Vec float)
+                      Qd : (Vec float)
+                      vd : (Vec float)
+                      Rd : (Vec float)
+                      n : int] : int
+    ```c
+    #include <math.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *h = (double*)(void*)((struct __V*)(intptr_t)hd)->data;
+  const double *Q = (const double*)(void*)((struct __V*)(intptr_t)Qd)->data;
+  const double *vals = (const double*)(void*)((struct __V*)(intptr_t)vd)->data;
+  const double *R = (const double*)(void*)((struct __V*)(intptr_t)Rd)->data;
+  double lo = vals[0], hi = vals[n - 1];
+  int singular = !(lo > 1e-10 * (hi > 0.0 ? hi : 1.0));
+  for (int64_t i = 0; i < n; i++) {
+    if (!singular) {
+      double d = 0.0;
+      for (int64_t k = 0; k < n; k++) d += Q[i*n + k] * Q[i*n + k] / vals[k];
+      h[i] = 1.0 - 1.0 / d;
+    } else {
+      double mx = 0.0;
+      for (int64_t j = 0; j < n; j++) if (j != i && fabs(R[i*n + j]) > mx) mx = fabs(R[i*n + j]);
+      h[i] = mx;
+    }
+  }
+  return 0;
+  ```)
+  ;;; __set-diag-kernel -- A = R with its diagonal replaced by h.
+  (defn __set-diag-kernel [Ad : (Vec float) Rd : (Vec float) hd : (Vec float) n : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  const double *R = (const double*)(void*)((struct __V*)(intptr_t)Rd)->data;
+  const double *h = (const double*)(void*)((struct __V*)(intptr_t)hd)->data;
+  for (int64_t i = 0; i < n * n; i++) A[i] = R[i];
+  for (int64_t i = 0; i < n; i++) A[i*n + i] = h[i];
+  return 0;
+  ```)
+  ;;; __paf-step-kernel -- from the eigenpairs (ascending) of the reduced
+  ;;; matrix: L (n x k) = top-k Q sqrt(max(lambda, 0)), signed so each column
+  ;;; sums positive; h <- row sums of L^2. Returns max |delta h| in info[0].
+  (defn __paf-step-kernel [Ld : (Vec float)
+                           hd : (Vec float)
+                           infod : (Vec float)
+                           Qd : (Vec float)
+                           vd : (Vec float)
+                           n : int
+                           k : int] : int
+    ```c
+    #include <math.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *L = (double*)(void*)((struct __V*)(intptr_t)Ld)->data;
+  double *h = (double*)(void*)((struct __V*)(intptr_t)hd)->data;
+  double *info = (double*)(void*)((struct __V*)(intptr_t)infod)->data;
+  const double *Q = (const double*)(void*)((struct __V*)(intptr_t)Qd)->data;
+  const double *vals = (const double*)(void*)((struct __V*)(intptr_t)vd)->data;
+  for (int64_t t = 0; t < k; t++) {
+    int64_t src = n - 1 - t;
+    double lam = vals[src] > 0.0 ? sqrt(vals[src]) : 0.0, sum = 0.0;
+    for (int64_t i = 0; i < n; i++) sum += Q[i*n + src];
+    double sg = sum < 0.0 ? -1.0 : 1.0;
+    for (int64_t i = 0; i < n; i++) L[i*k + t] = sg * Q[i*n + src] * lam;
+  }
+  double mx = 0.0;
+  for (int64_t i = 0; i < n; i++) {
+    double c = 0.0;
+    for (int64_t t = 0; t < k; t++) c += L[i*k + t] * L[i*k + t];
+    if (fabs(c - h[i]) > mx) mx = fabs(c - h[i]);
+    h[i] = c;
+  }
+  info[0] = mx;
+  return 0;
+  ```)
+  ;;; __uniq-kernel -- u[i] = 1 - h[i].
+  (defn __uniq-kernel [ud : (Vec float) hd : (Vec float) n : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *u = (double*)(void*)((struct __V*)(intptr_t)ud)->data;
+  const double *h = (const double*)(void*)((struct __V*)(intptr_t)hd)->data;
+  for (int64_t i = 0; i < n; i++) u[i] = 1.0 - h[i];
+  return 0;
+  ```)
+  (defn __info0 [^borrow info : (Vec float)] : float (:: (vec-get info 0) :float))
+  ;;; __paf -- run the PAF iteration on a validated R; returns the result.
+  (defn __paf [^borrow r : mat opts : FAOpts] : FaResult
+    (let [n    (mat-rows r)
+          k    (.nfactors opts)
+          h    (la-vec-new n)
+          l    (mat-new n k)
+          rh   (mat-new n n)
+          info (:: (vec-of 1.0) (Vec float))]
+      (match (eigen-sym r)
+        (Ok f) (do
+                 (__smc-kernel (.data h) (.data (.vecs f)) (.data (.vals f)) (.data r) n)
+                 (eigen-free f))
+        (Err e) (panic e))
+      (let [iters (letrec [go
+                           (fn [it : int] : int
+                             (if (or (>= it (.max-iters opts)) (< (__info0 info) (.tol opts)))
+                               it
+                               (do
+                                 (__set-diag-kernel (.data rh) (.data r) (.data h) n)
+                                 (match (eigen-sym rh)
+                                   (Ok f) (do
+                                            (__paf-step-kernel (.data l)
+                                              (.data h)
+                                              info
+                                              (.data (.vecs f))
+                                              (.data (.vals f))
+                                              n
+                                              k)
+                                            (eigen-free f))
+                                   (Err e) (panic e))
+                                 (go (+ it 1)))))]
+                    (go 0))
+            conv  (< (__info0 info) (.tol opts))
+            u     (la-vec-new n)]
+        (__uniq-kernel (.data u) (.data h) n)
+        (vec-free info)
+        (mat-free rh)
+        (make-struct FaResult l h u iters conv "paf"))))
+  ;;; __corr-like-kernel -- 1 when R (n x n) is symmetric with a unit diagonal.
+  (defn __corr-like-kernel [Rd : (Vec float) n : int] : int
+    ```c
+    #include <math.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  const double *R = (const double*)(void*)((struct __V*)(intptr_t)Rd)->data;
+  for (int64_t i = 0; i < n; i++) {
+    if (fabs(R[i*n + i] - 1.0) > 1e-8) return 0;
+    for (int64_t j = i + 1; j < n; j++) if (fabs(R[i*n + j] - R[j*n + i]) > 1e-10) return 0;
+  }
+  return 1;
+  ```)
+  ;;; factor-analysis -- fit an exploratory factor model to a correlation matrix.
+  ;;;
+  ;;; Parameters:
+  ;;;   r    -- n x n correlation matrix (borrowed), e.g. from `cor-mat`
+  ;;;   opts -- see FAOpts; `fa-opts` gives the defaults
+  ;;;
+  ;;; Returns:
+  ;;;   (Result FaResult cstr) -- Err when R is not a correlation matrix (square,
+  ;;;   symmetric, unit diagonal), nfactors is out of range, or the method /
+  ;;;   rotation is not available in v0.1. A run that hits max-iters is still
+  ;;;   Ok, with `converged` false.
+  ;;;
+  ;;; Example:
+  ;;;   (match (factor-analysis (cor-mat x) (fa-opts 2))
+  ;;;     (Ok f)  (do (fa-print f) (fa-free f))
+  ;;;     (Err e) (println e))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn factor-analysis [^borrow r : mat opts : FAOpts] : (Result FaResult cstr)
+    (cond (not= (mat-rows r) (mat-cols r))                     (Err "factor-analysis: R must be square")
+          (= (__corr-like-kernel (.data r) (mat-rows r)) 0)    (Err "factor-analysis: R must be a correlation matrix")
+          (or (< (.nfactors opts) 1) (>= (.nfactors opts) (mat-rows r))) (Err "factor-analysis: need 1 <= nfactors < n")
+          (not (__streq (.method opts) "paf"))                 (Err "factor-analysis: only method \"paf\" is available in v0.1")
+          (not (__streq (.rotate opts) "none"))                (Err "factor-analysis: only rotate \"none\" is available in v0.1")
+          :else                                                (Ok (__paf r opts))))
+  ;;; fa-free -- free a FaResult.
+  (defn fa-free [r : FaResult] : void
+    (mat-free (.loadings r))
+    (la-vec-free (.communality r))
+    (la-vec-free (.uniqueness r)))
+  ;;; __zscore-kernel -- Z = (X - mu) / sd column-wise.
+  (defn __zscore-kernel [Zd : (Vec float)
+                         Xd : (Vec float)
+                         mud : (Vec float)
+                         sdd : (Vec float)
+                         m : int
+                         n : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *Z = (double*)(void*)((struct __V*)(intptr_t)Zd)->data;
+  const double *X = (const double*)(void*)((struct __V*)(intptr_t)Xd)->data;
+  const double *mu = (const double*)(void*)((struct __V*)(intptr_t)mud)->data;
+  const double *sd = (const double*)(void*)((struct __V*)(intptr_t)sdd)->data;
+  for (int64_t i = 0; i < m; i++)
+    for (int64_t j = 0; j < n; j++)
+      Z[i*n + j] = (X[i*n + j] - mu[j]) / (sd[j] == 0.0 ? 1.0 : sd[j]);
+  return 0;
+  ```)
+  ;;; fa-scores -- regression (Thomson) factor scores F = Z R^-1 L.
+  ;;;
+  ;;; Parameters:
+  ;;;   f -- a fitted factor model (borrowed)
+  ;;;   x -- the m x n data the correlation matrix came from (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The m x k score matrix, Z being X standardized by its own means and
+  ;;;   standard deviations.
+  ;;;
+  ;;; Example:
+  ;;;   (fa-scores f x)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn fa-scores [^borrow f : FaResult ^borrow x : mat] : mat
+    (let [n (mat-rows (.loadings f))]
+      (when (not= (mat-cols x) n) (panic "fa-scores: column count mismatch"))
+      (let [mu (col-means x)
+            sd (col-sds x)
+            z  (mat-new (mat-rows x) n)]
+        (__zscore-kernel (.data z) (.data x) (.data mu) (.data sd) (mat-rows x) n)
+        (let [r  (cor-mat x)
+              ri (mv-pinv r)
+              w  (mat-mul ri (.loadings f))
+              s  (mat-mul z w)]
+          (mat-free w)
+          (mat-free ri)
+          (mat-free r)
+          (mat-free z)
+          (la-vec-free sd)
+          (la-vec-free mu)
+          s))))) ;; end defmodule multivariate/factor
