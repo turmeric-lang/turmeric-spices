@@ -1,0 +1,335 @@
+;;; decomp.tur -- tests for the v0.2 decompositions: SVD (LB0), the SVD
+;;; solvers (LB1) and the symmetric eigendecomposition (LB2).
+;;;
+;;; Mirrors linalg.tur's TAP harness (inline-C fail counter; `finish` returns
+;;; non-zero if any check failed). Each `t-*` helper builds its inputs,
+;;; computes a scalar or bool, and frees.
+(defmodule linalg/decomp-test
+  (import linalg/vec
+    :refer
+    [lavec la-vec-of la-vec-new la-vec-get la-vec-set! la-vec-len la-vec-free])
+  (import linalg/mat
+    :refer
+    [mat
+     mat-of
+     mat-new
+     mat-identity
+     mat-get
+     mat-set!
+     mat-rows
+     mat-cols
+     mat-mul
+     mat-transpose
+     mat-approx-eq?
+     mat-free])
+  (import linalg/decomp
+    :refer
+    [svdfac eigenfac svd svd-free eigen-sym eigen-free])
+  (import linalg/solve
+    :refer
+    [svd-solve svd-rank svd-condition svd-project])
+  ;; --- TAP harness (inline-C fail counter) ---
+  (defn check [idx : int name : cstr ok : bool] : void
+    ```c
+    /* __tur_include__: static int g_dc_fails = 0; */
+  if (!ok) g_dc_fails++;
+  printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
+  ```)
+  (defn finish [count : int] : int
+    ```c
+    printf("1..%lld\n", (long long)count);
+  if (g_dc_fails == 0) {
+    fprintf(stderr, "# All %lld decomp tests passed.\n", (long long)count);
+    return 0;
+  }
+  fprintf(stderr, "# %d/%lld decomp tests failed.\n", g_dc_fails, (long long)count);
+  return 1;
+  ```)
+  (defn fa [x : float] : float ```c return x < 0.0 ? -x : x; ```)
+  (defn approx [a : float b : float tol : float] : bool (< (fa (- a b)) tol))
+  ;;; rel10 -- agreement to 10 significant figures.
+  (defn rel10 [a : float b : float] : bool (< (fa (- a b)) (* 1e-10 (fa b))))
+  (defn sqrtf [x : float] : float
+    ```c
+    #include <math.h>
+    return sqrt(x);
+    ```)
+  (defn cosf [x : float] : float
+    ```c
+    #include <math.h>
+    return cos(x);
+    ```)
+  ;;; sigma -- the m x n matrix with s on its diagonal.
+  (defn sigma [^borrow f : svdfac] : mat
+    (let [m      (mat-rows (.U f))
+          n      (mat-cols (.Vt f))
+          k      (la-vec-len (.s f))
+          d      (mat-new m n)
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i k)
+                   0
+                   (do (mat-set! d i i (la-vec-get (.s f) i)) (set! i (+ i 1)) (go))))]
+        (go))
+      d))
+  ;;; svd-reconstructs? -- U S Vt ~= A to tol.
+  (defn svd-reconstructs? [^borrow a : mat tol : float] : bool
+    (let [f  (svd a)
+          d  (sigma f)
+          us (mat-mul (.U f) d)
+          r  (mat-mul us (.Vt f))
+          ok (= (mat-approx-eq? r a tol) 1)]
+      (mat-free d)
+      (mat-free us)
+      (mat-free r)
+      (svd-free f)
+      ok))
+  ;;; orthogonal? -- Q' Q ~= I.
+  (defn orthogonal? [^borrow q : mat tol : float] : bool
+    (let [qt (mat-transpose q)
+          p  (mat-mul qt q)
+          i  (mat-identity (mat-cols q))
+          ok (= (mat-approx-eq? p i tol) 1)]
+      (mat-free qt)
+      (mat-free p)
+      (mat-free i)
+      ok))
+  (defn a43 [] : mat
+    (mat-of 4 3 2.0 1.0 0.0 1.0 4.0 1.0 0.0 1.0 3.0 5.0 0.0 2.0))
+  ;; --- LB0: SVD ---
+  (defn t-svd-recon-43 [] : bool
+    (let [a (a43)] (let [ok (svd-reconstructs? a 1e-10)] (mat-free a) ok)))
+  (defn t-svd-u-orth [] : bool
+    (let [a (a43)
+          f (svd a)]
+      (let [ok (orthogonal? (.U f) 1e-10)] (svd-free f) (mat-free a) ok)))
+  (defn t-svd-v-orth [] : bool
+    (let [a (a43)
+          f (svd a)]
+      (let [ok (orthogonal? (.Vt f) 1e-10)] (svd-free f) (mat-free a) ok)))
+  (defn t-svd-shape [] : bool
+    (let [a (a43)
+          f (svd a)]
+      (let [ok (and (= (mat-rows (.U f)) 4)
+                 (and (= (mat-cols (.U f)) 4)
+                   (and (= (mat-rows (.Vt f)) 3) (= (la-vec-len (.s f)) 3))))]
+        (svd-free f)
+        (mat-free a)
+        ok)))
+  ;; numpy: [6.253767 3.99282317 2.63586067]
+  (defn t-svd-values [] : bool
+    (let [a (a43)
+          f (svd a)]
+      (let [ok (and (approx (la-vec-get (.s f) 0) 6.253767 1e-06)
+                 (and (approx (la-vec-get (.s f) 1) 3.99282317 1e-07)
+                   (approx (la-vec-get (.s f) 2) 2.63586067 1e-07)))]
+        (svd-free f)
+        (mat-free a)
+        ok)))
+  (defn t-svd-recon-wide [] : bool
+    (let [a (mat-of 2 4 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0)]
+      (let [ok (svd-reconstructs? a 1e-10)] (mat-free a) ok)))
+  (defn t-svd-wide-orth [] : bool
+    (let [a (mat-of 2 4 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0)
+          f (svd a)]
+      (let [ok (and (orthogonal? (.U f) 1e-10) (orthogonal? (.Vt f) 1e-10))]
+        (svd-free f)
+        (mat-free a)
+        ok)))
+  (defn t-svd-rankdef-orth [] : bool
+    (let [a (mat-of 3 2 1.0 2.0 2.0 4.0 3.0 6.0)
+          f (svd a)]
+      (let [ok (and (orthogonal? (.U f) 1e-10) (orthogonal? (.Vt f) 1e-10))]
+        (svd-free f)
+        (mat-free a)
+        ok)))
+  (defn t-svd-rankdef-recon [] : bool
+    (let [a (mat-of 3 2 1.0 2.0 2.0 4.0 3.0 6.0)]
+      (let [ok (svd-reconstructs? a 1e-10)] (mat-free a) ok)))
+  ;; --- LB1: SVD solvers ---
+  ;; A = [1 2 3]' [1 2] has rank 1; the minimum-norm least-squares solution of
+  ;; A x = [1 2 3] satisfies x1 + 2 x2 = 1 with x parallel to [1 2]: [0.2 0.4].
+  (defn t-svd-rank1 [] : int
+    (let [a (mat-of 3 2 1.0 2.0 2.0 4.0 3.0 6.0)
+          f (svd a)]
+      (let [r (svd-rank f 0.0)] (svd-free f) (mat-free a) r)))
+  (defn t-svd-solve-rankdef [] : bool
+    (let [a (mat-of 3 2 1.0 2.0 2.0 4.0 3.0 6.0)
+          b (la-vec-of 1.0 2.0 3.0)
+          f (svd a)
+          x (svd-solve f b)]
+      (let [ok (and (approx (la-vec-get x 0) 0.2 1e-12)
+                 (approx (la-vec-get x 1) 0.4 1e-12))]
+        (la-vec-free x)
+        (svd-free f)
+        (la-vec-free b)
+        (mat-free a)
+        ok)))
+  ;; over-determined, full rank: the line through (0,1) (1,3) (2,5) is y = 1 + 2t.
+  (defn t-svd-solve-lsq [] : bool
+    (let [a (mat-of 3 2 1.0 0.0 1.0 1.0 1.0 2.0)
+          b (la-vec-of 1.0 3.0 5.0)
+          f (svd a)
+          x (svd-solve f b)]
+      (let [ok (and (approx (la-vec-get x 0) 1.0 1e-12)
+                 (approx (la-vec-get x 1) 2.0 1e-12))]
+        (la-vec-free x)
+        (svd-free f)
+        (la-vec-free b)
+        (mat-free a)
+        ok)))
+  ;; under-determined: x1 + x2 = 2 has minimum-norm solution [1 1].
+  (defn t-svd-solve-minnorm [] : bool
+    (let [a (mat-of 1 2 1.0 1.0)
+          b (la-vec-of 2.0)
+          f (svd a)
+          x (svd-solve f b)]
+      (let [ok (and (approx (la-vec-get x 0) 1.0 1e-12)
+                 (approx (la-vec-get x 1) 1.0 1e-12))]
+        (la-vec-free x)
+        (svd-free f)
+        (la-vec-free b)
+        (mat-free a)
+        ok)))
+  ;; numpy: cond([[1 1] [1 1.0001]]) = 40002.00007491523
+  (defn t-svd-cond [] : bool
+    (let [a (mat-of 2 2 1.0 1.0 1.0 1.0001)
+          f (svd a)]
+      (let [ok (< (fa (- (svd-condition f) 40002.00007491523)) 1e-05)]
+        (svd-free f)
+        (mat-free a)
+        ok)))
+  (defn t-svd-project [] : bool
+    (let [a (mat-of 3 1 1.0 1.0 0.0)
+          b (la-vec-of 3.0 1.0 7.0)
+          f (svd a)
+          p (svd-project f b)]
+      (let [ok (and (approx (la-vec-get p 0) 2.0 1e-12)
+                 (and (approx (la-vec-get p 1) 2.0 1e-12)
+                   (approx (la-vec-get p 2) 0.0 1e-12)))]
+        (la-vec-free p)
+        (svd-free f)
+        (la-vec-free b)
+        (mat-free a)
+        ok)))
+  ;; --- LB2: symmetric eigendecomposition ---
+  (defn eig-recon? [^borrow a : mat] : bool
+    (match (eigen-sym a)
+      (Ok f) (let [n  (mat-rows a)
+                   d  (mat-new n n)
+                   ^mut i 0]
+               (letrec [go
+                        (fn [] : int
+                          (if (>= i n)
+                            0
+                            (do
+                              (mat-set! d i i (la-vec-get (.vals f) i))
+                              (set! i (+ i 1))
+                              (go))))]
+                 (go))
+               (let [qd (mat-mul (.vecs f) d)
+                     qt (mat-transpose (.vecs f))
+                     r  (mat-mul qd qt)
+                     ok (and (= (mat-approx-eq? r a 1e-10) 1)
+                          (orthogonal? (.vecs f) 1e-10))]
+                 (mat-free d)
+                 (mat-free qd)
+                 (mat-free qt)
+                 (mat-free r)
+                 (eigen-free f)
+                 ok))
+      (Err e) false))
+  (defn tri3 [] : mat (mat-of 3 3 2.0 -1.0 0.0 -1.0 2.0 -1.0 0.0 -1.0 2.0))
+  (defn tri5 [] : mat
+    (mat-of 5
+      5
+      2.0
+      -1.0
+      0.0
+      0.0
+      0.0
+      -1.0
+      2.0
+      -1.0
+      0.0
+      0.0
+      0.0
+      -1.0
+      2.0
+      -1.0
+      0.0
+      0.0
+      0.0
+      -1.0
+      2.0
+      -1.0
+      0.0
+      0.0
+      0.0
+      -1.0
+      2.0))
+  (defn t-eig3-recon [] : bool
+    (let [a (tri3)] (let [ok (eig-recon? a)] (mat-free a) ok)))
+  ;; eigenvalues of tridiag(-1, 2, -1) (3x3): 2 - sqrt 2, 2, 2 + sqrt 2
+  (defn t-eig3-values [] : bool
+    (let [a (tri3)]
+      (match (eigen-sym a)
+        (Ok f) (let [ok (and (rel10 (la-vec-get (.vals f) 0) (- 2.0 (sqrtf 2.0)))
+                          (and (rel10 (la-vec-get (.vals f) 1) 2.0)
+                            (rel10 (la-vec-get (.vals f) 2) (+ 2.0 (sqrtf 2.0)))))]
+                 (eigen-free f)
+                 (mat-free a)
+                 ok)
+        (Err e) (do (mat-free a) false))))
+  (defn t-eig5-recon [] : bool
+    (let [a (tri5)] (let [ok (eig-recon? a)] (mat-free a) ok)))
+  ;; eigenvalues of tridiag(-1, 2, -1) (5x5): 2 - 2 cos(k pi / 6), k = 1..5
+  (defn eig5-k-ok? [^borrow f : eigenfac k : int] : bool
+    (let [kf (if (= k 1) 1.0 (if (= k 2) 2.0 (if (= k 3) 3.0 (if (= k 4) 4.0 5.0))))]
+      (rel10 (la-vec-get (.vals f) (- k 1))
+        (- 2.0 (* 2.0 (cosf (/ (* kf 3.141592653589793) 6.0)))))))
+  (defn t-eig5-values [] : bool
+    (let [a (tri5)]
+      (match (eigen-sym a)
+        (Ok f) (let [ok (and (eig5-k-ok? f 1)
+                          (and (eig5-k-ok? f 2)
+                            (and (eig5-k-ok? f 3)
+                              (and (eig5-k-ok? f 4) (eig5-k-ok? f 5)))))]
+                 (eigen-free f)
+                 (mat-free a)
+                 ok)
+        (Err e) (do (mat-free a) false))))
+  (defn t-eig-nonsquare [] : bool
+    (let [a (mat-of 2 3 1.0 2.0 3.0 4.0 5.0 6.0)]
+      (let [ok (match (eigen-sym a) (Ok f) (do (eigen-free f) false) (Err e) true)]
+        (mat-free a)
+        ok)))
+  (defn t-eig-nonsym [] : bool
+    (let [a (mat-of 2 2 1.0 2.0 3.0 4.0)]
+      (let [ok (match (eigen-sym a) (Ok f) (do (eigen-free f) false) (Err e) true)]
+        (mat-free a)
+        ok)))
+  (defn main [] : int
+    (check 1 "svd: U S V' = A (4x3)" (t-svd-recon-43))
+    (check 2 "svd: U' U = I (4x3)" (t-svd-u-orth))
+    (check 3 "svd: V' V = I (4x3)" (t-svd-v-orth))
+    (check 4 "svd: shapes (4x3)" (t-svd-shape))
+    (check 5 "svd: singular values match numpy" (t-svd-values))
+    (check 6 "svd: U S V' = A (2x4, wide)" (t-svd-recon-wide))
+    (check 7 "svd: wide factors orthogonal" (t-svd-wide-orth))
+    (check 8 "svd: rank-deficient factors orthogonal" (t-svd-rankdef-orth))
+    (check 9 "svd: rank-deficient reconstructs" (t-svd-rankdef-recon))
+    (check 10 "svd-rank: rank-1 3x2" (= (t-svd-rank1) 1))
+    (check 11 "svd-solve: rank-deficient min-norm lsq" (t-svd-solve-rankdef))
+    (check 12 "svd-solve: over-determined lsq" (t-svd-solve-lsq))
+    (check 13 "svd-solve: under-determined min-norm" (t-svd-solve-minnorm))
+    (check 14 "svd-condition: near-singular 2x2" (t-svd-cond))
+    (check 15 "svd-project: onto a column" (t-svd-project))
+    (check 16 "eigen-sym: Q D Q' = A (3x3)" (t-eig3-recon))
+    (check 17 "eigen-sym: 3x3 closed form, 10 sig figs" (t-eig3-values))
+    (check 18 "eigen-sym: Q D Q' = A (5x5)" (t-eig5-recon))
+    (check 19 "eigen-sym: 5x5 closed form, 10 sig figs" (t-eig5-values))
+    (check 20 "eigen-sym: Err on non-square" (t-eig-nonsquare))
+    (check 21 "eigen-sym: Err on non-symmetric" (t-eig-nonsym))
+    (finish 21))) ;; end defmodule linalg/decomp-test

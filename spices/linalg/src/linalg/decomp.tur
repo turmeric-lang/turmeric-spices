@@ -1,4 +1,4 @@
-;;; linalg/decomp -- matrix decompositions (Cholesky, LU, QR)
+;;; linalg/decomp -- matrix decompositions (Cholesky, LU, QR, SVD, symmetric eigen)
 ;;;
 ;;; v0.21.0 model: factors are typed structs owning `mat`s (and, for LU, a
 ;;; `(Vec int)` pivot). The numeric kernels run in inline C over the backing
@@ -10,7 +10,22 @@
 ;;; Factor type names are hyphen-free (`cholfac`/`lufac`/`qrfac`) because a
 ;;; hyphen in a struct type name does not survive C codegen.
 (defmodule linalg/decomp
-  (export cholfac lufac qrfac chol chol-free lu lu-free qr qr-free)
+  (export cholfac
+    lufac
+    qrfac
+    svdfac
+    eigenfac
+    chol
+    chol-free
+    lu
+    lu-free
+    qr
+    qr-free
+    svd
+    svd-free
+    eigen-sym
+    eigen-free)
+  (import linalg/vec :refer [lavec la-vec-new la-vec-free])
   (import linalg/mat
     :refer
     [mat
@@ -26,6 +41,13 @@
   (defstruct cholfac [L : mat])
   (defstruct lufac [L : mat U : mat piv : (Vec int)])
   (defstruct qrfac [Q : mat R : mat])
+  ;;; svdfac -- A = U diag(s) Vt. U is m x m and Vt is n x n, both orthogonal;
+  ;;; s holds the min(m, n) singular values in descending order.
+  (defstruct svdfac [U : mat s : lavec Vt : mat])
+  ;;; eigenfac -- A = Q diag(vals) Q' for a symmetric A. vals holds the
+  ;;; eigenvalues in ascending order; column j of vecs is the unit eigenvector
+  ;;; for vals[j].
+  (defstruct eigenfac [vals : lavec vecs : mat])
   ;;; Private: a (Vec int) of n zeros (LU pivot scratch).
   (defn __izeros [n : int] : (Vec int)
     (let [d      (:: (vec-new) (Vec int))
@@ -181,4 +203,287 @@
         (__qr-kernel (.data q) (.data r) m n)
         (make-struct qrfac q r))))
   ;;; qr-free -- free a QR factor.
-  (defn qr-free [f : qrfac] : void (mat-free (.Q f)) (mat-free (.R f)))) ;; end defmodule linalg/decomp
+  (defn qr-free [f : qrfac] : void (mat-free (.Q f)) (mat-free (.R f)))
+  ;;; LB0 -- SVD via one-sided (Hestenes) Jacobi.
+  ;;; __svd-kernel -- A (m x n, row-major) -> U (m x m), s (min(m,n)), Vt
+  ;;; (n x n). Works on the taller of A and A' so the rotated block is always
+  ;;; tall: for m < n it factors A' = U2 S V2' and returns U = V2, Vt = U2'.
+  ;;; Columns of U that belong to a zero singular value, and the m - n columns
+  ;;; past the thin factor, are completed to an orthonormal basis by
+  ;;; Gram-Schmidt against the unit vectors.
+  (defn __svd-kernel [Ud : (Vec float)
+                      sd : (Vec float)
+                      Vtd : (Vec float)
+                      Ad : (Vec float)
+                      m : int
+                      n : int] : int
+    ```c
+    #include <math.h>
+    #include <stdlib.h>
+    #include <string.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *Uo = (double*)(void*)((struct __V*)(intptr_t)Ud)->data;
+  double *so = (double*)(void*)((struct __V*)(intptr_t)sd)->data;
+  double *Vto = (double*)(void*)((struct __V*)(intptr_t)Vtd)->data;
+  double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  int tr = (m < n);
+  int64_t R = tr ? n : m;          /* rows of the tall working matrix */
+  int64_t C = tr ? m : n;          /* its columns (= min(m, n)) */
+  double *W = (double*)malloc(sizeof(double) * (size_t)(R * C + 1));
+  double *V = (double*)malloc(sizeof(double) * (size_t)(C * C + 1));
+  double *Uf = (double*)malloc(sizeof(double) * (size_t)(R * R + 1));
+  double *sv = (double*)malloc(sizeof(double) * (size_t)(C + 1));
+  int64_t *ord = (int64_t*)malloc(sizeof(int64_t) * (size_t)(C + 1));
+  for (int64_t i = 0; i < R; i++)
+    for (int64_t j = 0; j < C; j++)
+      W[i*C + j] = tr ? A[j*n + i] : A[i*n + j];
+  for (int64_t i = 0; i < C; i++)
+    for (int64_t j = 0; j < C; j++) V[i*C + j] = (i == j) ? 1.0 : 0.0;
+  for (int sweep = 0; sweep < 100; sweep++) {
+    int rotated = 0;
+    for (int64_t p = 0; p < C - 1; p++) {
+      for (int64_t q = p + 1; q < C; q++) {
+        double al = 0.0, be = 0.0, ga = 0.0;
+        for (int64_t i = 0; i < R; i++) {
+          double wp = W[i*C + p], wq = W[i*C + q];
+          al += wp * wp; be += wq * wq; ga += wp * wq;
+        }
+        if (ga == 0.0 || fabs(ga) <= 1e-15 * sqrt(al * be)) continue;
+        rotated = 1;
+        double zeta = (be - al) / (2.0 * ga);
+        double t = (zeta >= 0.0 ? 1.0 : -1.0) / (fabs(zeta) + sqrt(1.0 + zeta * zeta));
+        double c = 1.0 / sqrt(1.0 + t * t), s = c * t;
+        for (int64_t i = 0; i < R; i++) {
+          double wp = W[i*C + p], wq = W[i*C + q];
+          W[i*C + p] = c * wp - s * wq;
+          W[i*C + q] = s * wp + c * wq;
+        }
+        for (int64_t i = 0; i < C; i++) {
+          double vp = V[i*C + p], vq = V[i*C + q];
+          V[i*C + p] = c * vp - s * vq;
+          V[i*C + q] = s * vp + c * vq;
+        }
+      }
+    }
+    if (!rotated) break;
+  }
+  double smax = 0.0;
+  for (int64_t j = 0; j < C; j++) {
+    double nn = 0.0;
+    for (int64_t i = 0; i < R; i++) nn += W[i*C + j] * W[i*C + j];
+    sv[j] = sqrt(nn);
+    if (sv[j] > smax) smax = sv[j];
+    ord[j] = j;
+  }
+  /* descending order (insertion sort; C is small next to the sweeps) */
+  for (int64_t a = 1; a < C; a++) {
+    int64_t k = ord[a], b = a - 1;
+    while (b >= 0 && sv[ord[b]] < sv[k]) { ord[b + 1] = ord[b]; b--; }
+    ord[b + 1] = k;
+  }
+  double tiny = smax * 1e-14 * (double)R;
+  if (tiny < 1e-300) tiny = 1e-300;
+  memset(Uf, 0, sizeof(double) * (size_t)(R * R));
+  /* filled[j] = 1 once column j of Uf holds a unit vector */
+  char *filled = (char*)calloc((size_t)(R + 1), 1);
+  for (int64_t j = 0; j < C; j++) {
+    int64_t src = ord[j];
+    if (sv[src] > tiny) {
+      for (int64_t i = 0; i < R; i++) Uf[i*R + j] = W[i*C + src] / sv[src];
+      filled[j] = 1;
+    }
+  }
+  /* complete the basis: try e_0, e_1, ... until every column is filled */
+  int64_t cand = 0;
+  for (int64_t j = 0; j < R; j++) {
+    if (filled[j]) continue;
+    double *u = (double*)malloc(sizeof(double) * (size_t)R);
+    for (;;) {
+      for (int64_t i = 0; i < R; i++) u[i] = (i == cand) ? 1.0 : 0.0;
+      cand++;
+      for (int pass = 0; pass < 2; pass++) {
+        for (int64_t k = 0; k < R; k++) {
+          if (!filled[k]) continue;
+          double d = 0.0;
+          for (int64_t i = 0; i < R; i++) d += Uf[i*R + k] * u[i];
+          for (int64_t i = 0; i < R; i++) u[i] -= d * Uf[i*R + k];
+        }
+      }
+      double nn = 0.0;
+      for (int64_t i = 0; i < R; i++) nn += u[i] * u[i];
+      nn = sqrt(nn);
+      if (nn > 1e-6 || cand >= R) {
+        for (int64_t i = 0; i < R; i++) Uf[i*R + j] = u[i] / nn;
+        filled[j] = 1;
+        break;
+      }
+    }
+    free(u);
+  }
+  free(filled);
+  for (int64_t j = 0; j < C; j++) so[j] = sv[ord[j]];
+  if (!tr) {
+    /* U = Uf (m x m); Vt[j][i] = V[i][ord[j]] */
+    for (int64_t i = 0; i < m * m; i++) Uo[i] = Uf[i];
+    for (int64_t j = 0; j < n; j++)
+      for (int64_t i = 0; i < n; i++) Vto[j*n + i] = V[i*C + ord[j]];
+  } else {
+    /* A' = Uf S V' with Uf n x n, V m x m: U = V (reordered), Vt = Uf' */
+    for (int64_t i = 0; i < m; i++)
+      for (int64_t j = 0; j < m; j++) Uo[i*m + j] = V[i*C + ord[j]];
+    for (int64_t i = 0; i < n; i++)
+      for (int64_t j = 0; j < n; j++) Vto[i*n + j] = Uf[j*R + i];
+  }
+  free(W); free(V); free(Uf); free(sv); free(ord);
+  return 0;
+  ```)
+  ;;; svd -- singular value decomposition A = U diag(s) Vt of any m x n matrix.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the matrix (borrowed); may be rectangular in either direction
+  ;;;
+  ;;; Returns:
+  ;;;   An svdfac: U (m x m) and Vt (n x n) orthogonal, s the min(m, n)
+  ;;;   singular values in descending order. Never fails.
+  ;;;
+  ;;; Example:
+  ;;;   (let [a (mat-of 2 2 3.0 0.0 0.0 4.0)
+  ;;;         f (svd a)]
+  ;;;     (la-vec-get (.s f) 0))  ; => 4.0
+  ;;;
+  ;;; Since: 0.2.0
+  (defn svd [^borrow a : mat] : svdfac
+    (let [m  (mat-rows a)
+          n  (mat-cols a)
+          k  (if (< m n) m n)
+          u  (mat-new-zeroed m m)
+          s  (la-vec-new k)
+          vt (mat-new-zeroed n n)]
+      (__svd-kernel (.data u) (.data s) (.data vt) (.data a) m n)
+      (make-struct svdfac u s vt)))
+  ;;; svd-free -- free an SVD factor.
+  (defn svd-free [f : svdfac] : void
+    (mat-free (.U f))
+    (la-vec-free (.s f))
+    (mat-free (.Vt f)))
+  ;;; LB2 -- symmetric eigendecomposition via cyclic Jacobi rotations.
+  ;;; __sym-check-kernel -- 1 if A (n x n) is symmetric to a relative tolerance.
+  (defn __sym-check-kernel [Ad : (Vec float) n : int] : int
+    ```c
+    #include <math.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *A = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  double mx = 0.0;
+  for (int64_t i = 0; i < n * n; i++) if (fabs(A[i]) > mx) mx = fabs(A[i]);
+  double tol = 1e-10 * (mx > 1.0 ? mx : 1.0);
+  for (int64_t i = 0; i < n; i++)
+    for (int64_t j = i + 1; j < n; j++)
+      if (fabs(A[i*n + j] - A[j*n + i]) > tol) return 0;
+  return 1;
+  ```)
+  ;;; __eigen-kernel -- A (n x n, symmetric) -> vals (ascending), Q (columns are
+  ;;; eigenvectors). Only the upper triangle of A is read.
+  (defn __eigen-kernel [valsd : (Vec float)
+                        Qd : (Vec float)
+                        Ad : (Vec float)
+                        n : int] : int
+    ```c
+    #include <math.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *vals = (double*)(void*)((struct __V*)(intptr_t)valsd)->data;
+  double *Q = (double*)(void*)((struct __V*)(intptr_t)Qd)->data;
+  double *A0 = (double*)(void*)((struct __V*)(intptr_t)Ad)->data;
+  double *M = (double*)malloc(sizeof(double) * (size_t)(n * n + 1));
+  double *V = (double*)malloc(sizeof(double) * (size_t)(n * n + 1));
+  for (int64_t i = 0; i < n; i++)
+    for (int64_t j = 0; j < n; j++) {
+      M[i*n + j] = (j >= i) ? A0[i*n + j] : A0[j*n + i];
+      V[i*n + j] = (i == j) ? 1.0 : 0.0;
+    }
+  for (int sweep = 0; sweep < 100; sweep++) {
+    double off = 0.0, diag = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+      diag += M[i*n + i] * M[i*n + i];
+      for (int64_t j = i + 1; j < n; j++) off += M[i*n + j] * M[i*n + j];
+    }
+    if (off <= 1e-30 * (diag > 0.0 ? diag : 1.0) || off == 0.0) break;
+    for (int64_t p = 0; p < n - 1; p++) {
+      for (int64_t q = p + 1; q < n; q++) {
+        double apq = M[p*n + q];
+        if (apq == 0.0) continue;
+        double app = M[p*n + p], aqq = M[q*n + q];
+        double theta = (aqq - app) / (2.0 * apq);
+        double t = (theta >= 0.0 ? 1.0 : -1.0) / (fabs(theta) + sqrt(theta * theta + 1.0));
+        double c = 1.0 / sqrt(t * t + 1.0), s = t * c;
+        /* M <- J' M J with J the (p, q) rotation */
+        for (int64_t k = 0; k < n; k++) {
+          double mkp = M[k*n + p], mkq = M[k*n + q];
+          M[k*n + p] = c * mkp - s * mkq;
+          M[k*n + q] = s * mkp + c * mkq;
+        }
+        for (int64_t k = 0; k < n; k++) {
+          double mpk = M[p*n + k], mqk = M[q*n + k];
+          M[p*n + k] = c * mpk - s * mqk;
+          M[q*n + k] = s * mpk + c * mqk;
+        }
+        M[p*n + q] = 0.0; M[q*n + p] = 0.0;
+        for (int64_t k = 0; k < n; k++) {
+          double vkp = V[k*n + p], vkq = V[k*n + q];
+          V[k*n + p] = c * vkp - s * vkq;
+          V[k*n + q] = s * vkp + c * vkq;
+        }
+      }
+    }
+  }
+  int64_t *ord = (int64_t*)malloc(sizeof(int64_t) * (size_t)(n + 1));
+  for (int64_t j = 0; j < n; j++) ord[j] = j;
+  for (int64_t a = 1; a < n; a++) {
+    int64_t k = ord[a], b = a - 1;
+    while (b >= 0 && M[ord[b]*n + ord[b]] > M[k*n + k]) { ord[b + 1] = ord[b]; b--; }
+    ord[b + 1] = k;
+  }
+  for (int64_t j = 0; j < n; j++) {
+    int64_t src = ord[j];
+    vals[j] = M[src*n + src];
+    /* fix the sign so the largest-magnitude component is positive */
+    int64_t big = 0;
+    for (int64_t i = 1; i < n; i++)
+      if (fabs(V[i*n + src]) > fabs(V[big*n + src])) big = i;
+    double sg = (V[big*n + src] < 0.0) ? -1.0 : 1.0;
+    for (int64_t i = 0; i < n; i++) Q[i*n + j] = sg * V[i*n + src];
+  }
+  free(M); free(V); free(ord);
+  return 0;
+  ```)
+  ;;; eigen-sym -- eigendecomposition A = Q diag(vals) Q' of a symmetric matrix.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- a square symmetric matrix (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   (Result eigenfac cstr) -- Ok with the eigenvalues in ascending order and
+  ;;;   the matching unit eigenvectors as the columns of `vecs`; Err when `a`
+  ;;;   is not square or not symmetric.
+  ;;;
+  ;;; Example:
+  ;;;   (match (eigen-sym (mat-of 2 2 2.0 1.0 1.0 2.0))
+  ;;;     (Ok f)  (la-vec-get (.vals f) 0)  ; => 1.0
+  ;;;     (Err e) 0.0)
+  ;;;
+  ;;; Since: 0.2.0
+  (defn eigen-sym [^borrow a : mat] : (Result eigenfac cstr)
+    (cond (not (= (mat-square? a) 1))                     (Err "eigen-sym: matrix must be square")
+          (= (__sym-check-kernel (.data a) (mat-rows a)) 0) (Err "eigen-sym: matrix must be symmetric")
+          :else                                           (let [n    (mat-rows a)
+                                                                vals (la-vec-new n)
+                                                                q    (mat-new-zeroed n n)]
+                                                            (__eigen-kernel (.data vals)
+                                                              (.data q)
+                                                              (.data a)
+                                                              n)
+                                                            (Ok (make-struct eigenfac vals q)))))
+  ;;; eigen-free -- free an eigendecomposition.
+  (defn eigen-free [f : eigenfac] : void
+    (la-vec-free (.vals f))
+    (mat-free (.vecs f)))) ;; end defmodule linalg/decomp
