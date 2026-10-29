@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # fixtures/run.sh -- tur-dom-core's end-to-end fixtures.
 #
-# fixtures/c/*_test.c are the C-level unit tests for c/dom/turdom.c: the
-# editing API (edit_test.c, xml-html-parsers-plan follow-up B1) and the
-# streaming writer (writer_test.c, B4).  They are plain C, so they live
+# fixtures/c/*_test.c are the C-level unit tests for c/dom/turdom.c and
+# c/dom/turdom_select.c: the editing API (edit_test.c, xml-html-parsers-plan
+# follow-up B1), the streaming writer (writer_test.c, B4) and the selector
+# engine (select_test.c, xml-html-followups-plan follow-up C).  They are plain C, so they live
 # outside tests/ (`tur test` builds .tur suites), and they are built here with
 # -fsanitize=address,undefined so a mutator that corrupts the arena or reads
 # freed memory fails the run.  scripts/run-shard.sh runs this after the tests
@@ -23,7 +24,7 @@ CC="${CC:-cc}"
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
-TESTS=(edit_test writer_test)
+TESTS=(edit_test writer_test select_test)
 CFLAGS=(-std=c11 -g -O1 -Wall -Wextra -Werror -I c)
 SAN=(-fsanitize=address,undefined -fno-sanitize-recover=all)
 
@@ -39,7 +40,7 @@ fails=0
 i=0
 for t in "${TESTS[@]}"; do
   i=$((i + 1))
-  src=("fixtures/c/$t.c" c/dom/turdom.c)
+  src=("fixtures/c/$t.c" c/dom/turdom.c c/dom/turdom_select.c)
   if "$CC" "${CFLAGS[@]}" "${SAN[@]}" "${src[@]}" -o "$OUT/$t" 2>"$OUT/cc.log"; then
     san="asan+ubsan"
   else

@@ -178,6 +178,86 @@ defn main [] : int
   0
 ```
 
+### CSS selectors
+
+`dom/select` (from `tur-dom-core`) runs CSS selectors over any tree, XML or
+HTML. Compile a selector once with `selector-compile`, then run it with
+`select-all` (`querySelectorAll`: every matching descendant, in document
+order), `select-first`, `node-matches-selector?` (`Element.matches`) or
+`node-closest` (`Element.closest`); free it with `selector-free`. For a
+one-off, `query` and `query-one` compile, run and free in one call, and hand
+back a `Result`:
+
+```turmeric
+(import dom/core   :refer [dom-node dom-free node-attr])
+(import dom/select :refer [query-one selector-error-message selector-error-release])
+(import xml/dom    :refer [dom-parse-string])
+
+(defn main [] : int
+  (match (dom-parse-string "<r><e id=\"a\"/><g><e id=\"b\" k=\"v\"/></g></r>")
+    (Ok d)  (do (match (query-one (dom-node d) "g > e[k=v]")
+                  (Ok (Some e)) (match (node-attr e "id")
+                                  (Some id) (println id)
+                                  (None)    nil)
+                  (Ok (None))   (println "no match")
+                  (Err err)     (do (println (selector-error-message err))
+                                    (selector-error-release err)))
+                (dom-free d))
+    (Err _) nil)
+  0)
+```
+
+```sweet-exp
+#lang sweet-exp
+import dom/core   :refer [dom-node dom-free node-attr]
+import dom/select :refer [query-one selector-error-message selector-error-release]
+import xml/dom    :refer [dom-parse-string]
+
+defn main [] : int
+  (match dom-parse-string("<r><e id=\"a\"/><g><e id=\"b\" k=\"v\"/></g></r>")
+    (Ok d)  (do (match query-one(dom-node(d) "g > e[k=v]")
+                  (Ok (Some e)) (match node-attr(e "id")
+                                  (Some id) println(id)
+                                  (None)    nil)
+                  (Ok (None))   println("no match")
+                  (Err err)     (do println(selector-error-message(err))
+                                    selector-error-release(err)))
+                dom-free(d))
+    (Err _) nil)
+  0
+```
+
+The grammar is Selectors Level 3 plus `:is()`, `:where()`, `:not()` with a
+list, `:nth-child(An+B of S)`, `:scope` and `:has()`. Anything else is a
+compile error that names it, never a selector that silently matches nothing:
+pseudo-elements, the dynamic and UI-state pseudo-classes (`:hover`,
+`:checked`, `:visited`, ...) that a parsed tree has no state for, `:lang()`
+and `:dir()`. Errors carry a byte offset into the selector.
+
+Three things differ from `find-all`:
+
+- **Namespaces.** An unprefixed type selector matches the *local* name in any
+  namespace (the CSS rule), where `find-all` matches the qualified name as
+  written. `atom:feed` is not a type selector at all -- the colon starts a
+  pseudo-class. Write `atom|feed` and declare the prefix with
+  `selector-compile-ns`, which takes `(prefix, URI)` pairs (the document's own
+  prefixes do not matter, only the URIs; the `""` prefix sets a default
+  namespace), or escape the colon, `atom\:feed`, to match the qualified name.
+- **Case.** XML compares everything case-sensitively.
+- **Scope.** Like `querySelectorAll`, `select-all` searches the root's
+  descendants but lets combinators look above it: `r e` from `<g>` finds the
+  `<e>` inside it even though `<r>` is outside the search.
+
+`:has()` is quadratic on the wrong input, so each query gives it a million
+candidate tests. Past that it answers false and `selector-gave-up?` says so;
+`query` and `query-one` return an `Err` instead of an incomplete answer.
+
+`node-css-path n` goes the other way: it returns a selector that picks
+exactly `n` (`tag:nth-child(k)` steps from the top, or from the nearest
+ancestor whose `id` is unique in the document), which makes "which node was
+that?" answerable in a log. A path only means something for the tree it was
+computed on.
+
 ### Serializing and comparing
 
 `dom-serialize` writes a node and its subtree back as XML: empty elements as

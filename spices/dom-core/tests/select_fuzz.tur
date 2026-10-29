@@ -1,0 +1,482 @@
+;; select_fuzz.tur -- differential fuzz for dom/select (xml-html-followups-plan
+;; follow-up C2): random selectors from a small grammar, run against random
+;; trees, compared with a deliberately naive matcher written here.
+;;
+;; A selector is generated as a value of `Sel`, rendered to text for the C
+;; engine, and evaluated directly by `naive?`, which follows the definitions
+;; left to right with no early-outs: `A B` is "n matches B and some ancestor
+;; matches A", `:nth-child(An+B)` counts the element siblings before n, and
+;; so on. Trees are built with dom/edit in both flavours. Every element of
+;; every tree is checked with node-matches-selector?, and select-all's count
+;; is checked against the oracle's. The seed is fixed, so a failure
+;; reproduces; it prints the selector and the tree.
+(defmodule dom_core_select_fuzz
+  (export)
+  (import dom/ownstr :refer [String to-cstr release])
+  (import dom/core
+    :refer
+    [Document
+     Node
+     dom-node
+     dom-free
+     dom-serialize
+     node-attr
+     node-name
+     node-parent
+     node-element?
+     node-prev-sibling
+     node-next-sibling
+     node-first-child
+     find-all])
+  (import dom/edit
+    :refer
+    [DomFlavor
+     XmlFlavor
+     HtmlFlavor
+     EditError
+     dom-new
+     create-element
+     create-text
+     node-append!
+     set-attr!])
+  (import dom/select
+    :refer
+    [Selector
+     SelectorError
+     selector-compile
+     selector-free
+     selector-error-message
+     selector-error-release
+     select-all
+     node-matches-selector?])
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-true])
+  (import test/runner :refer [run-all-status])
+  ;; ---- a small deterministic RNG ------------------------------------------------
+  ;;; __rng-seed -- internal: reset the generator.
+  (defn __rng-seed [s : int] : nil
+    ```c
+    /* __tur_include__: #include <stdint.h> */
+  /* __tur_include__: static uint64_t g_rng = 1; */
+  g_rng = (uint64_t)s * 2654435761u + 1;
+  ```)
+  ;;; rnd -- a pseudo-random integer in [0, n).
+  (defn rnd [n : int] : int
+    ```c
+    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17;
+  return (int64_t)(g_rng % (uint64_t)n);
+  ```)
+  ;;; pick -- one of five strings.
+  (defn pick [a : cstr b : cstr c : cstr d : cstr e : cstr] : cstr
+    (let [k (rnd 5)] (cond (= k 0) a (= k 1) b (= k 2) c (= k 3) d :else e)))
+  ;; ---- random trees -----------------------------------------------------------------
+  ;;; __must -- unwrap an edit result.
+  (defn __must [r : (Result Node EditError)] : Node
+    (match r (Ok n) n (Err _) (panic "edit failed")))
+  ;;; __done -- unwrap a nil edit result.
+  (defn __done [r : (Result nil EditError)] : nil
+    (match r (Ok _) nil (Err _) (panic "edit failed")))
+  ;;; __itoa -- a fresh decimal string (leaked; test only).
+  (defn __itoa [i : int] : cstr
+    ```c
+    char *b = (char *)malloc(24);
+  snprintf(b, 24, "%lld", (long long)i);
+  return b;
+  ```)
+  ;;; grow -- give `parent` up to `width` random children, `depth` levels down.
+  (defn grow [d : Document parent : Node depth : int width : int] : nil
+    (let [n      (rnd (+ width 1))
+          ^mut i 0]
+      (while (< i n)
+        (if (= (rnd 6) 0)
+          (__done (node-append! parent
+                    (__must (create-text d (pick "t" "" " " "x y" "z")))))
+          (let [el (__must (create-element d (pick "a" "b" "p" "div" "p")))]
+            (if (> (rnd 3) 0)
+              (__done (set-attr! el "id" (__itoa (rnd 40))))
+              nil)
+            (if (> (rnd 2) 0)
+              (__done (set-attr! el "class" (pick "x" "y" "x y" "y z" "")))
+              nil)
+            (if (= (rnd 3) 0)
+              (__done (set-attr! el "data-v" (pick "" "1" "12" "a b" "a-b")))
+              nil)
+            (__done (node-append! parent el))
+            (if (> depth 0) (grow d el (- depth 1) width) nil)))
+        (set! i (+ i 1)))))
+  ;;; random-doc -- a random tree under one root element.
+  (defn random-doc [html : bool] : Document
+    (let [d    (dom-new (if html (HtmlFlavor) (XmlFlavor)))
+          root (__must (create-element d "div"))]
+      (__done (node-append! (dom-node d) root))
+      (grow d root 4 4)
+      d))
+  ;; ---- selectors as data ------------------------------------------------------------
+  ;;; Sel -- a selector the generator can build and the oracle can read.
+  (defdata ^heap ^copy Sel
+    (SType cstr)
+    (SAny)
+    (SClass cstr)
+    (SId cstr)
+    (SAttr cstr int cstr) ;; name, op (0 exists 1 = 2 ~= 3 |= 4 ^= 5 $= 6 *=), value
+    (SNth int int bool bool) ;; a, b, from the end, of-type
+    (SEmpty)
+    (SRoot)
+    (SNot Sel)
+    (SIs Sel Sel)
+    (SAnd Sel Sel) ;; a compound: both
+    (SComb int Sel Sel)) ;; combinator (32 ' ', 62 '>', 43 '+', 126 '~'), left, right
+  ;;; gen-simple -- one simple selector.
+  (defn gen-simple [depth : int] : Sel
+    (let [k (rnd 11)]
+      (cond (= k 0) (SType (pick "a" "b" "p" "div" "i"))
+            (= k 1) (SAny)
+            (= k 2) (SClass (pick "x" "y" "z" "x" "w"))
+            (= k 3) (SId (__itoa (rnd 40)))
+            (= k 4) (SAttr (pick "data-v" "class" "id" "data-v" "title")
+                      (rnd 7)
+                      (pick "" "1" "a" "a b" "b"))
+            (= k 5) (SNth (- (rnd 5) 2)
+                      (- (rnd 6) 1)
+                      (= (rnd 2) 0)
+                      (= (rnd 2) 0))
+            (= k 6) (SEmpty)
+            (= k 7) (SRoot)
+            (= k 8) (if (> depth 0) (SNot (gen-complex (- depth 1))) (SAny))
+            (= k 9) (if (> depth 0)
+                      (SIs (gen-complex (- depth 1)) (gen-complex (- depth 1)))
+                      (SAny))
+            :else   (SType "p"))))
+  ;;; gen-compound -- one to three simple selectors together.
+  (defn gen-compound [depth : int] : Sel
+    (let [k (rnd 3)
+          a (gen-simple depth)]
+      (cond (= k 0) a
+            (= k 1) (SAnd a (gen-simple depth))
+            :else   (SAnd a (SAnd (gen-simple depth) (gen-simple depth))))))
+  ;;; gen-complex -- compounds joined by combinators.
+  (defn gen-complex [depth : int] : Sel
+    (let [n (rnd 3)]
+      (if (= n 0)
+        (gen-compound depth)
+        (__gen-chain depth n (gen-compound depth)))))
+  ;;; __gen-chain -- internal: extend `left` by n combinator steps.
+  (defn __gen-chain [depth : int n : int left : Sel] : Sel
+    (if (= n 0)
+      left
+      (let [k (rnd 4)
+            c (cond (= k 0) 32 (= k 1) 62 (= k 2) 43 :else 126)]
+        (__gen-chain depth (- n 1) (SComb c left (gen-compound depth))))))
+  ;; ---- rendering -----------------------------------------------------------------------
+  ;;; __buf-reset -- internal.
+  (defn __buf-reset [] : nil
+    ```c
+    /* __tur_include__: static char g_buf[16384]; */
+  g_buf[0] = '\0';
+  ```)
+  ;;; put -- append to the render buffer.
+  (defn put [s : cstr] : nil
+    ```c
+    strncat(g_buf, (const char *)s, sizeof g_buf - strlen(g_buf) - 1);
+  ```)
+  ;;; __buf -- internal.
+  (defn __buf [] : cstr
+    ```c
+    return g_buf;
+  ```)
+  ;;; __op-text -- internal: the attribute operator.
+  (defn __op-text [op : int] : cstr
+    (cond (= op 1) "="
+          (= op 2) "~="
+          (= op 3) "|="
+          (= op 4) "^="
+          (= op 5) "$="
+          :else    "*="))
+  ;;; __id-text -- internal: an id as CSS (`#\31 2` for "12").
+  (defn __id-text [id : cstr] : cstr
+    ```c
+    char *b = (char *)malloc(32);
+  snprintf(b, 32, "#\\%x %s", (unsigned)((const char *)id)[0], ((const char *)id) + 1);
+  return b;
+  ```)
+  ;;; render -- the selector as CSS text, into the buffer.
+  (defn render [s : Sel] : nil
+    (match s
+      (SType n)
+      (put n)
+      (SAny)
+      (put "*")
+      (SClass c)
+      (do (put ".") (put c))
+      (SId i)
+      (put (__id-text i))
+      (SAttr n op v)
+      (do
+        (put "[")
+        (put n)
+        (if (= op 0)
+          nil
+          (do (put (__op-text op)) (put "\"") (put v) (put "\"")))
+        (put "]"))
+      (SNth a b last typ)
+      (do
+        (put (if last
+               (if typ ":nth-last-of-type(" ":nth-last-child(")
+               (if typ ":nth-of-type(" ":nth-child(")))
+        (put (__itoa a))
+        (put "n")
+        (if (< b 0) nil (put "+"))
+        (put (__itoa b))
+        (put ")"))
+      (SEmpty)
+      (put ":empty")
+      (SRoot)
+      (put ":root")
+      (SNot x)
+      (do (put ":not(") (render x) (put ")"))
+      (SIs x y)
+      (do (put ":is(") (render x) (put ", ") (render y) (put ")"))
+      (SAnd x y)
+      (do (put "*") (render-in x) (render-in y))
+      (SComb c l r)
+      (do
+        (render l)
+        (put (cond (= c 32) " " (= c 62) " > " (= c 43) " + " :else " ~ "))
+        (render r))))
+  ;;; render-in -- a simple selector inside a compound (after a leading `*`).
+  (defn render-in [s : Sel] : nil
+    (match s
+      (SType n)
+      (do (put ":is(") (put n) (put ")"))
+      (SAny)
+      nil
+      (SAnd x y)
+      (do (render-in x) (render-in y))
+      (SComb c l r)
+      (do (put ":is(") (render s) (put ")"))
+      (SClass c)
+      (render s)
+      (SId i)
+      (render s)
+      (SAttr n op v)
+      (render s)
+      (SNth a b l t)
+      (render s)
+      (SEmpty)
+      (render s)
+      (SRoot)
+      (render s)
+      (SNot x)
+      (render s)
+      (SIs x y)
+      (render s)))
+  ;; ---- the naive oracle -------------------------------------------------------------------
+  ;;; __attr-test -- internal: one attribute operator over plain strings.
+  (defn __attr-test [op : int have : cstr want : cstr] : bool
+    ```c
+    const char *h = (const char *)have, *w = (const char *)want;
+  size_t hn = strlen(h), wn = strlen(w);
+  switch (op) {
+  case 1: return strcmp(h, w) == 0;
+  case 2: {
+    if (wn == 0 || strchr(w, ' ')) return false;
+    /* split have on spaces, compare each word */
+    const char *p = h;
+    while (*p) {
+      while (*p == ' ') p++;
+      const char *s = p;
+      while (*p && *p != ' ') p++;
+      if ((size_t)(p - s) == wn && strncmp(s, w, wn) == 0) return true;
+    }
+    return false;
+  }
+  case 3: return strcmp(h, w) == 0 || (hn > wn && strncmp(h, w, wn) == 0 && h[wn] == '-');
+  case 4: return wn > 0 && strncmp(h, w, wn) == 0;
+  case 5: return wn > 0 && hn >= wn && strcmp(h + hn - wn, w) == 0;
+  default: return wn > 0 && strstr(h, w) != NULL;
+  }
+  ```)
+  ;;; __name-is? -- internal: does element n have this name?
+  (defn __name-is? [n : Node name : cstr] : bool
+    (match (node-name n) (Some x) (__streq? x name) (None) false))
+  ;;; __streq? -- internal.
+  (defn __streq? [a : cstr b : cstr] : bool
+    ```c
+    return strcmp((const char *)a, (const char *)b) == 0;
+  ```)
+  ;;; parent-el -- the parent, when it is an element.
+  (defn parent-el [n : Node] : (Option Node)
+    (match (node-parent n)
+      (Some p)
+      (if (node-element? p) (Some p) (None))
+      (None)
+      (None)))
+  ;;; prev-el -- the previous element sibling.
+  (defn prev-el [n : Node] : (Option Node)
+    (match (node-prev-sibling n)
+      (Some p)
+      (if (node-element? p) (Some p) (prev-el p))
+      (None)
+      (None)))
+  ;;; next-el -- the next element sibling.
+  (defn next-el [n : Node] : (Option Node)
+    (match (node-next-sibling n)
+      (Some p)
+      (if (node-element? p) (Some p) (next-el p))
+      (None)
+      (None)))
+  ;;; same-name? -- internal: two elements with the same name.
+  (defn same-name? [a : Node b : Node] : bool
+    (match (node-name a) (Some x) (__name-is? b x) (None) false))
+  ;;; position -- 1 + the number of counted siblings on one side of n.
+  (defn position [n : Node x : (Option Node) last : bool typ : bool acc : int] : int
+    (match x
+      (None)
+      acc
+      (Some s)
+      (position n
+        (if last (next-el s) (prev-el s))
+        last
+        typ
+        (if (or (not typ) (same-name? s n)) (+ acc 1) acc))))
+  ;;; nth? -- is i = a*k + b for some k >= 0?
+  (defn nth? [a : int b : int i : int] : bool
+    (if (= a 0)
+      (= i b)
+      (let [d (- i b)] (and (= 0 (- d (* a (/ d a)))) (>= (/ d a) 0)))))
+  ;;; has-content? -- does n have an element child or non-empty text?
+  (defn has-content? [x : (Option Node)] : bool
+    (match x
+      (None)
+      false
+      (Some c)
+      (if (node-element? c)
+        true
+        (if (__text-nonempty? c) true (has-content? (node-next-sibling c))))))
+  ;;; __text-nonempty? -- internal: a text node with data.
+  (defn __text-nonempty? [n : Node] : bool
+    ```c
+    extern int turdom_kind(void *);
+  extern int64_t turdom_value_len(void *);
+  void *p = (void *)(intptr_t)n;
+  return (turdom_kind(p) == 2 || turdom_kind(p) == 4) && turdom_value_len(p) > 0;
+  ```)
+  ;;; some-ancestor? -- does some ancestor element satisfy sel?
+  (defn some-ancestor? [x : (Option Node) sel : Sel] : bool
+    (match x
+      (None)
+      false
+      (Some p)
+      (or (naive? sel p) (some-ancestor? (parent-el p) sel))))
+  ;;; some-prev? -- does some earlier element sibling satisfy sel?
+  (defn some-prev? [x : (Option Node) sel : Sel] : bool
+    (match x
+      (None)
+      false
+      (Some p)
+      (or (naive? sel p) (some-prev? (prev-el p) sel))))
+  ;;; naive? -- the reference matcher.
+  (defn naive? [s : Sel n : Node] : bool
+    (match s
+      (SType name)
+      (__name-is? n name)
+      (SAny)
+      true
+      (SClass c)
+      (match (node-attr n "class") (Some v) (__attr-test 2 v c) (None) false)
+      (SId i)
+      (match (node-attr n "id") (Some v) (__streq? v i) (None) false)
+      (SAttr name op v)
+      (match (node-attr n name)
+        (Some have)
+        (if (= op 0) true (__attr-test op have v))
+        (None)
+        false)
+      (SNth a b last typ)
+      (nth? a b (position n (if last (next-el n) (prev-el n)) last typ 1))
+      (SEmpty)
+      (not (has-content? (node-first-child n)))
+      (SRoot)
+      (match (node-parent n) (Some p) (not (node-element? p)) (None) false)
+      (SNot x)
+      (not (naive? x n))
+      (SIs x y)
+      (or (naive? x n) (naive? y n))
+      (SAnd x y)
+      (and (naive? x n) (naive? y n))
+      (SComb c l r)
+      (and (naive? r n)
+        (cond (= c 32) (some-ancestor? (parent-el n) l)
+              (= c 62) (match (parent-el n) (Some p) (naive? l p) (None) false)
+              (= c 43) (match (prev-el n) (Some p) (naive? l p) (None) false)
+              :else    (some-prev? (prev-el n) l)))))
+  ;; ---- the comparison ------------------------------------------------------------------------
+  ;;; __report -- internal: print a disagreement.
+  (defn __report [sel : cstr doc : cstr what : cstr] : nil
+    ```c
+    fprintf(stderr, "# DISAGREE (%s)\n#   selector: %s\n#   tree: %s\n", (const char *)what,
+          (const char *)sel, (const char *)doc);
+  ```)
+  ;;; count-naive -- elements of a list the oracle matches; reports a
+  ;;; disagreement with node-matches-selector? on any of them.
+  (defn count-naive [sel : Sel
+                     s : Selector
+                     ns : (Cons Node)
+                     acc : int
+                     bad : bool] : int
+    (if (tnil? ns)
+      (if bad (- 0 1) acc)
+      (let [n    (thead ns)
+            want (naive? sel n)
+            got  (node-matches-selector? n s)]
+        (count-naive sel
+          s
+          (ttail ns)
+          (if want (+ acc 1) acc)
+          (or bad (not (= want got)))))))
+  ;;; one-case -- one random selector against one tree; true when they agree.
+  (defn one-case [d : Document] : bool
+    (let [sel (gen-complex 2)]
+      (__buf-reset)
+      (render sel)
+      (match (selector-compile (__buf))
+        (Err e)
+        (do
+          (__report (__buf) (selector-error-message e) "did not compile")
+          (selector-error-release e)
+          false)
+        (Ok s)
+        (let [els  (find-all (dom-node d) "*")
+              want (count-naive sel s els 0 false)
+              got  (tlength (select-all (dom-node d) s))
+              ok   (= want got)]
+          (if ok
+            nil
+            (let [t (dom-serialize (dom-node d))]
+              (__report (__buf)
+                (to-cstr t)
+                (if (< want 0) "matches" "select-all count"))
+              (release t)))
+          (selector-free s)
+          ok))))
+  ;;; run-fuzz -- `docs` trees x `per` selectors; the disagreements.
+  (defn run-fuzz [seed : int docs : int per : int html : bool] : int
+    (__rng-seed seed)
+    (let [^mut i   0
+          ^mut bad 0]
+      (while (< i docs)
+        (let [d      (random-doc html)
+              ^mut j 0]
+          (while (< j per)
+            (if (one-case d) nil (set! bad (+ bad 1)))
+            (set! j (+ j 1)))
+          (dom-free d))
+        (set! i (+ i 1)))
+      bad))
+  (defn __all-tests [] : void
+    (describe "dom/select against a naive oracle"
+      (it "XML trees: 150 trees x 100 selectors agree"
+        (= 0 (run-fuzz 7 150 100 false)))
+      (it "HTML trees: 150 trees x 100 selectors agree"
+        (= 0 (run-fuzz 11 150 100 true)))))
+  (defn main [] : int (__all-tests) (run-all-status))) ;; end defmodule dom_core_select_fuzz
