@@ -127,6 +127,15 @@ void turlive_html_set(turlive_html *h, int64_t i, int64_t state, const char *s) 
     h->str[i] = xdup(s);
 }
 
+/* turlive_html_set for a malloc'd string the snapshot takes over (a content
+ * hole's child-markup), instead of copying it. */
+void turlive_html_take(turlive_html *h, int64_t i, int64_t state, char *s) {
+    if (!h || i < 0 || i >= h->n) { free(s); return; }
+    free(h->str[i]);
+    h->state[i] = (int)state;
+    h->str[i] = s;
+}
+
 void turlive_html_free(turlive_html *h) {
     if (!h) return;
     for (int64_t i = 0; i < h->n; i++) free(h->str[i]);

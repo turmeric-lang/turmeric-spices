@@ -22,8 +22,8 @@
   constructor calls building an `Html` tree (`HElem`, `HRawText`, `HText`,
   `HRaw`, `HList`, `HFragment`); `hiccup->string` renders it, byte for byte
   as `#html{...}` renders the same markup. Its opaque field types are
-  `HTag`, `HAttrName`, `HAttr` and `HRawBody` (type names are global, and
-  dom/event already has an `Attr`). An `Html` goes in an `#html{...}` hole
+  `Tag`, `AttrName`, `Attr` and `RawBody` (a module importing dom/event's
+  `Attr` too refers the one it means). An `Html` goes in an `#html{...}` hole
   through `ToChild Html`. The literal checks names, void elements, a
   second id, bare `{...}` attribute maps, dynamic `on*`/`style`/`srcdoc`
   values and `<script>`/`<style>` bodies, and nesting the HTML parser would

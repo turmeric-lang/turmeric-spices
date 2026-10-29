@@ -100,7 +100,7 @@ defn main [] : int
 | `html/edit` | `set-inner-html!`, `node-inner-html`, `node-outer-html` |
 | `html/sax` | `HtmlSaxParser`, `html-sax-parse-string`, `html-sax-parse-string-opts`, `html-sax-parser-new`, `html-sax-parser-new-opts`, `html-sax-feed!`, `html-sax-finish!`, `html-sax-parser-free` |
 | `html/transform` | `html-sax-transform`, `html-sax-transform-opts` |
-| `html/hiccup` | `Html` (`HElem` `HRawText` `HText` `HRaw` `HList` `HFragment` `HComment` `HCdata` `HPi`), `HTag`, `HAttrName`, `HAttr`, `HRawBody`, `HCommentBody`, `HCdataBody`, `HPiBody`, `hiccup`, `hiccup->string`, `hiccup->xml-string`, `hiccup->dom`, `hiccup->xml-dom`, `node->hiccup`, `tag`, `tag-name`, `attr-name`, `attr`, `attr-on`, `attr-name-of`, `attr-value`, `comment`, `cdata`, `pi` and their readers (and the internals the macro expands to) |
+| `html/hiccup` | `Html` (`HElem` `HRawText` `HText` `HRaw` `HList` `HFragment` `HComment` `HCdata` `HPi`), `Tag`, `AttrName`, `Attr`, `RawBody`, `CommentBody`, `CdataBody`, `PiBody`, `hiccup`, `hiccup->string`, `hiccup->xml-string`, `hiccup->dom`, `hiccup->xml-dom`, `node->hiccup`, `tag`, `tag-name`, `attr-name`, `attr`, `attr-on`, `attr-name-of`, `attr-value`, `comment`, `cdata`, `pi` and their readers (and the internals the macro expands to) |
 | `html/markup` | `html*` (the macro behind `#html{...}`), `html-render`, `html-raw-fix`; the literal's types and opt-outs are dom-core's `dom/holes` |
 
 The [HTML guide](../../docs/guides/html-guide.md) covers both, the tree's
