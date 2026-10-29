@@ -299,5 +299,5 @@ kind, and the R fits above.
 
 ## See also
 
-- [stats-formula plan](https://github.com/turmeric-lang/turmeric/blob/main/docs/upcoming/spices/stats-formula-plan.md)
+- [stats-formula plan](https://github.com/turmeric-lang/turmeric/blob/main/docs/archive/stats-formula-plan.md)
 - [tur-frame guide](frame-guide.md)
