@@ -32,10 +32,12 @@ turmeric's [Emscripten spice audit](https://github.com/turmeric-lang/turmeric/bl
 | [`tur-plot`](spices/plot/) | 2D data visualization (functions, points, histograms, contours) | 1 | ✅ | ✅ | ✅ | ✅ | tur-plutovg |
 | [`tur-crdt`](spices/crdt/) | Conflict-free replicated data types: counters, sets, registers, maps and a replicated sequence, over a join-semilattice, with delta-state mutators | 1 | ✅ | ✅ | ✅ | ✅ | -- |
 | [`tur-tourist-ws`](spices/tourist-ws/) | WebSocket routes for the tur-tourist framework (ws-route!) | 1 | ✅ | ✅ | ❌ | ❌ | tur-tourist, tur-ws-server, tur-httpd, tur-json |
-| [`tur-linalg`](spices/linalg/) | Dense float linear algebra: matrices, vectors, Cholesky/LU/QR solvers, mat4 graphics helpers | 2 | ✅ | ✅ | ✅ | ✅ | -- |
+| [`tur-linalg`](spices/linalg/) | Dense float linear algebra: matrices, vectors, Cholesky/LU/QR/SVD/eigen, CG/BiCGSTAB, optional BLAS/LAPACK backend, mat4 graphics helpers | 2 | ✅ | ✅ | ✅ | ✅ | BLAS/LAPACK (optional) |
+| [`tur-linalg-sparse`](spices/linalg-sparse/) | Sparse float matrices: CSR/CSC, SpMV, ILU(0), sparse CG/BiCGSTAB | 2 | ✅ | ✅ | ✅ | ✅ | tur-linalg |
 | [`tur-scscm`](spices/scscm/) | scscm s-expression -> sclang compiler, tested against scsynth and hcsynth ([guide](docs/guides/scscm-guide.md)) | 2 | ✅ | ✅ | ⚠️ | ⚠️ | -- |
 | [`tur-tidal`](spices/tidal/) | Tidal-like mini-notation -> Pbind/event text | 2 | ✅ | ✅ | ✅ | ✅ | -- |
 | [`tur-stats`](spices/stats/) | Statistical analysis on dataframes (summary, distributions, hypothesis tests, OLS, resampling) | 2 | ✅ | ✅ | ✅ | ✅ | -- |
+| [`tur-stats-multivariate`](spices/stats-multivariate/) | Multivariate statistics: covariance matrices, PCA, factor analysis, multivariate OLS, Hotelling T^2 / MANOVA, LDA | 2 | ✅ | ✅ | ✅ | ✅ | tur-linalg, tur-stats |
 | [`tur-ansi`](spices/ansi/) | ANSI terminal control, raw-mode key input, color, style, inline images (Kitty/iTerm2/sixel) | 2 | ✅ | ✅ | ⚠️ | ⚠️ | -- |
 | [`tur-tourist-session`](spices/tourist-session/) | Swappable-store session middleware for tur-tourist (memory + file stores) | 2 | ✅ | ✅ | ❌ | ❌ | tur-tourist, tur-httpd |
 | [`tur-ecs`](spices/ecs/) | Entity-Component-System for Turmeric. E1 surface: dense + sparse + tag storages, variadic-looking for-each (up to 8 components) over the row-typed Query value, with/without tag filters, defquery + run-query! functional surface | 2 | ✅ | ✅ | ✅ | ✅ | -- |

@@ -12,6 +12,10 @@ linear systems, computing decompositions, and using the graphics helpers.
 4. [Graphics transforms](#4-graphics-transforms)
 5. [Memory model](#5-memory-model)
 6. [Numerical accuracy and limitations](#6-numerical-accuracy-and-limitations)
+7. [SVD and eigendecomposition](#7-svd-and-eigendecomposition)
+8. [Iterative solvers](#8-iterative-solvers)
+9. [Sparse matrices](#9-sparse-matrices)
+10. [The BLAS/LAPACK backend](#10-the-blaslapack-backend)
 
 ---
 
@@ -389,19 +393,235 @@ the duration of the calling expression:
 
 ### Matrix sizes
 
-The pure Turmeric implementations are suitable for small to medium matrices
-(typically up to a few hundred elements). For very large matrices or
-production numerical work, consider:
+The numeric kernels run in C over the matrix buffers, and since v0.2
+`mat-mul` is cache-blocked (a 512x512 product takes on the order of 100 ms).
+For larger work:
 
-1. Using a specialized numerical library
-2. Adding a BLAS/LAPACK backend (planned for v0.2)
-3. Using iterative methods for sparse systems
+1. Build with the optional BLAS/LAPACK backend ([section 10](#10-the-blaslapack-backend))
+2. Use the iterative solvers for large SPD or diagonally dominant systems
+   ([section 8](#8-iterative-solvers))
+3. Store mostly-zero matrices in `tur-linalg-sparse` ([section 9](#9-sparse-matrices))
 
 ### Tolerances
 
 - Cholesky and LU check for zero pivots with tolerance 1e-12
 - `vec-normalize` rejects zero vectors with norm < 1e-6
 - `mat-approx-eq?` and `vec-approx-eq?` accept a user-specified tolerance
+
+---
+
+## 7. SVD and eigendecomposition
+
+Added in v0.2. Both live in `linalg/decomp`; the SVD helpers live in
+`linalg/solve`.
+
+### Singular value decomposition
+
+`svd` factors any m x n matrix, tall or wide, as `A = U diag(s) Vt`. `U` is
+m x m and `Vt` is n x n, both orthogonal; `s` holds the min(m, n) singular
+values in descending order. It never fails. The pure path uses one-sided
+(Hestenes) Jacobi rotations, which is accurate to high relative precision
+but costs O(m n^2) per sweep, so it suits matrices up to a few hundred on a
+side. The BLAS backend routes it to LAPACK's `dgesdd`.
+
+```turmeric
+(import linalg/mat :refer [mat-of mat-free])
+(import linalg/vec :refer [la-vec-of la-vec-get la-vec-free])
+(import linalg/decomp :refer [svd svd-free])
+(import linalg/solve :refer [svd-solve svd-rank svd-condition svd-project])
+
+(let [a (mat-of 3 2 1.0 2.0 2.0 4.0 3.0 6.0)   ; rank 1
+      b (la-vec-of 1.0 2.0 3.0)
+      f (svd a)
+      x (svd-solve f b)]                        ; minimum-norm least squares
+  (println (svd-rank f 0.0))                    ; 1
+  (println (la-vec-get x 0))                    ; 0.2
+  (la-vec-free x)
+  (svd-free f)
+  (la-vec-free b)
+  (mat-free a))
+```
+
+- `svd-rank f tol` counts the singular values above `tol`; a `tol <= 0`
+  uses the LAPACK/numpy cutoff `max(m, n) * eps * s[0]`.
+- `svd-solve f b` minimizes `||A x - b||` and, among the minimizers, `||x||`,
+  keeping only the singular values above that cutoff. It handles
+  over-determined, under-determined and rank-deficient systems.
+- `svd-condition f` is `s[0] / s[k-1]` (infinite for an exactly singular A).
+- `svd-project f b` is the orthogonal projection of `b` onto A's column space.
+
+### Symmetric eigendecomposition
+
+`eigen-sym` returns `(Result eigenfac cstr)`: `Err` when the matrix is not
+square or not symmetric, otherwise the eigenvalues in ascending order
+(`vals`) and the matching unit eigenvectors as the columns of `vecs`, each
+signed so its largest-magnitude component is positive. The pure path uses
+cyclic Jacobi rotations; the BLAS backend uses `dsyev`.
+
+```turmeric
+(import linalg/decomp :refer [eigen-sym eigen-free])
+
+(match (eigen-sym (mat-of 2 2 2.0 1.0 1.0 2.0))
+  (Ok f)  (do (println (la-vec-get (.vals f) 0))   ; 1
+              (println (la-vec-get (.vals f) 1))   ; 3
+              (eigen-free f))
+  (Err e) (println e))
+```
+
+### Small matrices
+
+`linalg/small` gained `mat2-mul`, `mat2-inv`, `mat3-mul`, `mat3-inv` and
+`mat3-normal-mat`, the transpose of the inverse of a `mat4`'s upper-left 3x3
+block -- the matrix that carries surface normals under a model transform.
+
+---
+
+## 8. Iterative solvers
+
+`linalg/iter` (v0.2) solves A x = b without factoring A: conjugate gradient
+for symmetric positive-definite A, BiCGSTAB for any non-singular A. Both
+start from x = 0 and stop when the residual `||b - A x||` drops below the
+tolerance or the iteration limit is reached. They return an `IterResult`
+that owns the solution:
+
+| Field | Meaning |
+|---|---|
+| `x` | the solution, or the last iterate if it did not converge |
+| `iters` | iterations used |
+| `residual` | `||b - A x||` of the returned `x` |
+| `converged` | `true` when `residual < tol` |
+
+```turmeric
+(import linalg/iter :refer [iter-opts iter-opts-default cg cg-free bicgstab bicgstab-free
+                            jacobi-precond])
+
+(let [r (cg a b (iter-opts 500 1e-10 false))]   ; max-iters, tol, verbose
+  (when (not (.converged r))
+    (println "cg did not converge"))
+  (println (.iters r))
+  (cg-free r))
+```
+
+`(iter-opts-default)` is 1000 iterations at tolerance 1e-10; set `verbose` to
+print each iteration's residual to stderr. `jacobi-precond` returns the
+reciprocals of A's diagonal, the vector a diagonal preconditioner applies.
+
+---
+
+## 9. Sparse matrices
+
+`tur-linalg-sparse` is a separate spice for matrices that are mostly zeros.
+It reuses linalg's `lavec` for vectors and `linalg/iter`'s `IterOpts` /
+`IterResult` for its solvers.
+
+Assemble a matrix as a coordinate list, then compress it. Entries may be
+pushed in any order; a repeated (row, col) is summed:
+
+```turmeric
+(import linalg-sparse/csr :refer [coo-new coo-push! coo-free csr-from-coo csr-free
+                                  csr-get csr-spmv])
+
+(let [c (coo-new 3 3)]
+  (coo-push! c 0 0 2.0)
+  (coo-push! c 0 1 -1.0)
+  (coo-push! c 1 1 1.5)
+  (coo-push! c 1 1 0.5)                 ; summed: (1, 1) = 2.0
+  (let [m (csr-from-coo c)]
+    (println (csr-get m 1 1))           ; 2
+    (println (csr-get m 2 0))           ; 0 -- not stored
+    (csr-free m)
+    (coo-free c)))
+```
+
+| Module | What it has |
+|---|---|
+| `linalg-sparse/csr` | `coomat` builder, `csrmat`, `csr-get`, `csr-spmv` (A v) |
+| `linalg-sparse/csc` | `cscmat`, `csc-get`, `csc-spmv` (A' v), `csc-from-csr`, `csr-from-csc`, `csc-transpose` |
+| `linalg-sparse/ops` | `csr-scale`, `csr-add` (union of patterns), `csr-transpose`, dense conversion both ways |
+| `linalg-sparse/solve` | `ilu0`, `ilu-apply`, `sparse-cg`, `sparse-bicgstab` |
+| `linalg-sparse/fmt` | `csr->str`, `csr-print`, `csc->str` -- `(row, col) value` lines |
+
+Transposition is cheap: the CSR buffers of A are exactly the CSC buffers of
+A', so `csr-transpose` and `csc-transpose` copy rather than re-sort.
+Changing the storage of the *same* matrix (`csc-from-csr`) is a counting
+sort, O(nnz + rows + cols).
+
+`sparse-cg` and `sparse-bicgstab` take the same options as the dense
+solvers but multiply through the CSR buffers, so one iteration costs
+O(nnz) and A is never densified. Free their result with
+`iter-result-free`:
+
+```turmeric
+(import linalg/iter :refer [iter-opts iter-result-free])
+(import linalg-sparse/solve :refer [sparse-cg])
+
+(let [r (sparse-cg a b (iter-opts 200 1e-10 false))]
+  (println (.iters r))       ; a 100x100 1D Laplacian takes about 100
+  (iter-result-free r))
+```
+
+`ilu0` is the incomplete LU factorization with zero fill-in: L (unit lower)
+and U keep A's sparsity pattern exactly, and `ilu-apply f r` solves
+`L U z = r`. It returns `(Result ilufac cstr)`, with `Err` for a non-square
+matrix or a missing or zero diagonal pivot. On a matrix with no fill to
+drop -- a tridiagonal one, say -- it is the exact LU.
+
+---
+
+## 10. The BLAS/LAPACK backend
+
+`tur-linalg` can route its dense hot paths to a system BLAS/LAPACK. The
+public API does not change and nothing else is affected: the backend is
+compiled in only when the consuming project asks for it, and a build without
+it references no BLAS symbol at all.
+
+| Turmeric function | Backend routine |
+|---|---|
+| `mat-mul` | `cblas_dgemm` |
+| `mat-mul-vec` | `cblas_dgemv` |
+| `chol` | `dpotrf` |
+| `lu` | `dgetrf` |
+| `qr` | `dgeqrf` + `dorgqr` |
+| `svd` | `dgesdd` |
+| `eigen-sym` | `dsyev` |
+
+To turn it on, define `TUR_LINALG_BLAS` and link a BLAS/LAPACK from your
+project's `build.tur`:
+
+```turmeric
+;; Linux, with libopenblas-dev (or any library providing cblas_* and LAPACK)
+:build-opts #map{:c-flags   ["-DTUR_LINALG_BLAS=1"]
+                 :link-libs ["openblas"]}
+
+;; macOS -- the system Accelerate framework
+:build-opts #map{:c-flags    ["-DTUR_LINALG_BLAS=1"]
+                 :link-flags ["-framework Accelerate"]}
+```
+
+The backend calls LAPACK's Fortran entry points (`dpotrf_` and so on) and
+declares their prototypes itself, so it needs no `cblas.h` or `lapacke.h`
+on any include path; OpenBLAS, MKL's compatibility layer, reference
+BLAS/LAPACK and Accelerate all provide those symbols. It assumes the
+default 32-bit LAPACK integer (an ILP64 build of OpenBLAS will not work).
+
+`(linalg-blas?)` (in `linalg/mat`) reports whether the backend is active.
+Setting the environment variable `TUR_LINALG_NO_BLAS` to a non-empty value
+switches it off at run time without a rebuild -- handy for comparing the two
+paths. The results agree to about 12 significant figures, with two
+differences to expect:
+
+- SVD singular vectors may differ in sign (any sign is a valid SVD);
+  singular values agree.
+- Pivoting, Householder sign and eigenvector sign conventions are the same
+  as the pure kernels, so `lu`, `qr` and `eigen-sym` factors match entry by
+  entry.
+
+The cache-blocked pure `mat-mul` uses 64 x 64 tiles. Override that at build
+time with `:c-flags ["-DTUR_LINALG_BLOCK=32"]`.
+
+The spice's `fixtures/run.sh` builds the linalg test suite against the
+backend, checks each routed operation against the pure kernels, and times
+the 512x512 multiply both ways.
 
 ---
 
