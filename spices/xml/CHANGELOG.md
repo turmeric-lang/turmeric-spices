@@ -8,6 +8,10 @@
   markup literals, the XML counterpart of tur-html's `#html{...}`, checked
   once with expat on first render. `xml*` is the macro behind it.
 - `errors/run.sh`: the compile-error table for `#xml{...}` holes.
+- Tests for dom-core's `dom/select` over parsed XML (`tests/select.tur`): the
+  web-platform-tests `querySelectorAll` table run against WPT's XHTML version
+  of its document (`tests/data/wpt-selectors/`), namespace prefixes and
+  defaults, and `node-css-path` round trips.
 
 ## 0.2.0
 

@@ -23,6 +23,11 @@ its modules are what you import to read what they produce:
   `ToChild` / `ToAttr` / `ToUrlAttr` classes, `Fragment`, the `raw-html`
   and `trusted-url` opt-outs and the URL scheme check (`url-safe`).
   `dom/markupc` is the literals' compile-time context tokenizer.
+- `dom/select` -- CSS selectors: `selector-compile`, then `select-all`,
+  `select-first`, `node-matches-selector?` and `node-closest`
+  (`querySelectorAll`, `querySelector`, `matches`, `closest`); `query` and
+  `query-one` for a one-off; `node-css-path` for a selector that picks
+  exactly one element.
 - `dom/event` -- `SaxEvent`, `SaxControl` and `Attr`: the event stream both
   SAX front doors deliver.
 - `dom/ownstr` -- `String`, the owned string type events and `node-text` hand
@@ -150,6 +155,19 @@ defn main [] : int
   0
 ```
 
+## Selectors
+
+`dom/select` runs CSS selectors -- Selectors Level 3 plus `:is()`,
+`:where()`, `:not(<list>)`, `:nth-child(An+B of S)`, `:scope` and `:has()` --
+over a tree from either parser, with the HTML case rules on an HTML document.
+A construct it does not support is a compile error naming it, never a
+selector that silently matches nothing. The engine is
+`c/dom/turdom_select.c`; it is tested against the web-platform-tests
+`querySelectorAll` table (in tur-html and tur-xml) and against a naive
+matcher on random trees (`tests/select_fuzz.tur`). The
+[XML guide](../../docs/guides/xml-guide.md#css-selectors) has the details:
+namespaces, scope, the `:has()` budget and `node-css-path`.
+
 ## Streaming writes
 
 `dom/writer` is the streaming counterpart: a `SaxWriter` turns `SaxEvent`s
@@ -176,6 +194,7 @@ released. `sax-keep` is the identity.
 | `dom/event` | `SaxEvent` (`StartElement` `EndElement` `Chars` `Comment` `Pi` `StartCdata` `EndCdata` `Doctype`), `SaxControl` (`Continue` `Stop`), `Attr`, `attrs-get`, `sax-event-release`, `sax-event-retain`, `sax-dispatch` |
 | `dom/holes` | `Fragment`, `XmlFragment`, `RawHtml`, `TrustedUrl`, `Child` (`ChildText` `ChildHtml` `ChildXml` `ChildRaw` `ChildEmpty`), `AttrVal` (`AttrText` `AttrTrusted` `AttrOn` `AttrOff`), `Hole` (`HoleChild` `HoleAttr`), `raw-html`, `raw-html-markup`, `trusted-url`, `url-safe`, `srcset-check`, `html->string`, `xml->string`, `fragment-free`, `xml-fragment-free`, `hole-child`, `hole-attr`, `render-template`, `template-checked?`, `template-check-markup`, `template-verify`, `template-parent`; the class methods `to-child`, `to-attr`, `to-url-attr` are ambient |
 | `dom/markupc` | `markup-expand` (macro time only; import it `:for-macros`) |
+| `dom/select` | `Selector`, `SelectorError`, `selector-error-message`, `selector-error-release`, `selector-compile`, `selector-compile-ns`, `selector-free`, `selector-gave-up?`, `select-all`, `select-first`, `node-matches-selector?`, `node-closest`, `query`, `query-one`, `node-css-path` |
 | `dom/writer` | `SaxWriter`, `WriteError` (`Rejected` `IoFailed`), `write-error-message`, `TransformError` (`InputError` `OutputError`), `transform-error-message`, `transform-error-release`, `sax-writer-new`, `sax-writer-to-file`, `sax-write!`, `sax-write-all!`, `sax-writer-finish!`, `sax-writer-free`, `sax-transform-handler`, `sax-keep` |
 | `dom/ownstr` | `String`, `from-cstr`, `adopt-cstr`, `to-cstr`, `retain`, `release`, `str-len`, `string=?` |
 

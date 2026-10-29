@@ -35,6 +35,33 @@
   `attr-state` and `attr-raw` for tur-html's live literals).
 - `c/dom/turmarkup.c`, a third `:c-source`: escaping, the URL check, the
   template walk and the per-literal check cache.
+- `dom/select` (xml-html-followups-plan follow-up C): CSS selectors over
+  any tree. `selector-compile` / `selector-compile-ns` (namespace prefixes,
+  and a default namespace under the `""` prefix) give a `Selector` or a
+  `SelectorError` with a byte offset; `select-all`, `select-first`,
+  `node-matches-selector?` and `node-closest` run it with
+  `querySelectorAll` / `querySelector` / `matches` / `closest` semantics;
+  `query` and `query-one` compile, run and free in one call; `selector-free`.
+  The grammar is Selectors Level 3 plus `:is()`, `:where()`, `:not(<list>)`,
+  `:nth-child(An+B of S)`, `:scope` and `:has()`. Pseudo-elements, the
+  dynamic and UI-state pseudo-classes, `:lang()` and `:dir()` are compile
+  errors that name the construct, never selectors that silently match
+  nothing. HTML documents follow the HTML case rules.
+- `:has()` gets a budget of a million candidate tests per query; past it the
+  `:has()` answers false, `selector-gave-up?` reports it, and `query` /
+  `query-one` return an Err.
+- `node-css-path`: a selector that picks exactly one element
+  (`tag:nth-child(k)` steps from the top, or from the nearest ancestor with a
+  unique `id`).
+- The engine is `c/dom/turdom_select.c`, a second `:c-source` (declared in
+  `turdom.h`). Neither parsing nor matching recurses on the document's depth.
+- Tests: `fixtures/c/select_test.c` (under ASan/UBSan), and
+  `tests/select_fuzz.tur`, a differential fuzz against a naive matcher
+  written in Turmeric. tur-html and tur-xml run the web-platform-tests
+  `querySelectorAll` table over the HTML and XHTML versions of its document.
+
+The plan named the query function `select`; that name is a reserved form
+(channel `select`), so it is `select-all`.
 
 ### Changed
 

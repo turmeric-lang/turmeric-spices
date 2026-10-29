@@ -23,6 +23,7 @@ what is particular to HTML.
 6. [Tokenizer events](#6-tokenizer-events)
 7. [Options, files and encodings](#7-options-files-and-encodings)
 8. [Editing and token-level transforms](#8-editing-and-token-level-transforms)
+9. [CSS selectors](#9-css-selectors)
 10. [Markup literals](#10-markup-literals)
 11. [Hiccup: markup as a value](#11-hiccup-markup-as-a-value)
 
@@ -237,6 +238,73 @@ things to know:
 For input too large to hold, plug `dom/writer`'s `sax-transform-handler` into
 `html-sax-parser-new`, with a writer from `sax-writer-to-file`, and feed the
 input in chunks.
+
+---
+
+## 9. CSS selectors
+
+`tur-dom-core`'s `dom/select` runs CSS selectors over a parsed page; the
+[XML guide](xml-guide.md#css-selectors) has the API. On an HTML document it
+follows the HTML rules: type selectors and attribute names ignore ASCII case
+on HTML elements (`DIV` finds `<div>`, but `foreignobject` does not find SVG's
+`<foreignObject>`), and so do the values of the attributes HTML lists as
+case-insensitive (`[type=TEXT]` finds `type="text"`; the `s` flag turns that
+off). `#id` and `.class` are case-sensitive, as in a no-quirks document --
+dom-core does not record quirks mode, so every document is treated as
+no-quirks.
+
+```turmeric
+(import dom/core   :refer [Node dom-node dom-free node-text])
+(import dom/ownstr :refer [to-cstr release])
+(import dom/select :refer [query])
+(import html/dom   :refer [html-parse])
+
+(defn print-texts [ns : (Cons Node)] : nil
+  (if (tnil? ns)
+    nil
+    (let [t (node-text (thead ns))]
+      (println (to-cstr t))
+      (release t)
+      (print-texts (ttail ns)))))
+
+(defn main [] : int
+  (let [d (html-parse "<ul><li class=done>a<li>b<li class=done>c</ul>")]
+    (match (query (dom-node d) "li:not(.done)")
+      (Ok ns) (print-texts ns)
+      (Err _) nil)
+    (dom-free d))
+  0)
+```
+
+```sweet-exp
+#lang sweet-exp
+import dom/core   :refer [Node dom-node dom-free node-text]
+import dom/ownstr :refer [to-cstr release]
+import dom/select :refer [query]
+import html/dom   :refer [html-parse]
+
+defn print-texts [ns : (Cons Node)] : nil
+  if tnil?(ns)
+    nil
+    let [t node-text(thead(ns))]
+      println $ to-cstr t
+      release(t)
+      print-texts $ ttail ns
+
+defn main [] : int
+  let [d html-parse("<ul><li class=done>a<li>b<li class=done>c</ul>")]
+    (match query(dom-node(d) "li:not(.done)")
+      (Ok ns) print-texts(ns)
+      (Err _) nil)
+    dom-free(d)
+  0
+```
+
+The engine is checked against the
+[web-platform-tests](https://github.com/web-platform-tests/wpt) table that
+browsers' `querySelectorAll` is tested with (`tests/select.tur` here; the
+XHTML run is tur-xml's), and against a naive reference matcher on random
+trees (dom-core's `tests/select_fuzz.tur`).
 
 ---
 

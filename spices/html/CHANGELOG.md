@@ -61,6 +61,10 @@
 - `html-raw-fix` (html/markup): the raw-html fixer both renderers use.
 - `errors/run.sh`: the compile-error tables for `#html{...}` holes and
   `hiccup` literals.
+- Tests for dom-core's `dom/select` over parsed HTML (`tests/select.tur`):
+  the web-platform-tests `querySelectorAll` table (`tests/data/wpt-selectors/`,
+  vendored with its licence and commit) in the document, detached-element and
+  in-document-element contexts, and `node-css-path` round trips.
 
 ## 0.2.0
 
