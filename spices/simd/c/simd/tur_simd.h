@@ -65,11 +65,12 @@ typedef struct { uint16_t v[8]; }  u16x8;
 #endif
 
 /* Every generator macro below takes the functions' whole name prefix (`F`,
- * e.g. simd_u8x16) rather than pasting it together from the type name:
- * c2mir's preprocessor mis-lexes a `##` operand that starts with `u8` (a
- * u8"..." string prefix to it) -- `u8 ## x` comes out as the number 88x, and
- * simd_##u8x16##_load as an undeclared name (turmeric
- * docs/reported/c2mir-paste-of-u8-prefixed-token.md). */
+ * e.g. simd_u8x16) rather than pasting it together from the type name: c2mir
+ * before turmeric-lang/mir#19 lexed every identifier starting `u8` as `88...`
+ * -- `u8 ## x` came out as the number 88x, and simd_##u8x16##_load as an
+ * undeclared name.  Fixed on turmeric main (turmeric
+ * docs/archive/c2mir-paste-of-u8-prefixed-token.md); the header keeps
+ * clear of it so a tur built before that still compiles it under `tur jit`. */
 
 /* The lanewise binary operations, for one type.  `L` is its lane count. */
 #if TUR_SIMD_VECTOR_EXT

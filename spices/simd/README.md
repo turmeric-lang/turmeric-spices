@@ -104,11 +104,11 @@ per element, best of five:
    horizontal sum. Nothing needed `shuffle` or masks; `min`/`max`/`div` are
    in the header unused by a kernel.
 
-Two toolchain issues found on the way, reported in turmeric:
-`docs/reported/c2mir-paste-of-u8-prefixed-token.md` (c2mir's preprocessor
-mis-lexes `u8 ## x`, so the header never pastes a type name) and
-`docs/reported/jit-ignores-spice-c-includes.md` (`tur jit` does not pass a
-spice's `:c-includes` to c2mir, so these tests fall back to cc under it).
+Two toolchain issues found on the way: c2mir lexed identifiers starting `u8`
+as `88...`, so the header never pastes a type name (already fixed on turmeric
+`main`: `docs/archive/c2mir-paste-of-u8-prefixed-token.md`); and `tur jit`
+does not pass a spice's `:c-includes` to c2mir, so these tests fall back to cc
+under it (`docs/reported/jit-ignores-spice-c-includes.md`).
 
 ## Running
 
