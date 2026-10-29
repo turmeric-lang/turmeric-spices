@@ -1,0 +1,443 @@
+;;; formula/expand -- turn a parsed right-hand side into a flat list of
+;;; model terms, as R's `terms()` does.
+;;;
+;;; A term is a set of variables: `x1` is the one-variable term {x1}, `x1:x2`
+;;; the interaction {x1, x2}. The operators expand as R's do:
+;;;
+;;;   a + b     terms of a, then the terms of b not already present
+;;;   a : b     every union of a term of a with a term of b
+;;;   a * b     a + b + a:b
+;;;   a / b     a + (all variables of a):b      -- `(a + b)/c` is a + b + a:b:c
+;;;   a ^ n     a * a * ... (n times)            -- `(a + b + c)^2` stops at
+;;;                                               two-way interactions
+;;;   a - b     the terms of a that are not terms of b
+;;;   - 1, + 0  no intercept;  + 1, - 0  intercept (the default)
+;;;
+;;; A variable crossed with itself is itself (`x:x` is `x`), so `x^2` is just
+;;; `x`, exactly as in R: a squared predictor is written `I(x^2)`.
+;;;
+;;; The variables of a term are kept in the order they first appear in the
+;;; formula, and the terms are ordered by how many variables they have --
+;;; main effects, then two-way interactions, ... -- each group in the order
+;;; it was written. A term that contains the response is dropped.
+;;;
+;;; Since: 0.1.0
+;; Term expansion.
+(load "stdlib/str-build.tur")
+
+(defmodule formula/expand
+  (export Term
+    term-label
+    term-variables
+    term-order
+    Expansion
+    formula-expand
+    expansion-response
+    expansion-variables
+    expansion-variable
+    expansion-terms
+    expansion-labels
+    expansion-intercept?)
+  (import formula/seq
+    :refer
+    [seq-reverse seq-map seq-foldl seq-length seq-append seq->carrier])
+  (import formula/text :refer [text-len text-byte text-sub text-eq?])
+  (import formula/ast
+    :refer
+    [Expr
+     ECol
+     Formula
+     FVar
+     FIntercept
+     FSum
+     FDiff
+     FNeg
+     FCross
+     FInteract
+     FNest
+     FPower
+     Lhs
+     OneSided
+     Response
+     ParsedFormula
+     parsed-formula-response
+     expr->string])
+  ;;; Term -- one model term: its label (`x1`, `x1:x2`, `I(x^2):g`) and its
+  ;;; variables' labels, in formula order.
+  ;;; Since: 0.1.0
+  (defdata ^heap ^copy Term (Term cstr (Cons cstr)))
+  ;;; term-label -- a term's label: its variables joined with `:`.
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the term
+  ;;;
+  ;;; Returns:
+  ;;;   cstr
+  ;;;
+  ;;; Example:
+  ;;;   (term-label t)   ; => "x1:x2"
+  ;;;
+  ;;; Since: 0.1.0
+  (defn term-label [t : Term] : cstr (match t (Term l _) l))
+  ;;; term-variables -- the labels of a term's variables, in formula order.
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the term
+  ;;;
+  ;;; Returns:
+  ;;;   (Cons cstr)
+  ;;;
+  ;;; Example:
+  ;;;   (term-variables t)   ; => ("x1" "x2")
+  ;;;
+  ;;; Since: 0.1.0
+  (defn term-variables [t : Term] : (Cons cstr) (match t (Term _ vs) vs))
+  ;;; term-order -- how many variables a term has (1 for a main effect).
+  ;;;
+  ;;; Parameters:
+  ;;;   t -- the term
+  ;;;
+  ;;; Returns:
+  ;;;   int
+  ;;;
+  ;;; Example:
+  ;;;   (term-order t)   ; => 2  for x1:x2
+  ;;;
+  ;;; Since: 0.1.0
+  (defn term-order [t : Term] : int (seq-length (term-variables t)))
+  ;;; Expansion -- an expanded formula: the left-hand side, the variables of
+  ;;; the right-hand side (in order of first appearance), the terms, and
+  ;;; whether the model has an intercept.
+  ;;; Since: 0.1.0
+  (defstruct ^copy Expansion
+    [lhs : Lhs vars : (Cons Expr) terms : (Cons Term) intercept : bool])
+  ;;; expansion-response -- the response variable, if any.
+  ;;;
+  ;;; Parameters:
+  ;;;   ex -- the expansion
+  ;;;
+  ;;; Returns:
+  ;;;   (Option Expr)
+  ;;;
+  ;;; Example:
+  ;;;   (expansion-response ex)   ; => (Some (ECol "y"))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn expansion-response [ex : Expansion] : (Option Expr)
+    (match (.lhs ex) (Response e) (Some e) (OneSided) (None)))
+  ;;; expansion-variables -- the right-hand side's variables, in the order they
+  ;;; first appear, each once.
+  ;;;
+  ;;; Parameters:
+  ;;;   ex -- the expansion
+  ;;;
+  ;;; Returns:
+  ;;;   (Cons Expr)
+  ;;;
+  ;;; Example:
+  ;;;   (seq-length (expansion-variables ex))   ; => 3  for y ~ a * b + I(c^2)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn expansion-variables [ex : Expansion] : (Cons Expr) (.vars ex))
+  ;;; expansion-variable -- the variable with a given label.
+  ;;;
+  ;;; Parameters:
+  ;;;   ex    -- the expansion
+  ;;;   label -- a variable label, as in term-variables
+  ;;;
+  ;;; Returns:
+  ;;;   (Option Expr)
+  ;;;
+  ;;; Example:
+  ;;;   (expansion-variable ex "I(x^2)")   ; => (Some (ECall "I" ...))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn expansion-variable [ex : Expansion label : cstr] : (Option Expr)
+    (__find-var (.vars ex) label))
+  ;;; __find-var -- internal.
+  (defn __find-var [vs : (Cons Expr) label : cstr] : (Option Expr)
+    (cond (tnil? vs)                                 (None)
+          (text-eq? (expr->string (thead vs)) label) (Some (thead vs))
+          :else                                      (__find-var (ttail vs)
+                                                       label)))
+  ;;; expansion-terms -- the terms, main effects first.
+  ;;;
+  ;;; Parameters:
+  ;;;   ex -- the expansion
+  ;;;
+  ;;; Returns:
+  ;;;   (Cons Term)
+  ;;;
+  ;;; Example:
+  ;;;   (seq-length (expansion-terms ex))   ; => 3  for y ~ a * b
+  ;;;
+  ;;; Since: 0.1.0
+  (defn expansion-terms [ex : Expansion] : (Cons Term) (.terms ex))
+  ;;; expansion-labels -- the terms' labels, main effects first.
+  ;;;
+  ;;; Parameters:
+  ;;;   ex -- the expansion
+  ;;;
+  ;;; Returns:
+  ;;;   (Cons cstr)
+  ;;;
+  ;;; Example:
+  ;;;   (expansion-labels ex)   ; => ("a" "b" "a:b")  for y ~ a * b
+  ;;;
+  ;;; Since: 0.1.0
+  (defn expansion-labels [ex : Expansion] : (Cons cstr)
+    (seq-map (.terms ex) term-label))
+  ;;; expansion-intercept? -- does the model have an intercept?
+  ;;;
+  ;;; Parameters:
+  ;;;   ex -- the expansion
+  ;;;
+  ;;; Returns:
+  ;;;   bool -- true unless the formula says `- 1` or `+ 0`
+  ;;;
+  ;;; Example:
+  ;;;   (expansion-intercept? ex)   ; => false  for y ~ x - 1
+  ;;;
+  ;;; Since: 0.1.0
+  (defn expansion-intercept? [ex : Expansion] : bool (.intercept ex))
+  ;; ---------------------------------------------------------------------------
+  ;; Variable sets.  A raw term is a (Cons cstr) of variable labels kept in
+  ;; the formula's variable order, so two equal sets are equal lists.
+  ;; ---------------------------------------------------------------------------
+  ;;; __has? -- internal.
+  (defn __has? [xs : (Cons cstr) x : cstr] : bool
+    (cond (tnil? xs)              false
+          (text-eq? (thead xs) x) true
+          :else                   (__has? (ttail xs) x)))
+  ;;; __keep -- internal: the members of `order` that are in a or in b, in
+  ;;; order.
+  (defn __keep [order : (Cons cstr) a : (Cons cstr) b : (Cons cstr)] : (Cons cstr)
+    (cond (tnil? order)                                          (tnil)
+          (or (__has? a (thead order)) (__has? b (thead order))) (tcons-of (thead order)
+                                                                   (__keep (ttail order)
+                                                                     a
+                                                                     b))
+          :else                                                  (__keep (ttail order)
+                                                                   a
+                                                                   b)))
+  ;;; __set-eq? -- internal.
+  (defn __set-eq? [a : (Cons cstr) b : (Cons cstr)] : bool
+    (cond (tnil? a)                      (tnil? b)
+          (tnil? b)                      false
+          (text-eq? (thead a) (thead b)) (__set-eq? (ttail a) (ttail b))
+          :else                          false))
+  ;;; __subset? -- internal: is every member of a in b?
+  (defn __subset? [a : (Cons cstr) b : (Cons cstr)] : bool
+    (cond (tnil? a)            true
+          (__has? b (thead a)) (__subset? (ttail a) b)
+          :else                false))
+  ;; ---------------------------------------------------------------------------
+  ;; Term lists.
+  ;; ---------------------------------------------------------------------------
+  ;;; __tl-has? -- internal.
+  (defn __tl-has? [ts : (Cons (Cons cstr)) t : (Cons cstr)] : bool
+    (cond (tnil? ts)               false
+          (__set-eq? (thead ts) t) true
+          :else                    (__tl-has? (ttail ts) t)))
+  ;;; __tl-add -- internal: append t unless present (acc is reversed).
+  (defn __tl-add [acc : (Cons (Cons cstr)) t : (Cons cstr)] : (Cons (Cons cstr))
+    (if (__tl-has? acc t) acc (tcons-of t acc)))
+  ;;; __tl-add-all -- internal.
+  (defn __tl-add-all [acc : (Cons (Cons cstr)) ts : (Cons (Cons cstr))] : (Cons (Cons cstr))
+    (if (tnil? ts) acc (__tl-add-all (__tl-add acc (thead ts)) (ttail ts))))
+  ;;; __tl-union -- internal: a's terms, then b's not already present.
+  (defn __tl-union [a : (Cons (Cons cstr)) b : (Cons (Cons cstr))] : (Cons (Cons cstr))
+    (seq-reverse (__tl-add-all (__tl-add-all (tnil) a) b)))
+  ;;; __tl-minus -- internal: a's terms that are not in b.
+  (defn __tl-minus [a : (Cons (Cons cstr)) b : (Cons (Cons cstr))] : (Cons (Cons cstr))
+    (cond (tnil? a)               (tnil)
+          (__tl-has? b (thead a)) (__tl-minus (ttail a) b)
+          :else                   (tcons-of (thead a) (__tl-minus (ttail a) b))))
+  ;;; __tl-pair-with -- internal: t unioned with each term of bs, onto acc.
+  (defn __tl-pair-with [order : (Cons cstr)
+                        t : (Cons cstr)
+                        bs : (Cons (Cons cstr))
+                        acc : (Cons (Cons cstr))] : (Cons (Cons cstr))
+    (if (tnil? bs)
+      acc
+      (__tl-pair-with order
+        t
+        (ttail bs)
+        (__tl-add acc (__keep order t (thead bs))))))
+  ;;; __tl-product-acc -- internal.
+  (defn __tl-product-acc [order : (Cons cstr)
+                          as : (Cons (Cons cstr))
+                          bs : (Cons (Cons cstr))
+                          acc : (Cons (Cons cstr))] : (Cons (Cons cstr))
+    (if (tnil? as)
+      acc
+      (__tl-product-acc order
+        (ttail as)
+        bs
+        (__tl-pair-with order (thead as) bs acc))))
+  ;;; __tl-product -- internal: R's InteractTerms -- for each term of a (outer)
+  ;;; and each term of b (inner), their union.
+  (defn __tl-product [order : (Cons cstr)
+                      a : (Cons (Cons cstr))
+                      b : (Cons (Cons cstr))] : (Cons (Cons cstr))
+    (seq-reverse (__tl-product-acc order a b (tnil))))
+  ;;; __tl-all-vars -- internal: every variable of a term list, as one set.
+  (defn __tl-all-vars [order : (Cons cstr) ts : (Cons (Cons cstr))] : (Cons cstr)
+    (if (tnil? ts)
+      (tnil)
+      (__keep order (thead ts) (__tl-all-vars order (ttail ts)))))
+  ;; ---------------------------------------------------------------------------
+  ;; Expansion proper.
+  ;; ---------------------------------------------------------------------------
+  ;; Whether a sub-formula says anything about the intercept.
+  (defdata ^copy Icpt (IUnset) (IOn) (IOff))
+  (defstruct ^copy Spec [terms : (Cons (Cons cstr)) icpt : Icpt])
+  ;;; __icpt-then -- internal: b's setting if it has one, else a's.
+  (defn __icpt-then [a : Icpt b : Icpt] : Icpt (match b (IUnset) a _ b))
+  ;;; __power -- internal: a ^ n as a * a * ... ; `acc` holds a^k.
+  (defn __power [order : (Cons cstr)
+                 base : (Cons (Cons cstr))
+                 acc : (Cons (Cons cstr))
+                 k : int
+                 n : int] : (Cons (Cons cstr))
+    (if (>= k n)
+      acc
+      (__power order
+        base
+        (__tl-union acc (__tl-product order acc base))
+        (+ k 1)
+        n)))
+  ;;; __spec -- internal: the terms and intercept setting of a sub-formula.
+  (defn __spec [order : (Cons cstr) f : Formula] : Spec
+    (match f
+      (FVar e)
+      (Spec (tcons-of (tcons-of (expr->string e) (tnil)) (tnil)) (IUnset))
+      (FIntercept on)
+      (Spec (tnil) (if on (IOn) (IOff)))
+      (FSum a b)
+      (let [sa (__spec order a)
+            sb (__spec order b)]
+        (Spec (__tl-union (.terms sa) (.terms sb))
+          (__icpt-then (.icpt sa) (.icpt sb))))
+      (FDiff a b)
+      (let [sa (__spec order a)
+            sb (__spec order b)]
+        (Spec (__tl-minus (.terms sa) (.terms sb))
+          (__removed (.icpt sa) (.icpt sb))))
+      (FNeg b)
+      (let [sb (__spec order b)] (Spec (tnil) (__removed (IUnset) (.icpt sb))))
+      (FCross a b)
+      (let [sa (__spec order a)
+            sb (__spec order b)
+            ta (.terms sa)
+            tb (.terms sb)]
+        (Spec (__tl-union (__tl-union ta tb) (__tl-product order ta tb))
+          (__icpt-then (.icpt sa) (.icpt sb))))
+      (FInteract a b)
+      (let [sa (__spec order a)
+            sb (__spec order b)]
+        (Spec (__tl-product order (.terms sa) (.terms sb))
+          (__icpt-then (.icpt sa) (.icpt sb))))
+      (FNest a b)
+      (let [sa  (__spec order a)
+            sb  (__spec order b)
+            ta  (.terms sa)
+            all (tcons-of (__tl-all-vars order ta) (tnil))]
+        (Spec (__tl-union ta (__tl-product order all (.terms sb)))
+          (__icpt-then (.icpt sa) (.icpt sb))))
+      (FPower a n)
+      (let [sa (__spec order a)
+            ta (.terms sa)]
+        (Spec (__power order ta ta 1 n) (.icpt sa)))))
+  ;;; __removed -- internal: the intercept after `a - b`: removing `1` turns it
+  ;;; off, removing `0` turns it on.
+  (defn __removed [a : Icpt b : Icpt] : Icpt
+    (match b (IOn) (IOff) (IOff) (IOn) (IUnset) a))
+  ;;; __collect -- internal: the variables of f not yet in acc (reversed),
+  ;;; in order of appearance.
+  (defn __collect [f : Formula acc : (Cons Expr)] : (Cons Expr)
+    (match f
+      (FVar e)
+      (if (__has? (seq-map acc expr->string) (expr->string e))
+        acc
+        (tcons-of e acc))
+      (FIntercept on)
+      acc
+      (FSum a b)
+      (__collect b (__collect a acc))
+      (FDiff a b)
+      (__collect b (__collect a acc))
+      (FNeg b)
+      (__collect b acc)
+      (FCross a b)
+      (__collect b (__collect a acc))
+      (FInteract a b)
+      (__collect b (__collect a acc))
+      (FNest a b)
+      (__collect b (__collect a acc))
+      (FPower a n)
+      (__collect a acc)))
+  ;;; __by-order -- internal: the terms of exactly k variables, in order.
+  (defn __by-order [ts : (Cons (Cons cstr)) k : int] : (Cons (Cons cstr))
+    (cond (tnil? ts)                    (tnil)
+          (= (seq-length (thead ts)) k) (tcons-of (thead ts)
+                                          (__by-order (ttail ts) k))
+          :else                         (__by-order (ttail ts) k)))
+  ;;; __sorted -- internal: terms grouped by order 1, 2, ... up to max.
+  (defn __sorted [ts : (Cons (Cons cstr)) k : int max : int] : (Cons (Cons cstr))
+    (if (> k max)
+      (tnil)
+      (__tl-union (__by-order ts k) (__sorted ts (+ k 1) max))))
+  ;;; __join -- internal: labels joined with ":".
+  (defn __join [xs : (Cons cstr)] : cstr
+    (cond (tnil? xs)         ""
+          (tnil? (ttail xs)) (thead xs)
+          :else              (str-concat (thead xs)
+                               (str-concat ":" (__join (ttail xs))))))
+  ;;; __used -- internal: the variables some term uses, in order.
+  (defn __used [vs : (Cons Expr) ts : (Cons (Cons cstr))] : (Cons Expr)
+    (cond (tnil? vs)                                                                                           (tnil)
+          (__subset? (tcons-of (expr->string (thead vs)) (tnil))
+            (__tl-all-vars (seq-map vs expr->string) ts))                                                      (tcons-of (thead vs)
+                                                                                                                 (__used (ttail vs)
+                                                                                                                   ts))
+          :else                                                                                                (__used (ttail vs)
+                                                                                                                 ts)))
+  ;;; formula-expand -- expand a parsed formula into its terms.
+  ;;;
+  ;;; Parameters:
+  ;;;   pf -- a ParsedFormula (from formula-parse)
+  ;;;
+  ;;; Returns:
+  ;;;   Expansion -- the response, the variables, the ordered terms and the
+  ;;;   intercept flag.
+  ;;;
+  ;;; Example:
+  ;;;   (match (formula-parse "y ~ a * b - 1")
+  ;;;     (Ok pf) (expansion-labels (formula-expand pf))   ; => ("a" "b" "a:b")
+  ;;;     (Err e) (tnil))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn formula-expand [pf : ParsedFormula] : Expansion
+    (let [vars  (seq-reverse (__collect (.rhs pf) (tnil)))
+          order (seq-map vars expr->string)
+          spec  (__spec order (.rhs pf))
+          raw   (match (parsed-formula-response pf)
+                  (Some e)
+                  (__drop-with (.terms spec) (expr->string e))
+                  (None)
+                  (.terms spec))
+          max   (seq-foldl raw
+                  0
+                  (fn [m : int t : (Cons cstr)] : int
+                    (if (> (seq-length t) m) (seq-length t) m)))
+          terms (__sorted raw 1 max)]
+      (Expansion (.lhs pf)
+        (__used vars terms)
+        (seq-map terms (fn [t : (Cons cstr)] : Term (Term (__join t) t)))
+        (match (.icpt spec) (IOff) false _ true))))
+  ;;; __drop-with -- internal: the terms that do not contain variable v.
+  (defn __drop-with [ts : (Cons (Cons cstr)) v : cstr] : (Cons (Cons cstr))
+    (cond (tnil? ts)            (tnil)
+          (__has? (thead ts) v) (__drop-with (ttail ts) v)
+          :else                 (tcons-of (thead ts) (__drop-with (ttail ts) v)))))

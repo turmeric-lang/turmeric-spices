@@ -1,0 +1,144 @@
+;; tests/formula/identity_test.tur -- formula/identity: values, nulls, and
+;; the errors.
+(defmodule stats_formula_identity_test
+  (export main)
+  (import frame/csv :refer [read-csv-string])
+  (import frame/typed :refer [Frame frame-typed])
+  (import formula/identity :refer [formula-eval-identity])
+  (import formula/model-frame
+    :refer
+    [ModelFrame
+     model-frame-names
+     model-frame-nrows
+     model-frame-value
+     model-frame-valid?
+     model-frame-free])
+  (import formula/ast
+    :refer
+    [FormulaError
+     FormulaErrorKind
+     SyntaxError
+     UnknownColumn
+     NotNumeric
+     DomainError
+     formula-error-kind
+     formula-error-message])
+  (import test/assert :refer [assert-true])
+  (import test/suite :refer [describe it])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; __near? -- |a - b| <= 1e-12 * max(1, |b|).
+  (defn __near? [a : float b : float] : bool
+    ```c
+    #include <math.h>
+  double s = fabs(b) > 1.0 ? fabs(b) : 1.0;
+  return fabs(a - b) <= 1e-12 * s;
+  ```)
+  ;; x: 1.5 2.5 -3.25 null;  n: int64;  g: utf8;  b: bool
+  (defn __data [] : int
+    (read-csv-string "x,n,g,b\n1.5,2,a,true\n2.5,3,b,false\n-3.25,4,a,true\n,5,b,false\n"
+      44
+      34
+      1
+      100
+      ""))
+  ;;; __at? -- column `name` of the result of `src` at `row` is `want`.
+  (defn __at? [src : cstr name : cstr row : int want : float] : bool
+    (match (formula-eval-identity (frame-typed (__data)) src)
+      (Ok m)
+      (let [r (match (model-frame-value m name row)
+                (Some v)
+                (__near? v want)
+                (None)
+                false)]
+        (model-frame-free m)
+        r)
+      (Err e)
+      (do (println (formula-error-message e)) false)))
+  ;;; __null-at? -- that cell is null.
+  (defn __null-at? [src : cstr name : cstr row : int] : bool
+    (match (formula-eval-identity (frame-typed (__data)) src)
+      (Ok m)
+      (let [r (not (model-frame-valid? m name row))] (model-frame-free m) r)
+      (Err e)
+      false))
+  ;;; __kind -- the error kind of evaluating src, as a word.
+  (defn __kind [src : cstr] : cstr
+    (match (formula-eval-identity (frame-typed (__data)) src)
+      (Ok m)
+      (do (model-frame-free m) "ok")
+      (Err e)
+      (match (formula-error-kind e)
+        (SyntaxError)
+        "syntax"
+        (UnknownColumn)
+        "unknown-column"
+        (NotNumeric)
+        "not-numeric"
+        (DomainError)
+        "domain"
+        _
+        "other")))
+  ;;; __message -- the error message of evaluating src.
+  (defn __message [src : cstr] : cstr
+    (match (formula-eval-identity (frame-typed (__data)) src)
+      (Ok m)
+      (do (model-frame-free m) "ok")
+      (Err e)
+      (formula-error-message e)))
+  (defn __all-tests [] : void
+    (describe "formula/identity values"
+      (it "I(x^2) squares, with a non-integer base"
+        (assert-true (and (__at? "I(x^2)" "I(x^2)" 0 2.25)
+                       (__at? "I(x^2)" "I(x^2)" 2 10.5625))))
+      (it "the I() wrapper is optional and names the column"
+        (assert-true (__at? "x^2" "x^2" 1 6.25)))
+      (it "int64 and bool columns read as numbers"
+        (assert-true (and (__at? "I(n + b)" "I(n + b)" 0 3.0)
+                       (__at? "I(n + b)" "I(n + b)" 1 3.0))))
+      (it "precedence: -x^2 + n * 2 / 4"
+        (assert-true (__at? "I(-x^2 + n * 2 / 4)" "I(-x^2 + n * 2/4)" 2 -8.5625)))
+      (it "log, exp, sqrt, abs"
+        (assert-true (__at? "log(abs(x)) + exp(0) + sqrt(n)"
+                       "log(abs(x)) + exp(0) + sqrt(n)"
+                       2
+                       4.178654996341646)))
+      (it "a non-integer power"
+        (assert-true (__at? "I(n^0.5)" "I(n^0.5)" 2 2.0)))
+      (it "the column is as long as the frame"
+        (assert-true (match (formula-eval-identity (frame-typed (__data))
+                              "I(x * 2)")
+                       (Ok m)
+                       (let [r (and (= (model-frame-nrows m) 4)
+                                 (__is? (thead (model-frame-names m))
+                                   "I(x * 2)"))]
+                         (model-frame-free m)
+                         r)
+                       (Err e)
+                       false))))
+    (describe "formula/identity nulls and errors"
+      (it "a null input gives a null"
+        (assert-true (__null-at? "I(x + n)" "I(x + n)" 3)))
+      (it "a domain error names the expression and the row"
+        (assert-true (and (__is? (__kind "log(x)") "domain")
+                       (__is? (__message "log(x)")
+                         "'log(x)' is not finite at row 2"))))
+      (it "division by zero is a domain error"
+        (assert-true (__is? (__kind "I(n / (n - 3))") "domain")))
+      (it "a null row is not a domain error"
+        (assert-true (__is? (__kind "I(1 / (x + 0))") "ok")))
+      (it "an unknown column"
+        (assert-true (and (__is? (__kind "I(z + 1)") "unknown-column")
+                       (__is? (__message "I(z + 1)")
+                         "column 'z' not found in frame"))))
+      (it "a categorical column in arithmetic"
+        (assert-true (__is? (__kind "I(g + 1)") "not-numeric")))
+      (it "a syntax error" (assert-true (__is? (__kind "I(x +)") "syntax")))))
+  (defn main [] : int (__all-tests) (run-all-status)))

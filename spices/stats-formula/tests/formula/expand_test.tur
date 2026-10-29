@@ -1,0 +1,133 @@
+;; tests/formula/expand_test.tur -- formula/expand against R: each want is
+;; attr(terms(f), "term.labels") (and attr(, "intercept")) for the same
+;; formula in R.
+(defmodule stats_formula_expand_test
+  (export main)
+  (import formula/parser :refer [formula-parse])
+  (import formula/expand
+    :refer
+    [Term
+     term-label
+     term-variables
+     term-order
+     Expansion
+     formula-expand
+     expansion-response
+     expansion-variables
+     expansion-variable
+     expansion-terms
+     expansion-labels
+     expansion-intercept?])
+  (import formula/ast :refer [Expr expr->string formula-error->string])
+  (import test/assert :refer [assert-true])
+  (import test/suite :refer [describe it])
+  (import test/runner :refer [run-all-status])
+  ;;; __is? -- byte equality, printing both on a mismatch.
+  (defn __is? [got : cstr want : cstr] : bool
+    ```c
+    #include <stdio.h>
+  if (strcmp((const char *)got, (const char *)want) == 0) return true;
+  fprintf(stderr, "# want: [%s]\n# got:  [%s]\n", want, got);
+  return false;
+  ```)
+  ;;; __join -- labels separated by spaces.
+  (defn __join [xs : (Cons cstr)] : cstr
+    (cond (tnil? xs)         ""
+          (tnil? (ttail xs)) (thead xs)
+          :else              (str-concat (thead xs)
+                               (str-concat " " (__join (ttail xs))))))
+  ;;; __x -- the term labels, then "| 1" or "| 0" for the intercept.
+  (defn __x [s : cstr] : cstr
+    (match (formula-parse s)
+      (Ok pf)
+      (let [ex (formula-expand pf)]
+        (str-concat (__join (expansion-labels ex))
+          (if (expansion-intercept? ex) " | 1" " | 0")))
+      (Err e)
+      (str-concat "error: " (formula-error->string e))))
+  ;;; __ex -- the expansion of s (s parses).
+  (defn __ex [s : cstr] : Expansion
+    (match (formula-parse s) (Ok pf) (formula-expand pf) (Err e) (__ex "~ 1")))
+  (defn __all-tests [] : void
+    (describe "formula/expand operators (vs R terms())"
+      (it "y ~ x1 * x2 + I(x3^2)"
+        (assert-true (__is? (__x "y ~ x1 * x2 + I(x3^2)")
+                       "x1 x2 I(x3^2) x1:x2 | 1")))
+      (it "y ~ a + b" (assert-true (__is? (__x "y ~ a + b") "a b | 1")))
+      (it "y ~ a + a (a duplicate is dropped)"
+        (assert-true (__is? (__x "y ~ a + a") "a | 1")))
+      (it "y ~ a:b" (assert-true (__is? (__x "y ~ a:b") "a:b | 1")))
+      (it "y ~ a * b * c"
+        (assert-true (__is? (__x "y ~ a * b * c") "a b c a:b a:c b:c a:b:c | 1")))
+      (it "y ~ (a + b + c)^2"
+        (assert-true (__is? (__x "y ~ (a + b + c)^2") "a b c a:b a:c b:c | 1")))
+      (it "y ~ (a + b + c)^3 is a * b * c"
+        (assert-true (__is? (__x "y ~ (a + b + c)^3")
+                       "a b c a:b a:c b:c a:b:c | 1")))
+      (it "y ~ (a + b + c)^2 - a:b"
+        (assert-true (__is? (__x "y ~ (a + b + c)^2 - a:b") "a b c a:c b:c | 1")))
+      (it "y ~ x^2 is just x (x:x is x)"
+        (assert-true (__is? (__x "y ~ x^2") "x | 1")))
+      (it "y ~ a / b" (assert-true (__is? (__x "y ~ a / b") "a a:b | 1")))
+      (it "y ~ (a + b) / c"
+        (assert-true (__is? (__x "y ~ (a + b) / c") "a b a:b:c | 1")))
+      (it "y ~ a / (b + c)"
+        (assert-true (__is? (__x "y ~ a / (b + c)") "a a:b a:c | 1")))
+      (it "y ~ (a + b) * (c + d)"
+        (assert-true (__is? (__x "y ~ (a + b) * (c + d)")
+                       "a b c d a:c a:d b:c b:d | 1")))
+      (it "y ~ a * b - a"
+        (assert-true (__is? (__x "y ~ a * b - a") "b a:b | 1")))
+      (it "variables in a term keep formula order: y ~ b:a + a"
+        (assert-true (__is? (__x "y ~ b:a + a") "a b:a | 1")))
+      (it "terms sort by order, then as written: y ~ a:b + c + d:e:f + g"
+        (assert-true (__is? (__x "y ~ a:b + c + d:e:f + g") "c g a:b d:e:f | 1")))
+      (it "the response is dropped from the right-hand side"
+        (assert-true (__is? (__x "y ~ y + x") "x | 1")))
+      (it "a computed variable is one variable"
+        (assert-true (__is? (__x "y ~ log(x) * I(z / 2)")
+                       "log(x) I(z/2) log(x):I(z/2) | 1")))
+      (it "a one-sided formula expands the same way"
+        (assert-true (__is? (__x "~ a * b") "a b a:b | 1"))))
+    (describe "formula/expand intercept (vs R attr(, \"intercept\"))"
+      (it "y ~ x - 1" (assert-true (__is? (__x "y ~ x - 1") "x | 0")))
+      (it "y ~ 0 + x" (assert-true (__is? (__x "y ~ 0 + x") "x | 0")))
+      (it "y ~ -1 + x" (assert-true (__is? (__x "y ~ -1 + x") "x | 0")))
+      (it "y ~ x + 0" (assert-true (__is? (__x "y ~ x + 0") "x | 0")))
+      (it "y ~ 0 + x + 1 puts it back"
+        (assert-true (__is? (__x "y ~ 0 + x + 1") "x | 1")))
+      (it "y ~ 1 has only the intercept"
+        (assert-true (__is? (__x "y ~ 1") " | 1")))
+      (it "y ~ 0 has nothing" (assert-true (__is? (__x "y ~ 0") " | 0")))
+      (it "y ~ x - 0 keeps it" (assert-true (__is? (__x "y ~ x - 0") "x | 1"))))
+    (describe "formula/expand accessors"
+      (it "terms carry their variables and order"
+        (let [ex (__ex "y ~ a * b")
+              t  (thead (ttail (ttail (expansion-terms ex))))]
+          (assert-true (and (__is? (term-label t) "a:b")
+                         (= (term-order t) 2)
+                         (__is? (__join (term-variables t)) "a b")))))
+      (it "expansion-variables lists each right-hand variable once, in order"
+        (let [ex (__ex "y ~ b + a * b + I(c^2)")]
+          (assert-true (__is? (__join (seq-labels (expansion-variables ex)))
+                         "b a I(c^2)"))))
+      (it "expansion-variable finds a variable by label"
+        (let [ex (__ex "y ~ a + I(c^2)")]
+          (assert-true (match (expansion-variable ex "I(c^2)")
+                         (Some e)
+                         (__is? (expr->string e) "I(c^2)")
+                         (None)
+                         false))))
+      (it "expansion-response"
+        (let [ex (__ex "log(y) ~ a")]
+          (assert-true (match (expansion-response ex)
+                         (Some e)
+                         (__is? (expr->string e) "log(y)")
+                         (None)
+                         false))))))
+  ;;; seq-labels -- variables' labels.
+  (defn seq-labels [vs : (Cons Expr)] : (Cons cstr)
+    (if (tnil? vs)
+      (tnil)
+      (tcons-of (expr->string (thead vs)) (seq-labels (ttail vs)))))
+  (defn main [] : int (__all-tests) (run-all-status)))
