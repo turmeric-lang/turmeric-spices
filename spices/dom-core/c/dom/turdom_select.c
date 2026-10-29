@@ -1,5 +1,5 @@
 /* c/dom/turdom_select.c -- CSS selectors over the turdom tree.  See turdom.h
- * ("selectors") and turmeric docs/upcoming/spices/xml-html-followups-plan.md,
+ * ("selectors") and turmeric docs/archive/xml-html-followups-plan.md,
  * follow-up C.
  *
  * Three parts: a parser that reads a selector list straight into a compiled
