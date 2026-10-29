@@ -533,7 +533,7 @@ An element is `[name attrs? child...]`:
   (or `to-url-attr` for `href`, `src` and the other URL attributes), exactly
   as in `#html{...}`: a `bool` is a boolean attribute, `None` drops the
   attribute, a URL is scheme-checked. A map `:class` joins the shorthand
-  classes. `:attrs*` splices a `(Cons HAttr)` built at run time.
+  classes. `:attrs*` splices a `(Cons Attr)` built at run time.
 - **children** -- string and number literals are text; nested vectors are
   elements; `if`, `let`, `list-map` and the other forms below have their
   results rewritten; anything else is a hole through `to-html` (the
@@ -567,10 +567,10 @@ corpus -- and either can hold the other: an `Html` value goes in an
 `Html` nodes are heap-allocated and never freed; rendering a tree per
 request belongs in a `with-region` bracket.
 
-The type names carry an `H` (`HTag`, `HAttr`, `HAttrName`, `HRawBody`,
-`HCommentBody`, `HCdataBody`, `HPiBody`) because a type name is global in a
-program: tur-dom-core's SAX `Attr` and a spice's own `Tag` would otherwise
-collide with them.
+`Attr` and `Tag` share their names with tur-dom-core's SAX `Attr` (and a
+spice may have its own `Tag`). A module that imports both refers the one it
+means, `(import html/hiccup :refer [Attr])`; the other stays reachable
+qualified, and a diagnostic spells hiccup's as `html/hiccup/Attr`.
 
 ### Markup inside expressions
 
