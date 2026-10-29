@@ -1,0 +1,72 @@
+;;; fmt_test.tur -- LS4: sparse matrix printing.
+(defmodule linalg-sparse/fmt-test
+  (import linalg-sparse/csr :refer [csrmat coo-new coo-push! coo-free csr-from-coo csr-free])
+  (import linalg-sparse/csc :refer [cscmat csc-from-coo csc-free])
+  (import linalg-sparse/fmt :refer [csr->str csr->str-prec csc->str csr-print sparse-str-free])
+  ;; --- TAP harness (inline-C fail counter) ---
+  (defn check [idx : int name : cstr ok : bool] : void
+    ```c
+    /* __tur_include__: static int g_fm_fails = 0; */
+  if (!ok) g_fm_fails++;
+  printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
+  ```)
+  (defn finish [count : int] : int
+    ```c
+    printf("1..%lld\n", (long long)count);
+  if (g_fm_fails == 0) {
+    fprintf(stderr, "# All %lld sparse fmt tests passed.\n", (long long)count);
+    return 0;
+  }
+  fprintf(stderr, "# %d/%lld sparse fmt tests failed.\n", g_fm_fails, (long long)count);
+  return 1;
+  ```)
+  (defn fa [x : float] : float ```c return x < 0.0 ? -x : x; ```)
+  (defn approx [a : float b : float] : bool (< (fa (- a b)) 1e-12))
+  (defn streq [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
+    return strcmp((const char *)a, (const char *)b) == 0;
+    ```)
+  (defn sample [] : csrmat
+    (let [c (coo-new 3 3)]
+      (coo-push! c 2 2 7.1)
+      (coo-push! c 0 0 2.0)
+      (coo-push! c 0 1 -1.0)
+      (coo-push! c 1 1 3.25)
+      (let [m (csr-from-coo c)] (coo-free c) m)))
+  (defn t-csr->str [] : bool
+    (let [m (sample)
+          s (csr->str m)]
+      (let [ok (streq s "csr 3x3 nnz=4\n(0, 0) 2.0000\n(0, 1) -1.0000\n(1, 1) 3.2500\n(2, 2) 7.1000")]
+        (sparse-str-free s)
+        (csr-free m)
+        ok)))
+  (defn t-csr->str-prec [] : bool
+    (let [m (sample)
+          s (csr->str-prec m 1)]
+      (let [ok (streq s "csr 3x3 nnz=4\n(0, 0) 2.0\n(0, 1) -1.0\n(1, 1) 3.2\n(2, 2) 7.1")]
+        (sparse-str-free s)
+        (csr-free m)
+        ok)))
+  (defn t-csc->str [] : bool
+    (let [c (coo-new 2 2)]
+      (coo-push! c 1 0 1.5)
+      (coo-push! c 0 1 2.5)
+      (let [m  (csc-from-coo c)
+            s  (csc->str m)
+            ok (streq s "csc 2x2 nnz=2\n(0, 1) 2.5000\n(1, 0) 1.5000")]
+        (sparse-str-free s)
+        (csc-free m)
+        (coo-free c)
+        ok)))
+  (defn t-empty [] : bool
+    (let [c (coo-new 2 2)
+          m (csr-from-coo c)
+          s (csr->str m)]
+      (let [ok (streq s "csr 2x2 nnz=0")] (sparse-str-free s) (csr-free m) (coo-free c) ok)))
+  (defn main [] : int
+    (check 1 "csr->str: header and row-major triples" (t-csr->str))
+    (check 2 "csr->str-prec: precision" (t-csr->str-prec))
+    (check 3 "csc->str: row-major order" (t-csc->str))
+    (check 4 "csr->str: empty matrix" (t-empty))
+    (finish 4))) ;; end defmodule linalg-sparse/fmt-test

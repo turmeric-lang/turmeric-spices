@@ -1,0 +1,112 @@
+;;; csr_test.tur -- LS0: COO assembly into CSR, element access and SpMV.
+;;;
+;;; The subject is the 5x5 tridiagonal matrix tridiag(-1, 2, -1), assembled
+;;; out of order and with one diagonal entry pushed as two halves, so the
+;;; sort and the duplicate-summing both run. SpMV is checked against the
+;;; dense `mat-mul-vec` of the same matrix.
+(defmodule linalg-sparse/csr-test
+  (import linalg/vec :refer [lavec la-vec-of la-vec-get la-vec-approx-eq? la-vec-free])
+  (import linalg/mat :refer [mat mat-of mat-mul-vec mat-free])
+  (import linalg-sparse/csr
+    :refer
+    [coomat csrmat coo-new coo-push! coo-nnz coo-free csr-from-coo csr-free
+     csr-rows csr-cols csr-nnz csr-get csr-spmv])
+  ;; --- TAP harness (inline-C fail counter) ---
+  (defn check [idx : int name : cstr ok : bool] : void
+    ```c
+    /* __tur_include__: static int g_csr_fails = 0; */
+  if (!ok) g_csr_fails++;
+  printf("%s %lld - %s\n", ok ? "ok" : "not ok", (long long)idx, (const char *)name);
+  ```)
+  (defn finish [count : int] : int
+    ```c
+    printf("1..%lld\n", (long long)count);
+  if (g_csr_fails == 0) {
+    fprintf(stderr, "# All %lld csr tests passed.\n", (long long)count);
+    return 0;
+  }
+  fprintf(stderr, "# %d/%lld csr tests failed.\n", g_csr_fails, (long long)count);
+  return 1;
+  ```)
+  (defn fa [x : float] : float ```c return x < 0.0 ? -x : x; ```)
+  (defn approx [a : float b : float] : bool (< (fa (- a b)) 1e-12))
+  ;;; tri5 -- tridiag(-1, 2, -1), pushed bottom-up with (2, 2) split in two.
+  (defn tri5 [] : csrmat
+    (let [c      (coo-new 5 5)
+          ^mut i 4]
+      (letrec [go
+               (fn [] : int
+                 (if (< i 0)
+                   0
+                   (do
+                     (when (< i 4) (coo-push! c i (+ i 1) -1.0))
+                     (if (= i 2)
+                       (do (coo-push! c i i 1.25) (coo-push! c i i 0.75))
+                       (coo-push! c i i 2.0))
+                     (when (> i 0) (coo-push! c i (- i 1) -1.0))
+                     (set! i (- i 1))
+                     (go))))]
+        (go))
+      (let [m (csr-from-coo c)] (coo-free c) m)))
+  (defn dense5 [] : mat
+    (mat-of 5 5
+      2.0 -1.0 0.0 0.0 0.0
+      -1.0 2.0 -1.0 0.0 0.0
+      0.0 -1.0 2.0 -1.0 0.0
+      0.0 0.0 -1.0 2.0 -1.0
+      0.0 0.0 0.0 -1.0 2.0))
+  (defn t-shape [] : bool
+    (let [m (tri5)]
+      (let [ok (and (= (csr-rows m) 5) (and (= (csr-cols m) 5) (= (csr-nnz m) 13)))]
+        (csr-free m)
+        ok)))
+  (defn t-dup-summed [] : bool
+    (let [m (tri5)] (let [ok (approx (csr-get m 2 2) 2.0)] (csr-free m) ok)))
+  (defn t-get [] : bool
+    (let [m (tri5)]
+      (let [ok (and (approx (csr-get m 0 0) 2.0)
+                 (and (approx (csr-get m 3 4) -1.0)
+                   (and (approx (csr-get m 4 3) -1.0) (approx (csr-get m 0 4) 0.0))))]
+        (csr-free m)
+        ok)))
+  (defn t-coo-nnz [] : bool
+    (let [c (coo-new 2 2)]
+      (coo-push! c 1 1 1.0)
+      (coo-push! c 1 1 1.0)
+      (let [ok (= (coo-nnz c) 2)] (coo-free c) ok)))
+  (defn t-spmv [] : bool
+    (let [m  (tri5)
+          d  (dense5)
+          v  (la-vec-of 1.5 -2.0 0.25 4.0 3.0)
+          ys (csr-spmv m v)
+          yd (mat-mul-vec d v)]
+      (let [ok (= (la-vec-approx-eq? ys yd 1e-12) 1)]
+        (la-vec-free ys)
+        (la-vec-free yd)
+        (la-vec-free v)
+        (mat-free d)
+        (csr-free m)
+        ok)))
+  (defn t-empty-row [] : bool
+    ;; a row with no entries still has a valid (empty) span in rowptr
+    (let [c (coo-new 3 3)]
+      (coo-push! c 2 0 5.0)
+      (coo-push! c 0 2 7.0)
+      (let [m  (csr-from-coo c)
+            v  (la-vec-of 1.0 1.0 1.0)
+            y  (csr-spmv m v)
+            ok (and (approx (la-vec-get y 0) 7.0)
+                 (and (approx (la-vec-get y 1) 0.0) (approx (la-vec-get y 2) 5.0)))]
+        (la-vec-free y)
+        (la-vec-free v)
+        (csr-free m)
+        (coo-free c)
+        ok)))
+  (defn main [] : int
+    (check 1 "csr-from-coo: shape and nnz" (t-shape))
+    (check 2 "csr-from-coo: duplicates are summed" (t-dup-summed))
+    (check 3 "csr-get: stored and absent entries" (t-get))
+    (check 4 "coo-nnz counts pushes" (t-coo-nnz))
+    (check 5 "csr-spmv matches dense mat-mul-vec" (t-spmv))
+    (check 6 "csr-spmv with an empty row" (t-empty-row))
+    (finish 6))) ;; end defmodule linalg-sparse/csr-test

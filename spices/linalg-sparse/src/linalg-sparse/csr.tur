@@ -1,0 +1,289 @@
+;;; linalg-sparse/csr -- Compressed Sparse Row matrices and the COO builder.
+;;;
+;;; A `csrmat` owns three heap buffers: `rowptr` (rows + 1 offsets), `colidx`
+;;; (nnz column indices, ascending within each row) and `vals` (nnz float64
+;;; values). Like linalg's `mat` it is move-only: readers borrow it and
+;;; `csr-free` consumes it.
+;;;
+;;; Matrices are assembled through a `coomat` (coordinate list): push
+;;; (row, col, value) triples in any order, then compress. Duplicate
+;;; coordinates are summed, which is the usual finite-element assembly rule.
+;;;
+;;; The numeric loops run in inline C over the backing `(Vec int)` /
+;;; `(Vec float)` buffers, as in linalg/decomp.
+(defmodule linalg-sparse/csr
+  (export coomat
+    csrmat
+    coo-new
+    coo-push!
+    coo-nnz
+    coo-free
+    csr-from-coo
+    csr-free
+    csr-rows
+    csr-cols
+    csr-nnz
+    csr-get
+    csr-spmv
+    sparse-izeros
+    sparse-fzeros)
+  (import linalg/vec :refer [lavec la-vec-new la-vec-len])
+  ;;; coomat -- a coordinate-list builder: parallel row / col / value buffers.
+  (defstruct coomat [rows : int cols : int ri : (Vec int) ci : (Vec int) v : (Vec float)])
+  ;;; csrmat -- a rows x cols matrix in Compressed Sparse Row form.
+  (defstruct csrmat
+    [rows : int
+     cols : int
+     nnz : int
+     rowptr : (Vec int)
+     colidx : (Vec int)
+     vals : (Vec float)])
+  ;;; sparse-izeros -- a (Vec int) of n zeros (shared buffer helper).
+  (defn sparse-izeros [n : int] : (Vec int)
+    (let [d      (:: (vec-new) (Vec int))
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n) 0 (do (vec-push! d 0) (set! i (+ i 1)) (go))))]
+        (go))
+      d))
+  ;;; sparse-fzeros -- a (Vec float) of n zeros (shared buffer helper).
+  (defn sparse-fzeros [n : int] : (Vec float)
+    (let [d      (:: (vec-new) (Vec float))
+          ^mut i 0]
+      (letrec [go
+               (fn [] : int
+                 (if (>= i n) 0 (do (vec-push! d 0.0) (set! i (+ i 1)) (go))))]
+        (go))
+      d))
+  ;;; coo-new -- an empty rows x cols coordinate list.
+  ;;;
+  ;;; Parameters:
+  ;;;   rows -- number of rows
+  ;;;   cols -- number of columns
+  ;;;
+  ;;; Returns:
+  ;;;   A coomat with no entries.
+  ;;;
+  ;;; Example:
+  ;;;   (let [c (coo-new 3 3)]
+  ;;;     (coo-push! c 0 0 2.0)
+  ;;;     (csr-from-coo c))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn coo-new [rows : int cols : int] : coomat
+    (make-struct coomat
+      rows
+      cols
+      (:: (vec-new) (Vec int))
+      (:: (vec-new) (Vec int))
+      (:: (vec-new) (Vec float))))
+  ;;; coo-push! -- append the entry (r, c) = v. Panics when out of range.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the coordinate list (borrowed)
+  ;;;   r -- row index, 0 <= r < rows
+  ;;;   c -- column index, 0 <= c < cols
+  ;;;   v -- the value; a repeated (r, c) is summed when compressed
+  ;;;
+  ;;; Example:
+  ;;;   (coo-push! c 1 2 -1.0)
+  ;;;
+  ;;; Since: 0.1.0
+  (defn coo-push! [^borrow m : coomat r : int c : int v : float] : void
+    (when (or (< r 0) (or (>= r (.rows m)) (or (< c 0) (>= c (.cols m)))))
+      (panic "coo-push!: index out of range"))
+    (vec-push! (.ri m) r)
+    (vec-push! (.ci m) c)
+    (vec-push! (.v m) v))
+  ;;; coo-nnz -- number of pushed entries (duplicates counted separately).
+  (defn coo-nnz [^borrow m : coomat] : int (vec-len (.ri m)))
+  ;;; coo-free -- free a coordinate list.
+  (defn coo-free [m : coomat] : void
+    (vec-free (.ri m))
+    (vec-free (.ci m))
+    (vec-free (.v m)))
+  ;;; __coo-sort-kernel -- write into perm the entry order sorted by (row, col)
+  ;;; (a stable bottom-up merge sort on the key row * cols + col) and return
+  ;;; the number of distinct coordinates.
+  (defn __coo-sort-kernel [permd : (Vec int)
+                           rid : (Vec int)
+                           cid : (Vec int)
+                           k : int
+                           cols : int] : int
+    ```c
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  int64_t *perm = ((struct __V*)(intptr_t)permd)->data;
+  const int64_t *ri = ((struct __V*)(intptr_t)rid)->data;
+  const int64_t *ci = ((struct __V*)(intptr_t)cid)->data;
+  if (k == 0) return 0;
+  int64_t *tmp = (int64_t*)malloc(sizeof(int64_t) * (size_t)k);
+  for (int64_t i = 0; i < k; i++) perm[i] = i;
+  for (int64_t w = 1; w < k; w *= 2) {
+    for (int64_t lo = 0; lo < k; lo += 2 * w) {
+      int64_t mid = lo + w < k ? lo + w : k, hi = lo + 2 * w < k ? lo + 2 * w : k;
+      int64_t a = lo, b = mid, o = lo;
+      while (a < mid && b < hi) {
+        int64_t ka = ri[perm[a]] * cols + ci[perm[a]];
+        int64_t kb = ri[perm[b]] * cols + ci[perm[b]];
+        tmp[o++] = (kb < ka) ? perm[b++] : perm[a++];
+      }
+      while (a < mid) tmp[o++] = perm[a++];
+      while (b < hi) tmp[o++] = perm[b++];
+    }
+    for (int64_t i = 0; i < k; i++) perm[i] = tmp[i];
+  }
+  free(tmp);
+  int64_t uniq = 1;
+  for (int64_t i = 1; i < k; i++)
+    if (ri[perm[i]] != ri[perm[i-1]] || ci[perm[i]] != ci[perm[i-1]]) uniq++;
+  return uniq;
+  ```)
+  ;;; __coo-fill-kernel -- compress the sorted entries into CSR buffers,
+  ;;; summing duplicates. colidx / vals are sized to the distinct count.
+  (defn __coo-fill-kernel [rpd : (Vec int)
+                           cxd : (Vec int)
+                           vsd : (Vec float)
+                           permd : (Vec int)
+                           rid : (Vec int)
+                           cid : (Vec int)
+                           vd : (Vec float)
+                           k : int
+                           rows : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  int64_t *rowptr = ((struct __V*)(intptr_t)rpd)->data;
+  int64_t *colidx = ((struct __V*)(intptr_t)cxd)->data;
+  double *vals = (double*)(void*)((struct __V*)(intptr_t)vsd)->data;
+  const int64_t *perm = ((struct __V*)(intptr_t)permd)->data;
+  const int64_t *ri = ((struct __V*)(intptr_t)rid)->data;
+  const int64_t *ci = ((struct __V*)(intptr_t)cid)->data;
+  const double *v = (const double*)(void*)((struct __V*)(intptr_t)vd)->data;
+  for (int64_t r = 0; r <= rows; r++) rowptr[r] = 0;
+  int64_t o = -1;
+  for (int64_t i = 0; i < k; i++) {
+    int64_t e = perm[i];
+    if (i > 0 && ri[e] == ri[perm[i-1]] && ci[e] == ci[perm[i-1]]) {
+      vals[o] += v[e];
+    } else {
+      o++;
+      colidx[o] = ci[e];
+      vals[o] = v[e];
+      rowptr[ri[e] + 1]++;
+    }
+  }
+  for (int64_t r = 0; r < rows; r++) rowptr[r + 1] += rowptr[r];
+  return 0;
+  ```)
+  ;;; csr-from-coo -- compress a coordinate list into CSR form.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the coordinate list (borrowed; it stays usable)
+  ;;;
+  ;;; Returns:
+  ;;;   A csrmat with column indices ascending in each row; repeated
+  ;;;   coordinates are summed into one stored entry.
+  ;;;
+  ;;; Example:
+  ;;;   (let [c (coo-new 2 2)]
+  ;;;     (coo-push! c 0 0 1.0)
+  ;;;     (coo-push! c 0 0 2.0)
+  ;;;     (csr-get (csr-from-coo c) 0 0))  ; => 3.0
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csr-from-coo [^borrow m : coomat] : csrmat
+    (let [k    (coo-nnz m)
+          perm (sparse-izeros k)
+          nnz  (__coo-sort-kernel perm (.ri m) (.ci m) k (.cols m))
+          rp   (sparse-izeros (+ (.rows m) 1))
+          cx   (sparse-izeros nnz)
+          vs   (sparse-fzeros nnz)]
+      (__coo-fill-kernel rp cx vs perm (.ri m) (.ci m) (.v m) k (.rows m))
+      (vec-free perm)
+      (make-struct csrmat (.rows m) (.cols m) nnz rp cx vs)))
+  ;;; csr-free -- free a CSR matrix.
+  (defn csr-free [m : csrmat] : void
+    (vec-free (.rowptr m))
+    (vec-free (.colidx m))
+    (vec-free (.vals m)))
+  ;;; csr-rows / csr-cols / csr-nnz -- shape and stored-entry count.
+  (defn csr-rows [^borrow m : csrmat] : int (.rows m))
+  (defn csr-cols [^borrow m : csrmat] : int (.cols m))
+  (defn csr-nnz [^borrow m : csrmat] : int (.nnz m))
+  ;;; __csr-get-kernel -- binary search row r for column c; 0.0 when absent.
+  (defn __csr-get-kernel [rpd : (Vec int)
+                          cxd : (Vec int)
+                          vsd : (Vec float)
+                          r : int
+                          c : int] : float
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  const int64_t *rowptr = ((struct __V*)(intptr_t)rpd)->data;
+  const int64_t *colidx = ((struct __V*)(intptr_t)cxd)->data;
+  const double *vals = (const double*)(void*)((struct __V*)(intptr_t)vsd)->data;
+  int64_t lo = rowptr[r], hi = rowptr[r + 1];
+  while (lo < hi) {
+    int64_t mid = lo + (hi - lo) / 2;
+    if (colidx[mid] == c) return vals[mid];
+    if (colidx[mid] < c) lo = mid + 1; else hi = mid;
+  }
+  return 0.0;
+  ```)
+  ;;; csr-get -- element (r, c); 0.0 for an entry that is not stored.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the matrix (borrowed)
+  ;;;   r -- row index
+  ;;;   c -- column index
+  ;;;
+  ;;; Returns:
+  ;;;   The stored value, found by binary search over row r.
+  ;;;
+  ;;; Example:
+  ;;;   (csr-get m 0 1)  ; => -1.0
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csr-get [^borrow m : csrmat r : int c : int] : float
+    (when (or (< r 0) (or (>= r (.rows m)) (or (< c 0) (>= c (.cols m)))))
+      (panic "csr-get: index out of range"))
+    (__csr-get-kernel (.rowptr m) (.colidx m) (.vals m) r c))
+  ;;; __csr-spmv-kernel -- y (rows) = A x.
+  (defn __csr-spmv-kernel [yd : (Vec float)
+                           rpd : (Vec int)
+                           cxd : (Vec int)
+                           vsd : (Vec float)
+                           xd : (Vec float)
+                           rows : int] : int
+    ```c
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  double *y = (double*)(void*)((struct __V*)(intptr_t)yd)->data;
+  const int64_t *rowptr = ((struct __V*)(intptr_t)rpd)->data;
+  const int64_t *colidx = ((struct __V*)(intptr_t)cxd)->data;
+  const double *vals = (const double*)(void*)((struct __V*)(intptr_t)vsd)->data;
+  const double *x = (const double*)(void*)((struct __V*)(intptr_t)xd)->data;
+  for (int64_t r = 0; r < rows; r++) {
+    double s = 0.0;
+    for (int64_t p = rowptr[r]; p < rowptr[r + 1]; p++) s += vals[p] * x[colidx[p]];
+    y[r] = s;
+  }
+  return 0;
+  ```)
+  ;;; csr-spmv -- sparse matrix-vector product A v.
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- a rows x cols CSR matrix (borrowed)
+  ;;;   v -- a vector of length cols (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A v, length rows, in O(nnz).
+  ;;;
+  ;;; Example:
+  ;;;   (csr-spmv m (la-vec-of 1.0 1.0 1.0))  ; => the row sums of m
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csr-spmv [^borrow m : csrmat ^borrow v : lavec] : lavec
+    (when (not= (la-vec-len v) (.cols m)) (panic "csr-spmv: length mismatch"))
+    (let [y (la-vec-new (.rows m))]
+      (__csr-spmv-kernel (.data y) (.rowptr m) (.colidx m) (.vals m) (.data v) (.rows m))
+      y))) ;; end defmodule linalg-sparse/csr

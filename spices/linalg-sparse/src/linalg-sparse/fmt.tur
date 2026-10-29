@@ -1,0 +1,104 @@
+;;; linalg-sparse/fmt -- printing for sparse matrices.
+;;;
+;;; A sparse matrix prints as a header line and one `(row, col) value` line
+;;; per stored entry, in row-major order:
+;;;
+;;;   csr 3x3 nnz=4
+;;;   (0, 0) 2.0000
+;;;   (0, 1) -1.0000
+;;;   ...
+;;;
+;;; As in linalg/fmt, each `*->str*` returns a malloc'd cstr that the caller
+;;; frees with `sparse-str-free`; the `*-print*` helpers print and free.
+(defmodule linalg-sparse/fmt
+  (export csr->str
+    csr->str-prec
+    csr-print
+    csr-print-prec
+    csc->str
+    csc-print
+    sparse-str-free)
+  (import linalg-sparse/csr :refer [csrmat csr-free])
+  (import linalg-sparse/csc :refer [cscmat csr-from-csc])
+  ;;; sparse-str-free -- free a cstr returned by the *->str* helpers.
+  (defn sparse-str-free [s : cstr] : void ```c free((void*)(intptr_t)s); ```)
+  ;;; __csr-fmt -- format CSR buffers; `tag` names the storage in the header.
+  (defn __csr-fmt [rpd : (Vec int)
+                   cxd : (Vec int)
+                   vsd : (Vec float)
+                   rows : int
+                   cols : int
+                   prec : int
+                   tag : cstr] : cstr
+    ```c
+    #include <stdio.h>
+    #include <stdlib.h>
+    struct __V { int64_t *data; int64_t len; int64_t cap; };
+  const int64_t *rp = ((struct __V*)(intptr_t)rpd)->data;
+  const int64_t *cx = ((struct __V*)(intptr_t)cxd)->data;
+  const double *vs = (const double*)(void*)((struct __V*)(intptr_t)vsd)->data;
+  int p = (prec < 0) ? 4 : (int)prec;
+  size_t cap = 128 + (size_t)rp[rows] * 64;
+  char *buf = (char*)malloc(cap);
+  size_t off = (size_t)snprintf(buf, cap, "%s %lldx%lld nnz=%lld", (const char*)tag,
+                                (long long)rows, (long long)cols, (long long)rp[rows]);
+  for (int64_t r = 0; r < rows; r++)
+    for (int64_t q = rp[r]; q < rp[r + 1]; q++) {
+      if (off + 96 > cap) { cap *= 2; buf = (char*)realloc(buf, cap); }
+      off += (size_t)snprintf(buf + off, cap - off, "\n(%lld, %lld) %.*f",
+                              (long long)r, (long long)cx[q], p, vs[q]);
+    }
+  return (const char *)buf;
+  ```)
+  ;;; csr->str-prec -- CSR matrix as text with `prec` decimals (caller frees).
+  ;;;
+  ;;; Parameters:
+  ;;;   m    -- the matrix (borrowed)
+  ;;;   prec -- digits after the decimal point
+  ;;;
+  ;;; Returns:
+  ;;;   A malloc'd cstr; free it with `sparse-str-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (csr->str-prec m 1)  ; => "csr 2x2 nnz=1\n(0, 0) 3.0"
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csr->str-prec [^borrow m : csrmat prec : int] : cstr
+    (__csr-fmt (.rowptr m) (.colidx m) (.vals m) (.rows m) (.cols m) prec "csr"))
+  ;;; csr->str -- CSR matrix as text with 4 decimals (caller frees).
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the matrix (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A malloc'd cstr; free it with `sparse-str-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (let [s (csr->str m)] (println s) (sparse-str-free s))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csr->str [^borrow m : csrmat] : cstr (csr->str-prec m 4))
+  ;;; csr-print-prec / csr-print -- print a CSR matrix to stdout.
+  (defn csr-print-prec [^borrow m : csrmat prec : int] : void
+    (let [s (csr->str-prec m prec)] (println s) (sparse-str-free s)))
+  (defn csr-print [^borrow m : csrmat] : void (csr-print-prec m 4))
+  ;;; csc->str -- CSC matrix as text, entries in row-major order (caller frees).
+  ;;;
+  ;;; Parameters:
+  ;;;   m -- the matrix (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   A malloc'd cstr headed `csc RxC nnz=N`; free it with `sparse-str-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (let [s (csc->str m)] (println s) (sparse-str-free s))
+  ;;;
+  ;;; Since: 0.1.0
+  (defn csc->str [^borrow m : cscmat] : cstr
+    (let [r (csr-from-csc m)
+          s (__csr-fmt (.rowptr r) (.colidx r) (.vals r) (.rows r) (.cols r) 4 "csc")]
+      (csr-free r)
+      s))
+  ;;; csc-print -- print a CSC matrix to stdout.
+  (defn csc-print [^borrow m : cscmat] : void
+    (let [s (csc->str m)] (println s) (sparse-str-free s)))) ;; end defmodule linalg-sparse/fmt
