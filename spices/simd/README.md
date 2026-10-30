@@ -10,8 +10,14 @@ real kernels on the operation set S1 proposes, check that set against them,
 and measure what a function boundary costs. Its findings are below, and in
 the plan.
 
-Needs a `tur` with `stdlib/numvec.tur` -- turmeric `main` after
-2026-10-28; no release carries it yet.
+It now also carries **`simd/s1`**: the same kernels rewritten in ordinary
+Turmeric on the vector types S1 gave the compiler (`F64x2`, `U8x16`,
+`F32x4`, ... in `stdlib/simd.tur`) -- the plan's graduation test for S1.
+
+Needs a `tur` with `stdlib/simd.tur` -- turmeric `main` after 2026-10-30
+(turmeric#1437); no release carries it yet. The vector types are an
+experiment, so this spice's `build.tur` sets `:experiments ["simd"]`, and a
+program importing `simd/s1` needs `--enable=simd` too.
 
 ## What is in it
 
@@ -53,7 +59,45 @@ one inline-C body (a 16- or 32-byte vector is not a Turmeric value yet):
 | `simd-biquad4-f32!` | one biquad (DF2T) over four interleaved channels, a channel per lane; state persists in an `F32Vec` of 8 |
 | `simd-lowering` | `"vector-ext"` or `"lanes"` |
 
-`tests/simd.tur` holds every kernel to its scalar result bit for bit.
+**`simd/s1`** -- the dot product, blend and biquad again, written in
+Turmeric on the S1 vector types: `let`, `while`, and `{a + b}` on vectors
+through their `Num` instances, with no inline C:
+
+```turmeric
+(import simd/s1 :refer [s1-dot-f64 s1-blend-u8! s1-biquad4-f32!])
+
+(s1-dot-f64 a b)                       ; = f64vec-dot = simd-dot-f64, to the bit
+(s1-blend-u8! out fg bg (as uint8 96))
+(s1-biquad4-f32! samples state (Biquad b0 b1 b2 a1 a2))
+```
+
+The inner loops read with `P-load-unchecked` after checking the lengths
+once; a checked `P-load` carries a panic check per call, which costs a call
+under clang.
+
+`tests/simd.tur` holds every kernel, inline-C and S1, to its scalar result
+bit for bit (21 tests).
+
+## S1 against inline C (2026-10-30)
+
+`bench/bench.tur`, ns/elem, best of five, x86-64, `-O2`:
+
+| kernel | gcc: inline C | gcc: S1 | clang: inline C | clang: S1 |
+|---|---|---|---|---|
+| dot f64 (`F64x2`) | 0.242 | 0.249 | 0.251 | 0.237 |
+| blend u8 (`U8x16` / `U16x8`) | 0.299 | 0.299 | 0.146 | 0.151 |
+| biquad x4 f32 (`F32x4`) | 0.969 | 0.985 | 0.974 | 1.32 |
+
+The dot product and the blend are as fast in Turmeric as in hand-written
+vector C on both compilers, which is the plan's graduation test for S1. The
+biquad is too on gcc, and 1.35x slower on clang: its loop carries two
+vectors (the filter state) from one iteration to the next, and clang keeps a
+16-byte struct of four floats as the two eight-byte halves the x86-64 ABI
+passes it in, so each iteration splits the state (`unpckhpd`) and joins it
+again (`movlhps`) on the recurrence's critical path. The dot product's four
+accumulators are independent, so the same shuffles hide behind them. A union
+with a vector member does not change the ABI's classification; the fix would
+be in how the compiler declares the vector types.
 
 ## Findings (2026-10-29)
 

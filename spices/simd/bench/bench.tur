@@ -1,6 +1,8 @@
 ;;; bench.tur -- time tur-simd's kernels against what a program has without it.
 ;;;
-;;; Each row: the SIMD kernel, then the alternatives -- N1's kernel where one
+;;; Each row: the SIMD kernel, its S1 twin on the compiler's vector types
+;;; (`simd/s1`, needs `--enable=simd`, which this spice's build.tur enables),
+;;; then the alternatives -- N1's kernel where one
 ;;; exists (`f64vec-dot`), and the scalar loop written in Turmeric.  Run it
 ;;; under different flags to see the lowering and the call boundary:
 ;;;
@@ -22,6 +24,7 @@
      simd-dot-f64x4
      simd-blend-u8!
      simd-biquad4-f32!])
+  (import simd/s1 :refer [s1-dot-f64 s1-blend-u8! s1-biquad4-f32!])
   (defn now-ns [] : int
     ```c
     #include <time.h>
@@ -73,7 +76,9 @@
                   (simd-dot-f64 a b)
                   (if (= which 1)
                     (f64vec-dot a b)
-                    (if (= which 2) (dot-scalar a b) (simd-dot-f64x4 a b))))))
+                    (if (= which 2)
+                      (dot-scalar a b)
+                      (if (= which 3) (simd-dot-f64x4 a b) (s1-dot-f64 a b)))))))
             (set! r (+ r 1)))
           (sink s)
           (let [dt (as float (- (now-ns) t0))]
@@ -124,7 +129,9 @@
               (simd-blend-u8! out a b (as uint8 (+ (mod r 200) 20)))
               (if (= which 1)
                 (blend-scalar! out a b (+ (mod r 200) 20))
-                (blend-c! out a b (+ (mod r 200) 20))))
+                (if (= which 2)
+                  (blend-c! out a b (+ (mod r 200) 20))
+                  (s1-blend-u8! out a b (as uint8 (+ (mod r 200) 20))))))
             (set! r (+ r 1)))
           (sink (as float (u8vec-ref out 7)))
           (let [dt (as float (- (now-ns) t0))]
@@ -194,8 +201,12 @@
               (simd-biquad4-f32! v st c)
               (if (= which 2)
                 (biquad-c! v st c)
-                (let [^mut ch 0]
-                  (while (< ch 4) (biquad-scalar! v st ch c) (set! ch (+ ch 1))))))
+                (if (= which 3)
+                  (s1-biquad4-f32! v st c)
+                  (let [^mut ch 0]
+                    (while (< ch 4)
+                      (biquad-scalar! v st ch c)
+                      (set! ch (+ ch 1)))))))
             (set! r (+ r 1)))
           (sink (as float (f32vec-ref v 5)))
           (let [dt (as float (- (now-ns) t0))]
@@ -205,13 +216,16 @@
   (defn main [] : int
     (note (simd-lowering))
     (row "dot f64: simd-dot-f64 (f64x2)" (time-dot 0))
+    (row "dot f64: s1-dot-f64 (F64x2, Turmeric)" (time-dot 4))
     (row "dot f64: simd-dot-f64x4" (time-dot 3))
     (row "dot f64: f64vec-dot (N1)" (time-dot 1))
     (row "dot f64: scalar Turmeric loop" (time-dot 2))
     (row "blend u8: simd-blend-u8!" (time-blend 0))
+    (row "blend u8: s1-blend-u8! (U8x16, Turmeric)" (time-blend 3))
     (row "blend u8: scalar Turmeric loop" (time-blend 1))
     (row "blend u8: scalar C, auto-vectorized" (time-blend 2))
     (row "biquad x4 f32: simd-biquad4-f32!" (time-biquad 0))
+    (row "biquad x4 f32: s1-biquad4-f32! (F32x4, Turmeric)" (time-biquad 3))
     (row "biquad x4 f32: 4 scalar Turmeric" (time-biquad 1))
     (row "biquad x4 f32: scalar C, 4 lanes" (time-biquad 2))
     0))
