@@ -5,7 +5,7 @@ numeric arrays (`F64Vec`, `F32Vec`, `U8Vec`, ... from `stdlib/numvec.tur`).
 
 This is **phase S0** of turmeric's
 [simd-and-vectorization-plan](https://github.com/turmeric-lang/turmeric/blob/main/docs/upcoming/simd-and-vectorization-plan.md):
-before the compiler knows a vector type (phase S1, `--enable=simd`), write
+before the compiler knew a vector type (phase S1), write
 real kernels on the operation set S1 proposes, check that set against them,
 and measure what a function boundary costs. Its findings are below, and in
 the plan.
@@ -14,10 +14,9 @@ It now also carries **`simd/s1`**: the same kernels rewritten in ordinary
 Turmeric on the vector types S1 gave the compiler (`F64x2`, `U8x16`,
 `F32x4`, ... in `stdlib/simd.tur`) -- the plan's graduation test for S1.
 
-Needs a `tur` with `stdlib/simd.tur` -- turmeric `main` after 2026-10-30
-(turmeric#1437); no release carries it yet. The vector types are an
-experiment, so this spice's `build.tur` sets `:experiments ["simd"]`, and a
-program importing `simd/s1` needs `--enable=simd` too.
+Needs turmeric v0.73.0 or later, where the vector types need no flag (they
+graduated from the `simd` experiment; v0.72.1 has them only behind
+`--enable=simd`).
 
 ## What is in it
 
