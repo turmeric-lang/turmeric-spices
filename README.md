@@ -31,6 +31,7 @@ turmeric's [Emscripten spice audit](https://github.com/turmeric-lang/turmeric/bl
 | [`tur-frame`](spices/frame/) | In-memory dataframe (Arrow-compatible columnar) | 1 | ✅ | ✅ | ✅ | ✅ | -- |
 | [`tur-plot`](spices/plot/) | 2D data visualization (functions, points, histograms, contours) | 1 | ✅ | ✅ | ✅ | ✅ | tur-plutovg |
 | [`tur-crdt`](spices/crdt/) | Conflict-free replicated data types: counters, sets, registers, maps and a replicated sequence, over a join-semilattice, with delta-state mutators | 1 | ✅ | ✅ | ✅ | ✅ | -- |
+| [`tur-simd`](spices/simd/) | Explicit SIMD on GCC/Clang vector extensions over numvec arrays: dot product, byte-image blend, 4-channel biquad (turmeric's S0 prototype) | 1 | ✅ | ✅ | ✅ | ✅ | -- |
 | [`tur-tourist-ws`](spices/tourist-ws/) | WebSocket routes for the tur-tourist framework (ws-route!) | 1 | ✅ | ✅ | ❌ | ❌ | tur-tourist, tur-ws-server, tur-httpd, tur-json |
 | [`tur-linalg`](spices/linalg/) | Dense float linear algebra: matrices, vectors, Cholesky/LU/QR/SVD/eigen, CG/BiCGSTAB, optional BLAS/LAPACK backend, mat4 graphics helpers | 2 | ✅ | ✅ | ✅ | ✅ | BLAS/LAPACK (optional) |
 | [`tur-linalg-sparse`](spices/linalg-sparse/) | Sparse float matrices: CSR/CSC, SpMV, ILU(0), sparse CG/BiCGSTAB | 2 | ✅ | ✅ | ✅ | ✅ | tur-linalg |
