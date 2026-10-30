@@ -1,0 +1,175 @@
+;;; simd/s1 -- the S0 kernels written in Turmeric on the compiler's vector types.
+;;;
+;;; simd-and-vectorization-plan (turmeric repo) phase S1 gave Turmeric vector
+;;; types of its own -- `F64x2`, `F32x4`, `U8x16`, `U16x8`, ... in
+;;; `stdlib/simd.tur`, behind `--enable=simd` -- so a kernel no longer has to
+;;; be one inline-C loop.  These are `simd/kernels`' dot product, blend and
+;;; biquad again, in ordinary Turmeric: `let`, `while`, `{a + b}` on vectors
+;;; through their `Num` instances.  Each gives its inline-C twin's bits, and
+;;; runs as fast (README, "S1").
+;;;
+;;; The loops read with `P-load-unchecked` after checking the lengths once:
+;;; the checked `P-load` carries a panic check per call, which costs a call
+;;; under clang (the plan's S1a findings).
+;;;
+;;; This spice's build.tur enables the experiment (`:experiments ["simd"]`);
+;;; a program importing this module needs `--enable=simd` too.
+;;;
+;;; Since: S1
+;; kernels on the vector types
+(load "stdlib/simd.tur")
+
+(defmodule simd/s1
+  (import simd/kernels :refer [Biquad])
+  (export s1-dot-f64 s1-blend-u8! s1-biquad4-f32!)
+  ;;; s1-dot-f64 -- the dot product of two F64Vecs, on F64x2 values.
+  ;;;
+  ;;; Four F64x2 accumulators hold N1's eight lanes (element i in lane
+  ;;; i mod 8), the tail goes to its lane one element at a time, and the lanes
+  ;;; are added in N1's tree: the same bits as `f64vec-dot` and
+  ;;; `simd-dot-f64`.  A length mismatch panics.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the first array (borrowed)
+  ;;;   b -- the second array (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The dot product.
+  ;;;
+  ;;; Example:
+  ;;;   (let [a (f64vec-of 1.5 2.5) b (f64vec-of 2.0 4.0)] (s1-dot-f64 a b))   ; => 13.0
+  ;;;
+  ;;; Since: S1
+  (defn s1-dot-f64 [^borrow a : F64Vec ^borrow b : F64Vec] : float
+    (when (not (= (f64vec-len a) (f64vec-len b)))
+      (panic "s1-dot-f64: length mismatch"))
+    (let [n       (f64vec-len a)
+          ^mut c0 (f64x2-splat 0.0)
+          ^mut c1 (f64x2-splat 0.0)
+          ^mut c2 (f64x2-splat 0.0)
+          ^mut c3 (f64x2-splat 0.0)
+          ^mut i  0]
+      (while (<= (+ i 8) n)
+        (let [m0 (* (unsafe (f64x2-load-unchecked a i))
+                   (unsafe (f64x2-load-unchecked b i)))
+              m1 (* (unsafe (f64x2-load-unchecked a (+ i 2)))
+                   (unsafe (f64x2-load-unchecked b (+ i 2))))
+              m2 (* (unsafe (f64x2-load-unchecked a (+ i 4)))
+                   (unsafe (f64x2-load-unchecked b (+ i 4))))
+              m3 (* (unsafe (f64x2-load-unchecked a (+ i 6)))
+                   (unsafe (f64x2-load-unchecked b (+ i 6))))]
+          (set! c0 (+ c0 m0))
+          (set! c1 (+ c1 m1))
+          (set! c2 (+ c2 m2))
+          (set! c3 (+ c3 m3)))
+        (set! i (+ i 8)))
+      ;; the tail: element i + k joins lane k
+      (let [^mut s0 (.l0 c0)
+            ^mut s1 (.l1 c0)
+            ^mut s2 (.l0 c1)
+            ^mut s3 (.l1 c1)
+            ^mut s4 (.l0 c2)
+            ^mut s5 (.l1 c2)
+            ^mut s6 (.l0 c3)
+            s7      (.l1 c3)]
+        (when (< i n) (set! s0 (+ s0 (* (f64vec-ref a i) (f64vec-ref b i)))))
+        (when (< (+ i 1) n)
+          (set! s1 (+ s1 (* (f64vec-ref a (+ i 1)) (f64vec-ref b (+ i 1))))))
+        (when (< (+ i 2) n)
+          (set! s2 (+ s2 (* (f64vec-ref a (+ i 2)) (f64vec-ref b (+ i 2))))))
+        (when (< (+ i 3) n)
+          (set! s3 (+ s3 (* (f64vec-ref a (+ i 3)) (f64vec-ref b (+ i 3))))))
+        (when (< (+ i 4) n)
+          (set! s4 (+ s4 (* (f64vec-ref a (+ i 4)) (f64vec-ref b (+ i 4))))))
+        (when (< (+ i 5) n)
+          (set! s5 (+ s5 (* (f64vec-ref a (+ i 5)) (f64vec-ref b (+ i 5))))))
+        (when (< (+ i 6) n)
+          (set! s6 (+ s6 (* (f64vec-ref a (+ i 6)) (f64vec-ref b (+ i 6))))))
+        (+ (+ (+ s0 s1) (+ s2 s3)) (+ (+ s4 s5) (+ s6 s7))))))
+  ;;; s1-blend-u8! -- dst = a * alpha/255 + b * (255 - alpha)/255, per byte.
+  ;;;
+  ;;; `simd-blend-u8!` on U8x16 / U16x8 values: sixteen bytes a step, widened
+  ;;; to two U16x8 (a product needs 16 bits), rounded with
+  ;;; t = a*alpha + b*(255-alpha) + 128, byte = (t + (t >> 8)) >> 8, and
+  ;;; narrowed back -- the same bytes.  All three arrays have the same length,
+  ;;; or a panic; dst may be a or b.
+  ;;;
+  ;;; Parameters:
+  ;;;   dst   -- the array written (borrowed)
+  ;;;   a     -- the image weighted by alpha (borrowed)
+  ;;;   b     -- the image weighted by 255 - alpha (borrowed)
+  ;;;   alpha -- 0 gives b, 255 gives a
+  ;;;
+  ;;; Example:
+  ;;;   (s1-blend-u8! out fg bg (as uint8 128))
+  ;;;
+  ;;; Since: S1
+  (defn s1-blend-u8! [^borrow dst : U8Vec
+                      ^borrow a : U8Vec
+                      ^borrow b : U8Vec
+                      alpha : uint8] : nil
+    (when (or (not (= (u8vec-len dst) (u8vec-len a)))
+            (not (= (u8vec-len dst) (u8vec-len b))))
+      (panic "s1-blend-u8!: length mismatch"))
+    (let [n      (u8vec-len dst)
+          ka     (as int alpha)
+          kb     (- 255 ka)
+          wa     (u16x8-splat (as uint16 ka))
+          wb     (u16x8-splat (as uint16 kb))
+          r      (u16x8-splat (as uint16 128))
+          ^mut i 0]
+      (while (<= (+ i 16) n)
+        (let [x  (unsafe (u8x16-load-unchecked a i))
+              y  (unsafe (u8x16-load-unchecked b i))
+              tl (+ (+ (* (u8x16-widen-lo x) wa) (* (u8x16-widen-lo y) wb)) r)
+              th (+ (+ (* (u8x16-widen-hi x) wa) (* (u8x16-widen-hi y) wb)) r)
+              ol (u16x8-shr (+ tl (u16x8-shr tl 8)) 8)
+              oh (u16x8-shr (+ th (u16x8-shr th 8)) 8)]
+          (unsafe (u8x16-store-unchecked! dst i (u16x8-narrow ol oh))))
+        (set! i (+ i 16)))
+      ;; the tail, one byte at a time, in the same arithmetic
+      (while (< i n)
+        (let [t (+ (+ (* (as int (u8vec-ref a i)) ka)
+                     (* (as int (u8vec-ref b i)) kb))
+                  128)]
+          (u8vec-set! dst i (as uint8 (bit-shr (+ t (bit-shr t 8)) 8))))
+        (set! i (+ i 1)))))
+  ;;; s1-biquad4-f32! -- run one biquad over four interleaved channels, in place.
+  ;;;
+  ;;; `simd-biquad4-f32!` on F32x4 values: buf holds frames of four samples
+  ;;; (channel c of frame f at 4f + c), so its length is a multiple of four,
+  ;;; or a panic; state holds z1 for channels 0-3, then z2 -- eight float32,
+  ;;; zeroed to start.  Each lane is one channel, its arithmetic in the scalar
+  ;;; order: the same bits as four scalar filters.
+  ;;;
+  ;;; Parameters:
+  ;;;   buf   -- the interleaved samples, filtered in place (borrowed)
+  ;;;   state -- the eight state values, updated (borrowed)
+  ;;;   c     -- the coefficients
+  ;;;
+  ;;; Example:
+  ;;;   (s1-biquad4-f32! buf state (Biquad b0 b1 b2 a1 a2))
+  ;;;
+  ;;; Since: S1
+  (defn s1-biquad4-f32! [^borrow buf : F32Vec ^borrow state : F32Vec c : Biquad] : nil
+    (when (or (not (= (mod (f32vec-len buf) 4) 0))
+            (not (= (f32vec-len state) 8)))
+      (panic "s1-biquad4-f32!: buf length must be a multiple of 4, state length 8"))
+    (let [n       (f32vec-len buf)
+          b0      (f32x4-splat (.b0 c))
+          b1      (f32x4-splat (.b1 c))
+          b2      (f32x4-splat (.b2 c))
+          a1      (f32x4-splat (.a1 c))
+          a2      (f32x4-splat (.a2 c))
+          ^mut z1 (f32x4-load state 0)
+          ^mut z2 (f32x4-load state 4)
+          ^mut i  0]
+      (while (< i n)
+        (let [x (unsafe (f32x4-load-unchecked buf i))
+              y (+ (* b0 x) z1)]
+          (set! z1 (+ (- (* b1 x) (* a1 y)) z2))
+          (set! z2 (- (* b2 x) (* a2 y)))
+          (unsafe (f32x4-store-unchecked! buf i y)))
+        (set! i (+ i 4)))
+      (f32x4-store! state 0 z1)
+      (f32x4-store! state 4 z2))))
