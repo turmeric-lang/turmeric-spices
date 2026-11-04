@@ -13,6 +13,24 @@ textures, 3D camera helpers, audio playback, and keyboard / gamepad input.
 Use it for prototypes, jam games, demos, and learning-oriented graphics
 code where raylib's "batteries-included" model is a better fit than raw GL.
 
+## Try it in the browser
+
+[Turmeric Arcade](https://play.turmeric-lang.com) runs raylib programs in
+the page: an editor beside a 480x270 screen, with this spice (and raygui, ecs
+and ecs-raylib) compiled in the browser -- inline C included -- and examples
+from a bouncing ball to Life. Each example starts with a `defscript` header
+naming the spices it uses, so a program copied out of the page runs natively
+as it stands:
+
+```sh
+tur --enable=script-deps run bouncing-ball.tur
+```
+
+Both loop styles work there: the blocking `while (not (window-should-close))`
+loop below, and the frame callback of `raylib/web` (`run-main-loop`,
+`with-web-game-loop`). The site is
+[turmeric-lang/turmeric-arcade](https://github.com/turmeric-lang/turmeric-arcade).
+
 ## Install
 
 ```turmeric no-check

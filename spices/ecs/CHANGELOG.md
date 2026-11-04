@@ -135,6 +135,15 @@ All notable changes to the `tur-ecs` spice are documented here.
 
 ### Fixed
 
+- **`world-alloc-entity!` / `world-despawn!` on wasm32.** Both viewed the
+  world's `gens` vector -- a stdlib vector -- as `{int64_t *data; size_t len;
+  size_t cap}`, where the stdlib's header is `int64_t len; int64_t cap`. On a
+  64-bit target the two agree; on wasm32 `size_t` is 4 bytes, so `len` was
+  read from the padding after `data` and the first entity trapped with
+  `memory access out of bounds` in the browser engine (turmeric's arcade,
+  raylib-web-playground-plan P3). The views use `int64_t` now; natively
+  nothing changes.
+
 - **`build.tur` parses again** -- `:spices` was spelled `#fx{...}`, an
   effect-row literal, where the manifest reader wants a map. The reader split
   that made the two distinct landed 2026-07-05 (turmeric `fe67bd9fd`,
