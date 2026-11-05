@@ -51,6 +51,44 @@ static inline double __stats_col_f64(const struct __frame_col *c, int64_t i) {
   }
 }
 #endif
+#ifndef __STATS_REGRESS_PT_DEFINED
+#define __STATS_REGRESS_PT_DEFINED
+/* The regularized incomplete beta I_x(a, b), by the Lentz continued fraction
+   (Numerical Recipes betacf) -- the terms stats/dist's `__ibeta` uses, which
+   agree with numerical integration.  The fraction regress used to inline had
+   b where b - m belongs in the even term and dropped the odd term's sign, so
+   its p-values were off, one of them negative
+   (stats-ols-pvalues-wrong-continued-fraction). */
+static double __stats_rg_ibeta(double x, double a, double b) {
+  if (x <= 0.0) return 0.0;
+  if (x >= 1.0) return 1.0;
+  int swapped = 0;
+  if (x > (a+1.0)/(a+b+2.0)) { double t=a;a=b;b=t; x=1.0-x; swapped=1; }
+  double front = exp(a*log(x)+b*log(1.0-x)-(lgamma(a)+lgamma(b)-lgamma(a+b)))/a;
+  double fpmin=1e-300, c=1.0, dd=1.0-((a+b)*x/(a+1.0));
+  if(fabs(dd)<fpmin)dd=fpmin; dd=1.0/dd; double h=dd;
+  for(int m=1;m<=300;m++){
+    double m2=2.0*(double)m;
+    double num=((double)m*(b-(double)m)*x)/((a+m2-1.0)*(a+m2));
+    dd=1.0+num*dd; if(fabs(dd)<fpmin)dd=fpmin;
+    c=1.0+num/c;   if(fabs(c)<fpmin)c=fpmin;
+    dd=1.0/dd; h*=dd*c;
+    num=-(a+(double)m)*(a+b+(double)m)*x/((a+m2)*(a+m2+1.0));
+    dd=1.0+num*dd; if(fabs(dd)<fpmin)dd=fpmin;
+    c=1.0+num/c;   if(fabs(c)<fpmin)c=fpmin;
+    dd=1.0/dd; double del=dd*c; h*=del;
+    if(fabs(del-1.0)<1e-14) break;
+  }
+  double val = front*h;
+  return swapped ? 1.0-val : val;
+}
+/* Two-tailed P(|T| > |t|) for Student's t with df degrees of freedom:
+   I_{df/(df+t^2)}(df/2, 1/2). */
+static double __stats_rg_p2(double t, double df) {
+  if (!(df > 0.0)) return 0.0/0.0;
+  return __stats_rg_ibeta(df/(df+t*t), 0.5*df, 0.5);
+}
+#endif
 #ifndef __STATS_FRAME_TYPES_DEFINED
 #define __STATS_FRAME_TYPES_DEFINED
 /* frame's own layout (spices/frame/src/frame/frame.tur, schema.tur), under
@@ -225,53 +263,14 @@ typedef struct {
   double *tv    = (double *)malloc((size_t)(p1*sizeof(double)));
   double *pv    = (double *)malloc((size_t)(p1*sizeof(double)));
 
-  /* simple approximation for t p-values via incomplete beta */
-  /* ibeta(a,b,x) -- Lentz CF */
-  #define _IBETA_CF(aa,bb,xx,out) do { \
-    double _a=(aa),_b=(bb),_x=(xx); \
-    if(_x<=0.0){out=0.0;}else if(_x>=1.0){out=1.0;} \
-    else { \
-      int _sym=(_x>(_a+1.0)/(_a+_b+2.0)); \
-      double _xa=_sym?1.0-_x:_x, _aa=_sym?_b:_a, _bb=_sym?_a:_b; \
-      double _lbc=lgamma(_aa+_bb)-lgamma(_aa)-lgamma(_bb)+_aa*log(_xa)+_bb*log(1.0-_xa); \
-      double _front=exp(_lbc)/_aa; \
-      double _f=1.0,_c=1.0,_d=1.0-(_aa+_bb)*_xa/(_aa+1.0),_eps=3e-8; \
-      if(fabs(_d)<1e-30) _d=1e-30; _d=1.0/_d; _f=_d; \
-      for(int _m2=1;_m2<=300;_m2+=2){ \
-        int _mm=_m2/2; \
-        double _dm=_bb*_xa*(double)_mm/((_aa+_m2-1)*(_aa+_m2)); \
-        double _em=_aa*_xa*(double)_mm/((_aa+_m2)*(1.0+_aa+_m2)); \
-        double _del; \
-        _d=1.0+_dm*_d; if(fabs(_d)<1e-30)_d=1e-30; \
-        _c=1.0+_dm/_c; if(fabs(_c)<1e-30)_c=1e-30; \
-        _d=1.0/_d; _f*=_c*_d; _del=_c*_d; \
-        _d=1.0+_em*_d; if(fabs(_d)<1e-30)_d=1e-30; \
-        _c=1.0+_em/_c; if(fabs(_c)<1e-30)_c=1e-30; \
-        _d=1.0/_d; double _delta2=_c*_d; _f*=_delta2; \
-        if(fabs(_delta2-1.0)<_eps) break; \
-        (void)_del; \
-      } \
-      double _i=_front*_f; if(_sym) _i=1.0-_i; \
-      out=_i; \
-    } \
-  } while(0)
-
   for(int64_t i=0;i<p1;i++){
     double sumsq=0.0;
     for(int64_t k=0;k<p1;k++) sumsq+=Linv[k*p1+i]*Linv[k*p1+i];
     se_v[i]=(df_res>0)?sigma*sqrt(sumsq):0.0;
     tv[i]=(se_v[i]>0)?beta[i]/se_v[i]:0.0;
     /* two-tailed p-value from t distribution with df_res */
-    double t2=tv[i]*tv[i];
-    double pp=0.0;
-    _IBETA_CF(0.5*(double)df_res, 0.5, (double)df_res/(double)df_res+t2, pp);
-    /* correct formula: P(|T|>|t|) = Ibeta(df/2, 1/2, df/(df+t^2)) */
-    double tt=fabs(tv[i]);
-    double x_bt=(double)df_res/((double)df_res+tt*tt);
-    double ib=0.0; _IBETA_CF(0.5*(double)df_res, 0.5, x_bt, ib);
-    pv[i]=ib; (void)pp;
+    pv[i]=__stats_rg_p2(tv[i],(double)df_res);
   }
-  #undef _IBETA_CF
 
   /* ---- Build names list (prepend "(Intercept)" if intercept?) ---- */
   /* We build a reversed cons list then don't reverse (OK for display). */
@@ -515,41 +514,13 @@ typedef struct {
   double *se2=(double *)malloc((size_t)(p1*sizeof(double)));
   double *tv2=(double *)malloc((size_t)(p1*sizeof(double)));
   double *pv2=(double *)malloc((size_t)(p1*sizeof(double)));
-  #define _IB2(aa,bb,xx,out) do { \
-    double _a=(aa),_b=(bb),_x=(xx); \
-    if(_x<=0.0){out=0.0;}else if(_x>=1.0){out=1.0;} \
-    else { \
-      int _sy=(_x>(_a+1.0)/(_a+_b+2.0)); \
-      double _xa=_sy?1.0-_x:_x,_aa=_sy?_b:_a,_bb=_sy?_a:_b; \
-      double _lbc=lgamma(_aa+_bb)-lgamma(_aa)-lgamma(_bb)+_aa*log(_xa)+_bb*log(1.0-_xa); \
-      double _fr2=exp(_lbc)/_aa,_f2=1.0,_c2=1.0,_d2=1.0-(_aa+_bb)*_xa/(_aa+1.0),_ep=3e-8; \
-      if(fabs(_d2)<1e-30)_d2=1e-30;_d2=1.0/_d2;_f2=_d2; \
-      for(int _m2=1;_m2<=300;_m2+=2){ \
-        int _mm=_m2/2; \
-        double _dm=_bb*_xa*(double)_mm/((_aa+_m2-1)*(_aa+_m2)); \
-        double _em=_aa*_xa*(double)_mm/((_aa+_m2)*(1.0+_aa+_m2)); \
-        _d2=1.0+_dm*_d2;if(fabs(_d2)<1e-30)_d2=1e-30; \
-        _c2=1.0+_dm/_c2;if(fabs(_c2)<1e-30)_c2=1e-30; \
-        _d2=1.0/_d2;_f2*=_c2*_d2; \
-        _d2=1.0+_em*_d2;if(fabs(_d2)<1e-30)_d2=1e-30; \
-        _c2=1.0+_em/_c2;if(fabs(_c2)<1e-30)_c2=1e-30; \
-        _d2=1.0/_d2;double _dlt2=_c2*_d2;_f2*=_dlt2; \
-        if(fabs(_dlt2-1.0)<_ep)break; \
-      } \
-      double _iv=_fr2*_f2;if(_sy)_iv=1.0-_iv;out=_iv; \
-    } \
-  } while(0)
   for(int64_t i=0;i<p1;i++){
     double sq=0.0;
     for(int64_t k=0;k<p1;k++) sq+=Linv2[k*p1+i]*Linv2[k*p1+i];
     se2[i]=(df_res2>0)?sigma2*sqrt(sq):0.0;
     tv2[i]=(se2[i]>0)?beta2[i]/se2[i]:0.0;
-    double tt=fabs(tv2[i]);
-    double xbt=(double)df_res2/((double)df_res2+tt*tt);
-    double ib=0.0;_IB2(0.5*(double)df_res2,0.5,xbt,ib);
-    pv2[i]=ib;
+    pv2[i]=__stats_rg_p2(tv2[i],(double)df_res2);
   }
-  #undef _IB2
 
   #define _MC2(dst,src,len) do { \
     int64_t _by=(len)*sizeof(double),_ro=(_by+63)&~((int64_t)63); \
