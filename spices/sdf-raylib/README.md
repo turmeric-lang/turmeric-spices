@@ -80,7 +80,7 @@ let [body sdf-sphere(0.0 0.0 0.0 1.5)
      core sdf-difference(body hole)
      sat  sdf-translate(sdf-sphere(0.0 0.0 0.0 0.45) 2.4 0.0 0.0)
      scene sdf-union(core sat)]
-  println $ "SDF at origin:" sdf-eval(scene 0.0 0.0 0.0)
+  println("SDF at origin:" sdf-eval(scene 0.0 0.0 0.0))
   let [mesh mc-extract(scene 32 -3.0 -3.0 -3.0 3.0 3.0 3.0)]
     export-stl(mesh "hello-sphere.stl")
     mesh-free(mesh)

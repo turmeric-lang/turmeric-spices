@@ -30,6 +30,24 @@ built-in stores:
       0)))
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import valkey/client          :refer [client-connect client-close])
+(import tourist-session-valkey/store :refer [valkey-store-new])
+(import session/mw             :refer [session-mw])
+(import session/config         :refer [default-session-config])
+
+defn main [] : int
+  let [c     ok-val(client-connect("127.0.0.1" 6379))
+       store valkey-store-new(c "sess" 86400)]   ;; client, key prefix, max-age
+    let [srv tourist(3000
+                     session-mw(store default-session-config())
+                     get!("/" home))]
+      ;; ... serve ...
+      client-close(c)   ;; the store borrows the client; you own its lifecycle
+      0
+```
+
 ## How it stores sessions
 
 - **Key layout.** Each session is one key, `<prefix>:<session-id>`.
@@ -46,7 +64,7 @@ built-in stores:
 
 ## API
 
-```turmeric
+```turmeric no-check
 ;; client  -- borrowed Valkey client (caller owns lifecycle)
 ;; prefix  -- key namespace, e.g. "sess"
 ;; max-age -- session lifetime in seconds (match SessionConfig's max-age)

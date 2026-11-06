@@ -32,6 +32,25 @@ spice; nothing is fetched, and a consumer builds offline. See
   (buf-free b))
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import msgpack/buf    :refer [Buf buf-free buf->hex])
+(import msgpack/decode :refer [mp-parse mp-tree-root mp-tree-free])
+(import msgpack/encode :refer [derive-msgpack])
+
+defstruct User [id : int  name : cstr  active : bool]
+derive-msgpack User (id int) (name cstr) (active bool)
+
+let [b encode-mp(make-struct(User 7 "alice" true))]   ;; owned Buf
+  ;; 83 a2 69 64 07 a4 6e 61 6d 65 a5 61 6c 69 63 65 a6 61 63 74 69 76 65 c3
+  ;;  = {"id":7,"name":"alice","active":true} as a fixmap
+  let [t ok-val(mp-parse(b))
+       u ok-val(::(decode-mp(t mp-tree-root(t)) (Result User cstr)))]
+    println .name(u)
+    mp-tree-free(t)
+  buf-free(b)
+```
+
 ## The three classes
 
 All three are **format-tagged**, and so are their methods. Typeclasses resolve
@@ -54,6 +73,11 @@ so the instance is selected by the ascription at the call site.
 ```turmeric
 (:: (decode-mp t n) (Result int  cstr))   ;; picks DecodeMp [int]
 (:: (decode-mp t n) (Result User cstr))   ;; picks the derived instance
+```
+
+```sweet-exp
+::(decode-mp(t n) (Result int  cstr))   ;; picks DecodeMp [int]
+::(decode-mp(t n) (Result User cstr))   ;; picks the derived instance
 ```
 
 Primitive instances ship for `int`, `bool`, `float`, `cstr`, `(Option A)` and
@@ -113,6 +137,23 @@ boundary, reach for `derive-mp-decoder`:
       (println (mp-decode-error-expected e 0))    ; => "string"
       (println (mp-decode-error-got      e 0))    ; => "int"
       (mp-decode-errors-free e))))
+```
+
+```sweet-exp
+#lang sweet-exp
+defstruct Person [name : cstr  age : int]
+derive-mp-decoder Person (name cstr) (age int)
+
+let [r ::(decode-mp-checked(t root) (Result Person MpDecodeErrors))]
+  if ok?(r)
+    use(ok-val(r))
+    let [e err-val(r)]
+      ;; every violation, not just the first
+      println mp-decode-errors-count(e)       ; => 2
+      println mp-decode-error-path(e 0)       ; => "name"
+      println mp-decode-error-expected(e 0)   ; => "string"
+      println mp-decode-error-got(e 0)        ; => "int"
+      mp-decode-errors-free(e)
 ```
 
 The type vocabulary (`int` / `string` / `bool` / `float` / `null` / `array` /

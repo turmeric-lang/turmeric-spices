@@ -69,6 +69,21 @@ let [e env-new()]
   (env-free e))
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import template/env    :refer [env-new env-set env-free])
+(import template/render :refer [render-file])
+
+let [e env-new()]
+  env-set(e "title" "Greetings")
+  env-set(e "name"  "Roger")
+  let [r render-file("template.html.tur" e)]
+    if ok?(r)
+      println $ ok-val r
+      println $ err-val r
+  env-free(e)
+```
+
 ### Template syntax
 
 | Syntax | Meaning |

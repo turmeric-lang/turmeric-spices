@@ -77,6 +77,22 @@ downstream `WRONGTYPE` reply or a segfault:
 (cmd c "SET" (vk-str "blob") (vk-bytes payload n))
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import valkey/cmd :refer [cmd vk-str vk-int vk-bytes])
+(import valkey/reply :refer [reply-free])
+
+;; string args
+let [r cmd(c "SET" vk-str("mykey") vk-str("myval"))]
+  if ok?(r) reply-free(ok-val(r)) println("set failed")
+
+;; integers are formatted to decimal on the wire
+cmd(c "EXPIRE" vk-str("mykey") vk-int(60))
+
+;; vk-bytes is binary-safe: embedded NULs flow through untruncated
+cmd(c "SET" vk-str("blob") vk-bytes(payload n))
+```
+
 `(cmd c "SET" "mykey" "myval")` -- passing bare cstrs -- does **not**
 type-check: `expected ValkeyArg, got cstr`. Wrap each argument with the
 appropriate `vk-*` constructor. The typed helpers (`cmd-set`, `cmd-get`,

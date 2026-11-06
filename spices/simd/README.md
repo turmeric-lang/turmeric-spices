@@ -50,6 +50,14 @@ one inline-C body (a 16- or 32-byte vector is not a Turmeric value yet):
 (simd-biquad4-f32! samples state (Biquad b0 b1 b2 a1 a2))   ; 4 interleaved channels
 ```
 
+```sweet-exp
+(import simd/kernels :refer [Biquad simd-dot-f64 simd-blend-u8! simd-biquad4-f32!])
+
+simd-dot-f64(a b)                     ; = f64vec-dot, to the bit
+simd-blend-u8!(out fg bg as(uint8 96))
+simd-biquad4-f32!(samples state Biquad(b0 b1 b2 a1 a2))   ; 4 interleaved channels
+```
+
 | function | |
 |---|---|
 | `simd-dot-f64`, `simd-dot-f32` | dot product on four-lane accumulators in N1's eight-lane order: bit-identical to `f64vec-dot` / `f32vec-dot` |
@@ -68,6 +76,14 @@ through their `Num` instances, with no inline C:
 (s1-dot-f64 a b)                       ; = f64vec-dot = simd-dot-f64, to the bit
 (s1-blend-u8! out fg bg (as uint8 96))
 (s1-biquad4-f32! samples state (Biquad b0 b1 b2 a1 a2))
+```
+
+```sweet-exp
+(import simd/s1 :refer [s1-dot-f64 s1-blend-u8! s1-biquad4-f32!])
+
+s1-dot-f64(a b)                       ; = f64vec-dot = simd-dot-f64, to the bit
+s1-blend-u8!(out fg bg as(uint8 96))
+s1-biquad4-f32!(samples state Biquad(b0 b1 b2 a1 a2))
 ```
 
 The inner loops read with `P-load-unchecked` after checking the lengths

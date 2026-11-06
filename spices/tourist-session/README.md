@@ -44,10 +44,39 @@ ownership model and tourist's context pattern.
     0))
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import tourist/app          :refer [tourist])
+(import tourist/dsl          :refer [get! post!])
+(import tourist/helpers      :refer [text redirect])
+(import session/mw           :refer [session-mw])
+(import session/config       :refer [dev-session-config])
+(import session/memory-store :refer [memory-store-new])
+(import session/ctx          :refer [session-get session-set! session-destroy!])
+
+defn dashboard [ctx : Ctx] : Response
+  let [uid session-get(ctx "user_id")]
+    if .is-ok(uid)
+      text $ str-concat "Hello, user " .ok-val(uid)
+      redirect("/login")
+
+defn main [] : int
+  let [store memory-store-new()
+       srv   tourist(3000
+                     session-mw(store dev-session-config())   ;; drop it in the list
+                     get!("/dashboard" dashboard))]
+    server-stop(srv)
+    0
+```
+
 Swapping the backend is a one-line change:
 
 ```turmeric
 (session-mw (file-store-new "/var/lib/app/sessions") (default-session-config))
+```
+
+```sweet-exp
+session-mw(file-store-new("/var/lib/app/sessions") default-session-config())
 ```
 
 A complete login/logout flow lives in
@@ -131,6 +160,12 @@ up. Turn on HMAC-SHA256 signing to reject a tampered or forged cookie at
 (session-mw store (with-signing-key (default-session-config) my-secret-key))
 ```
 
+```sweet-exp
+(import session/config :refer [default-session-config with-signing-key])
+
+session-mw(store with-signing-key(default-session-config() my-secret-key))
+```
+
 The cookie value becomes `<id>.<base64url-hmac>`; on the way in the MAC is
 recomputed and **constant-time** compared. A mismatch is treated exactly like
 an unknown ID — a fresh session is minted. Signing is **fail-closed**: turning
@@ -151,6 +186,15 @@ login) without losing the data the user just keyed in:
       (session-set! ctx "user_id" uid)
       (session-rotate! ctx)            ;; new ID, same data
       (redirect "/dashboard"))))
+```
+
+```sweet-exp
+defn do-login [ctx : Ctx] : Response
+  let [uid authenticate(ctx)]
+    do
+      session-set!(ctx "user_id" uid)
+      session-rotate!(ctx)            ;; new ID, same data
+      redirect("/dashboard")
 ```
 
 `session-rotate!` mints a fresh ID, keeps the live session map, and at flush
@@ -175,6 +219,17 @@ with the middleware:
   (post! "/save" save-handler))
 ```
 
+```sweet-exp
+(import tourist/middleware :refer [use!])
+(import session/csrf       :refer [csrf-token csrf-mw default-csrf-opts])
+
+tourist 3000
+  session-mw(memory-store-new() default-session-config())
+  use!(csrf-mw(default-csrf-opts()))     ;; 403s POST/PUT/PATCH/DELETE w/o a valid token
+  get!("/form" (fn [ctx] html(form-with-token(csrf-token(ctx)))))
+  post!("/save" save-handler)
+```
+
 The token lives in the session under the reserved `__csrf` key. The middleware
 accepts it as an `X-Csrf-Token` header (SPAs) or a configured form field
 (classic forms — `(csrf-opts "field_name")`, default `csrf_token`); the compare
@@ -190,7 +245,7 @@ pins it with a concurrent test). A global cannot hold a value of an erased
 typeclass-instance type, so a backend provides three functions and an opaque
 state pointer and calls `store-new`:
 
-```turmeric
+```turmeric no-check
 ;; load   : (c-fn [state:int id:cstr] int)            -> SessMap handle, 0 = miss
 ;; save   : (c-fn [state:int id:cstr map:int ttl:int] int)
 ;; delete : (c-fn [state:int id:cstr] int)

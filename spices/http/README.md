@@ -108,6 +108,23 @@ struct rather than a hand-walked document:
       (when (ok? u) (println (.name (ok-val u)))))))
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import http/client   :refer [http-request])
+(import http/request  :refer [json-request])
+(import http/response :refer [response-decode])
+
+defstruct User [id : int  name : cstr]
+derive-json User (id int) (name cstr)
+
+let [req json-request("POST" "https://api.example.com/users"
+                      make-struct(User 7 "ann") 0)
+     r   http-request(req)]
+  when ok?(r)
+    let [u response-decode(ok-val(r) User)]
+      when ok?(u) println(.name(ok-val(u)))
+```
+
 These build on json's codec surface. `http` no longer re-declares `yyjson` in
 its own `:cmake-deps`: the compiler collects `:cmake-deps` transitively across
 the declared `:spices` (and workspace siblings), so `yyjson` is inherited from

@@ -113,6 +113,22 @@ PEM-encoded file mbedTLS itself accepts.
   )
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import tls/ctx  :refer [tls-ctx-new tls-ctx-load-cert-pem tls-ctx-load-key-pem])
+(import tls/conn :refer [tls-wrap-fd tls-handshake tls-read tls-write tls-free])
+
+let [ctx tls-ctx-new()]
+  tls-ctx-load-cert-pem(ctx "/etc/letsencrypt/live/example.com/fullchain.pem")
+  tls-ctx-load-key-pem(ctx  "/etc/letsencrypt/live/example.com/privkey.pem")
+  ;; For each accepted TCP fd:
+  ;;   let [conn tls-wrap-fd(ctx fd)]
+  ;;     tls-handshake(conn)
+  ;;     ;; encrypted I/O via tls-read / tls-write on conn
+  ;;     tls-shutdown(conn)
+  ;;     tls-free(conn)
+```
+
 ### Linear `TlsConn` (U1)
 
 `TlsConn` is a `:linear` opaque. A conn returned by `tls-wrap-fd` must be
@@ -136,7 +152,7 @@ The H5 milestone of stdlib/httpd makes the integration one-line:
                            tls-ctx-load-cert-pem tls-ctx-load-key-pem])
 (import tls/httpd :refer [tls-httpd-init])
 
-(defn main [] :int
+(defn main [] : int
   (tls-httpd-init)            ;; wire spice -> httpd hook table (once)
   (let [ctx (tls-ctx-new)]
     (tls-ctx-load-cert-pem ctx "/tmp/tls-smoke-test/test-cert.pem")
@@ -146,6 +162,25 @@ The H5 milestone of stdlib/httpd makes the integration one-line:
       (httpd-free h)
       (tls-ctx-free ctx)
       0)))
+```
+
+```sweet-exp
+#lang sweet-exp
+load("stdlib/httpd.tur")
+(import tls/ctx   :refer [tls-ctx-new tls-ctx-free
+                           tls-ctx-load-cert-pem tls-ctx-load-key-pem])
+(import tls/httpd :refer [tls-httpd-init])
+
+defn main [] : int
+  tls-httpd-init()            ;; wire spice -> httpd hook table (once)
+  let [ctx tls-ctx-new()]
+    tls-ctx-load-cert-pem(ctx "/tmp/tls-smoke-test/test-cert.pem")
+    tls-ctx-load-key-pem(ctx  "/tmp/tls-smoke-test/test-key.pem")
+    let [h httpd-new-tls(8443 4 my-handler ctx)]
+      httpd-run(h)
+      httpd-free(h)
+      tls-ctx-free(ctx)
+      0
 ```
 
 See the full guide at

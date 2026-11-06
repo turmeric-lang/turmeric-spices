@@ -28,7 +28,7 @@ For sparse matrices see [`tur-linalg-sparse`](../linalg-sparse/).
 
 ## Install
 
-```turmeric
+```turmeric no-check
 :spices {
   "linalg" {:url    "https://github.com/turmeric-lang/turmeric-spices"
             :ref    "linalg-v0.2.0"
@@ -58,6 +58,22 @@ tur add https://github.com/turmeric-lang/turmeric-spices \
     (mat-free b)
     (mat-free c)
     0))
+```
+
+```sweet-exp
+#lang sweet-exp
+(import linalg/mat :refer [mat-of mat-mul mat-free])
+(import linalg/fmt :refer [mat-print])
+
+defn main [] : int
+  let [a mat-of(2 2 1.0 2.0 3.0 4.0)
+       b mat-of(2 2 5.0 6.0 7.0 8.0)
+       c mat-mul(a b)]
+    mat-print(c)
+    mat-free(a)
+    mat-free(b)
+    mat-free(c)
+    0
 ```
 
 ## Modules

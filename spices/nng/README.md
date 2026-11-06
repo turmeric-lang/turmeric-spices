@@ -69,20 +69,28 @@ A request/reply round trip over `inproc://`:
 
 ```sweet-exp
 #lang sweet-exp
-import nng/socket :refer [push-open pull-open dial listen close set-recv-timeout-ms]
-import nng/msg    :refer [send-str recv-str]
+(import nng/socket :refer [req-open rep-open dial listen close
+                           set-recv-timeout-ms])
+(import nng/msg    :refer [send-str recv-str])
 
-let [push ok-val(push-open())
-     pull ok-val(pull-open())]
-  listen(push "inproc://jobs")
-  dial(pull "inproc://jobs")
-  set-recv-timeout-ms(pull 2000)
-  send-str(push "job:42")
-  let [r recv-str(pull)]
-    when ok?(r)
-      println $ ok-val r
-  close(pull)
-  close(push)
+let [rep ok-val(rep-open())
+     req ok-val(req-open())]
+  listen(rep "inproc://demo")
+  dial(req "inproc://demo")
+  set-recv-timeout-ms(rep 2000)
+  set-recv-timeout-ms(req 2000)
+
+  send-str(req "ping")
+  let [asked recv-str(rep)]
+    when ok?(asked)
+      println $ ok-val asked       ;; "ping"
+      send-str(rep "pong")
+  let [heard recv-str(req)]
+    when ok?(heard)
+      println $ ok-val heard       ;; "pong"
+
+  close(req)
+  close(rep)
 ```
 
 ## Picking a protocol
@@ -137,6 +145,16 @@ a receive on a quiet socket parks the calling thread forever:
       (println (err-str (err-val r))))))
 ```
 
+```sweet-exp
+set-recv-timeout-ms(s 100)
+let [r recv-str(s)]
+  if ok?(r)
+    handle(ok-val(r))
+    if timed-out?(err-val(r))
+      nothing-yet()                    ;; not a failure -- just nothing to read
+      println $ err-str $ err-val r
+```
+
 `timed-out?` is the one error code worth branching on; `err-str` renders any of
 them via `nng_strerror`.
 
@@ -161,6 +179,21 @@ laid out as `{ int64 len; uint8 data[] }`, so binary messages cross intact:
   (when (ok? r)
     (println (payload->hex (ok-val r)))
     (payload-free (ok-val r))))            ;; recv gives you a fresh one to free
+```
+
+```sweet-exp
+#lang sweet-exp
+(import nng/payload :refer [payload-of-cstr payload-free payload->hex])
+(import nng/msg :refer [send-payload recv-payload])
+
+let [b payload-of-cstr("job:42")]
+  send-payload(s b)
+  payload-free(b)                        ;; send BORROWS; the Payload is still yours
+
+let [r recv-payload(s)]
+  when ok?(r)
+    println $ payload->hex $ ok-val r
+    payload-free(ok-val(r))              ;; recv gives you a fresh one to free
 ```
 
 Ownership never involves nng's allocator. A receive asks nng for the message,
@@ -193,6 +226,18 @@ the other side, and asserts the wire carries exactly the encoder's bytes:
   (buf-free encoded))
 ```
 
+```sweet-exp
+#lang sweet-exp
+defstruct Job [id : int  kind : cstr  urgent : bool]
+derive-msgpack Job (id int) (kind cstr) (urgent bool)
+
+let [encoded encode-mp(job)          ;; msgpack Buf
+     wire    mp->nng(encoded)]       ;; -> nng Payload (one copy)
+  send-payload(push wire)
+  payload-free(wire)
+  buf-free(encoded)
+```
+
 Both `mp->nng` and its inverse live in that test file, not in either spice: they
 are ~6 lines of C against a layout both modules document, and they are what a
 stdlib `Bytes` would eventually replace.
@@ -207,6 +252,12 @@ re-publish and re-try until something lands:
 ```turmeric
 (sub-subscribe sub "")                 ;; "" = everything; a SUB socket with
 (set-recv-timeout-ms sub 50)           ;;      NO subscription receives nothing
+;; then re-send on the pub side and re-try the receive until one arrives
+```
+
+```sweet-exp
+sub-subscribe(sub "")                 ;; "" = everything; a SUB socket with
+set-recv-timeout-ms(sub 50)           ;;      NO subscription receives nothing
 ;; then re-send on the pub side and re-try the receive until one arrives
 ```
 
@@ -465,6 +516,18 @@ Contexts come in two flavours:
       v1 (aio-wait a1)
       v2 (aio-wait a2)]
   (aio-take-str a1))
+```
+
+```sweet-exp
+let [s1 ctx-send-str-aio(q1 a1 "q1")
+     s2 ctx-send-str-aio(q2 a2 "q2")
+     w1 aio-wait(a1)
+     w2 aio-wait(a2)
+     r1 ctx-recv-aio(q1 a1)
+     r2 ctx-recv-aio(q2 a2)
+     v1 aio-wait(a1)
+     v2 aio-wait(a2)]
+  aio-take-str(a1)
 ```
 
 The rules:

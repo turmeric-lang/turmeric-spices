@@ -226,6 +226,12 @@ in template files.
     (html-response (hiccup [:p.greeting "Hello, " (name-of ctx) "!"]))))
 ```
 
+```sweet-exp
+get! "/hi/:name"
+  (fn [ctx : Ctx] : Response
+    html-response(hiccup([:p.greeting "Hello, " name-of(ctx) "!"])))
+```
+
 ## Status
 
 Early in development. See

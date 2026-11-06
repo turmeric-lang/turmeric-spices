@@ -166,6 +166,28 @@ directly. `serve` generates the captureless trampoline and starts the server.
 (server-stop srv)
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import httpd/handler  :refer [serve])
+(import httpd/request  :refer [req-path])
+(import httpd/response :refer [resp-ok not-found])
+(import httpd/server   :refer [server-stop])
+
+;; The witness is a defopaque :int used only to select the instance; its
+;; value carries no state (the method reads everything from the Request).
+defopaque App :int
+
+definstance Handler [App]
+  respond [self req]
+    if cstr-eq?("/health" req-path(::(req :Request)))
+      resp-ok("text/plain" "ok")
+      not-found("no such route")
+
+def srv serve(8080 App)     ;; serve-pool / serve-spawn mirror server-start-*
+;; ... application code ...
+server-stop(srv)
+```
+
 The method is named `respond` (not `handle`, which is a reserved special
 form). `server-start` and the bare `(c-fn [int] int)` API remain available as
 the lower-level path.
@@ -197,6 +219,21 @@ typeclasses, so a JSON endpoint needs no inline-C body parsing:
     (with-json-body (:: req :Request) EchoReq
       (fn [r : EchoReq]
         (json-ok (make-struct EchoResp (.msg r) (str-len (.msg r))))))))
+```
+
+```sweet-exp
+#lang sweet-exp
+defstruct EchoReq  [msg : cstr]
+defstruct EchoResp [echo : cstr  len : int]
+derive-json EchoReq  (msg cstr)
+derive-json EchoResp (echo cstr) (len int)
+
+defopaque Echo :int
+definstance Handler [Echo]
+  respond [self req]
+    with-json-body ::(req :Request) EchoReq
+      (fn [r : EchoReq]
+        json-ok(make-struct(EchoResp .msg(r) str-len(.msg(r)))))
 ```
 
 These build on the json codec surface. `httpd` does not declare `yyjson` in its

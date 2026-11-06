@@ -54,9 +54,35 @@ vendor-katex version:
     cp "$TMP"/package/dist/fonts/*.woff2 "$DEST/fonts/"
     echo "Vendored KaTeX {{version}} into $DEST"
 
-# Validate turmeric+sweet-exp code pairs in all spice READMEs.
+# Validate turmeric+sweet-exp code pairs in all spice READMEs, strictly: every
+# ```turmeric block needs a ```sweet-exp twin or a ```turmeric no-check marker.
+# The checker is turmeric's tools/check-guide-pairs.tur, so this needs a
+# turmeric CHECKOUT, not just a tur: $TURMERIC_DIR, default ../turmeric (the
+# sibling layout CI uses).  The tur that runs it is $TUR, else the checkout's
+# build/tur, else vendor/tur/tur from scripts/install-tur.sh, else PATH's.
+# This repo's spices/ is passed as a path with --strict-unpaired (what
+# --spices means), so the checkout need not sit at ../turmeric relative to a
+# directory named turmeric-spices.  CI runs the same check in spices-leg.yml.
 check-docs:
-    python3 tools/check-guide-pairs.py --spices
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SPICES="$PWD/spices"
+    TURMERIC="$(cd "${TURMERIC_DIR:-../turmeric}" 2>/dev/null && pwd)" || {
+        echo "error: no turmeric checkout at ${TURMERIC_DIR:-../turmeric} -- clone it or set TURMERIC_DIR" >&2
+        exit 2
+    }
+    if [ -n "${TUR:-}" ]; then BIN="$TUR"
+    elif [ -x "$TURMERIC/build/tur" ]; then BIN="$TURMERIC/build/tur"
+    elif [ -x "$PWD/vendor/tur/tur" ]; then BIN="$PWD/vendor/tur/tur"
+    else BIN="$(command -v tur)" || { echo "error: no tur found (set TUR)" >&2; exit 2; }
+    fi
+    case "$BIN" in
+        /*) ;;
+        */*) BIN="$PWD/$BIN" ;;
+        *) BIN="$(command -v "$BIN")" ;;
+    esac
+    cd "$TURMERIC"
+    "$BIN" run tools/check-guide-pairs.tur -- --tur "$BIN" --strict-unpaired "$SPICES"
 
 # Symlink vendor/tur/tur onto PATH at PREFIX/bin (default ~/.local/bin).
 # Run `./scripts/install-tur.sh` first to populate vendor/tur/. The symlink

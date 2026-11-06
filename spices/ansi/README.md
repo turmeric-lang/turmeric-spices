@@ -164,6 +164,10 @@ Named index constants (return `:int` for use with `fg4`/`bg4`):
 (fg4 (color-bright-red))   ;; same as (fg4 9)
 ```
 
+```sweet-exp
+fg4(color-bright-red())   ;; same as (fg4 9)
+```
+
 #### `Color` typeclass (depth-typed `fg` / `bg`)
 
 The depth-specific emitters above branch only on color *depth*, which the
@@ -187,6 +191,12 @@ and `bg`, dispatched on the value's type. Box a color with `color4` / `color8`
 (fg (color4 (color-red)))   ;; same bytes as (fg4 (color-red))
 (fg (color8 208))           ;; same bytes as (fg8 208)
 (bg (rgb 255 128 0))        ;; same bytes as (bg24 255 128 0)
+```
+
+```sweet-exp
+fg(color4(color-red()))   ;; same bytes as (fg4 (color-red))
+fg(color8(208))           ;; same bytes as (fg8 208)
+bg(rgb(255 128 0))        ;; same bytes as (bg24 255 128 0)
 ```
 
 Because depth is now a type, a routine parametric in a single `(Color a)`

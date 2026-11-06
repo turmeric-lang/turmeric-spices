@@ -54,6 +54,23 @@ The linear discipline is enforced at compile time:
     0))
 ```
 
+```sweet-exp
+#lang sweet-exp
+defmodule example
+  (import thread-pool/pool :refer [Pool pool-new pool-submit pool-stop])
+
+defn consume [x : int] : void
+  ;; ... do work with x ...
+  nil
+
+defn run [] : int
+  let [p pool-new(8 consume)]
+    pool-submit(p 1)
+    pool-submit(p 2)
+    pool-stop(p)         ;; required: the pool is linear
+    0
+```
+
 ### Capacity
 
 The ring buffer holds `max(size * 4, 64)` items (4x worker headroom, floor 64).
@@ -81,6 +98,14 @@ double-consume error.
 (with-pool [p (pool-new 8 consume)]   ;; callback must be a named defn here
   (pool-submit p 1)
   (pool-submit p 2))                   ;; pool-stop p runs automatically
+```
+
+```sweet-exp
+(import thread-pool/scope :refer [with-pool])
+
+with-pool [p pool-new(8 consume)]   ;; callback must be a named defn here
+  pool-submit(p 1)
+  pool-submit(p 2)                   ;; pool-stop p runs automatically
 ```
 
 `with-pool` guarantees cleanup on **normal** completion. It does not install an
@@ -119,6 +144,17 @@ thread, so it must outlive the await (`pool-map` arranges this for you).
           square)        ;; => (TList int) of [1 4]
 ```
 
+```sweet-exp
+(import thread-pool/parallel :refer [TList tlist-nil tlist-cons pool-map])
+
+defn square [x : int] : int {x * x}
+
+;; submit every item as a future, await all, collect in order
+pool-map pool
+  tlist-cons(1 tlist-cons(2 ::(tlist-nil() (TList int))))
+  square         ;; => (TList int) of [1 4]
+```
+
 `pool-map` submits all items before awaiting any, so the work runs in parallel
 across the pool, and returns results in input order.
 
@@ -136,6 +172,13 @@ across the pool, and returns results in input order.
   (if (ok? r)
     :accepted
     (match (err-val r) (PoolFull pending cap) :shed-load)))
+```
+
+```sweet-exp
+let [r pool-try-submit(p item)]
+  if ok?(r)
+    :accepted
+    (match (err-val r) (PoolFull pending cap) :shed-load)
 ```
 
 ## Raw C-interop hatch (`thread-pool/pool`)
@@ -166,6 +209,23 @@ the handle's lifetime.
   ;; (pool-submit-raw pool item) ...
   (pool-stop-raw pool))
 ```
+
+````sweet-exp
+#lang sweet-exp
+defn work-cb [item : ptr<void>] : void
+  ```c
+  int *v = (int *)item; /* ... */ free(v);
+  ```
+defn work-cb-ptr [] : ptr<void>
+  ```c
+  extern void example__work_hycb(void *);
+  return (void *)example__work_hycb;
+  ```
+
+let [pool pool-new-raw(4 work-cb-ptr())]
+  ;; (pool-submit-raw pool item) ...
+  pool-stop-raw(pool)
+````
 
 ## Known limitations (turmeric main, 0.24.x)
 

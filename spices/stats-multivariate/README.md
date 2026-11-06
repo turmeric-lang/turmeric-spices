@@ -24,7 +24,7 @@ Key features:
 
 ## Install
 
-```turmeric
+```turmeric no-check
 :spices #map{"stats-multivariate" #map{:url    "https://github.com/turmeric-lang/turmeric-spices"
                                        :ref    "stats-multivariate-v0.1.0"
                                        :subdir "spices/stats-multivariate"}}
@@ -47,6 +47,22 @@ It depends on `tur-linalg` (v0.2.0 or later) and `tur-stats`.
     (pca-free r)
     (mat-free x)
     0))
+```
+
+```sweet-exp
+#lang sweet-exp
+(import linalg/mat :refer [mat-of mat-free])
+(import multivariate/pca :refer [pca pca-opts pca-free pca-var-explained])
+(import multivariate/fmt :refer [pca-print])
+
+defn main [] : int
+  let [x mat-of(4 2 1.0 2.0 2.0 3.9 3.0 6.1 4.0 8.0)
+       r pca(x pca-opts(true false 0))]
+    pca-print(r)
+    println $ pca-var-explained r 1
+    pca-free(r)
+    mat-free(x)
+    0
 ```
 
 ## Modules
