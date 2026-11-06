@@ -69,6 +69,14 @@ per-node scaffolding.
 ;; => "return (x + 1);"
 ```
 
+```sweet-exp
+(import c-dsl/ir :refer [ce-var ce-lit ce-binop cs-return node->c])
+
+;; (x + 1) folded to C, then wrapped in a return statement
+node->c $ cs-return $ ce-binop "+" ce-var("x") ce-lit("1")
+;; => "return (x + 1);"
+```
+
 The flat builders remain the stable public surface; the IR is an additive,
 self-contained recursion-schemes layer. See the module header in
 `src/c-dsl/ir.tur` for the design rationale (notably why it uses one functor

@@ -45,6 +45,16 @@ Three primitives, usable against any raw buffer -- no `Secret` handle needed.
     (ok? r)))
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import secret/hygiene :refer [secure-wipe-ptr! crypto-random-bytes!
+                               crypto-random-source ct-eq-ptr?])
+
+defn mint-token [buf : ptr<void>] : bool
+  let [r crypto-random-bytes!(buf 32)]
+    ok?(r)
+```
+
 ### `secure-wipe-ptr! [p : ptr<void> n : int] : void`
 
 Zeroes `n` bytes at `p` through a primitive the optimizer may not elide:
@@ -92,6 +102,22 @@ fixed-size digests of them.
           (secret-wipe! k)      ;; omit this line and the program will not compile
           mac))
       0)))
+```
+
+```sweet-exp
+#lang sweet-exp
+(import secret/core :refer [Secret secret-random! secret-wipe!
+                            with-secret secret-len secret-eq?])
+
+defn sign-request [body : ptr<void> n : int] : int
+  let [r secret-random!(32)]
+    if ok?(r)
+      let [k   ok-val(r)
+           mac with-secret(k hmac-into)]
+        do
+          secret-wipe!(k)      ;; omit this line and the program will not compile
+          mac
+      0
 ```
 
 `Secret` is `defopaque ^linear ...`. Every control path through a live
@@ -151,6 +177,16 @@ genuinely require locking ask `secret-locked?`.
 (secret-hkdf-sha256 master "v1" "encryption" 32)
 ```
 
+```sweet-exp
+(import secret/kdf :refer [secret-hmac-sha256 secret-hkdf-sha256])
+
+;; MAC a request body under a borrowed key
+secret-hmac-sha256(key body len)            ;; => (Result Secret cstr)
+
+;; Derive a purpose-specific subkey from a master secret
+secret-hkdf-sha256(master "v1" "encryption" 32)
+```
+
 Both return a `Secret`, so a derived key inherits the same
 wipe-or-fail-to-compile discipline as a minted one. The MAC is a `Secret`
 too, on purpose: keeping it in one makes `secret-eq?` (constant-time) the
@@ -179,6 +215,13 @@ usual ASCII labels. A salt containing a NUL byte (RFC 5869's own case 1 uses
 
 (secret-of-hex "deadbeef")   ;; => (Result Secret cstr), 4 bytes
 (secret->hex k)              ;; => (Result Secret cstr), 2n hex chars
+```
+
+```sweet-exp
+(import secret/hex :refer [secret->hex secret-of-hex])
+
+secret-of-hex("deadbeef")   ;; => (Result Secret cstr), 4 bytes
+secret->hex(k)              ;; => (Result Secret cstr), 2n hex chars
 ```
 
 Hex is how key material actually travels -- config files, environment

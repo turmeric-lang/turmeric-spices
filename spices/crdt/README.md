@@ -174,6 +174,22 @@ Three designs, and the differences are the whole point:
 )
 ```
 
+```sweet-exp
+#lang sweet-exp
+defmodule demo
+  (import crdt/replica :refer [replica])
+  (import crdt/orset :refer [ORSet orset-new orset-add orset-remove orset-has?
+                             orset-count])
+
+  defn main [] : int
+    let [s orset-remove(orset-add(orset-add(orset-new() quote(apple) replica(quote(alice)))
+                                  quote(pear)
+                                  replica(quote(alice)))
+                        quote(apple))]
+      println orset-count(s)     ;; 1 -- pear
+    0
+```
+
 A removal forgets the dots this replica has OBSERVED rather than writing a
 tombstone. A concurrent add elsewhere carries a dot this replica never saw, so
 it survives the merge. That is add-wins, and it is the reason `crdt/causal`
@@ -237,6 +253,29 @@ The cost is that a read is a set.
 )
 ```
 
+```sweet-exp
+#lang sweet-exp
+defmodule demo
+  (import crdt/replica :refer [replica])
+  (import crdt/register :refer [LwwRegister lww-new lww-set lww-value
+                                MvRegister mv-new mv-set mv-values])
+
+  defn main [] : int
+    ;; Later stamp wins.
+    println
+      lww-value
+        join
+          lww-set(lww-new(replica(quote(alice))) 1 1000)
+          lww-set(lww-new(replica(quote(bob))) 2 2000)    ;; 2
+    ;; Concurrent writes: both survive.
+    println
+      mv-values
+        join
+          mv-set(mv-new(replica(quote(alice))) 1 1000)
+          mv-set(mv-new(replica(quote(bob))) 2 1000)      ;; 2
+    0
+```
+
 ## Maps -- `crdt/ormap`
 
 The type that makes the rest compose. Its merge has two jobs at once: decide
@@ -267,6 +306,30 @@ dispatches to `V`'s own instance:
                int))                                   ;; 21 -- MaxI's join
   0)
 )
+```
+
+```sweet-exp
+#lang sweet-exp
+defmodule demo
+  (import crdt/replica :refer [replica])
+  (import crdt/ormap :refer [ORMap ormap-new ormap-put ormap-get ormap-count])
+
+  defn hi [] : (ORMap MaxI)
+    ::
+      ormap-put ::(ormap-new() (ORMap MaxI)) replica(quote(alice)) quote(temp) ::(21 MaxI)
+      (ORMap MaxI)
+
+  defn lo [] : (ORMap MaxI)
+    ::
+      ormap-put ::(ormap-new() (ORMap MaxI)) replica(quote(bob)) quote(temp) ::(19 MaxI)
+      (ORMap MaxI)
+
+  defn main [] : int
+    println
+      ::
+        ::(ormap-get(::(join(hi() lo()) (ORMap MaxI)) quote(temp)) MaxI)
+        int                                    ;; 21 -- MaxI's join
+    0
 ```
 
 `ormap-merge-with` passes the value merge explicitly instead, which is
@@ -303,6 +366,26 @@ in with `apply-delta`:
     (println (gcounter-value (apply-delta (bob) d))))   ;; 10
   0)
 )
+```
+
+```sweet-exp
+#lang sweet-exp
+defmodule demo
+  (import crdt/replica :refer [replica])
+  (import crdt/counter :refer [GCounter gcounter-new gcounter-bump
+                               gcounter-value gcounter-delta-bump])
+
+  defn alice [] : GCounter
+    gcounter-bump(gcounter-new() replica(quote(alice)) 3)
+
+  defn bob [] : GCounter
+    gcounter-bump(gcounter-new() replica(quote(bob)) 5)
+
+  defn main [] : int
+    ;; alice bumps again and ships only the delta; bob folds it in.
+    let [d gcounter-delta-bump(alice() replica(quote(alice)) 2)]
+      println $ gcounter-value $ apply-delta bob() d   ;; 10
+    0
 ```
 
 The guarantee, asserted per type in `tests/crdt/test_delta.tur`: **applying a
@@ -357,6 +440,20 @@ forest.
     (println (rga-get d 1)))   ;; 105 -- character codes
   0)
 )
+```
+
+```sweet-exp
+#lang sweet-exp
+defmodule demo
+  (import crdt/replica :refer [replica])
+  (import crdt/rga :refer [Rga rga-new rga-append rga-insert rga-delete
+                           rga-get rga-len rga-size])
+
+  defn main [] : int
+    let [d rga-append(rga-append(rga-new() replica(quote(alice)) 72) replica(quote(alice)) 105)]
+      println rga-len(d)       ;; 2
+      println rga-get(d 1)     ;; 105 -- character codes
+    0
 ```
 
 Three consequences worth knowing before you use it:

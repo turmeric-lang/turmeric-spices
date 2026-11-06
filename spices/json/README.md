@@ -71,6 +71,17 @@ primitives, so floats round-trip); the macro emits one for any
 ;; => {"id":7,"name":"alice","active":true}
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import json/encode :refer [derive-json])
+
+defstruct User [id : int  name : cstr  active : bool]
+derive-json User (id int) (name cstr) (active bool)
+
+println $ encode-json $ make-struct User 7 "alice" true
+;; => {"id":7,"name":"alice","active":true}
+```
+
 This is the **P2a minimal slice** of the spices type-features uplift
 plan (`docs/upcoming/spices-type-features-uplift-plan.md` in the
 turmeric repo). It deliberately does not yet ship:
@@ -100,6 +111,19 @@ on top dispatches per-type via a return-type ascription:
       name-r   (:: (decode-json doc (unsafe (json-obj-get doc root "name"))) (Result cstr cstr))]
   (println (ok-val name-r))
   (unsafe (json-doc-free doc)))
+```
+
+```sweet-exp
+#lang sweet-exp
+(import json/decode :refer [json-parse-doc json-doc-free json-doc-root json-obj-get])
+(import json/encode)  ;; DecodeJson class lives here alongside derive-json
+
+let [doc    unsafe(json-parse-doc("{\"id\":42,\"name\":\"alice\"}"))
+     root   unsafe(json-doc-root(doc))
+     id-r   ::(decode-json(doc unsafe(json-obj-get(doc root "id")))   (Result int  cstr))
+     name-r ::(decode-json(doc unsafe(json-obj-get(doc root "name"))) (Result cstr cstr))]
+  println $ ok-val name-r
+  unsafe $ json-doc-free doc
 ```
 
 Each call to `(decode-json doc val)` returns `(Result T cstr)` where `T` is

@@ -82,6 +82,24 @@ for `ws://`. For `wss://`, run `tur fetch` once to build mbedTLS.
       (ws-free c))))
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import ws-client/client
+  :refer [ws-connect ws-conn-null? ws-last-error
+          ws-send ws-recv ws-frame-text ws-text? ws-close ws-free])
+
+let [c ws-connect("ws://localhost:9000/feed")]
+  if ws-conn-null?(c)
+    println(ws-last-error())
+    do
+      ws-send(c "hello")
+      let [f ws-recv(c)]
+        when ws-text?(f)
+          println $ ws-frame-text f   ;; payload valid until next ws-recv
+      ws-close(c)
+      ws-free(c)
+```
+
 ## API
 
 | Function | Signature | Purpose |
@@ -129,6 +147,14 @@ automatically (then surfaces the Ping), and surfaces Pong and Close frames.
   (if (ws-timeout? f)
     (println "no message within 500ms")
     (handle f)))
+```
+
+```sweet-exp
+ws-set-timeout(c 500)            ;; 500 ms
+let [f ws-recv(c)]
+  if ws-timeout?(f)
+    println("no message within 500ms")
+    handle(f)
 ```
 
 `ws-set-timeout` sets `SO_RCVTIMEO`; a fired timeout yields a `:timeout` frame

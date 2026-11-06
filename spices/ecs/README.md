@@ -214,7 +214,7 @@ bitmask ints. Per-component CIDs use the `<Comp>-cid` titlecase
 convention (`Pos-cid`, not `pos-cid`). Required imports at the call
 site:
 
-```turmeric
+```turmeric no-check
 (import ecs/system :refer [defsystem])
 (import ecs/cap    :refer [WriteCap ReadCap make-write-cap make-read-cap use-cap!])
 ```
@@ -233,6 +233,20 @@ Then:
   [Pos]
   [Pos]
   body)
+```
+
+```sweet-exp
+;; Before (E2 surface):
+defsystem physics
+  cid-bit(pos-cid)
+  cid-bit(pos-cid)
+  body
+
+;; After (I3 surface):
+defsystem physics
+  [Pos]
+  [Pos]
+  body
 ```
 
 `defcomponent-accessors` now emits `set-<Comp>!` / `get-<Comp>` that

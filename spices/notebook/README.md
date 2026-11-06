@@ -39,7 +39,7 @@ tur nb --help
 To use notebook in an existing Turmeric project, add it as a dependency in
 your `build.tur`:
 
-```turmeric
+```turmeric no-check
 (spice notebook "https://github.com/turmeric-lang/turmeric-spices.git"
   :subdir "spices/notebook")
 ```
@@ -47,7 +47,7 @@ your `build.tur`:
 Then run `tur fetch` to pull the dependency, and import notebook modules as
 normal:
 
-```turmeric
+```turmeric no-check
 (import notebook/image :refer [image-hook-record-path])
 ```
 
@@ -80,6 +80,11 @@ Cells that produce images can advertise them to the TUI via:
 ```turmeric
 (import notebook/image :refer [image-hook-record-path])
 (image-hook-record-path "/path/to/output.png")
+```
+
+```sweet-exp
+(import notebook/image :refer [image-hook-record-path])
+image-hook-record-path("/path/to/output.png")
 ```
 
 The TUI renders PNG images inline using the Kitty graphics protocol, iTerm2

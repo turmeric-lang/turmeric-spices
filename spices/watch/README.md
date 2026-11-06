@@ -28,7 +28,7 @@ not exported. Public callers should never import it.
 (import watch/opts  :refer [default-watch-opts])
 (import watch/watch :refer [watch-open-one watch-close watch-next])
 
-(defn main [] :int
+(defn main [] : int
   (let [opts (default-watch-opts)
         w    (watch-open-one "notes.md" opts)]
     (do
@@ -43,6 +43,28 @@ not exported. Public callers should never import it.
       (watch-close w))))
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import watch/event :refer [watch-event-kind watch-event-path watch-event-free
+                             watch-kind-write watch-kind-rename])
+(import watch/opts  :refer [default-watch-opts])
+(import watch/watch :refer [watch-open-one watch-close watch-next])
+
+defn main [] : int
+  let [opts default-watch-opts()
+       w    watch-open-one("notes.md" opts)]
+    do
+      loop []
+        let [ev watch-next(w -1)]   ; block forever
+          if {ev = 0}
+            0
+            do
+              println("file changed -- rerender now")
+              watch-event-free(ev)
+              recur()
+      watch-close(w)
+```
+
 For recursive directory watching use `watch-open-tree`:
 
 ```turmeric
@@ -51,7 +73,7 @@ For recursive directory watching use `watch-open-tree`:
 (import watch/event :refer [watch-event-path watch-event-kind
                              watch-kind->cstr watch-event-free])
 
-(defn main [] :int
+(defn main [] : int
   (let [opts (watch-opts-make 1 150 1 0 1)   ; recursive, 150 ms debounce
         w    (watch-open-tree "src/" opts)]
     (do
@@ -67,6 +89,31 @@ For recursive directory watching use `watch-open-tree`:
               (watch-event-free ev)
               (recur)))))
       (watch-close w))))
+```
+
+```sweet-exp
+#lang sweet-exp
+(import watch/opts  :refer [watch-opts-make watch-opts-free])
+(import watch/watch :refer [watch-open-tree watch-close watch-next])
+(import watch/event :refer [watch-event-path watch-event-kind
+                             watch-kind->cstr watch-event-free])
+
+defn main [] : int
+  let [opts watch-opts-make(1 150 1 0 1)   ; recursive, 150 ms debounce
+       w    watch-open-tree("src/" opts)]
+    do
+      watch-opts-free(opts)
+      loop []
+        let [ev watch-next(w -1)]
+          if {ev = 0}
+            0
+            do
+              ;; watch-event-path is now the FILE path, e.g. "src/foo/bar.tur"
+              println $ watch-kind->cstr $ watch-event-kind ev
+              println $ watch-event-path ev
+              watch-event-free(ev)
+              recur()
+      watch-close(w)
 ```
 
 ## Event kinds

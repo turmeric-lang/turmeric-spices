@@ -77,6 +77,44 @@ A mixed REST + WebSocket server: `/health` answers over HTTP, `/ws` echoes.
     0))
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import httpd/types    :refer [Conn Request])
+(import httpd/server   :refer [server-start-conn server-stop])
+(import httpd/request  :refer [req-method req-path])
+(import httpd/response :refer [resp-ok not-found bad-request])
+(import ws-core/conn   :refer [WsConn])
+(import ws-core/frame  :refer [ws-frame-text ws-text? ws-closed?])
+(import ws-server/server
+  :refer [ws-upgrade ws-server-recv ws-server-send ws-server-close])
+
+defn echo-loop [ws : WsConn] : void
+  let [f ws-server-recv(ws)]
+    if ws-closed?(f)
+      ws-server-close(ws)
+      do
+        when ws-text?(f) ws-server-send(ws ws-frame-text(f))
+        echo-loop(ws)
+
+defn handler [conn : Conn req : Request] : Response
+  (cond
+    {{req-method(req) = "GET"} and {req-path(req) = "/health"}}
+    resp-ok("text/plain" "ok")
+
+    {{req-method(req) = "GET"} and {req-path(req) = "/ws"}}
+    (if ok?(ws-upgrade(conn req echo-loop))
+      resp-ok("text/plain" "")              ;; placeholder; worker skips it
+      bad-request("not a websocket request"))
+
+    :else not-found(""))
+
+defn main [] : int
+  let [srv server-start-conn(8080 handler)]
+    ;; ... wait / signal ...
+    server-stop(srv)
+    0
+```
+
 ## API
 
 | Function | Signature | Purpose |
@@ -160,6 +198,18 @@ typeclass idiom), `serve-conn` bridges a `ConnHandler` instance to
       (bad-request "not a websocket request"))))
 
 (def srv (serve-conn 8080 WsEcho))         ;; top-level form
+```
+
+```sweet-exp
+#lang sweet-exp
+defopaque WsEcho :int
+definstance ConnHandler [WsEcho]
+  respond-conn [self conn req]
+    if ok?(ws-upgrade(conn req echo-loop))
+      resp-ok("text/plain" "")
+      bad-request("not a websocket request")
+
+def srv serve-conn(8080 WsEcho)         ;; top-level form
 ```
 
 ## `wss://` (TLS)

@@ -30,6 +30,32 @@ treatment contrasts and `na.omit`.
   (Err e) ...)
 ```
 
+```sweet-exp
+#lang sweet-exp
+(import frame/csv :refer [read-csv])
+(import frame/typed :refer [frame-typed])
+(import stats/regress :refer [ols-frame])
+(import formula/terms
+  :refer
+  [formula-parse-terms
+   formula-terms-response
+   formula-terms-predictors
+   formula-terms-intercept?
+   formula-terms-data
+   formula-terms-free])
+(import formula/model-frame :refer [model-frame-handle])
+
+(match formula-parse-terms(frame-typed(read-csv("mtcars.csv" 44 34 1 100 ""))
+                           "mpg ~ wt * hp + I(wt^2)")
+  (Ok t) (let [fit ols-frame(model-frame-handle(formula-terms-data(t))
+                             formula-terms-response(t)     ; "mpg"
+                             formula-terms-predictors(t)   ; ("wt" "hp" "I(wt^2)" "wt:hp")
+                             (if formula-terms-intercept?(t) 1 0))]
+           formula-terms-free(t)
+           fit)
+  (Err e) ...)
+```
+
 The guide is [docs/guides/formula-guide.md](../../docs/guides/formula-guide.md);
 [examples/01_tour.tur](examples/01_tour.tur) runs everything in it.
 

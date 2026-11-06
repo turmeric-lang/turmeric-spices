@@ -44,7 +44,7 @@ import glsl/shaders :refer [glsl-fragment-shader glsl-output]
 import glsl/core    :refer [glsl-set!]
 import glsl/codegen :refer [compile-glsl]
 
-println $
+println
   compile-glsl
     glsl-fragment-shader "330 core"
       vec-of(glsl-output("FragColor" ":vec4"))
@@ -66,6 +66,14 @@ new traversal is just a new F-algebra with no per-node scaffolding.
 
 ;; return (a + b).xyz;
 (node->c (gs-return (ge-swizzle (ge-binop "+" (ge-var "a") (ge-var "b")) ":xyz")))
+;; => "return (a + b).xyz;"
+```
+
+```sweet-exp
+(import glsl/ir :refer [ge-var ge-binop ge-swizzle gs-return node->c])
+
+;; return (a + b).xyz;
+node->c $ gs-return $ ge-swizzle ge-binop("+" ge-var("a") ge-var("b")) ":xyz"
 ;; => "return (a + b).xyz;"
 ```
 

@@ -75,6 +75,46 @@ This is **E3** in the ECS spice plan
 ) ;; end defmodule
 ```
 
+```sweet-exp
+#lang sweet-exp
+defmodule my-game (export)
+  (import ecs/entity   :refer [entity-index])
+  (import ecs/storage  :refer [dense-new dense-set! dense-get])
+  (import ecs/world    :refer [defcomponent defworld world-alloc-entity!])
+  (import ecs/query    :refer [for-each])
+  (import ecs-raylib/components :refer [Pos2 Vel2 Radius
+                                         pos2-make vel2-make radius-make])
+  (import ecs-raylib/systems    :refer [integrate-2d])
+  (import ecs-raylib/render     :refer [render-circles])
+  (import ecs-raylib/loop       :refer [with-game-loop])
+  (import raylib/types          :refer [Color])
+  (import raylib/color          :refer [red])
+
+  defcomponent Pos2
+  defcomponent Vel2
+  defcomponent Radius
+  defcomponent Color
+  defworld Scene [Pos2 Vel2 Radius Color]
+
+  integrate-2d   integrate Scene
+  render-circles render    Scene
+
+  defn main [] : int
+    let [w make-struct(Scene vec-new()
+                       dense-new() dense-new() dense-new() dense-new())]
+      let [e world-alloc-entity!(.gens(w))
+           i entity-index(e)]
+        dense-set!(.Pos2(w)   i pos2-make(400.0 300.0))
+        dense-set!(.Vel2(w)   i vel2-make(120.0 80.0))
+        dense-set!(.Radius(w) i radius-make(30.0))
+        dense-set!(.Color(w)  i red())
+      with-game-loop w "my game" 800 600 60
+        do
+          integrate(w dt)
+          render(w)
+      0
+```
+
 ## Install
 
 ```turmeric no-check
