@@ -121,6 +121,19 @@ stage_check() {
 stage_test() {
   local spice="$1" n_fail=0 d
   [ -d tests ] || { echo "no tests/ directory; skipping test run"; return 0; }
+  # Every program `tur test` builds is compiled with -fsanitize=address,undefined
+  # (TUR_SANITIZE_PROGRAMS=1), so a leak or a use-after-free in a suite FAILS
+  # it.  Without this only a suite whose program links libturi was sanitized,
+  # and a leak anywhere else passed with no diagnostic (turmeric
+  # docs/reported/spice-suites-without-libturi-run-unsanitized.md).
+  # requires.no-sanitize opts a spice out while its measured reports are open:
+  # its first line says what they are; delete it once the suite is clean.
+  if [ -f requires.no-sanitize ]; then
+    annotate warning "$spice: tests run unsanitized" "requires.no-sanitize: $(head -n1 requires.no-sanitize)"
+    unset TUR_SANITIZE_PROGRAMS
+  else
+    export TUR_SANITIZE_PROGRAMS=1
+  fi
   # `tur test <dir>` DOES recurse (a comment once claimed otherwise, which
   # is how ecs's compile-FAIL fixtures got run as tests and counted as 16
   # failures -- they live in errors/ now).  Two layouts exist:
