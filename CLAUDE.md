@@ -194,6 +194,14 @@ What is left, and where each goes:
   no CMake. Make sure exactly one TU defines the implementation macro: a
   `:c-sources` file is always linked, unlike a static archive's member. See
   `raygui`.
+- **A C++ library** (manifold): tur links with `cc`, and no CMake target
+  reports the C++ runtime, so a static C++ dep fails on undefined
+  `operator new` / `__cxa_*`. `:link-flags ["-lstdc++"]` is Linux-only (macOS
+  wants `-lc++`). Wrap the dep in a `:path` CMake project that appends the
+  runtime from `CMAKE_CXX_IMPLICIT_LINK_LIBRARIES` to the real library
+  target's `INTERFACE_LINK_LIBRARIES` -- not to an INTERFACE wrapper target,
+  which `:targets` cannot name. See `manifold`, and turmeric
+  `docs/reported/cmake-dep-cxx-runtime-not-linked.md`.
 - **Anything that needs real CMake work** (glad is a code generator, not a
   library): a small CMake project under `spices/<spice>/cmake-deps/<name>/`,
   declared as a `:path` cmake-dep with `:targets`:

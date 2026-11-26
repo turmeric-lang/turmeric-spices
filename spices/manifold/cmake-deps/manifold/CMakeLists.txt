@@ -20,6 +20,12 @@
 # It has to be manifoldc, not an INTERFACE wrapper target listed in :targets:
 # tur emits $<TARGET_FILE_DIR:t> for every target in :targets, which is a
 # hard generate-time error on an INTERFACE library.
+#
+# Both are reported in turmeric, each with an offline repro:
+#   docs/reported/cmake-dep-cxx-runtime-not-linked.md
+#   docs/reported/cmake-dep-interface-target-fails-generate.md
+# When the first is fixed this file can go, and build.tur can fetch manifold
+# by :url again.
 cmake_minimum_required(VERSION 3.20)
 project(manifold_deps CXX)
 
@@ -34,7 +40,8 @@ set(MANIFOLD_PYBIND OFF CACHE BOOL "" FORCE)
 # Single-threaded, on purpose (README "Threading").  MANIFOLD_PAR=ON needs
 # oneTBB, and manifold links it as $<$<BOOL:${MANIFOLD_PAR}>:TBB::tbb>.  tur's
 # link walk drops any entry that is still a generator expression, so TBB would
-# never reach the link line and the build would fail on undefined tbb symbols.
+# never reach the link line and the build would fail on undefined tbb symbols
+# (turmeric docs/reported/cmake-dep-genex-link-entry-dropped.md).
 set(MANIFOLD_PAR OFF CACHE BOOL "" FORCE)
 # Under Emscripten manifold turns its JavaScript binding on by default; this
 # spice wants only the C one.

@@ -152,7 +152,8 @@ Each of these is a compile error, pinned by a fixture under `errors/`:
 
 The linearity check follows named bindings. A solid that never gets a name is
 invisible to it, so these three shapes compile and leak. They were measured
-with turmeric main as of 2026-11-24, under LeakSanitizer.
+with turmeric main as of 2026-11-24, under LeakSanitizer, and are reported as
+turmeric `docs/reported/linear-values-without-a-binding-are-not-checked.md`.
 
 | Shape | Why it leaks | Write instead |
 |---|---|---|
@@ -169,8 +170,9 @@ practical guard.
 Manifold is built **single-threaded** here (`MANIFOLD_PAR=OFF`). Every
 operation runs on the thread that calls it, and a large boolean uses one core
 however many the machine has. Manifold's parallel backend needs oneTBB, which
-`tur fetch` cannot currently put on the link line (see the note in
-`cmake-deps/manifold/CMakeLists.txt`).
+`tur fetch` cannot currently put on the link line: Manifold links it through a
+generator expression, and tur's link walk drops those (turmeric
+`docs/reported/cmake-dep-genex-link-entry-dropped.md`).
 
 Manifold also evaluates lazily. A boolean returns immediately with a node of a
 CSG tree; the mesh is computed the first time something asks about it. The
