@@ -79,6 +79,7 @@ turmeric's [Emscripten spice audit](https://github.com/turmeric-lang/turmeric/bl
 | [`tur-xml`](spices/xml/) | XML SAX (one-shot and push) and DOM parsing with safe defaults | 3 | ✅ | ✅ | ? | ? | expat 2.9.0 |
 | [`tur-html`](spices/html/) | WHATWG HTML parsing: browser-identical trees, fragments, tokenizer events | 3 | ✅ | ✅ | ? | ? | lexbor 3.0.1 |
 | [`tur-zlib`](spices/zlib/) | zlib + gzip encode/decode for Turmeric | 3 | ✅ | ✅ | ✅ | ✅ | zlib 1.3.1 |
+| [`tur-manifold`](spices/manifold/) | Solid modeling: CSG booleans, transforms and hulls on guaranteed-manifold meshes, with linear `Solid` handles (prototype) | 3 | ? | ✅ | ? | ? | Manifold v3.5.5, Clipper2 (C++17, built from source) |
 
 ### Platform notes
 

@@ -1,0 +1,44 @@
+;; manifold/types.tur -- the owned handles of tur-manifold.
+;;
+;; Both are `^linear`: a value is produced once and must be consumed exactly
+;; once.  That is checked for every NAMED binding -- a `let` that never
+;; consumes its Solid is TUR-E0100, a second use after a consuming call is
+;; TUR-E0101, consuming in one `if` branch only is TUR-E0104.
+;;
+;; The checker does not follow a value that is never bound, so three shapes
+;; compile and leak.  They are listed in the README ("What the checker does
+;; not catch") and were measured, not guessed:
+;;
+;;   (volume (cube 1.5 1.5 1.5 true))    ; a temporary handed to a ^borrow slot
+;;   (translate s 1.5 0.0 0.0)           ; a result nobody binds or consumes
+;;   (Part (cube 1.5 1.5 1.5 true) 7)    ; a Solid stored in a struct or a vec
+;;
+;; Why linear and not `^affine` with a `Drop` instance, the shape stdlib's
+;; numvec uses: measured on turmeric main (2026-11-24), an affine Solid that
+;; is consumed in one `if` branch only compiles and is then freed twice at
+;; scope exit, and one consumed in BOTH branches is rejected as "used more
+;; than once".  Linear rejects the first at compile time and accepts the
+;; second.  `^linear` with a `Drop` instance is worse than either: every
+;; explicit `solid-free` of a bound value is a double free.
+(defmodule manifold/types
+  (export Solid SolidVec)
+  ;;; Solid -- an owned handle to one manifold solid (a `ManifoldManifold*`).
+  ;;;
+  ;;; Manifold solids are immutable: every operation makes a new one.  A Solid
+  ;;; is `^linear`, so each is consumed exactly once -- by an operation that
+  ;;; takes it (`union`, `translate`, ...), by `solid-vec-push!`, or by
+  ;;; `solid-free`.  Queries (`volume`, `genus`, ...) take it `^borrow` and
+  ;;; leave it with the caller.  `solid-copy` makes a second handle when one
+  ;;; solid feeds two operations; the copy shares the geometry, so it is cheap.
+  ;;;
+  ;;; Since: M0
+  (defopaque ^linear Solid :int)
+  ;;; SolidVec -- an owned, growable list of solids (a `ManifoldManifoldVec*`).
+  ;;;
+  ;;; The way to combine a number of solids only known at run time: a loop
+  ;;; cannot rebind a linear accumulator, but it can push into a borrowed
+  ;;; SolidVec.  Consumed by `union-all`, `intersection-all`, `hull-all` or
+  ;;; `solid-vec-free`.
+  ;;;
+  ;;; Since: M0
+  (defopaque ^linear SolidVec :int))

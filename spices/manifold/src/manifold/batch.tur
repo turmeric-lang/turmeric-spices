@@ -1,0 +1,200 @@
+;; manifold/batch.tur -- combining a run-time number of solids.
+;;
+;; `(union a b)` is enough when the solids are written out in the source.  A
+;; loop is different: the obvious accumulator
+;;
+;;   (let [^mut acc (empty-solid)]
+;;     (while ... (set! acc (union acc (next-part))))
+;;     acc)
+;;
+;; is rejected with TUR-E0101 -- `union` consumes `acc`, and assigning it again
+;; does not make it usable again as far as the checker is concerned.  So a loop
+;; pushes into a SolidVec instead, which it only borrows, and one batch
+;; operation consumes the vector at the end.  That is also the faster way to
+;; combine many solids: manifold orders a batch boolean itself.
+;;
+;; A recursive fold whose accumulator is a parameter works without any of
+;; this, since each call consumes its accumulator exactly once.
+(defmodule manifold/batch
+  (import manifold/types :refer [Solid SolidVec])
+  (export solid-vec-new
+    solid-vec-push!
+    solid-vec-len
+    solid-vec-get
+    solid-vec-free
+    union-all
+    intersection-all
+    hull-all
+    decompose)
+  ;;; solid-vec-new -- an empty list of solids.
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh SolidVec.  Consume it with `union-all`, `intersection-all`,
+  ;;;   `hull-all` or `solid-vec-free`.
+  ;;;
+  ;;; Example:
+  ;;;   (let [parts (solid-vec-new)]
+  ;;;     (solid-vec-push! parts (cube 1.5 1.5 1.5 false))
+  ;;;     (union-all parts))
+  ;;;
+  ;;; Since: M0
+  (defn solid-vec-new [] : SolidVec
+    ```c
+    #include <manifold/manifoldc.h>
+  return (intptr_t)manifold_manifold_empty_vec(manifold_alloc_manifold_vec());
+  ```)
+  ;;; solid-vec-push! -- append a solid to a list.
+  ;;;
+  ;;; Parameters:
+  ;;;   v -- the list (borrowed)
+  ;;;   s -- the solid to append; consumed -- the list owns it from here
+  ;;;
+  ;;; Returns:
+  ;;;   void
+  ;;;
+  ;;; Example:
+  ;;;   (solid-vec-push! parts (translate (cube 1.5 1.5 1.5 false) 2.5 0.0 0.0))
+  ;;;
+  ;;; Since: M0
+  (defn solid-vec-push! [^borrow v : SolidVec s : Solid] : void
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifold *p = (ManifoldManifold *)(intptr_t)s;
+  manifold_manifold_vec_push_back((ManifoldManifoldVec *)(intptr_t)v, p);
+  manifold_delete_manifold(p);
+  ```)
+  ;;; solid-vec-len -- the number of solids in a list.
+  ;;;
+  ;;; Parameters:
+  ;;;   v -- the list (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The count.
+  ;;;
+  ;;; Since: M0
+  (defn solid-vec-len [^borrow v : SolidVec] : int
+    ```c
+    #include <manifold/manifoldc.h>
+  return (int64_t)manifold_manifold_vec_length((ManifoldManifoldVec *)(intptr_t)v);
+  ```)
+  ;;; solid-vec-get -- a handle to one solid of a list.
+  ;;;
+  ;;; Parameters:
+  ;;;   v -- the list (borrowed); it keeps its own reference to the solid
+  ;;;   i -- zero-based index
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid, to be consumed like any other.  An index outside
+  ;;;   0 .. (solid-vec-len v) - 1 gives an empty solid.
+  ;;;
+  ;;; Example:
+  ;;;   (let [pieces (decompose s)
+  ;;;         first-piece (solid-vec-get pieces 0)]
+  ;;;     (solid-vec-free pieces)
+  ;;;     first-piece)
+  ;;;
+  ;;; Since: M0
+  (defn solid-vec-get [^borrow v : SolidVec i : int] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifoldVec *pv = (ManifoldManifoldVec *)(intptr_t)v;
+  if (i < 0 || (size_t)i >= manifold_manifold_vec_length(pv))
+    return (intptr_t)manifold_empty(manifold_alloc_manifold());
+  return (intptr_t)manifold_manifold_vec_get(manifold_alloc_manifold(), pv, (size_t)i);
+  ```)
+  ;;; solid-vec-free -- release a list and every solid in it.
+  ;;;
+  ;;; Parameters:
+  ;;;   v -- the list; consumed
+  ;;;
+  ;;; Returns:
+  ;;;   void
+  ;;;
+  ;;; Since: M0
+  (defn solid-vec-free [v : SolidVec] : void
+    ```c
+    #include <manifold/manifoldc.h>
+  manifold_delete_manifold_vec((ManifoldManifoldVec *)(intptr_t)v);
+  ```)
+  ;;; union-all -- the union of every solid in a list.
+  ;;;
+  ;;; Parameters:
+  ;;;   v -- the list; consumed
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid; empty for an empty list.
+  ;;;
+  ;;; Example:
+  ;;;   (let [parts (solid-vec-new)
+  ;;;         ^mut x 0.0]
+  ;;;     (while (< x 7.0)
+  ;;;       (solid-vec-push! parts (translate (cube 1.5 1.5 1.5 false) x 0.0 0.0))
+  ;;;       (set! x (+ x 2.5)))
+  ;;;     (union-all parts))
+  ;;;
+  ;;; Since: M0
+  (defn union-all [v : SolidVec] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifoldVec *pv = (ManifoldManifoldVec *)(intptr_t)v;
+  ManifoldManifold *r = manifold_batch_boolean(manifold_alloc_manifold(), pv, MANIFOLD_ADD);
+  manifold_delete_manifold_vec(pv);
+  return (intptr_t)r;
+  ```)
+  ;;; intersection-all -- what every solid in a list has in common.
+  ;;;
+  ;;; Parameters:
+  ;;;   v -- the list; consumed
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid; empty for an empty list.
+  ;;;
+  ;;; Since: M0
+  (defn intersection-all [v : SolidVec] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifoldVec *pv = (ManifoldManifoldVec *)(intptr_t)v;
+  ManifoldManifold *r = manifold_batch_boolean(manifold_alloc_manifold(), pv, MANIFOLD_INTERSECT);
+  manifold_delete_manifold_vec(pv);
+  return (intptr_t)r;
+  ```)
+  ;;; hull-all -- the convex hull around every solid in a list.
+  ;;;
+  ;;; Parameters:
+  ;;;   v -- the list; consumed
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh, convex Solid.
+  ;;;
+  ;;; Since: M0
+  (defn hull-all [v : SolidVec] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifoldVec *pv = (ManifoldManifoldVec *)(intptr_t)v;
+  ManifoldManifold *r = manifold_batch_hull(manifold_alloc_manifold(), pv);
+  manifold_delete_manifold_vec(pv);
+  return (intptr_t)r;
+  ```)
+  ;;; decompose -- split a solid into its connected pieces.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid; consumed
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh SolidVec with one solid per connected piece.
+  ;;;
+  ;;; Example:
+  ;;;   (let [pieces (decompose two-separate-cubes)
+  ;;;         n (solid-vec-len pieces)]
+  ;;;     (solid-vec-free pieces)
+  ;;;     n)   ; => 2
+  ;;;
+  ;;; Since: M0
+  (defn decompose [s : Solid] : SolidVec
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifold *p = (ManifoldManifold *)(intptr_t)s;
+  ManifoldManifoldVec *r = manifold_decompose(manifold_alloc_manifold_vec(), p);
+  manifold_delete_manifold(p);
+  return (intptr_t)r;
+  ```))

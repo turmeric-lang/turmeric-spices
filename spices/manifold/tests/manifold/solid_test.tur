@@ -1,0 +1,230 @@
+;; tests/manifold/solid_test.tur -- constructors, booleans, transforms and
+;; queries, checked against geometry that can be worked out by hand.
+;;
+;; Every `it` binds its assertion results, frees what it owns, and only then
+;; returns their conjunction: `it` takes a bool, and `solid-free` returns
+;; void, so a body ending in a free hands `it` nothing to judge.
+;;
+;; CI runs this under TUR_SANITIZE_PROGRAMS=1, so a Solid that is never freed
+;; fails the suite even where the linearity checker cannot see it.
+(defmodule manifold/tests/solid
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-eq assert-true assert-false])
+  (import test/runner :refer [run-all-status])
+  (import manifold/types :refer [Solid])
+  (import manifold/solid
+    :refer
+    [cube
+     cylinder
+     sphere
+     tetrahedron
+     empty-solid
+     union
+     difference
+     intersection
+     translate
+     rotate
+     scale
+     mirror
+     hull
+     solid-copy
+     solid-free
+     with-solid
+     volume
+     surface-area
+     genus
+     num-vert
+     num-edge
+     num-tri
+     empty?
+     solid-status
+     solid-ok?
+     status-name])
+  ;; |a - b| within tol.  Booleans and transforms are exact only up to
+  ;; manifold's own epsilon, so nothing here compares floats with `=`.
+  (defn near? [a : float b : float tol : float] : bool
+    (and (> a (- b tol)) (< a (+ b tol))))
+  (defn cstr-eq? [a : cstr b : cstr] : bool
+    ```c
+    #include <string.h>
+  return strcmp((const char *)(intptr_t)a, (const char *)(intptr_t)b) == 0;
+  ```)
+  ;; A row of `n` unit cubes along x, 2.5 apart, by recursion: each call
+  ;; consumes its accumulator once, which is the one accumulating shape the
+  ;; linearity checker accepts.
+  (defn row [n : int x : float acc : Solid] : Solid
+    (if (<= n 0)
+      acc
+      (row (- n 1)
+        (+ x 2.5)
+        (union acc (translate (cube 1.0 1.0 1.0 false) x 0.0 0.0)))))
+  (defn __all-tests [] : void
+    (describe "manifold/solid constructors"
+      (it "a cube has its volume, its area, 12 triangles and no handles"
+        (let [c (cube 2.5 1.5 0.5 true)
+              v (assert-true (near? (volume c) 1.875 1e-09))
+              a (assert-true (near? (surface-area c) 11.5 1e-09))
+              t (assert-eq 12 (num-tri c))
+              n (assert-eq 8 (num-vert c))
+              e (assert-eq 18 (num-edge c))
+              g (assert-eq 0 (genus c))
+              k (assert-true (solid-ok? c))]
+          (solid-free c)
+          (and v (and a (and t (and n (and e (and g k))))))))
+      (it "a tetrahedron has 4 triangles and volume 8/3"
+        (let [t (tetrahedron)
+              n (assert-eq 4 (num-tri t))
+              v (assert-true (near? (volume t) 2.6666666666666665 1e-09))]
+          (solid-free t)
+          (and n v)))
+      (it "a sphere is a little under (4/3) pi r^3 and closes in with more segments"
+        (let [coarse (sphere 1.5 16)
+              fine   (sphere 1.5 128)
+              exact  14.137166941154069
+              vc     (volume coarse)
+              vf     (volume fine)
+              below  (assert-true (and (< vc vf) (< vf exact)))
+              close  (assert-true (near? vf exact 0.05))]
+          (solid-free coarse)
+          (solid-free fine)
+          (and below close)))
+      (it "a cylinder is pi r^2 h, approached from below"
+        (let [c     (cylinder 4.5 0.75 0.75 256 true)
+              exact 7.952156404399163
+              v     (volume c)
+              r     (assert-true (and (< v exact) (near? v exact 0.002)))]
+          (solid-free c)
+          r))
+      (it "the empty solid is empty, valid and has no volume"
+        (let [e (empty-solid)
+              a (assert-true (empty? e))
+              b (assert-true (solid-ok? e))
+              c (assert-true (near? (volume e) 0.0 1e-09))]
+          (solid-free e)
+          (and a (and b c))))
+      (it "a cube with a negative edge is empty and says why"
+        (let [bad (cube -1.5 1.5 1.5 true)
+              a   (assert-true (empty? bad))
+              b   (assert-false (solid-ok? bad))
+              c   (assert-true (cstr-eq? ":invalid-construction"
+                                 (status-name (solid-status bad))))]
+          (solid-free bad)
+          (and a (and b c))))
+      (it "a valid solid's status is :no-error"
+        (let [c (cube 1.5 1.5 1.5 true)
+              r (assert-true (cstr-eq? ":no-error"
+                               (status-name (solid-status c))))]
+          (solid-free c)
+          r)))
+    (describe "manifold/solid booleans"
+      (it "operands written inline are consumed, so nesting needs no names"
+        (let [d      (difference (cube 2.5 2.5 2.5 true) (sphere 1.5 48))
+              v      (volume d)
+              inside (assert-true (and (> v 0.0) (< v 15.625)))
+              ok     (assert-true (solid-ok? d))]
+          (solid-free d)
+          (and inside ok)))
+      (it "vol(A or B) = vol(A) + vol(B) - vol(A and B)"
+        (let [a  (cube 2.5 2.5 2.5 true)
+              b  (translate (sphere 1.5 48) 1.25 0.0 0.0)
+              va (volume a)
+              vb (volume b)
+              u  (union (solid-copy a) (solid-copy b))
+              i  (intersection a b)
+              r  (assert-true (near? (volume u) (- (+ va vb) (volume i)) 1e-06))]
+          (solid-free u)
+          (solid-free i)
+          r))
+      (it "vol(A minus B) = vol(A) - vol(A and B)"
+        (let [a       (cube 2.5 2.5 2.5 true)
+              b       (translate (cube 2.5 2.5 2.5 true) 1.25 0.5 0.0)
+              va      (volume a)
+              d       (difference (solid-copy a) (solid-copy b))
+              i       (intersection a b)
+              ;; the overlap is a 1.25 x 2.0 x 2.5 box
+              overlap (assert-true (near? (volume i) 6.25 1e-06))
+              r       (assert-true (near? (volume d) (- va 6.25) 1e-06))]
+          (solid-free d)
+          (solid-free i)
+          (and overlap r)))
+      (it "solids that do not touch intersect to nothing"
+        (let [i  (intersection (cube 1.5 1.5 1.5 false)
+                   (translate (cube 1.5 1.5 1.5 false) 3.5 0.0 0.0))
+              r  (assert-true (empty? i))
+              ok (assert-true (solid-ok? i))]
+          (solid-free i)
+          (and r ok)))
+      (it "drilling a hole through a cube makes a torus: genus 1"
+        (let [d  (difference (cube 2.5 2.5 2.5 true)
+                   (cylinder 4.5 0.75 0.75 48 true))
+              g  (assert-eq 1 (genus d))
+              ok (assert-true (solid-ok? d))]
+          (solid-free d)
+          (and g ok)))
+      (it "a blind hole leaves genus 0"
+        (let [d (difference (cube 2.5 2.5 2.5 true)
+                  (translate (cylinder 4.5 0.75 0.75 48 false) 0.0 0.0 0.25))
+              g (assert-eq 0 (genus d))]
+          (solid-free d)
+          g)))
+    (describe "manifold/solid transforms"
+      (it "translate and rotate keep the volume"
+        (let [s (-> (cube 2.5 1.5 0.5 true)
+                  (translate 0.75 -1.25 3.5)
+                  (rotate 22.5 45.0 67.5))
+              r (assert-true (near? (volume s) 1.875 1e-06))]
+          (solid-free s)
+          r))
+      (it "scale multiplies the volume by the product of the factors"
+        (let [s (scale (cube 1.5 1.5 1.5 true) 2.0 0.5 3.0)
+              r (assert-true (near? (volume s) 10.125 1e-06))]
+          (solid-free s)
+          r))
+      (it "a solid and its mirror image, glued at the mirror plane, double the volume"
+        (let [half  (cube 1.5 2.5 0.5 false)
+              whole (union (solid-copy half) (mirror half 1.0 0.0 0.0))
+              v     (assert-true (near? (volume whole) 3.75 1e-06))
+              ;; one box 3.0 x 2.5 x 0.5, not two
+              a     (assert-true (near? (surface-area whole) 20.5 1e-06))]
+          (solid-free whole)
+          (and v a)))
+      (it "mirroring in a plane with no normal gives nothing"
+        (let [m (mirror (cube 1.5 1.5 1.5 true) 0.0 0.0 0.0)
+              r (assert-true (empty? m))]
+          (solid-free m)
+          r))
+      (it "the hull of two separated cubes is the box around them"
+        (let [h (hull (union (cube 1.0 1.0 1.0 false)
+                        (translate (cube 1.0 1.0 1.0 false) 2.5 0.0 0.0)))
+              v (assert-true (near? (volume h) 3.5 1e-06))
+              g (assert-eq 0 (genus h))]
+          (solid-free h)
+          (and v g))))
+    (describe "manifold/solid ownership"
+      (it "solid-copy gives a second handle that outlives the first"
+        (let [a (cube 1.5 1.5 1.5 true)
+              b (solid-copy a)]
+          (solid-free a)
+          (let [r (assert-true (near? (volume b) 3.375 1e-09))]
+            (solid-free b)
+            r)))
+      (it "with-solid frees its binding and yields the body's value"
+        (assert-true (near? (with-solid [d
+                                         (difference (cube 2.5 2.5 2.5 true)
+                                           (cube 1.5 1.5 1.5 true))]
+                              (volume d))
+                       12.25
+                       1e-06)))
+      (it "an if may consume a solid when both branches do"
+        (let [a   (cube 1.5 1.5 1.5 true)
+              big (> (volume a) 1.0)
+              b   (if big (scale a 2.0 2.0 2.0) (translate a 0.5 0.0 0.0))
+              r   (assert-true (near? (volume b) 27.0 1e-06))]
+          (solid-free b)
+          r))
+      (it "a recursive fold accumulates through a consumed parameter"
+        (let [r4 (row 4 0.0 (empty-solid))
+              v  (assert-true (near? (volume r4) 4.0 1e-06))]
+          (solid-free r4)
+          v))))
+  (defn main [] : int (__all-tests) (run-all-status)))
