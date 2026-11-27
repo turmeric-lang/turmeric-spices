@@ -7,8 +7,8 @@ guaranteed to stay manifold (watertight, no self-intersections), wrapping
 > **Status: prototype (0.1.0).** This is the first slice -- primitives,
 > booleans, transforms, hulls, queries and batch operations -- built to settle
 > how solids are owned. Cross-sections, mesh import/export, level sets and a
-> raylib viewer are not here yet. Verified on Linux x86-64; the macOS build is
-> untested until CI runs it.
+> raylib viewer are not here yet. Built and tested on Linux x86-64 and, in CI,
+> on macOS arm64.
 
 ## Install
 
