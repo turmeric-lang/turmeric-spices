@@ -1,0 +1,570 @@
+;; manifold/solid.tur -- constructors, CSG operations and queries on a Solid.
+;;
+;; The ownership convention, in one place:
+;;
+;;   constructors   cube sphere cylinder ...   return a fresh Solid
+;;   operations     union translate hull ...   CONSUME every Solid they take
+;;                                             and return a fresh one
+;;   queries        volume genus num-tri ...   take the Solid `^borrow`
+;;   solid-copy                                borrows, returns a second handle
+;;   solid-free                                consumes
+;;
+;; Operations consume so that an expression nests without leaking:
+;;
+;;   (difference (cube 2.5 2.5 2.5 true) (sphere 1.5 48))
+;;
+;; Both operands are temporaries with no name.  The linearity checker does not
+;; follow an unnamed value into a `^borrow` parameter, so had `difference`
+;; borrowed them nothing would ever free them and nothing would say so
+;; (measured under LeakSanitizer: one leaked cube is 18 allocations, with no
+;; diagnostic at compile time).  Consuming them is what gives each temporary
+;; an owner.  The price is `solid-copy` where one solid feeds two operations.
+;;
+;; Every operation frees its operands AFTER building the result.  Manifold
+;; evaluates lazily -- a boolean returns a node of a CSG tree, not a mesh --
+;; and the node holds its own reference to what it was built from, so the
+;; operand handles can go at once.
+(defmodule manifold/solid
+  (import manifold/types :refer [Solid])
+  (export cube
+    cylinder
+    sphere
+    tetrahedron
+    empty-solid
+    union
+    difference
+    intersection
+    translate
+    rotate
+    scale
+    mirror
+    hull
+    solid-copy
+    solid-free
+    with-solid
+    volume
+    surface-area
+    genus
+    num-vert
+    num-edge
+    num-tri
+    empty?
+    solid-status
+    solid-ok?
+    status-name)
+  ;; -------------------------------------------------------------------------
+  ;; Constructors
+  ;; -------------------------------------------------------------------------
+  ;;; cube -- an axis-aligned box.
+  ;;;
+  ;;; Parameters:
+  ;;;   x, y, z -- edge lengths along each axis
+  ;;;   center  -- true to centre the box on the origin; false to put one
+  ;;;              corner at the origin and the box in the positive octant
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid.  A negative length, or all three zero, gives an empty
+  ;;;   one whose `solid-status` is :invalid-construction.
+  ;;;
+  ;;; Example:
+  ;;;   (let [c (cube 2.5 1.5 0.5 true)] ... (solid-free c))
+  ;;;
+  ;;; Since: M0
+  (defn cube [x : float y : float z : float center : bool] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  return (intptr_t)manifold_cube(manifold_alloc_manifold(), x, y, z, center ? 1 : 0);
+  ```)
+  ;;; cylinder -- a cylinder or cone frustum along the z axis.
+  ;;;
+  ;;; Parameters:
+  ;;;   height      -- extent along z
+  ;;;   radius-low  -- radius at the bottom
+  ;;;   radius-high -- radius at the top; equal to radius-low for a cylinder,
+  ;;;                  0.0 for a cone
+  ;;;   segments    -- number of sides; 0 lets manifold choose from its
+  ;;;                  circular-quality defaults
+  ;;;   center      -- true to centre it on the origin along z
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid.
+  ;;;
+  ;;; Example:
+  ;;;   (cylinder 4.5 0.75 0.75 48 true)
+  ;;;
+  ;;; Since: M0
+  (defn cylinder [height : float
+                  radius-low : float
+                  radius-high : float
+                  segments : int
+                  center : bool] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  return (intptr_t)manifold_cylinder(manifold_alloc_manifold(), height, radius_low,
+                                     radius_high, (int)segments, center ? 1 : 0);
+  ```)
+  ;;; sphere -- a geodesic sphere centred on the origin.
+  ;;;
+  ;;; Parameters:
+  ;;;   radius   -- sphere radius
+  ;;;   segments -- number of segments around a great circle (rounded up to a
+  ;;;               multiple of 4); 0 lets manifold choose
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid.  It is a polyhedron, so its volume is a little under
+  ;;;   (4/3) pi r^3 and approaches it as `segments` grows.
+  ;;;
+  ;;; Example:
+  ;;;   (sphere 1.5 64)
+  ;;;
+  ;;; Since: M0
+  (defn sphere [radius : float segments : int] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  return (intptr_t)manifold_sphere(manifold_alloc_manifold(), radius, (int)segments);
+  ```)
+  ;;; tetrahedron -- the regular tetrahedron with vertices at alternating
+  ;;; corners of the cube [-1, 1]^3.
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid with 4 triangles and volume 8/3.
+  ;;;
+  ;;; Since: M0
+  (defn tetrahedron [] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  return (intptr_t)manifold_tetrahedron(manifold_alloc_manifold());
+  ```)
+  ;;; empty-solid -- the solid with no geometry.
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid for which `empty?` is true.  The identity of `union`.
+  ;;;   It is still a handle and still has to be consumed.
+  ;;;
+  ;;; Since: M0
+  (defn empty-solid [] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  return (intptr_t)manifold_empty(manifold_alloc_manifold());
+  ```)
+  ;; -------------------------------------------------------------------------
+  ;; Booleans -- consume both operands
+  ;; -------------------------------------------------------------------------
+  ;;; union -- everything inside either solid.
+  ;;;
+  ;;; Parameters:
+  ;;;   a, b -- the operands; both are consumed
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid.
+  ;;;
+  ;;; Example:
+  ;;;   (union (cube 1.5 1.5 1.5 true) (sphere 1.0 32))
+  ;;;
+  ;;; Since: M0
+  (defn union [a : Solid b : Solid] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifold *pa = (ManifoldManifold *)(intptr_t)a;
+  ManifoldManifold *pb = (ManifoldManifold *)(intptr_t)b;
+  ManifoldManifold *r = manifold_union(manifold_alloc_manifold(), pa, pb);
+  manifold_delete_manifold(pa);
+  manifold_delete_manifold(pb);
+  return (intptr_t)r;
+  ```)
+  ;;; difference -- everything inside `a` and outside `b`.
+  ;;;
+  ;;; Parameters:
+  ;;;   a -- the solid to cut from; consumed
+  ;;;   b -- the solid to remove; consumed
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid.
+  ;;;
+  ;;; Example:
+  ;;;   (difference (cube 2.5 2.5 2.5 true) (sphere 1.5 48))
+  ;;;
+  ;;; Since: M0
+  (defn difference [a : Solid b : Solid] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifold *pa = (ManifoldManifold *)(intptr_t)a;
+  ManifoldManifold *pb = (ManifoldManifold *)(intptr_t)b;
+  ManifoldManifold *r = manifold_difference(manifold_alloc_manifold(), pa, pb);
+  manifold_delete_manifold(pa);
+  manifold_delete_manifold(pb);
+  return (intptr_t)r;
+  ```)
+  ;;; intersection -- everything inside both solids.
+  ;;;
+  ;;; Parameters:
+  ;;;   a, b -- the operands; both are consumed
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid, empty when the operands do not overlap.
+  ;;;
+  ;;; Example:
+  ;;;   (intersection (cube 1.5 1.5 1.5 true) (sphere 1.0 32))
+  ;;;
+  ;;; Since: M0
+  (defn intersection [a : Solid b : Solid] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifold *pa = (ManifoldManifold *)(intptr_t)a;
+  ManifoldManifold *pb = (ManifoldManifold *)(intptr_t)b;
+  ManifoldManifold *r = manifold_intersection(manifold_alloc_manifold(), pa, pb);
+  manifold_delete_manifold(pa);
+  manifold_delete_manifold(pb);
+  return (intptr_t)r;
+  ```)
+  ;; -------------------------------------------------------------------------
+  ;; Transforms -- consume the solid.  It comes first, so `->` threads them.
+  ;; -------------------------------------------------------------------------
+  ;;; translate -- move a solid.
+  ;;;
+  ;;; Parameters:
+  ;;;   s       -- the solid; consumed
+  ;;;   x, y, z -- the offset along each axis
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid.
+  ;;;
+  ;;; Example:
+  ;;;   (-> (cube 1.5 1.5 1.5 true) (translate 0.75 0.0 0.0) (rotate 0.0 0.0 22.5))
+  ;;;
+  ;;; Since: M0
+  (defn translate [s : Solid x : float y : float z : float] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifold *p = (ManifoldManifold *)(intptr_t)s;
+  ManifoldManifold *r = manifold_translate(manifold_alloc_manifold(), p, x, y, z);
+  manifold_delete_manifold(p);
+  return (intptr_t)r;
+  ```)
+  ;;; rotate -- rotate a solid about the origin.
+  ;;;
+  ;;; Parameters:
+  ;;;   s             -- the solid; consumed
+  ;;;   x-deg, y-deg, z-deg -- Euler angles in DEGREES, applied about x, then
+  ;;;                          y, then z.  Multiples of 90 are exact.
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid.
+  ;;;
+  ;;; Example:
+  ;;;   (rotate (cylinder 4.5 0.75 0.75 48 true) 90.0 0.0 0.0)
+  ;;;
+  ;;; Since: M0
+  (defn rotate [s : Solid x-deg : float y-deg : float z-deg : float] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifold *p = (ManifoldManifold *)(intptr_t)s;
+  ManifoldManifold *r = manifold_rotate(manifold_alloc_manifold(), p, x_deg, y_deg, z_deg);
+  manifold_delete_manifold(p);
+  return (intptr_t)r;
+  ```)
+  ;;; scale -- scale a solid about the origin.
+  ;;;
+  ;;; Parameters:
+  ;;;   s       -- the solid; consumed
+  ;;;   x, y, z -- the factor along each axis
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid.  Its volume is the original's times |x * y * z|.
+  ;;;
+  ;;; Example:
+  ;;;   (scale (sphere 1.0 48) 1.5 1.0 0.5)
+  ;;;
+  ;;; Since: M0
+  (defn scale [s : Solid x : float y : float z : float] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifold *p = (ManifoldManifold *)(intptr_t)s;
+  ManifoldManifold *r = manifold_scale(manifold_alloc_manifold(), p, x, y, z);
+  manifold_delete_manifold(p);
+  return (intptr_t)r;
+  ```)
+  ;;; mirror -- reflect a solid in the plane through the origin with the given
+  ;;; normal.
+  ;;;
+  ;;; Parameters:
+  ;;;   s          -- the solid; consumed
+  ;;;   nx, ny, nz -- the plane's normal; it need not be unit length.  The zero
+  ;;;                 vector gives an empty solid.
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid.
+  ;;;
+  ;;; Example:
+  ;;;   (mirror (translate (cube 1.5 1.5 1.5 false) 0.5 0.0 0.0) 1.0 0.0 0.0)
+  ;;;
+  ;;; Since: M0
+  (defn mirror [s : Solid nx : float ny : float nz : float] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifold *p = (ManifoldManifold *)(intptr_t)s;
+  ManifoldManifold *r = manifold_mirror(manifold_alloc_manifold(), p, nx, ny, nz);
+  manifold_delete_manifold(p);
+  return (intptr_t)r;
+  ```)
+  ;;; hull -- the convex hull of a solid.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid; consumed.  It may be several disconnected pieces: the
+  ;;;        hull wraps all of them.
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh, convex Solid.
+  ;;;
+  ;;; Example:
+  ;;;   (hull (union (cube 1.0 1.0 1.0 false)
+  ;;;                (translate (cube 1.0 1.0 1.0 false) 2.5 0.0 0.0)))
+  ;;;
+  ;;; Since: M0
+  (defn hull [s : Solid] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  ManifoldManifold *p = (ManifoldManifold *)(intptr_t)s;
+  ManifoldManifold *r = manifold_hull(manifold_alloc_manifold(), p);
+  manifold_delete_manifold(p);
+  return (intptr_t)r;
+  ```)
+  ;; -------------------------------------------------------------------------
+  ;; Copying and releasing
+  ;; -------------------------------------------------------------------------
+  ;;; solid-copy -- a second handle to the same solid.
+  ;;;
+  ;;; For when one solid feeds two operations: each operation consumes its
+  ;;; operand, so the second one needs a handle of its own.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid (borrowed; still the caller's to consume)
+  ;;;
+  ;;; Returns:
+  ;;;   A fresh Solid sharing the original's geometry.  Nothing is duplicated
+  ;;;   but a reference, and both handles have to be consumed.
+  ;;;
+  ;;; Example:
+  ;;;   (let [a (cube 1.5 1.5 1.5 false)
+  ;;;         both (union (solid-copy a) (translate (solid-copy a) 2.5 0.0 0.0))]
+  ;;;     (solid-free a)
+  ;;;     both)
+  ;;;
+  ;;; Since: M0
+  (defn solid-copy [^borrow s : Solid] : Solid
+    ```c
+    #include <manifold/manifoldc.h>
+  return (intptr_t)manifold_copy(manifold_alloc_manifold(), (ManifoldManifold *)(intptr_t)s);
+  ```)
+  ;;; solid-free -- release a solid.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid; consumed.  Using it afterwards is TUR-E0101.
+  ;;;
+  ;;; Returns:
+  ;;;   void
+  ;;;
+  ;;; Example:
+  ;;;   (let [c (cube 1.5 1.5 1.5 true) v (volume c)] (solid-free c) v)
+  ;;;
+  ;;; Since: M0
+  (defn solid-free [s : Solid] : void
+    ```c
+    #include <manifold/manifoldc.h>
+  manifold_delete_manifold((ManifoldManifold *)(intptr_t)s);
+  ```)
+  ;;; with-solid -- bind a solid for a body, then release it.
+  ;;;
+  ;;; `(with-solid [name init] body...)` evaluates `init`, runs the body with
+  ;;; `name` bound to it, frees it, and yields the body's last value.  The
+  ;;; body may borrow `name` (queries, `solid-copy`) but must not consume it.
+  ;;;
+  ;;; Example:
+  ;;;   (with-solid [d (difference (cube 2.5 2.5 2.5 true) (sphere 1.5 48))]
+  ;;;     (volume d))
+  ;;;
+  ;;; Since: M0
+  (defmacro with-solid [binding & body]
+    `(let [~(first binding) ~(second binding)
+           result#          (do ~@body)]
+       (solid-free ~(first binding))
+       result#))
+  ;; -------------------------------------------------------------------------
+  ;; Queries -- borrow the solid
+  ;; -------------------------------------------------------------------------
+  ;;; volume -- the enclosed volume.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The volume; 0.0 for an empty solid.
+  ;;;
+  ;;; Example:
+  ;;;   (with-solid [c (cube 1.5 1.5 1.5 true)] (volume c))   ; => 3.375
+  ;;;
+  ;;; Since: M0
+  (defn volume [^borrow s : Solid] : float
+    ```c
+    #include <manifold/manifoldc.h>
+  return manifold_volume((ManifoldManifold *)(intptr_t)s);
+  ```)
+  ;;; surface-area -- the total area of the solid's boundary.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The area; 0.0 for an empty solid.
+  ;;;
+  ;;; Example:
+  ;;;   (with-solid [c (cube 1.5 1.5 1.5 true)] (surface-area c))   ; => 13.5
+  ;;;
+  ;;; Since: M0
+  (defn surface-area [^borrow s : Solid] : float
+    ```c
+    #include <manifold/manifoldc.h>
+  return manifold_surface_area((ManifoldManifold *)(intptr_t)s);
+  ```)
+  ;;; genus -- the number of handles: 0 for a ball, 1 for a torus.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The genus.  It is only the count of handles for a single connected
+  ;;;   piece; several pieces together report a lower, even negative, number.
+  ;;;
+  ;;; Example:
+  ;;;   ;; a cube with a hole drilled through it is a torus
+  ;;;   (with-solid [d (difference (cube 2.5 2.5 2.5 true)
+  ;;;                              (cylinder 4.5 0.75 0.75 48 true))]
+  ;;;     (genus d))   ; => 1
+  ;;;
+  ;;; Since: M0
+  (defn genus [^borrow s : Solid] : int
+    ```c
+    #include <manifold/manifoldc.h>
+  return (int64_t)manifold_genus((ManifoldManifold *)(intptr_t)s);
+  ```)
+  ;;; num-vert -- the number of vertices in the solid's mesh.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The vertex count.
+  ;;;
+  ;;; Since: M0
+  (defn num-vert [^borrow s : Solid] : int
+    ```c
+    #include <manifold/manifoldc.h>
+  return (int64_t)manifold_num_vert((ManifoldManifold *)(intptr_t)s);
+  ```)
+  ;;; num-edge -- the number of edges in the solid's mesh.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The edge count.
+  ;;;
+  ;;; Since: M0
+  (defn num-edge [^borrow s : Solid] : int
+    ```c
+    #include <manifold/manifoldc.h>
+  return (int64_t)manifold_num_edge((ManifoldManifold *)(intptr_t)s);
+  ```)
+  ;;; num-tri -- the number of triangles in the solid's mesh.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   The triangle count: 12 for a cube.
+  ;;;
+  ;;; Since: M0
+  (defn num-tri [^borrow s : Solid] : int
+    ```c
+    #include <manifold/manifoldc.h>
+  return (int64_t)manifold_num_tri((ManifoldManifold *)(intptr_t)s);
+  ```)
+  ;;; empty? -- whether the solid has no geometry.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   true for `empty-solid`, for an intersection of solids that do not
+  ;;;   overlap, and for any solid whose `solid-status` is not 0.
+  ;;;
+  ;;; Since: M0
+  (defn empty? [^borrow s : Solid] : bool
+    ```c
+    #include <manifold/manifoldc.h>
+  return manifold_is_empty((ManifoldManifold *)(intptr_t)s) != 0;
+  ```)
+  ;;; solid-status -- manifold's error code for this solid.
+  ;;;
+  ;;; Manifold does not fail an operation: it returns an empty solid that
+  ;;; carries the reason, and every operation on that solid carries it on.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   0 when the solid is valid, otherwise a `ManifoldError` code; pass it
+  ;;;   to `status-name` for the name.
+  ;;;
+  ;;; Since: M0
+  (defn solid-status [^borrow s : Solid] : int
+    ```c
+    #include <manifold/manifoldc.h>
+  return (int64_t)manifold_status((ManifoldManifold *)(intptr_t)s);
+  ```)
+  ;;; solid-ok? -- whether the solid carries no error.
+  ;;;
+  ;;; Parameters:
+  ;;;   s -- the solid (borrowed)
+  ;;;
+  ;;; Returns:
+  ;;;   true when `solid-status` is 0.  An empty solid is ok.
+  ;;;
+  ;;; Since: M0
+  (defn solid-ok? [^borrow s : Solid] : bool (= 0 (solid-status s)))
+  ;;; status-name -- the name of a `solid-status` code.
+  ;;;
+  ;;; Parameters:
+  ;;;   code -- a value returned by `solid-status`
+  ;;;
+  ;;; Returns:
+  ;;;   A keyword-style name such as ":no-error" or ":not-manifold";
+  ;;;   ":unknown" for a code this version of the spice does not know.
+  ;;;
+  ;;; Example:
+  ;;;   (with-solid [c (cube 1.5 1.5 1.5 true)] (status-name (solid-status c)))
+  ;;;   ; => ":no-error"
+  ;;;
+  ;;; Since: M0
+  (defn status-name [code : int] : cstr
+    ```c
+    #include <manifold/manifoldc.h>
+  switch ((ManifoldError)code) {
+    case MANIFOLD_NO_ERROR:                        return (char *)":no-error";
+    case MANIFOLD_NON_FINITE_VERTEX:               return (char *)":non-finite-vertex";
+    case MANIFOLD_NOT_MANIFOLD:                    return (char *)":not-manifold";
+    case MANIFOLD_VERTEX_INDEX_OUT_OF_BOUNDS:      return (char *)":vertex-index-out-of-bounds";
+    case MANIFOLD_PROPERTIES_WRONG_LENGTH:         return (char *)":properties-wrong-length";
+    case MANIFOLD_MISSING_POSITION_PROPERTIES:     return (char *)":missing-position-properties";
+    case MANIFOLD_MERGE_VECTORS_DIFFERENT_LENGTHS: return (char *)":merge-vectors-different-lengths";
+    case MANIFOLD_MERGE_INDEX_OUT_OF_BOUNDS:       return (char *)":merge-index-out-of-bounds";
+    case MANIFOLD_TRANSFORM_WRONG_LENGTH:          return (char *)":transform-wrong-length";
+    case MANIFOLD_RUN_INDEX_WRONG_LENGTH:          return (char *)":run-index-wrong-length";
+    case MANIFOLD_FACE_ID_WRONG_LENGTH:            return (char *)":face-id-wrong-length";
+    case MANIFOLD_INVALID_CONSTRUCTION:            return (char *)":invalid-construction";
+    case MANIFOLD_RESULT_TOO_LARGE:                return (char *)":result-too-large";
+    case MANIFOLD_INVALID_TANGENTS:                return (char *)":invalid-tangents";
+    case MANIFOLD_CANCELLED:                       return (char *)":cancelled";
+  }
+  return (char *)":unknown";
+  ```))

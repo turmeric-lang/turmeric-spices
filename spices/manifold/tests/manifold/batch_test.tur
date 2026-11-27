@@ -1,0 +1,100 @@
+;; tests/manifold/batch_test.tur -- SolidVec and the batch operations.
+;;
+;; The first test is the shape this module is for: a loop that does not know
+;; how many solids it will make pushes them into a borrowed SolidVec, and one
+;; batch operation consumes the vector.
+(defmodule manifold/tests/batch
+  (import test/suite :refer [describe it])
+  (import test/assert :refer [assert-eq assert-true])
+  (import test/runner :refer [run-all-status])
+  (import manifold/solid
+    :refer
+    [cube sphere union translate solid-free volume genus empty? solid-ok?])
+  (import manifold/batch
+    :refer
+    [solid-vec-new
+     solid-vec-push!
+     solid-vec-len
+     solid-vec-get
+     solid-vec-free
+     union-all
+     intersection-all
+     hull-all
+     decompose])
+  (defn near? [a : float b : float tol : float] : bool
+    (and (> a (- b tol)) (< a (+ b tol))))
+  (defn __all-tests [] : void
+    (describe "manifold/batch"
+      (it "a loop pushes into a borrowed SolidVec; union-all consumes it"
+        (let [parts  (solid-vec-new)
+              ^mut x 0.0]
+          (while (< x 9.0)
+            (solid-vec-push! parts
+              (translate (cube 1.5 1.5 1.5 false) x 0.0 0.0))
+            (set! x (+ x 2.5)))
+          (let [n (assert-eq 4 (solid-vec-len parts))
+                u (union-all parts)
+                v (assert-true (near? (volume u) 13.5 1e-06))]
+            (solid-free u)
+            (and n v))))
+      (it "union-all of overlapping solids counts the overlap once"
+        (let [parts (solid-vec-new)]
+          (solid-vec-push! parts (cube 2.5 2.5 2.5 false))
+          (solid-vec-push! parts
+            (translate (cube 2.5 2.5 2.5 false) 1.25 0.0 0.0))
+          (let [u (union-all parts)
+                r (assert-true (near? (volume u) 23.4375 1e-06))]
+            (solid-free u)
+            r)))
+      (it "intersection-all keeps what every solid shares"
+        (let [parts (solid-vec-new)]
+          (solid-vec-push! parts (cube 2.5 2.5 2.5 false))
+          (solid-vec-push! parts
+            (translate (cube 2.5 2.5 2.5 false) 1.25 0.0 0.0))
+          (solid-vec-push! parts
+            (translate (cube 2.5 2.5 2.5 false) 0.0 1.5 0.0))
+          (let [i (intersection-all parts)
+                ;; 1.25 x 1.0 x 2.5
+                r (assert-true (near? (volume i) 3.125 1e-06))]
+            (solid-free i)
+            r)))
+      (it "hull-all wraps every solid in the list"
+        (let [parts (solid-vec-new)]
+          (solid-vec-push! parts (cube 1.0 1.0 1.0 false))
+          (solid-vec-push! parts
+            (translate (cube 1.0 1.0 1.0 false) 2.5 0.0 0.0))
+          (let [h (hull-all parts)
+                v (assert-true (near? (volume h) 3.5 1e-06))
+                g (assert-eq 0 (genus h))]
+            (solid-free h)
+            (and v g))))
+      (it "decompose gives one solid per connected piece"
+        (let [pieces (decompose (union (cube 1.5 1.5 1.5 false)
+                                  (translate (sphere 0.75 32) 4.5 0.0 0.0)))
+              n      (assert-eq 2 (solid-vec-len pieces))
+              a      (solid-vec-get pieces 0)
+              b      (solid-vec-get pieces 1)
+              whole  (+ (volume a) (volume b))]
+          (solid-free a)
+          (solid-free b)
+          (let [u (union-all pieces)
+                r (assert-true (near? (volume u) whole 1e-06))]
+            (solid-free u)
+            (and n r))))
+      (it "an index outside the list gives an empty, valid solid"
+        (let [parts (solid-vec-new)]
+          (solid-vec-push! parts (cube 1.5 1.5 1.5 false))
+          (let [past   (solid-vec-get parts 1)
+                before (solid-vec-get parts -1)
+                r      (assert-true (and (empty? past) (empty? before)))
+                ok     (assert-true (and (solid-ok? past) (solid-ok? before)))]
+            (solid-free past)
+            (solid-free before)
+            (solid-vec-free parts)
+            (and r ok))))
+      (it "an empty list unions to nothing"
+        (let [u (union-all (solid-vec-new))
+              r (assert-true (empty? u))]
+          (solid-free u)
+          r))))
+  (defn main [] : int (__all-tests) (run-all-status)))
