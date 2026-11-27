@@ -3,25 +3,28 @@
 ;; Both are `^linear`: a value is produced once and must be consumed exactly
 ;; once.  That is checked for every NAMED binding -- a `let` that never
 ;; consumes its Solid is TUR-E0100, a second use after a consuming call is
-;; TUR-E0101, consuming in one `if` branch only is TUR-E0104.
+;; TUR-E0101, consuming in one `if` branch only is TUR-E0104 -- and for a
+;; call result written as a statement, which is TUR-E0100 too.
 ;;
-;; The checker does not follow a value that is never bound, so three shapes
-;; compile and leak.  They are listed in the README ("What the checker does
-;; not catch") and were measured, not guessed:
+;; Two shapes of a Solid that never gets a name still compile and leak.  They
+;; are listed in the README ("What the checker does not catch") and were
+;; measured, not guessed:
 ;;
 ;;   (volume (cube 1.5 1.5 1.5 true))    ; a temporary handed to a ^borrow slot
-;;   (translate s 1.5 0.0 0.0)           ; a result nobody binds or consumes
 ;;   (Part (cube 1.5 1.5 1.5 true) 7)    ; a Solid stored in a struct or a vec
 ;;
+;; turmeric keeps them open as
+;; docs/reported/linear-values-without-a-binding-are-not-checked.md.
+;;
 ;; Why linear and not `^affine` with a `Drop` instance, the shape stdlib's
-;; numvec uses: measured on turmeric main (2026-11-24), an affine Solid that
-;; is consumed in one `if` branch only compiles and is then freed twice at
-;; scope exit, and one consumed in BOTH branches is rejected as "used more
-;; than once".  Linear rejects the first at compile time and accepts the
-;; second.  `^linear` with a `Drop` instance is worse than either: every
-;; explicit `solid-free` of a bound value is a double free.  Reported as
-;; turmeric docs/reported/affine-drop-handle-consumed-in-one-branch-double-frees.md
-;; and linear-values-without-a-binding-are-not-checked.md.
+;; numvec uses and the one that would free a Solid at scope exit with no
+;; `solid-free`.  The prototype chose linear because affine handles were then
+;; freed twice when one `if` branch consumed them; turmeric has since fixed
+;; that (docs/archive/affine-drop-handle-consumed-in-one-branch-double-frees.md).
+;; What still decides it, measured 2026-11-27: a function that takes an
+;; affine handle by value and never uses it compiles and leaks it, where the
+;; linear one is TUR-E0100.  Every operation here takes its operands by value,
+;; so that is the check this spice leans on most.
 (defmodule manifold/types
   (export Solid SolidVec)
   ;;; Solid -- an owned handle to one manifold solid (a `ManifoldManifold*`).
@@ -37,9 +40,9 @@
   (defopaque ^linear Solid :int)
   ;;; SolidVec -- an owned, growable list of solids (a `ManifoldManifoldVec*`).
   ;;;
-  ;;; The way to combine a number of solids only known at run time: a loop
-  ;;; cannot rebind a linear accumulator, but it can push into a borrowed
-  ;;; SolidVec.  Consumed by `union-all`, `intersection-all`, `hull-all` or
+  ;;; The way to hold a number of solids only known at run time: a loop
+  ;;; pushes into a SolidVec it borrows, and one batch operation consumes it.
+  ;;; Consumed by `union-all`, `intersection-all`, `hull-all` or
   ;;; `solid-vec-free`.
   ;;;
   ;;; Since: M0

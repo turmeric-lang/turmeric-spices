@@ -10,7 +10,7 @@
 # and stop testing its subject, so every assertion pins the code AND a witness
 # substring naming the binding at fault.
 #
-# What is NOT here: the three shapes the checker accepts and that leak at run
+# What is NOT here: the two shapes the checker accepts and that leak at run
 # time (README "What the checker does not catch").  A fixture pinning "this
 # still compiles" would turn this spice's CI red the day turmeric closes one
 # of them.  tests/ run under LeakSanitizer in CI, which is what catches those.
@@ -97,6 +97,13 @@ expect_reject manifold-borrowed-solid-consumed.tur TUR-E0109 \
 expect_reject manifold-solid-vec-leak.tur TUR-E0100 \
   'linear value '\''parts'\'' dropped without being consumed' \
   'a SolidVec that is filled and never consumed is a leak'
+
+expect_reject manifold-solid-result-discarded.tur TUR-E0100 \
+  'linear value of type Solid is discarded here' \
+  'an operation whose result nobody binds is rejected'
+expect_reject manifold-solid-overwritten.tur TUR-E0100 \
+  'linear value '\''acc'\'' is overwritten without being consumed' \
+  'set! over a Solid that was not consumed is rejected'
 
 echo "1..$n"
 if [ "$fail" -ne 0 ]; then

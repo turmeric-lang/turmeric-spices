@@ -50,8 +50,8 @@
   return strcmp((const char *)(intptr_t)a, (const char *)(intptr_t)b) == 0;
   ```)
   ;; A row of `n` unit cubes along x, 2.5 apart, by recursion: each call
-  ;; consumes its accumulator once, which is the one accumulating shape the
-  ;; linearity checker accepts.
+  ;; consumes its accumulator once.  The `while` + `set!` twin is in the
+  ;; ownership tests below.
   (defn row [n : int x : float acc : Solid] : Solid
     (if (<= n 0)
       acc
@@ -226,5 +226,34 @@
         (let [r4 (row 4 0.0 (empty-solid))
               v  (assert-true (near? (volume r4) 4.0 1e-06))]
           (solid-free r4)
-          v))))
+          v))
+      (it "a while loop accumulates by set! on a ^mut solid"
+        (let [^mut acc (empty-solid)
+              ^mut x   0.0]
+          (while (< x 9.0)
+            (set! acc
+              (union acc (translate (cube 1.0 1.0 1.0 false) x 0.0 0.0)))
+            (set! x (+ x 2.5)))
+          (let [v (assert-true (near? (volume acc) 4.0 1e-06))]
+            (solid-free acc)
+            v))))
+    ;; Meshes big enough that the parallel backend has real work to split
+    ;; across its worker threads -- and CI runs this under the sanitizers.
+    ;; The identity checked needs no closed form: what the union counts once
+    ;; and the intersection counts again is exactly what the two volumes count
+    ;; twice.
+    (describe "manifold/solid large meshes"
+      (it "vol(A or B) + vol(A and B) = vol(A) + vol(B) on 32768-triangle spheres"
+        (let [a  (sphere 1.5 256)
+              b  (translate (sphere 1.5 256) 1.25 0.0 0.0)
+              n  (assert-eq 32768 (num-tri a))
+              va (volume a)
+              vb (volume b)
+              u  (union (solid-copy a) (solid-copy b))
+              i  (intersection a b)
+              ok (assert-true (solid-ok? u))
+              r  (assert-true (near? (+ (volume u) (volume i)) (+ va vb) 1e-06))]
+          (solid-free u)
+          (solid-free i)
+          (and n (and ok r))))))
   (defn main [] : int (__all-tests) (run-all-status)))

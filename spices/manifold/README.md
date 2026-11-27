@@ -20,10 +20,17 @@ guaranteed to stay manifold (watertight, no self-intersections), wrapping
 }
 ```
 
-`tur fetch` builds Manifold v3.5.5 and its Clipper2 dependency from source and
-links them statically. That needs a C++17 compiler, CMake 3.20 or newer, git,
-and network access at fetch time. A cold build takes about 45 seconds on four
-cores and leaves roughly 220 MB under `cmake/build/`.
+`tur fetch` builds Manifold v3.5.5, the Clipper2 commit it pins and oneTBB
+v2022.3.0 from source and links all three statically. That needs a C++17
+compiler, CMake 3.20 or newer, git, and network access at fetch time. A cold
+build takes about 3 minutes 45 seconds and leaves roughly 535 MB under
+`cmake/build/`. `tur fetch` compiles one file at a time unless told otherwise;
+`CMAKE_BUILD_PARALLEL_LEVEL=4 tur fetch` brings it to about 65 seconds on four
+cores.
+
+It needs a `tur` newer than v0.73.0. That release and earlier ones do not put
+the C++ runtime or oneTBB on the link line, so the first program fails to link
+on undefined symbols, `operator new` among them.
 
 ## Quick start
 
@@ -108,33 +115,55 @@ with-solid [d difference(cube(2.5 2.5 2.5 true) sphere(1.5 48))]
 
 ### Loops
 
-A `while` loop cannot accumulate by rebinding: `(set! acc (union acc part))` is
-rejected with `TUR-E0101`, because assigning `acc` again does not make it
-usable again once `union` has consumed it. Push into a `SolidVec` instead --
-`solid-vec-push!` borrows the vector and consumes the solid -- and let one
-batch operation consume the vector:
+A loop can accumulate into a `^mut` solid. `union` consumes the old value and
+`set!` puts the result in its place, so the binding holds exactly one solid
+before and after every iteration:
 
 ```turmeric
-(let [parts (solid-vec-new)
+(let [^mut acc (empty-solid)
+      ^mut x   0.0]
+  (while (< x 9.0)
+    (set! acc (union acc (translate (cube 1.5 1.5 1.5 false) x 0.0 0.0)))
+    (set! x (+ x 2.5)))
+  acc)
+```
+
+```sweet-exp
+let [^mut acc empty-solid()
+     ^mut x   0.0]
+  while {x < 9.0}
+    set!(acc union(acc translate(cube(1.5 1.5 1.5 false) x 0.0 0.0)))
+    set!(x {x + 2.5})
+  acc
+```
+
+The new value has to use up the old one in its own expression. Assigning over
+a solid that is still live -- `(set! acc (cube 1.5 1.5 1.5 false))` -- would
+orphan it, and is rejected.
+
+A `SolidVec` holds a list of solids instead. `solid-vec-push!` borrows the
+vector and consumes the solid, and one batch operation consumes the vector:
+
+```turmeric
+(let [parts  (solid-vec-new)
       ^mut x 0.0]
   (while (< x 9.0)
     (solid-vec-push! parts (translate (cube 1.5 1.5 1.5 false) x 0.0 0.0))
     (set! x (+ x 2.5)))
-  (union-all parts))
+  (hull-all parts))
 ```
 
 ```sweet-exp
-let [parts solid-vec-new()
+let [parts  solid-vec-new()
      ^mut x 0.0]
   while {x < 9.0}
     solid-vec-push!(parts translate(cube(1.5 1.5 1.5 false) x 0.0 0.0))
     set!(x {x + 2.5})
-  union-all(parts)
+  hull-all(parts)
 ```
 
 `union-all`, `intersection-all` and `hull-all` consume the vector;
-`solid-vec-free` releases one you decide not to use. A recursive function
-whose accumulator is a parameter needs none of this.
+`solid-vec-free` releases one you decide not to use. `decompose` returns one.
 
 ### What the compiler catches
 
@@ -147,32 +176,41 @@ Each of these is a compile error, pinned by a fixture under `errors/`:
 | Passing one handle as both operands, `(union a a)` | `TUR-E0101` |
 | Consuming a solid in one branch of an `if` but not the other | `TUR-E0104` |
 | Freeing a solid inside a function that only borrowed it | `TUR-E0109` |
+| An operation written as a statement, its result bound to nothing | `TUR-E0100` |
+| `set!` over a solid that has not been consumed | `TUR-E0100` |
 
 ### What the checker does not catch
 
-The linearity check follows named bindings. A solid that never gets a name is
-invisible to it, so these three shapes compile and leak. They were measured
-with turmeric main as of 2026-11-24, under LeakSanitizer, and are reported as
-turmeric `docs/reported/linear-values-without-a-binding-are-not-checked.md`.
+A solid that never gets a name is followed only part of the way, so these two
+shapes compile and leak. They were measured with turmeric main as of
+2026-11-27, under LeakSanitizer, and turmeric keeps them open as
+`docs/reported/linear-values-without-a-binding-are-not-checked.md`.
 
 | Shape | Why it leaks | Write instead |
 |---|---|---|
 | `(volume (cube 1.5 1.5 1.5 true))` | a temporary handed to a borrowing function has no owner | bind it, or use `with-solid` |
-| `(translate s 2.5 0.0 0.0)` as a statement | the result is never bound or consumed | bind the result |
 | a `Solid` stored in a struct field or a vector literal | the aggregate is not linear | a `SolidVec` |
 
 The spice's own tests run under LeakSanitizer in CI (`TUR_SANITIZE_PROGRAMS=1`),
-which does catch all three at run time. Doing the same in your project is the
+which does catch both at run time. Doing the same in your project is the
 practical guard.
 
 ## Threading
 
-Manifold is built **single-threaded** here (`MANIFOLD_PAR=OFF`). Every
-operation runs on the thread that calls it, and a large boolean uses one core
-however many the machine has. Manifold's parallel backend needs oneTBB, which
-`tur fetch` cannot currently put on the link line: Manifold links it through a
-generator expression, and tur's link walk drops those (turmeric
-`docs/reported/cmake-dep-genex-link-entry-dropped.md`).
+Manifold is built with its parallel backend (`MANIFOLD_PAR=ON`). A call still
+returns only when its work is done, but a large boolean, hull or query splits
+that work across oneTBB's worker threads -- by default as many as the machine
+has hardware threads. Nothing in this API starts or configures those threads;
+they belong to oneTBB.
+
+What this does not make safe is your own threads. The spice has only been
+tested with each `Solid` used from the thread that made it, and says nothing
+about handing one to another Turmeric thread.
+
+oneTBB is compiled in as a static archive (`MANIFOLD_USE_BUILTIN_TBB=ON`), so
+nothing has to be installed first. Manifold warns that a static oneTBB can
+misbehave in a program that also links another copy of it, which matters only
+if a second native dependency of yours brings its own.
 
 Manifold also evaluates lazily. A boolean returns immediately with a node of a
 CSG tree; the mesh is computed the first time something asks about it. The
@@ -190,6 +228,7 @@ following, checked against the sources at the pinned versions:
 |---|---|---|
 | [Manifold](https://github.com/elalish/manifold) | v3.5.5 | Apache-2.0 (no `NOTICE` file) |
 | [Clipper2](https://github.com/AngusJohnson/Clipper2) | commit `46f6391`, the one Manifold pins | BSL-1.0 |
+| [oneTBB](https://github.com/oneapi-src/oneTBB) | v2022.3.0, the one Manifold pins | Apache-2.0 (no `NOTICE` file) |
 
 Manifold's tree also carries code under other terms, each stated in the file's
 own header:
@@ -202,9 +241,15 @@ own header:
 | `include/manifold/linalg.h` | Sterling Orsten's `linalg.h` | public domain |
 | `src/quickhull.cpp`, `src/quickhull.h` | Antti Kuukka's QuickHull | public domain |
 
+oneTBB's `third-party-programs.txt` lists six components. One is compiled into
+the archive this spice links: the ITT Notify API, listed there under a
+BSD-3-Clause notice. The others are not part of it: hwloc, gperftools, a
+Python recipe and doctest are not linked, and the libstdc++ workaround is
+compiled only against libstdc++ 4.7 to 5.
+
 All of these are permissive licenses. If you distribute a binary built with
-this spice, Apache-2.0 asks you to pass on a copy of that license, and the MIT
-and Sun notices ask to be preserved. This is a summary of what the files say,
+this spice, Apache-2.0 asks you to pass on a copy of that license, and the MIT,
+BSD and Sun notices ask to be preserved. This is a summary of what the files say,
 not legal advice.
 
 ## See also
