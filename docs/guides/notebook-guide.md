@@ -138,25 +138,32 @@ spice takes a few seconds longer; set `TUR_BIN` if `tur` is not on `PATH`.
 What runs compiled:
 
 - `stats` (distributions, tests, summaries), `frame` (CSV, filtering,
-  group-by, printing), `plot` (scatter, histograms, densities) and `linalg`
-  (matrices, solvers, formatting), whose APIs pass numbers, strings,
-  handles, cons lists and by-value records.
+  group-by, printing) and `linalg` (matrices, solvers, formatting), whose
+  APIs pass numbers, strings, handles, cons lists and by-value records.
 - Turmeric wrappers in those spices over private C helpers.
+- A cell's `defn` or `fn` literal passed to a `^fat` callback parameter
+  whose signature is numbers, handles and records -- signal's
+  `buffer-render` sampling a cell's function, say. The compiled code calls
+  back into the session.
 
-A function that takes or returns a record (linalg's `mat`) is callable once
-its module is imported in the session -- the import is where its layout
-comes from -- which a cell does anyway to use the name.
+A function that takes or returns a record (linalg's `mat`), or takes a
+callback, is callable once its module is imported in the session -- the
+import is where the layout and the callback's signature come from -- which
+a cell does anyway to use the name.
 
 What still cannot:
 
-- A cell's `defn` passed as a C callback, such as plot's `function`
-  renderer: the interpreter's closure has no C address to hand over.
+- `plot`, since its typed API: its renderers are `AnyRenderer` values and
+  its data arrives as `(Vec Point)` and the like, and neither crosses into
+  compiled code from a session yet, so the calls run interpreted and stop
+  at plot's first C body. Tracked as turmeric's
+  `docs/reported/plot-typed-api-has-no-ffi-shim.md`.
 - An inline-C `defn` written in a cell itself, beyond the interpreter's
   few simple shapes. Build such values with `cons` and `float->bits`
   (`(load "stdlib/bits.tur")`) instead -- the example notebooks do.
 
-Tracked as turmeric's
-`docs/reported/notebook-cells-cannot-call-inline-c-spices.md`.
+The history is turmeric's
+`docs/archive/notebook-cells-cannot-call-inline-c-spices.md`.
 
 Example -- load a CSV and print its shape:
 

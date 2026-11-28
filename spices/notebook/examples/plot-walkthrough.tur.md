@@ -13,10 +13,12 @@ Plot y = x^2 over [-2, 2]. The `function` renderer takes a typed callback
 (a `(fn [float] float)`), a domain, a sample count, a line style, and a
 label.
 
-> This cell is not evaluated (`eval=false`): `function` calls its callback
-> from plot's compiled code, and a cell's `defn` is an interpreter closure
-> that compiled code cannot call. The cell runs as written in a compiled
-> program.
+> This cell is not evaluated (`eval=false`). Handing a cell's `defn` to
+> compiled code as a callback works, but `function` returns an `AnyRenderer`,
+> which a notebook session cannot take from plot's compiled image yet --
+> nor can the cells below, for the same reason (turmeric's
+> `docs/reported/plot-typed-api-has-no-ffi-shim.md`). The cell runs as
+> written in a compiled program.
 
 ```turmeric {eval=false}
 (import plot/core  :refer [plot-write-png])
